@@ -187,9 +187,18 @@ impl ScenarioIdentityV0 {
     }
 
     /// Append one configuration layer's content digest in application order.
-    pub fn record_config_layer(&mut self, bytes: &[u8]) {
-        self.ordered_config_layer_digests
-            .push(manifest_digest("config-layer-v0", bytes));
+    ///
+    /// Each entry is prefixed with the layer kind's wire tag (`file:`, `environment:`,
+    /// `cli:`), so a manifest can say not just WHAT the config was but WHICH KINDS of
+    /// layer built it, in order. File layers digest their exact source bytes — those
+    /// bytes ARE the layer — while the environment and CLI layers digest their
+    /// canonical statement bytes.
+    pub fn record_config_layer(&mut self, kind: precedence::ConfigLayerKind, bytes: &[u8]) {
+        self.ordered_config_layer_digests.push(format!(
+            "{}:{}",
+            kind.wire_tag(),
+            manifest_digest("config-layer-v0", bytes)
+        ));
     }
 }
 
@@ -375,6 +384,15 @@ pub struct RunManifestV3 {
     /// resolved. A real run always records one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_policy: Option<ThreadPolicyV0>,
+    /// Cross-layer configuration displacements the composed config resolved — the config
+    /// analogue of [`ThreadPolicyV0`]'s `overridden`.
+    ///
+    /// Empty when no explicit layer displaced another explicit layer's value (displacing a
+    /// built-in default is configuration, not a displacement). A user whose scenario file
+    /// said one thing and whose environment said another reads it here, in the run's own
+    /// record, rather than discovering it from the results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_overrides: Vec<precedence::ConfigFieldOverride>,
     /// Explicit proof of the requested startup warmup, attached only after it completes.
     ///
     /// Attaching it through [`Self::with_bootstrap_evidence`] validates the two digests and
@@ -651,6 +669,20 @@ impl RunManifestV3 {
         self
     }
 
+    /// Record the cross-layer configuration displacements the startup path resolved.
+    ///
+    /// Reaches the manifest the same way the thread policy does, and for the same reason:
+    /// a world cannot know which configuration layers fought over its knobs, only the
+    /// startup composition path can.
+    #[must_use]
+    pub fn with_config_overrides(
+        mut self,
+        overrides: Vec<precedence::ConfigFieldOverride>,
+    ) -> Self {
+        self.config_overrides = overrides;
+        self
+    }
+
     /// Validate and attach exact bootstrap execution evidence.
     ///
     /// This is deliberately fallible: the manifest must never claim a request different from its
@@ -784,6 +816,7 @@ impl RunManifestV3 {
             // `with_thread_policy`, so a manifest that carries no policy is one that was built
             // outside a real run — which is a true statement, not a missing field.
             thread_policy: None,
+            config_overrides: Vec::new(),
             bootstrap_evidence: None,
             random_streams,
             next_agent_uid,

@@ -392,6 +392,83 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
 }
 
 #[test]
+fn the_manifest_records_which_config_layers_built_the_run_and_who_displaced_whom() {
+    // defaults -> scenario file -> environment -> CLI, driven through the real binary.
+    // The file says 2000, the environment says 1000, the CLI says 500. The run must use
+    // 500, and the manifest must carry BOTH displacements plus a kind-tagged digest for
+    // every layer that spoke — that is what lets two runs that disagree be told apart by
+    // their layer provenance rather than only by their final config digest.
+    let dir = run_dir("config_layer_provenance");
+    let scenario_path = dir.join("scenario.toml");
+    std::fs::write(&scenario_path, b"world_width = 2000\n").expect("write scenario layer");
+    let scenario_arg = scenario_path
+        .to_str()
+        .expect("temp path is valid Unicode")
+        .to_owned();
+
+    let output = launch_with(
+        &dir,
+        &[("SCRIPTBOTS_CONFIG_OVERRIDES", "world_width = 1000")],
+        &["--config", &scenario_arg, "--set", "world_width=500"],
+    );
+    let manifest = manifest_of(&output, &dir);
+
+    assert_eq!(
+        manifest["normalized_config"]["world_width"], 500,
+        "the CLI layer names the value for this exact invocation and must win"
+    );
+
+    let overrides = manifest["config_overrides"]
+        .as_array()
+        .expect("cross-layer displacements must be in the run record");
+    let displaced: Vec<(&str, &str, &str)> = overrides
+        .iter()
+        .filter(|entry| entry["path"] == "world_width")
+        .map(|entry| {
+            (
+                entry["losing_kind"].as_str().expect("losing kind"),
+                entry["winning_kind"].as_str().expect("winning kind"),
+                entry["winning_layer"].as_str().expect("winning layer"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        displaced
+            .iter()
+            .map(|(loser, winner, _)| (*loser, *winner))
+            .collect::<Vec<_>>(),
+        vec![("file", "environment"), ("environment", "cli")],
+        "both displacements must be recorded in application order: {overrides:?}"
+    );
+    assert!(
+        displaced[1].2.contains("--set world_width=500"),
+        "the winning CLI layer must be attributable to the exact flag text, got {:?}",
+        displaced[1].2
+    );
+
+    let digests: Vec<String> = manifest["scenario"]["ordered_config_layer_digests"]
+        .as_array()
+        .expect("ordered layer digests")
+        .iter()
+        .map(|value| value.as_str().expect("digest entry").to_owned())
+        .collect();
+    let kinds: Vec<&str> = digests
+        .iter()
+        .map(|entry| entry.split(':').next().unwrap_or(""))
+        .collect();
+    // The harness exports SCRIPTBOTS_RNG_SEED for every run, so the environment speaks
+    // twice: once through SCRIPTBOTS_CONFIG_OVERRIDES and once through the typed
+    // variables. Every statement appears, kind-tagged, in application order.
+    assert_eq!(
+        kinds,
+        vec!["file", "environment", "environment", "cli"],
+        "every layer that spoke must appear as a kind-tagged digest, in order: {digests:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn two_identical_runs_produce_the_same_provenance() {
     // This is what makes "provenanced" mean something. If two runs of the same
     // build, seed and config disagreed about their own configuration, the manifest

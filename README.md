@@ -449,6 +449,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
  - `--profile-sweep N`: run a sweep of configurations for profiling and print a summary.
  - `--auto-tune N`: quick sweep to pick threads/thresholds for the chosen storage, then continue.
  - `--det-check N`: run determinism self-check (1-thread vs N-threads summaries comparison).
+ - `--set PATH=VALUE`: dotted-path configuration override in TOML syntax, repeatable (e.g., `--set world_width=800 --set neuroflow.enabled=true`; string values use TOML quotes). Configuration layers apply defaults → `--config` files (in order) → environment → CLI; every applied layer appends a kind-tagged content digest to the run manifest's `scenario.ordered_config_layer_digests`, and any field where one explicit layer displaced another is recorded in the manifest's `config_overrides`.
  - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.
  - `--storage {file|memory}`: select the FrankenSQLite target. `file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a fresh generated run path and refuses existing databases or stale sidecars; `memory` opens volatile `:memory:` through the same engine.
  - `--recover-storage FILE`: exclusively reopen a validated existing ScriptBots run, replay/finalize its durable outbox, print the admitted/applied/durable watermarks, and exit. This repairs persistence only; it does not reconstruct the in-memory world or resume simulation ticks.
@@ -470,6 +471,8 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
  - `SCRIPTBOTS_TERMINAL_EMOJI` — force emoji mode `1|true|yes|on` or disable with `0|false|off|no`.
  - `SCRIPTBOTS_RENDER_SAFE` — force conservative rendering path in GUI mode (also enabled by `--renderer-safe` or `--low-power`).
  - `SCRIPTBOTS_RENDER_WATERMARK` — overlay a tiny diagnostics watermark in the GUI canvas (also enabled by `--debug-watermark`).
+- `SCRIPTBOTS_CONFIG_OVERRIDES` — inline TOML document merged as the most-general environment configuration layer (e.g., `world_width = 1000`). Beats `--config` files, loses to the typed `SCRIPTBOTS_*` variables and to every CLI flag; malformed content fails startup closed. Each applied layer appends a kind-tagged digest to the manifest, and cross-layer displacements land in the manifest's `config_overrides`.
+- `SCRIPTBOTS_RNG_SEED` — environment-layer RNG seed; `--rng-seed` outranks it as a distinct CLI layer with its own provenance.
 - `SCRIPTBOTS_NEUROFLOW_ENABLED` — `true|false`.
 - `SCRIPTBOTS_NEUROFLOW_HIDDEN` — comma-separated hidden sizes (e.g., `64,32,16`).
 - `SCRIPTBOTS_NEUROFLOW_ACTIVATION` — `tanh|sigmoid|relu`.

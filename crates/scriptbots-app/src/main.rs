@@ -6,7 +6,10 @@ use scriptbots_app::{
     BootstrapEvidenceV0, CharacterizationTraceV2, ControlServerConfig, ControlServerReservation,
     RunIdentityV1, RunManifestV3, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
     WorldStepDriver,
-    precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
+    precedence::{
+        ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
+        canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
+    },
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -18,8 +21,8 @@ use scriptbots_brain::{
 };
 use scriptbots_core::{
     AgentData, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
-    PersistenceSessionError, RenderAutoExposureSettings, RenderSettings, RenderTonemapMode,
-    ReplayEventKind, ScriptBotsConfig, TickSummary, WorldDigestV1, WorldPersistence, WorldState,
+    PersistenceSessionError, RenderTonemapMode, ReplayEventKind, ScriptBotsConfig, TickSummary,
+    WorldDigestV1, WorldPersistence, WorldState,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
@@ -88,7 +91,7 @@ fn main() -> Result<()> {
         run_det_child(&config, tick_limit)?;
         return Ok(());
     }
-    let (config, launch_scenario) = compose_config_with_scenario(&cli)?;
+    let (config, launch_scenario, config_overrides) = compose_config_with_scenario(&cli)?;
 
     if let Some(ticks) = cli.characterize_v0 {
         run_characterization_v0(&cli, config, launch_scenario, ticks)?;
@@ -157,6 +160,7 @@ fn main() -> Result<()> {
                 thresholds,
                 profile_thread_policy,
                 launch_scenario.clone(),
+                config_overrides.clone(),
             )?;
         }
         return Ok(());
@@ -276,6 +280,7 @@ fn main() -> Result<()> {
         cli.bootstrap_ticks,
         policy,
         launch_scenario,
+        config_overrides,
     )?;
     let simulation_step = persistence_step_driver(&world, &persistence);
 
@@ -931,6 +936,7 @@ fn build_run_manifest(
     identity: RunIdentityV1,
     scenario: ScenarioIdentityV0,
     thread_policy: ThreadPolicy,
+    config_overrides: Vec<ConfigFieldOverride>,
 ) -> std::result::Result<RunManifestV3, scriptbots_app::RunManifestError> {
     RunManifestV3::from_world_with_provenance(
         identity,
@@ -941,13 +947,17 @@ fn build_run_manifest(
     .map(|manifest| {
         // Record what the run DECIDED, not merely what the environment said. Build provenance
         // captures environment declarations, which may have lost to a more specific policy layer.
-        manifest.with_thread_policy(ThreadPolicyV0 {
-            threads: thread_policy.threads,
-            source: thread_policy.source.wire_tag().to_owned(),
-            overridden: thread_policy
-                .overridden
-                .map(|declined| declined.wire_tag().to_owned()),
-        })
+        // The same rule covers the config itself: cross-layer displacements are part of how this
+        // exact configuration came to be, so they ride beside the thread policy.
+        manifest
+            .with_thread_policy(ThreadPolicyV0 {
+                threads: thread_policy.threads,
+                source: thread_policy.source.wire_tag().to_owned(),
+                overridden: thread_policy
+                    .overridden
+                    .map(|declined| declined.wire_tag().to_owned()),
+            })
+            .with_config_overrides(config_overrides)
     })
 }
 
@@ -1087,6 +1097,7 @@ fn bootstrap_world(
     bootstrap_ticks: u64,
     thread_policy: ThreadPolicy,
     mut scenario: ScenarioIdentityV0,
+    config_overrides: Vec<ConfigFieldOverride>,
 ) -> Result<(
     SharedWorld,
     SharedPersistenceAdmission,
@@ -1130,7 +1141,7 @@ fn bootstrap_world(
     identity
         .validate()
         .context("invalid live-run identity before storage registration")?;
-    let manifest = build_run_manifest(&world, identity, scenario, thread_policy)
+    let manifest = build_run_manifest(&world, identity, scenario, thread_policy, config_overrides)
         .context("failed to build durable run provenance before tick zero")?;
     let storage_record = manifest
         .to_storage_record()
@@ -1247,15 +1258,26 @@ fn bootstrap_world(
 }
 
 fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
-    compose_config_with_scenario(cli).map(|(config, _scenario)| config)
+    compose_config_with_scenario(cli).map(|(config, _scenario, _overrides)| config)
 }
 
-/// Compose the effective configuration and its exact ordered layer provenance in one pass.
+/// Compose the effective configuration, its exact ordered layer provenance, and every
+/// cross-layer displacement in one pass.
 ///
-/// Reading each layer once is load-bearing: re-reading files after composition could digest
-/// bytes different from those that actually configured the run.
-fn compose_config_with_scenario(cli: &AppCli) -> Result<(ScriptBotsConfig, ScenarioIdentityV0)> {
-    let mut config = ScriptBotsConfig {
+/// Layer order, most general first: built-in defaults -> configuration files (in
+/// order) -> environment -> CLI. Statement GATHERING (file reads, environment reads,
+/// flag interpretation) happens here; the merge itself is the pure
+/// [`resolve_config_layers`], so the precedence rules are testable without a process.
+/// Reading each file once is load-bearing: re-reading files after composition could
+/// digest bytes different from those that actually configured the run.
+fn compose_config_with_scenario(
+    cli: &AppCli,
+) -> Result<(
+    ScriptBotsConfig,
+    ScenarioIdentityV0,
+    Vec<ConfigFieldOverride>,
+)> {
+    let defaults = ScriptBotsConfig {
         persistence_interval: 60,
         history_capacity: 600,
         ..ScriptBotsConfig::default()
@@ -1267,24 +1289,340 @@ fn compose_config_with_scenario(cli: &AppCli) -> Result<(ScriptBotsConfig, Scena
     };
     let mut scenario = ScenarioIdentityV0::caller_seeded(scenario_id);
     scenario.population_recipe = "fixed-4x4-registered-brain-grid-v1".to_owned();
-    config = apply_config_layers_with_scenario(config, &cli.config_layers, &mut scenario)?;
-    apply_env_overrides(&mut config);
-    if let Some(seed) = cli.rng_seed {
-        config.rng_seed = Some(seed);
+
+    let defaults_value =
+        serde_json::to_value(&defaults).context("failed to serialize base config")?;
+
+    let mut statements: Vec<ConfigLayerStatement> = Vec::new();
+    for path in &cli.config_layers {
+        let (fields, source_bytes) = load_config_layer_with_source(path)?;
+        info!(layer = %path.display(), "Applying configuration layer");
+        scenario.record_config_layer(ConfigLayerKind::File, &source_bytes);
+        statements.push(ConfigLayerStatement {
+            kind: ConfigLayerKind::File,
+            label: format!("file:{}", path.display()),
+            fields,
+        });
     }
-    if let Some(limit) = cli.auto_pause_below {
-        config.control.auto_pause_population_below = Some(limit);
+
+    // Whether anything before the environment layer already spoke for
+    // `render.auto_exposure`. When nothing did, a speed-only environment override
+    // must state the block's fresh default (`enabled: true`) itself — the merged
+    // block replaces a `null` wholesale and `enabled` is a required field.
+    let auto_exposure_already_spoken = defaults.render.auto_exposure.is_some()
+        || statements.iter().any(|statement| {
+            statement
+                .fields
+                .pointer("/render/auto_exposure")
+                .is_some_and(|value| !value.is_null())
+        });
+    for statement in gather_env_statements(auto_exposure_already_spoken)? {
+        scenario.record_config_layer(
+            ConfigLayerKind::Environment,
+            &canonical_layer_bytes(&statement.fields),
+        );
+        statements.push(statement);
     }
-    if let Some(age) = cli.auto_pause_age_above {
-        config.control.auto_pause_age_above = Some(age);
+    for statement in gather_cli_statements(cli)? {
+        scenario.record_config_layer(
+            ConfigLayerKind::Cli,
+            &canonical_layer_bytes(&statement.fields),
+        );
+        statements.push(statement);
     }
-    if cli.auto_pause_on_spike {
-        config.control.auto_pause_on_spike_hit = true;
+
+    let resolved = resolve_config_layers(&defaults_value, &statements);
+    for displaced in &resolved.overrides {
+        info!(
+            path = %displaced.path,
+            losing_layer = %displaced.losing_layer,
+            winning_layer = %displaced.winning_layer,
+            "Configuration layer displaced an earlier layer's value"
+        );
     }
+
+    let config = deserialize_merged_config(&resolved.merged)?;
     config
         .validate()
         .context("invalid composed ScriptBots configuration")?;
-    Ok((config, scenario))
+    Ok((config, scenario, resolved.overrides))
+}
+
+/// Decode the merged configuration tree, naming the exact field on failure.
+fn deserialize_merged_config(merged: &JsonValue) -> Result<ScriptBotsConfig> {
+    let json = serde_json::to_string(merged).context("failed to encode merged configuration")?;
+    let mut deserializer = serde_json::Deserializer::from_str(&json);
+    serde_path_to_error::deserialize::<_, ScriptBotsConfig>(&mut deserializer).map_err(
+        |error: serde_path_to_error::Error<serde_json::Error>| {
+            anyhow::anyhow!(
+                "failed to deserialize merged configuration at {}: {}",
+                error.path(),
+                error.inner()
+            )
+        },
+    )
+}
+
+/// Gather what the environment said about the configuration, without mutating anything.
+///
+/// Two statements, most general first:
+/// 1. `SCRIPTBOTS_CONFIG_OVERRIDES` — one inline TOML document able to speak for any
+///    knob. Malformed content fails closed, like every other control-environment value.
+/// 2. The typed `SCRIPTBOTS_*` variables — each names exactly one knob, so together
+///    they are more specific than the catch-all document and are applied after it.
+///
+/// The values are PASSED to the resolver, never written back into the process
+/// environment: startup `set_var` smearing is exactly what made the thread-count
+/// environment capture lie about what the user actually exported.
+fn gather_env_statements(auto_exposure_already_spoken: bool) -> Result<Vec<ConfigLayerStatement>> {
+    let mut statements = Vec::new();
+    if let Ok(raw) = env::var("SCRIPTBOTS_CONFIG_OVERRIDES") {
+        let fields: JsonValue = toml::from_str(&raw)
+            .context("failed to parse SCRIPTBOTS_CONFIG_OVERRIDES as a TOML document")?;
+        if fields.as_object().is_some_and(|map| !map.is_empty()) {
+            statements.push(ConfigLayerStatement {
+                kind: ConfigLayerKind::Environment,
+                label: "env:SCRIPTBOTS_CONFIG_OVERRIDES".to_owned(),
+                fields,
+            });
+        }
+    }
+    let typed = typed_env_fields(auto_exposure_already_spoken)?;
+    if typed.as_object().is_some_and(|map| !map.is_empty()) {
+        statements.push(ConfigLayerStatement {
+            kind: ConfigLayerKind::Environment,
+            label: "env:SCRIPTBOTS_*".to_owned(),
+            fields: typed,
+        });
+    }
+    Ok(statements)
+}
+
+/// The typed `SCRIPTBOTS_*` environment variables, decoded into the partial
+/// configuration they state.
+///
+/// The pre-existing NeuroFlow/render variables keep their historical warn-and-skip
+/// semantics for invalid values; the variables clap used to parse
+/// (`SCRIPTBOTS_RNG_SEED` and the auto-pause family) keep their historical
+/// fail-closed semantics.
+#[allow(clippy::too_many_lines)]
+fn typed_env_fields(auto_exposure_already_spoken: bool) -> Result<JsonValue> {
+    let mut root = serde_json::Map::new();
+
+    let mut neuroflow = serde_json::Map::new();
+    if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_ENABLED") {
+        match parse_bool(&value) {
+            Some(flag) => {
+                neuroflow.insert("enabled".to_owned(), JsonValue::Bool(flag));
+            }
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_ENABLED value; expected true/false")
+            }
+        }
+    }
+    if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_HIDDEN") {
+        match parse_layers(&value) {
+            Some(layers) => {
+                neuroflow.insert(
+                    "hidden_layers".to_owned(),
+                    serde_json::to_value(layers)
+                        .context("failed to encode SCRIPTBOTS_NEUROFLOW_HIDDEN")?,
+                );
+            }
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_HIDDEN value; expected comma-separated integers")
+            }
+        }
+    }
+    if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_ACTIVATION") {
+        match parse_activation(&value) {
+            Some(activation) => {
+                neuroflow.insert(
+                    "activation".to_owned(),
+                    serde_json::to_value(activation)
+                        .context("failed to encode SCRIPTBOTS_NEUROFLOW_ACTIVATION")?,
+                );
+            }
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_ACTIVATION value; expected tanh|sigmoid|relu")
+            }
+        }
+    }
+    if !neuroflow.is_empty() {
+        root.insert("neuroflow".to_owned(), JsonValue::Object(neuroflow));
+    }
+
+    let mut render = serde_json::Map::new();
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_TONEMAP") {
+        match parse_tonemap(&value) {
+            Some(mode) => {
+                render.insert(
+                    "tonemap_mode".to_owned(),
+                    serde_json::to_value(mode)
+                        .context("failed to encode SCRIPTBOTS_RENDER_TONEMAP")?,
+                );
+            }
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_TONEMAP value; expected aces|agx|tony")
+            }
+        }
+    }
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_TONEMAP_BIAS") {
+        match value.trim().parse::<f32>() {
+            Ok(bias) if bias.is_finite() => {
+                render.insert(
+                    "tonemap_exposure_bias".to_owned(),
+                    JsonValue::from(f64::from(bias)),
+                );
+            }
+            _ => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_TONEMAP_BIAS value; expected finite f32")
+            }
+        }
+    }
+    let mut auto_exposure = serde_json::Map::new();
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE") {
+        match parse_bool(&value) {
+            Some(enabled) => {
+                auto_exposure.insert("enabled".to_owned(), JsonValue::Bool(enabled));
+            }
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE value; expected true/false")
+            }
+        }
+    }
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_BRIGHTEN") {
+        match value.trim().parse::<f32>() {
+            Ok(speed) if speed.is_finite() && speed >= 0.0 => {
+                auto_exposure.insert(
+                    "speed_brighten".to_owned(),
+                    JsonValue::from(f64::from(speed)),
+                );
+            }
+            _ => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_BRIGHTEN value; expected non-negative f32")
+            }
+        }
+    }
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_DARKEN") {
+        match value.trim().parse::<f32>() {
+            Ok(speed) if speed.is_finite() && speed >= 0.0 => {
+                auto_exposure.insert("speed_darken".to_owned(), JsonValue::from(f64::from(speed)));
+            }
+            _ => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_DARKEN value; expected non-negative f32")
+            }
+        }
+    }
+    if !auto_exposure.is_empty() {
+        // A speed-only override creating a FRESH auto-exposure block states the
+        // block's historical fresh default (`enabled: true`) itself, because the
+        // merged block replaces a `null` wholesale and `enabled` is required. When an
+        // earlier layer already spoke for the block, deep-merge preserves that
+        // layer's `enabled` — exactly as the old take-or-init mutation did.
+        if !auto_exposure.contains_key("enabled") && !auto_exposure_already_spoken {
+            auto_exposure.insert("enabled".to_owned(), JsonValue::Bool(true));
+        }
+        render.insert("auto_exposure".to_owned(), JsonValue::Object(auto_exposure));
+    }
+    if !render.is_empty() {
+        root.insert("render".to_owned(), JsonValue::Object(render));
+    }
+
+    if let Ok(value) = env::var("SCRIPTBOTS_RNG_SEED") {
+        let seed: u64 = value.trim().parse().with_context(|| {
+            format!("invalid SCRIPTBOTS_RNG_SEED value `{value}`; expected an unsigned 64-bit seed")
+        })?;
+        root.insert("rng_seed".to_owned(), JsonValue::from(seed));
+    }
+    let mut control = serde_json::Map::new();
+    if let Ok(value) = env::var("SCRIPTBOTS_AUTO_PAUSE_BELOW") {
+        let count: u32 = value.trim().parse().with_context(|| {
+            format!("invalid SCRIPTBOTS_AUTO_PAUSE_BELOW value `{value}`; expected u32")
+        })?;
+        control.insert(
+            "auto_pause_population_below".to_owned(),
+            JsonValue::from(count),
+        );
+    }
+    if let Ok(value) = env::var("SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE") {
+        let age: u32 = value.trim().parse().with_context(|| {
+            format!("invalid SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE value `{value}`; expected u32")
+        })?;
+        control.insert("auto_pause_age_above".to_owned(), JsonValue::from(age));
+    }
+    if let Ok(value) = env::var("SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE") {
+        let flag = parse_bool(&value).with_context(|| {
+            format!("invalid SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE value `{value}`; expected true/false")
+        })?;
+        if flag {
+            control.insert("auto_pause_on_spike_hit".to_owned(), JsonValue::Bool(true));
+        }
+    }
+    if !control.is_empty() {
+        root.insert("control".to_owned(), JsonValue::Object(control));
+    }
+
+    Ok(JsonValue::Object(root))
+}
+
+/// Gather what the command line said about the configuration.
+///
+/// Generic `--set` entries come first, each as its own statement so a later entry
+/// displacing an earlier one is attributable to the exact flag text; the typed flags
+/// (`--rng-seed`, the auto-pause family) name single knobs and are applied last.
+fn gather_cli_statements(cli: &AppCli) -> Result<Vec<ConfigLayerStatement>> {
+    let mut statements = Vec::new();
+    for entry in &cli.set_overrides {
+        let fields: JsonValue = toml::from_str(entry).with_context(|| {
+            format!(
+                "failed to parse --set {entry} as TOML (expected PATH=VALUE; string values \
+                 use TOML quotes, e.g. --set 'label=\"dunes\"')"
+            )
+        })?;
+        if fields.as_object().is_none_or(serde_json::Map::is_empty) {
+            bail!("--set {entry} names no configuration field (expected PATH=VALUE)");
+        }
+        statements.push(ConfigLayerStatement {
+            kind: ConfigLayerKind::Cli,
+            label: format!("cli:--set {entry}"),
+            fields,
+        });
+    }
+    let typed = typed_cli_fields(cli);
+    if typed.as_object().is_some_and(|map| !map.is_empty()) {
+        statements.push(ConfigLayerStatement {
+            kind: ConfigLayerKind::Cli,
+            label: "cli:flags".to_owned(),
+            fields: typed,
+        });
+    }
+    Ok(statements)
+}
+
+/// The typed configuration-affecting CLI flags, as the partial they state.
+fn typed_cli_fields(cli: &AppCli) -> JsonValue {
+    let mut root = serde_json::Map::new();
+    if let Some(seed) = cli.rng_seed {
+        root.insert("rng_seed".to_owned(), JsonValue::from(seed));
+    }
+    let mut control = serde_json::Map::new();
+    if let Some(limit) = cli.auto_pause_below {
+        control.insert(
+            "auto_pause_population_below".to_owned(),
+            JsonValue::from(limit),
+        );
+    }
+    if let Some(age) = cli.auto_pause_age_above {
+        control.insert("auto_pause_age_above".to_owned(), JsonValue::from(age));
+    }
+    if cli.auto_pause_on_spike {
+        control.insert("auto_pause_on_spike_hit".to_owned(), JsonValue::Bool(true));
+    }
+    if !control.is_empty() {
+        root.insert("control".to_owned(), JsonValue::Object(control));
+    }
+    JsonValue::Object(root)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1350,7 +1688,11 @@ struct AppCli {
     )]
     config_layers: Vec<PathBuf>,
     /// RNG seed override for deterministic runs.
-    #[arg(long = "rng-seed", value_name = "SEED", env = "SCRIPTBOTS_RNG_SEED")]
+    ///
+    /// `SCRIPTBOTS_RNG_SEED` supplies the same knob through the environment layer,
+    /// which this flag outranks — the two are separate layers with separate
+    /// provenance, not one flag with two spellings.
+    #[arg(long = "rng-seed", value_name = "SEED")]
     rng_seed: Option<u64>,
     /// Explicit number of simulation ticks to run before launching the selected frontend.
     #[arg(
@@ -1370,26 +1712,22 @@ struct AppCli {
     #[arg(long = "tick-limit", value_name = "TICKS", requires = "replay_db")]
     tick_limit: Option<u64>,
     /// Auto-pause when population is at or below this count.
-    #[arg(
-        long = "auto-pause-below",
-        value_name = "COUNT",
-        env = "SCRIPTBOTS_AUTO_PAUSE_BELOW"
-    )]
+    /// (`SCRIPTBOTS_AUTO_PAUSE_BELOW` supplies the environment-layer equivalent.)
+    #[arg(long = "auto-pause-below", value_name = "COUNT")]
     auto_pause_below: Option<u32>,
     /// Auto-pause when any agent's age meets or exceeds this value.
-    #[arg(
-        long = "auto-pause-age-above",
-        value_name = "AGE",
-        env = "SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE"
-    )]
+    /// (`SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE` supplies the environment-layer equivalent.)
+    #[arg(long = "auto-pause-age-above", value_name = "AGE")]
     auto_pause_age_above: Option<u32>,
     /// Auto-pause after a spike hit is recorded.
-    #[arg(
-        long = "auto-pause-on-spike",
-        action = ArgAction::SetTrue,
-        env = "SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE"
-    )]
+    /// (`SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE` supplies the environment-layer equivalent.)
+    #[arg(long = "auto-pause-on-spike", action = ArgAction::SetTrue)]
     auto_pause_on_spike: bool,
+    /// Dotted-path configuration override in TOML syntax, repeatable and applied after
+    /// configuration files and environment variables (e.g., `--set world_width=800`,
+    /// `--set neuroflow.enabled=true`). String values use TOML quoting.
+    #[arg(long = "set", value_name = "PATH=VALUE", action = ArgAction::Append)]
+    set_overrides: Vec<String>,
     /// Print the composed configuration in the selected format.
     #[arg(long = "print-config", action = ArgAction::SetTrue)]
     print_config: bool,
@@ -1480,50 +1818,17 @@ enum ConfigFormat {
 
 #[cfg(test)]
 fn apply_config_layers(base: ScriptBotsConfig, layers: &[PathBuf]) -> Result<ScriptBotsConfig> {
-    apply_config_layers_internal(base, layers, None)
-}
-
-fn apply_config_layers_with_scenario(
-    base: ScriptBotsConfig,
-    layers: &[PathBuf],
-    scenario: &mut ScenarioIdentityV0,
-) -> Result<ScriptBotsConfig> {
-    apply_config_layers_internal(base, layers, Some(scenario))
-}
-
-fn apply_config_layers_internal(
-    base: ScriptBotsConfig,
-    layers: &[PathBuf],
-    mut scenario: Option<&mut ScenarioIdentityV0>,
-) -> Result<ScriptBotsConfig> {
-    if layers.is_empty() {
-        return Ok(base);
-    }
-
-    let mut merged = serde_json::to_value(&base).context("failed to serialize base config")?;
+    let defaults_value = serde_json::to_value(&base).context("failed to serialize base config")?;
+    let mut statements = Vec::new();
     for path in layers {
-        let (layer_value, source_bytes) = load_config_layer_with_source(path)?;
-        if let Some(scenario) = scenario.as_mut() {
-            scenario.record_config_layer(&source_bytes);
-        }
-        info!(
-            layer = %path.display(),
-            "Applying configuration layer"
-        );
-        merge_layer(&mut merged, layer_value);
+        let (fields, _source_bytes) = load_config_layer_with_source(path)?;
+        statements.push(ConfigLayerStatement {
+            kind: ConfigLayerKind::File,
+            label: format!("file:{}", path.display()),
+            fields,
+        });
     }
-
-    let json = serde_json::to_string(&merged).context("failed to encode merged configuration")?;
-    let mut deserializer = serde_json::Deserializer::from_str(&json);
-    serde_path_to_error::deserialize::<_, ScriptBotsConfig>(&mut deserializer).map_err(
-        |error: serde_path_to_error::Error<serde_json::Error>| {
-            anyhow::anyhow!(
-                "failed to deserialize merged configuration at {}: {}",
-                error.path(),
-                error.inner()
-            )
-        },
-    )
+    deserialize_merged_config(&resolve_config_layers(&defaults_value, &statements).merged)
 }
 
 fn load_config_layer_with_source(path: &Path) -> Result<(JsonValue, Vec<u8>)> {
@@ -1544,23 +1849,6 @@ fn load_config_layer_with_source(path: &Path) -> Result<(JsonValue, Vec<u8>)> {
             .with_context(|| format!("failed to parse TOML config layer {}", path.display())),
     }?;
     Ok((value, source_bytes))
-}
-
-fn merge_layer(base: &mut JsonValue, layer: JsonValue) {
-    match (base, layer) {
-        (JsonValue::Object(base_map), JsonValue::Object(layer_map)) => {
-            for (key, value) in layer_map {
-                if let Some(existing) = base_map.get_mut(&key) {
-                    merge_layer(existing, value);
-                } else {
-                    base_map.insert(key, value);
-                }
-            }
-        }
-        (target, value) => {
-            *target = value;
-        }
-    }
 }
 
 fn snapshot_exit_requested(cli: &AppCli) -> bool {
@@ -2321,6 +2609,7 @@ fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn profile_world_steps_with_storage(
     config: &ScriptBotsConfig,
     tick_limit: u64,
@@ -2328,6 +2617,7 @@ fn profile_world_steps_with_storage(
     thresholds: ThresholdsOverride,
     thread_policy: ThreadPolicy,
     mut scenario: ScenarioIdentityV0,
+    config_overrides: Vec<ConfigFieldOverride>,
 ) -> Result<()> {
     // Storage profiling performs only the requested measured steps; it has no startup warmup.
     scenario.bootstrap_ticks = 0;
@@ -2361,7 +2651,7 @@ fn profile_world_steps_with_storage(
     identity
         .validate()
         .context("invalid finite storage-profile identity before registration")?;
-    let manifest = build_run_manifest(&world, identity, scenario, thread_policy)
+    let manifest = build_run_manifest(&world, identity, scenario, thread_policy, config_overrides)
         .context("failed to build storage-profile provenance before tick zero")?;
     let storage_record = manifest
         .to_storage_record()
@@ -2989,92 +3279,6 @@ fn install_brains(world: &mut WorldState) -> Result<InstalledBrains> {
     Ok(installed)
 }
 
-fn apply_env_overrides(config: &mut ScriptBotsConfig) {
-    if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_ENABLED") {
-        match parse_bool(&value) {
-            Some(flag) => config.neuroflow.enabled = flag,
-            None => {
-                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_ENABLED value; expected true/false")
-            }
-        }
-    }
-
-    if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_HIDDEN") {
-        match parse_layers(&value) {
-            Some(layers) => config.neuroflow.hidden_layers = layers,
-            None => {
-                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_HIDDEN value; expected comma-separated integers")
-            }
-        }
-    }
-
-    if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_ACTIVATION") {
-        match parse_activation(&value) {
-            Some(activation) => config.neuroflow.activation = activation,
-            None => {
-                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_ACTIVATION value; expected tanh|sigmoid|relu")
-            }
-        }
-    }
-
-    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_TONEMAP") {
-        match parse_tonemap(&value) {
-            Some(mode) => config.render.tonemap_mode = Some(mode),
-            None => {
-                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_TONEMAP value; expected aces|agx|tony")
-            }
-        }
-    }
-
-    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_TONEMAP_BIAS") {
-        match value.trim().parse::<f32>() {
-            Ok(bias) if bias.is_finite() => config.render.tonemap_exposure_bias = Some(bias),
-            _ => {
-                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_TONEMAP_BIAS value; expected finite f32")
-            }
-        }
-    }
-
-    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE") {
-        match parse_bool(&value) {
-            Some(enabled) => {
-                let mut settings = take_or_init_auto_exposure(&mut config.render, enabled);
-                settings.enabled = enabled;
-                config.render.auto_exposure = Some(settings);
-            }
-            None => {
-                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE value; expected true/false")
-            }
-        }
-    }
-
-    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_BRIGHTEN") {
-        match value.trim().parse::<f32>() {
-            Ok(speed) if speed.is_finite() && speed >= 0.0 => {
-                let mut settings = take_or_init_auto_exposure(&mut config.render, true);
-                settings.speed_brighten = Some(speed);
-                config.render.auto_exposure = Some(settings);
-            }
-            _ => {
-                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_BRIGHTEN value; expected non-negative f32")
-            }
-        }
-    }
-
-    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_DARKEN") {
-        match value.trim().parse::<f32>() {
-            Ok(speed) if speed.is_finite() && speed >= 0.0 => {
-                let mut settings = take_or_init_auto_exposure(&mut config.render, true);
-                settings.speed_darken = Some(speed);
-                config.render.auto_exposure = Some(settings);
-            }
-            _ => {
-                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_DARKEN value; expected non-negative f32")
-            }
-        }
-    }
-}
-
 fn parse_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -3114,20 +3318,6 @@ fn parse_tonemap(raw: &str) -> Option<RenderTonemapMode> {
         "tony" | "tonymcmapface" => Some(RenderTonemapMode::Tony),
         _ => None,
     }
-}
-
-fn take_or_init_auto_exposure(
-    settings: &mut RenderSettings,
-    default_enabled: bool,
-) -> RenderAutoExposureSettings {
-    settings
-        .auto_exposure
-        .take()
-        .unwrap_or(RenderAutoExposureSettings {
-            enabled: default_enabled,
-            speed_brighten: None,
-            speed_darken: None,
-        })
 }
 
 #[cfg(any(feature = "gui", feature = "bevy_render"))]
@@ -3376,8 +3566,8 @@ mod tests {
 
         let mut scenario = ScenarioIdentityV0::caller_seeded("manifest-test");
         scenario.bootstrap_ticks = 37;
-        let manifest =
-            build_run_manifest(&world, identity, scenario, thread_policy).expect("manifest");
+        let manifest = build_run_manifest(&world, identity, scenario, thread_policy, Vec::new())
+            .expect("manifest");
 
         assert_eq!(
             world.tick().0,
@@ -4130,27 +4320,32 @@ activation = "Sigmoid"
     #[test]
     #[serial]
     fn composed_scenario_digests_the_exact_ordered_layer_bytes() {
-        let dir = tempdir().expect("tempdir");
-        let first_path = dir.path().join("first.toml");
-        let second_path = dir.path().join("second.toml");
-        let first = b"rng_seed = 41\nworld_width = 800\n";
-        let second = b"rng_seed = 42\nworld_height = 600\n";
-        fs::write(&first_path, first).expect("write first layer");
-        fs::write(&second_path, second).expect("write second layer");
+        with_clean_config_env(|| {
+            let dir = tempdir().expect("tempdir");
+            let first_path = dir.path().join("first.toml");
+            let second_path = dir.path().join("second.toml");
+            let first = b"rng_seed = 41\nworld_width = 800\n";
+            let second = b"rng_seed = 42\nworld_height = 600\n";
+            fs::write(&first_path, first).expect("write first layer");
+            fs::write(&second_path, second).expect("write second layer");
 
-        let mut cli = default_cli();
-        cli.config_layers = vec![first_path, second_path];
-        let (config, scenario) =
-            compose_config_with_scenario(&cli).expect("compose scenario provenance");
+            let mut cli = default_cli();
+            cli.config_layers = vec![first_path, second_path];
+            let (config, scenario, overrides) =
+                compose_config_with_scenario(&cli).expect("compose scenario provenance");
 
-        let mut expected = ScenarioIdentityV0::caller_seeded("scriptbots-app-layered-v1");
-        expected.population_recipe = "fixed-4x4-registered-brain-grid-v1".to_owned();
-        expected.record_config_layer(first);
-        expected.record_config_layer(second);
-        assert_eq!(scenario, expected);
-        assert_eq!(config.rng_seed, Some(42));
-        assert_eq!(config.world_width, 800);
-        assert_eq!(config.world_height, 600);
+            let mut expected = ScenarioIdentityV0::caller_seeded("scriptbots-app-layered-v1");
+            expected.population_recipe = "fixed-4x4-registered-brain-grid-v1".to_owned();
+            expected.record_config_layer(ConfigLayerKind::File, first);
+            expected.record_config_layer(ConfigLayerKind::File, second);
+            assert_eq!(scenario, expected);
+            assert_eq!(config.rng_seed, Some(42));
+            assert_eq!(config.world_width, 800);
+            assert_eq!(config.world_height, 600);
+            // Two files disagreeing about rng_seed is itself a reportable displacement.
+            assert_eq!(overrides.len(), 1, "unexpected overrides: {overrides:?}");
+            assert_eq!(overrides[0].path, "rng_seed");
+        });
     }
 
     #[test]
@@ -4500,29 +4695,117 @@ activation = "Sigmoid"
         }
     }
 
-    #[test]
-    fn env_overrides_apply_expected_settings() {
-        with_env_lock(|| {
-            let prev_enabled = std::env::var("SCRIPTBOTS_NEUROFLOW_ENABLED").ok();
-            let prev_hidden = std::env::var("SCRIPTBOTS_NEUROFLOW_HIDDEN").ok();
-            let prev_activation = std::env::var("SCRIPTBOTS_NEUROFLOW_ACTIVATION").ok();
+    /// Every environment variable the configuration gatherers read. Tests that need a
+    /// deterministic composition clear all of them, because the environment is now a
+    /// digest-recorded LAYER: an ambient variable would add a statement and change the
+    /// scenario provenance under the test.
+    const CONFIG_ENV_VARS: [&str; 13] = [
+        "SCRIPTBOTS_CONFIG_OVERRIDES",
+        "SCRIPTBOTS_NEUROFLOW_ENABLED",
+        "SCRIPTBOTS_NEUROFLOW_HIDDEN",
+        "SCRIPTBOTS_NEUROFLOW_ACTIVATION",
+        "SCRIPTBOTS_RENDER_TONEMAP",
+        "SCRIPTBOTS_RENDER_TONEMAP_BIAS",
+        "SCRIPTBOTS_RENDER_AUTO_EXPOSURE",
+        "SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_BRIGHTEN",
+        "SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_DARKEN",
+        "SCRIPTBOTS_RNG_SEED",
+        "SCRIPTBOTS_AUTO_PAUSE_BELOW",
+        "SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE",
+        "SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE",
+    ];
 
+    fn with_clean_config_env<F: FnOnce()>(f: F) {
+        with_env_lock(|| {
+            let saved: Vec<(&str, Option<String>)> = CONFIG_ENV_VARS
+                .iter()
+                .map(|var| (*var, std::env::var(var).ok()))
+                .collect();
+            for (var, _) in &saved {
+                unsafe { std::env::remove_var(var) };
+            }
+            f();
+            for (var, previous) in saved {
+                restore_env(var, previous);
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn env_overrides_apply_expected_settings() {
+        with_clean_config_env(|| {
             unsafe {
                 std::env::set_var("SCRIPTBOTS_NEUROFLOW_ENABLED", "true");
                 std::env::set_var("SCRIPTBOTS_NEUROFLOW_HIDDEN", "64, 32 ,16");
                 std::env::set_var("SCRIPTBOTS_NEUROFLOW_ACTIVATION", "relu");
             }
 
-            let mut config = ScriptBotsConfig::default();
-            apply_env_overrides(&mut config);
+            let config = compose_config(&default_cli()).expect("compose with environment layer");
 
             assert!(config.neuroflow.enabled);
             assert_eq!(config.neuroflow.hidden_layers, vec![64, 32, 16]);
             assert_eq!(config.neuroflow.activation, NeuroflowActivationKind::Relu);
+        });
+    }
 
-            restore_env("SCRIPTBOTS_NEUROFLOW_ENABLED", prev_enabled);
-            restore_env("SCRIPTBOTS_NEUROFLOW_HIDDEN", prev_hidden);
-            restore_env("SCRIPTBOTS_NEUROFLOW_ACTIVATION", prev_activation);
+    #[test]
+    #[serial]
+    fn a_file_loses_to_the_environment_which_loses_to_the_cli() {
+        // The bead's acceptance chain driven through the real composition path: a
+        // scenario file that sets `world_width` loses to an environment variable that
+        // sets it, which loses to a CLI flag — and every displacement is on the record.
+        with_clean_config_env(|| {
+            let dir = tempdir().expect("tempdir");
+            let file_path = dir.path().join("scenario.toml");
+            fs::write(&file_path, b"world_width = 2000\n").expect("write scenario layer");
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_CONFIG_OVERRIDES", "world_width = 1000");
+            }
+
+            let mut cli = default_cli();
+            cli.config_layers = vec![file_path];
+            cli.set_overrides = vec!["world_width=500".to_owned()];
+            let (config, scenario, overrides) =
+                compose_config_with_scenario(&cli).expect("compose layered config");
+
+            assert_eq!(
+                config.world_width, 500,
+                "the CLI names the value for THIS invocation and must win"
+            );
+            assert_eq!(
+                overrides.len(),
+                2,
+                "both displacements must be on the record: {overrides:?}"
+            );
+            assert_eq!(overrides[0].path, "world_width");
+            assert_eq!(overrides[0].losing_kind, ConfigLayerKind::File);
+            assert_eq!(overrides[0].winning_kind, ConfigLayerKind::Environment);
+            assert_eq!(overrides[1].path, "world_width");
+            assert_eq!(overrides[1].losing_kind, ConfigLayerKind::Environment);
+            assert_eq!(overrides[1].winning_kind, ConfigLayerKind::Cli);
+
+            // Every layer that spoke appended a kind-tagged digest, in application order.
+            let kinds: Vec<&str> = scenario
+                .ordered_config_layer_digests
+                .iter()
+                .map(|entry| entry.split(':').next().unwrap_or(""))
+                .collect();
+            assert_eq!(kinds, vec!["file", "environment", "cli"]);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn set_override_rejects_entries_that_name_no_field() {
+        with_clean_config_env(|| {
+            let mut cli = default_cli();
+            cli.set_overrides = vec!["world_width".to_owned()];
+            let error = compose_config(&cli).expect_err("PATH without VALUE must fail");
+            assert!(
+                format!("{error:#}").contains("--set"),
+                "the error must name the flag: {error:#}"
+            );
         });
     }
 
@@ -4567,6 +4850,7 @@ activation = "Sigmoid"
                 DEFAULT_BOOTSTRAP_TICKS,
                 resolve_thread_policy(None, None, None, false),
                 ScenarioIdentityV0::caller_seeded("invalid-neuroflow-test"),
+                Vec::new(),
             )
             .err()
             .expect("adapter validation must fail before storage setup");
@@ -4608,6 +4892,7 @@ activation = "Sigmoid"
                 ThresholdsOverride::default(),
                 resolve_thread_policy(None, None, None, false),
                 ScenarioIdentityV0::caller_seeded("invalid-neuroflow-profile-test"),
+                Vec::new(),
             )
             .expect_err("adapter validation must fail before profiling storage setup");
             let path_exists = path.exists();

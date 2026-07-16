@@ -36,6 +36,8 @@
 //! into a final run whose operator had already made the decision themselves.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Which layer actually decided the thread count.
@@ -195,6 +197,366 @@ pub fn resolve_thread_policy(
         threads: None,
         source: ThreadSource::BuiltinDefault,
         overridden: None,
+    }
+}
+
+// ============================================================================
+// Configuration layering: defaults -> scenario files -> environment -> CLI
+// ============================================================================
+//
+// The thread lane above resolved ONE knob. The config itself has hundreds, and
+// until this resolver existed they were layered by a pile of one-off
+// `if let Ok(value) = env::var(..)` blocks plus in-place CLI mutations — the
+// same shape as the thread bug before it was fixed: the winner was whichever
+// branch happened to run last, rather than the layer the user most explicitly
+// stated.
+//
+// The rule is the same one that made the thread lane coherent: the more
+// specific layer wins. A CLI flag names a value for THIS invocation; an
+// environment variable names it for this shell; a scenario file names it for
+// anyone who runs the file; the defaults speak for nobody in particular.
+//
+//   defaults -> scenario files (in order) -> environment -> CLI
+//
+// And the same discipline applies: resolution is a PURE function of what each
+// layer said. No environment reads, no file reads, no logging — the caller
+// gathers the statements, the resolver merges them and returns the provenance
+// of every field where one layer displaced another. That purity is what makes
+// the matrix below testable at all.
+
+/// Which kind of layer a configuration statement came from.
+///
+/// Declared in application order: a later kind is more specific than an
+/// earlier one, and the resolver applies statements in exactly the order the
+/// caller supplies them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigLayerKind {
+    /// The built-in `ScriptBotsConfig` defaults — the layer that speaks for
+    /// nobody in particular and therefore loses to everyone.
+    Defaults,
+    /// A scenario/configuration file supplied with `--config`.
+    File,
+    /// Environment variables (`SCRIPTBOTS_*`).
+    Environment,
+    /// Command-line flags — the user naming a value for this exact invocation.
+    Cli,
+}
+
+impl ConfigLayerKind {
+    /// Stable identifier for PERSISTED records — the run manifest.
+    ///
+    /// Deliberately separate from [`fmt::Display`] for the same reason as
+    /// [`ThreadSource::wire_tag`]: a Display string is prose someone will
+    /// eventually reword, while this is a wire value compared across runs.
+    #[must_use]
+    pub const fn wire_tag(self) -> &'static str {
+        match self {
+            Self::Defaults => "defaults",
+            Self::File => "file",
+            Self::Environment => "environment",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+impl fmt::Display for ConfigLayerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.wire_tag())
+    }
+}
+
+/// What one configuration layer actually said.
+///
+/// `fields` is a partial configuration as a JSON object tree: only the paths
+/// the layer spoke about are present. The caller performs whatever I/O and
+/// parsing produced it (reading a file, decoding environment variables,
+/// interpreting flags); by the time a statement reaches the resolver it is
+/// pure data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLayerStatement {
+    /// Which kind of layer is speaking.
+    pub kind: ConfigLayerKind,
+    /// Human-readable identity of the speaker — a file path, a variable name,
+    /// a flag name. Carried into override records so a reader can tell WHICH
+    /// file lost to WHICH variable, not merely that "a file" lost.
+    pub label: String,
+    /// The partial configuration the layer stated.
+    pub fields: JsonValue,
+}
+
+/// One configuration field where a later layer displaced an earlier layer's value.
+///
+/// The config analogue of [`ThreadPolicy::overridden`]: the normal, correct
+/// outcome of the precedence rules rather than a mistake — but it must be
+/// visible. A user whose scenario file said one thing and whose environment
+/// said another deserves to see that in the run record rather than discover it
+/// from the results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigFieldOverride {
+    /// Dotted path of the displaced field (for example `neuroflow.enabled`).
+    /// Configuration field names never contain dots, so the path is
+    /// unambiguous.
+    pub path: String,
+    /// Label of the layer whose value was displaced.
+    pub losing_layer: String,
+    /// Kind of the layer whose value was displaced.
+    pub losing_kind: ConfigLayerKind,
+    /// The value that was displaced.
+    pub losing_value: JsonValue,
+    /// Label of the layer whose value now stands.
+    pub winning_layer: String,
+    /// Kind of the layer whose value now stands.
+    pub winning_kind: ConfigLayerKind,
+    /// The value that now stands.
+    pub winning_value: JsonValue,
+}
+
+/// The merged configuration tree plus the provenance of every displacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConfigLayers {
+    /// The configuration after every layer was applied in order.
+    pub merged: JsonValue,
+    /// Every cross-layer displacement, in application order.
+    ///
+    /// Displacing a DEFAULT is not recorded here — that is simply what
+    /// configuring means. An entry exists only where two explicit layers both
+    /// named the same path and disagreed; when several layers disagree in
+    /// sequence, each displacement names the most recent earlier writer, so a
+    /// three-way conflict yields a chain of two records.
+    pub overrides: Vec<ConfigFieldOverride>,
+}
+
+/// Merge every layer statement over the defaults, in order, tracking who wrote
+/// what.
+///
+/// Pure: no environment reads, no file reads, no logging. The caller supplies
+/// what each layer said and gets back the merged tree plus the provenance of
+/// every field where one explicit layer displaced another — which is what
+/// makes the layering matrix testable at all.
+///
+/// Merging is the same deep-merge the file layers have always used: objects
+/// merge key by key, everything else (scalars and arrays alike) replaces
+/// wholesale. Restating the standing value is not a displacement, but it does
+/// make the restating layer the field's most recent writer, so a later
+/// conflicting layer names the runner-up — exactly as the thread lane's
+/// `overridden` names the next-most-specific declined layer.
+#[must_use]
+pub fn resolve_config_layers(
+    defaults: &JsonValue,
+    layers: &[ConfigLayerStatement],
+) -> ResolvedConfigLayers {
+    let mut merged = defaults.clone();
+    let mut provenance: BTreeMap<String, usize> = BTreeMap::new();
+    let mut overrides = Vec::new();
+    for (index, layer) in layers.iter().enumerate() {
+        merge_tracked(
+            &mut merged,
+            &layer.fields,
+            "",
+            index,
+            layers,
+            &mut provenance,
+            &mut overrides,
+        );
+    }
+    ResolvedConfigLayers { merged, overrides }
+}
+
+/// Canonical content bytes for one layer's statement, for the ordered layer
+/// digests in the run manifest.
+///
+/// Canonical by explicit recursive key-sorting, NOT by trusting the map type:
+/// this workspace's dependency graph enables `serde_json`'s `preserve_order`
+/// feature, so a `Value` serializes in insertion order and two statements with
+/// identical content but different construction histories would otherwise
+/// digest differently. File layers keep digesting their exact source bytes —
+/// those bytes ARE the layer; this exists for the environment and CLI layers,
+/// which have no source file.
+#[must_use]
+pub fn canonical_layer_bytes(fields: &JsonValue) -> Vec<u8> {
+    canonical_value(fields).to_string().into_bytes()
+}
+
+/// Rebuild a JSON tree with every object's keys in sorted order.
+///
+/// Array order is preserved — element order is data, while object key order is
+/// an accident of construction.
+fn canonical_value(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                if let Some(child) = map.get(key) {
+                    sorted.insert(key.clone(), canonical_value(child));
+                }
+            }
+            JsonValue::Object(sorted)
+        }
+        JsonValue::Array(items) => JsonValue::Array(items.iter().map(canonical_value).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Recursive worker for [`resolve_config_layers`].
+///
+/// `provenance` maps each dotted leaf path to the index of the layer that most
+/// recently wrote it. Only explicit layers appear; paths still owned by the
+/// defaults are absent, which is how "displacing a default is not an override"
+/// falls out of the structure instead of being a special case.
+fn merge_tracked(
+    target: &mut JsonValue,
+    incoming: &JsonValue,
+    path: &str,
+    layer_index: usize,
+    layers: &[ConfigLayerStatement],
+    provenance: &mut BTreeMap<String, usize>,
+    overrides: &mut Vec<ConfigFieldOverride>,
+) {
+    if let (JsonValue::Object(target_map), JsonValue::Object(incoming_map)) =
+        (&mut *target, incoming)
+    {
+        for (key, value) in incoming_map {
+            let child_path = join_path(path, key);
+            if let Some(existing) = target_map.get_mut(key) {
+                merge_tracked(
+                    existing,
+                    value,
+                    &child_path,
+                    layer_index,
+                    layers,
+                    provenance,
+                    overrides,
+                );
+            } else {
+                target_map.insert(key.clone(), value.clone());
+                mark_subtree(provenance, &child_path, value, layer_index);
+            }
+        }
+        return;
+    }
+
+    // Leaf write: a scalar or array, or a shape conflict where one side is an
+    // object and the other is not. Either way the incoming value replaces the
+    // standing subtree wholesale, so every earlier claim at or below this path
+    // is displaced together.
+    record_displacement(
+        target,
+        incoming,
+        path,
+        layer_index,
+        layers,
+        provenance,
+        overrides,
+    );
+    purge_subtree(provenance, path);
+    mark_subtree(provenance, path, incoming, layer_index);
+    *target = incoming.clone();
+}
+
+/// Record one displacement if this leaf write takes a path an earlier explicit
+/// layer had written differently.
+fn record_displacement(
+    target: &JsonValue,
+    incoming: &JsonValue,
+    path: &str,
+    layer_index: usize,
+    layers: &[ConfigLayerStatement],
+    provenance: &BTreeMap<String, usize>,
+    overrides: &mut Vec<ConfigFieldOverride>,
+) {
+    if target == incoming {
+        // Restating the standing value displaces nothing.
+        return;
+    }
+    let Some(loser_index) = most_recent_writer(provenance, path) else {
+        // The standing value came from the defaults; replacing it is simply
+        // what configuring means.
+        return;
+    };
+    let (Some(loser), Some(winner)) = (layers.get(loser_index), layers.get(layer_index)) else {
+        return;
+    };
+    overrides.push(ConfigFieldOverride {
+        path: path.to_owned(),
+        losing_layer: loser.label.clone(),
+        losing_kind: loser.kind,
+        losing_value: target.clone(),
+        winning_layer: winner.label.clone(),
+        winning_kind: winner.kind,
+        winning_value: incoming.clone(),
+    });
+}
+
+/// The most recent explicit layer that wrote this exact path or anything
+/// strictly below it (a subtree replacement displaces every claim inside).
+fn most_recent_writer(provenance: &BTreeMap<String, usize>, path: &str) -> Option<usize> {
+    let exact = provenance.get(path).copied();
+    let below = descendants(provenance, path).map(|(_, index)| index).max();
+    exact.into_iter().chain(below).max()
+}
+
+/// Mark every leaf inside `value` as written by `layer_index`.
+fn mark_subtree(
+    provenance: &mut BTreeMap<String, usize>,
+    path: &str,
+    value: &JsonValue,
+    layer_index: usize,
+) {
+    if let JsonValue::Object(map) = value {
+        if map.is_empty() {
+            // An empty object is still a statement at this path.
+            provenance.insert(path.to_owned(), layer_index);
+            return;
+        }
+        for (key, child) in map {
+            let child_path = join_path(path, key);
+            mark_subtree(provenance, &child_path, child, layer_index);
+        }
+        return;
+    }
+    provenance.insert(path.to_owned(), layer_index);
+}
+
+/// Forget every claim at or below `path`; its subtree has been replaced.
+fn purge_subtree(provenance: &mut BTreeMap<String, usize>, path: &str) {
+    if path.is_empty() {
+        provenance.clear();
+        return;
+    }
+    provenance.remove(path);
+    let doomed: Vec<String> = descendants(provenance, path)
+        .map(|(key, _)| key.to_owned())
+        .collect();
+    for key in doomed {
+        provenance.remove(&key);
+    }
+}
+
+/// Iterate provenance entries strictly below `path` in the dotted hierarchy.
+fn descendants<'p>(
+    provenance: &'p BTreeMap<String, usize>,
+    path: &str,
+) -> impl Iterator<Item = (&'p str, usize)> {
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}.")
+    };
+    provenance
+        .range(prefix.clone()..)
+        .take_while(move |(key, _)| key.starts_with(&prefix))
+        .map(|(key, &index)| (key.as_str(), index))
+}
+
+/// Join a dotted parent path with a child key.
+fn join_path(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{path}.{key}")
     }
 }
 
@@ -359,5 +721,450 @@ mod tests {
             let second = resolve_thread_policy(cli, env, auto, low);
             assert_eq!(first, second);
         }
+    }
+}
+
+#[cfg(test)]
+mod config_layering_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn statement(kind: ConfigLayerKind, label: &str, fields: JsonValue) -> ConfigLayerStatement {
+        ConfigLayerStatement {
+            kind,
+            label: label.to_owned(),
+            fields,
+        }
+    }
+
+    fn defaults() -> JsonValue {
+        json!({
+            "world_width": 1600,
+            "world_height": 900,
+            "rng_seed": null,
+            "neuroflow": { "enabled": false, "hidden_layers": [16, 8] },
+        })
+    }
+
+    fn at<'v>(merged: &'v JsonValue, dotted: &str) -> &'v JsonValue {
+        let pointer = format!("/{}", dotted.replace('.', "/"));
+        merged
+            .pointer(&pointer)
+            .unwrap_or_else(|| panic!("path `{dotted}` missing from merged config"))
+    }
+
+    /// The layering matrix, in full — the config analogue of the thread matrix
+    /// above, and table-driven for the same reason: the interesting bugs are
+    /// not in any single branch but in the INTERACTIONS between layers, and an
+    /// interaction nobody enumerated is an interaction nobody tested.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_layering_matrix_covers_every_pair_and_specific_beats_general() {
+        struct Case {
+            name: &'static str,
+            layers: Vec<ConfigLayerStatement>,
+            want: Vec<(&'static str, JsonValue)>,
+            /// `(path, losing_layer, winning_layer)` triples, in order.
+            want_overrides: Vec<(&'static str, &'static str, &'static str)>,
+        }
+
+        let cases = [
+            Case {
+                name: "nobody speaks: the defaults stand and nothing is an override",
+                layers: vec![],
+                want: vec![("world_width", json!(1600))],
+                want_overrides: vec![],
+            },
+            Case {
+                name: "a file beating a default is configuration, not an override",
+                layers: vec![statement(
+                    ConfigLayerKind::File,
+                    "file:base.toml",
+                    json!({"world_width": 2048}),
+                )],
+                want: vec![("world_width", json!(2048))],
+                want_overrides: vec![],
+            },
+            Case {
+                name: "the environment displaces the file, and the record says so",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:base.toml",
+                        json!({"world_width": 2048}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Environment,
+                        "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                        json!({"world_width": 1024}),
+                    ),
+                ],
+                want: vec![("world_width", json!(1024))],
+                want_overrides: vec![(
+                    "world_width",
+                    "file:base.toml",
+                    "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                )],
+            },
+            Case {
+                name: "the CLI displaces the environment",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::Environment,
+                        "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                        json!({"world_width": 1024}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Cli,
+                        "cli:--set",
+                        json!({"world_width": 512}),
+                    ),
+                ],
+                want: vec![("world_width", json!(512))],
+                want_overrides: vec![(
+                    "world_width",
+                    "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                    "cli:--set",
+                )],
+            },
+            Case {
+                name: "the CLI displaces the file when the environment is silent",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:base.toml",
+                        json!({"world_width": 2048}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Cli,
+                        "cli:--set",
+                        json!({"world_width": 512}),
+                    ),
+                ],
+                want: vec![("world_width", json!(512))],
+                want_overrides: vec![("world_width", "file:base.toml", "cli:--set")],
+            },
+            Case {
+                name: "all three speak: the CLI wins and every displacement is on the record",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:base.toml",
+                        json!({"world_width": 2048}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Environment,
+                        "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                        json!({"world_width": 1024}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Cli,
+                        "cli:--set",
+                        json!({"world_width": 512}),
+                    ),
+                ],
+                want: vec![("world_width", json!(512))],
+                want_overrides: vec![
+                    (
+                        "world_width",
+                        "file:base.toml",
+                        "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                    ),
+                    (
+                        "world_width",
+                        "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                        "cli:--set",
+                    ),
+                ],
+            },
+            Case {
+                name: "a later file displaces an earlier file, by name",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:first.toml",
+                        json!({"rng_seed": 41}),
+                    ),
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:second.toml",
+                        json!({"rng_seed": 42}),
+                    ),
+                ],
+                want: vec![("rng_seed", json!(42))],
+                want_overrides: vec![("rng_seed", "file:first.toml", "file:second.toml")],
+            },
+            Case {
+                name: "agreement is not displacement",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:base.toml",
+                        json!({"world_width": 2048}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Environment,
+                        "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                        json!({"world_width": 2048}),
+                    ),
+                ],
+                want: vec![("world_width", json!(2048))],
+                want_overrides: vec![],
+            },
+            Case {
+                name: "an empty statement changes nothing and displaces nothing",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:base.toml",
+                        json!({"world_width": 2048}),
+                    ),
+                    statement(ConfigLayerKind::Environment, "env:typed", json!({})),
+                ],
+                want: vec![("world_width", json!(2048))],
+                want_overrides: vec![],
+            },
+            Case {
+                name: "nested fields are tracked by dotted path",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:base.toml",
+                        json!({"neuroflow": {"enabled": true}}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Cli,
+                        "cli:--set",
+                        json!({"neuroflow": {"enabled": false}}),
+                    ),
+                ],
+                want: vec![
+                    ("neuroflow.enabled", json!(false)),
+                    // Sibling keys the later layer did not mention survive.
+                    ("neuroflow.hidden_layers", json!([16, 8])),
+                ],
+                want_overrides: vec![("neuroflow.enabled", "file:base.toml", "cli:--set")],
+            },
+            Case {
+                name: "arrays replace wholesale rather than merging elementwise",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:base.toml",
+                        json!({"neuroflow": {"hidden_layers": [64, 32]}}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Environment,
+                        "env:SCRIPTBOTS_NEUROFLOW_HIDDEN",
+                        json!({"neuroflow": {"hidden_layers": [8]}}),
+                    ),
+                ],
+                want: vec![("neuroflow.hidden_layers", json!([8]))],
+                want_overrides: vec![(
+                    "neuroflow.hidden_layers",
+                    "file:base.toml",
+                    "env:SCRIPTBOTS_NEUROFLOW_HIDDEN",
+                )],
+            },
+            Case {
+                name: "a subtree replacement displaces the claims written inside it",
+                layers: vec![
+                    statement(
+                        ConfigLayerKind::File,
+                        "file:base.toml",
+                        json!({"neuroflow": {"enabled": true}}),
+                    ),
+                    statement(
+                        ConfigLayerKind::Cli,
+                        "cli:--set",
+                        json!({"neuroflow": "disabled"}),
+                    ),
+                ],
+                want: vec![("neuroflow", json!("disabled"))],
+                want_overrides: vec![("neuroflow", "file:base.toml", "cli:--set")],
+            },
+        ];
+
+        for case in cases {
+            let resolved = resolve_config_layers(&defaults(), &case.layers);
+            for (path, want_value) in &case.want {
+                assert_eq!(
+                    at(&resolved.merged, path),
+                    want_value,
+                    "`{}`: wrong merged value at `{path}`",
+                    case.name
+                );
+            }
+            let got: Vec<(&str, &str, &str)> = resolved
+                .overrides
+                .iter()
+                .map(|o| {
+                    (
+                        o.path.as_str(),
+                        o.losing_layer.as_str(),
+                        o.winning_layer.as_str(),
+                    )
+                })
+                .collect();
+            let want: Vec<(&str, &str, &str)> = case.want_overrides.clone();
+            assert_eq!(got, want, "`{}`: wrong override record", case.name);
+        }
+    }
+
+    #[test]
+    fn an_override_record_carries_both_values_and_both_kinds() {
+        let resolved = resolve_config_layers(
+            &defaults(),
+            &[
+                statement(
+                    ConfigLayerKind::File,
+                    "file:base.toml",
+                    json!({"world_width": 2048}),
+                ),
+                statement(
+                    ConfigLayerKind::Environment,
+                    "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                    json!({"world_width": 1024}),
+                ),
+            ],
+        );
+        assert_eq!(
+            resolved.overrides,
+            vec![ConfigFieldOverride {
+                path: "world_width".to_owned(),
+                losing_layer: "file:base.toml".to_owned(),
+                losing_kind: ConfigLayerKind::File,
+                losing_value: json!(2048),
+                winning_layer: "env:SCRIPTBOTS_CONFIG_OVERRIDES".to_owned(),
+                winning_kind: ConfigLayerKind::Environment,
+                winning_value: json!(1024),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_restated_value_makes_the_restater_the_runner_up() {
+        // File says 800, the environment restates 800, the CLI says 900. The
+        // displacement names the environment — the most recent earlier writer —
+        // exactly as the thread lane's `overridden` names the next-most-specific
+        // declined layer rather than the whole queue behind it.
+        let resolved = resolve_config_layers(
+            &defaults(),
+            &[
+                statement(
+                    ConfigLayerKind::File,
+                    "file:base.toml",
+                    json!({"world_width": 800}),
+                ),
+                statement(
+                    ConfigLayerKind::Environment,
+                    "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                    json!({"world_width": 800}),
+                ),
+                statement(
+                    ConfigLayerKind::Cli,
+                    "cli:--set",
+                    json!({"world_width": 900}),
+                ),
+            ],
+        );
+        assert_eq!(resolved.overrides.len(), 1);
+        assert_eq!(
+            resolved.overrides[0].losing_layer,
+            "env:SCRIPTBOTS_CONFIG_OVERRIDES"
+        );
+        assert_eq!(resolved.overrides[0].winning_layer, "cli:--set");
+    }
+
+    #[test]
+    fn the_merged_tree_deserializes_into_the_real_config() {
+        // The bead's acceptance chain, end to end on the REAL config type: a
+        // scenario file that sets `world_width` loses to an environment
+        // variable that sets it, which loses to a CLI flag.
+        let defaults = serde_json::to_value(scriptbots_core::ScriptBotsConfig::default())
+            .expect("default config serializes");
+        let resolved = resolve_config_layers(
+            &defaults,
+            &[
+                statement(
+                    ConfigLayerKind::File,
+                    "file:scenario.toml",
+                    json!({"world_width": 2048}),
+                ),
+                statement(
+                    ConfigLayerKind::Environment,
+                    "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                    json!({"world_width": 1024}),
+                ),
+                statement(
+                    ConfigLayerKind::Cli,
+                    "cli:--set",
+                    json!({"world_width": 512}),
+                ),
+            ],
+        );
+        let config: scriptbots_core::ScriptBotsConfig =
+            serde_json::from_value(resolved.merged).expect("merged tree deserializes");
+        assert_eq!(config.world_width, 512);
+        assert_eq!(resolved.overrides.len(), 2);
+    }
+
+    #[test]
+    fn resolution_is_a_pure_function_of_its_statements() {
+        let layers = [
+            statement(
+                ConfigLayerKind::File,
+                "file:base.toml",
+                json!({"world_width": 2048, "neuroflow": {"enabled": true}}),
+            ),
+            statement(
+                ConfigLayerKind::Environment,
+                "env:SCRIPTBOTS_CONFIG_OVERRIDES",
+                json!({"world_width": 1024}),
+            ),
+            statement(
+                ConfigLayerKind::Cli,
+                "cli:--set",
+                json!({"neuroflow": {"enabled": false}}),
+            ),
+        ];
+        let first = resolve_config_layers(&defaults(), &layers);
+        let second = resolve_config_layers(&defaults(), &layers);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn canonical_bytes_are_construction_order_independent() {
+        // The workspace dependency graph enables serde_json's `preserve_order`
+        // feature, so a Value serializes in INSERTION order. Canonicalization
+        // must therefore sort keys explicitly, or two statements with the same
+        // content would digest differently depending on how they were
+        // assembled. This test failed against the naive implementation and
+        // exists so nobody reintroduces it.
+        let mut forward = serde_json::Map::new();
+        forward.insert("alpha".to_owned(), json!(1));
+        forward.insert("omega".to_owned(), json!(2));
+        let mut backward = serde_json::Map::new();
+        backward.insert("omega".to_owned(), json!(2));
+        backward.insert("alpha".to_owned(), json!(1));
+
+        assert_eq!(
+            canonical_layer_bytes(&JsonValue::Object(forward)),
+            canonical_layer_bytes(&JsonValue::Object(backward)),
+        );
+        assert_ne!(
+            canonical_layer_bytes(&json!({"alpha": 1})),
+            canonical_layer_bytes(&json!({"alpha": 2})),
+        );
+    }
+
+    #[test]
+    fn wire_tags_are_stable_persisted_values() {
+        // These land in run manifests and are compared across runs; changing
+        // one is a schema decision, not a wording tweak.
+        assert_eq!(ConfigLayerKind::Defaults.wire_tag(), "defaults");
+        assert_eq!(ConfigLayerKind::File.wire_tag(), "file");
+        assert_eq!(ConfigLayerKind::Environment.wire_tag(), "environment");
+        assert_eq!(ConfigLayerKind::Cli.wire_tag(), "cli");
     }
 }
