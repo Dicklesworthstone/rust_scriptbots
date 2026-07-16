@@ -1826,24 +1826,26 @@ mod characterization_tests {
         assert_eq!(
             observed_sequences,
             [
+                // Deliberately re-pinned in bd-2cd1 when the V0.1 probe expanded from one global
+                // RNG stream to six named domain streams.
                 // Re-pinned when the characterization digest was extended to cover active
                 // interventions. The trajectory itself was unchanged: no intervention is active.
                 [
-                    "12ffd8903f2588f4",
-                    "57dadbd0dc0ef3bb",
-                    "093aada106046e77",
-                    "ccc3dc999e2dbd45",
-                    "77bf36ffad164f62",
+                    "9170abeee25b6132",
+                    "465d51c2d5baff86",
+                    "35be0bef875fb7ce",
+                    "e4ab9fb7f2c8e057",
+                    "42f3e7cfd202e12b",
                 ]
                 .map(str::to_owned),
                 // Re-pinned after sensory bearings moved from the host C math library to
                 // deterministic pure-Rust `libm::atan2f`.
                 [
-                    "1daf2c9601805056",
-                    "34862afcc3524912",
-                    "20a40eb07ba95835",
-                    "43e8f2f64a481ff5",
-                    "360f4818949324a7",
+                    "67db1d378a2a6d53",
+                    "fa7277780a43affb",
+                    "694b8a52675e93d2",
+                    "403d0eb4df234203",
+                    "be46adf860b9bfcd",
                 ]
                 .map(str::to_owned),
             ]
