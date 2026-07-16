@@ -2294,9 +2294,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_brain::mlp::MlpBrainFamily;
+    use crate::tests::boxed_fixture_brain_family;
 
-    const MLP_KIND: &str = "checkpoint-test-mlp";
+    const CHECKPOINT_KIND: &str = "checkpoint-test-protocol";
+    const CHECKPOINT_FAMILY_ID: &str = "checkpoint-test-protocol-family";
 
     fn checkpoint_config() -> ScriptBotsConfig {
         ScriptBotsConfig {
@@ -2340,23 +2341,29 @@ mod tests {
         }
     }
 
-    fn register_mlp(registry: &mut BrainRegistry) -> u64 {
+    fn register_checkpoint_family(registry: &mut BrainRegistry) -> u64 {
         registry
-            .register_family(MLP_KIND, Box::new(MlpBrainFamily::new()))
-            .expect("register checkpoint MLP protocol")
+            .register_family(
+                CHECKPOINT_KIND,
+                boxed_fixture_brain_family(CHECKPOINT_FAMILY_ID),
+            )
+            .expect("register checkpoint protocol fixture")
     }
 
-    fn world_with_mlp() -> (WorldState, u64) {
+    fn world_with_checkpoint_family() -> (WorldState, u64) {
         let mut world = WorldState::new(checkpoint_config()).expect("checkpoint test world");
         let key = world
-            .register_brain_family(MLP_KIND, Box::new(MlpBrainFamily::new()))
-            .expect("register source MLP protocol");
+            .register_brain_family(
+                CHECKPOINT_KIND,
+                boxed_fixture_brain_family(CHECKPOINT_FAMILY_ID),
+            )
+            .expect("register source protocol fixture");
         (world, key)
     }
 
-    fn prepared_mlp_registry() -> BrainRegistry {
+    fn prepared_checkpoint_registry() -> BrainRegistry {
         let mut registry = BrainRegistry::new();
-        assert_eq!(register_mlp(&mut registry), 0);
+        assert_eq!(register_checkpoint_family(&mut registry), 0);
         registry
     }
 
@@ -2522,7 +2529,7 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn checkpoint_v1_representative_wire_golden() {
-        let (mut world, brain_key) = world_with_mlp();
+        let (mut world, brain_key) = world_with_checkpoint_family();
         install_nontrivial_hydrology(&mut world);
         world.active_effects.push(ActiveEffect {
             region: Region::Disc {
@@ -2579,7 +2586,7 @@ mod tests {
 
     #[test]
     fn evolved_world_round_trips_by_uid_and_continues_identically() {
-        let (mut original, brain_key) = world_with_mlp();
+        let (mut original, brain_key) = world_with_checkpoint_family();
         install_nontrivial_hydrology(&mut original);
         original.active_effects.push(ActiveEffect {
             region: Region::Disc {
@@ -2717,8 +2724,9 @@ mod tests {
         let second_wire = decoded.encode().expect("re-encode checkpoint");
         assert_eq!(second_wire, first_wire, "checkpoint encoding is idempotent");
 
-        let mut restored = WorldState::restore_checkpoint_v1(&decoded, prepared_mlp_registry())
-            .expect("restore evolved checkpoint");
+        let mut restored =
+            WorldState::restore_checkpoint_v1(&decoded, prepared_checkpoint_registry())
+                .expect("restore evolved checkpoint");
         assert_ne!(
             original.config().history_capacity,
             ScriptBotsConfig::default().history_capacity,
@@ -2810,7 +2818,7 @@ mod tests {
 
     #[test]
     fn wire_metadata_integrity_and_semantic_tampering_fail_closed() {
-        let (world, _) = world_with_mlp();
+        let (world, _) = world_with_checkpoint_family();
         let checkpoint = world.checkpoint_v1().expect("empty-world checkpoint");
         let encoded = checkpoint.encode().expect("checkpoint wire");
         let mut envelope_with_trailing_data = encoded.clone();
@@ -3040,7 +3048,7 @@ mod tests {
                 && key == legacy_key
         ));
 
-        let (source, _) = world_with_mlp();
+        let (source, _) = world_with_checkpoint_family();
         let checkpoint = source.checkpoint_v1().expect("protocol checkpoint");
         assert!(matches!(
             WorldState::restore_checkpoint_v1(&checkpoint, BrainRegistry::new()),
@@ -3049,7 +3057,10 @@ mod tests {
 
         let mut wrong_kind_registry = BrainRegistry::new();
         wrong_kind_registry
-            .register_family("wrong-kind", Box::new(MlpBrainFamily::new()))
+            .register_family(
+                "wrong-kind",
+                boxed_fixture_brain_family(CHECKPOINT_FAMILY_ID),
+            )
             .expect("same-cardinality wrong-kind registry");
         assert!(matches!(
             WorldState::restore_checkpoint_v1(&checkpoint, wrong_kind_registry),
@@ -3066,7 +3077,7 @@ mod tests {
         });
         assert_eq!(leading_retired_key, 0);
         assert!(source_registry.unregister(leading_retired_key));
-        assert_eq!(register_mlp(source_registry), 1);
+        assert_eq!(register_checkpoint_family(source_registry), 1);
         let trailing_retired_key = source_registry.register("retired-checkpoint-brain", |_rng| {
             Ok(Box::new(LegacyCheckpointBrain))
         });
@@ -3079,14 +3090,14 @@ mod tests {
         assert_eq!(requirements.next_key, 3);
         assert_eq!(requirements.entries.len(), 1);
         assert_eq!(requirements.entries[0].key, 1);
-        assert_eq!(requirements.entries[0].kind, MLP_KIND);
+        assert_eq!(requirements.entries[0].kind, CHECKPOINT_KIND);
         assert_eq!(requirements.entries[0].factory_state_digest, None);
         assert_eq!(
             requirements.entries[0]
                 .protocol_family
                 .as_ref()
                 .map(BrainFamilyId::as_str),
-            Some("mlp-baseline")
+            Some(CHECKPOINT_FAMILY_ID)
         );
 
         let mut cursor_too_low = BrainRegistry::new();
@@ -3094,7 +3105,7 @@ mod tests {
             Ok(Box::new(LegacyCheckpointBrain))
         });
         assert!(cursor_too_low.unregister(retired_key));
-        assert_eq!(register_mlp(&mut cursor_too_low), 1);
+        assert_eq!(register_checkpoint_family(&mut cursor_too_low), 1);
         assert!(matches!(
             WorldState::restore_checkpoint_v1(&retired_checkpoint, cursor_too_low),
             Err(WorldCheckpointError::RegistryMismatch { .. })
@@ -3106,7 +3117,7 @@ mod tests {
         });
         assert_eq!(prepared_leading_key, leading_retired_key);
         assert!(retired_prepared.unregister(prepared_leading_key));
-        assert_eq!(register_mlp(&mut retired_prepared), 1);
+        assert_eq!(register_checkpoint_family(&mut retired_prepared), 1);
         let prepared_trailing_key = retired_prepared.register("retired-checkpoint-brain", |_rng| {
             Ok(Box::new(LegacyCheckpointBrain))
         });
@@ -3179,7 +3190,7 @@ mod tests {
             })
         ));
 
-        let (mut queued, _) = world_with_mlp();
+        let (mut queued, _) = world_with_checkpoint_family();
         queued
             .enqueue_intervention(Intervention::Bloom {
                 region: Region::All,

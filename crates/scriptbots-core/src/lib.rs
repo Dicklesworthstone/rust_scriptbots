@@ -24896,6 +24896,10 @@ mod tests {
         }
     }
 
+    pub(crate) fn boxed_fixture_brain_family(id: &str) -> Box<dyn BrainFamilyAdapter> {
+        Box::new(FixtureBrainFamily::new(id))
+    }
+
     fn fixture_provenance() -> BrainProvenance {
         BrainProvenance {
             created_at: Tick(12),
