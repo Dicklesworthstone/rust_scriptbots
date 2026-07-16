@@ -453,12 +453,45 @@ fn the_manifest_records_which_config_layers_built_the_run_and_who_displaced_whom
         .collect();
     // The harness exports SCRIPTBOTS_RNG_SEED for every run, so the environment speaks
     // twice: once through SCRIPTBOTS_CONFIG_OVERRIDES and once through the typed
-    // variables. Every statement appears, kind-tagged, in application order.
+    // variables. Every statement appears, kind-tagged, in application order — starting
+    // with the defaults every run is built from.
     assert_eq!(
         kinds,
-        vec!["file", "environment", "environment", "cli"],
+        vec!["defaults", "file", "environment", "environment", "cli"],
         "every layer that spoke must appear as a kind-tagged digest, in order: {digests:?}"
     );
+
+    // The displacement record must reach BOTH provenance artifacts: the durable
+    // manifest registered in the run database before tick zero, and the supplemental
+    // sidecar. A record that exists only beside the database can be lost with the
+    // directory; one that exists only inside it cannot be read without tooling.
+    let sidecar: RunManifestV3 = serde_json::from_value(manifest.clone())
+        .expect("the sidecar must satisfy the typed V3 manifest contract");
+    assert!(
+        !sidecar.config_overrides.is_empty(),
+        "the typed sidecar must carry the displacement record"
+    );
+    let database_path = dir.join("run.sqlite");
+    let database_path = database_path
+        .to_str()
+        .expect("the temporary database path must be valid Unicode");
+    let reader = StorageReader::open(database_path)
+        .expect("the completed run database must be queryable read-only");
+    let durable = reader
+        .run_manifest()
+        .expect("the run database must contain its validated durable manifest");
+    let pre_tick: RunManifestV3 = serde_json::from_str(&durable.manifest_json)
+        .expect("the durable launch manifest must retain its typed V3 representation");
+    assert_eq!(
+        pre_tick.config_overrides, sidecar.config_overrides,
+        "the durable manifest and the sidecar must agree on the displacement record"
+    );
+    assert_eq!(
+        pre_tick.scenario.ordered_config_layer_digests,
+        sidecar.scenario.ordered_config_layer_digests,
+        "the durable manifest and the sidecar must agree on the ordered layer digests"
+    );
+    drop(reader);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1089,24 +1089,29 @@ mod config_layering_tests {
                 statement(
                     ConfigLayerKind::File,
                     "file:scenario.toml",
-                    json!({"world_width": 2048}),
+                    json!({"world_width": 2000}),
                 ),
                 statement(
                     ConfigLayerKind::Environment,
                     "env:SCRIPTBOTS_CONFIG_OVERRIDES",
-                    json!({"world_width": 1024}),
+                    json!({"world_width": 1000}),
                 ),
                 statement(
                     ConfigLayerKind::Cli,
                     "cli:--set",
-                    json!({"world_width": 512}),
+                    json!({"world_width": 500}),
                 ),
             ],
         );
         let config: scriptbots_core::ScriptBotsConfig =
             serde_json::from_value(resolved.merged).expect("merged tree deserializes");
-        assert_eq!(config.world_width, 512);
+        assert_eq!(config.world_width, 500);
         assert_eq!(resolved.overrides.len(), 2);
+        // The winning values must also form a VALID config — a chain proven only on a
+        // tree the validator would reject proves nothing about a real run.
+        config
+            .validate()
+            .expect("the resolved configuration must satisfy config validation");
     }
 
     #[test]

@@ -1296,6 +1296,13 @@ fn compose_config_with_scenario(
 
     let defaults_value =
         serde_json::to_value(&defaults).context("failed to serialize base config")?;
+    // The defaults are a layer too: "every applied layer appends its digest" includes
+    // the layer every run starts from, so even a default-only run's manifest names
+    // what built it instead of carrying an empty provenance list.
+    scenario.record_config_layer(
+        ConfigLayerKind::Defaults,
+        &canonical_layer_bytes(&defaults_value),
+    );
 
     let mut statements: Vec<ConfigLayerStatement> = Vec::new();
     for path in &cli.config_layers {
@@ -1320,14 +1327,14 @@ fn compose_config_with_scenario(
                 .pointer("/render/auto_exposure")
                 .is_some_and(|value| !value.is_null())
         });
-    for statement in gather_env_statements(auto_exposure_already_spoken)? {
+    for statement in gather_env_statements(auto_exposure_already_spoken, &defaults_value)? {
         scenario.record_config_layer(
             ConfigLayerKind::Environment,
             &canonical_layer_bytes(&statement.fields),
         );
         statements.push(statement);
     }
-    for statement in gather_cli_statements(cli)? {
+    for statement in gather_cli_statements(cli, &defaults_value)? {
         scenario.record_config_layer(
             ConfigLayerKind::Cli,
             &canonical_layer_bytes(&statement.fields),
@@ -1378,12 +1385,16 @@ fn deserialize_merged_config(merged: &JsonValue) -> Result<ScriptBotsConfig> {
 /// The values are PASSED to the resolver, never written back into the process
 /// environment: startup `set_var` smearing is exactly what made the thread-count
 /// environment capture lie about what the user actually exported.
-fn gather_env_statements(auto_exposure_already_spoken: bool) -> Result<Vec<ConfigLayerStatement>> {
+fn gather_env_statements(
+    auto_exposure_already_spoken: bool,
+    defaults_value: &JsonValue,
+) -> Result<Vec<ConfigLayerStatement>> {
     let mut statements = Vec::new();
     if let Ok(raw) = env::var("SCRIPTBOTS_CONFIG_OVERRIDES") {
         let fields: JsonValue = toml::from_str(&raw)
             .context("failed to parse SCRIPTBOTS_CONFIG_OVERRIDES as a TOML document")?;
         if fields.as_object().is_some_and(|map| !map.is_empty()) {
+            reject_unknown_paths(defaults_value, &fields, "SCRIPTBOTS_CONFIG_OVERRIDES")?;
             statements.push(ConfigLayerStatement {
                 kind: ConfigLayerKind::Environment,
                 label: "env:SCRIPTBOTS_CONFIG_OVERRIDES".to_owned(),
@@ -1559,9 +1570,10 @@ fn typed_env_fields(auto_exposure_already_spoken: bool) -> Result<JsonValue> {
         let flag = parse_bool(&value).with_context(|| {
             format!("invalid SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE value `{value}`; expected true/false")
         })?;
-        if flag {
-            control.insert("auto_pause_on_spike_hit".to_owned(), JsonValue::Bool(true));
-        }
+        // An explicit `false` is a statement too: it must be able to displace a file
+        // layer's `true` and be evidenced in the override record, exactly like any
+        // other explicitly stated value.
+        control.insert("auto_pause_on_spike_hit".to_owned(), JsonValue::Bool(flag));
     }
     if !control.is_empty() {
         root.insert("control".to_owned(), JsonValue::Object(control));
@@ -1575,7 +1587,10 @@ fn typed_env_fields(auto_exposure_already_spoken: bool) -> Result<JsonValue> {
 /// Generic `--set` entries come first, each as its own statement so a later entry
 /// displacing an earlier one is attributable to the exact flag text; the typed flags
 /// (`--rng-seed`, the auto-pause family) name single knobs and are applied last.
-fn gather_cli_statements(cli: &AppCli) -> Result<Vec<ConfigLayerStatement>> {
+fn gather_cli_statements(
+    cli: &AppCli,
+    defaults_value: &JsonValue,
+) -> Result<Vec<ConfigLayerStatement>> {
     let mut statements = Vec::new();
     for entry in &cli.set_overrides {
         let fields: JsonValue = toml::from_str(entry).with_context(|| {
@@ -1587,6 +1602,7 @@ fn gather_cli_statements(cli: &AppCli) -> Result<Vec<ConfigLayerStatement>> {
         if fields.as_object().is_none_or(serde_json::Map::is_empty) {
             bail!("--set {entry} names no configuration field (expected PATH=VALUE)");
         }
+        reject_unknown_paths(defaults_value, &fields, &format!("--set {entry}"))?;
         statements.push(ConfigLayerStatement {
             kind: ConfigLayerKind::Cli,
             label: format!("cli:--set {entry}"),
@@ -1602,6 +1618,48 @@ fn gather_cli_statements(cli: &AppCli) -> Result<Vec<ConfigLayerStatement>> {
         });
     }
     Ok(statements)
+}
+
+/// Reject generic-override paths the configuration schema does not contain.
+///
+/// The generic surfaces (`--set`, `SCRIPTBOTS_CONFIG_OVERRIDES`) can name any dotted
+/// path, and serde deserialization silently IGNORES unknown keys — so a typo like
+/// `world_widht=800` would merge, vanish, and leave the run configured differently
+/// than its operator believes. Unknown keys fail closed instead, checked against the
+/// serialized defaults tree (the complete schema: every config field is present in
+/// it, and no config field is map-valued). Two deliberate limits:
+/// - below a `null` (an unset `Option` block) the JSON shape is not introspectable,
+///   so deeper keys are admitted and the typed deserializer owns their validation;
+/// - type mismatches are not checked here because serde already fails them loudly
+///   with an exact field path — only the SILENT failure class lives in this guard.
+fn reject_unknown_paths(defaults: &JsonValue, incoming: &JsonValue, label: &str) -> Result<()> {
+    fn walk(
+        defaults: &JsonValue,
+        incoming: &JsonValue,
+        path: &mut Vec<String>,
+        label: &str,
+    ) -> Result<()> {
+        let (JsonValue::Object(default_map), JsonValue::Object(incoming_map)) =
+            (defaults, incoming)
+        else {
+            return Ok(());
+        };
+        for (key, value) in incoming_map {
+            let Some(deeper) = default_map.get(key) else {
+                path.push(key.clone());
+                bail!(
+                    "{label} names `{}`, which is not a configuration field",
+                    path.join(".")
+                );
+            };
+            path.push(key.clone());
+            walk(deeper, value, path, label)?;
+            path.pop();
+        }
+        Ok(())
+    }
+    let mut path = Vec::new();
+    walk(defaults, incoming, &mut path, label)
 }
 
 /// The typed configuration-affecting CLI flags, as the partial they state.
@@ -4340,6 +4398,16 @@ activation = "Sigmoid"
 
             let mut expected = ScenarioIdentityV0::caller_seeded("scriptbots-app-layered-v1");
             expected.population_recipe = "fixed-4x4-registered-brain-grid-v1".to_owned();
+            let defaults_value = serde_json::to_value(ScriptBotsConfig {
+                persistence_interval: 60,
+                history_capacity: 600,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("serialize composed defaults");
+            expected.record_config_layer(
+                ConfigLayerKind::Defaults,
+                &canonical_layer_bytes(&defaults_value),
+            );
             expected.record_config_layer(ConfigLayerKind::File, first);
             expected.record_config_layer(ConfigLayerKind::File, second);
             assert_eq!(scenario, expected);
@@ -4789,13 +4857,93 @@ activation = "Sigmoid"
             assert_eq!(overrides[1].losing_kind, ConfigLayerKind::Environment);
             assert_eq!(overrides[1].winning_kind, ConfigLayerKind::Cli);
 
-            // Every layer that spoke appended a kind-tagged digest, in application order.
+            // Every layer that spoke appended a kind-tagged digest, in application
+            // order — including the defaults every run starts from.
             let kinds: Vec<&str> = scenario
                 .ordered_config_layer_digests
                 .iter()
                 .map(|entry| entry.split(':').next().unwrap_or(""))
                 .collect();
-            assert_eq!(kinds, vec!["file", "environment", "cli"]);
+            assert_eq!(kinds, vec!["defaults", "file", "environment", "cli"]);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_default_only_run_still_records_the_defaults_digest() {
+        with_clean_config_env(|| {
+            let (_config, scenario, overrides) =
+                compose_config_with_scenario(&default_cli()).expect("compose defaults only");
+            assert!(overrides.is_empty(), "nothing spoke, nothing displaced");
+            let kinds: Vec<&str> = scenario
+                .ordered_config_layer_digests
+                .iter()
+                .map(|entry| entry.split(':').next().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                kinds,
+                vec!["defaults"],
+                "a run configured by nothing but the defaults must still name its one layer"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn an_explicit_env_false_displaces_a_file_layer_true() {
+        // `SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE=false` is a statement, not an absence: it
+        // must displace a scenario file's `true` and appear in the override record.
+        with_clean_config_env(|| {
+            let dir = tempdir().expect("tempdir");
+            let file_path = dir.path().join("spike.toml");
+            fs::write(&file_path, b"[control]\nauto_pause_on_spike_hit = true\n")
+                .expect("write spike layer");
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE", "false");
+            }
+
+            let mut cli = default_cli();
+            cli.config_layers = vec![file_path];
+            let (config, _scenario, overrides) =
+                compose_config_with_scenario(&cli).expect("compose spike layers");
+
+            assert!(
+                !config.control.auto_pause_on_spike_hit,
+                "the explicit environment false must win over the file's true"
+            );
+            assert_eq!(overrides.len(), 1, "unexpected overrides: {overrides:?}");
+            assert_eq!(overrides[0].path, "control.auto_pause_on_spike_hit");
+            assert_eq!(overrides[0].losing_kind, ConfigLayerKind::File);
+            assert_eq!(overrides[0].winning_kind, ConfigLayerKind::Environment);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn unknown_generic_override_paths_fail_closed() {
+        with_clean_config_env(|| {
+            // A top-level typo through --set.
+            let mut cli = default_cli();
+            cli.set_overrides = vec!["world_widht=800".to_owned()];
+            let error = compose_config(&cli).expect_err("a typo'd field must not vanish");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("world_widht") && rendered.contains("not a configuration field"),
+                "the error must name the unknown path: {rendered}"
+            );
+
+            // A nested typo through the environment document.
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_CONFIG_OVERRIDES", "neuroflow.enabld = true");
+            }
+            let error =
+                compose_config(&default_cli()).expect_err("a nested typo'd field must not vanish");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("neuroflow.enabld")
+                    && rendered.contains("not a configuration field"),
+                "the error must name the nested unknown path: {rendered}"
+            );
         });
     }
 
