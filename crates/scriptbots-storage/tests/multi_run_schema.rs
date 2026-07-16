@@ -224,6 +224,31 @@ fn mutate_manifest(record: &mut RunManifestRecord, mutate: impl FnOnce(&mut serd
     record.manifest_json = serde_json::to_string(&value).expect("mutated manifest is valid JSON");
 }
 
+fn config_override(
+    losing_kind: &str,
+    winning_kind: &str,
+    losing_value: serde_json::Value,
+    winning_value: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "path": "world_width",
+        "losing_layer": "scenario.toml",
+        "losing_kind": losing_kind,
+        "losing_value": losing_value,
+        "winning_layer": "--set world_width=500",
+        "winning_kind": winning_kind,
+        "winning_value": winning_value,
+    })
+}
+
+fn accept_manifest(record: RunManifestRecord) {
+    let mut pipeline =
+        StoragePipeline::memory_for_run(record).expect("storage accepts the valid V3 manifest");
+    pipeline
+        .shutdown()
+        .expect("accepted manifest storage shuts down cleanly");
+}
+
 fn attach_zero_tick_v34_evidence(record: &mut RunManifestRecord) {
     let digest = launch_continuation_fixture(record.root_seed).world_digest;
     record.brain_roster_json = "[]".to_owned();
@@ -651,6 +676,379 @@ fn v3_manifest_validation_rejects_missing_and_wrongly_typed_structure() {
         error.contains("/limitations/rng_state_restorable must be a boolean"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn v3_config_overrides_accept_omission_empty_and_structured_json_values() {
+    accept_manifest(manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 100),
+        "overrides-omitted",
+        1_700_000_000_100,
+    ));
+
+    let mut empty = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 101),
+        "overrides-empty",
+        1_700_000_000_101,
+    );
+    mutate_manifest(&mut empty, |value| {
+        value["config_overrides"] = serde_json::json!([]);
+    });
+    accept_manifest(empty);
+
+    let mut structured = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 102),
+        "overrides-structured",
+        1_700_000_000_102,
+    );
+    mutate_manifest(&mut structured, |value| {
+        let mut boundary_entry = config_override(
+            "file",
+            "cli",
+            serde_json::json!(700),
+            serde_json::json!(500),
+        );
+        boundary_entry["path"] = serde_json::json!("x".repeat(512));
+        boundary_entry["losing_layer"] = serde_json::json!("é".repeat(256));
+        boundary_entry["winning_layer"] = serde_json::json!("y".repeat(512));
+        value["config_overrides"] = serde_json::json!([
+            config_override(
+                "file",
+                "environment",
+                serde_json::Value::Null,
+                serde_json::json!(true),
+            ),
+            config_override(
+                "environment",
+                "cli",
+                serde_json::json!(42),
+                serde_json::json!(["one", "two"]),
+            ),
+            config_override(
+                "file",
+                "file",
+                serde_json::json!({"old": 1}),
+                serde_json::json!({"new": 2}),
+            ),
+            boundary_entry,
+        ]);
+    });
+    accept_manifest(structured);
+
+    let mut bootstrap = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 120),
+        "overrides-v34",
+        1_700_000_000_120,
+    );
+    attach_zero_tick_v34_evidence(&mut bootstrap);
+    mutate_manifest(&mut bootstrap, |value| {
+        value["config_overrides"] = serde_json::json!([config_override(
+            "file",
+            "cli",
+            serde_json::json!(1_000),
+            serde_json::json!(500),
+        )]);
+    });
+    accept_manifest(bootstrap);
+}
+
+#[test]
+fn v3_config_overrides_require_an_array_and_exact_record_shape() {
+    let mut null_overrides = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 103),
+        "overrides-null",
+        1_700_000_000_103,
+    );
+    mutate_manifest(&mut null_overrides, |value| {
+        value["config_overrides"] = serde_json::Value::Null;
+    });
+    let error = manifest_validation_error(null_overrides);
+    assert!(
+        error.contains("/config_overrides must be an array"),
+        "unexpected error: {error}"
+    );
+
+    let mut non_object = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 104),
+        "override-non-object",
+        1_700_000_000_104,
+    );
+    mutate_manifest(&mut non_object, |value| {
+        value["config_overrides"] = serde_json::json!([[]]);
+    });
+    let error = manifest_validation_error(non_object);
+    assert!(
+        error.contains("/config_overrides/0 must be an object"),
+        "unexpected error: {error}"
+    );
+
+    let mut missing = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 105),
+        "override-missing-field",
+        1_700_000_000_105,
+    );
+    mutate_manifest(&mut missing, |value| {
+        let mut entry = config_override(
+            "defaults",
+            "cli",
+            serde_json::json!(1),
+            serde_json::json!(2),
+        );
+        entry
+            .as_object_mut()
+            .expect("override fixture is an object")
+            .remove("winning_value");
+        value["config_overrides"] = serde_json::json!([entry]);
+    });
+    let error = manifest_validation_error(missing);
+    assert!(
+        error.contains("/config_overrides/0 fields are") && error.contains("winning_value"),
+        "unexpected error: {error}"
+    );
+
+    let mut extra = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 106),
+        "override-extra-field",
+        1_700_000_000_106,
+    );
+    mutate_manifest(&mut extra, |value| {
+        let mut entry = config_override(
+            "defaults",
+            "cli",
+            serde_json::json!(1),
+            serde_json::json!(2),
+        );
+        entry
+            .as_object_mut()
+            .expect("override fixture is an object")
+            .insert("unknown".to_owned(), serde_json::json!(true));
+        value["config_overrides"] = serde_json::json!([entry]);
+    });
+    let error = manifest_validation_error(extra);
+    assert!(
+        error.contains("/config_overrides/0 fields are") && error.contains("unknown"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn v3_config_overrides_enforce_count_label_and_kind_bounds() {
+    let entry = config_override(
+        "file",
+        "cli",
+        serde_json::json!(1),
+        serde_json::json!(2),
+    );
+    let mut at_cap = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 107),
+        "override-count-cap",
+        1_700_000_000_107,
+    );
+    mutate_manifest(&mut at_cap, |value| {
+        value["config_overrides"] = serde_json::Value::Array(vec![entry.clone(); 1_024]);
+    });
+    accept_manifest(at_cap);
+
+    let mut above_cap = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 108),
+        "override-count-over",
+        1_700_000_000_108,
+    );
+    mutate_manifest(&mut above_cap, |value| {
+        value["config_overrides"] = serde_json::Value::Array(vec![entry.clone(); 1_025]);
+    });
+    let error = manifest_validation_error(above_cap);
+    assert!(
+        error.contains("/config_overrides accepts at most 1024 entries"),
+        "unexpected error: {error}"
+    );
+
+    for (sequence, field, invalid) in [
+        (109, "path", serde_json::json!(" ")),
+        (110, "path", serde_json::json!("x".repeat(513))),
+        (111, "winning_layer", serde_json::json!("é".repeat(257))),
+        (112, "winning_layer", serde_json::json!("bad\nlayer")),
+    ] {
+        let mut record = manifest(
+            RunId::from_namespace_sequence(0xc011_1de0, sequence),
+            &format!("override-invalid-label-{sequence}"),
+            1_700_000_000_000 + sequence,
+        );
+        mutate_manifest(&mut record, |value| {
+            let mut invalid_entry = entry.clone();
+            invalid_entry[field] = invalid;
+            value["config_overrides"] = serde_json::json!([invalid_entry]);
+        });
+        let error = manifest_validation_error(record);
+        assert!(
+            error.contains(&format!("/config_overrides/0/{field}"))
+                && error.contains("control-free")
+                && error.contains("512 bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    let mut wrong_label_type = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 121),
+        "override-label-type",
+        1_700_000_000_121,
+    );
+    mutate_manifest(&mut wrong_label_type, |value| {
+        let mut invalid_entry = entry.clone();
+        invalid_entry["losing_layer"] = serde_json::json!({"not": "a label"});
+        value["config_overrides"] = serde_json::json!([invalid_entry]);
+    });
+    let error = manifest_validation_error(wrong_label_type);
+    assert!(
+        error.contains("/config_overrides/0/losing_layer must be a string, found object"),
+        "unexpected error: {error}"
+    );
+
+    for (sequence, field, invalid) in [
+        (113, "losing_kind", serde_json::json!("CLI")),
+        (114, "winning_kind", serde_json::json!("scenario")),
+        (115, "winning_kind", serde_json::json!(7)),
+    ] {
+        let mut record = manifest(
+            RunId::from_namespace_sequence(0xc011_1de0, sequence),
+            &format!("override-invalid-kind-{sequence}"),
+            1_700_000_000_000 + sequence,
+        );
+        mutate_manifest(&mut record, |value| {
+            let mut invalid_entry = entry.clone();
+            invalid_entry[field] = invalid;
+            value["config_overrides"] = serde_json::json!([invalid_entry]);
+        });
+        let error = manifest_validation_error(record);
+        assert!(
+            error.contains(&format!("/config_overrides/0/{field}")),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn v3_config_override_values_are_bounded_by_compact_json_bytes() {
+    const VALUE_LIMIT: usize = 64 * 1024;
+    let boundary = serde_json::Value::String("\n".repeat((VALUE_LIMIT - 2) / 2));
+    let one_over = serde_json::Value::String(format!(
+        "{}x",
+        "\n".repeat((VALUE_LIMIT - 2) / 2)
+    ));
+    assert_eq!(
+        serde_json::to_vec(&boundary)
+            .expect("boundary JSON value serializes")
+            .len(),
+        VALUE_LIMIT
+    );
+    assert_eq!(
+        serde_json::to_vec(&one_over)
+            .expect("one-over JSON value serializes")
+            .len(),
+        VALUE_LIMIT + 1
+    );
+
+    let mut accepted = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 116),
+        "override-value-cap",
+        1_700_000_000_116,
+    );
+    mutate_manifest(&mut accepted, |value| {
+        value["config_overrides"] = serde_json::json!([config_override(
+            "file",
+            "cli",
+            boundary.clone(),
+            boundary,
+        )]);
+    });
+    accept_manifest(accepted);
+
+    for (sequence, field) in [(117, "losing_value"), (118, "winning_value")] {
+        let mut rejected = manifest(
+            RunId::from_namespace_sequence(0xc011_1de0, sequence),
+            &format!("override-value-over-{sequence}"),
+            1_700_000_000_000 + sequence,
+        );
+        mutate_manifest(&mut rejected, |value| {
+            let mut invalid_entry = config_override(
+                "file",
+                "cli",
+                serde_json::json!(1),
+                serde_json::json!(2),
+            );
+            invalid_entry[field] = one_over.clone();
+            value["config_overrides"] = serde_json::json!([invalid_entry]);
+        });
+        let error = manifest_validation_error(rejected);
+        assert!(
+            error.contains(&format!("/config_overrides/0/{field}"))
+                && error.contains("65537 bytes")
+                && error.contains("65536-byte limit"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn config_overrides_are_bound_by_manifest_digest() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temp_db_path("config_override_manifest_digest");
+    let run_id = RunId::from_namespace_sequence(0xc011_1de0, 119);
+    let mut record = manifest(run_id, "override-digest", 1_700_000_000_119);
+    mutate_manifest(&mut record, |value| {
+        value["config_overrides"] = serde_json::json!([
+            config_override(
+                "file",
+                "environment",
+                serde_json::json!(2_000),
+                serde_json::json!(1_000),
+            ),
+            config_override(
+                "environment",
+                "cli",
+                serde_json::json!(1_000),
+                serde_json::json!(500),
+            ),
+        ]);
+    });
+    let original_manifest: serde_json::Value = serde_json::from_str(&record.manifest_json)?;
+    let expected_overrides = original_manifest["config_overrides"].clone();
+    let mut pipeline = StoragePipeline::create_new_file_for_run(&path, record.clone())?;
+    pipeline.shutdown()?;
+
+    let mut tampered: serde_json::Value = serde_json::from_str(&record.manifest_json)?;
+    tampered["config_overrides"][1]["winning_value"] = serde_json::json!(501);
+    let tampered_json = serde_json::to_string(&tampered)?;
+    let connection = Connection::open(&path)?;
+    let stored_manifest_json = connection
+        .query_row_with_params(
+            "SELECT manifest_json FROM runs WHERE run_id = ?1",
+            &[run_id.to_string().into()],
+        )?
+        .get_typed::<String>(0)?;
+    let stored_manifest: serde_json::Value = serde_json::from_str(&stored_manifest_json)?;
+    assert_eq!(
+        stored_manifest["config_overrides"], expected_overrides,
+        "storage must preserve duplicate-path override records in application order"
+    );
+    connection.execute_with_params(
+        "UPDATE runs SET manifest_json = ?1 WHERE run_id = ?2",
+        &[tampered_json.into(), run_id.to_string().into()],
+    )?;
+    connection.close()?;
+
+    let error = match StoragePipeline::recover_existing(&path) {
+        Err(error) => error,
+        Ok(mut unexpected) => {
+            unexpected.shutdown()?;
+            return Err("recovery accepted override provenance with a stale manifest digest".into());
+        }
+    };
+    assert!(
+        error.to_string().contains("runs.manifest_digest"),
+        "unexpected override-tampering error: {error}"
+    );
+
+    Ok(())
 }
 
 #[test]

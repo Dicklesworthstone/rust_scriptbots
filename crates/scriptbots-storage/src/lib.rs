@@ -610,6 +610,8 @@ const MAX_RUN_LABEL_BYTES: usize = 512;
 const MAX_RUN_IDENTITY_BYTES: usize = 128;
 const MAX_LIVE_RUN_POLICY_BYTES: usize = 256;
 const MAX_MANIFEST_TEXT_BYTES: usize = 64 * 1024;
+const MAX_CONFIG_OVERRIDES: usize = 1_024;
+const MAX_CONFIG_OVERRIDE_VALUE_BYTES: usize = 64 * 1024;
 const MAX_RUN_AGENT_RNG_COUNTERS: usize = 1_000_000;
 const CONFIG_DIGEST_ENCODING_V1: &str = "blake3-canonical-json-v1";
 const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
@@ -637,7 +639,11 @@ pub struct RunManifestRecord {
     pub scenario_version: u16,
     /// Canonical normalized configuration JSON.
     pub normalized_config_json: String,
-    /// Digest of the normalized configuration.
+    /// Digest of the normalized configuration only.
+    ///
+    /// Layer-displacement history in `manifest_json.config_overrides` deliberately does not alter
+    /// this digest. The separate manifest digest covers the complete manifest JSON, including
+    /// every override record when the optional field is present.
     pub config_digest: String,
     /// Root seed, preserved losslessly as an unsigned value and stored as fixed-width hex.
     pub root_seed: u64,
@@ -930,6 +936,7 @@ fn validate_v3_manifest_projection(
 
     validate_v3_identity(record, manifest)?;
     validate_v3_thread_policy(manifest)?;
+    validate_v3_config_overrides(manifest)?;
     require_manifest_projection(manifest, "/root_seed", &json!(record.root_seed))?;
     manifest_required_u64(manifest, "/root_seed")?;
     validate_v3_random_streams(record, manifest)?;
@@ -1043,6 +1050,123 @@ fn validate_v3_thread_policy(manifest: &Value) -> Result<(), StorageError> {
         false,
     )?;
     Ok(())
+}
+
+const RUN_MANIFEST_V3_CONFIG_OVERRIDE_KINDS: [&str; 4] =
+    ["defaults", "file", "environment", "cli"];
+
+fn validate_v3_config_overrides(manifest: &Value) -> Result<(), StorageError> {
+    let Some(value) = manifest.pointer("/config_overrides") else {
+        return Ok(());
+    };
+    let entries = value.as_array().map(Vec::as_slice).ok_or_else(|| {
+        manifest_projection_error(format!(
+            "/config_overrides must be an array, found {}",
+            manifest_json_value_kind(value)
+        ))
+    })?;
+    if entries.len() > MAX_CONFIG_OVERRIDES {
+        return Err(manifest_projection_error(format!(
+            "/config_overrides accepts at most {MAX_CONFIG_OVERRIDES} entries"
+        )));
+    }
+
+    for (index, _) in entries.iter().enumerate() {
+        let pointer = format!("/config_overrides/{index}");
+        manifest_require_exact_object_fields(
+            manifest,
+            &pointer,
+            &[
+                "path",
+                "losing_layer",
+                "losing_kind",
+                "losing_value",
+                "winning_layer",
+                "winning_kind",
+                "winning_value",
+            ],
+        )?;
+        for field in ["path", "losing_layer", "winning_layer"] {
+            manifest_required_config_override_label(
+                manifest,
+                &format!("{pointer}/{field}"),
+            )?;
+        }
+        for field in ["losing_kind", "winning_kind"] {
+            let kind_pointer = format!("{pointer}/{field}");
+            manifest_required_config_override_kind(manifest, &kind_pointer)?;
+        }
+        for field in ["losing_value", "winning_value"] {
+            let value_pointer = format!("{pointer}/{field}");
+            let override_value = manifest_required_value(manifest, &value_pointer)?;
+            let encoded = serde_json::to_vec(override_value).map_err(|error| {
+                manifest_projection_error(format!(
+                    "{value_pointer} could not be compact-serialized: {error}"
+                ))
+            })?;
+            if encoded.len() > MAX_CONFIG_OVERRIDE_VALUE_BYTES {
+                return Err(manifest_projection_error(format!(
+                    "{value_pointer} compact JSON is {} bytes, exceeding the {MAX_CONFIG_OVERRIDE_VALUE_BYTES}-byte limit",
+                    encoded.len()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn manifest_required_config_override_label<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+) -> Result<&'a str, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    let string = value.as_str().ok_or_else(|| {
+        manifest_projection_error(format!(
+            "{pointer} must be a string, found {}",
+            manifest_json_value_kind(value)
+        ))
+    })?;
+    if string.trim().is_empty()
+        || string.len() > MAX_RUN_LABEL_BYTES
+        || string.chars().any(char::is_control)
+    {
+        return Err(manifest_projection_error(format!(
+            "{pointer} must be nonblank, control-free, and at most {MAX_RUN_LABEL_BYTES} bytes"
+        )));
+    }
+    Ok(string)
+}
+
+fn manifest_required_config_override_kind<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+) -> Result<&'a str, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    let kind = value.as_str().ok_or_else(|| {
+        manifest_projection_error(format!(
+            "{pointer} must be one of {RUN_MANIFEST_V3_CONFIG_OVERRIDE_KINDS:?}, found {}",
+            manifest_json_value_kind(value)
+        ))
+    })?;
+    if !RUN_MANIFEST_V3_CONFIG_OVERRIDE_KINDS.contains(&kind) {
+        return Err(manifest_projection_error(format!(
+            "{pointer} must be one of {RUN_MANIFEST_V3_CONFIG_OVERRIDE_KINDS:?}, found an unsupported {}-byte string",
+            kind.len()
+        )));
+    }
+    Ok(kind)
+}
+
+fn manifest_json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 const RUN_MANIFEST_V3_RANDOM_DOMAINS: [&str; 6] = [
