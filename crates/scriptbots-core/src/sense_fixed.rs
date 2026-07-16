@@ -87,19 +87,24 @@ pub const ACCUM_CEILING: i64 = MAX_NEIGHBORS_ASSUMED * (MAX_TERM as i64) * ONE;
 #[must_use]
 #[inline]
 pub fn to_fixed(value: f32) -> i64 {
+    to_fixed_with_saturation(value).0
+}
+
+#[inline]
+fn to_fixed_with_saturation(value: f32) -> (i64, bool) {
     if !value.is_finite() {
-        return 0;
+        return (0, false);
     }
     let scaled = f64::from(value) * f64::from(ONE as u32);
     // round-ties-to-even, matching IEEE's default and the shader's rounding.
     let rounded = round_half_to_even(scaled);
     if rounded >= ACCUM_CEILING as f64 {
-        return ACCUM_CEILING;
+        return (ACCUM_CEILING, true);
     }
     if rounded <= -(ACCUM_CEILING as f64) {
-        return -ACCUM_CEILING;
+        return (-ACCUM_CEILING, true);
     }
-    rounded as i64
+    (rounded as i64, false)
 }
 
 fn round_half_to_even(value: f64) -> f64 {
@@ -253,16 +258,20 @@ pub struct SenseChannels {
 
 #[inline]
 fn add_saturating(slot: &mut i64, term: f32, saturations: &mut u32) {
-    let fixed = to_fixed(term);
+    let (fixed, conversion_saturated) = to_fixed_with_saturation(term);
     let sum = slot.saturating_add(fixed);
-    if sum > ACCUM_CEILING {
+    let accumulation_saturated = if sum > ACCUM_CEILING {
         *slot = ACCUM_CEILING;
-        *saturations = saturations.saturating_add(1);
+        true
     } else if sum < -ACCUM_CEILING {
         *slot = -ACCUM_CEILING;
-        *saturations = saturations.saturating_add(1);
+        true
     } else {
         *slot = sum;
+        false
+    };
+    if conversion_saturated || accumulation_saturated {
+        *saturations = saturations.saturating_add(1);
     }
 }
 
@@ -312,19 +321,38 @@ impl SenseAccum {
     /// disappears into the clamp, and then one day it does not.
     #[must_use]
     pub fn finalize(&self) -> SenseChannels {
-        let channel = |value: i64| from_fixed(value).clamp(0.0, 1.0);
+        self.finalize_with_multipliers(1.0, 1.0, 1.0, 1.0)
+    }
+
+    /// Convert to clamped channels after applying the non-eye trait modifiers.
+    ///
+    /// Smell, sound, hearing, and blood are accumulated without their agent
+    /// traits and scaled exactly once after the complete neighbour reduction,
+    /// matching the production sensing contract. Eye sensitivity is already
+    /// part of each eye contribution and is deliberately not applied here.
+    #[must_use]
+    pub fn finalize_with_multipliers(
+        &self,
+        smell: f32,
+        sound: f32,
+        hearing: f32,
+        blood: f32,
+    ) -> SenseChannels {
+        let channel = |value: i64, multiplier: f32| {
+            (from_fixed(value) * multiplier).clamp(0.0, 1.0)
+        };
         let mut out = SenseChannels {
-            smell: channel(self.smell),
-            sound: channel(self.sound),
-            hearing: channel(self.hearing),
-            blood: channel(self.blood),
+            smell: channel(self.smell, smell),
+            sound: channel(self.sound, sound),
+            hearing: channel(self.hearing, hearing),
+            blood: channel(self.blood, blood),
             ..SenseChannels::default()
         };
         for eye in 0..NUM_EYES {
-            out.density[eye] = channel(self.density[eye]);
-            out.red[eye] = channel(self.red[eye]);
-            out.green[eye] = channel(self.green[eye]);
-            out.blue[eye] = channel(self.blue[eye]);
+            out.density[eye] = channel(self.density[eye], 1.0);
+            out.red[eye] = channel(self.red[eye], 1.0);
+            out.green[eye] = channel(self.green[eye], 1.0);
+            out.blue[eye] = channel(self.blue[eye], 1.0);
         }
         out
     }
@@ -362,6 +390,44 @@ mod tests {
         assert_eq!(to_fixed(1e30), ACCUM_CEILING);
         assert_eq!(to_fixed(-1e30), -ACCUM_CEILING);
         assert!(to_fixed(1e30) > 0, "saturation must not wrap negative");
+    }
+
+    #[test]
+    fn a_single_oversized_term_counts_its_conversion_saturation() {
+        let mut accum = SenseAccum::default();
+        accum.contribute(&NeighborContribution {
+            smell: 1e30,
+            sound: -1e30,
+            ..NeighborContribution::default()
+        });
+
+        assert_eq!(accum.smell, ACCUM_CEILING);
+        assert_eq!(accum.sound, -ACCUM_CEILING);
+        assert_eq!(
+            accum.saturations, 2,
+            "each term clamped during fixed-point conversion must make the run suspect"
+        );
+    }
+
+    #[test]
+    fn trait_scaled_finalize_applies_non_eye_traits_after_accumulation() {
+        let mut accum = SenseAccum::default();
+        accum.contribute(&NeighborContribution {
+            density: [0.5, 0.0, 0.0, 0.0],
+            smell: 0.5,
+            sound: 0.25,
+            hearing: 0.75,
+            blood: 0.5,
+            ..NeighborContribution::default()
+        });
+
+        let channels = accum.finalize_with_multipliers(0.5, 2.0, 2.0, 0.25);
+
+        assert_eq!(channels.density[0].to_bits(), 0.5f32.to_bits());
+        assert_eq!(channels.smell.to_bits(), 0.25f32.to_bits());
+        assert_eq!(channels.sound.to_bits(), 0.5f32.to_bits());
+        assert_eq!(channels.hearing.to_bits(), 1.0f32.to_bits());
+        assert_eq!(channels.blood.to_bits(), 0.125f32.to_bits());
     }
 
     fn contribution(seed: f32) -> NeighborContribution {
