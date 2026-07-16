@@ -11,22 +11,25 @@
 //! or application recovery feature.
 
 use super::*;
-use crate::rng_domains::DomainStreamRestoreError;
+use crate::rng_domains::{
+    AgentRngCountersV1, AgentSubstreamProtocolError, AgentSubstreamProtocolV1,
+    DomainStreamRestoreError,
+};
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
 /// Strict schema carried by the first world checkpoint envelope.
-pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.1";
+pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.2";
 /// Codec revision for [`WorldCheckpointV1`].
 ///
 /// Any serialized field or variant layout, nested live DTO layout, or canonicalization change
 /// requires a codec bump. A change to future-state coverage or field meaning requires a new
 /// checkpoint schema. Never rebless the representative V1 wire golden without reviewing both
 /// version identities.
-pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 2;
-const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v2";
+pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 3;
+const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v3";
 
 /// Maximum complete checkpoint wire accepted by the decoder.
 ///
@@ -199,7 +202,10 @@ pub enum WorldCheckpointError {
     /// The six-domain random-stream checkpoint could not be restored.
     #[error(transparent)]
     RandomStreams(#[from] DomainStreamRestoreError),
-    /// The embedded V1.4 source digest violated its own contract.
+    /// The agent-keyed random-substream protocol is foreign or bound to another root.
+    #[error(transparent)]
+    AgentSubstreamProtocol(#[from] AgentSubstreamProtocolError),
+    /// The embedded V1.5 source digest violated its own contract.
     #[error(transparent)]
     DigestContract(#[from] WorldDigestV1ContractError),
 }
@@ -224,6 +230,7 @@ struct WorldCheckpointStateV1 {
     tick: Tick,
     epoch: u64,
     random_streams: DomainStreamsCheckpoint,
+    agent_substream_protocol: AgentSubstreamProtocolV1,
     next_agent_uid: u64,
     next_spawn_ordinal: u64,
     next_birth_ordinal: u64,
@@ -352,6 +359,7 @@ impl BrainRegistryCheckpointV1 {
 #[serde(deny_unknown_fields)]
 struct AgentCheckpointV1 {
     identity: AgentIdentity,
+    rng_counters: AgentRngCountersV1,
     data: AgentData,
     runtime: AgentRuntimeCheckpointV1,
     brain: AgentBrainCheckpointV1,
@@ -675,6 +683,9 @@ impl WorldCheckpointV1 {
                 persistence_interval: state.config.persistence_interval,
             });
         }
+        state
+            .agent_substream_protocol
+            .validate(state.random_streams.root_seed())?;
         ensure_count_bound("agents", state.agents.len(), MAX_CHECKPOINT_AGENTS)?;
         ensure_count_bound(
             "registry.entries",
@@ -723,6 +734,7 @@ impl WorldCheckpointV1 {
         }
         validate_environment_checkpoint(state)?;
         validate_agent_checkpoint(state)?;
+        validate_agent_rng_checkpoint(state)?;
         validate_origin_checkpoint(state)?;
         for (index, effect) in state.active_effects.iter().enumerate() {
             effect
@@ -798,6 +810,7 @@ impl WorldState {
             tick: self.tick,
             epoch: self.epoch,
             random_streams: self.rng.checkpoint(),
+            agent_substream_protocol: self.agent_substream_protocol_v1(),
             next_agent_uid: self.next_agent_uid,
             next_spawn_ordinal: self.next_spawn_ordinal,
             next_birth_ordinal: self.next_birth_ordinal,
@@ -895,6 +908,7 @@ impl WorldState {
         restored.brain_registry = brain_registry;
         restored.agents = AgentArena::with_capacity(state.agents.len());
         restored.identities = AgentMap::new();
+        restored.agent_rng_counters = AgentMap::new();
         restored.runtime = AgentMap::new();
 
         for saved in &state.agents {
@@ -935,6 +949,7 @@ impl WorldState {
             runtime.validate_at(&format!("agents[uid={}].runtime", saved.identity.uid.0))?;
             let id = restored.agents.try_insert(saved.data)?;
             restored.identities.insert(id, saved.identity);
+            restored.agent_rng_counters.insert(id, saved.rng_counters);
             restored.runtime.insert(id, runtime);
         }
         restored.agent_execution_order_canonical = true;
@@ -1028,6 +1043,12 @@ impl WorldState {
                     path: format!("agents[uid={}].identity", uid.0),
                     detail: "missing stable identity".to_owned(),
                 })?;
+        let rng_counters =
+            self.agent_rng_counters(id)
+                .ok_or_else(|| WorldCheckpointError::Contract {
+                    path: format!("agents[uid={}].rng_counters", uid.0),
+                    detail: "missing agent random-substream continuation counters".to_owned(),
+                })?;
         let data = self
             .agents
             .snapshot(id)
@@ -1092,6 +1113,7 @@ impl WorldState {
         };
         Ok(AgentCheckpointV1 {
             identity,
+            rng_counters,
             data,
             runtime: AgentRuntimeCheckpointV1::capture(runtime),
             brain,
@@ -1725,6 +1747,35 @@ fn validate_agent_checkpoint(state: &WorldCheckpointStateV1) -> Result<(), World
     }
     if state.tick.0 == u64::MAX {
         return contract_error("tick", "checkpoint tick has no continuation headroom");
+    }
+    Ok(())
+}
+
+fn validate_agent_rng_checkpoint(
+    state: &WorldCheckpointStateV1,
+) -> Result<(), WorldCheckpointError> {
+    let counters = state
+        .agents
+        .iter()
+        .map(|saved| AgentRngCounterStateV1::new(saved.identity.uid, saved.rng_counters))
+        .collect::<Vec<_>>();
+    let actual = world_counters_digest_v1(
+        &state.agent_substream_protocol,
+        state.tick,
+        state.epoch,
+        state.next_agent_uid,
+        state.next_spawn_ordinal,
+        state.next_birth_ordinal,
+        &counters,
+    );
+    if actual != state.source_digest.counters {
+        return contract_error(
+            "source_digest.counters",
+            format!(
+                "digest records `{}`, but checkpoint counters recompute to `{actual}`",
+                state.source_digest.counters
+            ),
+        );
     }
     Ok(())
 }
@@ -2508,6 +2559,19 @@ mod tests {
         .expect("raw checkpoint envelope fixture")
     }
 
+    fn protocol_with_json_field(
+        protocol: &AgentSubstreamProtocolV1,
+        field: &str,
+        value: serde_json::Value,
+    ) -> AgentSubstreamProtocolV1 {
+        let mut encoded = serde_json::to_value(protocol).expect("protocol JSON fixture");
+        encoded
+            .as_object_mut()
+            .expect("protocol must serialize as an object")
+            .insert(field.to_owned(), value);
+        serde_json::from_value(encoded).expect("structurally valid protocol tamper")
+    }
+
     fn agent_id_for_uid(world: &WorldState, uid: AgentUid) -> AgentId {
         world
             .agents()
@@ -2579,6 +2643,19 @@ mod tests {
     }
 
     fn assert_protocol_state_equal(left: &WorldState, right: &WorldState) {
+        assert_eq!(
+            right.agent_substream_protocol_v1(),
+            left.agent_substream_protocol_v1(),
+            "agent random-substream protocol"
+        );
+        assert_eq!(
+            right
+                .ordered_agent_rng_counters_v1()
+                .expect("right ordered random counters"),
+            left.ordered_agent_rng_counters_v1()
+                .expect("left ordered random counters"),
+            "complete stable-UID random-counter lane"
+        );
         let mut uids = left
             .agents()
             .iter_handles()
@@ -2598,6 +2675,11 @@ mod tests {
             let right_id = agent_id_for_uid(right, uid);
             let left_runtime = left.agent_runtime(left_id).expect("left runtime");
             let right_runtime = right.agent_runtime(right_id).expect("right runtime");
+            assert_eq!(
+                right.agent_rng_counters(right_id),
+                left.agent_rng_counters(left_id),
+                "agent random counters for UID {uid:?}"
+            );
             assert_eq!(right_runtime.lineage, left_runtime.lineage, "UID {uid:?}");
             assert_eq!(
                 right.agent_brain_genome(right_id),
@@ -2710,10 +2792,10 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_437,
-                "32c6b7155d5e061cdd041227a62f53e4af0b43e8166f686bd81a26348bb10b2f",
+                0,
+                "DSR_REBLESS_WORLD_CHECKPOINT_V1_2_CODEC3",
             ),
-            "a V1 wire change requires explicit schema/codec review before reblessing"
+            "the first DSR batch-verification pass must report and then rebless the reviewed V1.2/codec-3 wire"
         );
     }
 
@@ -2836,6 +2918,14 @@ mod tests {
                 .expect("evolved founder evaluator checkpoint"),
             founder_evaluator_before,
             "the fixture must exercise a non-default evaluator state"
+        );
+        assert!(
+            original
+                .ordered_agent_rng_counters_v1()
+                .expect("evolved random counters")
+                .iter()
+                .any(|state| state.counters() != AgentRngCountersV1::default()),
+            "the round-trip fixture must advance at least one persisted agent random counter"
         );
 
         let injected_data = AgentData {
@@ -3006,7 +3096,7 @@ mod tests {
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode private wire fixture");
 
-        wire.schema = "scriptbots.world-checkpoint.v2".to_owned();
+        wire.schema = "scriptbots.world-checkpoint.v1.1".to_owned();
         let foreign_schema = postcard::to_allocvec(&wire).expect("foreign schema wire");
         assert!(matches!(
             WorldCheckpointV1::decode(&foreign_schema),
@@ -3015,7 +3105,7 @@ mod tests {
 
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode integrity fixture");
-        wire.codec_version = WORLD_CHECKPOINT_V1_CODEC_VERSION + 1;
+        wire.codec_version = WORLD_CHECKPOINT_V1_CODEC_VERSION - 1;
         let foreign_codec = postcard::to_allocvec(&wire).expect("foreign codec wire");
         assert!(matches!(
             WorldCheckpointV1::decode(&foreign_codec),
@@ -3024,7 +3114,7 @@ mod tests {
 
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode codec-identity fixture");
-        wire.codec = "postcard+blake3-v1".to_owned();
+        wire.codec = "postcard+blake3-v2".to_owned();
         let foreign_codec_identity =
             postcard::to_allocvec(&wire).expect("foreign codec identity wire");
         assert!(matches!(
@@ -3075,6 +3165,76 @@ mod tests {
             Err(WorldCheckpointError::NonCanonical { layer: "payload" })
         ));
 
+        let mut missing_protocol =
+            serde_json::to_value(&checkpoint.state).expect("checkpoint state JSON fixture");
+        missing_protocol
+            .as_object_mut()
+            .expect("checkpoint state is an object")
+            .remove("agent_substream_protocol");
+        assert!(
+            serde_json::from_value::<WorldCheckpointStateV1>(missing_protocol).is_err(),
+            "checkpoint state missing the agent-substream protocol decoded"
+        );
+
+        let mut unknown_protocol_peer =
+            serde_json::to_value(&checkpoint.state).expect("checkpoint state JSON fixture");
+        unknown_protocol_peer
+            .as_object_mut()
+            .expect("checkpoint state is an object")
+            .insert(
+                "agent_substream_dense_lane".to_owned(),
+                serde_json::json!("forbidden"),
+            );
+        assert!(
+            serde_json::from_value::<WorldCheckpointStateV1>(unknown_protocol_peer).is_err(),
+            "checkpoint state accepted an unknown agent-substream field"
+        );
+
+        let mut wrong_protocol_version = checkpoint.clone();
+        let unsupported_version = wrong_protocol_version
+            .state
+            .agent_substream_protocol
+            .version()
+            + 1;
+        let tampered_protocol = protocol_with_json_field(
+            &wrong_protocol_version.state.agent_substream_protocol,
+            "version",
+            serde_json::json!(unsupported_version),
+        );
+        wrong_protocol_version.state.agent_substream_protocol = tampered_protocol;
+        assert!(matches!(
+            wrong_protocol_version.encode(),
+            Err(WorldCheckpointError::AgentSubstreamProtocol(
+                AgentSubstreamProtocolError::Version { .. }
+            ))
+        ));
+
+        let mut wrong_protocol_algorithm = checkpoint.clone();
+        let tampered_protocol = protocol_with_json_field(
+            &wrong_protocol_algorithm.state.agent_substream_protocol,
+            "algorithm",
+            serde_json::json!("dense-agent-rng-v0"),
+        );
+        wrong_protocol_algorithm.state.agent_substream_protocol = tampered_protocol;
+        assert!(matches!(
+            wrong_protocol_algorithm.encode(),
+            Err(WorldCheckpointError::AgentSubstreamProtocol(
+                AgentSubstreamProtocolError::Algorithm { .. }
+            ))
+        ));
+
+        let mut wrong_protocol_root = checkpoint.clone();
+        wrong_protocol_root.state.agent_substream_protocol =
+            AgentSubstreamProtocolV1::from_root_seed(
+                wrong_protocol_root.state.random_streams.root_seed() ^ 1,
+            );
+        assert!(matches!(
+            wrong_protocol_root.encode(),
+            Err(WorldCheckpointError::AgentSubstreamProtocol(
+                AgentSubstreamProtocolError::RootSeed { .. }
+            ))
+        ));
+
         for hidden_layers in [
             vec![4, 0, 2],
             vec![1; MAX_NEUROFLOW_HIDDEN_LAYERS + 1],
@@ -3093,6 +3253,53 @@ mod tests {
             ));
         }
 
+        let (mut counter_world, brain_key) = world_with_checkpoint_family();
+        let counter_agent = counter_world
+            .try_spawn_agent(AgentData::default())
+            .expect("counter fixture agent");
+        assert!(
+            counter_world
+                .bind_agent_brain(counter_agent, brain_key)
+                .expect("bind counter fixture brain")
+        );
+        let counter_checkpoint = counter_world
+            .checkpoint_v1()
+            .expect("checkpoint with agent counters");
+        let mut missing_counters =
+            serde_json::to_value(&counter_checkpoint.state.agents[0])
+                .expect("agent checkpoint JSON fixture");
+        missing_counters
+            .as_object_mut()
+            .expect("agent checkpoint is an object")
+            .remove("rng_counters");
+        assert!(
+            serde_json::from_value::<AgentCheckpointV1>(missing_counters).is_err(),
+            "agent checkpoint missing its random continuation counters decoded"
+        );
+        let mut unknown_counter_peer =
+            serde_json::to_value(&counter_checkpoint.state.agents[0])
+                .expect("agent checkpoint JSON fixture");
+        unknown_counter_peer
+            .as_object_mut()
+            .expect("agent checkpoint is an object")
+            .insert("rng_dense_slot".to_owned(), serde_json::json!(3));
+        assert!(
+            serde_json::from_value::<AgentCheckpointV1>(unknown_counter_peer).is_err(),
+            "agent checkpoint accepted a dense-slot random continuation"
+        );
+        let mut changed_counters = counter_checkpoint;
+        let saved_counters = changed_counters.state.agents[0].rng_counters;
+        changed_counters.state.agents[0].rng_counters = AgentRngCountersV1::from_ordinals(
+            saved_counters.reproduction_attempt_ordinal() + 1,
+            saved_counters.birth_ordinal(),
+            saved_counters.brain_initialization_ordinal(),
+        );
+        assert!(matches!(
+            changed_counters.encode(),
+            Err(WorldCheckpointError::Contract { ref path, .. })
+                if path == "source_digest.counters"
+        ));
+
         let mut duplicate = checkpoint.clone();
         duplicate.state.agents = vec![
             AgentCheckpointV1 {
@@ -3101,6 +3308,7 @@ mod tests {
                     spawn_ordinal: 0,
                     birth_ordinal: None,
                 },
+                rng_counters: AgentRngCountersV1::default(),
                 data: AgentData::default(),
                 runtime: AgentRuntimeCheckpointV1::capture(&AgentRuntime::default()),
                 brain: AgentBrainCheckpointV1::Unbound,
@@ -3111,6 +3319,7 @@ mod tests {
                     spawn_ordinal: 0,
                     birth_ordinal: None,
                 },
+                rng_counters: AgentRngCountersV1::default(),
                 data: AgentData::default(),
                 runtime: AgentRuntimeCheckpointV1::capture(&AgentRuntime::default()),
                 brain: AgentBrainCheckpointV1::Unbound,
@@ -3130,6 +3339,7 @@ mod tests {
                 spawn_ordinal: 0,
                 birth_ordinal: None,
             },
+            rng_counters: AgentRngCountersV1::default(),
             data: AgentData::default(),
             runtime: AgentRuntimeCheckpointV1 {
                 energy: f32::NAN,
@@ -3286,6 +3496,94 @@ mod tests {
             Err(WorldCheckpointError::Contract { ref path, .. })
                 if path == "registry.entries"
         ));
+    }
+
+    #[test]
+    fn agent_random_checkpoint_tampering_rejects_before_evaluator_reconstruction() {
+        let source_constructions = Arc::new(AtomicUsize::new(0));
+        let mut source = WorldState::new(checkpoint_config()).expect("random source world");
+        let source_key = source
+            .register_brain_family(
+                CHECKPOINT_KIND,
+                boxed_fixture_brain_family_with_behavior_probe(
+                    CHECKPOINT_FAMILY_ID,
+                    0,
+                    Arc::clone(&source_constructions),
+                ),
+            )
+            .expect("register random source fixture");
+        let agent = source
+            .try_spawn_agent(AgentData::default())
+            .expect("random source agent");
+        assert!(
+            source
+                .bind_agent_brain(agent, source_key)
+                .expect("bind random source brain")
+        );
+        assert!(
+            source_constructions.load(Ordering::Relaxed) > 0,
+            "the source fixture must construct an evaluator before checkpointing"
+        );
+        let checkpoint = source.checkpoint_v1().expect("random source checkpoint");
+
+        let prepared_constructions = Arc::new(AtomicUsize::new(0));
+        let prepared_registry = || {
+            let mut registry = BrainRegistry::new();
+            let key = registry
+                .register_family(
+                    CHECKPOINT_KIND,
+                    boxed_fixture_brain_family_with_behavior_probe(
+                        CHECKPOINT_FAMILY_ID,
+                        0,
+                        Arc::clone(&prepared_constructions),
+                    ),
+                )
+                .expect("register exact prepared random fixture");
+            assert_eq!(key, source_key);
+            registry
+        };
+
+        let mut wrong_root = checkpoint.clone();
+        wrong_root.state.agent_substream_protocol =
+            AgentSubstreamProtocolV1::from_root_seed(
+                wrong_root.state.random_streams.root_seed() ^ 1,
+            );
+        assert!(matches!(
+            WorldState::restore_checkpoint_v1(&wrong_root, prepared_registry()),
+            Err(WorldCheckpointError::AgentSubstreamProtocol(
+                AgentSubstreamProtocolError::RootSeed { .. }
+            ))
+        ));
+        assert_eq!(
+            prepared_constructions.load(Ordering::Relaxed),
+            0,
+            "protocol/root mismatch must reject before reconstructing any evaluator or agent"
+        );
+
+        let mut wrong_counter = checkpoint.clone();
+        let saved = wrong_counter.state.agents[0].rng_counters;
+        wrong_counter.state.agents[0].rng_counters = AgentRngCountersV1::from_ordinals(
+            saved.reproduction_attempt_ordinal(),
+            saved.birth_ordinal() + 1,
+            saved.brain_initialization_ordinal(),
+        );
+        assert!(matches!(
+            WorldState::restore_checkpoint_v1(&wrong_counter, prepared_registry()),
+            Err(WorldCheckpointError::Contract { ref path, .. })
+                if path == "source_digest.counters"
+        ));
+        assert_eq!(
+            prepared_constructions.load(Ordering::Relaxed),
+            0,
+            "counter-lane mismatch must reject before reconstructing any evaluator or agent"
+        );
+
+        WorldState::restore_checkpoint_v1(&checkpoint, prepared_registry())
+            .expect("untampered checkpoint reconstructs evaluators");
+        assert!(
+            prepared_constructions.load(Ordering::Relaxed) > 0,
+            "the valid-control restore must prove the evaluator-construction probe is live"
+        );
     }
 
     #[test]
