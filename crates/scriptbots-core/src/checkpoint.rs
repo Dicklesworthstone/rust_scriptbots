@@ -2791,7 +2791,10 @@ mod tests {
         let actual = blake3::hash(&wire).to_hex().to_string();
         assert_eq!(
             (wire.len(), actual.as_str()),
-            (0, "DSR_REBLESS_WORLD_CHECKPOINT_V1_2_CODEC3",),
+            (
+                8_538,
+                "5faae3f2c17ae1e6877ec0f027bdd339566f5a10a9b1880623ccc631d9c4f82b",
+            ),
             "the first DSR batch-verification pass must report and then rebless the reviewed V1.2/codec-3 wire"
         );
     }
