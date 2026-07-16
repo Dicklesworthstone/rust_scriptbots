@@ -20,10 +20,16 @@
 //! `(IslandId, AgentUid)`. A migrating agent (bd-16g.5.2) must be re-identified
 //! under that pair, never by its bare local UID.
 //!
-//! A partially-stepped archipelago is unobservable by construction:
-//! [`Archipelago::step_to_barrier`] takes `&mut self`, so no reader can observe
-//! islands between barriers, and a mid-barrier island fault latches the whole
-//! archipelago with a typed error instead of leaving a silently uneven epoch.
+//! A partially-stepped archipelago is unobservable by construction, on two
+//! independent axes. First, [`Archipelago::step_to_barrier`] takes `&mut self`,
+//! so no reader can interleave with a barrier. Second, every exposed view is
+//! **barrier-committed**: the archipelago never hands out live snapshot hubs or
+//! command ports (a `HostCore`'s `local_port()` can enqueue commands even
+//! through `&self`, so no `&HostCore` accessor exists at all), and
+//! [`Archipelago::island_snapshot`] serves only snapshots captured after a
+//! completed barrier. A mid-barrier island fault latches the whole archipelago
+//! with a typed error naming the island; the exposed views and digests remain
+//! at the prior barrier rather than leaking a silently uneven epoch.
 //!
 //! # Step topology (the parallelism dial)
 //!
@@ -46,7 +52,10 @@
 //! storage pipeline, keyed by each host's unique session identity
 //! ([`crate::JournalBatchId`] is explicitly documented to support several
 //! hosts sharing one adapter). By default every island gets its own in-memory
-//! volatile journal.
+//! volatile journal. A storage-backed adapter must additionally buffer each
+//! island's batches and flush them only at barrier completion, in ascending
+//! island-id order, so the storage layer never observes a partial barrier —
+//! that buffering policy is part of the bd-16g.5.5 contract, not this module.
 //!
 //! # Seeds and sessions (provisional derivation)
 //!
@@ -77,7 +86,7 @@
 use crate::{
     ApplicationState, CommandEnvelope, CommandId, HostAccessError, HostBlocker, HostCommand,
     HostFault, HostHealth, HostPort, HostSessionId, JournalPort, ManualHostDriver, ManualInstant,
-    SnapshotHub,
+    RenderSnapshot,
     host_core::{HostCore, HostCoreBuildError, HostCoreOptions},
 };
 use scriptbots_core::{
@@ -85,7 +94,7 @@ use scriptbots_core::{
     WorldStateError,
 };
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, sync::Arc};
 use thiserror::Error;
 
 /// Maximum number of islands one archipelago may own.
@@ -466,6 +475,11 @@ struct Island {
     core: HostCore,
     next_command_sequence: u64,
     time_cursor: u64,
+    /// The island's exposed view: the snapshot captured at the last completed
+    /// barrier (or at construction). Refreshed only after every island has
+    /// reached the barrier tick, so a mid-barrier fault can never leak a
+    /// partially-stepped view.
+    committed_snapshot: Arc<RenderSnapshot>,
 }
 
 impl Island {
@@ -588,6 +602,7 @@ impl Archipelago {
 
         let mut built: Vec<Island> = Vec::with_capacity(islands.len());
         let mut reference_registry: Option<Vec<(u64, String)>> = None;
+        let mut reference_registry_lane: Option<String> = None;
         let mut start_tick: Option<Tick> = None;
 
         for spec in &islands {
@@ -687,6 +702,34 @@ impl Archipelago {
                     }
                 }
             }
+            // `(key, kind)` equality is a readable first gate but proves too
+            // little: two registries can agree on every key and kind while
+            // registering different factory construction state or protocol
+            // families. The world digest's registry lane covers the exact
+            // registered contract (keys, kinds, family identity, and declared
+            // factory-state digests), so lane equality is the real uniformity
+            // requirement.
+            let registry_lane = world
+                .world_digest_v1()
+                .map_err(|source| ArchipelagoError::Digest {
+                    island: spec.id,
+                    source,
+                })?
+                .brain_registry;
+            match &reference_registry_lane {
+                None => reference_registry_lane = Some(registry_lane),
+                Some(reference_lane) => {
+                    if reference_lane != &registry_lane {
+                        return Err(ArchipelagoError::IncompatibleIslands {
+                            reference: islands[0].id,
+                            island: spec.id,
+                            field: "brain_registry_contract",
+                            reference_value: reference_lane.clone(),
+                            island_value: registry_lane,
+                        });
+                    }
+                }
+            }
 
             let core = match journal_factory(&meta) {
                 Some(journal) => HostCore::with_journal(session_id, world, options, journal),
@@ -697,11 +740,13 @@ impl Archipelago {
                 source,
             })?;
 
+            let committed_snapshot = core.latest_snapshot();
             built.push(Island {
                 meta,
                 core,
                 next_command_sequence: 1,
                 time_cursor: 0,
+                committed_snapshot,
             });
         }
 
@@ -795,27 +840,35 @@ impl Archipelago {
         self.latched.as_deref()
     }
 
-    /// Read-only access to one island's host.
+    /// The island's barrier-committed snapshot: the view captured at the last
+    /// completed barrier (or at construction).
+    ///
+    /// Live snapshot hubs and host handles are deliberately not exposed —
+    /// a `HostCore`'s `local_port()` can enqueue commands even through a
+    /// shared reference, and a live hub would observe islands mid-barrier.
+    /// After an island fault this still returns the prior barrier's view, so
+    /// a partially-stepped epoch is never observable.
     #[must_use]
-    pub fn island_core(&self, island: IslandId) -> Option<&HostCore> {
+    pub fn island_snapshot(&self, island: IslandId) -> Option<Arc<RenderSnapshot>> {
         self.island_index(island)
-            .map(|index| &self.islands[index].core)
+            .map(|index| Arc::clone(&self.islands[index].committed_snapshot))
     }
 
-    /// Thread-safe latest-value snapshot reader for one island.
-    #[must_use]
-    pub fn island_snapshot_hub(&self, island: IslandId) -> Option<SnapshotHub> {
-        self.island_index(island)
-            .map(|index| self.islands[index].core.snapshot_hub())
-    }
-
-    /// Canonical scientific digest of one island.
+    /// Canonical scientific digest of one island at the current barrier.
     ///
     /// # Errors
     ///
-    /// Returns [`ArchipelagoError::UnknownIsland`] for an unknown identity and
+    /// Returns [`ArchipelagoError::UnknownIsland`] for an unknown identity,
+    /// [`ArchipelagoError::Latched`] once an island fault has latched the
+    /// archipelago (a digest taken then would expose a partially-stepped
+    /// epoch; the fault error already names the failed island and tick), and
     /// [`ArchipelagoError::Digest`] when the digest cannot be computed.
     pub fn island_digest(&self, island: IslandId) -> Result<WorldDigestV1, ArchipelagoError> {
+        if let Some(detail) = &self.latched {
+            return Err(ArchipelagoError::Latched {
+                detail: detail.clone(),
+            });
+        }
         let index = self
             .island_index(island)
             .ok_or(ArchipelagoError::UnknownIsland { island })?;
@@ -881,6 +934,11 @@ impl Archipelago {
             }
         }
 
+        // Every island reached the barrier: commit the new views in ascending
+        // island-id order. This is the only place exposed snapshots advance.
+        for island in &mut self.islands {
+            island.committed_snapshot = island.core.latest_snapshot();
+        }
         self.epoch += 1;
         self.barrier_tick = target;
         let islands = self
@@ -891,7 +949,7 @@ impl Archipelago {
                 label: island.meta.label.clone(),
                 world_tick: island.core.world_tick(),
                 ticks_stepped: interval,
-                summary: island.core.latest_snapshot().completed_summary.clone(),
+                summary: island.committed_snapshot.completed_summary.clone(),
             })
             .collect();
         Ok(BarrierReport {
@@ -1102,7 +1160,83 @@ mod tests {
         EventJournalReader, JournalAdmission, JournalBatch, JournalReceipt,
         ShutdownCommitRequirement,
     };
-    use std::sync::Arc;
+    use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
+
+    const TEST_BRAIN_KIND: &str = "archi-test-brain";
+    const TEST_BRAIN_FACTORY_DIGEST: u64 = 0xA5C1_1A60_7E57_0001;
+
+    /// Minimal heritable brain so determinism tests exercise agent bodies,
+    /// brain genomes/evaluator state, UID allocation, and RNG draws instead of
+    /// hashing empty worlds.
+    #[derive(Debug, Clone)]
+    struct TestBrain {
+        weight: f32,
+    }
+
+    fn draw_unit(rng: &mut dyn RandomStream) -> f32 {
+        f32::from(u16::try_from(rng.next_u32() & 0xFFFF).expect("masked to u16 range"))
+            / f32::from(u16::MAX)
+    }
+
+    impl BrainRunner for TestBrain {
+        fn kind(&self) -> &'static str {
+            TEST_BRAIN_KIND
+        }
+
+        fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+            let mut outputs = [0.0f32; OUTPUT_SIZE];
+            for (index, output) in outputs.iter_mut().enumerate() {
+                *output = (inputs[index % INPUT_SIZE] * self.weight).clamp(0.0, 1.0);
+            }
+            outputs
+        }
+
+        fn state_digest(&self) -> Option<u64> {
+            Some(u64::from(self.weight.to_bits()))
+        }
+
+        fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+
+        fn mutate(
+            &mut self,
+            rng: &mut dyn RandomStream,
+            _rate: f32,
+            scale: f32,
+        ) -> Result<(), BrainSpawnError> {
+            let step = draw_unit(rng) - 0.5;
+            self.weight = step
+                .mul_add(scale.abs().clamp(0.01, 1.0), self.weight)
+                .clamp(0.05, 2.0);
+            Ok(())
+        }
+    }
+
+    fn register_test_brain(world: &mut WorldState, factory_digest: u64) {
+        let _key = world
+            .brain_registry_mut()
+            .expect("registry is mutable before the first tick")
+            .register_with_state_digest(TEST_BRAIN_KIND, factory_digest, |rng| {
+                Ok(Box::new(TestBrain {
+                    weight: draw_unit(rng).mul_add(0.9, 0.1),
+                }) as Box<dyn BrainRunner>)
+            });
+    }
+
+    fn build_populated_world(config: ScriptBotsConfig) -> Result<WorldState, WorldStateError> {
+        let mut world = WorldState::new(config)?;
+        register_test_brain(&mut world, TEST_BRAIN_FACTORY_DIGEST);
+        Ok(world)
+    }
+
+    fn populated_world_factory(meta: &IslandMeta) -> Result<WorldState, WorldStateError> {
+        build_populated_world(meta.effective_config.clone())
+    }
+
+    fn populated_archipelago(config: ArchipelagoConfig) -> Result<Archipelago, ArchipelagoError> {
+        Archipelago::with_factories(config, populated_world_factory, |_meta| None)
+    }
 
     fn test_config(seed: Option<u64>) -> ScriptBotsConfig {
         ScriptBotsConfig {
@@ -1112,6 +1246,16 @@ mod tests {
             rng_seed: seed,
             persistence_interval: 0,
             ..ScriptBotsConfig::default()
+        }
+    }
+
+    /// A config whose population floor keeps agents (and therefore brains,
+    /// UIDs, and RNG draws) in every determinism test's digest.
+    fn populated_config(seed: Option<u64>) -> ScriptBotsConfig {
+        ScriptBotsConfig {
+            population_minimum: 12,
+            population_spawn_interval: 5,
+            ..test_config(seed)
         }
     }
 
@@ -1315,7 +1459,7 @@ mod tests {
     #[test]
     fn single_island_archipelago_is_bit_identical_to_a_plain_world() {
         let mut archipelago =
-            Archipelago::new(archipelago_config(vec![spec(0, test_config(None))], 10))
+            populated_archipelago(archipelago_config(vec![spec(0, populated_config(None))], 10))
                 .expect("single-island archipelago");
         for _ in 0..3 {
             archipelago.step_to_barrier().expect("barrier");
@@ -1331,7 +1475,7 @@ mod tests {
             .expect("island meta")
             .effective_config
             .clone();
-        let mut plain = WorldState::new(effective).expect("plain world");
+        let mut plain = build_populated_world(effective).expect("plain world");
         for _ in 0..30 {
             plain.step().expect("plain step");
         }
@@ -1341,25 +1485,38 @@ mod tests {
             island_digest, plain_digest,
             "the archipelago wrapper must add zero scientific drift"
         );
+        assert!(
+            plain_digest.evaluator_state_covered,
+            "the test brain must expose evaluator state so the digest covers it"
+        );
+        let snapshot = archipelago
+            .island_snapshot(IslandId(0))
+            .expect("committed snapshot");
+        assert_eq!(snapshot.world.tick, 30);
+        assert!(
+            snapshot.world.summary.agent_count > 0,
+            "the population floor must keep agents in the digest: zero-agent \
+             determinism proves nothing about UID, brain, or RNG state"
+        );
     }
 
     #[test]
     fn island_digests_are_independent_of_neighbors() {
         let island_specs: Vec<IslandSpec> = (0..8)
             .map(|id| {
-                let mut config = test_config(None);
+                let mut config = populated_config(None);
                 config.food_growth_rate = 0.01f32.mul_add(f32::from(id), 0.01);
                 spec(id, config)
             })
             .collect();
         let subject = island_specs[3].clone();
 
-        let mut crowded = Archipelago::new(archipelago_config(island_specs, 10))
+        let mut crowded = populated_archipelago(archipelago_config(island_specs, 10))
             .expect("eight-island archipelago");
         crowded.step_to_barrier().expect("crowded barrier");
         let crowded_digest = crowded.island_digest(IslandId(3)).expect("crowded digest");
 
-        let mut alone = Archipelago::new(archipelago_config(vec![subject], 10))
+        let mut alone = populated_archipelago(archipelago_config(vec![subject], 10))
             .expect("single-island archipelago");
         alone.step_to_barrier().expect("alone barrier");
         let alone_digest = alone.island_digest(IslandId(3)).expect("alone digest");
@@ -1374,18 +1531,18 @@ mod tests {
     fn reversed_step_order_produces_identical_per_island_digests() {
         let island_specs: Vec<IslandSpec> = (0..4)
             .map(|id| {
-                let mut config = test_config(None);
+                let mut config = populated_config(None);
                 config.food_growth_rate = 0.01f32.mul_add(f32::from(id), 0.01);
                 spec(id, config)
             })
             .collect();
 
-        let mut ascending = Archipelago::new(archipelago_config(island_specs.clone(), 10))
+        let mut ascending = populated_archipelago(archipelago_config(island_specs.clone(), 10))
             .expect("ascending archipelago");
         ascending.step_to_barrier().expect("ascending barrier");
 
-        let mut reversed =
-            Archipelago::new(archipelago_config(island_specs, 10)).expect("reversed archipelago");
+        let mut reversed = populated_archipelago(archipelago_config(island_specs, 10))
+            .expect("reversed archipelago");
         let order: Vec<usize> = (0..reversed.island_count()).rev().collect();
         reversed
             .step_to_barrier_in_order(&order)
@@ -1405,12 +1562,12 @@ mod tests {
     fn heterogeneous_islands_reach_common_ticks_with_distinct_digests() {
         let island_specs: Vec<IslandSpec> = (0..4)
             .map(|id| {
-                let mut config = test_config(None);
+                let mut config = populated_config(None);
                 config.food_growth_rate = 0.02f32.mul_add(f32::from(id), 0.01);
                 spec(id, config)
             })
             .collect();
-        let mut archipelago = Archipelago::new(archipelago_config(island_specs, 25))
+        let mut archipelago = populated_archipelago(archipelago_config(island_specs, 25))
             .expect("heterogeneous archipelago");
 
         let mut last_report = None;
@@ -1514,6 +1671,101 @@ mod tests {
             archipelago.step_to_barrier(),
             Err(ArchipelagoError::Latched { .. })
         ));
+
+        // Island 0 stepped to the barrier tick internally before island 1
+        // faulted, but no exposed view may show that: every committed snapshot
+        // stays at the prior boundary and digests refuse while latched.
+        for id in [0_u16, 1] {
+            let snapshot = archipelago
+                .island_snapshot(IslandId(id))
+                .expect("committed snapshot exists");
+            assert_eq!(
+                snapshot.world.tick, 0,
+                "island {id}'s exposed view must remain at the prior barrier \
+                 after a mid-barrier fault"
+            );
+        }
+        assert!(matches!(
+            archipelago.island_digest(IslandId(0)),
+            Err(ArchipelagoError::Latched { .. })
+        ));
+    }
+
+    #[test]
+    fn differing_factory_state_digests_are_an_incompatible_registry_contract() {
+        let islands = vec![spec(0, test_config(None)), spec(1, test_config(None))];
+        let result = Archipelago::with_factories(
+            archipelago_config(islands, 1),
+            |meta| {
+                let mut world = WorldState::new(meta.effective_config.clone())?;
+                let factory_digest = if meta.id == IslandId(0) {
+                    0xAAAA_AAAA_AAAA_AAAA
+                } else {
+                    0xBBBB_BBBB_BBBB_BBBB
+                };
+                register_test_brain(&mut world, factory_digest);
+                Ok(world)
+            },
+            |_meta| None,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ArchipelagoError::IncompatibleIslands {
+                    island: IslandId(1),
+                    field: "brain_registry_contract",
+                    ..
+                })
+            ),
+            "identical (key, kind) descriptors with different factory \
+             construction state must be rejected by the registry-lane check"
+        );
+    }
+
+    /// The bead's full-scale E2E: four heterogeneous islands, 2,000 ticks,
+    /// headless. Ignored in the fast lane; DSR runs it explicitly. The
+    /// exactly-one-storage-file half of the bead's E2E requires the storage
+    /// funnel and is owned by bd-16g.5.5.
+    #[test]
+    #[ignore = "DSR long lane: 4 heterogeneous islands to tick 2000"]
+    fn dsr_heterogeneous_islands_reach_tick_two_thousand_headless() {
+        let island_specs: Vec<IslandSpec> = (0..4)
+            .map(|id| {
+                let mut config = populated_config(None);
+                config.food_growth_rate = 0.02f32.mul_add(f32::from(id), 0.01);
+                spec(id, config)
+            })
+            .collect();
+        let mut archipelago = populated_archipelago(archipelago_config(island_specs, 250))
+            .expect("heterogeneous archipelago");
+
+        for _ in 0..8 {
+            archipelago.step_to_barrier().expect("barrier");
+        }
+        assert_eq!(archipelago.barrier_tick(), Tick(2_000));
+        assert_eq!(archipelago.epoch(), 8);
+        assert!(archipelago.latched().is_none());
+
+        let mut digests = Vec::new();
+        for id in 0..4_u16 {
+            let snapshot = archipelago
+                .island_snapshot(IslandId(id))
+                .expect("committed snapshot");
+            assert_eq!(snapshot.world.tick, 2_000, "island {id} tick count");
+            assert!(
+                snapshot.world.summary.agent_count > 0,
+                "island {id} must remain populated"
+            );
+            digests.push(
+                archipelago
+                    .island_digest(IslandId(id))
+                    .expect("island digest")
+                    .overall,
+            );
+        }
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(digests.len(), 4, "islands must evolve distinct science");
     }
 
     #[test]
