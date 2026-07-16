@@ -18862,6 +18862,7 @@ impl WorldState {
     }
 
     /// Trusted internal removal path for simulation cleanup and invariant tests.
+    #[cfg(test)]
     fn remove_agent(&mut self, id: AgentId) -> Option<AgentData> {
         self.runtime.remove(id);
         self.identities.remove(id);
