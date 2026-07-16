@@ -56,11 +56,16 @@ pub fn largest_shift(series: &[f64], min_segment: usize) -> Option<ChangePoint> 
     let total = prefix[n];
 
     let mut best: Option<ChangePoint> = None;
-    for k in min_segment..=(n - min_segment) {
+    for (k, &prefix_at_k) in prefix
+        .iter()
+        .enumerate()
+        .take((n - min_segment) + 1)
+        .skip(min_segment)
+    {
         #[allow(clippy::cast_precision_loss)]
-        let before_mean = prefix[k] / k as f64;
+        let before_mean = prefix_at_k / k as f64;
         #[allow(clippy::cast_precision_loss)]
-        let after_mean = (total - prefix[k]) / (n - k) as f64;
+        let after_mean = (total - prefix_at_k) / (n - k) as f64;
         let shift = after_mean - before_mean;
         // Strictly-greater keeps the EARLIEST split among ties, which is deterministic and the
         // conventional choice (report the onset, not a later equivalent split).

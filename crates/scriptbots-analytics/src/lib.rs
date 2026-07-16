@@ -479,6 +479,84 @@ struct ChangepointRow {
     significant_fdr: bool,
 }
 
+struct ChangepointCandidate {
+    metric: String,
+    change_tick: u64,
+    shift: f64,
+    before_mean: f64,
+    after_mean: f64,
+    certification: certify::EventCertification,
+}
+
+fn certify_metric_changepoints(
+    by_metric: BTreeMap<String, Vec<(u64, f64)>>,
+    window: usize,
+    cert_params: &certify::CertificationParams,
+) -> Result<Vec<ChangepointCandidate>, AnalyticsError> {
+    let mut candidates = Vec::new();
+    for (metric, mut points) in by_metric {
+        points.sort_by_key(|(tick, _)| *tick);
+        let series: Vec<f64> = points.iter().map(|(_, value)| *value).collect();
+        let Some(cp) = changepoint::largest_shift(&series, window) else {
+            continue;
+        };
+        let certification = certify::certify_event(&series, cp.index, cert_params)
+            .map_err(|error| metric_stats_error(&error))?;
+        candidates.push(ChangepointCandidate {
+            metric,
+            change_tick: points[cp.index].0,
+            shift: cp.shift,
+            before_mean: cp.before_mean,
+            after_mean: cp.after_mean,
+            certification,
+        });
+    }
+    Ok(candidates)
+}
+
+fn render_changepoints_markdown(machine: &ChangepointsMachine) -> String {
+    let mut md = String::new();
+    let _ = writeln!(md, "# Metric change-points\n");
+    if machine.truncated {
+        let _ = writeln!(
+            md,
+            "> **Note:** the metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; early \
+             history was not analysed and a shift in it is not reported here.\n"
+        );
+    }
+    let _ = writeln!(
+        md,
+        "_window={}, FDR={}, {} of {} metrics show a certified regime shift._\n",
+        machine.window, machine.fdr, machine.significant, machine.metrics_examined
+    );
+    if machine.changepoints.is_empty() {
+        let _ = writeln!(
+            md,
+            "_No metric series was long enough to certify a change-point._"
+        );
+        return md;
+    }
+
+    let _ = writeln!(md, "| metric | tick | shift | p | 95% CI | d | δ | real? |");
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
+    for row in &machine.changepoints {
+        let _ = writeln!(
+            md,
+            "| {} | {} | {:+.4} | {:.4} | [{:.3}, {:.3}] | {:.3} | {:.3} | {} |",
+            row.metric,
+            row.change_tick,
+            row.shift,
+            row.p_value,
+            row.ci_lower,
+            row.ci_upper,
+            row.cohens_d,
+            row.cliffs_delta,
+            if row.significant_fdr { "yes" } else { "no" },
+        );
+    }
+    md
+}
+
 impl Report for MetricChangepoints {
     fn name(&self) -> &'static str {
         "metric-changepoints"
@@ -528,35 +606,9 @@ impl Report for MetricChangepoints {
             ..certify::CertificationParams::default()
         };
 
-        // First pass: locate and certify one change-point per eligible metric. The window equals
-        // `min_segment`, so a shift found by `largest_shift(series, window)` always leaves a full
-        // `window` of samples on each side — `certify_event` can never see an out-of-range window.
-        struct Candidate {
-            metric: String,
-            change_tick: u64,
-            shift: f64,
-            before_mean: f64,
-            after_mean: f64,
-            certification: certify::EventCertification,
-        }
-        let mut candidates: Vec<Candidate> = Vec::new();
-        for (metric, mut points) in by_metric {
-            points.sort_by_key(|(tick, _)| *tick);
-            let series: Vec<f64> = points.iter().map(|(_, value)| *value).collect();
-            let Some(cp) = changepoint::largest_shift(&series, window) else {
-                continue; // too short to admit a certified change-point
-            };
-            let certification = certify::certify_event(&series, cp.index, &cert_params)
-                .map_err(|e| metric_stats_error(&e))?;
-            candidates.push(Candidate {
-                metric,
-                change_tick: points[cp.index].0,
-                shift: cp.shift,
-                before_mean: cp.before_mean,
-                after_mean: cp.after_mean,
-                certification,
-            });
-        }
+        // The window doubles as `min_segment`, so every located shift leaves a full certification
+        // window on both sides and `certify_event` cannot see an out-of-range window.
+        let candidates = certify_metric_changepoints(by_metric, window, &cert_params)?;
 
         // Second pass: Benjamini-Hochberg across every metric's p-value at once.
         let p_values: Vec<f64> = candidates.iter().map(|c| c.certification.p_value).collect();
@@ -592,44 +644,7 @@ impl Report for MetricChangepoints {
             changepoints: rows,
         };
 
-        let mut md = String::new();
-        let _ = writeln!(md, "# Metric change-points\n");
-        if machine.truncated {
-            let _ = writeln!(
-                md,
-                "> **Note:** the metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; early \
-                 history was not analysed and a shift in it is not reported here.\n"
-            );
-        }
-        let _ = writeln!(
-            md,
-            "_window={}, FDR={}, {} of {} metrics show a certified regime shift._\n",
-            machine.window, machine.fdr, machine.significant, machine.metrics_examined
-        );
-        if machine.changepoints.is_empty() {
-            let _ = writeln!(
-                md,
-                "_No metric series was long enough to certify a change-point._"
-            );
-        } else {
-            let _ = writeln!(md, "| metric | tick | shift | p | 95% CI | d | δ | real? |");
-            let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
-            for row in &machine.changepoints {
-                let _ = writeln!(
-                    md,
-                    "| {} | {} | {:+.4} | {:.4} | [{:.3}, {:.3}] | {:.3} | {:.3} | {} |",
-                    row.metric,
-                    row.change_tick,
-                    row.shift,
-                    row.p_value,
-                    row.ci_lower,
-                    row.ci_upper,
-                    row.cohens_d,
-                    row.cliffs_delta,
-                    if row.significant_fdr { "yes" } else { "no" },
-                );
-            }
-        }
+        let md = render_changepoints_markdown(&machine);
 
         let output = base_output(
             self.name(),
