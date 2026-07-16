@@ -1011,7 +1011,7 @@ database contains more than one, and run discovery is a bounded, structurally
 validated catalog page rather than an unbounded scan.
 
 Production startup now materializes the seed before world construction, then
-registers the complete canonical V2 manifest before persistence is bound or
+registers the complete canonical V3 manifest before persistence is bound or
 tick zero can run. It stores independently verified projections for
 scenario identity, config digest, RNG, brain roster, build/source/toolchain,
 features, target, and bootstrap evidence. Recovery recomputes every stored
@@ -1975,17 +1975,17 @@ Writer errors, queue bounds, flush, and cancellation belong to the runtime/stora
 Completion evidence:
 
 - `AgentUid` plus deterministic spawn/birth ordinals now cross snapshots, lineage, replay,
-  telemetry, lifecycle records, FrankenSQLite rows, analytics, and the V2 run manifest without
+  telemetry, lifecycle records, FrankenSQLite rows, analytics, and the run manifest without
   replacing `AgentId` as the live arena handle;
 - the object-safe `RandomStream` boundary wraps the exact `rand 0.9.5` `SmallRng` behavior with a
   bounded/versioned opaque state envelope, fixed codec golden, differential sampling proof, and
-  serialized continuation tests; named domains and scheduler-independent streams remain deferred;
+  serialized continuation tests; named domains were deliberately deferred to 1.9 and are now live;
 - persistence moved to outbox payload V2 and an exact fresh-run migration 3/4 pair, so an old
   AgentId database is refused rather than silently interpreted as the stable-UID layout; and
 - `GenomeProvenance.parents` remains an explicit legacy placeholder owned by `bd-2z0.3.2`; this
   slice does not half-migrate the later genome/evaluator-state protocol.
 
-**Exit:** downstream brain APIs depend on a real protocol, while the later `fnp-random`/domain-separation decision remains independent.
+**Exit:** downstream brain APIs depend on a real protocol, while the later domain-separation decision remains independently reviewable.
 
 #### 1.6 brain genome/evaluator-state protocol [Completed — `bd-2z0.3.2`]
 
@@ -2039,6 +2039,9 @@ claim that world integration early.
 - [Completed — `bd-2z0.3.14`, `1387939`, DSR `bd-2z0-3-14-verify-7`] Make every dense agent
   execution and spawn stage canonical by `AgentUid`, then advance the digest schema before
   retiring the explicit execution-order lane;
+- [Currently In Progress — `bd-2cd1`] Advance the digest and six-point trace to V1.3 with a
+  strict fixed-object hash for all six restorable random-domain checkpoints; advance the run
+  manifest to V3/V3.1 so root seed and continuation state cannot be collapsed back into one stream;
 - include genome, evaluator state, RNG state, config, terrain/food, spawn ordinals, and all future-affecting counters;
 - [Completed — `bd-2z0.3.13`] Opt-in clock-free trace with exactly six semantic checkpoints,
   separate world/deferred-work/output/resource lanes, pre-consumption death/spawn queues,
@@ -2053,10 +2056,14 @@ claim that world integration early.
 
 #### 1.9 domain-separated RNG and `fnp-random` decision [Currently In Progress — `bd-2cd1`, TopazCastle, 2026-07-15]
 
-- benchmark/integrate or reject pinned `fnp-random` adapter;
-- domain-separated streams;
-- checkpoint states;
-- permutation/noninteraction tests.
+- [Completed — `bd-2z0.3.10`] Reject pinned `fnp-random`: its nightly-only, non-WASM contract
+  does not serve this project's C++ parity oracle; retain the pinned `SmallRngStream` protocol;
+- [Currently In Progress — `bd-2cd1`] Route every world stochastic boundary through one of six
+  explicit global domains, persist a strict fixed six-field checkpoint, and expose every domain
+  independently in the canonical digest;
+- [Tracked — `bd-1kxd`, depends on `bd-2cd1`] Replace shared agent-affecting domain consumption
+  with stable agent-keyed/counter substreams and prove dense-permutation and distant-agent
+  noninteraction. Six global domains solve cross-domain draw coupling, not per-agent coupling.
 
 **Exit:** unrelated agent insertion or analytics cadence does not perturb existing agent streams.
 

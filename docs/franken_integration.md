@@ -109,7 +109,7 @@ release-packaging obligation: bd-2z0.13.6).
    scopes every scientific and operational row. Writers own one run; append is
    atomic and allowed only after prior runs are fully durable. Multi-run reads
    select a run explicitly, catalog discovery is bounded and structurally
-   validated, recovery revalidates canonical V2/V2.1 manifest projections and
+   validated, recovery revalidates canonical V3/V3.1 manifest projections and
    digests under the writer lease, and V3-V5 files are refused without rewrite
    (`bd-2z0.5.1`).
 10. **Every supported scientific write uses one outbox protocol**: both

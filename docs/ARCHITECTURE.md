@@ -163,9 +163,10 @@ the same derived seed). `RunManifestV3` records the domain-derivation identity a
 stream's algorithm id, so native and browser continuations cannot be confused.
 
 - **Both protocol layers are versioned and self-describing.** `DomainStreamsCheckpoint` carries the
-  root seed, domain-derivation algorithm, mapping codec, and exact named-domain set. Each embedded
-  `RandomStreamState` separately carries its concrete generator id (including the `rand` version)
-  and codec; restore **refuses** either a domain-protocol mismatch or an incompatible stream state.
+  root seed, domain-derivation algorithm, fixed-object codec, and exactly six named domain fields.
+  Each embedded `RandomStreamState` separately carries its concrete generator id (including the
+  `rand` version) and codec; restore **refuses** either a domain-protocol mismatch or an incompatible
+  stream state.
   A `rand` upgrade that changes the generator is therefore a loud, announced act —
   `crates/scriptbots-core/tests/rng_sequence_compat.rs` pins the sequence so the bump fails in a
   test whose subject *is* the dependency, rather than silently moving every digest.
@@ -173,8 +174,8 @@ stream's algorithm id, so native and browser continuations cannot be confused.
   (Environment, Food, Population, Lineage, Mutation, Crossover) from the root seed, via a versioned
   FNV-1a over a *stable string tag* (never the enum discriminant — inserting a variant must not
   re-seed the others). Independent streams mean adding a draw in one domain cannot perturb another,
-  and "same food, different mutation seed" becomes an askable experiment. Core and frontend callers
-  must name the domain at every stochastic boundary; there is no fallback global stream.
+  so changing one domain's draw schedule leaves every other continuation fixed. Core and frontend
+  callers must name the domain at every stochastic boundary; there is no fallback global stream.
 
 **The hashing rule, learned the hard way.** Anything persisted or compared across runs uses a
 **specified** hash (`characterization_fnv1a64` / a pinned FNV-1a), **never** `std::hash::DefaultHasher`
