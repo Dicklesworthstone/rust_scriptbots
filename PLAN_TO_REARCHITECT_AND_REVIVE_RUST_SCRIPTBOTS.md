@@ -2031,7 +2031,7 @@ claim that world integration early.
 
 **Exit:** a multi-generation fixture proves real brain genomes evolve and every child is bound.
 
-#### 1.8 canonical digest and checkpoint skeleton [Digest oracle and RNG-aware manifest completed — `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; checkpoint envelope remains — `bd-3n7p`]
+#### 1.8 canonical digest and checkpoint skeleton [Digest oracle and RNG-aware manifest completed — `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; checkpoint envelope currently in progress — `bd-3n7p`, TopazCastle, 2026-07-16]
 
 - [Completed — `bd-2z0.3.13`] Canonical `scriptbots.world-digest.v1.1`: stable-UID
   science lanes, explicit current dense execution-order lane, evaluator/factory coverage,
@@ -2050,9 +2050,9 @@ claim that world integration early.
   typed capture errors, first-divergence lookup, an aggregate trace hash, and strict decoded-wire
   validation. The literal golden remains confined to a pinned DSR-only environment guard rather
   than a Cargo feature, so generic `--all-features` testing remains portable;
-- [Tracked — `bd-3n7p`, depends on `bd-2cd1`] Add the versioned checkpoint envelope/codec that
+- [Currently In Progress — `bd-3n7p`, depends on `bd-2cd1`] Add the versioned checkpoint envelope/codec that
   can restore the complete future-affecting world state;
-- [Tracked — `bd-3n7p`] Add encode/decode idempotence and lane-by-lane restore fixtures over an
+- [Currently In Progress — `bd-3n7p`] Add encode/decode idempotence and lane-by-lane restore fixtures over an
   evolved world;
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical V3/V3.1 with the fixed
   six-domain continuation object.
