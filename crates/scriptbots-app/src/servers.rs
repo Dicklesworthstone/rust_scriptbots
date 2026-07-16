@@ -1059,6 +1059,28 @@ impl IntoResponse for AppError {
     }
 }
 
+/// Run a world-lock-taking control operation on the blocking thread pool.
+///
+/// Every `ControlHandle` read or mutation may contend on the world mutex with
+/// the simulation driver, which holds it for a full scientific tick at a time.
+/// Calling such an operation directly from a handler parks a tokio async
+/// worker on a blocking lock; with one slow tick and `num_cpus` concurrent
+/// clients the entire control plane (REST, Swagger, and MCP) freezes (bd-134).
+/// A parked blocking-pool thread is cheap and bounded; a parked async worker
+/// is the event loop.
+async fn run_control<T, F>(operation: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, ControlError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|join_error| {
+            AppError::internal(format!("control operation task failed: {join_error}"))
+        })?
+        .map_err(AppError::from)
+}
+
 #[utoipa::path(
     get,
     path = "/api/knobs",
@@ -1066,7 +1088,7 @@ impl IntoResponse for AppError {
     responses((status = 200, body = [KnobEntry]))
 )]
 async fn get_knobs(State(state): State<ApiState>) -> Result<Json<Vec<KnobEntry>>, AppError> {
-    let mut knobs = state.handle.list_knobs()?;
+    let mut knobs = run_control(move || state.handle.list_knobs()).await?;
     knobs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Json(knobs))
 }
@@ -1078,7 +1100,7 @@ async fn get_knobs(State(state): State<ApiState>) -> Result<Json<Vec<KnobEntry>>
     responses((status = 200, body = ConfigSnapshot))
 )]
 async fn get_config(State(state): State<ApiState>) -> Result<Json<ConfigSnapshot>, AppError> {
-    let snapshot = state.handle.snapshot()?;
+    let snapshot = run_control(move || state.handle.snapshot()).await?;
     Ok(Json(snapshot))
 }
 
@@ -1092,7 +1114,7 @@ async fn get_config(State(state): State<ApiState>) -> Result<Json<ConfigSnapshot
 async fn get_latest_tick_summary(
     State(state): State<ApiState>,
 ) -> Result<Json<TickSummaryDto>, AppError> {
-    let summary = state.handle.latest_summary()?;
+    let summary = run_control(move || state.handle.latest_summary()).await?;
     Ok(Json(summary.into()))
 }
 
@@ -1108,7 +1130,7 @@ async fn get_latest_tick_summary(
 async fn get_hydrology_snapshot(
     State(state): State<ApiState>,
 ) -> Result<Json<HydrologySnapshot>, AppError> {
-    match state.handle.hydrology_snapshot()? {
+    match run_control(move || state.handle.hydrology_snapshot()).await? {
         Some(snapshot) => Ok(Json(snapshot)),
         None => Err(AppError::not_found("hydrology state unavailable")),
     }
@@ -1129,13 +1151,17 @@ async fn stream_ticks_sse(
         IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).then(move |_| {
             let handle = handle.clone();
             async move {
-                let event = match handle.latest_summary() {
-                    Ok(summary) => {
+                // Poll on the blocking pool: a contended world mutex must park
+                // a blocking thread, never this stream's async worker (bd-134).
+                let summary =
+                    tokio::task::spawn_blocking(move || handle.latest_summary()).await;
+                let event = match summary {
+                    Ok(Ok(summary)) => {
                         let json = serde_json::to_string(&TickSummaryDto::from(summary))
                             .unwrap_or_else(|_| "{}".to_string());
                         Event::default().data(json)
                     }
-                    Err(_) => Event::default().data("{}"),
+                    Ok(Err(_)) | Err(_) => Event::default().data("{}"),
                 };
                 Ok::<Event, Infallible>(event)
             }
@@ -1151,10 +1177,7 @@ async fn stream_ticks_sse(
     responses((status = 200, description = "ASCII screenshot", content_type = "text/plain"))
 )]
 async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, AppError> {
-    let text = state
-        .handle
-        .ascii_map()
-        .map_err::<AppError, _>(|e| e.into())?;
+    let text = run_control(move || state.handle.ascii_map()).await?;
     Ok((StatusCode::OK, text).into_response())
 }
 
@@ -1166,10 +1189,9 @@ async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, App
     responses((status = 200, description = "PNG screenshot", content_type = "image/png"))
 )]
 async fn screenshot_png(State(state): State<ApiState>) -> Result<Response, AppError> {
-    let bytes = state
-        .handle
-        .snapshot_png(1024, 576)
-        .map_err::<AppError, _>(|e| e.into())?;
+    // Rasterization is CPU-heavy on top of the lock acquisition, so the whole
+    // operation belongs on the blocking pool (bd-134).
+    let bytes = run_control(move || state.handle.snapshot_png(1024, 576)).await?;
     Ok((StatusCode::OK, axum::body::Bytes::from(bytes)).into_response())
 }
 
@@ -1186,13 +1208,17 @@ async fn stream_ticks_ndjson(State(state): State<ApiState>) -> Result<Response, 
         IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).then(move |_| {
             let handle = handle.clone();
             async move {
-                let line = match handle.latest_summary() {
-                    Ok(summary) => {
+                // Poll on the blocking pool: a contended world mutex must park
+                // a blocking thread, never this stream's async worker (bd-134).
+                let summary =
+                    tokio::task::spawn_blocking(move || handle.latest_summary()).await;
+                let line = match summary {
+                    Ok(Ok(summary)) => {
                         let json = serde_json::to_string(&TickSummaryDto::from(summary))
                             .unwrap_or_else(|_| "{}".to_string());
-                        format!("{}\n", json)
+                        format!("{json}\n")
                     }
-                    Err(_) => "{}\n".to_string(),
+                    Ok(Err(_)) | Err(_) => "{}\n".to_string(),
                 };
                 Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(line))
             }
@@ -1221,7 +1247,7 @@ async fn get_events_tail(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(32);
-    let events = state.handle.events_tail(limit)?;
+    let events = run_control(move || state.handle.events_tail(limit)).await?;
     Ok(Json(events))
 }
 
@@ -1240,7 +1266,7 @@ async fn get_scoreboard(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10);
-    let board = state.handle.compute_scoreboard(limit)?;
+    let board = run_control(move || state.handle.compute_scoreboard(limit)).await?;
     Ok(Json(board))
 }
 
@@ -1286,12 +1312,13 @@ async fn get_agents_debug(
         };
     }
 
-    let mut agents: Vec<AgentDebugEntryDto> = state
-        .handle
-        .debug_agents(query.clone())?
-        .into_iter()
-        .map(AgentDebugEntryDto::from)
-        .collect();
+    let query_for_world = query.clone();
+    let mut agents: Vec<AgentDebugEntryDto> =
+        run_control(move || state.handle.debug_agents(query_for_world))
+            .await?
+            .into_iter()
+            .map(AgentDebugEntryDto::from)
+            .collect();
     // Ensure deterministic ordering and explicit tie-breaks
     match query.sort {
         AgentDebugSort::EnergyDesc => agents.sort_by(|a, b| {
@@ -1337,7 +1364,7 @@ async fn post_selection(
     Json(body): Json<SelectionUpdateRequestBody>,
 ) -> Result<(StatusCode, Json<SelectionAcknowledge>), AppError> {
     let update: SelectionUpdate = body.into();
-    state.handle.update_selection(update)?;
+    run_control(move || state.handle.update_selection(update)).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(SelectionAcknowledge { queued: true }),
@@ -1358,7 +1385,7 @@ async fn patch_config(
     State(state): State<ApiState>,
     Json(payload): Json<ConfigPatchRequest>,
 ) -> Result<Json<ConfigSnapshot>, AppError> {
-    let snapshot = state.handle.apply_patch(payload.patch)?;
+    let snapshot = run_control(move || state.handle.apply_patch(payload.patch)).await?;
     Ok(Json(snapshot))
 }
 
@@ -1379,7 +1406,7 @@ async fn apply_updates(
     if payload.updates.is_empty() {
         return Err(AppError::bad_request("updates cannot be empty"));
     }
-    let snapshot = state.handle.apply_updates(&payload.updates)?;
+    let snapshot = run_control(move || state.handle.apply_updates(&payload.updates)).await?;
     Ok(Json(snapshot))
 }
 
@@ -1392,9 +1419,8 @@ async fn apply_updates(
 async fn get_config_audit(
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<ConfigAuditEntryView>>, AppError> {
-    let mut entries: Vec<ConfigAuditEntryView> = state
-        .handle
-        .audit()?
+    let mut entries: Vec<ConfigAuditEntryView> = run_control(move || state.handle.audit())
+        .await?
         .into_iter()
         .map(ConfigAuditEntryView::from)
         .collect();
@@ -1430,7 +1456,7 @@ async fn apply_preset(
             payload.name
         )));
     };
-    let snapshot = state.handle.apply_patch(kind.patch())?;
+    let snapshot = run_control(move || state.handle.apply_patch(kind.patch())).await?;
     Ok(Json(snapshot))
 }
 
@@ -1744,18 +1770,18 @@ impl ToolHandler for ControlTool {
                 let kind = PresetKind::from_name(name_value).ok_or_else(|| {
                     McpError::Validation(format!("unknown preset: {}", name_value))
                 })?;
-                let snapshot = self
-                    .handle
-                    .apply_patch(kind.patch())
-                    .map_err(map_control_error)?;
+                let handle = self.handle.clone();
+                let snapshot = run_control_mcp(move || handle.apply_patch(kind.patch())).await?;
                 Ok(make_tool_result(snapshot)?)
             }
             ControlToolKind::ListKnobs => {
-                let knobs = self.handle.list_knobs().map_err(map_control_error)?;
+                let handle = self.handle.clone();
+                let knobs = run_control_mcp(move || handle.list_knobs()).await?;
                 Ok(make_tool_result(knobs)?)
             }
             ControlToolKind::GetConfig => {
-                let snapshot = self.handle.snapshot().map_err(map_control_error)?;
+                let handle = self.handle.clone();
+                let snapshot = run_control_mcp(move || handle.snapshot()).await?;
                 Ok(make_tool_result(snapshot)?)
             }
             ControlToolKind::ApplyUpdates => {
@@ -1769,10 +1795,8 @@ impl ToolHandler for ControlTool {
                 if updates.is_empty() {
                     return Err(McpError::Validation("updates cannot be empty".into()));
                 }
-                let snapshot = self
-                    .handle
-                    .apply_updates(&updates)
-                    .map_err(map_control_error)?;
+                let handle = self.handle.clone();
+                let snapshot = run_control_mcp(move || handle.apply_updates(&updates)).await?;
                 Ok(make_tool_result(snapshot)?)
             }
             ControlToolKind::ApplyPatch => {
@@ -1783,10 +1807,8 @@ impl ToolHandler for ControlTool {
                 if !patch_value.is_object() {
                     return Err(McpError::Validation("patch must be a JSON object".into()));
                 }
-                let snapshot = self
-                    .handle
-                    .apply_patch(patch_value)
-                    .map_err(map_control_error)?;
+                let handle = self.handle.clone();
+                let snapshot = run_control_mcp(move || handle.apply_patch(patch_value)).await?;
                 Ok(make_tool_result(snapshot)?)
             }
         }
@@ -1808,6 +1830,21 @@ where
         structured_content: Some(structured),
         meta: None,
     })
+}
+
+/// MCP twin of [`run_control`]: a contended world mutex parks a blocking-pool
+/// thread instead of the MCP server's async worker (bd-134).
+async fn run_control_mcp<T, F>(operation: F) -> Result<T, McpError>
+where
+    F: FnOnce() -> Result<T, ControlError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|join_error| {
+            McpError::Internal(format!("control operation task failed: {join_error}"))
+        })?
+        .map_err(map_control_error)
 }
 
 fn map_control_error(err: ControlError) -> McpError {
