@@ -188,9 +188,10 @@ Source of truth: `crates/scriptbots-core/src/lib.rs` (`RandomStream`, `SmallRngS
 
 ---
 
-## 6. The science oracles: characterization digest and `WorldDigestV1`
+## 6. The science oracles and core checkpoint
 
-Two digests decide whether two runs are *the same run*.
+Two digests decide whether two runs are *the same run*. `WorldCheckpointV1` is the bounded
+reconstruction envelope for the core science state whose equality those digests prove.
 
 - `CharacterizationDigestV0` — the original, explicitly legacy oracle. It *declares* its own
   limitations (in `CharacterizationLimitationsV0`, whose `superseded_by` field names
@@ -202,6 +203,13 @@ Two digests decide whether two runs are *the same run*.
   Coverage is part of the output: if a bound brain cannot expose its state,
   `evaluator_state_covered` is false and the family is *named*, so a digest computed while blind can
   never collide with one computed while seeing.
+- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1` Postcard
+  envelope with an unkeyed BLAKE3 corruption checksum, only at an open, persistence-disabled
+  completed boundary with no deferred host output. It carries the complete configuration,
+  stable-UID agents, genome/evaluator state, exact declarative registry roster and allocation
+  cursor, environment/effects/origins, future-affecting counters, and all six RNG continuations.
+  Restore allocates fresh physical `AgentId` values through a caller-prepared exact
+  `BrainRegistry` and rechecks the saved `WorldDigestV1`.
 
 **Rules.**
 
@@ -216,9 +224,17 @@ Two digests decide whether two runs are *the same run*.
 - **Declare limitations; never hide them.** The honest thing v0 did — stating in the manifest what
   it does not cover — is the standard. A digest that quietly skips part of the world is worse than
   one that says it cannot see it.
+- **Checkpoint bytes are data, never executable code, and a core checkpoint is not product
+  resume.** Declarative registry equality does not attest adapter implementation identity, so
+  semantic changes currently rely on honest family schema/codec bumps. The envelope excludes
+  storage/session ownership, retained analytics/history, configuration-audit provenance,
+  UI/render state, and run-bundle discovery; application resume remains Phase 4.1.
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`characterization_digest_v0`,
-`WorldState::world_digest_v1`, `WorldDigestV1`); `RunManifestV3` in `scriptbots-app`.
+`WorldState::world_digest_v1`, `WorldDigestV1`);
+`crates/scriptbots-core/src/checkpoint.rs` (`WorldCheckpointV1`,
+`WorldState::checkpoint_v1`, `WorldState::restore_checkpoint_v1`); `RunManifestV3` in
+`scriptbots-app`.
 
 ---
 

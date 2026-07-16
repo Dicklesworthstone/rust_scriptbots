@@ -2031,7 +2031,7 @@ claim that world integration early.
 
 **Exit:** a multi-generation fixture proves real brain genomes evolve and every child is bound.
 
-#### 1.8 canonical digest and checkpoint skeleton [Digest oracle and RNG-aware manifest completed — `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; checkpoint envelope currently in progress — `bd-3n7p`, TopazCastle, 2026-07-16]
+#### 1.8 canonical digest and checkpoint skeleton [Completed — digest oracle and RNG-aware manifest: `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; core checkpoint: `bd-3n7p`, implementation series `b544705` through `a977cdf`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`, TopazCastle, 2026-07-16]
 
 - [Completed — `bd-2z0.3.13`] Canonical `scriptbots.world-digest.v1.1`: stable-UID
   science lanes, explicit current dense execution-order lane, evaluator/factory coverage,
@@ -2050,14 +2050,16 @@ claim that world integration early.
   typed capture errors, first-divergence lookup, an aggregate trace hash, and strict decoded-wire
   validation. The literal golden remains confined to a pinned DSR-only environment guard rather
   than a Cargo feature, so generic `--all-features` testing remains portable;
-- [Currently In Progress — `bd-3n7p`, depends on `bd-2cd1`] Add the strict
+- [Completed — `bd-3n7p`, `b544705`, `4ef3e8e`, DSR
+  `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`] Added the strict
   `scriptbots.world-checkpoint.v1` core science envelope: bounded canonical Postcard with an
   unkeyed BLAKE3 corruption checksum, exact six-domain RNG continuation, stable `AgentUid`
   identities/counters, environment/effects/origins, full genome provenance, evaluator state, and
   a data-only required-registry roster. Restore allocates fresh physical `AgentId` values and
   requires a caller-prepared exact registry; executable adapters never come from checkpoint data;
-- [Currently In Progress — `bd-3n7p`] Add fail-closed schema/codec/canonicality/size/invariant
-  tests plus encode/decode idempotence and lane-by-lane restore/next-transition fixtures over an
+- [Completed — `bd-3n7p`, `a977cdf`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at
+  `7866550`] Added fail-closed schema/codec/canonicality/size/invariant tests plus encode/decode
+  idempotence and lane-by-lane restore/next-transition fixtures over an
   evolved world with a real birth, death, mutation, evaluator-state change, and recycled slot;
 - [Boundary clarified — `bd-3n7p`] This Phase 1.8 artifact is deliberately core-science-only and
   requires `persistence_interval=0` at an open boundary. It does not restore FrankenSQLite
@@ -2068,8 +2070,8 @@ claim that world integration early.
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical V3/V3.1 with the fixed
   six-domain continuation object.
 
-**Exit (pending `bd-3n7p`):** fixed runs have a canonical first-divergence oracle and checkpoint
-schema before runtime/replay work.
+**Exit (completed — `bd-3n7p`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`):** fixed
+runs have a canonical first-divergence oracle and checkpoint schema before runtime/replay work.
 
 #### 1.9 domain-separated RNG and `fnp-random` decision [Global six-domain cutover completed — `bd-2cd1`, TopazCastle, 2026-07-16; per-agent noninteraction remains — `bd-1kxd`]
 
