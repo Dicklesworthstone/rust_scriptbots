@@ -10,12 +10,14 @@ use fsqlite::{
     migrate::MigrationRunner,
 };
 use scriptbots_core::{
-    AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding, DeathCause, DeathRecord,
-    Generation, PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch,
-    PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope, Tick,
-    WorldPersistence,
+    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding, DeathCause,
+    DeathRecord, Generation, PersistenceAdmissionError, PersistenceAdmissionState,
+    PersistenceBatch, PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind,
+    ReplayRngScope, Tick, WorldPersistence, world_counters_digest_v1,
     ancestry::{AncestryError, AncestryGraph},
-    rng_domains::{DomainStreams, DomainStreamsCheckpoint, RngDomain},
+    rng_domains::{
+        AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain,
+    },
 };
 use scriptbots_runtime::RunId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -609,7 +611,10 @@ const MAX_RUN_LABEL_BYTES: usize = 512;
 const MAX_RUN_IDENTITY_BYTES: usize = 128;
 const MAX_LIVE_RUN_POLICY_BYTES: usize = 256;
 const MAX_MANIFEST_TEXT_BYTES: usize = 64 * 1024;
+const MAX_RUN_AGENT_RNG_COUNTERS: usize = 1_000_000;
 const CONFIG_DIGEST_ENCODING_V1: &str = "blake3-canonical-json-v1";
+const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
+const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.4";
 
 /// Queryable provenance registered atomically before a run may persist tick zero.
 ///
@@ -902,10 +907,15 @@ fn validate_v3_manifest_projection(
     brain_roster: &Value,
 ) -> Result<(), StorageError> {
     let schema = manifest_required_bounded_string(manifest, "/schema", MAX_RUN_LABEL_BYTES)?;
-    if !matches!(
+    if matches!(
         schema,
         "scriptbots.run-manifest.v3" | "scriptbots.run-manifest.v3.2"
     ) {
+        return Err(manifest_projection_error(format!(
+            "/schema is {schema:?}, but that schema is continuation-incomplete; expected {RUN_MANIFEST_V3_SCHEMA:?} or {RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA:?}"
+        )));
+    }
+    if schema != RUN_MANIFEST_V3_SCHEMA && schema != RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA {
         return Err(manifest_projection_error(format!(
             "/schema is {schema:?}, expected a supported V3 manifest"
         )));
@@ -924,13 +934,16 @@ fn validate_v3_manifest_projection(
     require_manifest_projection(manifest, "/root_seed", &json!(record.root_seed))?;
     manifest_required_u64(manifest, "/root_seed")?;
     validate_v3_random_streams(record, manifest)?;
-    for pointer in [
-        "/next_agent_uid",
-        "/next_spawn_ordinal",
-        "/next_birth_ordinal",
-    ] {
-        manifest_required_u64(manifest, pointer)?;
-    }
+    let next_agent_uid = manifest_required_u64(manifest, "/next_agent_uid")?;
+    let next_spawn_ordinal = manifest_required_u64(manifest, "/next_spawn_ordinal")?;
+    let next_birth_ordinal = manifest_required_u64(manifest, "/next_birth_ordinal")?;
+    let launch_counters_digest = validate_v3_agent_rng_continuations(
+        record,
+        manifest,
+        next_agent_uid,
+        next_spawn_ordinal,
+        next_birth_ordinal,
+    )?;
     let bootstrap_ticks = validate_v3_scenario(record, manifest)?;
 
     require_manifest_projection(manifest, "/normalized_config", normalized_config)?;
@@ -966,7 +979,12 @@ fn validate_v3_manifest_projection(
         ));
     }
     validate_v3_limitations(manifest, purpose)?;
-    validate_v3_bootstrap(manifest, schema, bootstrap_ticks)?;
+    validate_v3_bootstrap(
+        manifest,
+        schema,
+        bootstrap_ticks,
+        &launch_counters_digest,
+    )?;
 
     Ok(())
 }
@@ -1141,6 +1159,138 @@ fn validate_v3_random_stream_state(manifest: &Value, domain: &str) -> Result<(),
         }
     }
     Ok(())
+}
+
+fn validate_v3_agent_rng_continuations(
+    record: &RunManifestRecord,
+    manifest: &Value,
+    next_agent_uid: u64,
+    next_spawn_ordinal: u64,
+    next_birth_ordinal: u64,
+) -> Result<String, StorageError> {
+    manifest_require_exact_object_fields(
+        manifest,
+        "/agent_substream_protocol",
+        &[
+            "version",
+            "algorithm",
+            "codec_version",
+            "stream_algorithm",
+            "root_seed",
+        ],
+    )?;
+    manifest_required_u16(manifest, "/agent_substream_protocol/version")?;
+    manifest_required_bounded_string(
+        manifest,
+        "/agent_substream_protocol/algorithm",
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    manifest_required_u16(manifest, "/agent_substream_protocol/codec_version")?;
+    manifest_required_bounded_string(
+        manifest,
+        "/agent_substream_protocol/stream_algorithm",
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    manifest_required_u64(manifest, "/agent_substream_protocol/root_seed")?;
+    let protocol: AgentSubstreamProtocolV1 = serde_json::from_value(
+        manifest_required_value(manifest, "/agent_substream_protocol")?.clone(),
+    )
+    .map_err(|error| {
+        manifest_projection_error(format!(
+            "/agent_substream_protocol cannot be decoded as a strict protocol envelope: {error}"
+        ))
+    })?;
+    protocol.validate(record.root_seed).map_err(|error| {
+        manifest_projection_error(format!("/agent_substream_protocol is incompatible: {error}"))
+    })?;
+
+    let expected_next_agent_uid = next_spawn_ordinal.checked_add(1).ok_or_else(|| {
+        manifest_projection_error("/next_spawn_ordinal has no remaining identity headroom")
+    })?;
+    if next_agent_uid != expected_next_agent_uid {
+        return Err(manifest_projection_error(format!(
+            "/next_agent_uid is {next_agent_uid}, expected /next_spawn_ordinal + 1 ({expected_next_agent_uid})"
+        )));
+    }
+    if next_birth_ordinal > next_spawn_ordinal {
+        return Err(manifest_projection_error(format!(
+            "/next_birth_ordinal is {next_birth_ordinal}, but cannot exceed /next_spawn_ordinal {next_spawn_ordinal}"
+        )));
+    }
+
+    let values = manifest_required_array(manifest, "/agent_rng_counters")?;
+    if values.len() > MAX_RUN_AGENT_RNG_COUNTERS {
+        return Err(manifest_projection_error(format!(
+            "/agent_rng_counters accepts at most {MAX_RUN_AGENT_RNG_COUNTERS} entries"
+        )));
+    }
+    let expected_count = next_agent_uid.saturating_sub(1);
+    let found_count = u64::try_from(values.len()).map_err(|error| {
+        manifest_projection_error(format!(
+            "/agent_rng_counters length cannot be represented as u64: {error}"
+        ))
+    })?;
+    if found_count != expected_count {
+        return Err(manifest_projection_error(format!(
+            "/agent_rng_counters has {found_count} entries, expected one launch continuation for each allocated UID ({expected_count})"
+        )));
+    }
+
+    let mut counters = Vec::with_capacity(values.len());
+    let mut previous_uid = None;
+    for (index, value) in values.iter().enumerate() {
+        let pointer = format!("/agent_rng_counters/{index}");
+        manifest_require_exact_object_fields(
+            manifest,
+            &pointer,
+            &["agent_uid", "counters"],
+        )?;
+        manifest_required_u64(manifest, &format!("{pointer}/agent_uid"))?;
+        manifest_require_exact_object_fields(
+            manifest,
+            &format!("{pointer}/counters"),
+            &["reproduction_attempt", "birth", "brain_initialization"],
+        )?;
+        for field in ["reproduction_attempt", "birth", "brain_initialization"] {
+            manifest_required_u64(manifest, &format!("{pointer}/counters/{field}"))?;
+        }
+        let state: AgentRngCounterStateV1 =
+            serde_json::from_value(value.clone()).map_err(|error| {
+                manifest_projection_error(format!(
+                    "{pointer} cannot be decoded as an agent continuation record: {error}"
+                ))
+            })?;
+        let uid = state.agent_uid().get();
+        if uid == 0 {
+            return Err(manifest_projection_error(format!(
+                "{pointer}/agent_uid cannot use the zero sentinel"
+            )));
+        }
+        if uid >= next_agent_uid {
+            return Err(manifest_projection_error(format!(
+                "{pointer}/agent_uid is {uid}, but /next_agent_uid is {next_agent_uid}"
+            )));
+        }
+        if let Some(previous) = previous_uid
+            && previous >= uid
+        {
+            return Err(manifest_projection_error(format!(
+                "{pointer}/agent_uid is {uid}, but the previous UID is {previous}; records must be strictly ascending"
+            )));
+        }
+        previous_uid = Some(uid);
+        counters.push(state);
+    }
+
+    Ok(world_counters_digest_v1(
+        &protocol,
+        Tick::zero(),
+        0,
+        next_agent_uid,
+        next_spawn_ordinal,
+        next_birth_ordinal,
+        &counters,
+    ))
 }
 
 fn validate_v3_scenario(record: &RunManifestRecord, manifest: &Value) -> Result<u64, StorageError> {
@@ -1444,11 +1594,12 @@ fn validate_v3_bootstrap(
     manifest: &Value,
     schema: &str,
     scenario_bootstrap_ticks: u64,
+    launch_counters_digest: &str,
 ) -> Result<(), StorageError> {
-    if schema == "scriptbots.run-manifest.v3" {
+    if schema == RUN_MANIFEST_V3_SCHEMA {
         if manifest.pointer("/bootstrap_evidence").is_some() {
             return Err(manifest_projection_error(
-                "/bootstrap_evidence is forbidden by scriptbots.run-manifest.v3",
+                "/bootstrap_evidence is forbidden by the base run-manifest schema",
             ));
         }
         return Ok(());
@@ -1469,6 +1620,12 @@ fn validate_v3_bootstrap(
     }
     let start = validate_v3_world_digest(manifest, "/bootstrap_evidence/start")?;
     let end = validate_v3_world_digest(manifest, "/bootstrap_evidence/end")?;
+    if start.counters != launch_counters_digest {
+        return Err(manifest_projection_error(format!(
+            "/bootstrap_evidence/start/counters is {:?}, expected launch counters digest {:?}",
+            start.counters, launch_counters_digest
+        )));
+    }
     if start.tick.0 != 0 {
         return Err(manifest_projection_error(format!(
             "/bootstrap_evidence/start/tick is {}, expected 0",
@@ -9548,6 +9705,7 @@ mod tests {
     use scriptbots_core::{
         AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
         PersistenceEventKind, Position, Tick, TickSummary,
+        rng_domains::AgentRngCountersV1,
     };
     use std::{
         fs,
@@ -9577,6 +9735,80 @@ mod tests {
         let mut manifest = RunManifestRecord::unattributed(run_id);
         manifest.started_at_unix_ms = started_at_unix_ms;
         manifest
+    }
+
+    #[test]
+    fn agent_rng_manifest_projection_is_strict_and_binds_the_launch_digest() {
+        let root_seed = 0xA63E_71C5;
+        let mut record = RunManifestRecord::unattributed(RunId::new(0xA63E_71C5));
+        record.root_seed = root_seed;
+        let protocol = AgentSubstreamProtocolV1::from_root_seed(root_seed);
+        let counters = vec![
+            AgentRngCounterStateV1::new(
+                AgentUid(1),
+                AgentRngCountersV1::from_ordinals(2, 3, 4),
+            ),
+            AgentRngCounterStateV1::new(
+                AgentUid(2),
+                AgentRngCountersV1::from_ordinals(5, 6, 7),
+            ),
+        ];
+        let manifest = json!({
+            "agent_substream_protocol": protocol,
+            "agent_rng_counters": counters,
+        });
+        let digest = validate_v3_agent_rng_continuations(&record, &manifest, 3, 2, 1)
+            .expect("strict continuation projection");
+        assert_eq!(
+            digest,
+            world_counters_digest_v1(
+                &protocol,
+                Tick::zero(),
+                0,
+                3,
+                2,
+                1,
+                &counters,
+            )
+        );
+
+        let mut reordered = manifest.clone();
+        reordered["agent_rng_counters"]
+            .as_array_mut()
+            .expect("counter array")
+            .reverse();
+        let error = validate_v3_agent_rng_continuations(&record, &reordered, 3, 2, 1)
+            .expect_err("reordered UIDs must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("records must be strictly ascending")
+        );
+
+        let mut missing = manifest.clone();
+        missing["agent_rng_counters"]
+            .as_array_mut()
+            .expect("counter array")
+            .pop();
+        let error = validate_v3_agent_rng_continuations(&record, &missing, 3, 2, 1)
+            .expect_err("missing launch continuation must fail");
+        assert!(error.to_string().contains("expected one launch continuation"));
+
+        let mut unknown = manifest.clone();
+        unknown["agent_rng_counters"][0]["counters"]["future_counter"] = json!(0);
+        let error = validate_v3_agent_rng_continuations(&record, &unknown, 3, 2, 1)
+            .expect_err("unknown counter field must fail");
+        assert!(error.to_string().contains("expected exactly"));
+
+        let mut wrong_root = manifest;
+        wrong_root["agent_substream_protocol"]["root_seed"] = json!(root_seed ^ 1);
+        let error = validate_v3_agent_rng_continuations(&record, &wrong_root, 3, 2, 1)
+            .expect_err("protocol root mismatch must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("agent random-substream root seed")
+        );
     }
 
     fn normalized_scientific_schema(

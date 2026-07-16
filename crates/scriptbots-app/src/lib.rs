@@ -3,9 +3,12 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use scriptbots_core::{
-    CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0,
+    AgentRngCounterStateV1, CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0,
     PersistenceAdmissionSession, ScriptBotsConfig, TickEvents, WorldDigestV1,
-    WorldDigestV1ContractError, WorldState, rng_domains::DomainStreamsCheckpoint,
+    WorldDigestV1ContractError, WorldState, world_counters_digest_v1,
+    rng_domains::{
+        AgentSubstreamProtocolError, AgentSubstreamProtocolV1, DomainStreamsCheckpoint,
+    },
 };
 use scriptbots_runtime::RunId;
 pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
@@ -17,9 +20,9 @@ pub type SharedWorld = Arc<Mutex<WorldState>>;
 pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
 /// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
-pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3";
+pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
 /// Compatible V3 minor schema used when a manifest carries adapter-attested bootstrap evidence.
-pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.2";
+pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.4";
 /// Schema identifier for a sequence of V2 world characterization points.
 pub const CHARACTERIZATION_TRACE_V2_SCHEMA: &str = "scriptbots.characterization-trace.v2";
 /// Safety bound for the temporary characterization runner.
@@ -442,6 +445,10 @@ pub struct RunManifestV3 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_evidence: Option<BootstrapEvidenceV0>,
     pub random_streams: DomainStreamsCheckpoint,
+    /// Exact derivation and target-specific generator contract for agent-keyed continuations.
+    pub agent_substream_protocol: AgentSubstreamProtocolV1,
+    /// Live agent-local continuation counters in strict ascending [`scriptbots_core::AgentUid`] order.
+    pub agent_rng_counters: Vec<AgentRngCounterStateV1>,
     pub next_agent_uid: u64,
     pub next_spawn_ordinal: u64,
     pub next_birth_ordinal: u64,
@@ -533,6 +540,112 @@ pub enum RunManifestError {
         /// Root seed carried by the domain-stream checkpoint.
         checkpoint: u64,
     },
+    /// Older V3 minor schemas omit the agent-keyed continuation contract.
+    #[error(
+        "run manifest schema `{found}` is continuation-incomplete; expected `scriptbots.run-manifest.v3.3` or `scriptbots.run-manifest.v3.4`"
+    )]
+    ContinuationIncompleteSchema {
+        /// Legacy schema tag supplied by a caller or decoded record.
+        found: String,
+    },
+    /// The schema tag did not match whether bootstrap evidence is present.
+    #[error("run manifest schema `{found}` does not match expected schema `{expected}`")]
+    Schema {
+        /// Schema tag carried by the manifest.
+        found: String,
+        /// Schema tag required by the manifest's evidence shape.
+        expected: &'static str,
+    },
+    /// The numeric major schema must remain pinned even as minor tags advance.
+    #[error("run manifest schema_version {found} does not match 3")]
+    SchemaVersion {
+        /// Numeric version carried by the manifest.
+        found: u16,
+    },
+    /// Agent-keyed continuation metadata did not match the world root or compiled RNG lane.
+    #[error("invalid agent random-substream protocol: {source}")]
+    AgentSubstreamProtocol {
+        /// Typed protocol mismatch.
+        #[source]
+        source: AgentSubstreamProtocolError,
+    },
+    /// Stable UID and spawn allocation cursors must describe the same next identity.
+    #[error(
+        "next_agent_uid {next_agent_uid} does not equal next_spawn_ordinal {next_spawn_ordinal} plus one"
+    )]
+    AgentIdentitySequence {
+        /// First unallocated stable UID.
+        next_agent_uid: u64,
+        /// First unallocated spawn ordinal.
+        next_spawn_ordinal: u64,
+    },
+    /// Successful births are a subset of all spawns.
+    #[error(
+        "next_birth_ordinal {next_birth_ordinal} exceeds next_spawn_ordinal {next_spawn_ordinal}"
+    )]
+    BirthOrdinalOutOfRange {
+        /// First unallocated birth ordinal.
+        next_birth_ordinal: u64,
+        /// First unallocated spawn ordinal.
+        next_spawn_ordinal: u64,
+    },
+    /// A launch manifest must carry one continuation record for every allocated UID.
+    #[error(
+        "agent_rng_counters has {found} entries, expected one launch continuation for each allocated UID ({expected})"
+    )]
+    AgentRngCounterCount {
+        /// Number of serialized records.
+        found: u64,
+        /// Number implied by the launch identity cursor.
+        expected: u64,
+    },
+    /// A live agent was absent from the world-owned continuation map during manifest capture.
+    #[error("failed to capture live agent random continuations: {source}")]
+    AgentRngCountersCapture {
+        /// Typed characterization failure.
+        #[source]
+        source: CharacterizationError,
+    },
+    /// Agent UID zero is reserved and cannot own continuation state.
+    #[error("agent_rng_counters[{index}].agent_uid cannot use the zero sentinel")]
+    AgentRngCounterUidZero {
+        /// Offending array index.
+        index: usize,
+    },
+    /// Canonical continuation records must be strictly ordered and unique by stable UID.
+    #[error(
+        "agent_rng_counters[{index}].agent_uid is {found}, but the previous UID is {previous}; records must be strictly ascending"
+    )]
+    AgentRngCounterOrder {
+        /// Offending array index.
+        index: usize,
+        /// Previous stable UID.
+        previous: u64,
+        /// Current stable UID.
+        found: u64,
+    },
+    /// A live UID cannot reach or exceed the next unallocated UID.
+    #[error(
+        "agent_rng_counters[{index}].agent_uid is {uid}, but next_agent_uid is {next_agent_uid}"
+    )]
+    AgentRngCounterUidOutOfRange {
+        /// Offending array index.
+        index: usize,
+        /// Stable UID carried by the record.
+        uid: u64,
+        /// First unallocated stable UID.
+        next_agent_uid: u64,
+    },
+    /// Bootstrap start evidence must attest the manifest's exact launch continuation state.
+    #[error(
+        "bootstrap start counters digest `{found}` does not match manifest launch counters digest `{expected}`"
+    )]
+    BootstrapCounterDigestMismatch {
+        /// Digest carried by the bootstrap start boundary.
+        found: String,
+        /// Digest recomputed from the manifest's launch continuation fields.
+        expected: String,
+    },
     #[error("failed to normalize ScriptBots configuration: {0}")]
     ConfigSerialization(#[source] serde_json::Error),
     #[error("failed to encode normalized ScriptBots configuration for its BLAKE3 digest: {0}")]
@@ -604,6 +717,97 @@ pub enum RunManifestError {
 }
 
 impl RunManifestV3 {
+    fn validate_agent_rng_contract(&self) -> Result<(), RunManifestError> {
+        if matches!(
+            self.schema.as_str(),
+            "scriptbots.run-manifest.v3" | "scriptbots.run-manifest.v3.2"
+        ) {
+            return Err(RunManifestError::ContinuationIncompleteSchema {
+                found: self.schema.clone(),
+            });
+        }
+        let expected_schema = if self.bootstrap_evidence.is_some() {
+            RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA
+        } else {
+            RUN_MANIFEST_V3_SCHEMA
+        };
+        if self.schema != expected_schema {
+            return Err(RunManifestError::Schema {
+                found: self.schema.clone(),
+                expected: expected_schema,
+            });
+        }
+        if self.schema_version != 3 {
+            return Err(RunManifestError::SchemaVersion {
+                found: self.schema_version,
+            });
+        }
+        if self.random_streams.root_seed != self.root_seed {
+            return Err(RunManifestError::RandomStreamRootSeedMismatch {
+                manifest: self.root_seed,
+                checkpoint: self.random_streams.root_seed,
+            });
+        }
+        self.agent_substream_protocol
+            .validate(self.random_streams.root_seed)
+            .map_err(|source| RunManifestError::AgentSubstreamProtocol { source })?;
+        if self.next_spawn_ordinal.checked_add(1) != Some(self.next_agent_uid) {
+            return Err(RunManifestError::AgentIdentitySequence {
+                next_agent_uid: self.next_agent_uid,
+                next_spawn_ordinal: self.next_spawn_ordinal,
+            });
+        }
+        if self.next_birth_ordinal > self.next_spawn_ordinal {
+            return Err(RunManifestError::BirthOrdinalOutOfRange {
+                next_birth_ordinal: self.next_birth_ordinal,
+                next_spawn_ordinal: self.next_spawn_ordinal,
+            });
+        }
+        let found = u64::try_from(self.agent_rng_counters.len()).unwrap_or(u64::MAX);
+        let expected = self.next_agent_uid.saturating_sub(1);
+        if found != expected {
+            return Err(RunManifestError::AgentRngCounterCount { found, expected });
+        }
+
+        let mut previous_uid = None;
+        for (index, state) in self.agent_rng_counters.iter().enumerate() {
+            let uid = state.agent_uid().get();
+            if uid == 0 {
+                return Err(RunManifestError::AgentRngCounterUidZero { index });
+            }
+            if uid >= self.next_agent_uid {
+                return Err(RunManifestError::AgentRngCounterUidOutOfRange {
+                    index,
+                    uid,
+                    next_agent_uid: self.next_agent_uid,
+                });
+            }
+            if let Some(previous) = previous_uid
+                && previous >= uid
+            {
+                return Err(RunManifestError::AgentRngCounterOrder {
+                    index,
+                    previous,
+                    found: uid,
+                });
+            }
+            previous_uid = Some(uid);
+        }
+        Ok(())
+    }
+
+    fn launch_counters_digest(&self) -> String {
+        world_counters_digest_v1(
+            &self.agent_substream_protocol,
+            scriptbots_core::Tick::zero(),
+            0,
+            self.next_agent_uid,
+            self.next_spawn_ordinal,
+            self.next_birth_ordinal,
+            &self.agent_rng_counters,
+        )
+    }
+
     /// Project the complete manifest into the storage-owned queryable provenance contract.
     ///
     /// The full canonical manifest remains embedded, while frequently filtered provenance fields
@@ -618,6 +822,7 @@ impl RunManifestV3 {
                 checkpoint: self.random_streams.root_seed,
             });
         }
+        self.validate_agent_rng_contract()?;
         let derived_provenance = validate_build_provenance_claim(&self.build)?;
         if self.reproducible != derived_provenance {
             return Err(RunManifestError::InconsistentReproducibilityClaim {
@@ -735,6 +940,7 @@ impl RunManifestV3 {
         mut self,
         evidence: BootstrapEvidenceV0,
     ) -> Result<Self, RunManifestError> {
+        self.validate_agent_rng_contract()?;
         if self.bootstrap_evidence.is_some() {
             return Err(RunManifestError::BootstrapEvidenceAlreadyAttached);
         }
@@ -787,6 +993,13 @@ impl RunManifestV3 {
                 boundary: "end",
                 source,
             })?;
+        let expected_counters = self.launch_counters_digest();
+        if evidence.start.counters != expected_counters {
+            return Err(RunManifestError::BootstrapCounterDigestMismatch {
+                found: evidence.start.counters.clone(),
+                expected: expected_counters,
+            });
+        }
 
         self.schema = RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA.to_owned();
         self.bootstrap_evidence = Some(evidence);
@@ -844,10 +1057,17 @@ impl RunManifestV3 {
                 checkpoint: random_streams.root_seed,
             });
         }
+        let agent_substream_protocol = world.agent_substream_protocol_v1();
+        agent_substream_protocol
+            .validate(random_streams.root_seed)
+            .map_err(|source| RunManifestError::AgentSubstreamProtocol { source })?;
+        let agent_rng_counters = world
+            .ordered_agent_rng_counters_v1()
+            .map_err(|source| RunManifestError::AgentRngCountersCapture { source })?;
         let (next_agent_uid, next_spawn_ordinal, next_birth_ordinal) =
             world.identity_sequence_state();
 
-        Ok(Self {
+        let manifest = Self {
             schema: RUN_MANIFEST_V3_SCHEMA.to_owned(),
             schema_version: 3,
             purpose: "characterization_only".to_owned(),
@@ -861,6 +1081,8 @@ impl RunManifestV3 {
             config_overrides: Vec::new(),
             bootstrap_evidence: None,
             random_streams,
+            agent_substream_protocol,
+            agent_rng_counters,
             next_agent_uid,
             next_spawn_ordinal,
             next_birth_ordinal,
@@ -873,7 +1095,9 @@ impl RunManifestV3 {
             reproducible,
             warnings,
             limitations: CharacterizationLimitationsV0::default(),
-        })
+        };
+        manifest.validate_agent_rng_contract()?;
+        Ok(manifest)
     }
 
     /// Serialize the manifest to deterministic compact JSON bytes.
@@ -1343,6 +1567,18 @@ mod characterization_tests {
         );
         assert_eq!(manifest.config_digest_encoding, "blake3-canonical-json-v1");
         assert_eq!(manifest.random_streams.root_seed, manifest.root_seed);
+        assert_eq!(
+            manifest.agent_substream_protocol.root_seed(),
+            manifest.root_seed
+        );
+        assert_eq!(
+            manifest
+                .agent_rng_counters
+                .iter()
+                .map(|state| state.agent_uid().get())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
         let encoded = manifest.canonical_json_bytes().expect("manifest JSON");
         let storage_record = manifest.to_storage_record().expect("storage projection");
         assert_eq!(
@@ -1378,6 +1614,8 @@ mod characterization_tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
             [
+                "agent_rng_counters",
+                "agent_substream_protocol",
                 "brain_roster",
                 "build",
                 "config_digest",
@@ -1397,6 +1635,48 @@ mod characterization_tests {
                 "schema_version",
                 "warnings",
             ]
+        );
+        assert_eq!(
+            encoded_value["agent_substream_protocol"]
+                .as_object()
+                .expect("agent substream protocol object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "algorithm",
+                "codec_version",
+                "root_seed",
+                "stream_algorithm",
+                "version",
+            ]
+        );
+        assert_eq!(
+            encoded_value["agent_rng_counters"]
+                .as_array()
+                .expect("agent counter records")
+                .iter()
+                .map(|record| record["agent_uid"].as_u64().expect("counter UID"))
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(
+            encoded_value["agent_rng_counters"][0]
+                .as_object()
+                .expect("agent counter record")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["agent_uid", "counters"]
+        );
+        assert_eq!(
+            encoded_value["agent_rng_counters"][0]["counters"]
+                .as_object()
+                .expect("agent counters object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["birth", "brain_initialization", "reproduction_attempt"]
         );
         assert_eq!(encoded_value["schema"], RUN_MANIFEST_V3_SCHEMA);
         assert_eq!(encoded_value["schema_version"], 3);
@@ -1615,6 +1895,23 @@ mod characterization_tests {
             "bootstrap evidence wire changes require another schema boundary"
         );
 
+        let unrelated_start = test_world(Some(0xB007_57A5))
+            .world_digest_v1()
+            .expect("unrelated valid tick-zero digest");
+        let counters_mismatch = base
+            .clone()
+            .with_bootstrap_evidence(BootstrapEvidenceV0 {
+                requested: 0,
+                completed: 0,
+                start: unrelated_start.clone(),
+                end: unrelated_start,
+            })
+            .expect_err("bootstrap start must bind the manifest's launch counters");
+        assert!(matches!(
+            counters_mismatch,
+            RunManifestError::BootstrapCounterDigestMismatch { .. }
+        ));
+
         let request_mismatch = base
             .clone()
             .with_bootstrap_evidence(BootstrapEvidenceV0 {
@@ -1830,6 +2127,62 @@ mod characterization_tests {
             complete_test_build(),
         )
         .expect("consistent manifest");
+        let mut continuation_incomplete = manifest.clone();
+        continuation_incomplete.schema = "scriptbots.run-manifest.v3".to_owned();
+        let error = continuation_incomplete
+            .to_storage_record()
+            .expect_err("legacy V3 lacks agent-keyed continuation state");
+        assert!(matches!(
+            error,
+            RunManifestError::ContinuationIncompleteSchema { ref found }
+                if found == "scriptbots.run-manifest.v3"
+        ));
+        let mut missing_counter = manifest.clone();
+        missing_counter.agent_rng_counters.pop();
+        let error = missing_counter
+            .to_storage_record()
+            .expect_err("every launch UID requires one continuation record");
+        assert!(matches!(
+            error,
+            RunManifestError::AgentRngCounterCount {
+                found: 1,
+                expected: 2,
+            }
+        ));
+        let mut reordered_counters = manifest.clone();
+        reordered_counters.agent_rng_counters.reverse();
+        let error = reordered_counters
+            .to_storage_record()
+            .expect_err("counter records must remain in strict UID order");
+        assert!(matches!(
+            error,
+            RunManifestError::AgentRngCounterOrder {
+                index: 1,
+                previous: 2,
+                found: 1,
+            }
+        ));
+        let mut mismatched_protocol_json =
+            serde_json::to_value(&manifest).expect("manifest JSON value");
+        mismatched_protocol_json["agent_substream_protocol"]["root_seed"] =
+            serde_json::json!(manifest.root_seed ^ 1);
+        let mismatched_protocol: RunManifestV3 =
+            serde_json::from_value(mismatched_protocol_json).expect("strict protocol shape");
+        let error = mismatched_protocol
+            .to_storage_record()
+            .expect_err("protocol root must match the domain-stream root");
+        assert!(matches!(
+            error,
+            RunManifestError::AgentSubstreamProtocol { .. }
+        ));
+        let mut unknown_counter_field =
+            serde_json::to_value(&manifest).expect("manifest JSON value");
+        unknown_counter_field["agent_rng_counters"][0]["counters"]["future_counter"] =
+            serde_json::json!(0);
+        assert!(
+            serde_json::from_value::<RunManifestV3>(unknown_counter_field).is_err(),
+            "counter records must reject unknown continuation fields"
+        );
         let mut mismatched_streams = manifest.clone();
         mismatched_streams.random_streams.root_seed ^= 1;
         let error = mismatched_streams
