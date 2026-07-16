@@ -35424,55 +35424,58 @@ mod tests {
         // Re-pinned in bd-300o after the CPU sense lane adopted the shared Q20 fixed-point
         // accumulator and poly-acos geometry. Re-pinned again in bd-2i1 after WorldDigest and the
         // trace advanced to V1.6 and default locomotion returned to the exact legacy two-rotation
-        // model. The DSR capture reviewed all six complete lane tuples, not only the final hash.
+        // model. Re-pinned in bd-hiv1 after sensing adopted the prior completed runtime wheel
+        // outputs instead of physical velocity. The DSR capture reviewed all six complete lane
+        // tuples, not only the final hash; transition, output-tail, and resource lanes remained
+        // unchanged while the stage-world and aggregate lanes advanced transitively.
         const EXPECTED: [(&str, &str, &str, &str, &str, &str); 6] = [
             (
                 "sense",
-                "38375d6c988e2052",
+                "0a0d121ea0f472f1",
                 "79c9f653219e2e99",
                 "a5c3391527f7be0f",
                 "15b8ace5445abf68",
-                "43f10b9c41215673",
+                "3547a78fcb8d17ba",
             ),
             (
                 "brains",
-                "4c66879398207e7d",
+                "36540a72ec2bb079",
                 "0784675f322b8c77",
                 "e253563076bd2b5d",
                 "338ece8c58e3aa54",
-                "83981d3ac0dcf1da",
+                "f4b85779233ab1fe",
             ),
             (
                 "actuation",
-                "71287c2dcfbdbc72",
+                "6e06f10730262c8d",
                 "9372d014d2c797ef",
                 "d47fa5d7b8cf2959",
                 "f86a99d091268ea6",
-                "3bf4e85a2ad0fffb",
+                "93789562882bac27",
             ),
             (
                 "food",
-                "24e5d999c18cf8c4",
+                "53bee6a16454250d",
                 "c015084f9ab60410",
                 "fc08078be123d220",
                 "b02ed06b5635e312",
-                "96faf88adc0b194c",
+                "695657518b13ef6f",
             ),
             (
                 "death_cleanup",
-                "24e5d999c18cf8c4",
+                "53bee6a16454250d",
                 "46581b2d02073daa",
                 "9b909fd41eae4aca",
                 "69b3e219fb68f4da",
-                "667416b7d6ce7d52",
+                "d5443a522bc98035",
             ),
             (
                 "population",
-                "68e77898afc15f8c",
+                "3f5b0ac62a7eef37",
                 "ff09abb6bd938d55",
                 "1aad4a0f35a0c69b",
                 "e94c6bb812e4088d",
-                "a6d6458943ebca5f",
+                "a3c9d6740ea1f0d2",
             ),
         ];
         if std::env::var("SCRIPTBOTS_WORLD_DIGEST_GOLDEN").as_deref() == Ok("1") {
@@ -35487,7 +35490,7 @@ mod tests {
             assert_eq!(build.pointer_width, 64);
             assert_eq!(
                 (observed.as_slice(), trace.overall.as_str()),
-                (&EXPECTED[..], "62f2bde434e6d9a9")
+                (&EXPECTED[..], "ca726f9062c140db")
             );
             println!(
                 "scriptbots.world-digest-golden.v1.6: six checkpoints and trace overall {} verified",
