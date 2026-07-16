@@ -23176,10 +23176,7 @@ mod tests {
         assert_eq!(repeated.kind(), "stub");
         assert_eq!(world.tick(), Tick(1));
         assert_eq!(
-            world
-                .agent_runtime(agent)
-                .expect("latched runtime")
-                .outputs,
+            world.agent_runtime(agent).expect("latched runtime").outputs,
             [0.0; OUTPUT_SIZE]
         );
     }
