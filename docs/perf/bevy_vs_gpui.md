@@ -58,13 +58,19 @@ Shortcut: `scripts/run_perf_benchmarks.sh --renderer bevy --scenario dense_agent
 
 ### 3.1 Initial Golden Comparison (GPU-less sanity check)
 
-Using the existing reference PNGs, the difference between the GPUI and Bevy default renders is:
+Using the DSR-reviewed CPU-surrogate reference PNGs regenerated for the
+six-domain RNG cutover (`rust_default.png` SHA-256 `ba75a6d4…779a4fa` and
+`bevy_default.png` SHA-256 `1f68f947…429aef`), the difference is:
 
-- Mean absolute error: **39.64**
-- RMSE: **59.37**
-- Channel MAE (R,G,B): **39.08**, **32.36**, **47.28**
+- Mean absolute error: **58.73**
+- RMSE: **72.66**
+- Channel MAE (R,G,B): **54.79**, **52.50**, **68.89**
 
-These values provide a pre-flight baseline before collecting live runtime numbers. Update this section after regenerating goldens or once new lighting passes land.
+These 8-bit-scale values come from ImageMagick 7 `compare` with alpha disabled
+(`MAE`, `RMSE`, and per-channel `MAE`; normalized results multiplied by 255).
+They are a comparison of the two CPU-surrogate semantic assets, not evidence
+from a GPUI window, Bevy render graph, or GPU framebuffer. Update this section
+after regenerating either golden or once new lighting passes land.
 
 > **Headless environment note (2025-10-31):** Attempting to run the GPUI or Bevy renderers under `WGPU_BACKEND=gl` in this CI/container environment stalls or panics because no presentation surface/device is available. Metrics capture is therefore blocked until we can run on a workstation with a real graphics backend. \
 > Additional 2025-10-31 update: GPUI run (`logs/perf/20251031_default_gui.log`) confirmed the stall. The Bevy build blocker caused by `TerrainChunkStats` field changes has been resolved; benchmarking is now waiting solely on access to a Vulkan-capable workstation (see forthcoming 2025-10-31 BrownSnow update entry).

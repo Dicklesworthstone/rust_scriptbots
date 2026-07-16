@@ -3343,7 +3343,10 @@ The canonical artifact contained exactly ticks `[0,1,2,3,4]`, population recipe
 `75cd2ff76928a8c0`, and `ec0e84c64e13d02a`. It correctly set
 `reproducible: false` with one warning because the shared checkout was dirty.
 The dirty status and tracked diff are themselves fingerprinted; untracked file
-contents remain explicitly outside V0.
+contents remain explicitly outside V0. These five values are historical,
+pre-domain-cutover Characterization V0.0 evidence; the current V0.1 trace uses
+the six-domain protocol and must not be compared to them as though its science
+contract were unchanged.
 
 RCH was healthy but still rejected this `/Users/jemanuel/projects` checkout
 against its `/Volumes/USBNVME16TB/data/projects` canonical root, then attempted
