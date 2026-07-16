@@ -3109,6 +3109,17 @@ impl StorageBuffer {
             && self.replay_events.is_empty()
     }
 
+    /// Total buffered rows across every table, for degraded-close reporting.
+    fn row_count(&self) -> usize {
+        self.ticks.len()
+            + self.metrics.len()
+            + self.events.len()
+            + self.agents.len()
+            + self.births.len()
+            + self.deaths.len()
+            + self.replay_events.len()
+    }
+
     fn clear(&mut self) {
         self.ticks.clear();
         self.metrics.clear();
@@ -7211,9 +7222,45 @@ impl Storage {
     }
 }
 
+impl Storage {
+    /// The one structured line a panic-degraded close leaves behind for post-mortems.
+    ///
+    /// A separate formatter rather than an inline `eprintln!` so a test can pin the
+    /// `panicking=true` marker and the database path without capturing stderr.
+    fn degraded_close_line(&self) -> String {
+        format!(
+            "storage degraded close: panicking=true path={} buffered_rows_abandoned={} \
+             admitted_batches_awaiting_finalize={} last_admitted_batch_id={}; transactional \
+             flush skipped during panic unwinding — batches already admitted to the durable \
+             outbox are replayed and finalized by startup recovery on the next open",
+            self.path,
+            self.buffer.row_count(),
+            self.buffered_outbox_ids.len(),
+            self.buffered_outbox_ids
+                .last()
+                .map_or_else(|| "none".to_owned(), |id| id.as_i64().to_string()),
+        )
+    }
+}
+
 impl Drop for Storage {
     fn drop(&mut self) {
         if self.conn.is_none() {
+            return;
+        }
+        if std::thread::panicking() {
+            // This drop is only running because the thread is ALREADY unwinding. If the
+            // panic originated inside fsqlite mid-transaction, the connection's state is
+            // suspect, and re-entering it with a full transactional flush could panic a
+            // second time — and a panic from a Drop during unwinding aborts the whole
+            // process, taking the renderer and every other thread with it. Close
+            // best-effort instead: batches already admitted to the durable outbox are
+            // finalized by startup recovery, so only the un-admitted in-memory buffer is
+            // abandoned, and the line below says exactly that for the post-mortem.
+            eprintln!("{}", self.degraded_close_line());
+            if let Some(mut connection) = self.conn.take() {
+                connection.close_best_effort_in_place();
+            }
             return;
         }
         if self.terminally_failed {
@@ -12618,6 +12665,94 @@ mod tests {
         assert_eq!(tick_count, 1, "rejected mismatch poisoned the writer");
         storage.close()?;
         Ok(())
+    }
+
+    #[test]
+    fn a_panicking_thread_drops_storage_best_effort_instead_of_aborting() {
+        // Dropping a live Storage used to run a full transactional flush even while the
+        // thread was unwinding from a panic. If that flush panicked too — say the original
+        // panic came from inside fsqlite mid-transaction and the connection state was
+        // inconsistent — the second panic happened inside a Drop during unwinding, which
+        // aborts the entire process. This test COMPLETING is the proof: the drop below
+        // runs during a real unwind and must not re-enter the transactional path.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut storage = Storage::unattributed_memory().expect("open memory storage");
+            storage
+                .persist(&sample_batch(7, 0.7))
+                .expect("admit one batch");
+            storage.flush().expect("apply the admitted batch");
+            storage
+                .persist(&sample_batch(8, 0.8))
+                .expect("buffer a second batch");
+            panic!("simulated worker panic while storage holds a buffered batch");
+        }));
+        assert!(unwound.is_err(), "the simulated panic must actually unwind");
+    }
+
+    #[test]
+    fn a_panic_degraded_close_loses_nothing_the_outbox_admitted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("panic-degraded-close");
+        let path_string = path.to_string_lossy().to_string();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut storage = create_file_storage(&path_string).expect("create file storage");
+            storage
+                .persist(&sample_batch(7, 0.7))
+                .expect("admit the first batch");
+            storage.flush().expect("apply the first batch");
+            storage
+                .persist(&sample_batch(8, 0.8))
+                .expect("admit the second batch without applying it");
+            panic!("simulated worker panic between admission and application");
+        }));
+        assert!(unwound.is_err(), "the simulated panic must actually unwind");
+
+        // The degraded close skipped the transactional flush, so batch 8 sits in the
+        // durable outbox as admitted-but-unapplied. Recovery must replay and finalize it:
+        // the panic cost the process nothing that had been admitted.
+        let reopened = recover_file_storage(&path_string)?;
+        let watermarks = reopened.persistence_watermarks()?;
+        assert!(
+            watermarks.admitted.is_some(),
+            "the degraded close must not erase the admitted watermark"
+        );
+        assert_eq!(
+            watermarks.admitted, watermarks.applied,
+            "recovery must finalize every batch the degraded close left admitted"
+        );
+        let tick_count: i64 = reopened
+            .connection()?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(reopened.run_id)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            tick_count, 2,
+            "both admitted ticks must survive the panic-degraded close"
+        );
+        assert_integrity(&reopened)?;
+        reopened.close()?;
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn the_degraded_close_line_marks_the_panic_and_names_the_database() {
+        // The degraded-close path leaves exactly one line behind for post-mortems, and
+        // tooling filters on its `panicking=true` marker. Pinned via the formatter so the
+        // content is testable without capturing another thread's stderr.
+        let storage = Storage::unattributed_memory().expect("open memory storage");
+        let line = storage.degraded_close_line();
+        assert!(
+            line.contains("panicking=true"),
+            "post-mortems filter on the panicking marker: {line}"
+        );
+        assert!(
+            line.contains(":memory:"),
+            "the degraded-close line must name the database: {line}"
+        );
     }
 
     #[test]
