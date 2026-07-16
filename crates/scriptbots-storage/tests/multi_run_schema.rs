@@ -3,7 +3,8 @@
 use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
-    Generation, MetricSample, PersistenceBatch, Position, Tick, TickSummary,
+    Generation, MetricSample, PersistenceBatch, Position, ScriptBotsConfig, Tick, TickSummary,
+    WorldState,
     rng_domains::DomainStreams,
 };
 use scriptbots_runtime::RunId;
@@ -33,6 +34,23 @@ fn temp_db_path(label: &str) -> String {
 fn random_streams_checkpoint_fixture(root_seed: u64) -> serde_json::Value {
     serde_json::to_value(DomainStreams::from_root_seed(root_seed).checkpoint())
         .expect("fixture domain-stream checkpoint is serializable")
+}
+
+fn world_digest_fixture(root_seed: u64) -> serde_json::Value {
+    let world = WorldState::new(ScriptBotsConfig {
+        world_width: 40,
+        world_height: 40,
+        food_cell_size: 10,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        rng_seed: Some(root_seed),
+        ..ScriptBotsConfig::default()
+    })
+    .expect("digest fixture world");
+    serde_json::to_value(world.world_digest_v1().expect("digest fixture"))
+        .expect("fixture world digest is serializable")
 }
 
 fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunManifestRecord {
@@ -811,6 +829,71 @@ fn v32_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
     let error = manifest_validation_error(missing_evidence);
     assert!(
         error.contains("/bootstrap_evidence is required"),
+        "unexpected error: {error}"
+    );
+
+    let digest = world_digest_fixture(u64::MAX);
+    let mut valid = manifest(run_id, "v32-valid-evidence", 1_700_000_000_024);
+    mutate_manifest(&mut valid, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
+        value["bootstrap_evidence"] = serde_json::json!({
+            "requested": 0,
+            "completed": 0,
+            "start": digest.clone(),
+            "end": digest,
+        });
+    });
+    let mut accepted = StoragePipeline::memory_for_run(valid)
+        .expect("storage accepts complete adapter-attested V3.2 bootstrap evidence");
+    accepted
+        .shutdown()
+        .expect("accepted V3.2 fixture shuts down cleanly");
+
+    let mut foreign_digest_schema = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 6),
+        "v32-foreign-digest-schema",
+        1_700_000_000_025,
+    );
+    let digest = world_digest_fixture(u64::MAX);
+    mutate_manifest(&mut foreign_digest_schema, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
+        value["bootstrap_evidence"] = serde_json::json!({
+            "requested": 0,
+            "completed": 0,
+            "start": digest.clone(),
+            "end": digest,
+        });
+        value["bootstrap_evidence"]["start"]["schema"] =
+            serde_json::json!("scriptbots.world-digest.v1.3");
+    });
+    let error = manifest_validation_error(foreign_digest_schema);
+    assert!(
+        error.contains("/bootstrap_evidence/start violates the WorldDigestV1 contract")
+            && error.contains("world-digest schema"),
+        "unexpected error: {error}"
+    );
+
+    let mut invalid_digest_overall = manifest(
+        RunId::from_namespace_sequence(0xc011_1de0, 7),
+        "v32-invalid-digest-overall",
+        1_700_000_000_026,
+    );
+    let digest = world_digest_fixture(u64::MAX);
+    mutate_manifest(&mut invalid_digest_overall, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
+        value["bootstrap_evidence"] = serde_json::json!({
+            "requested": 0,
+            "completed": 0,
+            "start": digest.clone(),
+            "end": digest,
+        });
+        value["bootstrap_evidence"]["start"]["overall"] =
+            serde_json::json!("0000000000000000");
+    });
+    let error = manifest_validation_error(invalid_digest_overall);
+    assert!(
+        error.contains("/bootstrap_evidence/start violates the WorldDigestV1 contract")
+            && error.contains("world-digest overall"),
         "unexpected error: {error}"
     );
 }

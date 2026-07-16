@@ -238,7 +238,11 @@ impl ScenarioIdentityV0 {
     }
 }
 
-/// Registered brain family recorded in stable key order.
+/// Human-readable registered brain family recorded in stable key order.
+///
+/// This roster is a query/provenance projection, not an executable-semantics attestation. Current
+/// V3.2 bootstrap evidence carries the authoritative adapter-attested registry fingerprint in each
+/// [`WorldDigestV1::brain_registry`] lane; key and kind alone cannot recompute that fingerprint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainRosterEntryV0 {
     pub registry_key: u64,
@@ -309,7 +313,9 @@ pub struct ThreadPolicyV0 {
 ///
 /// Both digests are complete [`WorldDigestV1`] values rather than tick-only claims. The start
 /// boundary is captured from the seeded launch state before any bootstrap transition, and the end
-/// boundary is captured after `completed` persistence-session steps.
+/// boundary is captured after `completed` persistence-session steps. Their `brain_registry` lanes
+/// bind the full adapter identities; [`BrainRosterEntryV0`] remains a deliberately narrower
+/// human-readable projection rather than a second, lossy attestation format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapEvidenceV0 {
     /// Number of bootstrap transitions requested by startup policy.

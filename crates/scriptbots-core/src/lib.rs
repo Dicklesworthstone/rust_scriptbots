@@ -2668,6 +2668,40 @@ pub const WORLD_DIGEST_V1_ALGORITHM: &str = "fnv1a64-v0";
 /// Stable logical identity used by the V1.4 agent lane and transition order.
 pub const WORLD_DIGEST_V1_AGENT_IDENTITY: &str = "AgentUid";
 
+#[derive(Clone, Copy)]
+struct BrainRegistryDigestEntryV1<'a> {
+    key: u64,
+    kind: &'a str,
+    factory_state_digest: Option<u64>,
+    protocol_family: Option<&'a str>,
+    adapter_identity: Option<BrainAdapterIdentityV1>,
+}
+
+fn brain_registry_digest_v1(
+    next_key: u64,
+    entries: impl IntoIterator<Item = BrainRegistryDigestEntryV1<'_>>,
+) -> String {
+    let mut entries = entries.into_iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|entry| entry.key);
+
+    let mut encoder =
+        CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "brain-registry");
+    encoder.u64(next_key);
+    encoder.usize(entries.len());
+    for entry in entries {
+        encoder.u64(entry.key);
+        encoder.string(entry.kind);
+        encoder.option_u64(entry.factory_state_digest);
+        encoder.option_string(entry.protocol_family);
+        encoder.bool(entry.adapter_identity.is_some());
+        if let Some(identity) = entry.adapter_identity {
+            encoder.u32(identity.semantic_version());
+            encoder.bytes(identity.digest());
+        }
+    }
+    encoder.finish()
+}
+
 /// The exact six per-domain hashes carried by [`RngDomainDigestV1`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18259,28 +18293,25 @@ impl WorldState {
         // Registry construction semantics are separate from bound evaluator state. Legacy
         // factories attest captured closure state, while protocol families attest stable adapter
         // behavior. A registration that supplies neither is named as an explicit coverage gap.
-        let mut registrations: Vec<_> = self.brain_registry.entries.iter().collect();
-        registrations.sort_unstable_by_key(|(key, _)| **key);
+        let brain_registry = brain_registry_digest_v1(
+            self.brain_registry.next_key,
+            self.brain_registry
+                .entries
+                .iter()
+                .map(|(key, entry)| BrainRegistryDigestEntryV1 {
+                    key: *key,
+                    kind: entry.kind.as_ref(),
+                    factory_state_digest: entry.factory_state_digest,
+                    protocol_family: entry
+                        .protocol_adapter
+                        .as_ref()
+                        .map(|adapter| adapter.family_id().as_str()),
+                    adapter_identity: entry.adapter_identity,
+                }),
+        );
+
         let mut uncovered_factories: BTreeSet<String> = BTreeSet::new();
-        let mut registry_encoder =
-            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "brain-registry");
-        registry_encoder.u64(self.brain_registry.next_key);
-        registry_encoder.usize(registrations.len());
-        for (key, entry) in registrations {
-            registry_encoder.u64(*key);
-            registry_encoder.string(entry.kind.as_ref());
-            registry_encoder.option_u64(entry.factory_state_digest);
-            registry_encoder.option_string(
-                entry
-                    .protocol_adapter
-                    .as_ref()
-                    .map(|adapter| adapter.family_id().as_str()),
-            );
-            registry_encoder.bool(entry.adapter_identity.is_some());
-            if let Some(identity) = entry.adapter_identity {
-                registry_encoder.u32(identity.semantic_version());
-                registry_encoder.bytes(identity.digest());
-            }
+        for entry in self.brain_registry.entries.values() {
             let construction_semantics_covered = if entry.protocol_adapter.is_some() {
                 entry.adapter_identity.is_some()
             } else {
@@ -18290,7 +18321,6 @@ impl WorldState {
                 uncovered_factories.insert(entry.kind.to_string());
             }
         }
-        let brain_registry = registry_encoder.finish();
 
         let evaluator_state_covered = uncovered.is_empty();
         let uncovered_families: Vec<String> = uncovered.into_iter().collect();
@@ -25807,6 +25837,36 @@ mod tests {
             right.brain_registry.adapter_identity(right_key),
             "the fixture's changed executable behavior must change its attestation"
         );
+
+        let fixture = FixtureBrainFamily::new("identity-fixture");
+        let genome = fixture.genome(2, -1, fixture_provenance());
+        let state = fixture.state(3);
+        let mut left_evaluator = left
+            .brain_registry
+            .family(left_key)
+            .expect("left identity adapter")
+            .evaluator(&genome, &state)
+            .expect("left identity evaluator");
+        let mut right_evaluator = right
+            .brain_registry
+            .family(right_key)
+            .expect("right identity adapter")
+            .evaluator(&genome, &state)
+            .expect("right identity evaluator");
+        let mut sensors = [0.0; INPUT_SIZE];
+        sensors[0] = 4.0;
+        let left_outputs = left_evaluator
+            .evaluate(&sensors)
+            .expect("left identity evaluation");
+        let right_outputs = right_evaluator
+            .evaluate(&sensors)
+            .expect("right identity evaluation");
+        assert_eq!(
+            right_outputs[0],
+            left_outputs[0] + 1.0,
+            "the identity fixture's attested offset must change actual evaluator behavior"
+        );
+        assert_eq!(&right_outputs[1..], &left_outputs[1..]);
 
         let left_digest = left.world_digest_v1().expect("left identity digest");
         let right_digest = right.world_digest_v1().expect("right identity digest");

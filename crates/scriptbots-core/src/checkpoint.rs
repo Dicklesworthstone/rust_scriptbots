@@ -333,6 +333,26 @@ struct BrainRegistryEntryCheckpointV1 {
     protocol_family: Option<BrainFamilyId>,
 }
 
+impl BrainRegistryCheckpointV1 {
+    fn digest_v1(&self) -> String {
+        brain_registry_digest_v1(
+            self.next_key,
+            self.entries
+                .iter()
+                .map(|entry| BrainRegistryDigestEntryV1 {
+                    key: entry.key,
+                    kind: &entry.kind,
+                    factory_state_digest: entry.factory_state_digest,
+                    protocol_family: entry
+                        .protocol_family
+                        .as_ref()
+                        .map(BrainFamilyId::as_str),
+                    adapter_identity: entry.adapter_identity,
+                }),
+        )
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentCheckpointV1 {
@@ -677,6 +697,16 @@ impl WorldCheckpointV1 {
             MAX_CHECKPOINT_ORIGINS,
         )?;
         validate_registry_checkpoint(&state.registry)?;
+        let registry_digest = state.registry.digest_v1();
+        if registry_digest != state.source_digest.brain_registry {
+            return contract_error(
+                "source_digest.brain_registry",
+                format!(
+                    "digest records `{}`, but checkpoint registry recomputes to `{registry_digest}`",
+                    state.source_digest.brain_registry
+                ),
+            );
+        }
         let has_legacy_registry_entry = state
             .registry
             .entries
@@ -3316,10 +3346,11 @@ mod tests {
             )
             .expect("register changed-behavior identity fixture");
         assert_eq!(changed_key, source_key);
+        let changed_identity = changed_registry
+            .adapter_identity(changed_key)
+            .expect("prepared adapter identity");
         assert_ne!(
-            changed_registry
-                .adapter_identity(changed_key)
-                .expect("prepared adapter identity"),
+            changed_identity,
             saved_identity,
             "the fixture's changed evaluator behavior must move its semantic identity"
         );
@@ -3332,6 +3363,40 @@ mod tests {
             prepared_constructions.load(Ordering::Relaxed),
             0,
             "registry identity mismatch must reject before reconstructing any evaluator or agent"
+        );
+
+        let mut tampered = checkpoint.clone();
+        tampered.state.registry.entries[0].adapter_identity = Some(changed_identity);
+        let tampered_wire = encode_unvalidated_state(&tampered.state);
+        assert!(matches!(
+            WorldCheckpointV1::decode(&tampered_wire),
+            Err(WorldCheckpointError::Contract { ref path, .. })
+                if path == "source_digest.brain_registry"
+        ));
+
+        let mut tampered_registry = BrainRegistry::new();
+        assert_eq!(
+            tampered_registry
+                .register_family(
+                    CHECKPOINT_KIND,
+                    boxed_fixture_brain_family_with_behavior_probe(
+                        CHECKPOINT_FAMILY_ID,
+                        1,
+                        Arc::clone(&prepared_constructions),
+                    ),
+                )
+                .expect("register tampered-registry identity fixture"),
+            source_key
+        );
+        assert!(matches!(
+            WorldState::restore_checkpoint_v1(&tampered, tampered_registry),
+            Err(WorldCheckpointError::Contract { ref path, .. })
+                if path == "source_digest.brain_registry"
+        ));
+        assert_eq!(
+            prepared_constructions.load(Ordering::Relaxed),
+            0,
+            "checkpoint self-binding mismatch must reject before reconstructing any evaluator or agent"
         );
     }
 
