@@ -6,7 +6,7 @@
 //! not tell which build, which seed, or which config produced a run directory.
 //!
 //! The current contract is stronger: a base `RunManifestV3` is registered in the
-//! run database before tick zero, and the adjacent V3.2 sidecar supplements that
+//! run database before tick zero, and the adjacent V3.4 sidecar supplements that
 //! durable record with post-bootstrap evidence. These tests drive the real binary
 //! and inspect both records on disk.
 
@@ -17,6 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use scriptbots_app::{
     CHARACTERIZATION_TRACE_V2_SCHEMA, CharacterizationTraceV2, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA,
     RUN_MANIFEST_V3_SCHEMA, RunManifestV3,
+};
+use scriptbots_core::{
+    Tick, rng_domains::AgentSubstreamProtocolV1, world_counters_digest_v1,
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::StorageReader;
@@ -254,7 +257,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     );
     assert_eq!(
         manifest["schema"], RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA,
-        "bootstrap evidence must move the V3 manifest onto its adapter-attested V3.2 schema"
+        "bootstrap evidence must move the V3 manifest onto its adapter-attested V3.4 schema"
     );
     assert_eq!(manifest["schema_version"], 3);
     assert_eq!(manifest["random_streams"]["root_seed"], 4242);
@@ -284,6 +287,78 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
 
     let sidecar: RunManifestV3 = serde_json::from_value(manifest.clone())
         .expect("the supplemental sidecar must satisfy the typed V3 manifest contract");
+    let expected_agent_substream_protocol = AgentSubstreamProtocolV1::from_root_seed(4242);
+    assert_eq!(
+        sidecar.agent_substream_protocol,
+        expected_agent_substream_protocol,
+        "the sidecar must bind the exact target-specific agent-keyed RNG protocol for this seed"
+    );
+    assert_eq!(sidecar.agent_substream_protocol.root_seed(), 4242);
+    assert_eq!(sidecar.agent_substream_protocol.version(), 1);
+    assert_eq!(sidecar.agent_substream_protocol.codec_version(), 1);
+    assert_eq!(
+        sidecar.agent_substream_protocol.algorithm(),
+        "scriptbots.agent-rng-substreams.v1"
+    );
+    assert!(
+        !sidecar
+            .agent_substream_protocol
+            .stream_algorithm()
+            .trim()
+            .is_empty(),
+        "the protocol must name the concrete target-specific random generator"
+    );
+    assert_eq!(sidecar.next_agent_uid, 17);
+    assert_eq!(sidecar.next_spawn_ordinal, 16);
+    assert_eq!(sidecar.next_birth_ordinal, 0);
+    let launch_agent_uids = sidecar
+        .agent_rng_counters
+        .iter()
+        .map(|state| state.agent_uid().get())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        launch_agent_uids,
+        (1_u64..=16).collect::<Vec<_>>(),
+        "the launch continuation rows must be sorted by every founder's stable UID"
+    );
+    for state in &sidecar.agent_rng_counters {
+        let counters = state.counters();
+        assert_eq!(
+            counters.reproduction_attempt_ordinal(),
+            0,
+            "founder {} must not consume a reproduction-attempt substream before tick zero",
+            state.agent_uid().get()
+        );
+        assert_eq!(
+            counters.birth_ordinal(),
+            0,
+            "founder {} must not consume a birth substream before tick zero",
+            state.agent_uid().get()
+        );
+        assert_eq!(
+            counters.brain_initialization_ordinal(),
+            1,
+            "founder {} must record its one startup brain construction",
+            state.agent_uid().get()
+        );
+    }
+    let bootstrap_evidence = sidecar
+        .bootstrap_evidence
+        .as_ref()
+        .expect("the V3.4 sidecar must carry completed bootstrap evidence");
+    let expected_start_counters = world_counters_digest_v1(
+        &sidecar.agent_substream_protocol,
+        Tick::zero(),
+        0,
+        sidecar.next_agent_uid,
+        sidecar.next_spawn_ordinal,
+        sidecar.next_birth_ordinal,
+        &sidecar.agent_rng_counters,
+    );
+    assert_eq!(
+        bootstrap_evidence.start.counters, expected_start_counters,
+        "the bootstrap start digest must bind the exact launch continuation rows and protocol"
+    );
     let run_id_text = manifest["identity"]["run_id"]
         .as_str()
         .expect("the run identity must encode its durable RunId as text");
@@ -418,6 +493,11 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     assert_eq!(pre_tick.identity, sidecar.identity);
     assert_eq!(pre_tick.root_seed, sidecar.root_seed);
     assert_eq!(pre_tick.random_streams, sidecar.random_streams);
+    assert_eq!(
+        pre_tick.agent_substream_protocol,
+        sidecar.agent_substream_protocol
+    );
+    assert_eq!(pre_tick.agent_rng_counters, sidecar.agent_rng_counters);
     assert_eq!(pre_tick.normalized_config, sidecar.normalized_config);
     assert_eq!(pre_tick.build, sidecar.build);
     assert!(

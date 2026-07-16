@@ -4,7 +4,7 @@ use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
     Generation, MetricSample, PersistenceBatch, Position, ScriptBotsConfig, Tick, TickSummary,
-    WorldState, rng_domains::DomainStreams,
+    WorldState,
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
@@ -30,13 +30,18 @@ fn temp_db_path(label: &str) -> String {
         .to_owned()
 }
 
-fn random_streams_checkpoint_fixture(root_seed: u64) -> serde_json::Value {
-    serde_json::to_value(DomainStreams::from_root_seed(root_seed).checkpoint())
-        .expect("fixture domain-stream checkpoint is serializable")
+struct LaunchContinuationFixture {
+    random_streams: serde_json::Value,
+    agent_substream_protocol: serde_json::Value,
+    agent_rng_counters: serde_json::Value,
+    next_agent_uid: u64,
+    next_spawn_ordinal: u64,
+    next_birth_ordinal: u64,
+    world_digest: serde_json::Value,
 }
 
-fn world_digest_fixture(root_seed: u64) -> serde_json::Value {
-    let world = WorldState::new(ScriptBotsConfig {
+fn launch_continuation_fixture(root_seed: u64) -> LaunchContinuationFixture {
+    let mut world = WorldState::new(ScriptBotsConfig {
         world_width: 40,
         world_height: 40,
         food_cell_size: 10,
@@ -47,12 +52,46 @@ fn world_digest_fixture(root_seed: u64) -> serde_json::Value {
         rng_seed: Some(root_seed),
         ..ScriptBotsConfig::default()
     })
-    .expect("digest fixture world");
-    serde_json::to_value(world.world_digest_v1().expect("digest fixture"))
-        .expect("fixture world digest is serializable")
+    .expect("launch continuation fixture world");
+    world
+        .try_spawn_agent(AgentData {
+            position: Position::new(12.0, 34.0),
+            ..AgentData::default()
+        })
+        .expect("fixture founder is finite");
+
+    let random_streams = serde_json::to_value(world.random_streams_checkpoint())
+        .expect("fixture domain-stream checkpoint is serializable");
+    let agent_substream_protocol = serde_json::to_value(world.agent_substream_protocol_v1())
+        .expect("fixture agent-substream protocol is serializable");
+    let agent_rng_counters = serde_json::to_value(
+        world
+            .ordered_agent_rng_counters_v1()
+            .expect("fixture agent counters are complete"),
+    )
+    .expect("fixture agent counters are serializable");
+    let (next_agent_uid, next_spawn_ordinal, next_birth_ordinal) =
+        world.identity_sequence_state();
+    let world_digest = serde_json::to_value(
+        world
+            .world_digest_v1()
+            .expect("fixture launch digest is characterizable"),
+    )
+    .expect("fixture world digest is serializable");
+
+    LaunchContinuationFixture {
+        random_streams,
+        agent_substream_protocol,
+        agent_rng_counters,
+        next_agent_uid,
+        next_spawn_ordinal,
+        next_birth_ordinal,
+        world_digest,
+    }
 }
 
 fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunManifestRecord {
+    let launch = launch_continuation_fixture(u64::MAX);
     let normalized_config = serde_json::json!({
         "agent_count": 1,
         "rng_seed": u64::MAX,
@@ -68,7 +107,7 @@ fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunMani
     let brain_roster_json =
         serde_json::to_string(&brain_roster).expect("fixture brain roster is serializable");
     let manifest_json = serde_json::json!({
-        "schema": "scriptbots.run-manifest.v3",
+        "schema": "scriptbots.run-manifest.v3.3",
         "schema_version": 3,
         "purpose": "characterization_only",
         "identity": {
@@ -85,10 +124,12 @@ fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunMani
             "source": "test-fixture",
             "overridden": null
         },
-        "random_streams": random_streams_checkpoint_fixture(u64::MAX),
-        "next_agent_uid": 2,
-        "next_spawn_ordinal": 1,
-        "next_birth_ordinal": 0,
+        "random_streams": launch.random_streams,
+        "agent_substream_protocol": launch.agent_substream_protocol,
+        "agent_rng_counters": launch.agent_rng_counters,
+        "next_agent_uid": launch.next_agent_uid,
+        "next_spawn_ordinal": launch.next_spawn_ordinal,
+        "next_birth_ordinal": launch.next_birth_ordinal,
         "scenario": {
             "id": "multi-run-schema-proof",
             "schema_version": 1,
@@ -184,10 +225,11 @@ fn mutate_manifest(record: &mut RunManifestRecord, mutate: impl FnOnce(&mut serd
     record.manifest_json = serde_json::to_string(&value).expect("mutated manifest is valid JSON");
 }
 
-fn attach_zero_tick_v32_evidence(record: &mut RunManifestRecord, digest: serde_json::Value) {
+fn attach_zero_tick_v34_evidence(record: &mut RunManifestRecord) {
+    let digest = launch_continuation_fixture(record.root_seed).world_digest;
     record.brain_roster_json = "[]".to_owned();
     mutate_manifest(record, |value| {
-        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.4");
         value["brain_roster"] = serde_json::json!([]);
         value["bootstrap_evidence"] = serde_json::json!({
             "requested": 0,
@@ -398,8 +440,27 @@ fn two_runs_with_overlapping_scientific_and_operational_keys_remain_isolated()
         );
         let manifest_json: serde_json::Value =
             serde_json::from_str(&persisted_manifest.manifest_json)?;
+        assert_eq!(manifest_json["schema"], "scriptbots.run-manifest.v3.3");
         assert_eq!(manifest_json["identity"]["run_id"], run_id.to_string());
         assert_eq!(manifest_json["identity"]["variant_id"], expected_variant);
+        assert_eq!(
+            manifest_json["agent_substream_protocol"]["root_seed"],
+            serde_json::json!(u64::MAX)
+        );
+        assert_eq!(
+            manifest_json["agent_rng_counters"]
+                .as_array()
+                .expect("persisted launch counters")
+                .len(),
+            1
+        );
+        assert_eq!(
+            manifest_json["agent_rng_counters"][0]["agent_uid"],
+            serde_json::json!(1)
+        );
+        assert_eq!(manifest_json["next_agent_uid"], serde_json::json!(2));
+        assert_eq!(manifest_json["next_spawn_ordinal"], serde_json::json!(1));
+        assert_eq!(manifest_json["next_birth_ordinal"], serde_json::json!(0));
         assert_eq!(
             persisted_manifest.source_revision.as_deref(),
             Some("0123456789abcdef")
@@ -791,7 +852,7 @@ fn v3_manifest_binds_domain_checkpoint_metadata_and_rejects_v2() {
 fn v3_manifest_requires_every_random_domain_checkpoint_to_restore() {
     let run_id = RunId::from_namespace_sequence(0xc011_1de0, 7);
 
-    let foreign_checkpoint = random_streams_checkpoint_fixture(7);
+    let foreign_checkpoint = launch_continuation_fixture(7).random_streams;
     let foreign_mutation = foreign_checkpoint["streams"]["mutation"].clone();
     let mut wrong_derived_seed = manifest(run_id, "wrong-derived-seed", 1_700_000_000_030);
     mutate_manifest(&mut wrong_derived_seed, |value| {
@@ -823,21 +884,49 @@ fn v3_manifest_requires_every_random_domain_checkpoint_to_restore() {
 }
 
 #[test]
-fn v32_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
+fn continuation_incomplete_v3_and_v32_manifests_are_refused() {
     let run_id = RunId::from_namespace_sequence(0xc011_1de0, 5);
-    let mut adapter_blind = manifest(run_id, "v31-adapter-blind", 1_700_000_000_022);
-    mutate_manifest(&mut adapter_blind, |value| {
+    let mut legacy_v3 = manifest(run_id, "legacy-v3", 1_700_000_000_022);
+    mutate_manifest(&mut legacy_v3, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3");
+    });
+    let error = manifest_validation_error(legacy_v3);
+    assert!(
+        error.contains("continuation-incomplete")
+            && error.contains("scriptbots.run-manifest.v3.3")
+            && error.contains("scriptbots.run-manifest.v3.4"),
+        "unexpected error: {error}"
+    );
+
+    let mut legacy_v32 = manifest(run_id, "legacy-v32", 1_700_000_000_023);
+    mutate_manifest(&mut legacy_v32, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
+    });
+    let error = manifest_validation_error(legacy_v32);
+    assert!(
+        error.contains("continuation-incomplete")
+            && error.contains("scriptbots.run-manifest.v3.3")
+            && error.contains("scriptbots.run-manifest.v3.4"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn v34_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
+    let run_id = RunId::from_namespace_sequence(0xc011_1de0, 6);
+    let mut unsupported = manifest(run_id, "v31-adapter-blind", 1_700_000_000_024);
+    mutate_manifest(&mut unsupported, |value| {
         value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.1");
     });
-    let error = manifest_validation_error(adapter_blind);
+    let error = manifest_validation_error(unsupported);
     assert!(
         error.contains("expected a supported V3 manifest"),
         "unexpected error: {error}"
     );
 
-    let mut missing_evidence = manifest(run_id, "v32-missing-evidence", 1_700_000_000_023);
+    let mut missing_evidence = manifest(run_id, "v34-missing-evidence", 1_700_000_000_025);
     mutate_manifest(&mut missing_evidence, |value| {
-        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.4");
     });
     let error = manifest_validation_error(missing_evidence);
     assert!(
@@ -845,22 +934,20 @@ fn v32_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
         "unexpected error: {error}"
     );
 
-    let digest = world_digest_fixture(u64::MAX);
-    let mut valid = manifest(run_id, "v32-valid-evidence", 1_700_000_000_024);
-    attach_zero_tick_v32_evidence(&mut valid, digest);
+    let mut valid = manifest(run_id, "v34-valid-evidence", 1_700_000_000_026);
+    attach_zero_tick_v34_evidence(&mut valid);
     let mut accepted = StoragePipeline::memory_for_run(valid)
-        .expect("storage accepts complete adapter-attested V3.2 bootstrap evidence");
+        .expect("storage accepts complete adapter-attested V3.4 bootstrap evidence");
     accepted
         .shutdown()
-        .expect("accepted V3.2 fixture shuts down cleanly");
+        .expect("accepted V3.4 fixture shuts down cleanly");
 
     let mut foreign_digest_schema = manifest(
-        RunId::from_namespace_sequence(0xc011_1de0, 6),
-        "v32-foreign-digest-schema",
-        1_700_000_000_025,
+        RunId::from_namespace_sequence(0xc011_1de0, 7),
+        "v34-foreign-digest-schema",
+        1_700_000_000_027,
     );
-    let digest = world_digest_fixture(u64::MAX);
-    attach_zero_tick_v32_evidence(&mut foreign_digest_schema, digest);
+    attach_zero_tick_v34_evidence(&mut foreign_digest_schema);
     mutate_manifest(&mut foreign_digest_schema, |value| {
         value["bootstrap_evidence"]["start"]["schema"] =
             serde_json::json!("scriptbots.world-digest.v1.3");
@@ -873,12 +960,11 @@ fn v32_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
     );
 
     let mut invalid_registry_lane = manifest(
-        RunId::from_namespace_sequence(0xc011_1de0, 7),
-        "v32-invalid-registry-lane",
-        1_700_000_000_026,
+        RunId::from_namespace_sequence(0xc011_1de0, 8),
+        "v34-invalid-registry-lane",
+        1_700_000_000_028,
     );
-    let digest = world_digest_fixture(u64::MAX);
-    attach_zero_tick_v32_evidence(&mut invalid_registry_lane, digest);
+    attach_zero_tick_v34_evidence(&mut invalid_registry_lane);
     mutate_manifest(&mut invalid_registry_lane, |value| {
         let registry_lane = value["bootstrap_evidence"]["start"]["brain_registry"]
             .as_str()
