@@ -2320,22 +2320,26 @@ mod characterization_tests {
                 // RNG stream to six named domain streams.
                 // Re-pinned when the characterization digest was extended to cover active
                 // interventions. The trajectory itself was unchanged: no intervention is active.
+                // Re-pinned in bd-300o when production sensing moved to the shared Q20 fixed-point
+                // accumulator and poly-acos geometry. Tick zero deliberately remains unchanged.
                 [
                     "9170abeee25b6132",
-                    "465d51c2d5baff86",
-                    "35be0bef875fb7ce",
-                    "e4ab9fb7f2c8e057",
-                    "42f3e7cfd202e12b",
+                    "876c3009186f8816",
+                    "330430a05939febd",
+                    "8ff3e794cc4b5444",
+                    "006b041f86137fe7",
                 ]
                 .map(str::to_owned),
                 // Re-pinned after sensory bearings moved from the host C math library to
                 // deterministic pure-Rust `libm::atan2f`.
+                // Re-pinned again in bd-300o for the reviewed fixed-point sensing cutover;
+                // this seed's tick-zero boundary is likewise byte-identical to the old golden.
                 [
                     "67db1d378a2a6d53",
-                    "fa7277780a43affb",
-                    "694b8a52675e93d2",
-                    "403d0eb4df234203",
-                    "be46adf860b9bfcd",
+                    "32ff710f669b9d3c",
+                    "7af95113c73ed23d",
+                    "1c73dcad44c88561",
+                    "228925dabed18267",
                 ]
                 .map(str::to_owned),
             ]

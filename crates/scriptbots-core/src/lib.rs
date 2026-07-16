@@ -34779,54 +34779,57 @@ mod tests {
                 )
             })
             .collect();
+        // Re-pinned in bd-300o after the CPU sense lane adopted the shared Q20 fixed-point
+        // accumulator and poly-acos geometry. Transition, output-tail, and resource lanes remain
+        // byte-identical; only world state and the derived overall digest move.
         const EXPECTED: [(&str, &str, &str, &str, &str, &str); 6] = [
             (
                 "sense",
-                "7ab9aac66ee4f831",
+                "2cb3af37e334b003",
                 "f7ba7d51724a4e96",
                 "a288ed262733519c",
                 "a9a8a3e653861825",
-                "1deb32793a5d38f7",
+                "b3f26824f7169412",
             ),
             (
                 "brains",
-                "465c153faa0b37d5",
+                "f61c743d6de27c1c",
                 "bb91f8dd38e9542a",
                 "40539ac87ff6d848",
                 "5fbf37cd117e8daf",
-                "e9bb113e17d49a67",
+                "c160089972b372a0",
             ),
             (
                 "actuation",
-                "eb30d61dbd545d74",
+                "83a3d5359bcae2c9",
                 "9bfb039058c4289c",
                 "a8d417184b7c090e",
                 "a147b2dccee4a41b",
-                "d6bedba839837093",
+                "fb8376b16dadbf87",
             ),
             (
                 "food",
-                "5ea2250b12d64db2",
+                "4c0c853fde4adced",
                 "8854c44dab16fe2d",
                 "be9168d1222971d9",
                 "ad3caabd03c562b5",
-                "1ae709d9b77ee099",
+                "284d495528409c54",
             ),
             (
                 "death_cleanup",
-                "5ea2250b12d64db2",
+                "4c0c853fde4adced",
                 "6e2c46d07bcca0d5",
                 "5c3e11d3015258a9",
                 "4d73ffc0cef3d24b",
-                "b3e2afb8d2c03350",
+                "1e7960b87bee6649",
             ),
             (
                 "population",
-                "41ea36738ddc3cfc",
+                "47feaa5a244f3dc2",
                 "5bcaf261789605b0",
                 "9acd9f8b42183152",
                 "1401865a921d6b02",
-                "1afd773c100e71b0",
+                "ad382e25c6259630",
             ),
         ];
         if std::env::var("SCRIPTBOTS_WORLD_DIGEST_GOLDEN").as_deref() == Ok("1") {
@@ -34841,7 +34844,7 @@ mod tests {
             assert_eq!(build.pointer_width, 64);
             assert_eq!(
                 (observed.as_slice(), trace.overall.as_str()),
-                (&EXPECTED[..], "054786603015a261")
+                (&EXPECTED[..], "f8cfe1fa7a548c89")
             );
             println!(
                 "scriptbots.world-digest-golden.v1.5: six checkpoints and trace overall {} verified",
