@@ -525,7 +525,8 @@ Create focused fixtures for:
 
 - eye view direction, FOV falloff, density, and color channels;
 - blood sensor half-FOV and wounded-target scaling;
-- differential-drive heading and movement;
+- [Currently In Progress — `bd-2i1`] exact legacy two-rotation heading/movement by default, with
+  conventional differential drive selectable for experiments;
 - neural output channel mapping;
 - food intake, health/energy changes, and metabolic drains;
 - spike reach, facing, cost, boost, and damage;
@@ -2049,8 +2050,7 @@ claim that world integration early.
   restorable random-domain checkpoints; advanced the base/bootstrap run manifest to V3/V3.1 so
   root seed and continuation state could not be collapsed back into one stream (the adapter
   attestation change above advances the bootstrap minor to V3.2);
-- [Completed through V1.4 — `bd-2z0.3.13`, `bd-2cd1`, `bd-h547`; V1.5 code-first integration
-  currently in progress — `bd-1kxd`] Bind the canonical digest to genome, evaluator state, all six
+- [Completed through V1.5 — `bd-2z0.3.13`, `bd-2cd1`, `bd-h547`, `bd-1kxd`] Bind the canonical digest to genome, evaluator state, all six
   RNG states, config, terrain/food, spawn ordinals, adapter identities, the exact agent-substream
   protocol, and UID-ordered per-agent continuation counters;
 - [Completed — `bd-2z0.3.13`] Opt-in clock-free trace with exactly six semantic checkpoints,
@@ -2085,23 +2085,30 @@ claim that world integration early.
   changes must change the identity; payload interpretation changes must additionally bump the
   family schema/codec. Identity/digest/trace/checkpoint goldens remain deliberately pending the
   centralized DSR batch;
-- [Currently In Progress — `bd-1kxd`, code-first/batch-verify] Advance the canonical science
+- [Completed — `bd-1kxd`, DSR `rust_scriptbots_bd_h547_1kxd_verify-darwin-arm64-run-1784199104-97370`] Advance the canonical science
   surfaces to `scriptbots.world-digest.v1.5`/codec-5,
   `scriptbots.world-step-trace.v1.5`/codec-5, and
   `scriptbots.world-checkpoint.v1.2`/codec-3 with `postcard+blake3-v3`. The digest and trace bind
   `AgentSubstreamProtocolV1` plus counters ordered by stable UID. The checkpoint validates the exact
   protocol and one counter object per saved UID before any evaluator or agent reconstruction;
+- [Currently In Progress — `bd-2i1`, code-first/batch-verify] Advance the current science surfaces
+  to `scriptbots.world-digest.v1.6`/codec-6, `scriptbots.world-step-trace.v1.6`/codec-6, and
+  `scriptbots.world-checkpoint.v1.3`/codec-4 with `postcard+blake3-v4`. The new identities bind the
+  selected `locomotion_model` into future-affecting configuration and prevent legacy-default and
+  differential experiments from sharing a digest or checkpoint contract;
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical base V3 plus the then-current
   V3.1 bootstrap minor with the fixed six-domain continuation object; `bd-h547` advanced that
   bootstrap minor to V3.2 for adapter-attested V1.4 evidence. `bd-1kxd` now advances the canonical
   base to `scriptbots.run-manifest.v3.3` with launch protocol/counters and the bootstrap form to
   `scriptbots.run-manifest.v3.4`, which binds those exact launch values to the tick-zero V1.5
-  digest. This schema movement remains code-first and DSR-pending.
+  digest. `bd-2i1` advances only the bootstrap form to `scriptbots.run-manifest.v3.5` so the
+  selected locomotion model is bound through the tick-zero V1.6 digest. The V3.5 schema movement
+  remains code-first and DSR-pending.
 
 **Exit (completed — `bd-3n7p`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`):** fixed
 runs have a canonical first-divergence oracle and checkpoint schema before runtime/replay work.
 
-#### 1.9 domain-separated RNG and `fnp-random` decision [Currently In Progress — global six-domain cutover completed in `bd-2cd1`; agent-keyed noninteraction implementation and DSR proof pending in `bd-1kxd`]
+#### 1.9 domain-separated RNG and `fnp-random` decision [Completed — global six-domain cutover in `bd-2cd1`; agent-keyed noninteraction and DSR proof in `bd-1kxd`]
 
 - [Completed — `bd-2z0.3.10`] Reject pinned `fnp-random`: its nightly-only, non-WASM contract
   does not serve this project's C++ parity oracle; retain the pinned `SmallRngStream` protocol;
@@ -2585,8 +2592,8 @@ These become separate implementation beads for terrain, camera/input, HUD, and c
 - persist the already-defined canonical manifest/digest schemas;
 - sequenced commands and status transitions;
 - nonempty domain events;
-- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.2`/codec-3
-  `postcard+blake3-v3` science envelope, then
+- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.3`/codec-4
+  `postcard+blake3-v4` science envelope, then
   reconstruct host-owned persistence/session state around the restored core world;
 - checkpoint resume and first-divergence verification.
 
@@ -2712,7 +2719,7 @@ Use RCH for compute-intensive gates when healthy; otherwise run sequentially in 
 | Eyes | center, boundary, outside, rotations, colors, 8+ neighbors, scalar/SIMD |
 | Blood | FOV boundaries, wound scaling, toroidal target |
 | Brain inputs/outputs | typed mapping, range, finite values, known fixtures |
-| Movement | differential drive, boost, wrap, terrain slope |
+| Movement | legacy two-rotation parity, selectable differential drive, boost, wrap, terrain slope |
 | Food/ecology | growth/decay/diffusion/intake, ledger, caps, starvation |
 | Combat | reach/facing/cost/damage, boost channel, death attribution |
 | Reproduction | gates, cost, placement, lineage, genome mutation/crossover, bound evaluator |

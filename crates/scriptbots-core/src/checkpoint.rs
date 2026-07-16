@@ -21,15 +21,15 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
 /// Strict schema carried by the first world checkpoint envelope.
-pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.2";
+pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.3";
 /// Codec revision for [`WorldCheckpointV1`].
 ///
 /// Any serialized field or variant layout, nested live DTO layout, or canonicalization change
 /// requires a codec bump. A change to future-state coverage or field meaning requires a new
 /// checkpoint schema. Never rebless the representative V1 wire golden without reviewing both
 /// version identities.
-pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 3;
-const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v3";
+pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 4;
+const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v4";
 
 /// Maximum complete checkpoint wire accepted by the decoder.
 ///
@@ -205,7 +205,7 @@ pub enum WorldCheckpointError {
     /// The agent-keyed random-substream protocol is foreign or bound to another root.
     #[error(transparent)]
     AgentSubstreamProtocol(#[from] AgentSubstreamProtocolError),
-    /// The embedded V1.5 source digest violated its own contract.
+    /// The embedded V1.6 source digest violated its own contract.
     #[error(transparent)]
     DigestContract(#[from] WorldDigestV1ContractError),
 }
@@ -2493,6 +2493,7 @@ mod tests {
             metabolism_drain: 0.0,
             movement_drain: 0.0,
             bot_speed: 0.0,
+            locomotion_model: LocomotionModel::Differential,
             spike_damage: 0.0,
             spike_energy_cost: 0.0,
             aging_health_decay_rate: 0.0,
@@ -2795,7 +2796,7 @@ mod tests {
                 8_538,
                 "5faae3f2c17ae1e6877ec0f027bdd339566f5a10a9b1880623ccc631d9c4f82b",
             ),
-            "the first DSR batch-verification pass must report and then rebless the reviewed V1.2/codec-3 wire"
+            "the first DSR batch-verification pass must report and then rebless the reviewed V1.3/codec-4 wire"
         );
     }
 
@@ -3096,7 +3097,7 @@ mod tests {
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode private wire fixture");
 
-        wire.schema = "scriptbots.world-checkpoint.v1.1".to_owned();
+        wire.schema = "scriptbots.world-checkpoint.v1.2".to_owned();
         let foreign_schema = postcard::to_allocvec(&wire).expect("foreign schema wire");
         assert!(matches!(
             WorldCheckpointV1::decode(&foreign_schema),
@@ -3114,7 +3115,7 @@ mod tests {
 
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode codec-identity fixture");
-        wire.codec = "postcard+blake3-v2".to_owned();
+        wire.codec = "postcard+blake3-v3".to_owned();
         let foreign_codec_identity =
             postcard::to_allocvec(&wire).expect("foreign codec identity wire");
         assert!(matches!(

@@ -615,7 +615,7 @@ const MAX_CONFIG_OVERRIDE_VALUE_BYTES: usize = 64 * 1024;
 const MAX_RUN_AGENT_RNG_COUNTERS: usize = 1_000_000;
 const CONFIG_DIGEST_ENCODING_V1: &str = "blake3-canonical-json-v1";
 const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
-const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.4";
+const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.5";
 
 /// Queryable provenance registered atomically before a run may persist tick zero.
 ///
@@ -912,6 +912,11 @@ fn validate_v3_manifest_projection(
     brain_roster: &Value,
 ) -> Result<(), StorageError> {
     let schema = manifest_required_bounded_string(manifest, "/schema", MAX_RUN_LABEL_BYTES)?;
+    if schema == "scriptbots.run-manifest.v3.4" {
+        return Err(manifest_projection_error(format!(
+            "/schema is {schema:?}, but that bootstrap schema embeds the superseded WorldDigestV1.5 contract; expected {RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA:?}"
+        )));
+    }
     if matches!(
         schema,
         "scriptbots.run-manifest.v3" | "scriptbots.run-manifest.v3.2"

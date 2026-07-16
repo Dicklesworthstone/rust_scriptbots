@@ -2071,8 +2071,8 @@ impl BrainRegistry {
     ///
     /// The supplied digest must change whenever captured seeds, model bytes, architecture
     /// settings, or other closure state capable of changing a newly spawned brain changes.
-    /// Factories registered through [`Self::register`] remain valid, but V1.4 reports their
-    /// closure state as explicitly uncovered.
+    /// Factories registered through [`Self::register`] remain valid, but V1.4 and later reports
+    /// their closure state as explicitly uncovered.
     pub fn register_with_state_digest<F>(
         &mut self,
         kind: impl Into<Cow<'static, str>>,
@@ -2783,14 +2783,13 @@ pub struct CharacterizationDigestV0 {
 }
 
 /// Schema tag for [`WorldDigestV1`].
-/// V1.5 binds the agent-keyed random-substream protocol and every live UID's future-affecting
-/// continuation counters into the counters lane.
-pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.5";
-/// Wire revision for the canonical V1.5 payload.
-pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 5;
-/// Stable hash algorithm identifier carried by and hashed into V1.5.
+/// V1.6 adds the selected locomotion model to the future-affecting scientific-config lane.
+pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.6";
+/// Wire revision for the canonical V1.6 payload.
+pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 6;
+/// Stable hash algorithm identifier carried by and hashed into V1.6.
 pub const WORLD_DIGEST_V1_ALGORITHM: &str = "fnv1a64-v0";
-/// Stable logical identity used by the V1.5 agent lane and transition order.
+/// Stable logical identity used by the V1.6 agent lane and transition order.
 pub const WORLD_DIGEST_V1_AGENT_IDENTITY: &str = "AgentUid";
 
 #[derive(Clone, Copy)]
@@ -2955,7 +2954,7 @@ pub struct WorldDigestV1 {
     pub agent_identity: String,
 }
 
-/// A decoded V1.5 boundary digest violated its pinned semantic contract.
+/// A decoded V1.6 boundary digest violated its pinned semantic contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorldDigestV1ContractError {
     #[error("world-digest schema `{found}` does not match `{expected}`")]
@@ -3862,6 +3861,26 @@ struct ActuationResult {
     give_intent: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LocomotionStep {
+    heading: f32,
+    velocity: Velocity,
+    position: Position,
+    slope_along: f32,
+    wheel_effort: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocomotionParams {
+    model: LocomotionModel,
+    bot_radius: f32,
+    world_width: f32,
+    world_height: f32,
+    cell_size: f32,
+    topography_enabled: bool,
+    topography_speed_gain: f32,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ActuationDrain {
     basal: f32,
@@ -4289,12 +4308,12 @@ pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
 pub const WORLD_STEP_OUTCOME_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v3";
 
 /// Schema identifier for opt-in per-stage scientific-state digests.
-pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.5";
+pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.6";
 /// Wire revision for the adapter-attested canonical-UID six-point trace payload.
-pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 5;
+pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 6;
 /// Schema identifier for a non-boundary world digest captured during one transition.
 pub const WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA: &str =
-    "scriptbots.world-step-stage-world-digest.v5";
+    "scriptbots.world-step-stage-world-digest.v6";
 
 /// Stable stage identifiers emitted by [`WorldStepProfile`].
 ///
@@ -8315,6 +8334,17 @@ pub struct ConfigAuditEntry {
     pub patch: serde_json::Value,
 }
 
+/// Wheel-output integration models available to the simulation.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocomotionModel {
+    /// Exact two-wheel rotation sequence from the original C++ simulator.
+    #[default]
+    Legacy,
+    /// Conventional differential-drive integration retained for experiments.
+    Differential,
+}
+
 /// Static configuration for a ScriptBots world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScriptBotsConfig {
@@ -8348,8 +8378,11 @@ pub struct ScriptBotsConfig {
     pub sense_max_neighbors: f32,
     /// Base wheel speed produced when outputs saturate.
     pub bot_speed: f32,
-    /// Half the distance between differential wheels (also used for wrapping vision bias).
+    /// Legacy wheel separation and differential-drive half wheelbase, in world units.
     pub bot_radius: f32,
+    /// Kinematics used to integrate wheel outputs into heading and position.
+    #[serde(default)]
+    pub locomotion_model: LocomotionModel,
     /// Multiplier applied when boost output is triggered.
     pub boost_multiplier: f32,
     /// Increment applied to spike length toward its target each tick.
@@ -8538,6 +8571,7 @@ impl Default for ScriptBotsConfig {
             sense_max_neighbors: 12.0,
             bot_speed: 0.3,
             bot_radius: 10.0,
+            locomotion_model: LocomotionModel::Legacy,
             boost_multiplier: 2.0,
             spike_growth_rate: 0.005,
             metabolism_drain: 0.0002,
@@ -13818,6 +13852,133 @@ impl WorldState {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn rotate_vector_ccw(x: f32, y: f32, angle: f32) -> (f32, f32) {
+        let cosine = angle.cos();
+        let sine = angle.sin();
+        (x * cosine - y * sine, x * sine + y * cosine)
+    }
+
+    fn legacy_locomotion_heading(heading: f32, left_speed: f32, right_speed: f32) -> f32 {
+        let mut next_heading = heading - left_speed;
+        if next_heading < -HALF_TURN {
+            next_heading = HALF_TURN - (-HALF_TURN - next_heading);
+        }
+        next_heading += right_speed;
+        if next_heading > HALF_TURN {
+            next_heading = -HALF_TURN + (next_heading - HALF_TURN);
+        }
+        next_heading
+    }
+
+    fn legacy_locomotion_step(
+        position: Position,
+        heading: f32,
+        left_speed: f32,
+        right_speed: f32,
+        bot_radius: f32,
+    ) -> LocomotionStep {
+        let (offset_x, offset_y) =
+            Self::rotate_vector_ccw(bot_radius * 0.5, 0.0, heading + std::f32::consts::FRAC_PI_2);
+        let left_wheel = Position::new(position.x + offset_x, position.y + offset_y);
+        let right_wheel = Position::new(position.x - offset_x, position.y - offset_y);
+
+        let (left_relative_x, left_relative_y) = Self::rotate_vector_ccw(
+            right_wheel.x - position.x,
+            right_wheel.y - position.y,
+            -left_speed,
+        );
+        let after_left = Position::new(
+            right_wheel.x - left_relative_x,
+            right_wheel.y - left_relative_y,
+        );
+
+        let (right_relative_x, right_relative_y) = Self::rotate_vector_ccw(
+            after_left.x - left_wheel.x,
+            after_left.y - left_wheel.y,
+            right_speed,
+        );
+        let next_position = Position::new(
+            left_wheel.x + right_relative_x,
+            left_wheel.y + right_relative_y,
+        );
+
+        LocomotionStep {
+            heading: Self::legacy_locomotion_heading(heading, left_speed, right_speed),
+            velocity: Velocity::new(next_position.x - position.x, next_position.y - position.y),
+            position: next_position,
+            slope_along: 0.0,
+            wheel_effort: (left_speed.abs() + right_speed.abs()) * 0.5,
+        }
+    }
+
+    fn actuation_locomotion(
+        position: Position,
+        heading: f32,
+        mut left_speed: f32,
+        mut right_speed: f32,
+        terrain: &TerrainLayer,
+        params: LocomotionParams,
+    ) -> LocomotionStep {
+        let steering_heading = match params.model {
+            LocomotionModel::Legacy => {
+                Self::legacy_locomotion_heading(heading, left_speed, right_speed)
+            }
+            LocomotionModel::Differential => {
+                let wheel_base = params.bot_radius.max(1.0) * 2.0;
+                wrap_signed_angle(heading + (right_speed - left_speed) / wheel_base)
+            }
+        };
+
+        let mut slope_along = 0.0;
+        if params.topography_enabled && params.cell_size > 0.0 {
+            let (gradient_x, gradient_y) =
+                terrain.gradient_world(position.x, position.y, params.cell_size);
+            slope_along = gradient_x * steering_heading.cos() + gradient_y * steering_heading.sin();
+            if params.topography_speed_gain > 0.0 {
+                let downhill = (-slope_along).max(0.0);
+                let uphill = slope_along.max(0.0);
+                let mut speed_factor = 1.0;
+                if downhill > 0.0 {
+                    speed_factor *= 1.0 + downhill * params.topography_speed_gain;
+                }
+                if uphill > 0.0 {
+                    speed_factor /= 1.0 + uphill * params.topography_speed_gain;
+                }
+                speed_factor = speed_factor.clamp(0.4, 1.8);
+                left_speed *= speed_factor;
+                right_speed *= speed_factor;
+            }
+        }
+
+        let mut step = match params.model {
+            LocomotionModel::Legacy => Self::legacy_locomotion_step(
+                position,
+                heading,
+                left_speed,
+                right_speed,
+                params.bot_radius,
+            ),
+            LocomotionModel::Differential => {
+                let linear = (left_speed + right_speed) * 0.5;
+                let velocity = Velocity::new(
+                    steering_heading.cos() * linear,
+                    steering_heading.sin() * linear,
+                );
+                LocomotionStep {
+                    heading: steering_heading,
+                    velocity,
+                    position: Position::new(position.x + velocity.vx, position.y + velocity.vy),
+                    slope_along: 0.0,
+                    wheel_effort: (left_speed.abs() + right_speed.abs()) * 0.5,
+                }
+            }
+        };
+        step.position.x = Self::wrap_position(step.position.x, params.world_width);
+        step.position.y = Self::wrap_position(step.position.y, params.world_height);
+        step.slope_along = slope_along;
+        step
+    }
+
     fn wrap_position(value: f32, extent: f32) -> f32 {
         if extent <= 0.0 {
             return 0.0;
@@ -13846,8 +14007,8 @@ impl WorldState {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
         let bot_speed = self.config.bot_speed.max(0.0);
-        let bot_radius = self.config.bot_radius.max(1.0);
-        let wheel_base = (bot_radius * 2.0).max(1.0);
+        let bot_radius = self.config.bot_radius;
+        let locomotion_model = self.config.locomotion_model;
         let boost_multiplier = self.config.boost_multiplier.max(1.0);
         let spike_growth = self.config.spike_growth_rate.max(0.0);
         let movement_drain = self.config.movement_drain;
@@ -13924,6 +14085,15 @@ impl WorldState {
         let topo_enabled = self.config.topography_enabled;
         let topo_gain = self.config.topography_speed_gain.max(0.0);
         let topo_penalty = self.config.topography_energy_penalty.max(0.0);
+        let locomotion_params = LocomotionParams {
+            model: locomotion_model,
+            bot_radius,
+            world_width: width,
+            world_height: height,
+            cell_size,
+            topography_enabled: topo_enabled,
+            topography_speed_gain: topo_gain,
+        };
         #[cfg(feature = "simd_wide")]
         let mut results: Vec<ActuationResult> = vec![ActuationResult::default(); handles.len()];
         #[cfg(feature = "simd_wide")]
@@ -13945,46 +14115,16 @@ impl WorldState {
                         right_speed *= boost_multiplier;
                     }
 
-                    let mut heading = headings_snapshot[idx];
-                    let angular = (right_speed - left_speed) / wheel_base;
-                    heading = wrap_signed_angle(heading + angular);
+                    let locomotion = Self::actuation_locomotion(
+                        positions_snapshot[idx],
+                        headings_snapshot[idx],
+                        left_speed,
+                        right_speed,
+                        terrain,
+                        locomotion_params,
+                    );
 
-                    let mut slope_along: f32 = 0.0;
-                    if topo_enabled && cell_size > 0.0 {
-                        let (grad_x, grad_y) = terrain.gradient_world(
-                            positions_snapshot[idx].x,
-                            positions_snapshot[idx].y,
-                            cell_size,
-                        );
-                        let dir_x = heading.cos();
-                        let dir_y = heading.sin();
-                        slope_along = grad_x * dir_x + grad_y * dir_y;
-                        if topo_gain > 0.0 {
-                            let downhill = (-slope_along).max(0.0);
-                            let uphill = slope_along.max(0.0);
-                            let mut speed_factor: f32 = 1.0;
-                            if downhill > 0.0 {
-                                speed_factor *= 1.0 + downhill * topo_gain;
-                            }
-                            if uphill > 0.0 {
-                                speed_factor /= 1.0 + uphill * topo_gain;
-                            }
-                            speed_factor = speed_factor.clamp(0.4, 1.8);
-                            left_speed *= speed_factor;
-                            right_speed *= speed_factor;
-                        }
-                    }
-
-                    let linear = (left_speed + right_speed) * 0.5;
-                    let vx = heading.cos() * linear;
-                    let vy = heading.sin() * linear;
-
-                    let mut next_pos = positions_snapshot[idx];
-                    next_pos.x = Self::wrap_position(next_pos.x + vx, width);
-                    next_pos.y = Self::wrap_position(next_pos.y + vy, height);
-
-                    let movement_penalty =
-                        movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                    let movement_penalty = movement_drain * locomotion.wheel_effort;
                     let mut drain = metabolism_drain + movement_penalty;
                     let mut ramp_penalty = 0.0;
                     if ramp_rate > 0.0 {
@@ -14000,10 +14140,10 @@ impl WorldState {
                     drain += boost_drain;
                     let before_topography = drain;
                     if topo_enabled && topo_penalty > 0.0 {
-                        if slope_along > 0.0 {
-                            drain += slope_along * topo_penalty;
-                        } else if slope_along < 0.0 {
-                            drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
+                        if locomotion.slope_along > 0.0 {
+                            drain += locomotion.slope_along * topo_penalty;
+                        } else if locomotion.slope_along < 0.0 {
+                            drain = (drain + locomotion.slope_along * topo_penalty * 0.5).max(0.0);
                         }
                     }
                     let drain_breakdown = ActuationDrain {
@@ -14024,9 +14164,9 @@ impl WorldState {
                     }
                     results[idx] = ActuationResult {
                         delta: Some(ActuationDelta {
-                            heading,
-                            velocity: Velocity::new(vx, vy),
-                            position: next_pos,
+                            heading: locomotion.heading,
+                            velocity: locomotion.velocity,
+                            position: locomotion.position,
                             health_delta,
                         }),
                         energy,
@@ -14055,42 +14195,15 @@ impl WorldState {
                     left_speed *= boost_multiplier;
                     right_speed *= boost_multiplier;
                 }
-                let mut heading = headings_snapshot[idx];
-                let angular = (right_speed - left_speed) / wheel_base;
-                heading = wrap_signed_angle(heading + angular);
-                let mut slope_along: f32 = 0.0;
-                if topo_enabled && cell_size > 0.0 {
-                    let (gx, gy) = terrain.gradient_world(
-                        positions_snapshot[idx].x,
-                        positions_snapshot[idx].y,
-                        cell_size,
-                    );
-                    let dir_x = heading.cos();
-                    let dir_y = heading.sin();
-                    slope_along = gx * dir_x + gy * dir_y;
-                    if topo_gain > 0.0 {
-                        let downhill = (-slope_along).max(0.0);
-                        let uphill = slope_along.max(0.0);
-                        let mut speed_factor: f32 = 1.0;
-                        if downhill > 0.0 {
-                            speed_factor *= 1.0 + downhill * topo_gain;
-                        }
-                        if uphill > 0.0 {
-                            speed_factor /= 1.0 + uphill * topo_gain;
-                        }
-                        speed_factor = speed_factor.clamp(0.4, 1.8);
-                        left_speed *= speed_factor;
-                        right_speed *= speed_factor;
-                    }
-                }
-                let linear = (left_speed + right_speed) * 0.5;
-                let vx = heading.cos() * linear;
-                let vy = heading.sin() * linear;
-                let mut next_pos = positions_snapshot[idx];
-                next_pos.x = Self::wrap_position(next_pos.x + vx, width);
-                next_pos.y = Self::wrap_position(next_pos.y + vy, height);
-                let movement_penalty =
-                    movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                let locomotion = Self::actuation_locomotion(
+                    positions_snapshot[idx],
+                    headings_snapshot[idx],
+                    left_speed,
+                    right_speed,
+                    terrain,
+                    locomotion_params,
+                );
+                let movement_penalty = movement_drain * locomotion.wheel_effort;
                 let mut drain = metabolism_drain + movement_penalty;
                 let mut ramp_penalty = 0.0;
                 if ramp_rate > 0.0 {
@@ -14106,10 +14219,10 @@ impl WorldState {
                 drain += boost_drain;
                 let before_topography = drain;
                 if topo_enabled && topo_penalty > 0.0 {
-                    if slope_along > 0.0 {
-                        drain += slope_along * topo_penalty;
-                    } else if slope_along < 0.0 {
-                        drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
+                    if locomotion.slope_along > 0.0 {
+                        drain += locomotion.slope_along * topo_penalty;
+                    } else if locomotion.slope_along < 0.0 {
+                        drain = (drain + locomotion.slope_along * topo_penalty * 0.5).max(0.0);
                     }
                 }
                 let drain_breakdown = ActuationDrain {
@@ -14129,9 +14242,9 @@ impl WorldState {
                 }
                 results[idx] = ActuationResult {
                     delta: Some(ActuationDelta {
-                        heading,
-                        velocity: Velocity::new(vx, vy),
-                        position: next_pos,
+                        heading: locomotion.heading,
+                        velocity: locomotion.velocity,
+                        position: locomotion.position,
                         health_delta,
                     }),
                     energy,
@@ -14156,45 +14269,16 @@ impl WorldState {
                     right_speed *= boost_multiplier;
                 }
 
-                let mut heading = headings_snapshot[idx];
-                let angular = (right_speed - left_speed) / wheel_base;
-                heading = wrap_signed_angle(heading + angular);
-                let mut slope_along: f32 = 0.0;
-                if topo_enabled && cell_size > 0.0 {
-                    let (grad_x, grad_y) = terrain.gradient_world(
-                        positions_snapshot[idx].x,
-                        positions_snapshot[idx].y,
-                        cell_size,
-                    );
-                    let dir_x = heading.cos();
-                    let dir_y = heading.sin();
-                    slope_along = grad_x * dir_x + grad_y * dir_y;
-                    if topo_gain > 0.0 {
-                        let downhill = (-slope_along).max(0.0);
-                        let uphill = slope_along.max(0.0);
-                        let mut speed_factor: f32 = 1.0;
-                        if downhill > 0.0 {
-                            speed_factor *= 1.0 + downhill * topo_gain;
-                        }
-                        if uphill > 0.0 {
-                            speed_factor /= 1.0 + uphill * topo_gain;
-                        }
-                        speed_factor = speed_factor.clamp(0.4, 1.8);
-                        left_speed *= speed_factor;
-                        right_speed *= speed_factor;
-                    }
-                }
+                let locomotion = Self::actuation_locomotion(
+                    positions_snapshot[idx],
+                    headings_snapshot[idx],
+                    left_speed,
+                    right_speed,
+                    terrain,
+                    locomotion_params,
+                );
 
-                let linear = (left_speed + right_speed) * 0.5;
-                let vx = heading.cos() * linear;
-                let vy = heading.sin() * linear;
-
-                let mut next_pos = positions_snapshot[idx];
-                next_pos.x = Self::wrap_position(next_pos.x + vx, width);
-                next_pos.y = Self::wrap_position(next_pos.y + vy, height);
-
-                let movement_penalty =
-                    movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                let movement_penalty = movement_drain * locomotion.wheel_effort;
                 let mut drain = metabolism_drain + movement_penalty;
                 let mut ramp_penalty = 0.0;
                 if ramp_rate > 0.0 {
@@ -14210,10 +14294,10 @@ impl WorldState {
                 drain += boost_drain;
                 let before_topography = drain;
                 if topo_enabled && topo_penalty > 0.0 {
-                    if slope_along > 0.0 {
-                        drain += slope_along * topo_penalty;
-                    } else if slope_along < 0.0 {
-                        drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
+                    if locomotion.slope_along > 0.0 {
+                        drain += locomotion.slope_along * topo_penalty;
+                    } else if locomotion.slope_along < 0.0 {
+                        drain = (drain + locomotion.slope_along * topo_penalty * 0.5).max(0.0);
                     }
                 }
                 let drain_breakdown = ActuationDrain {
@@ -14234,9 +14318,9 @@ impl WorldState {
                 }
                 ActuationResult {
                     delta: Some(ActuationDelta {
-                        heading,
-                        velocity: Velocity::new(vx, vy),
-                        position: next_pos,
+                        heading: locomotion.heading,
+                        velocity: locomotion.velocity,
+                        position: locomotion.position,
                         health_delta,
                     }),
                     energy,
@@ -21985,6 +22069,418 @@ mod tests {
     fn default_config_constructs_world() {
         let config = ScriptBotsConfig::default();
         WorldState::new(config).expect("default config should be valid");
+    }
+
+    #[test]
+    fn locomotion_model_defaults_to_legacy_and_uses_stable_serde_names() {
+        let default = ScriptBotsConfig::default();
+        assert_eq!(default.locomotion_model, LocomotionModel::Legacy);
+
+        let mut encoded = serde_json::to_value(&default).expect("serialize default config");
+        assert_eq!(encoded["locomotion_model"], "legacy");
+        encoded["locomotion_model"] = serde_json::Value::String("differential".to_owned());
+        let differential: ScriptBotsConfig =
+            serde_json::from_value(encoded.clone()).expect("decode differential model");
+        assert_eq!(differential.locomotion_model, LocomotionModel::Differential);
+
+        encoded
+            .as_object_mut()
+            .expect("config serializes as an object")
+            .remove("locomotion_model");
+        let omitted: ScriptBotsConfig =
+            serde_json::from_value(encoded).expect("decode config with omitted locomotion model");
+        assert_eq!(omitted.locomotion_model, LocomotionModel::Legacy);
+    }
+
+    #[test]
+    fn world_digest_v1_6_binds_locomotion_model_only_through_config_and_overall_lanes() {
+        let base = ScriptBotsConfig {
+            closed: true,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x216),
+            ..ScriptBotsConfig::default()
+        };
+        let legacy = WorldState::new(base.clone())
+            .expect("legacy digest world")
+            .world_digest_v1()
+            .expect("legacy V1.6 digest");
+        let differential = WorldState::new(ScriptBotsConfig {
+            locomotion_model: LocomotionModel::Differential,
+            ..base
+        })
+        .expect("differential digest world")
+        .world_digest_v1()
+        .expect("differential V1.6 digest");
+
+        assert_ne!(legacy.config, differential.config);
+        assert_ne!(legacy.overall, differential.overall);
+        let mut normalized = differential;
+        normalized.config.clone_from(&legacy.config);
+        normalized.overall.clone_from(&legacy.overall);
+        assert_eq!(normalized, legacy);
+    }
+
+    fn assert_locomotion_oracle(label: &str, actual: f32, expected: f32) {
+        let relative_error = (actual - expected).abs() / expected.abs().max(1.0);
+        assert!(
+            relative_error <= 1.0e-6,
+            "{label}: expected {expected:.9}, got {actual:.9} (relative error {relative_error:e})"
+        );
+    }
+
+    #[test]
+    fn legacy_locomotion_matches_world_cpp_ccw_micro_oracles() {
+        struct Oracle {
+            label: &'static str,
+            position: Position,
+            heading: f32,
+            left_speed: f32,
+            right_speed: f32,
+            expected_position: Position,
+            expected_heading: f32,
+        }
+
+        let oracles = [
+            Oracle {
+                label: "equal wheels retain the legacy crab drift",
+                position: Position::new(100.0, 100.0),
+                heading: 0.0,
+                left_speed: 0.3,
+                right_speed: 0.3,
+                expected_position: Position::new(102.955_2, 100.446_63),
+                expected_heading: 0.0,
+            },
+            Oracle {
+                label: "counter rotation retains the second-order position drift",
+                position: Position::new(100.0, 100.0),
+                heading: 0.0,
+                left_speed: 0.3,
+                right_speed: -0.3,
+                expected_position: Position::new(99.868_01, 99.573_31),
+                expected_heading: -0.6,
+            },
+            Oracle {
+                label: "asymmetric wheel arc",
+                position: Position::new(500.0, 200.0),
+                heading: std::f32::consts::FRAC_PI_4,
+                left_speed: 0.15,
+                right_speed: 0.3,
+                expected_position: Position::new(501.285_2, 201.837_42),
+                expected_heading: 0.935_398_16,
+            },
+            Oracle {
+                label: "boosted right wheel near the world boundary",
+                position: Position::new(5_999.0, 100.0),
+                heading: std::f32::consts::FRAC_PI_2,
+                left_speed: 0.0,
+                right_speed: 0.6,
+                expected_position: Position::new(5_998.126_5, 102.823_21),
+                expected_heading: 2.170_796_4,
+            },
+        ];
+
+        for oracle in oracles {
+            let actual = WorldState::legacy_locomotion_step(
+                oracle.position,
+                oracle.heading,
+                oracle.left_speed,
+                oracle.right_speed,
+                10.0,
+            );
+            assert_locomotion_oracle(
+                &format!("{} x", oracle.label),
+                actual.position.x,
+                oracle.expected_position.x,
+            );
+            assert_locomotion_oracle(
+                &format!("{} y", oracle.label),
+                actual.position.y,
+                oracle.expected_position.y,
+            );
+            assert_locomotion_oracle(
+                &format!("{} heading", oracle.label),
+                actual.heading,
+                oracle.expected_heading,
+            );
+        }
+    }
+
+    #[test]
+    fn production_actuation_routes_simd_chunks_remainder_and_scalar_through_legacy_model() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            position: Position,
+            heading: f32,
+            left: f32,
+            right: f32,
+            boost: bool,
+        }
+
+        let cases = [
+            Case {
+                position: Position::new(100.0, 100.0),
+                heading: 0.0,
+                left: 1.0,
+                right: 1.0,
+                boost: false,
+            },
+            Case {
+                position: Position::new(500.0, 200.0),
+                heading: std::f32::consts::FRAC_PI_4,
+                left: 0.5,
+                right: 1.0,
+                boost: false,
+            },
+            Case {
+                position: Position::new(5_999.0, 100.0),
+                heading: std::f32::consts::FRAC_PI_2,
+                left: 0.0,
+                right: 1.0,
+                boost: true,
+            },
+            Case {
+                position: Position::new(400.0, 800.0),
+                heading: -0.7,
+                left: 1.0,
+                right: 0.0,
+                boost: false,
+            },
+            Case {
+                position: Position::new(900.0, 700.0),
+                heading: 2.9,
+                left: 0.25,
+                right: 0.75,
+                boost: true,
+            },
+        ];
+        let config = ScriptBotsConfig {
+            locomotion_model: LocomotionModel::Legacy,
+            closed: true,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            topography_enabled: false,
+            rng_seed: Some(21),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("legacy production-path world");
+        let mut handles = Vec::with_capacity(cases.len());
+
+        for (index, case) in cases.iter().copied().enumerate() {
+            let mut agent = sample_agent(u32::try_from(index).expect("five fixtures fit u32"));
+            agent.position = case.position;
+            agent.heading = case.heading;
+            let handle = world.spawn_agent(agent);
+            let runtime = world.agent_runtime_mut(handle).expect("fixture runtime");
+            runtime.outputs = [0.0; OUTPUT_SIZE];
+            runtime.outputs[OutputChannel::WheelLeft.index()] = case.left;
+            runtime.outputs[OutputChannel::WheelRight.index()] = case.right;
+            runtime.outputs[OutputChannel::Boost.index()] = if case.boost { 1.0 } else { 0.0 };
+            handles.push(handle);
+        }
+
+        world.stage_actuation();
+
+        for (case, handle) in cases.into_iter().zip(handles) {
+            let multiplier = if case.boost { 2.0 } else { 1.0 };
+            let mut expected = WorldState::legacy_locomotion_step(
+                case.position,
+                case.heading,
+                case.left * 0.3 * multiplier,
+                case.right * 0.3 * multiplier,
+                10.0,
+            );
+            expected.position.x = WorldState::wrap_position(expected.position.x, 6_000.0);
+            expected.position.y = WorldState::wrap_position(expected.position.y, 3_000.0);
+            let actual = world.snapshot_agent(handle).expect("actuated fixture").data;
+            assert_locomotion_oracle("production x", actual.position.x, expected.position.x);
+            assert_locomotion_oracle("production y", actual.position.y, expected.position.y);
+            assert_locomotion_oracle("production heading", actual.heading, expected.heading);
+            assert_locomotion_oracle("production vx", actual.velocity.vx, expected.velocity.vx);
+            assert_locomotion_oracle("production vy", actual.velocity.vy, expected.velocity.vy);
+        }
+    }
+
+    #[test]
+    fn differential_model_preserves_the_preexisting_heading_and_translation_formula() {
+        let config = ScriptBotsConfig {
+            locomotion_model: LocomotionModel::Differential,
+            closed: true,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            topography_enabled: false,
+            rng_seed: Some(0xd1ff),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("differential production-path world");
+        let mut agent = sample_agent(0);
+        agent.position = Position::new(100.0, 100.0);
+        agent.heading = 0.4;
+        let handle = world.spawn_agent(agent);
+        let runtime = world
+            .agent_runtime_mut(handle)
+            .expect("differential runtime");
+        runtime.outputs = [0.0; OUTPUT_SIZE];
+        runtime.outputs[OutputChannel::WheelLeft.index()] = 0.5;
+        runtime.outputs[OutputChannel::WheelRight.index()] = 1.0;
+        runtime.outputs[OutputChannel::Boost.index()] = 1.0;
+
+        world.stage_actuation();
+
+        let actual = world.snapshot_agent(handle).expect("actuated agent").data;
+        assert_locomotion_oracle("differential heading", actual.heading, 0.415_000_02);
+        assert_locomotion_oracle("differential x", actual.position.x, 100.411_804);
+        assert_locomotion_oracle("differential y", actual.position.y, 100.181_435);
+        assert_locomotion_oracle("differential vx", actual.velocity.vx, 0.411_802_35);
+        assert_locomotion_oracle("differential vy", actual.velocity.vy, 0.181_435_48);
+    }
+
+    #[test]
+    fn seeded_500_tick_heading_envelopes_are_deterministic_and_model_specific() {
+        struct EnvelopeBrain {
+            state: u64,
+            sample_index: u16,
+        }
+
+        impl EnvelopeBrain {
+            fn next_unit(&mut self) -> f32 {
+                self.state = self
+                    .state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let sample = u16::try_from(self.state >> 48).expect("upper sixteen bits fit u16");
+                f32::from(sample) / f32::from(u16::MAX)
+            }
+        }
+
+        impl BrainRunner for EnvelopeBrain {
+            fn kind(&self) -> &'static str {
+                "locomotion-envelope"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                let forced_extreme = self.sample_index.is_multiple_of(100);
+                self.sample_index += 1;
+                let mut outputs = [0.0; OUTPUT_SIZE];
+                if forced_extreme {
+                    outputs[OutputChannel::WheelRight.index()] = 1.0;
+                } else {
+                    outputs[OutputChannel::WheelLeft.index()] = self.next_unit();
+                    outputs[OutputChannel::WheelRight.index()] = self.next_unit();
+                }
+                outputs
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(self.state ^ u64::from(self.sample_index))
+            }
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        struct EnvelopeStats {
+            mean: f32,
+            p95: f32,
+            max: f32,
+        }
+
+        fn run(model: LocomotionModel) -> (Vec<u32>, EnvelopeStats) {
+            let config = ScriptBotsConfig {
+                locomotion_model: model,
+                closed: true,
+                population_spawn_interval: 0,
+                food_intake_rate: 0.0,
+                food_waste_rate: 0.0,
+                food_sharing_rate: 0.0,
+                reproduction_energy_threshold: f32::MAX,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                metabolism_ramp_rate: 0.0,
+                metabolism_boost_penalty: 0.0,
+                temperature_discomfort_rate: 0.0,
+                aging_health_decay_rate: 0.0,
+                spike_damage: 0.0,
+                spike_energy_cost: 0.0,
+                topography_enabled: false,
+                rng_seed: Some(21_500),
+                ..ScriptBotsConfig::default()
+            };
+            let mut world = WorldState::new(config).expect("heading-envelope world");
+            let mut agent = sample_agent(0);
+            agent.position = Position::new(3_000.0, 1_500.0);
+            agent.heading = 0.0;
+            let handle = world.spawn_agent(agent);
+            let key = world
+                .brain_registry_mut()
+                .expect("envelope registry mutation")
+                .register("locomotion-envelope", |_rng| {
+                    Ok(Box::new(EnvelopeBrain {
+                        state: 0x51a7_1e5e_d15c_a11e,
+                        sample_index: 0,
+                    }))
+                });
+            assert!(
+                world
+                    .bind_agent_brain(handle, key)
+                    .expect("envelope brain factory")
+            );
+
+            let mut heading_deltas = Vec::with_capacity(500);
+            for _ in 0..500 {
+                let before = world
+                    .snapshot_agent(handle)
+                    .expect("agent before envelope tick")
+                    .data
+                    .heading;
+                world.step().expect("envelope tick");
+                let after = world
+                    .snapshot_agent(handle)
+                    .expect("agent after envelope tick")
+                    .data
+                    .heading;
+                heading_deltas.push(wrap_signed_angle(after - before).abs());
+            }
+
+            let bits = heading_deltas.iter().map(|value| value.to_bits()).collect();
+            heading_deltas.sort_by(f32::total_cmp);
+            let count =
+                f32::from(u16::try_from(heading_deltas.len()).expect("500 samples fit u16"));
+            let mean = heading_deltas.iter().sum::<f32>() / count;
+            let p95_index = (heading_deltas.len() * 95).div_ceil(100) - 1;
+            let stats = EnvelopeStats {
+                mean,
+                p95: heading_deltas[p95_index],
+                max: *heading_deltas.last().expect("non-empty envelope"),
+            };
+            tracing::info!(
+                target: "scriptbots::locomotion_envelope",
+                ?model,
+                ticks = heading_deltas.len(),
+                mean = stats.mean,
+                p95 = stats.p95,
+                max = stats.max,
+                "measured deterministic heading-delta envelope"
+            );
+            (bits, stats)
+        }
+
+        let (legacy_first, legacy_stats) = run(LocomotionModel::Legacy);
+        let (legacy_second, _) = run(LocomotionModel::Legacy);
+        let (differential_first, differential_stats) = run(LocomotionModel::Differential);
+        let (differential_second, _) = run(LocomotionModel::Differential);
+        assert_eq!(legacy_first, legacy_second);
+        assert_eq!(differential_first, differential_second);
+        assert!((legacy_stats.max - 0.3).abs() <= 1.0e-5);
+        assert!(legacy_stats.p95 <= 0.3 + 1.0e-5);
+        assert!((differential_stats.max - 0.015).abs() <= 1.0e-6);
+        assert!(differential_stats.p95 <= 0.015 + 1.0e-6);
+        assert!((legacy_stats.max / differential_stats.max - 20.0).abs() <= 1.0e-3);
     }
 
     #[test]
@@ -34847,7 +35343,7 @@ mod tests {
                 (&EXPECTED[..], "f8cfe1fa7a548c89")
             );
             println!(
-                "scriptbots.world-digest-golden.v1.5: six checkpoints and trace overall {} verified",
+                "scriptbots.world-digest-golden.v1.6: six checkpoints and trace overall {} verified",
                 trace.overall
             );
         } else {
@@ -35300,8 +35796,8 @@ mod tests {
             "legacy raw-slot characterization must prove the fixture layouts really differ"
         );
         assert_eq!(
-            left.world_digest_v1().expect("left pre-step V1.5"),
-            right.world_digest_v1().expect("right pre-step V1.5")
+            left.world_digest_v1().expect("left pre-step V1.6"),
+            right.world_digest_v1().expect("right pre-step V1.6")
         );
 
         let mut left_tracer = WorldStepTracer::default();
@@ -35372,8 +35868,8 @@ mod tests {
         assert_eq!(left.resource_ledger(), right.resource_ledger());
         assert_eq!(left.history, right.history);
         assert_eq!(
-            left.world_digest_v1().expect("left final V1.5"),
-            right.world_digest_v1().expect("right final V1.5")
+            left.world_digest_v1().expect("left final V1.6"),
+            right.world_digest_v1().expect("right final V1.6")
         );
     }
 
@@ -35525,8 +36021,8 @@ mod tests {
                 right.agent_brain_evaluator_state(right_child).unwrap()
             );
         }
-        let left_final = left.world_digest_v1().expect("left reproduction V1.5");
-        let right_final = right.world_digest_v1().expect("right reproduction V1.5");
+        let left_final = left.world_digest_v1().expect("left reproduction V1.6");
+        let right_final = right.world_digest_v1().expect("right reproduction V1.6");
         assert_eq!(left_final.rng, right_final.rng);
         assert_eq!(left_final.counters, right_final.counters);
         assert_eq!(left_final, right_final);
@@ -35674,8 +36170,8 @@ mod tests {
             .expect("right scheduled trace contract");
         assert_eq!(left_trace.first_divergence(right_trace).unwrap(), None);
         assert_eq!(left.resource_ledger(), right.resource_ledger());
-        let left_final = left.world_digest_v1().expect("left crossover V1.5");
-        let right_final = right.world_digest_v1().expect("right crossover V1.5");
+        let left_final = left.world_digest_v1().expect("left crossover V1.6");
+        let right_final = right.world_digest_v1().expect("right crossover V1.6");
         assert_eq!(left_final.rng, right_final.rng);
         assert_eq!(left_final.counters, right_final.counters);
         assert_eq!(left_final, right_final);

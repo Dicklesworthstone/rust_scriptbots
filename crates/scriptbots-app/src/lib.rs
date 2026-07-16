@@ -20,8 +20,8 @@ pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
 /// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
 pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
-/// Compatible V3 minor schema used when a manifest carries adapter-attested bootstrap evidence.
-pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.4";
+/// Compatible V3 minor schema used when a manifest carries WorldDigestV1.6 bootstrap evidence.
+pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.5";
 /// Schema identifier for a sequence of V2 world characterization points.
 pub const CHARACTERIZATION_TRACE_V2_SCHEMA: &str = "scriptbots.characterization-trace.v2";
 /// Safety bound for the temporary characterization runner.
@@ -243,7 +243,7 @@ impl ScenarioIdentityV0 {
 /// Human-readable registered brain family recorded in stable key order.
 ///
 /// This roster is a query/provenance projection, not an executable-semantics attestation. Current
-/// V3.4 bootstrap evidence carries the authoritative adapter-attested registry fingerprint in each
+/// V3.5 bootstrap evidence carries the authoritative adapter-attested registry fingerprint in each
 /// [`WorldDigestV1::brain_registry`] lane; key and kind alone cannot recompute that fingerprint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainRosterEntryV0 {
@@ -551,12 +551,20 @@ pub enum RunManifestError {
         /// Root seed carried by the domain-stream checkpoint.
         checkpoint: u64,
     },
-    /// Older V3 minor schemas omit the agent-keyed continuation contract.
+    /// Older V3 minor schemas omit part of the current future-state continuation contract.
     #[error(
-        "run manifest schema `{found}` is continuation-incomplete; expected `scriptbots.run-manifest.v3.3` or `scriptbots.run-manifest.v3.4`"
+        "run manifest schema `{found}` is continuation-incomplete; expected `scriptbots.run-manifest.v3.3` or `scriptbots.run-manifest.v3.5`"
     )]
     ContinuationIncompleteSchema {
         /// Legacy schema tag supplied by a caller or decoded record.
+        found: String,
+    },
+    /// A bootstrap manifest embeds a superseded scientific digest contract.
+    #[error(
+        "run manifest schema `{found}` embeds the superseded WorldDigestV1.5 contract; expected `scriptbots.run-manifest.v3.5` for bootstrap evidence"
+    )]
+    SupersededBootstrapSchema {
+        /// Superseded bootstrap schema tag supplied by a caller or decoded record.
         found: String,
     },
     /// The schema tag did not match whether bootstrap evidence is present.
@@ -734,6 +742,11 @@ impl RunManifestV3 {
             "scriptbots.run-manifest.v3" | "scriptbots.run-manifest.v3.2"
         ) {
             return Err(RunManifestError::ContinuationIncompleteSchema {
+                found: self.schema.clone(),
+            });
+        }
+        if self.schema == "scriptbots.run-manifest.v3.4" {
+            return Err(RunManifestError::SupersededBootstrapSchema {
                 found: self.schema.clone(),
             });
         }
@@ -1573,12 +1586,12 @@ mod characterization_tests {
             r#"{"a":[{"left":false,"right":true}],"z":{"alpha":1,"beta":2}}"#
         );
 
-        let world = test_world(Some(17));
+        let mut world = test_world(Some(17));
         let mut identity = test_run_identity(0x17);
         identity.experiment_id = Some("canonical-experiment".to_owned());
         identity.variant_id = Some("variant-a".to_owned());
         let manifest = RunManifestV3::from_world_with_provenance(
-            identity,
+            identity.clone(),
             ScenarioIdentityV0::caller_seeded("canonical-test"),
             &world,
             complete_test_build(),
@@ -1591,6 +1604,24 @@ mod characterization_tests {
             format!("blake3:{}", blake3::hash(&normalized_config_bytes).to_hex())
         );
         assert_eq!(manifest.config_digest_encoding, "blake3-canonical-json-v1");
+        assert_eq!(manifest.normalized_config["locomotion_model"], "legacy");
+        let mut differential_config = world.config().clone();
+        differential_config.locomotion_model = scriptbots_core::LocomotionModel::Differential;
+        world
+            .apply_config_update(differential_config)
+            .expect("select differential locomotion");
+        let differential_manifest = RunManifestV3::from_world_with_provenance(
+            identity,
+            ScenarioIdentityV0::caller_seeded("canonical-test"),
+            &world,
+            complete_test_build(),
+        )
+        .expect("differential manifest");
+        assert_eq!(
+            differential_manifest.normalized_config["locomotion_model"],
+            "differential"
+        );
+        assert_ne!(manifest.config_digest, differential_manifest.config_digest);
         assert_eq!(manifest.random_streams.root_seed, manifest.root_seed);
         assert_eq!(
             manifest.agent_substream_protocol.root_seed(),
@@ -2183,6 +2214,16 @@ mod characterization_tests {
             error,
             RunManifestError::ContinuationIncompleteSchema { ref found }
                 if found == "scriptbots.run-manifest.v3"
+        ));
+        let mut prior_bootstrap = manifest.clone();
+        prior_bootstrap.schema = "scriptbots.run-manifest.v3.4".to_owned();
+        let error = prior_bootstrap
+            .to_storage_record()
+            .expect_err("V3.4 embeds the superseded WorldDigestV1.5 contract");
+        assert!(matches!(
+            error,
+            RunManifestError::SupersededBootstrapSchema { ref found }
+                if found == "scriptbots.run-manifest.v3.4"
         ));
         let mut missing_counter = manifest.clone();
         missing_counter.agent_rng_counters.pop();

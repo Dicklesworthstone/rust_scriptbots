@@ -6,7 +6,7 @@
 //! not tell which build, which seed, or which config produced a run directory.
 //!
 //! The current contract is stronger: a base `RunManifestV3` is registered in the
-//! run database before tick zero, and the adjacent V3.4 sidecar supplements that
+//! run database before tick zero, and the adjacent V3.5 sidecar supplements that
 //! durable record with post-bootstrap evidence. These tests drive the real binary
 //! and inspect both records on disk.
 
@@ -255,7 +255,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     );
     assert_eq!(
         manifest["schema"], RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA,
-        "bootstrap evidence must move the V3 manifest onto its adapter-attested V3.4 schema"
+        "bootstrap evidence must move the V3 manifest onto its V1.6-attested V3.5 schema"
     );
     assert_eq!(manifest["schema_version"], 3);
     assert_eq!(manifest["random_streams"]["root_seed"], 4242);
@@ -342,7 +342,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     let bootstrap_evidence = sidecar
         .bootstrap_evidence
         .as_ref()
-        .expect("the V3.4 sidecar must carry completed bootstrap evidence");
+        .expect("the V3.5 sidecar must carry completed bootstrap evidence");
     let expected_start_counters = world_counters_digest_v1(
         &sidecar.agent_substream_protocol,
         Tick::zero(),
