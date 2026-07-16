@@ -13871,8 +13871,8 @@ impl WorldState {
                     Ok(replacements) => {
                         for (((_, job_index), output), evaluator) in cohort
                             .iter()
-                            .zip(outputs.into_iter())
-                            .zip(replacements.into_iter())
+                            .zip(outputs)
+                            .zip(replacements)
                         {
                             let job = &mut jobs[*job_index];
                             job.execution = BrainExecution::Protocol(evaluator);
