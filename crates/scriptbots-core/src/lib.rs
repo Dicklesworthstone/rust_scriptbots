@@ -13895,6 +13895,7 @@ impl WorldState {
                     !job.batch_handled && matches!(&job.execution, BrainExecution::Protocol(_))
                 })
                 .count();
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             tracing::debug!(
                 target: "scriptbots::brain_batch",
                 tick = self.tick.0,
@@ -13908,6 +13909,14 @@ impl WorldState {
                 eligible_sizes = ?eligible_sizes,
                 batch_sizes = ?batch_sizes,
                 "classified and evaluated protocol brain cohorts"
+            );
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            let _ = (
+                opted_in_families,
+                eligible_sizes,
+                batch_sizes,
+                scalar_protocol_agents,
+                rejected_cohorts,
             );
         }
 
