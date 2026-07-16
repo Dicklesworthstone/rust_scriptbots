@@ -24708,20 +24708,24 @@ mod tests {
 
         for (destination, source) in source_for_destination.iter().copied().enumerate() {
             let destination_id = handles[destination];
-            assert!(world
-                .agents
-                .replace_trusted(destination_id, data[source]));
-            assert!(world
-                .identities
-                .insert(destination_id, identities[source])
-                .is_none());
-            assert!(world
-                .runtime
-                .insert(
-                    destination_id,
-                    runtimes[source].take().expect("runtime permutation is bijective"),
-                )
-                .is_none());
+            assert!(world.agents.replace_trusted(destination_id, data[source]));
+            assert!(
+                world
+                    .identities
+                    .insert(destination_id, identities[source])
+                    .is_none()
+            );
+            assert!(
+                world
+                    .runtime
+                    .insert(
+                        destination_id,
+                        runtimes[source]
+                            .take()
+                            .expect("runtime permutation is bijective"),
+                    )
+                    .is_none()
+            );
         }
         world.agent_execution_order_canonical = false;
     }
@@ -30010,10 +30014,7 @@ mod tests {
             runtime.energy = 0.015;
             runtime.give_intent = 1.0;
         }
-        world
-            .agent_runtime_mut(lower_uid_recipient)
-            .unwrap()
-            .energy = 0.0;
+        world.agent_runtime_mut(lower_uid_recipient).unwrap().energy = 0.0;
         world
             .agent_runtime_mut(higher_uid_recipient)
             .unwrap()
@@ -32231,7 +32232,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_ne!(
-            left.characterization_digest_v0().expect("left legacy layout digest"),
+            left.characterization_digest_v0()
+                .expect("left legacy layout digest"),
             right
                 .characterization_digest_v0()
                 .expect("right legacy layout digest"),
@@ -32252,11 +32254,26 @@ mod tests {
             .expect("right canonical transition");
         assert!(left_completion.fault.is_none());
         assert!(right_completion.fault.is_none());
-        assert_eq!(left_completion.outcome.events, right_completion.outcome.events);
-        assert_eq!(left_completion.outcome.summary, right_completion.outcome.summary);
-        assert_eq!(left_completion.outcome.births, right_completion.outcome.births);
-        assert_eq!(left_completion.outcome.deaths, right_completion.outcome.deaths);
-        assert_eq!(left_completion.outcome.combat, right_completion.outcome.combat);
+        assert_eq!(
+            left_completion.outcome.events,
+            right_completion.outcome.events
+        );
+        assert_eq!(
+            left_completion.outcome.summary,
+            right_completion.outcome.summary
+        );
+        assert_eq!(
+            left_completion.outcome.births,
+            right_completion.outcome.births
+        );
+        assert_eq!(
+            left_completion.outcome.deaths,
+            right_completion.outcome.deaths
+        );
+        assert_eq!(
+            left_completion.outcome.combat,
+            right_completion.outcome.combat
+        );
         assert_eq!(
             left_completion.outcome.resource_tick,
             right_completion.outcome.resource_tick
@@ -32284,7 +32301,9 @@ mod tests {
             right_tracer.death_cleanup_input_pending_deaths
         );
         assert!(left_trace.stages.iter().all(|stage| stage.capture.is_ok()));
-        left_trace.validate_contract().expect("left canonical trace contract");
+        left_trace
+            .validate_contract()
+            .expect("left canonical trace contract");
         right_trace
             .validate_contract()
             .expect("right canonical trace contract");
@@ -32354,11 +32373,26 @@ mod tests {
             .expect("right protocol reproduction");
         assert!(left_completion.fault.is_none());
         assert!(right_completion.fault.is_none());
-        assert_eq!(left_completion.outcome.events, right_completion.outcome.events);
-        assert_eq!(left_completion.outcome.summary, right_completion.outcome.summary);
-        assert_eq!(left_completion.outcome.births, right_completion.outcome.births);
-        assert_eq!(left_completion.outcome.deaths, right_completion.outcome.deaths);
-        assert_eq!(left_completion.outcome.combat, right_completion.outcome.combat);
+        assert_eq!(
+            left_completion.outcome.events,
+            right_completion.outcome.events
+        );
+        assert_eq!(
+            left_completion.outcome.summary,
+            right_completion.outcome.summary
+        );
+        assert_eq!(
+            left_completion.outcome.births,
+            right_completion.outcome.births
+        );
+        assert_eq!(
+            left_completion.outcome.deaths,
+            right_completion.outcome.deaths
+        );
+        assert_eq!(
+            left_completion.outcome.combat,
+            right_completion.outcome.combat
+        );
         assert_eq!(
             left_completion.outcome.resource_tick,
             right_completion.outcome.resource_tick
@@ -32409,7 +32443,10 @@ mod tests {
             let genome = left
                 .agent_brain_genome(left_child)
                 .expect("reproduction child genome");
-            assert_eq!(genome.provenance().parents, [birth.parent_a, birth.parent_b]);
+            assert_eq!(
+                genome.provenance().parents,
+                [birth.parent_a, birth.parent_b]
+            );
             assert!(matches!(
                 genome.provenance().derivation,
                 BrainGenomeDerivation::Crossover | BrainGenomeDerivation::CrossoverThenMutation
@@ -32501,10 +32538,22 @@ mod tests {
             .expect("right scheduled crossover");
         assert!(left_completion.fault.is_none());
         assert!(right_completion.fault.is_none());
-        assert_eq!(left_completion.outcome.events, right_completion.outcome.events);
-        assert_eq!(left_completion.outcome.summary, right_completion.outcome.summary);
-        assert_eq!(left_completion.outcome.births, right_completion.outcome.births);
-        assert_eq!(left_completion.outcome.resource_tick, right_completion.outcome.resource_tick);
+        assert_eq!(
+            left_completion.outcome.events,
+            right_completion.outcome.events
+        );
+        assert_eq!(
+            left_completion.outcome.summary,
+            right_completion.outcome.summary
+        );
+        assert_eq!(
+            left_completion.outcome.births,
+            right_completion.outcome.births
+        );
+        assert_eq!(
+            left_completion.outcome.resource_tick,
+            right_completion.outcome.resource_tick
+        );
         assert_eq!(left_completion.outcome.births.len(), 1);
         let birth = &left_completion.outcome.births[0];
         assert_eq!(birth.origin, BirthOrigin::Injected);
@@ -32545,7 +32594,10 @@ mod tests {
                     .material_hash()
             })
         });
-        assert_eq!(left_genome.provenance().parent_genome_hashes, expected_hashes);
+        assert_eq!(
+            left_genome.provenance().parent_genome_hashes,
+            expected_hashes
+        );
         assert_eq!(
             left.agent_brain_evaluator_state(left_child).unwrap(),
             right.agent_brain_evaluator_state(right_child).unwrap()
