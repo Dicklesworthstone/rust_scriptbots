@@ -1,20 +1,967 @@
-use criterion::{BatchSize, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 use scriptbots_brain::MlpBrain;
 use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig};
 use scriptbots_core::{
-    DYNAMIC_WORLD_SNAPSHOT_SCHEMA, DynamicWorldSnapshot, RuleBasedMapGenerator, ScriptBotsConfig,
-    TerrainKind, TileSpec, TilesetSpec, WORLD_STEP_PROFILE_SCHEMA, WorldState, WorldStepProfiler,
-    WorldStepStage,
+    AgentData, AgentId, AnalyticsStride, BrainAdapterIdentityV1, BrainBatchArchitectureKey,
+    BrainBatchEvaluator, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
+    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection,
+    BrainInspectionError, BrainInspectionSnapshot, BrainProtocolError,
+    DYNAMIC_WORLD_SNAPSHOT_SCHEMA, DynamicWorldSnapshot, Generation, INPUT_SIZE, MutationRates,
+    OUTPUT_SIZE, OffspringStatePolicy, Position, RandomStream, RuleBasedMapGenerator,
+    ScriptBotsConfig, TerrainKind, TileSpec, TilesetSpec, Velocity, WORLD_STEP_PROFILE_SCHEMA,
+    WorldState, WorldStepProfiler, WorldStepStage,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const DENSE_BENCH_FAMILY_ID: &str = "bench-dense-25x16x9";
+const DENSE_BENCH_KIND: &str = "bench.dense.25x16x9";
+const DENSE_BENCH_HIDDEN: usize = 16;
+const DENSE_BENCH_INPUT_WIRE: u16 = 25;
+const DENSE_BENCH_HIDDEN_WIRE: u16 = 16;
+const DENSE_BENCH_OUTPUT_WIRE: u16 = 9;
+const DENSE_BENCH_GENOME_SCHEMA: u32 = 1;
+const DENSE_BENCH_GENOME_CODEC: u16 = 1;
+const DENSE_BENCH_STATE_SCHEMA: u32 = 1;
+const DENSE_BENCH_STATE_CODEC: u16 = 1;
+const DENSE_BENCH_GENOME_MAGIC: [u8; 4] = *b"DB25";
+const DENSE_BENCH_STATE_MAGIC: [u8; 4] = *b"DBST";
+const DENSE_BENCH_INPUT_HIDDEN: usize = INPUT_SIZE * DENSE_BENCH_HIDDEN;
+const DENSE_BENCH_HIDDEN_OUTPUT: usize = DENSE_BENCH_HIDDEN * OUTPUT_SIZE;
+const DENSE_BENCH_PARAMETER_COUNT: usize = DENSE_BENCH_INPUT_HIDDEN
+    + DENSE_BENCH_HIDDEN
+    + DENSE_BENCH_HIDDEN_OUTPUT
+    + OUTPUT_SIZE;
+const DENSE_BENCH_GENOME_HEADER_BYTES: usize = DENSE_BENCH_GENOME_MAGIC.len() + 3 * 2;
+const DENSE_BENCH_GENOME_PAYLOAD_BYTES: usize =
+    DENSE_BENCH_GENOME_HEADER_BYTES + DENSE_BENCH_PARAMETER_COUNT * 4;
+const DENSE_BENCH_STATE_PAYLOAD_BYTES: usize =
+    DENSE_BENCH_STATE_MAGIC.len() + blake3::OUT_LEN + 8;
+
+#[derive(Clone, Copy)]
+enum DenseBenchMode {
+    Scalar,
+    Batch,
+}
+
+impl DenseBenchMode {
+    const fn batch_enabled(self) -> bool {
+        matches!(self, Self::Batch)
+    }
+}
+
+#[derive(Clone)]
+struct DenseBenchParameters {
+    input_hidden: Vec<f32>,
+    hidden_bias: [f32; DENSE_BENCH_HIDDEN],
+    hidden_output: Vec<f32>,
+    output_bias: [f32; OUTPUT_SIZE],
+}
+
+impl DenseBenchParameters {
+    fn random(rng: &mut dyn RandomStream) -> Self {
+        let mut sample = || {
+            let upper = u16::try_from(rng.next_u32() >> 16)
+                .expect("the upper half of a u32 always fits u16");
+            (f32::from(upper) / f32::from(u16::MAX) - 0.5) * 0.5
+        };
+        Self {
+            input_hidden: (0..DENSE_BENCH_INPUT_HIDDEN)
+                .map(|_| sample())
+                .collect(),
+            hidden_bias: std::array::from_fn(|_| sample()),
+            hidden_output: (0..DENSE_BENCH_HIDDEN_OUTPUT)
+                .map(|_| sample())
+                .collect(),
+            output_bias: std::array::from_fn(|_| sample()),
+        }
+    }
+}
+
+struct DenseBenchFamily {
+    family_id: BrainFamilyId,
+    mode: DenseBenchMode,
+    batch_calls: Option<Arc<AtomicUsize>>,
+}
+
+impl DenseBenchFamily {
+    fn new(mode: DenseBenchMode, batch_calls: Option<Arc<AtomicUsize>>) -> Self {
+        Self {
+            family_id: BrainFamilyId::new(DENSE_BENCH_FAMILY_ID)
+                .expect("the benchmark family identifier is canonical"),
+            mode,
+            batch_calls,
+        }
+    }
+
+    fn invalid(
+        &self,
+        kind: BrainEnvelopeKind,
+        detail: impl Into<String>,
+    ) -> BrainProtocolError {
+        dense_bench_invalid(&self.family_id, kind, detail)
+    }
+
+    fn encode_genome(parameters: &DenseBenchParameters) -> Vec<u8> {
+        debug_assert_eq!(INPUT_SIZE, usize::from(DENSE_BENCH_INPUT_WIRE));
+        debug_assert_eq!(
+            DENSE_BENCH_HIDDEN,
+            usize::from(DENSE_BENCH_HIDDEN_WIRE)
+        );
+        debug_assert_eq!(OUTPUT_SIZE, usize::from(DENSE_BENCH_OUTPUT_WIRE));
+        let mut payload = Vec::with_capacity(DENSE_BENCH_GENOME_PAYLOAD_BYTES);
+        payload.extend_from_slice(&DENSE_BENCH_GENOME_MAGIC);
+        payload.extend_from_slice(&DENSE_BENCH_INPUT_WIRE.to_le_bytes());
+        payload.extend_from_slice(&DENSE_BENCH_HIDDEN_WIRE.to_le_bytes());
+        payload.extend_from_slice(&DENSE_BENCH_OUTPUT_WIRE.to_le_bytes());
+        for value in &parameters.input_hidden {
+            payload.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        for value in parameters.hidden_bias {
+            payload.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        for value in &parameters.hidden_output {
+            payload.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        for value in parameters.output_bias {
+            payload.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        debug_assert_eq!(payload.len(), DENSE_BENCH_GENOME_PAYLOAD_BYTES);
+        payload
+    }
+
+    fn decode_genome(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<DenseBenchParameters, BrainProtocolError> {
+        genome.require_protocol(
+            &self.family_id,
+            DENSE_BENCH_GENOME_SCHEMA,
+            DENSE_BENCH_GENOME_CODEC,
+        )?;
+        let payload = genome.payload();
+        if payload.len() != DENSE_BENCH_GENOME_PAYLOAD_BYTES {
+            return Err(self.invalid(
+                BrainEnvelopeKind::Genome,
+                format!(
+                    "dense benchmark genome requires exactly {DENSE_BENCH_GENOME_PAYLOAD_BYTES} bytes, found {}",
+                    payload.len()
+                ),
+            ));
+        }
+        let mut cursor = 0;
+        let magic = dense_bench_take::<4>(payload, &mut cursor).ok_or_else(|| {
+            self.invalid(BrainEnvelopeKind::Genome, "truncated genome magic")
+        })?;
+        let inputs = u16::from_le_bytes(
+            dense_bench_take::<2>(payload, &mut cursor).ok_or_else(|| {
+                self.invalid(BrainEnvelopeKind::Genome, "truncated input dimension")
+            })?,
+        );
+        let hidden = u16::from_le_bytes(
+            dense_bench_take::<2>(payload, &mut cursor).ok_or_else(|| {
+                self.invalid(BrainEnvelopeKind::Genome, "truncated hidden dimension")
+            })?,
+        );
+        let outputs = u16::from_le_bytes(
+            dense_bench_take::<2>(payload, &mut cursor).ok_or_else(|| {
+                self.invalid(BrainEnvelopeKind::Genome, "truncated output dimension")
+            })?,
+        );
+        if magic != DENSE_BENCH_GENOME_MAGIC
+            || inputs != DENSE_BENCH_INPUT_WIRE
+            || hidden != DENSE_BENCH_HIDDEN_WIRE
+            || outputs != DENSE_BENCH_OUTPUT_WIRE
+        {
+            return Err(self.invalid(
+                BrainEnvelopeKind::Genome,
+                format!(
+                    "unsupported dense benchmark header: magic={magic:?}, inputs={inputs}, hidden={hidden}, outputs={outputs}"
+                ),
+            ));
+        }
+
+        let mut parameters = Vec::with_capacity(DENSE_BENCH_PARAMETER_COUNT);
+        for index in 0..DENSE_BENCH_PARAMETER_COUNT {
+            let bits = dense_bench_take::<4>(payload, &mut cursor).ok_or_else(|| {
+                self.invalid(
+                    BrainEnvelopeKind::Genome,
+                    format!("truncated dense parameter {index}"),
+                )
+            })?;
+            let value = f32::from_bits(u32::from_le_bytes(bits));
+            if !value.is_finite() {
+                return Err(self.invalid(
+                    BrainEnvelopeKind::Genome,
+                    format!("dense parameter {index} is not finite"),
+                ));
+            }
+            parameters.push(value);
+        }
+        if cursor != payload.len() {
+            return Err(self.invalid(
+                BrainEnvelopeKind::Genome,
+                "dense benchmark genome contains trailing bytes",
+            ));
+        }
+
+        let mut offset = 0;
+        let input_hidden = parameters[offset..offset + DENSE_BENCH_INPUT_HIDDEN].to_vec();
+        offset += DENSE_BENCH_INPUT_HIDDEN;
+        let hidden_bias = parameters[offset..offset + DENSE_BENCH_HIDDEN]
+            .try_into()
+            .expect("the validated dense hidden-bias slice has exact length");
+        offset += DENSE_BENCH_HIDDEN;
+        let hidden_output = parameters[offset..offset + DENSE_BENCH_HIDDEN_OUTPUT].to_vec();
+        offset += DENSE_BENCH_HIDDEN_OUTPUT;
+        let output_bias = parameters[offset..offset + OUTPUT_SIZE]
+            .try_into()
+            .expect("the validated dense output-bias slice has exact length");
+        offset += OUTPUT_SIZE;
+        debug_assert_eq!(offset, parameters.len());
+        Ok(DenseBenchParameters {
+            input_hidden,
+            hidden_bias,
+            hidden_output,
+            output_bias,
+        })
+    }
+
+    fn state(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        evaluations: u64,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        self.validate_genome(genome)?;
+        dense_bench_state_envelope(
+            &self.family_id,
+            *genome.material_hash().as_bytes(),
+            evaluations,
+        )
+    }
+
+    fn decode_state(
+        &self,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<([u8; blake3::OUT_LEN], u64), BrainProtocolError> {
+        state.require_protocol(
+            &self.family_id,
+            DENSE_BENCH_STATE_SCHEMA,
+            DENSE_BENCH_STATE_CODEC,
+        )?;
+        let payload = state.payload();
+        if payload.len() != DENSE_BENCH_STATE_PAYLOAD_BYTES {
+            return Err(self.invalid(
+                BrainEnvelopeKind::EvaluatorState,
+                format!(
+                    "dense benchmark state requires exactly {DENSE_BENCH_STATE_PAYLOAD_BYTES} bytes, found {}",
+                    payload.len()
+                ),
+            ));
+        }
+        let mut cursor = 0;
+        let magic = dense_bench_take::<4>(payload, &mut cursor).ok_or_else(|| {
+            self.invalid(
+                BrainEnvelopeKind::EvaluatorState,
+                "truncated evaluator-state magic",
+            )
+        })?;
+        let genome_digest =
+            dense_bench_take::<{ blake3::OUT_LEN }>(payload, &mut cursor).ok_or_else(|| {
+                self.invalid(
+                    BrainEnvelopeKind::EvaluatorState,
+                    "truncated evaluator-state genome digest",
+                )
+            })?;
+        let evaluations = u64::from_le_bytes(
+            dense_bench_take::<8>(payload, &mut cursor).ok_or_else(|| {
+                self.invalid(
+                    BrainEnvelopeKind::EvaluatorState,
+                    "truncated evaluator-state counter",
+                )
+            })?,
+        );
+        if magic != DENSE_BENCH_STATE_MAGIC || cursor != payload.len() {
+            return Err(self.invalid(
+                BrainEnvelopeKind::EvaluatorState,
+                "unsupported dense benchmark evaluator-state header",
+            ));
+        }
+        Ok((genome_digest, evaluations))
+    }
+}
+
+impl BrainFamilyCodec for DenseBenchFamily {
+    fn family_id(&self) -> &BrainFamilyId {
+        &self.family_id
+    }
+
+    fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
+        BrainAdapterIdentityV1::from_semantic_descriptor(
+            &self.family_id,
+            1,
+            b"scriptbots.bench-dense-25x16x9.adapter-semantics.v1",
+        )
+    }
+
+    fn random_genome_material(
+        &self,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        BrainGenomeMaterial::new(
+            DENSE_BENCH_GENOME_SCHEMA,
+            DENSE_BENCH_GENOME_CODEC,
+            Self::encode_genome(&DenseBenchParameters::random(rng)),
+        )
+    }
+
+    fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
+        self.decode_genome(genome).map(|_| ())
+    }
+
+    fn validate_evaluator_state(
+        &self,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<(), BrainProtocolError> {
+        self.decode_state(state).map(|_| ())
+    }
+
+    fn mutate_genome_material(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        _rates: MutationRates,
+        _rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        self.validate_genome(genome)?;
+        BrainGenomeMaterial::new(
+            DENSE_BENCH_GENOME_SCHEMA,
+            DENSE_BENCH_GENOME_CODEC,
+            genome.payload().to_vec(),
+        )
+    }
+
+    fn crossover_genomes_material(
+        &self,
+        left: &BrainGenomeEnvelope,
+        right: &BrainGenomeEnvelope,
+        _rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        self.validate_genome(left)?;
+        self.validate_genome(right)?;
+        BrainGenomeMaterial::new(
+            DENSE_BENCH_GENOME_SCHEMA,
+            DENSE_BENCH_GENOME_CODEC,
+            left.payload().to_vec(),
+        )
+    }
+
+    fn initial_state(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        _rng: &mut dyn RandomStream,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        self.state(genome, 0)
+    }
+
+    fn offspring_state_policy(&self) -> OffspringStatePolicy {
+        OffspringStatePolicy::Reset
+    }
+
+    fn offspring_state(
+        &self,
+        child: &BrainGenomeEnvelope,
+        _parents: &[&BrainEvaluatorStateEnvelope],
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        self.initial_state(child, rng)
+    }
+
+    fn evaluator(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+        let parameters = self.decode_genome(genome)?;
+        let (state_genome, evaluations) = self.decode_state(state)?;
+        let genome_digest = *genome.material_hash().as_bytes();
+        if state_genome != genome_digest {
+            return Err(self.invalid(
+                BrainEnvelopeKind::EvaluatorState,
+                "dense evaluator state belongs to a different genome",
+            ));
+        }
+        Ok(Box::new(DenseBenchEvaluator {
+            family_id: self.family_id.clone(),
+            genome_digest,
+            parameters,
+            evaluations,
+        }))
+    }
+
+    fn batch_architecture_key(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<Option<BrainBatchArchitectureKey>, BrainProtocolError> {
+        if !self.mode.batch_enabled() {
+            return Ok(None);
+        }
+        self.validate_genome(genome)?;
+        BrainBatchArchitectureKey::new(b"dense-f32-25x16x9-distinct-lanes-v1".to_vec()).map(Some)
+    }
+
+    fn batch_evaluator(
+        &self,
+        genomes: &[&BrainGenomeEnvelope],
+        states: &[&BrainEvaluatorStateEnvelope],
+    ) -> Result<Option<Box<dyn BrainBatchEvaluator>>, BrainProtocolError> {
+        if genomes.len() != states.len() {
+            return Err(BrainProtocolError::BatchCardinalityMismatch {
+                evaluators: genomes.len(),
+                inputs: states.len(),
+                outputs: states.len(),
+            });
+        }
+        if !self.mode.batch_enabled() {
+            return Ok(None);
+        }
+        let evaluators = genomes
+            .iter()
+            .zip(states)
+            .map(|(genome, state)| {
+                let parameters = self.decode_genome(genome)?;
+                let (state_genome, evaluations) = self.decode_state(state)?;
+                let genome_digest = *genome.material_hash().as_bytes();
+                if state_genome != genome_digest {
+                    return Err(self.invalid(
+                        BrainEnvelopeKind::EvaluatorState,
+                        "dense batch lane state belongs to a different genome",
+                    ));
+                }
+                Ok(DenseBenchEvaluator {
+                    family_id: self.family_id.clone(),
+                    genome_digest,
+                    parameters,
+                    evaluations,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(batch_calls) = &self.batch_calls {
+            batch_calls.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        Ok(Some(Box::new(DenseBenchBatchEvaluator {
+            family_id: self.family_id.clone(),
+            evaluators,
+        })))
+    }
+}
+
+struct DenseBenchEvaluator {
+    family_id: BrainFamilyId,
+    genome_digest: [u8; blake3::OUT_LEN],
+    parameters: DenseBenchParameters,
+    evaluations: u64,
+}
+
+impl DenseBenchEvaluator {
+    fn evaluate_dense(
+        &mut self,
+        sensors: &[f32; INPUT_SIZE],
+    ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
+        if sensors.iter().any(|value| !value.is_finite()) {
+            return Err(dense_bench_invalid(
+                &self.family_id,
+                BrainEnvelopeKind::EvaluatorState,
+                "dense benchmark sensor input contains a non-finite value",
+            ));
+        }
+        let next_evaluations = self.evaluations.checked_add(1).ok_or_else(|| {
+            dense_bench_invalid(
+                &self.family_id,
+                BrainEnvelopeKind::EvaluatorState,
+                "dense benchmark evaluation counter is exhausted",
+            )
+        })?;
+        let outputs = dense_bench_forward(&self.parameters, self.evaluations, sensors);
+        if outputs.iter().any(|value| !value.is_finite()) {
+            return Err(dense_bench_invalid(
+                &self.family_id,
+                BrainEnvelopeKind::EvaluatorState,
+                "dense benchmark evaluation produced a non-finite output",
+            ));
+        }
+        self.evaluations = next_evaluations;
+        Ok(outputs)
+    }
+}
+
+impl BrainEvaluator for DenseBenchEvaluator {
+    fn family_id(&self) -> &BrainFamilyId {
+        &self.family_id
+    }
+
+    fn evaluate(
+        &mut self,
+        sensors: &[f32; INPUT_SIZE],
+    ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
+        self.evaluate_dense(sensors)
+    }
+
+    fn inspect(
+        &self,
+        _request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        Ok(None)
+    }
+
+    fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        dense_bench_state_envelope(
+            &self.family_id,
+            self.genome_digest,
+            self.evaluations,
+        )
+    }
+}
+
+struct DenseBenchBatchEvaluator {
+    family_id: BrainFamilyId,
+    // Each lane retains independently decoded weights and state. This measures the complete
+    // protocol-batch roundtrip, not a shared-weight shortcut or an optimized matrix kernel.
+    evaluators: Vec<DenseBenchEvaluator>,
+}
+
+impl BrainBatchEvaluator for DenseBenchBatchEvaluator {
+    fn family_id(&self) -> &BrainFamilyId {
+        &self.family_id
+    }
+
+    fn evaluate_batch(
+        &mut self,
+        sensors: &[[f32; INPUT_SIZE]],
+        outputs: &mut [[f32; OUTPUT_SIZE]],
+    ) -> Result<(), BrainProtocolError> {
+        if self.evaluators.len() != sensors.len() || sensors.len() != outputs.len() {
+            return Err(BrainProtocolError::BatchCardinalityMismatch {
+                evaluators: self.evaluators.len(),
+                inputs: sensors.len(),
+                outputs: outputs.len(),
+            });
+        }
+        for ((evaluator, input), output) in self
+            .evaluators
+            .iter_mut()
+            .zip(sensors)
+            .zip(outputs.iter_mut())
+        {
+            *output = evaluator.evaluate_dense(input)?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint_states(
+        &self,
+    ) -> Result<Vec<BrainEvaluatorStateEnvelope>, BrainProtocolError> {
+        self.evaluators
+            .iter()
+            .map(BrainEvaluator::checkpoint_state)
+            .collect()
+    }
+}
+
+fn dense_bench_invalid(
+    family_id: &BrainFamilyId,
+    kind: BrainEnvelopeKind,
+    detail: impl Into<String>,
+) -> BrainProtocolError {
+    BrainProtocolError::InvalidPayload {
+        kind,
+        family_id: family_id.clone(),
+        detail: detail.into(),
+    }
+}
+
+fn dense_bench_take<const N: usize>(payload: &[u8], cursor: &mut usize) -> Option<[u8; N]> {
+    let end = cursor.checked_add(N)?;
+    let bytes = payload.get(*cursor..end)?;
+    *cursor = end;
+    bytes.try_into().ok()
+}
+
+fn dense_bench_state_envelope(
+    family_id: &BrainFamilyId,
+    genome_digest: [u8; blake3::OUT_LEN],
+    evaluations: u64,
+) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+    let mut payload = Vec::with_capacity(DENSE_BENCH_STATE_PAYLOAD_BYTES);
+    payload.extend_from_slice(&DENSE_BENCH_STATE_MAGIC);
+    payload.extend_from_slice(&genome_digest);
+    payload.extend_from_slice(&evaluations.to_le_bytes());
+    BrainEvaluatorStateEnvelope::new(
+        family_id.clone(),
+        DENSE_BENCH_STATE_SCHEMA,
+        DENSE_BENCH_STATE_CODEC,
+        payload,
+    )
+}
+
+fn dense_bench_forward(
+    parameters: &DenseBenchParameters,
+    evaluations: u64,
+    sensors: &[f32; INPUT_SIZE],
+) -> [f32; OUTPUT_SIZE] {
+    let mut hidden = [0.0; DENSE_BENCH_HIDDEN];
+    for (hidden_index, hidden_output) in hidden.iter_mut().enumerate() {
+        let mut accumulator = parameters.hidden_bias[hidden_index];
+        let row = hidden_index * INPUT_SIZE;
+        for (sensor, weight) in sensors
+            .iter()
+            .zip(&parameters.input_hidden[row..row + INPUT_SIZE])
+        {
+            accumulator += sensor * weight;
+        }
+        *hidden_output = accumulator.tanh();
+    }
+
+    let phase_bits =
+        u16::try_from(evaluations & 1023).expect("the bounded evaluation phase fits u16");
+    let state_bias = (f32::from(phase_bits) - 512.0) * 0.000_001;
+    let mut outputs = [0.0; OUTPUT_SIZE];
+    for (output_index, output) in outputs.iter_mut().enumerate() {
+        let mut accumulator = parameters.output_bias[output_index] + state_bias;
+        let row = output_index * DENSE_BENCH_HIDDEN;
+        for (hidden_value, weight) in hidden
+            .iter()
+            .zip(&parameters.hidden_output[row..row + DENSE_BENCH_HIDDEN])
+        {
+            accumulator += hidden_value * weight;
+        }
+        *output = accumulator.tanh();
+    }
+    outputs
+}
+
+struct DenseBenchWorld {
+    world: WorldState,
+    agents: Vec<AgentId>,
+    batch_calls: Option<Arc<AtomicUsize>>,
+}
+
+fn dense_bench_config() -> ScriptBotsConfig {
+    ScriptBotsConfig {
+        world_width: 1_000,
+        world_height: 1_000,
+        food_cell_size: 20,
+        initial_food: 0.0,
+        rng_seed: Some(0x25_16_09_ba_7c_2026),
+        chart_flush_interval: 0,
+        food_respawn_interval: 0,
+        food_respawn_amount: 0.0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        sense_radius: 1.0,
+        sense_max_neighbors: 1.0,
+        bot_speed: 0.0,
+        bot_radius: 1.0,
+        boost_multiplier: 1.0,
+        spike_growth_rate: 0.0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        metabolism_ramp_rate: 0.0,
+        metabolism_boost_penalty: 0.0,
+        temperature_discomfort_rate: 0.0,
+        food_intake_rate: 0.0,
+        food_waste_rate: 0.0,
+        food_sharing_rate: 0.0,
+        food_transfer_rate: 0.0,
+        reproduction_attempt_chance: 0.0,
+        reproduction_food_bonus: 0.0,
+        reproduction_fertility_bonus: 0.0,
+        reproduction_partner_chance: 0.0,
+        reproduction_meta_mutation_chance: 0.0,
+        aging_tick_interval: u32::MAX,
+        aging_health_decay_rate: 0.0,
+        aging_health_decay_max: 0.0,
+        aging_energy_penalty_rate: 0.0,
+        carcass_distribution_radius: 0.0,
+        carcass_health_reward: 0.0,
+        carcass_reproduction_reward: 0.0,
+        carcass_energy_share_rate: 0.0,
+        carcass_indicator_scale: 0.0,
+        closed: true,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        population_crossover_chance: 0.0,
+        spike_damage: 0.0,
+        spike_energy_cost: 0.0,
+        spike_speed_damage_bonus: 0.0,
+        spike_length_damage_bonus: 0.0,
+        history_capacity: 1,
+        narrative_interval: 0,
+        narrative_capacity: 0,
+        persistence_interval: 0,
+        analytics_stride: AnalyticsStride {
+            macro_metrics: 0,
+            behavior_metrics: 0,
+            lifecycle_events: 0,
+        },
+        ..ScriptBotsConfig::default()
+    }
+}
+
+fn build_dense_bench_world(
+    agent_count: usize,
+    mode: DenseBenchMode,
+    probe_batch_calls: bool,
+) -> DenseBenchWorld {
+    let mut world = WorldState::new(dense_bench_config()).expect("dense benchmark world");
+    let batch_calls = probe_batch_calls.then(|| Arc::new(AtomicUsize::new(0)));
+    let family_key = world
+        .register_brain_family(
+            DENSE_BENCH_KIND,
+            Box::new(DenseBenchFamily::new(mode, batch_calls.clone())),
+        )
+        .expect("register dense benchmark family");
+    let mut agents = Vec::with_capacity(agent_count);
+    for ordinal in 0..agent_count {
+        let column = u16::try_from(ordinal % 100).expect("benchmark column fits u16");
+        let row = u16::try_from(ordinal / 100).expect("benchmark row fits u16");
+        let agent = world
+            .try_spawn_agent(AgentData::new(
+                Position::new(
+                    f32::from(column) * 10.0 + 0.5,
+                    f32::from(row) * 10.0 + 0.5,
+                ),
+                Velocity::default(),
+                0.0,
+                1.0,
+                [0.25, 0.5, 0.75],
+                0.0,
+                false,
+                0,
+                Generation(0),
+            ))
+            .expect("dense benchmark agent is finite");
+        assert!(
+            world
+                .bind_agent_brain(agent, family_key)
+                .expect("bind dense benchmark brain")
+        );
+        agents.push(agent);
+    }
+    DenseBenchWorld {
+        world,
+        agents,
+        batch_calls,
+    }
+}
+
+fn dense_bench_genome_hashes(world: &WorldState, agents: &[AgentId]) -> Vec<[u8; 32]> {
+    agents
+        .iter()
+        .map(|agent| {
+            *world
+                .agent_brain_genome(*agent)
+                .expect("dense benchmark agent has a genome")
+                .material_hash()
+                .as_bytes()
+        })
+        .collect()
+}
+
+fn dense_bench_output_bits(
+    world: &WorldState,
+    agents: &[AgentId],
+) -> Vec<[u32; OUTPUT_SIZE]> {
+    agents
+        .iter()
+        .map(|agent| {
+            world
+                .agent_runtime(*agent)
+                .expect("dense benchmark agent has runtime")
+                .outputs
+                .map(f32::to_bits)
+        })
+        .collect()
+}
+
+fn dense_bench_states(
+    world: &WorldState,
+    agents: &[AgentId],
+) -> Vec<BrainEvaluatorStateEnvelope> {
+    agents
+        .iter()
+        .map(|agent| {
+            world
+                .agent_brain_evaluator_state(*agent)
+                .expect("checkpoint dense benchmark evaluator")
+                .expect("dense benchmark agent has protocol state")
+        })
+        .collect()
+}
+
+fn assert_dense_bench_preflight(agent_count: usize) {
+    let DenseBenchWorld {
+        world: mut scalar,
+        agents: scalar_agents,
+        batch_calls: scalar_calls,
+    } = build_dense_bench_world(agent_count, DenseBenchMode::Scalar, true);
+    let DenseBenchWorld {
+        world: mut batch,
+        agents: batch_agents,
+        batch_calls,
+    } = build_dense_bench_world(agent_count, DenseBenchMode::Batch, true);
+
+    let scalar_hashes = dense_bench_genome_hashes(&scalar, &scalar_agents);
+    let batch_hashes = dense_bench_genome_hashes(&batch, &batch_agents);
+    assert_eq!(
+        scalar_hashes, batch_hashes,
+        "matched scalar and batch worlds must carry the same ordered genomes"
+    );
+    assert_eq!(
+        scalar_hashes.iter().copied().collect::<HashSet<_>>().len(),
+        agent_count,
+        "the benchmark cohort must carry distinct per-agent weights"
+    );
+
+    let mut scalar_profiler = WorldStepProfiler::default();
+    let mut batch_profiler = WorldStepProfiler::default();
+    scalar
+        .step_profiled(&mut scalar_profiler)
+        .expect("scalar dense benchmark preflight step");
+    batch
+        .step_profiled(&mut batch_profiler)
+        .expect("batch dense benchmark preflight step");
+    assert_eq!(
+        scalar_calls
+            .expect("scalar preflight probe")
+            .load(AtomicOrdering::Relaxed),
+        0,
+        "the scalar benchmark family must never enter the batch hook"
+    );
+    assert_eq!(
+        batch_calls
+            .expect("batch preflight probe")
+            .load(AtomicOrdering::Relaxed),
+        1,
+        "one homogeneous architecture must execute as one batch cohort"
+    );
+    assert_eq!(
+        dense_bench_output_bits(&scalar, &scalar_agents),
+        dense_bench_output_bits(&batch, &batch_agents),
+        "batch outputs must be bit-identical to scalar outputs"
+    );
+    assert_eq!(
+        dense_bench_states(&scalar, &scalar_agents),
+        dense_bench_states(&batch, &batch_agents),
+        "batch evaluator states must be bit-identical to scalar states"
+    );
+    assert_eq!(
+        scalar
+            .world_digest_v1()
+            .expect("scalar dense benchmark digest"),
+        batch
+            .world_digest_v1()
+            .expect("batch dense benchmark digest"),
+        "batch and scalar transitions must produce the same science digest"
+    );
+}
+
+fn bench_brain_protocol_cohorts(c: &mut Criterion) {
+    let samples = env::var("SB_BATCH_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 10)
+        .unwrap_or(10);
+    let warmup_seconds = env::var("SB_BATCH_BENCH_WARMUP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1);
+    let measurement_seconds = env::var("SB_BATCH_BENCH_MEASURE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5);
+
+    let mut group = c.benchmark_group("brain_protocol_cohort");
+    group.sample_size(samples);
+    group.warm_up_time(Duration::from_secs(warmup_seconds));
+    group.measurement_time(Duration::from_secs(measurement_seconds));
+
+    for agent_count in [2_000_usize, 5_000, 10_000] {
+        assert_dense_bench_preflight(agent_count);
+        group.throughput(Throughput::Elements(
+            u64::try_from(agent_count).expect("benchmark population fits u64"),
+        ));
+
+        {
+            let DenseBenchWorld {
+                world: mut scalar,
+                ..
+            } = build_dense_bench_world(agent_count, DenseBenchMode::Scalar, false);
+            group.bench_with_input(
+                BenchmarkId::new("scalar_live", agent_count),
+                &agent_count,
+                |bencher, _| {
+                    let mut profiler = WorldStepProfiler::default();
+                    bencher.iter_custom(|iterations| {
+                        let mut measured = Duration::ZERO;
+                        for _ in 0..iterations {
+                            scalar
+                                .step_profiled(&mut profiler)
+                                .expect("profile scalar dense brain stage");
+                            let elapsed_ns = profiler
+                                .latest()
+                                .and_then(|profile| profile.elapsed_ns(WorldStepStage::Brains))
+                                .expect("profile includes the scalar brain stage");
+                            measured =
+                                measured.saturating_add(Duration::from_nanos(elapsed_ns));
+                            black_box(scalar.tick());
+                        }
+                        measured
+                    });
+                },
+            );
+        }
+
+        {
+            let DenseBenchWorld {
+                world: mut batch, ..
+            } = build_dense_bench_world(agent_count, DenseBenchMode::Batch, false);
+            group.bench_with_input(
+                BenchmarkId::new("batch_roundtrip", agent_count),
+                &agent_count,
+                |bencher, _| {
+                    let mut profiler = WorldStepProfiler::default();
+                    bencher.iter_custom(|iterations| {
+                        let mut measured = Duration::ZERO;
+                        for _ in 0..iterations {
+                            batch
+                                .step_profiled(&mut profiler)
+                                .expect("profile batch dense brain stage");
+                            let elapsed_ns = profiler
+                                .latest()
+                                .and_then(|profile| profile.elapsed_ns(WorldStepStage::Brains))
+                                .expect("profile includes the batch brain stage");
+                            measured =
+                                measured.saturating_add(Duration::from_nanos(elapsed_ns));
+                            black_box(batch.tick());
+                        }
+                        measured
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
 
 #[allow(clippy::field_reassign_with_default)]
 fn bench_world_steps(c: &mut Criterion) {
@@ -2606,6 +3553,7 @@ fn run_self_test() -> GateResult<()> {
 
 fn run_criterion() {
     let mut criterion = Criterion::default().configure_from_args();
+    bench_brain_protocol_cohorts(&mut criterion);
     bench_world_steps(&mut criterion);
     bench_hydrology_map_generation(&mut criterion);
     criterion.final_summary();
