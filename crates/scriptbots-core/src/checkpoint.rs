@@ -2793,10 +2793,10 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_538,
-                "5faae3f2c17ae1e6877ec0f027bdd339566f5a10a9b1880623ccc631d9c4f82b",
+                8_539,
+                "73376b3b7bcd7704f0e5b57312b3070f7becf63166a25b1e9e58a6f275da85ea",
             ),
-            "the first DSR batch-verification pass must report and then rebless the reviewed V1.3/codec-4 wire"
+            "the reviewed V1.3/codec-4 wire must remain byte-identical after bd-2i1 bound the locomotion model"
         );
     }
 

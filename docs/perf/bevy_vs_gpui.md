@@ -58,8 +58,8 @@ Shortcut: `scripts/run_perf_benchmarks.sh --renderer bevy --scenario dense_agent
 
 ### 3.1 Initial Golden Comparison (GPU-less sanity check)
 
-Using the DSR-reviewed CPU-surrogate reference PNGs regenerated for the
-six-domain RNG cutover (`rust_default.png` SHA-256 `ba75a6d4…779a4fa` and
+Using the DSR-reviewed CPU-surrogate reference PNGs, with the Rust asset regenerated after the
+exact legacy-locomotion restoration (`rust_default.png` SHA-256 `d36e71cb…c09636a9` and
 `bevy_default.png` SHA-256 `1f68f947…429aef`), the difference is:
 
 - Mean absolute error: **58.73**

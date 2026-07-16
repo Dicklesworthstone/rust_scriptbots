@@ -35276,56 +35276,57 @@ mod tests {
             })
             .collect();
         // Re-pinned in bd-300o after the CPU sense lane adopted the shared Q20 fixed-point
-        // accumulator and poly-acos geometry. Transition, output-tail, and resource lanes remain
-        // byte-identical; only world state and the derived overall digest move.
+        // accumulator and poly-acos geometry. Re-pinned again in bd-2i1 after WorldDigest and the
+        // trace advanced to V1.6 and default locomotion returned to the exact legacy two-rotation
+        // model. The DSR capture reviewed all six complete lane tuples, not only the final hash.
         const EXPECTED: [(&str, &str, &str, &str, &str, &str); 6] = [
             (
                 "sense",
-                "2cb3af37e334b003",
-                "f7ba7d51724a4e96",
-                "a288ed262733519c",
-                "a9a8a3e653861825",
-                "b3f26824f7169412",
+                "38375d6c988e2052",
+                "79c9f653219e2e99",
+                "a5c3391527f7be0f",
+                "15b8ace5445abf68",
+                "43f10b9c41215673",
             ),
             (
                 "brains",
-                "f61c743d6de27c1c",
-                "bb91f8dd38e9542a",
-                "40539ac87ff6d848",
-                "5fbf37cd117e8daf",
-                "c160089972b372a0",
+                "4c66879398207e7d",
+                "0784675f322b8c77",
+                "e253563076bd2b5d",
+                "338ece8c58e3aa54",
+                "83981d3ac0dcf1da",
             ),
             (
                 "actuation",
-                "83a3d5359bcae2c9",
-                "9bfb039058c4289c",
-                "a8d417184b7c090e",
-                "a147b2dccee4a41b",
-                "fb8376b16dadbf87",
+                "71287c2dcfbdbc72",
+                "9372d014d2c797ef",
+                "d47fa5d7b8cf2959",
+                "f86a99d091268ea6",
+                "3bf4e85a2ad0fffb",
             ),
             (
                 "food",
-                "4c0c853fde4adced",
-                "8854c44dab16fe2d",
-                "be9168d1222971d9",
-                "ad3caabd03c562b5",
-                "284d495528409c54",
+                "24e5d999c18cf8c4",
+                "c015084f9ab60410",
+                "fc08078be123d220",
+                "b02ed06b5635e312",
+                "96faf88adc0b194c",
             ),
             (
                 "death_cleanup",
-                "4c0c853fde4adced",
-                "6e2c46d07bcca0d5",
-                "5c3e11d3015258a9",
-                "4d73ffc0cef3d24b",
-                "1e7960b87bee6649",
+                "24e5d999c18cf8c4",
+                "46581b2d02073daa",
+                "9b909fd41eae4aca",
+                "69b3e219fb68f4da",
+                "667416b7d6ce7d52",
             ),
             (
                 "population",
-                "47feaa5a244f3dc2",
-                "5bcaf261789605b0",
-                "9acd9f8b42183152",
-                "1401865a921d6b02",
-                "ad382e25c6259630",
+                "68e77898afc15f8c",
+                "ff09abb6bd938d55",
+                "1aad4a0f35a0c69b",
+                "e94c6bb812e4088d",
+                "a6d6458943ebca5f",
             ),
         ];
         if std::env::var("SCRIPTBOTS_WORLD_DIGEST_GOLDEN").as_deref() == Ok("1") {
@@ -35340,7 +35341,7 @@ mod tests {
             assert_eq!(build.pointer_width, 64);
             assert_eq!(
                 (observed.as_slice(), trace.overall.as_str()),
-                (&EXPECTED[..], "f8cfe1fa7a548c89")
+                (&EXPECTED[..], "62f2bde434e6d9a9")
             );
             println!(
                 "scriptbots.world-digest-golden.v1.6: six checkpoints and trace overall {} verified",
