@@ -2,9 +2,16 @@
 
 pub mod ancestry;
 pub mod channels;
+mod checkpoint;
 pub mod detect;
 pub mod rng_domains;
 pub mod sense_fixed;
+
+pub use checkpoint::{
+    CheckpointBrainRegistryRequirementV1, CheckpointBrainRegistryRequirementsV1,
+    MAX_WORLD_CHECKPOINT_BYTES, WORLD_CHECKPOINT_V1_CODEC_VERSION, WORLD_CHECKPOINT_V1_SCHEMA,
+    WorldCheckpointError, WorldCheckpointV1,
+};
 
 pub use channels::{
     BOOST_THRESHOLD, OutputChannel, OutputsExt, SENSOR_LAYOUT, SensorChannel, SensorKind,
@@ -8249,12 +8256,17 @@ impl Default for ScriptBotsConfig {
     }
 }
 
+const MAX_NEUROFLOW_HIDDEN_LAYERS: usize = 64;
+const MAX_NEUROFLOW_LAYER_NEURONS: usize = 65_536;
+const MAX_NEUROFLOW_NETWORK_WEIGHTS: usize = 1_048_576;
+
 /// Runtime configuration options for NeuroFlow-backed brains.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NeuroflowSettings {
     /// Whether NeuroFlow brains are registered at runtime.
     pub enabled: bool,
     /// Hidden layer sizes supplied to the NeuroFlow network.
+    #[serde(deserialize_with = "deserialize_neuroflow_hidden_layers")]
     pub hidden_layers: Vec<usize>,
     /// Activation function applied to the hidden/output layers.
     pub activation: NeuroflowActivationKind,
@@ -8268,6 +8280,85 @@ impl Default for NeuroflowSettings {
             activation: NeuroflowActivationKind::Tanh,
         }
     }
+}
+
+fn deserialize_neuroflow_hidden_layers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct HiddenLayersVisitor;
+
+    impl<'de> Visitor<'de> for HiddenLayersVisitor {
+        type Value = Vec<usize>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_NEUROFLOW_HIDDEN_LAYERS} NeuroFlow hidden layers"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let hinted = sequence.size_hint().unwrap_or_default();
+            if hinted > MAX_NEUROFLOW_HIDDEN_LAYERS {
+                return Err(serde::de::Error::invalid_length(hinted, &self));
+            }
+            let mut layers = Vec::with_capacity(hinted.min(MAX_NEUROFLOW_HIDDEN_LAYERS));
+            let mut previous = INPUT_SIZE;
+            let mut total_weights = 0usize;
+            while let Some(layer) = sequence.next_element()? {
+                if layers.len() == MAX_NEUROFLOW_HIDDEN_LAYERS {
+                    return Err(serde::de::Error::invalid_length(layers.len() + 1, &self));
+                }
+                if layer == 0 || layer > MAX_NEUROFLOW_LAYER_NEURONS {
+                    return Err(serde::de::Error::custom(format!(
+                        "NeuroFlow hidden layer {} has {layer} neurons; expected 1..={MAX_NEUROFLOW_LAYER_NEURONS}",
+                        layers.len()
+                    )));
+                }
+                let layer_weights = layer
+                    .checked_mul(previous.checked_add(1).ok_or_else(|| {
+                        serde::de::Error::custom("NeuroFlow weight dimensions overflow usize")
+                    })?)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("NeuroFlow weight dimensions overflow usize")
+                    })?;
+                total_weights = total_weights.checked_add(layer_weights).ok_or_else(|| {
+                    serde::de::Error::custom("NeuroFlow total weight count overflows usize")
+                })?;
+                if total_weights > MAX_NEUROFLOW_NETWORK_WEIGHTS {
+                    return Err(serde::de::Error::custom(format!(
+                        "NeuroFlow network has {total_weights} hidden weights; maximum is {MAX_NEUROFLOW_NETWORK_WEIGHTS}"
+                    )));
+                }
+                layers.push(layer);
+                previous = layer;
+            }
+            let output_weights = OUTPUT_SIZE
+                .checked_mul(previous.checked_add(1).ok_or_else(|| {
+                    serde::de::Error::custom("NeuroFlow output dimensions overflow usize")
+                })?)
+                .ok_or_else(|| {
+                    serde::de::Error::custom("NeuroFlow output dimensions overflow usize")
+                })?;
+            total_weights = total_weights.checked_add(output_weights).ok_or_else(|| {
+                serde::de::Error::custom("NeuroFlow total weight count overflows usize")
+            })?;
+            if total_weights > MAX_NEUROFLOW_NETWORK_WEIGHTS {
+                return Err(serde::de::Error::custom(format!(
+                    "NeuroFlow network has {total_weights} weights; maximum is {MAX_NEUROFLOW_NETWORK_WEIGHTS}"
+                )));
+            }
+            Ok(layers)
+        }
+    }
+
+    deserializer.deserialize_seq(HiddenLayersVisitor)
 }
 
 /// Supported activation functions for NeuroFlow networks.

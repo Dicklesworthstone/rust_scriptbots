@@ -2050,10 +2050,21 @@ claim that world integration early.
   typed capture errors, first-divergence lookup, an aggregate trace hash, and strict decoded-wire
   validation. The literal golden remains confined to a pinned DSR-only environment guard rather
   than a Cargo feature, so generic `--all-features` testing remains portable;
-- [Currently In Progress — `bd-3n7p`, depends on `bd-2cd1`] Add the versioned checkpoint envelope/codec that
-  can restore the complete future-affecting world state;
-- [Currently In Progress — `bd-3n7p`] Add encode/decode idempotence and lane-by-lane restore fixtures over an
-  evolved world;
+- [Currently In Progress — `bd-3n7p`, depends on `bd-2cd1`] Add the strict
+  `scriptbots.world-checkpoint.v1` core science envelope: bounded canonical Postcard with an
+  unkeyed BLAKE3 corruption checksum, exact six-domain RNG continuation, stable `AgentUid`
+  identities/counters, environment/effects/origins, full genome provenance, evaluator state, and
+  a data-only required-registry roster. Restore allocates fresh physical `AgentId` values and
+  requires a caller-prepared exact registry; executable adapters never come from checkpoint data;
+- [Currently In Progress — `bd-3n7p`] Add fail-closed schema/codec/canonicality/size/invariant
+  tests plus encode/decode idempotence and lane-by-lane restore/next-transition fixtures over an
+  evolved world with a real birth, death, mutation, evaluator-state change, and recycled slot;
+- [Boundary clarified — `bd-3n7p`] This Phase 1.8 artifact is deliberately core-science-only and
+  requires `persistence_interval=0` at an open boundary. It does not restore FrankenSQLite
+  ownership/admission, retained analytics, configuration audit history, UI/render state, or a
+  product run bundle. Application checkpoint discovery/resume remains Phase 4.1, so the legacy
+  `CharacterizationLimitationsV0::checkpoint_replay_guarantee` remains `false`; flipping that V0
+  manifest claim here would overstate product replay support;
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical V3/V3.1 with the fixed
   six-domain continuation object.
 
@@ -2525,12 +2536,13 @@ These become separate implementation beads for terrain, camera/input, HUD, and c
 
 ### Phase 4 — Replay and Experiments (`P1`)
 
-#### 4.1 command/event journal and checkpoint implementation
+#### 4.1 command/event journal and product checkpoint integration
 
 - persist the already-defined canonical manifest/digest schemas;
 - sequenced commands and status transitions;
 - nonempty domain events;
-- evaluator/RNG/world checkpoint state;
+- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1` science envelope, then
+  reconstruct host-owned persistence/session state around the restored core world;
 - checkpoint resume and first-divergence verification.
 
 **Exit:** tick-zero and checkpoint replay match in the bit-exact lane and empty evidence is rejected.
