@@ -1153,8 +1153,7 @@ async fn stream_ticks_sse(
             async move {
                 // Poll on the blocking pool: a contended world mutex must park
                 // a blocking thread, never this stream's async worker (bd-134).
-                let summary =
-                    tokio::task::spawn_blocking(move || handle.latest_summary()).await;
+                let summary = tokio::task::spawn_blocking(move || handle.latest_summary()).await;
                 let event = match summary {
                     Ok(Ok(summary)) => {
                         let json = serde_json::to_string(&TickSummaryDto::from(summary))
@@ -1210,8 +1209,7 @@ async fn stream_ticks_ndjson(State(state): State<ApiState>) -> Result<Response, 
             async move {
                 // Poll on the blocking pool: a contended world mutex must park
                 // a blocking thread, never this stream's async worker (bd-134).
-                let summary =
-                    tokio::task::spawn_blocking(move || handle.latest_summary()).await;
+                let summary = tokio::task::spawn_blocking(move || handle.latest_summary()).await;
                 let line = match summary {
                     Ok(Ok(summary)) => {
                         let json = serde_json::to_string(&TickSummaryDto::from(summary))
