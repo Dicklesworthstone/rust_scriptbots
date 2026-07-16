@@ -2031,7 +2031,7 @@ claim that world integration early.
 
 **Exit:** a multi-generation fixture proves real brain genomes evolve and every child is bound.
 
-#### 1.8 canonical digest and checkpoint skeleton [Digest Oracle Completed — `bd-2z0.3.13`; checkpoint/manifest work remains]
+#### 1.8 canonical digest and checkpoint skeleton [Digest oracle and RNG-aware manifest completed — `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; checkpoint envelope remains — `bd-3n7p`]
 
 - [Completed — `bd-2z0.3.13`] Canonical `scriptbots.world-digest.v1.1`: stable-UID
   science lanes, explicit current dense execution-order lane, evaluator/factory coverage,
@@ -2039,33 +2039,41 @@ claim that world integration early.
 - [Completed — `bd-2z0.3.14`, `1387939`, DSR `bd-2z0-3-14-verify-7`] Make every dense agent
   execution and spawn stage canonical by `AgentUid`, then advance the digest schema before
   retiring the explicit execution-order lane;
-- [Currently In Progress — `bd-2cd1`] Advance the digest and six-point trace to V1.3 with a
-  strict fixed-object hash for all six restorable random-domain checkpoints; advance the run
-  manifest to V3/V3.1 so root seed and continuation state cannot be collapsed back into one stream;
-- include genome, evaluator state, RNG state, config, terrain/food, spawn ordinals, and all future-affecting counters;
+- [Completed — `bd-2cd1`, `a547201`, DSR `bd-2cd1-verify-5` and `bd-2cd1-perf-compare-1`]
+  Advanced the digest and six-point trace to V1.3 with a strict fixed-object hash for all six
+  restorable random-domain checkpoints; advanced the run manifest to V3/V3.1 so root seed and
+  continuation state cannot be collapsed back into one stream;
+- [Completed — `bd-2z0.3.13`, `bd-2cd1`] Bind the canonical digest to genome, evaluator state,
+  all six RNG states, config, terrain/food, spawn ordinals, and all future-affecting counters;
 - [Completed — `bd-2z0.3.13`] Opt-in clock-free trace with exactly six semantic checkpoints,
   separate world/deferred-work/output/resource lanes, pre-consumption death/spawn queues,
   typed capture errors, first-divergence lookup, an aggregate trace hash, and strict decoded-wire
   validation. The literal golden remains confined to a pinned DSR-only environment guard rather
   than a Cargo feature, so generic `--all-features` testing remains portable;
-- checkpoint envelope/codec skeleton;
-- encode/decode idempotence fixtures;
-- upgrade `RunManifestV0` to a versioned canonical manifest.
+- [Tracked — `bd-3n7p`, depends on `bd-2cd1`] Add the versioned checkpoint envelope/codec that
+  can restore the complete future-affecting world state;
+- [Tracked — `bd-3n7p`] Add encode/decode idempotence and lane-by-lane restore fixtures over an
+  evolved world;
+- [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical V3/V3.1 with the fixed
+  six-domain continuation object.
 
-**Exit:** fixed runs have a canonical first-divergence oracle and checkpoint schema before runtime/replay work.
+**Exit (pending `bd-3n7p`):** fixed runs have a canonical first-divergence oracle and checkpoint
+schema before runtime/replay work.
 
-#### 1.9 domain-separated RNG and `fnp-random` decision [Currently In Progress — `bd-2cd1`, TopazCastle, 2026-07-15]
+#### 1.9 domain-separated RNG and `fnp-random` decision [Global six-domain cutover completed — `bd-2cd1`, TopazCastle, 2026-07-16; per-agent noninteraction remains — `bd-1kxd`]
 
 - [Completed — `bd-2z0.3.10`] Reject pinned `fnp-random`: its nightly-only, non-WASM contract
   does not serve this project's C++ parity oracle; retain the pinned `SmallRngStream` protocol;
-- [Currently In Progress — `bd-2cd1`] Route every world stochastic boundary through one of six
-  explicit global domains, persist a strict fixed six-field checkpoint, and expose every domain
-  independently in the canonical digest;
-- [Tracked — `bd-1kxd`, depends on `bd-2cd1`] Replace shared agent-affecting domain consumption
-  with stable agent-keyed/counter substreams and prove dense-permutation and distant-agent
-  noninteraction. Six global domains solve cross-domain draw coupling, not per-agent coupling.
+- [Completed — `bd-2cd1`, `a547201`, DSR `bd-2cd1-verify-5` and `bd-2cd1-perf-compare-1`]
+  Routed every world stochastic boundary through one of six explicit global domains, persisted a
+  strict fixed six-field checkpoint, and exposed every domain independently in the canonical digest;
+- [Tracked — `bd-1kxd`, depends on `bd-3n7p` after `bd-2cd1`] Replace shared agent-affecting
+  domain consumption with stable agent-keyed/counter substreams and prove dense-permutation and
+  distant-agent noninteraction. Six global domains solve cross-domain draw coupling, not per-agent
+  coupling.
 
-**Exit:** unrelated agent insertion or analytics cadence does not perturb existing agent streams.
+**Exit (pending `bd-1kxd`):** unrelated agent insertion or analytics cadence does not perturb
+existing agent streams.
 
 #### 1.10 resource ledger and meadow tuning
 
