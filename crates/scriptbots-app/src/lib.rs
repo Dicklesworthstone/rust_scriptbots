@@ -1,6 +1,6 @@
 //! Shared application plumbing for ScriptBots control surfaces.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use scriptbots_core::{
     CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0,
@@ -58,6 +58,40 @@ pub struct BuildProvenanceV0 {
     pub warnings: Vec<String>,
 }
 
+/// The mutable runtime environment values provenance records, pinned at launch.
+///
+/// Startup legitimately mutates the process environment after resolving the thread
+/// policy — it is still the only channel to the Rayon pool builder (the bd-3p7i
+/// "env-as-IPC" disease note; the value-passing cure belongs to the `HostCore`
+/// config lane). Capturing at manifest time therefore recorded OUR OWN write as the
+/// user's environment: export 16, pass `--threads 4`, and the capture said "4" — wrong
+/// about the one fact it purports to record. The snapshot is pinned by the first
+/// caller, which is the binary's first statement, so the record is what the USER
+/// launched with rather than what startup smeared over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchEnvironmentV0 {
+    /// `RAYON_NUM_THREADS` exactly as the process was launched.
+    pub rayon_num_threads: Option<String>,
+    /// `SCRIPTBOTS_MAX_THREADS` exactly as the process was launched.
+    pub scriptbots_max_threads: Option<String>,
+}
+
+static LAUNCH_ENVIRONMENT: OnceLock<LaunchEnvironmentV0> = OnceLock::new();
+
+impl LaunchEnvironmentV0 {
+    /// Pin — or return the already pinned — launch environment snapshot.
+    ///
+    /// Call before any startup code mutates the process environment; every later call
+    /// gets the pinned snapshot regardless of what has been written since.
+    #[must_use]
+    pub fn pin() -> &'static Self {
+        LAUNCH_ENVIRONMENT.get_or_init(|| Self {
+            rayon_num_threads: std::env::var("RAYON_NUM_THREADS").ok(),
+            scriptbots_max_threads: std::env::var("SCRIPTBOTS_MAX_THREADS").ok(),
+        })
+    }
+}
+
 impl BuildProvenanceV0 {
     /// Capture provenance embedded in the current `scriptbots-app` build.
     ///
@@ -67,9 +101,11 @@ impl BuildProvenanceV0 {
     /// deliberately compile-time inputs: a shipped binary must never describe the caller's
     /// current directory, current Git checkout, or currently installed compiler as the source of
     /// the already-built executable. Missing values remain visibly unknown; provenance is never
-    /// fabricated.
+    /// fabricated. The two runtime environment fields come from the pinned
+    /// [`LaunchEnvironmentV0`], never from a live read that startup may have overwritten.
     #[must_use]
     pub fn current() -> Self {
+        let launch_environment = LaunchEnvironmentV0::pin();
         let source_revision = compile_time_text(option_env!("SCRIPTBOTS_SOURCE_REVISION"));
         let source_branch = compile_time_text(option_env!("SCRIPTBOTS_SOURCE_BRANCH"));
         let source_tree_clean =
@@ -130,8 +166,8 @@ impl BuildProvenanceV0 {
             compiled_features,
             core: CoreBuildIdentityV0::current(),
             rustflags: option_env!("RUSTFLAGS").map(str::to_owned),
-            rayon_num_threads: std::env::var("RAYON_NUM_THREADS").ok(),
-            scriptbots_max_threads: std::env::var("SCRIPTBOTS_MAX_THREADS").ok(),
+            rayon_num_threads: launch_environment.rayon_num_threads.clone(),
+            scriptbots_max_threads: launch_environment.scriptbots_max_threads.clone(),
             provenance_complete: false,
             warnings,
         };

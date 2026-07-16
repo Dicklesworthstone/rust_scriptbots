@@ -129,24 +129,19 @@ fn the_manifest_records_the_thread_policy_the_run_actually_resolved() {
          variable was seen and outranked, rather than ignored or lost."
     );
 
-    // AND THE ENVIRONMENT CAPTURE CANNOT BE TRUSTED TO SHOW THIS — which is why the field above
-    // had to exist.
-    //
-    // `BuildProvenanceV0` captures SCRIPTBOTS_MAX_THREADS by reading the environment at manifest
-    // time. But startup calls `set_var("SCRIPTBOTS_MAX_THREADS", resolved)` to communicate the
-    // decision to Rayon, so by the time provenance is captured WE HAVE OVERWRITTEN THE USER'S OWN
-    // VARIABLE. The field claims to record the environment and actually records what we clobbered
-    // it with: it reports 4 here, not the 16 the user exported.
-    //
-    // This is asserted rather than glossed over, because it is a real defect (filed separately)
-    // and because it pins the reason `thread_policy` is the only honest record of what happened.
-    // If someone later fixes the clobber, this assertion fails and points them straight at the
-    // comment explaining why.
+    // AND THE ENVIRONMENT CAPTURE NOW AGREES WITH REALITY. The user exported 16; the run
+    // used 4; the capture must say 16. Startup still communicates the resolved count to
+    // Rayon through `set_var`, but provenance reads the launch-pinned
+    // `LaunchEnvironmentV0` snapshot taken before any mutation (bd-3p7i), so our own
+    // write can no longer masquerade as the user's environment. `thread_policy` above
+    // records the DECISION; this field records the USER'S STATEMENT; they differ exactly
+    // when precedence did its job.
     assert_eq!(
-        manifest["build"]["scriptbots_max_threads"], "4",
-        "the environment capture no longer reports the CLOBBERED value. If the set_var clobber \
-         has been fixed so that provenance captures the user's real environment (16), that is an \
-         improvement — update this assertion to expect \"16\" and note it on the bead."
+        manifest["build"]["scriptbots_max_threads"], "16",
+        "the environment capture must report what the USER exported at launch (16), not \
+         the resolved value startup wrote back into the environment (4). If this reports \
+         4 again, the launch-environment snapshot is being taken after startup mutation — \
+         the exact bd-3p7i clobber regressing."
     );
 
     let _ = std::fs::remove_dir_all(&dir);

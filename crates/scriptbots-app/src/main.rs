@@ -73,6 +73,10 @@ fn persistence_step_driver(
 }
 
 fn main() -> Result<()> {
+    // FIRST, before anything can mutate the process environment: pin the launch
+    // environment so build provenance records what the user exported, not what
+    // startup's thread-policy set_var smeared over it (bd-3p7i).
+    let _launch_environment = scriptbots_app::LaunchEnvironmentV0::pin();
     let cli = AppCli::parse();
     init_tracing();
 
