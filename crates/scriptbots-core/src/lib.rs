@@ -13713,7 +13713,7 @@ impl WorldState {
             // reach this loop because only a parked live protocol evaluator can become a batch
             // candidate. A family declining the architecture hook preserves the scalar path.
             for (job_index, job) in jobs.iter_mut().enumerate() {
-                if !matches!(job.execution, BrainExecution::Protocol(_)) {
+                if !matches!(&job.execution, BrainExecution::Protocol(_)) {
                     continue;
                 }
                 let Some(registry_key) = job.protocol_registry_key else {
@@ -13892,7 +13892,7 @@ impl WorldState {
             let scalar_protocol_agents = jobs
                 .iter()
                 .filter(|job| {
-                    !job.batch_handled && matches!(job.execution, BrainExecution::Protocol(_))
+                    !job.batch_handled && matches!(&job.execution, BrainExecution::Protocol(_))
                 })
                 .count();
             tracing::debug!(
@@ -25575,6 +25575,7 @@ mod tests {
         batch_returns_none: bool,
         batch_fail_at_lane: Option<usize>,
         batch_truncates_checkpoint: bool,
+        reconstruction_failure: Option<(i8, i16)>,
         batch_probe: Option<Arc<Mutex<Vec<Vec<i8>>>>>,
     }
 
@@ -25591,6 +25592,7 @@ mod tests {
                 batch_returns_none: false,
                 batch_fail_at_lane: None,
                 batch_truncates_checkpoint: false,
+                reconstruction_failure: None,
                 batch_probe: None,
             }
         }
@@ -25662,6 +25664,17 @@ mod tests {
         ) -> Self {
             let mut family = Self::with_batch_probe(id, batch_probe);
             family.batch_truncates_checkpoint = true;
+            family
+        }
+
+        fn failing_reconstruction_after_batch(
+            id: &str,
+            gain: i8,
+            accumulator: i16,
+            batch_probe: Arc<Mutex<Vec<Vec<i8>>>>,
+        ) -> Self {
+            let mut family = Self::with_batch_probe(id, batch_probe);
+            family.reconstruction_failure = Some((gain, accumulator));
             family
         }
 
@@ -25837,7 +25850,7 @@ mod tests {
                 .map(BrainEvaluator::checkpoint_state)
                 .collect::<Result<Vec<_>, _>>()?;
             if self.truncates_checkpoint {
-                states.pop();
+                states.truncate(states.len().saturating_sub(1));
             }
             Ok(states)
         }
@@ -25860,6 +25873,18 @@ mod tests {
             }
             semantic_material.push(u8::from(self.evaluation_fails));
             semantic_material.extend_from_slice(&self.evaluation_offset.to_le_bytes());
+            if let Some(lane) = self.batch_fail_at_lane {
+                semantic_material.push(1);
+                semantic_material.extend_from_slice(lane.to_string().as_bytes());
+            }
+            if self.batch_truncates_checkpoint {
+                semantic_material.push(2);
+            }
+            if let Some((gain, accumulator)) = self.reconstruction_failure {
+                semantic_material.push(3);
+                semantic_material.push(gain as u8);
+                semantic_material.extend_from_slice(&accumulator.to_le_bytes());
+            }
             BrainAdapterIdentityV1::from_semantic_descriptor(&self.id, 1, &semantic_material)
         }
 
@@ -25979,6 +26004,15 @@ mod tests {
             }
             let (gain, bias) = self.decode_genome(genome)?;
             let accumulator = self.decode_state(state)?;
+            if self.reconstruction_failure == Some((gain, accumulator)) {
+                return Err(BrainProtocolError::InvalidPayload {
+                    kind: BrainEnvelopeKind::EvaluatorState,
+                    family_id: self.id.clone(),
+                    detail: format!(
+                        "fixture rejected reconstruction for gain {gain} at accumulator {accumulator}"
+                    ),
+                });
+            }
             Ok(Box::new(FixtureBrainEvaluator {
                 id: self.id.clone(),
                 gain,
@@ -26166,27 +26200,48 @@ mod tests {
             .brain = BrainBinding::protocol(key, id.to_owned(), genome, evaluator);
     }
 
-    fn spawn_fixture_protocol_agent(
-        world: &mut WorldState,
-        key: u64,
-        family_id: &str,
+    #[derive(Clone, Copy)]
+    struct FixtureProtocolLane {
         seed: u32,
         gain: i8,
         bias: i8,
         accumulator: i16,
         sensor_zero: f32,
-    ) -> AgentId {
-        let agent = world.spawn_agent(sample_agent(seed));
-        let family = FixtureBrainFamily::new(family_id);
-        let genome = family.genome(
+    }
+
+    const fn fixture_protocol_lane(
+        seed: u32,
+        gain: i8,
+        bias: i8,
+        accumulator: i16,
+        sensor_zero: f32,
+    ) -> FixtureProtocolLane {
+        FixtureProtocolLane {
+            seed,
             gain,
             bias,
+            accumulator,
+            sensor_zero,
+        }
+    }
+
+    fn spawn_fixture_protocol_agent(
+        world: &mut WorldState,
+        key: u64,
+        family_id: &str,
+        lane: FixtureProtocolLane,
+    ) -> AgentId {
+        let agent = world.spawn_agent(sample_agent(lane.seed));
+        let family = FixtureBrainFamily::new(family_id);
+        let genome = family.genome(
+            lane.gain,
+            lane.bias,
             BrainProvenance {
                 created_at: world.tick(),
                 ..BrainProvenance::default()
             },
         );
-        let state = family.state(accumulator);
+        let state = family.state(lane.accumulator);
         let evaluator = family
             .evaluator(&genome, &state)
             .expect("fixture protocol evaluator");
@@ -26195,7 +26250,7 @@ mod tests {
             .expect("fixture protocol runtime");
         runtime.brain =
             BrainBinding::protocol(key, family_id.to_owned(), genome, evaluator);
-        runtime.sensors[0] = sensor_zero;
+        runtime.sensors[0] = lane.sensor_zero;
         agent
     }
 
@@ -27569,20 +27624,36 @@ mod tests {
             .agent_runtime_mut(unbound)
             .expect("unbound runtime")
             .sensors[0] = 0.25;
-        let alpha_first =
-            spawn_fixture_protocol_agent(&mut world, alpha_key, "batch-alpha", 1, 2, 1, 3, 4.0);
+        let alpha_first = spawn_fixture_protocol_agent(
+            &mut world,
+            alpha_key,
+            "batch-alpha",
+            fixture_protocol_lane(1, 2, 1, 3, 4.0),
+        );
         let legacy = world.spawn_agent(sample_agent(2));
         {
             let runtime = world.agent_runtime_mut(legacy).expect("legacy runtime");
             runtime.brain = BrainBinding::with_runner(Box::new(StubBrain));
             runtime.sensors[0] = 0.75;
         }
-        let beta_first =
-            spawn_fixture_protocol_agent(&mut world, beta_key, "batch-beta", 3, -1, 2, 5, 3.0);
-        let alpha_second =
-            spawn_fixture_protocol_agent(&mut world, alpha_key, "batch-alpha", 4, 3, -2, 1, 2.0);
-        let beta_second =
-            spawn_fixture_protocol_agent(&mut world, beta_key, "batch-beta", 5, 2, 0, -1, 5.0);
+        let beta_first = spawn_fixture_protocol_agent(
+            &mut world,
+            beta_key,
+            "batch-beta",
+            fixture_protocol_lane(3, -1, 2, 5, 3.0),
+        );
+        let alpha_second = spawn_fixture_protocol_agent(
+            &mut world,
+            alpha_key,
+            "batch-alpha",
+            fixture_protocol_lane(4, 3, -2, 1, 2.0),
+        );
+        let beta_second = spawn_fixture_protocol_agent(
+            &mut world,
+            beta_key,
+            "batch-beta",
+            fixture_protocol_lane(5, 2, 0, -1, 5.0),
+        );
 
         world.stage_brains().expect("mixed batch stage");
 
@@ -27655,6 +27726,178 @@ mod tests {
 
     #[cfg(feature = "batch-brains")]
     #[test]
+    fn stage_brains_excludes_missing_execution_from_live_protocol_cohorts() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("missing execution batch world");
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let key = world
+            .register_brain_family(
+                "batch-missing-execution",
+                Box::new(FixtureBrainFamily::with_batch_probe(
+                    "batch-missing-execution",
+                    Arc::clone(&probe),
+                )),
+            )
+            .expect("missing execution family");
+        let first = spawn_fixture_protocol_agent(
+            &mut world,
+            key,
+            "batch-missing-execution",
+            fixture_protocol_lane(1, 2, 1, 3, 4.0),
+        );
+        let second = spawn_fixture_protocol_agent(
+            &mut world,
+            key,
+            "batch-missing-execution",
+            fixture_protocol_lane(2, 3, -2, 1, 2.0),
+        );
+        let missing_protocol = world.spawn_agent(sample_agent(3));
+        let stripped_protocol = world
+            .agent_runtime(first)
+            .expect("live protocol source")
+            .brain
+            .clone();
+        world
+            .agent_runtime_mut(missing_protocol)
+            .expect("missing protocol runtime")
+            .brain = stripped_protocol;
+        let missing_legacy = world.spawn_agent(sample_agent(4));
+        world
+            .agent_runtime_mut(missing_legacy)
+            .expect("missing legacy runtime")
+            .brain = BrainBinding::with_runner(Box::new(StubBrain)).clone();
+
+        let error = world
+            .stage_brains()
+            .expect_err("missing execution must remain a typed terminal fault");
+        assert_eq!(error.kind(), "batch-missing-execution");
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<MissingProtocolEvaluator>())
+                .is_some()
+        );
+        assert_eq!(
+            *probe.lock().expect("missing execution probe"),
+            vec![vec![2, 3]],
+            "executor-free protocol and legacy bindings must never enter a cohort"
+        );
+        assert_eq!(
+            world.agent_runtime(first).expect("first live result").outputs[0].to_bits(),
+            12.0_f32.to_bits()
+        );
+        assert_eq!(
+            world
+                .agent_runtime(second)
+                .expect("second live result")
+                .outputs[0]
+                .to_bits(),
+            5.0_f32.to_bits()
+        );
+        for agent in [missing_protocol, missing_legacy] {
+            assert_eq!(
+                world
+                    .agent_runtime(agent)
+                    .expect("missing execution containment")
+                    .outputs,
+                [0.0; OUTPUT_SIZE]
+            );
+        }
+    }
+
+    #[cfg(all(
+        feature = "batch-brains",
+        feature = "parallel",
+        not(target_arch = "wasm32")
+    ))]
+    #[test]
+    fn stage_brain_results_and_digest_are_independent_of_rayon_thread_count() {
+        fn execute(
+            threads: usize,
+        ) -> (
+            Vec<[u32; OUTPUT_SIZE]>,
+            Vec<BrainEvaluatorStateEnvelope>,
+            WorldDigestV1,
+        ) {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                population_minimum: 0,
+                rng_seed: Some(0xBA7C_2026),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("thread-independent batch world");
+            let key = world
+                .register_brain_family(
+                    "batch-thread-count",
+                    Box::new(FixtureBrainFamily::new("batch-thread-count")),
+                )
+                .expect("thread-count family");
+            let protocol_agents = [
+                fixture_protocol_lane(1, 2, 1, 3, 4.0),
+                fixture_protocol_lane(2, 3, -2, 1, 2.0),
+                fixture_protocol_lane(3, -1, 2, 5, 3.0),
+                fixture_protocol_lane(4, 2, 0, -1, 5.0),
+                fixture_protocol_lane(5, 4, -3, 7, -0.5),
+                fixture_protocol_lane(6, -2, 6, 2, 1.25),
+            ]
+            .map(|lane| {
+                spawn_fixture_protocol_agent(
+                    &mut world,
+                    key,
+                    "batch-thread-count",
+                    lane,
+                )
+            });
+            let unbound = world.spawn_agent(sample_agent(7));
+            world
+                .agent_runtime_mut(unbound)
+                .expect("thread-count unbound")
+                .sensors[0] = 0.375;
+            let legacy = world.spawn_agent(sample_agent(8));
+            world
+                .agent_runtime_mut(legacy)
+                .expect("thread-count legacy")
+                .brain = BrainBinding::with_runner(Box::new(StubBrain));
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("dedicated test pool");
+            pool.install(|| world.stage_brains())
+                .expect("thread-count brain stage");
+            let outputs = world
+                .agents()
+                .iter_handles()
+                .map(|agent| {
+                    output_bits(
+                        world
+                            .agent_runtime(agent)
+                            .expect("thread-count runtime")
+                            .outputs,
+                    )
+                })
+                .collect();
+            let states = protocol_agents
+                .into_iter()
+                .map(|agent| {
+                    world
+                        .agent_brain_evaluator_state(agent)
+                        .expect("thread-count checkpoint")
+                        .expect("thread-count protocol state")
+                })
+                .collect();
+            let digest = world.world_digest_v1().expect("thread-count digest");
+            (outputs, states, digest)
+        }
+
+        let one = execute(1);
+        assert_eq!(execute(2), one);
+        assert_eq!(execute(4), one);
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
     fn stage_brains_preserves_scalar_fallback_when_family_declines_batch() {
         let mut world = WorldState::new(ScriptBotsConfig {
             population_minimum: 0,
@@ -27687,41 +27930,25 @@ mod tests {
                 &mut world,
                 scalar_key,
                 "scalar-only",
-                1,
-                2,
-                1,
-                3,
-                4.0,
+                fixture_protocol_lane(1, 2, 1, 3, 4.0),
             ),
             spawn_fixture_protocol_agent(
                 &mut world,
                 scalar_key,
                 "scalar-only",
-                2,
-                3,
-                -2,
-                1,
-                2.0,
+                fixture_protocol_lane(2, 3, -2, 1, 2.0),
             ),
             spawn_fixture_protocol_agent(
                 &mut world,
                 declining_key,
                 "declining-batch",
-                3,
-                -1,
-                2,
-                5,
-                3.0,
+                fixture_protocol_lane(3, -1, 2, 5, 3.0),
             ),
             spawn_fixture_protocol_agent(
                 &mut world,
                 declining_key,
                 "declining-batch",
-                4,
-                2,
-                0,
-                -1,
-                5.0,
+                fixture_protocol_lane(4, 2, 0, -1, 5.0),
             ),
         ];
 
@@ -27742,6 +27969,83 @@ mod tests {
                 expected.to_bits()
             );
         }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_batch_and_scalar_paths_are_bit_identical() {
+        fn build_world(
+            batch_enabled: bool,
+        ) -> (WorldState, [AgentId; 4], Arc<Mutex<Vec<Vec<i8>>>>) {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                population_minimum: 0,
+                rng_seed: Some(0xB17B_17B1),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("matched batch world");
+            let probe = Arc::new(Mutex::new(Vec::new()));
+            let family = if batch_enabled {
+                FixtureBrainFamily::with_batch_probe("batch-scalar-match", Arc::clone(&probe))
+            } else {
+                FixtureBrainFamily::scalar_only("batch-scalar-match", Arc::clone(&probe))
+            };
+            let key = world
+                .register_brain_family("batch-scalar-match", Box::new(family))
+                .expect("matched family");
+            let agents = [
+                fixture_protocol_lane(1, 2, 1, 3, 4.0),
+                fixture_protocol_lane(2, 3, -2, 1, 2.0),
+                fixture_protocol_lane(3, -1, 2, 5, 3.0),
+                fixture_protocol_lane(4, 2, 0, -1, 5.0),
+            ]
+            .map(|lane| {
+                spawn_fixture_protocol_agent(
+                    &mut world,
+                    key,
+                    "batch-scalar-match",
+                    lane,
+                )
+            });
+            (world, agents, probe)
+        }
+
+        let (mut scalar, scalar_agents, scalar_probe) = build_world(false);
+        let (mut batch, batch_agents, batch_probe) = build_world(true);
+        scalar.stage_brains().expect("matched scalar stage");
+        batch.stage_brains().expect("matched batch stage");
+        assert!(scalar_probe.lock().expect("matched scalar probe").is_empty());
+        assert_eq!(
+            *batch_probe.lock().expect("matched batch probe"),
+            vec![vec![2, 3, -1, 2]]
+        );
+        for (scalar_agent, batch_agent) in scalar_agents.into_iter().zip(batch_agents) {
+            assert_eq!(
+                output_bits(
+                    scalar
+                        .agent_runtime(scalar_agent)
+                        .expect("matched scalar result")
+                        .outputs,
+                ),
+                output_bits(
+                    batch
+                        .agent_runtime(batch_agent)
+                        .expect("matched batch result")
+                        .outputs,
+                )
+            );
+            assert_eq!(
+                scalar
+                    .agent_brain_evaluator_state(scalar_agent)
+                    .expect("matched scalar checkpoint"),
+                batch
+                    .agent_brain_evaluator_state(batch_agent)
+                    .expect("matched batch checkpoint")
+            );
+        }
+        assert_eq!(
+            scalar.world_digest_v1().expect("matched scalar digest"),
+            batch.world_digest_v1().expect("matched batch digest")
+        );
     }
 
     #[cfg(feature = "batch-brains")]
@@ -27767,21 +28071,13 @@ mod tests {
             &mut world,
             key,
             "batch-rollback",
-            1,
-            2,
-            1,
-            3,
-            4.0,
+            fixture_protocol_lane(1, 2, 1, 3, 4.0),
         );
         let second = spawn_fixture_protocol_agent(
             &mut world,
             key,
             "batch-rollback",
-            2,
-            3,
-            -2,
-            1,
-            2.0,
+            fixture_protocol_lane(2, 3, -2, 1, 2.0),
         );
         let before = [first, second].map(|agent| {
             world
@@ -27822,6 +28118,75 @@ mod tests {
 
     #[cfg(feature = "batch-brains")]
     #[test]
+    fn stage_brains_rolls_back_when_a_post_batch_evaluator_cannot_reconstruct() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("batch reconstruction world");
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let key = world
+            .register_brain_family(
+                "batch-reconstruction",
+                Box::new(FixtureBrainFamily::failing_reconstruction_after_batch(
+                    "batch-reconstruction",
+                    3,
+                    2,
+                    Arc::clone(&probe),
+                )),
+            )
+            .expect("reconstruction family");
+        let agents = [
+            spawn_fixture_protocol_agent(
+                &mut world,
+                key,
+                "batch-reconstruction",
+                fixture_protocol_lane(1, 2, 1, 3, 4.0),
+            ),
+            spawn_fixture_protocol_agent(
+                &mut world,
+                key,
+                "batch-reconstruction",
+                fixture_protocol_lane(2, 3, -2, 1, 2.0),
+            ),
+        ];
+        let before = agents.map(|agent| {
+            world
+                .agent_brain_evaluator_state(agent)
+                .expect("pre-reconstruction checkpoint")
+                .expect("pre-reconstruction protocol state")
+        });
+
+        let error = world
+            .stage_brains()
+            .expect_err("one invalid replacement must roll back every cohort lane");
+        assert!(
+            error
+                .to_string()
+                .contains("fixture rejected reconstruction for gain 3 at accumulator 2")
+        );
+        assert_eq!(
+            *probe.lock().expect("reconstruction probe"),
+            vec![vec![2, 3]]
+        );
+        for (lane, agent) in agents.into_iter().enumerate() {
+            let runtime = world
+                .agent_runtime(agent)
+                .expect("reconstruction rollback runtime");
+            assert_eq!(runtime.outputs, [0.0; OUTPUT_SIZE]);
+            assert!(runtime.brain.is_bound());
+            assert_eq!(
+                world
+                    .agent_brain_evaluator_state(agent)
+                    .expect("post-reconstruction checkpoint")
+                    .expect("post-reconstruction protocol state"),
+                before[lane]
+            );
+        }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
     fn stage_brains_rejects_batch_checkpoint_cardinality_without_committing() {
         let mut world = WorldState::new(ScriptBotsConfig {
             population_minimum: 0,
@@ -27843,21 +28208,13 @@ mod tests {
                 &mut world,
                 key,
                 "batch-cardinality",
-                1,
-                2,
-                1,
-                3,
-                4.0,
+                fixture_protocol_lane(1, 2, 1, 3, 4.0),
             ),
             spawn_fixture_protocol_agent(
                 &mut world,
                 key,
                 "batch-cardinality",
-                2,
-                3,
-                -2,
-                1,
-                2.0,
+                fixture_protocol_lane(2, 3, -2, 1, 2.0),
             ),
         ];
         let before = agents.map(|agent| {
@@ -27913,21 +28270,13 @@ mod tests {
                 &mut world,
                 key,
                 "disabled-batch",
-                1,
-                2,
-                1,
-                3,
-                4.0,
+                fixture_protocol_lane(1, 2, 1, 3, 4.0),
             ),
             spawn_fixture_protocol_agent(
                 &mut world,
                 key,
                 "disabled-batch",
-                2,
-                3,
-                -2,
-                1,
-                2.0,
+                fixture_protocol_lane(2, 3, -2, 1, 2.0),
             ),
         ];
 
