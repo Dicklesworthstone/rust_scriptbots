@@ -60,8 +60,11 @@ fn launch_with(dir: &Path, envs: &[(&str, &str)], args: &[&str]) -> std::process
         .env("SCRIPTBOTS_STORAGE_PATH", &db)
         .env("SCRIPTBOTS_RNG_SEED", "4242")
         // Preserve real control-server startup while allowing parallel test cases
-        // to reserve distinct sockets atomically through the operating system.
+        // to reserve distinct REST and MCP sockets atomically through the operating system.
+        .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_CONTROL_MCP", "http")
+        .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", "2")
         .env("SCRIPTBOTS_TERMINAL_HEADLESS", "1")
         .args(["--mode", "terminal", "--bootstrap-ticks", "2"]);
