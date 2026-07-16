@@ -51,6 +51,65 @@ const LIVE_RUN_POLICY: &str = "operator-controlled-until-stop-v1";
 
 type SharedPersistenceAdmission = Arc<Mutex<PersistenceAdmissionSession>>;
 
+#[derive(Clone, Copy)]
+struct SenseRunSummary {
+    tick: u64,
+    saturations_total: u64,
+}
+
+impl SenseRunSummary {
+    fn capture(world: &WorldState) -> Self {
+        Self {
+            tick: world.tick().0,
+            saturations_total: world.sense_saturations_total(),
+        }
+    }
+}
+
+fn emit_sense_startup_contract() {
+    info!(
+        target: "scriptbots::sense",
+        sense_kernel = "fixed_point",
+        frac_bits = scriptbots_core::sense_fixed::SENSE_FRAC_BITS,
+        max_neighbors_assumed = scriptbots_core::sense_fixed::MAX_NEIGHBORS_ASSUMED,
+        headroom_bits = scriptbots_core::sense_fixed::SENSE_HEADROOM_BITS,
+        geometry = scriptbots_core::sense_fixed::SENSE_GEOMETRY,
+        poly_max_err = scriptbots_core::sense_fixed::ACOS_MAX_ERROR,
+        "sense numeric contract"
+    );
+}
+
+fn emit_sense_run_end(summary: SenseRunSummary, completed: bool) {
+    let suspect = summary.saturations_total != 0;
+    let status = if completed { "completed" } else { "error" };
+    if suspect || !completed {
+        warn!(
+            target: "scriptbots::sense",
+            tick = summary.tick,
+            saturations_total = summary.saturations_total,
+            suspect,
+            status,
+            "sense run ended"
+        );
+    } else {
+        info!(
+            target: "scriptbots::sense",
+            tick = summary.tick,
+            saturations_total = summary.saturations_total,
+            suspect,
+            status,
+            "sense run ended"
+        );
+    }
+}
+
+fn capture_shared_sense_run_summary(world: &SharedWorld) -> SenseRunSummary {
+    match world.lock() {
+        Ok(world) => SenseRunSummary::capture(&world),
+        Err(poisoned) => SenseRunSummary::capture(&poisoned.into_inner()),
+    }
+}
+
 fn persistence_step_driver(
     world: &SharedWorld,
     session: &SharedPersistenceAdmission,
@@ -395,9 +454,11 @@ fn main() -> Result<()> {
             )),
         }
     })();
-    finish_with_storage(runtime_result, "runtime", || {
+    let result = finish_with_storage(runtime_result, "runtime", || {
         finalize_and_shutdown_storage(&world, &persistence, &mut storage_pipeline)
-    })
+    });
+    emit_sense_run_end(capture_shared_sense_run_summary(&world), result.is_ok());
+    result
 }
 
 fn prefer_storage_failure<T>(
@@ -662,6 +723,7 @@ fn run_characterization_v0(
     identity
         .validate()
         .context("invalid characterization run identity")?;
+    emit_sense_startup_contract();
     let trace = CharacterizationTraceV2::capture_with_scenario_and_session(
         identity,
         scenario,
@@ -669,8 +731,9 @@ fn run_characterization_v0(
         &mut world,
         &mut persistence,
         ticks,
-    )?;
-    let mut bytes = trace.canonical_json_bytes()?;
+    );
+    emit_sense_run_end(SenseRunSummary::capture(&world), trace.is_ok());
+    let mut bytes = trace?.canonical_json_bytes()?;
     bytes.push(b'\n');
 
     if let Some(path) = cli.characterization_out.as_ref() {
@@ -1224,6 +1287,7 @@ fn bootstrap_world(
             });
         }
     };
+    emit_sense_startup_contract();
     let bootstrap_result = (|| -> Result<()> {
         for _ in 0..bootstrap_ticks {
             persistence.step(&mut world)?;
@@ -1249,10 +1313,12 @@ fn bootstrap_world(
         Ok(())
     })();
     if let Err(error) = bootstrap_result {
-        return finish_with_storage(Err(error), "world bootstrap", || {
+        let result = finish_with_storage(Err(error), "world bootstrap", || {
             let finalization = finalize_world_persistence(&mut world, &mut persistence);
             finalize_then_shutdown_storage(finalization, &mut pipeline)
         });
+        emit_sense_run_end(SenseRunSummary::capture(&world), result.is_ok());
+        return result;
     }
 
     Ok((
@@ -2614,13 +2680,19 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
     let brain_keys = install_brains(&mut world)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
-    for _ in 0..tick_limit {
-        persistence.step(&mut world)?;
-    }
-    persistence
-        .finalize(&mut world)
-        .context("failed to admit the final partial replay batch")?;
-
+    emit_sense_startup_contract();
+    let simulation_result = (|| -> Result<()> {
+        for _ in 0..tick_limit {
+            persistence.step(&mut world)?;
+        }
+        persistence
+            .finalize(&mut world)
+            .context("failed to admit the final partial replay batch")?;
+        Ok(())
+    })();
+    let sense_summary = SenseRunSummary::capture(&world);
+    emit_sense_run_end(sense_summary, simulation_result.is_ok());
+    simulation_result?;
     drop(world);
     drop(persistence);
 
@@ -2656,10 +2728,16 @@ fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()>
     let brain_keys = install_brains(&mut world)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
+    emit_sense_startup_contract();
     let start = Instant::now();
-    for _ in 0..tick_limit {
-        persistence.step(&mut world)?;
-    }
+    let result = (|| -> Result<()> {
+        for _ in 0..tick_limit {
+            persistence.step(&mut world)?;
+        }
+        Ok(())
+    })();
+    emit_sense_run_end(SenseRunSummary::capture(&world), result.is_ok());
+    result?;
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
     let tps = tick_limit as f64 / secs;
@@ -2768,6 +2846,7 @@ fn profile_world_steps_with_storage(
             );
         }
     };
+    emit_sense_startup_contract();
     let start = Instant::now();
     let profile_result = (|| -> Result<()> {
         for _ in 0..tick_limit {
@@ -2775,10 +2854,12 @@ fn profile_world_steps_with_storage(
         }
         Ok(())
     })();
-    finish_with_storage(profile_result, "storage profiling", || {
+    let result = finish_with_storage(profile_result, "storage profiling", || {
         let finalization = finalize_world_persistence(&mut world, &mut persistence);
         finalize_then_shutdown_storage(finalization, &mut pipeline)
-    })?;
+    });
+    emit_sense_run_end(SenseRunSummary::capture(&world), result.is_ok());
+    result?;
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
     let tps = tick_limit as f64 / secs;
