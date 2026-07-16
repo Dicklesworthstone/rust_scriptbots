@@ -23147,11 +23147,12 @@ mod tests {
             completion.outcome.births.is_empty(),
             "the otherwise reproduction-eligible parent must not birth from a containment tick"
         );
-        let CompletedStepFault::BrainSpawn(fault) = completion
+        let fault = completion
             .fault
-            .expect("missing legacy execution must produce a completed fault")
-        else {
-            panic!("missing legacy execution produced a non-brain fault");
+            .expect("missing legacy execution must produce a completed fault");
+        assert!(matches!(&fault, CompletedStepFault::BrainSpawn(_)));
+        let CompletedStepFault::BrainSpawn(fault) = fault else {
+            return;
         };
         assert_eq!(fault.kind(), "stub");
         assert!(
@@ -23170,8 +23171,9 @@ mod tests {
         let repeated = world
             .step_outcome()
             .expect_err("latched missing-runner fault must reject a second transition");
+        assert!(matches!(&repeated, WorldStepError::BrainSpawn(_)));
         let WorldStepError::BrainSpawn(repeated) = repeated else {
-            panic!("latched missing-runner fault changed error type");
+            return;
         };
         assert_eq!(repeated.kind(), "stub");
         assert_eq!(world.tick(), Tick(1));
