@@ -24351,7 +24351,7 @@ mod tests {
             rng: &mut dyn RandomStream,
         ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
             let (gain, bias) = self.decode_genome(genome)?;
-            let delta = if rates.primary > 0.0 {
+            let delta = if rng.random::<f32>() < rates.primary {
                 (rng.next_u32() % 7 + 1) as i8
             } else {
                 0
