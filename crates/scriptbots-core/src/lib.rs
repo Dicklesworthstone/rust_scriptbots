@@ -154,7 +154,7 @@ const RANDOM_STREAM_ALGORITHM: &str = "rand-0.9.5-smallrng-xoshiro256plusplus-64
 #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
 const RANDOM_STREAM_ALGORITHM: &str = "rand-0.9.5-smallrng-xoshiro128plusplus-32-seed-from-u64";
 
-/// Serializable continuation state for the current world random stream.
+/// Serializable continuation state for one random-stream adapter.
 ///
 /// `SmallRng` deliberately does not promise a portable, serializable state. This first protocol
 /// therefore carries a bounded opaque payload identified by an algorithm and codec version. The
@@ -2612,7 +2612,11 @@ impl DynamicWorldSnapshot {
 }
 
 /// Schema identifier for the temporary pre-redesign world characterization digest.
-pub const CHARACTERIZATION_DIGEST_V0_SCHEMA: &str = "scriptbots.world.characterization.v0";
+///
+/// V0.1 replaces the original single-stream four-draw probe with four draws from each of the six
+/// domain streams. The type remains the deliberately limited V0 characterization aid, but the
+/// schema change prevents its incompatible RNG semantics from masquerading as the original wire.
+pub const CHARACTERIZATION_DIGEST_V0_SCHEMA: &str = "scriptbots.world.characterization.v0.1";
 
 /// Stable, non-cryptographic fingerprint of the deterministic world fields available today.
 ///
@@ -2649,14 +2653,64 @@ pub const WORLD_DIGEST_V1_ALGORITHM: &str = "fnv1a64-v0";
 /// Stable logical identity used by the V1.3 agent lane and transition order.
 pub const WORLD_DIGEST_V1_AGENT_IDENTITY: &str = "AgentUid";
 
+/// The exact six per-domain hashes carried by [`RngDomainDigestV1`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RngDomainDigestsV1 {
+    /// Environment, terrain, weather, and intervention randomness.
+    pub environment: String,
+    /// Food scatter and regrowth randomness.
+    pub food: String,
+    /// Population seeding, placement, culling, and floor-injection randomness.
+    pub population: String,
+    /// Parent, partner, and lineage-selection randomness.
+    pub lineage: String,
+    /// Brain and agent-runtime mutation randomness.
+    pub mutation: String,
+    /// Crossover admission and construction randomness.
+    pub crossover: String,
+}
+
+impl RngDomainDigestsV1 {
+    fn from_fn(mut digest_for: impl FnMut(RngDomain) -> String) -> Self {
+        Self {
+            environment: digest_for(RngDomain::Environment),
+            food: digest_for(RngDomain::Food),
+            population: digest_for(RngDomain::Population),
+            lineage: digest_for(RngDomain::Lineage),
+            mutation: digest_for(RngDomain::Mutation),
+            crossover: digest_for(RngDomain::Crossover),
+        }
+    }
+
+    /// Return the hash for one stable random domain.
+    #[must_use]
+    pub fn get(&self, domain: RngDomain) -> &str {
+        match domain {
+            RngDomain::Environment => &self.environment,
+            RngDomain::Food => &self.food,
+            RngDomain::Population => &self.population,
+            RngDomain::Lineage => &self.lineage,
+            RngDomain::Mutation => &self.mutation,
+            RngDomain::Crossover => &self.crossover,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (RngDomain, &str)> {
+        RngDomain::ALL
+            .into_iter()
+            .map(|domain| (domain, self.get(domain)))
+    }
+}
+
 /// Diagnostic hash of every restorable random-domain checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RngDomainDigestV1 {
     /// Hash over the exact ordered set of domain hashes below.
     pub overall: String,
-    /// Per-domain hashes keyed by the stable [`RngDomain::tag`] values.
-    pub domains: BTreeMap<String, String>,
+    /// Per-domain hashes named by the stable [`RngDomain::tag`] values.
+    pub domains: RngDomainDigestsV1,
 }
 
 impl RngDomainDigestV1 {
@@ -2666,11 +2720,7 @@ impl RngDomainDigestV1 {
         encoder.usize(RngDomain::ALL.len());
         for domain in RngDomain::ALL {
             encoder.string(domain.tag());
-            encoder.string(
-                self.domains
-                    .get(domain.tag())
-                    .map_or("<missing>", String::as_str),
-            );
+            encoder.string(self.domains.get(domain));
         }
         encoder.finish()
     }
@@ -2757,8 +2807,6 @@ pub enum WorldDigestV1ContractError {
     CoverageOrder { coverage: &'static str },
     #[error("world-digest field `{field}` is not a lowercase 16-digit digest")]
     DigestFormat { field: &'static str },
-    #[error("world-digest RNG domains are not the exact supported six-domain set")]
-    RngDomainSet,
     #[error("world-digest RNG domain `{domain}` is not a lowercase 16-digit digest")]
     RngDomainDigestFormat { domain: String },
     #[error("world-digest RNG aggregate does not match its ordered domain hashes")]
@@ -2859,17 +2907,10 @@ impl WorldDigestV1 {
                 return Err(WorldDigestV1ContractError::DigestFormat { field });
             }
         }
-        if self.rng.domains.len() != RngDomain::ALL.len()
-            || RngDomain::ALL
-                .into_iter()
-                .any(|domain| !self.rng.domains.contains_key(domain.tag()))
-        {
-            return Err(WorldDigestV1ContractError::RngDomainSet);
-        }
-        for (domain, digest) in &self.rng.domains {
+        for (domain, digest) in self.rng.domains.iter() {
             if !is_characterization_digest(digest) {
                 return Err(WorldDigestV1ContractError::RngDomainDigestFormat {
-                    domain: domain.clone(),
+                    domain: domain.tag().to_owned(),
                 });
             }
         }
@@ -4945,15 +4986,11 @@ impl WorldStepTrace {
                 return Err(WorldStepTraceContractError::DigestFormat { point, field });
             }
         }
-        if world.rng.domains.len() != RngDomain::ALL.len()
-            || RngDomain::ALL
-                .into_iter()
-                .any(|domain| !world.rng.domains.contains_key(domain.tag()))
-            || world
-                .rng
-                .domains
-                .values()
-                .any(|digest| !is_characterization_digest(digest))
+        if world
+            .rng
+            .domains
+            .iter()
+            .any(|(_, digest)| !is_characterization_digest(digest))
             || !is_characterization_digest(&world.rng.overall)
             || world.rng.overall != world.rng.recomputed_overall()
         {
@@ -15025,7 +15062,7 @@ impl WorldState {
         let mut runtime = AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
         let binding = if let Some(key) = self
             .brain_registry
-            .random_key(self.rng.stream(RngDomain::Population))
+            .random_key(self.rng.stream(RngDomain::Lineage))
         {
             self.prepare_registered_brain(key, record_tick)?
         } else {
@@ -17957,11 +17994,8 @@ impl WorldState {
         // stream's algorithm identity ride along, so no generator or domain-remapping change can
         // silently compare as the same continuation.
         let checkpoint = self.rng.checkpoint();
-        let mut rng_domains = BTreeMap::new();
-        for domain in RngDomain::ALL {
-            let state = checkpoint
-                .stream(domain)
-                .expect("live DomainStreams checkpoints contain every domain");
+        let rng_domains = RngDomainDigestsV1::from_fn(|domain| {
+            let state = checkpoint.stream(domain);
             let mut encoder =
                 CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "rng-domain");
             encoder.string(&checkpoint.algorithm);
@@ -17976,8 +18010,8 @@ impl WorldState {
             for byte in &state.state {
                 encoder.u8(*byte);
             }
-            rng_domains.insert(domain.tag().to_owned(), encoder.finish());
-        }
+            encoder.finish()
+        });
         let mut rng = RngDomainDigestV1 {
             overall: String::new(),
             domains: rng_domains,
@@ -21949,6 +21983,56 @@ mod tests {
     }
 
     #[test]
+    fn real_food_respawn_advances_only_the_food_random_domain() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 1,
+            food_respawn_amount: 0.25,
+            food_max: 1.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xF00D_D04A),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("food-domain world");
+
+        let checkpoint_before = world.random_streams_checkpoint();
+        let digest_before = world.world_digest_v1().expect("pre-respawn digest");
+        assert!(world.stage_food_respawn(Tick(1)).is_some());
+        let checkpoint_after = world.random_streams_checkpoint();
+        let digest_after = world.world_digest_v1().expect("post-respawn digest");
+
+        for domain in RngDomain::ALL {
+            let before = checkpoint_before.stream(domain);
+            let after = checkpoint_after.stream(domain);
+            if domain == RngDomain::Food {
+                assert_ne!(before, after, "food respawn consumed no Food-domain RNG");
+                assert_ne!(
+                    digest_before.rng.domains.get(domain),
+                    digest_after.rng.domains.get(domain),
+                    "food respawn did not move the Food-domain digest"
+                );
+            } else {
+                assert_eq!(
+                    before,
+                    after,
+                    "food respawn perturbed the {} domain checkpoint",
+                    domain.tag()
+                );
+                assert_eq!(
+                    digest_before.rng.domains.get(domain),
+                    digest_after.rng.domains.get(domain),
+                    "food respawn perturbed the {} domain digest",
+                    domain.tag()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn aging_respects_tick_cadence() {
         let config = ScriptBotsConfig {
             world_width: 120,
@@ -24181,7 +24265,7 @@ mod tests {
         let id = reference_world.spawn_agent(data);
         if let Some(key) = reference_world
             .brain_registry
-            .random_key(reference_world.rng.stream(RngDomain::Population))
+            .random_key(reference_world.rng.stream(RngDomain::Lineage))
         {
             assert!(
                 reference_world

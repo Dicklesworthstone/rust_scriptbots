@@ -13,11 +13,9 @@
 //! cannot tell "I changed the physics" apart from "I added a draw", which is the single most
 //! expensive kind of diff to reason about.
 //!
-//! **2. You cannot hold one domain fixed while varying another.** That is not a nicety — it is
-//! what a controlled experiment IS. "Same food layout, different mutation seed" is unaskable
-//! with a single stream, because changing the mutation seed changes the food. Every "replicate"
-//! that varies one factor silently varies all of them, and the experiment measures something
-//! other than what it claims.
+//! **2. You cannot perturb one domain's draw schedule without varying every other domain.** Add a
+//! mutation draw and the food continuation changes too. Every experiment that changes one
+//! stochastic code path silently changes all of them, and measures something other than it claims.
 //!
 //! # The fix
 //!
@@ -36,7 +34,6 @@
 
 use crate::{RandomStream, RandomStreamRestoreError, RandomStreamState, SmallRngStream};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// Identity of the derivation. Bump this ONLY when deliberately re-deriving every domain seed —
 /// doing so moves every stochastic decision in the project, so it must be announced.
@@ -44,13 +41,13 @@ pub const RNG_DOMAIN_DERIVATION_V1: &str = "scriptbots.rng-domains.v1";
 
 /// Version of the six-domain checkpoint envelope.
 pub const DOMAIN_STREAMS_CHECKPOINT_VERSION: u16 = 1;
-/// Codec version for the ordered domain-to-stream-state mapping.
+/// Codec version for the fixed domain-state wire object.
 pub const DOMAIN_STREAMS_CHECKPOINT_CODEC_VERSION: u16 = 1;
 
 /// The independent domains a stochastic decision can belong to.
 ///
 /// These are not cosmetic labels. Two decisions belong in different domains when an experiment
-/// might reasonably want to hold one fixed while varying the other.
+/// might reasonably need one domain's draw schedule not to perturb the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RngDomain {
     /// Terrain, weather, interventions — everything about the world that is not food.
@@ -69,7 +66,7 @@ pub enum RngDomain {
 
 impl RngDomain {
     /// Every domain, in the stable derivation and digest order. It must never be reordered: the
-    /// order is part of the science wire even though serialized checkpoint maps are keyed.
+    /// order is part of the science wire and matches the fixed checkpoint object's field order.
     pub const ALL: [RngDomain; 6] = [
         RngDomain::Environment,
         RngDomain::Food,
@@ -147,10 +144,10 @@ pub struct DomainStreams {
 
 /// Serializable continuation state for every random domain in one world.
 ///
-/// The top-level metadata identifies the domain derivation and mapping codec; each entry then
+/// The top-level metadata identifies the domain derivation and fixed-object codec; each field then
 /// carries the underlying generator's own independently versioned [`RandomStreamState`]. Keeping
-/// both layers explicit prevents either a domain-remapping change or a generator-state change
-/// from being mistaken for a compatible continuation.
+/// both layers explicit prevents either a domain-remapping change or a generator-state change from
+/// being mistaken for a compatible continuation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DomainStreamsCheckpoint {
@@ -158,14 +155,51 @@ pub struct DomainStreamsCheckpoint {
     pub algorithm: String,
     pub codec_version: u16,
     pub root_seed: u64,
-    pub streams: BTreeMap<String, RandomStreamState>,
+    pub streams: DomainStreamStates,
+}
+
+/// Fixed wire object containing exactly one checkpoint for each random domain.
+///
+/// Named fields make missing and future domains a decode error instead of allowing a partially
+/// populated map to reach restore. Field order is also the canonical checkpoint serialization
+/// order and deliberately matches [`RngDomain::ALL`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DomainStreamStates {
+    /// Environment-domain continuation state.
+    pub environment: RandomStreamState,
+    /// Food-domain continuation state.
+    pub food: RandomStreamState,
+    /// Population-domain continuation state.
+    pub population: RandomStreamState,
+    /// Lineage-domain continuation state.
+    pub lineage: RandomStreamState,
+    /// Mutation-domain continuation state.
+    pub mutation: RandomStreamState,
+    /// Crossover-domain continuation state.
+    pub crossover: RandomStreamState,
 }
 
 impl DomainStreamsCheckpoint {
-    /// Return one named domain's checkpoint.
+    /// Return the checkpoint for one random domain.
     #[must_use]
-    pub fn stream(&self, domain: RngDomain) -> Option<&RandomStreamState> {
-        self.streams.get(domain.tag())
+    pub const fn stream(&self, domain: RngDomain) -> &RandomStreamState {
+        self.streams.stream(domain)
+    }
+}
+
+impl DomainStreamStates {
+    /// Return the checkpoint for one random domain.
+    #[must_use]
+    pub const fn stream(&self, domain: RngDomain) -> &RandomStreamState {
+        match domain {
+            RngDomain::Environment => &self.environment,
+            RngDomain::Food => &self.food,
+            RngDomain::Population => &self.population,
+            RngDomain::Lineage => &self.lineage,
+            RngDomain::Mutation => &self.mutation,
+            RngDomain::Crossover => &self.crossover,
+        }
     }
 }
 
@@ -187,10 +221,10 @@ impl DomainStreams {
     /// The stream for a domain.
     ///
     /// Infallible by construction: `from_root_seed` populates every variant of `RngDomain::ALL`,
-    /// and `restore` refuses any state that does not. There is deliberately no `Option` here —
-    /// a caller forced to handle "this domain has no stream" would have nothing sensible to do
-    /// but fall back to some other domain's stream, which is precisely the coupling this module
-    /// exists to prevent.
+    /// and the fixed checkpoint wire requires every domain before `restore` can run. There is
+    /// deliberately no `Option` here — a caller forced to handle "this domain has no stream"
+    /// would have nothing sensible to do but fall back to some other domain's stream, which is
+    /// precisely the coupling this module exists to prevent.
     pub fn stream(&mut self, domain: RngDomain) -> &mut SmallRngStream {
         &mut self.streams[domain.index()]
     }
@@ -198,30 +232,28 @@ impl DomainStreams {
     /// Capture a restorable checkpoint of every domain.
     #[must_use]
     pub fn checkpoint(&self) -> DomainStreamsCheckpoint {
+        let checkpoint = |domain: RngDomain| self.streams[domain.index()].checkpoint();
         DomainStreamsCheckpoint {
             version: DOMAIN_STREAMS_CHECKPOINT_VERSION,
             algorithm: RNG_DOMAIN_DERIVATION_V1.to_owned(),
             codec_version: DOMAIN_STREAMS_CHECKPOINT_CODEC_VERSION,
             root_seed: self.root_seed,
-            streams: RngDomain::ALL
-                .into_iter()
-                .map(|domain| {
-                    (
-                        domain.tag().to_owned(),
-                        self.streams[domain.index()].checkpoint(),
-                    )
-                })
-                .collect(),
+            streams: DomainStreamStates {
+                environment: checkpoint(RngDomain::Environment),
+                food: checkpoint(RngDomain::Food),
+                population: checkpoint(RngDomain::Population),
+                lineage: checkpoint(RngDomain::Lineage),
+                mutation: checkpoint(RngDomain::Mutation),
+                crossover: checkpoint(RngDomain::Crossover),
+            },
         }
     }
 
     /// Restore from a checkpoint.
     ///
-    /// A checkpoint MISSING a domain is refused rather than silently re-derived from the root
-    /// seed. Re-deriving would look like a successful restore while quietly rewinding that
-    /// domain's stream to tick zero — the resumed run would diverge from the one it claims to
-    /// continue, and the digest would not necessarily catch it because the *other* domains would
-    /// match perfectly.
+    /// The fixed-field wire type guarantees every domain is present before this method can be
+    /// called. Restore then validates the envelope, every generator state, and every embedded
+    /// derived seed before returning any live stream.
     pub fn restore(checkpoint: &DomainStreamsCheckpoint) -> Result<Self, DomainStreamRestoreError> {
         if checkpoint.version != DOMAIN_STREAMS_CHECKPOINT_VERSION {
             return Err(DomainStreamRestoreError::Version {
@@ -241,23 +273,9 @@ impl DomainStreams {
                 expected: DOMAIN_STREAMS_CHECKPOINT_CODEC_VERSION,
             });
         }
-        if let Some(domain) = checkpoint.streams.keys().find(|tag| {
-            !RngDomain::ALL
-                .into_iter()
-                .any(|domain| domain.tag() == tag.as_str())
-        }) {
-            return Err(DomainStreamRestoreError::UnexpectedDomain {
-                domain: domain.clone(),
-            });
-        }
-
         let restore_domain =
             |domain: RngDomain| -> Result<SmallRngStream, DomainStreamRestoreError> {
-                let state = checkpoint.stream(domain).ok_or_else(|| {
-                    DomainStreamRestoreError::MissingDomain {
-                        domain: domain.tag(),
-                    }
-                })?;
+                let state = checkpoint.streams.stream(domain);
                 let stream = SmallRngStream::from_state(state).map_err(|source| {
                     DomainStreamRestoreError::Stream {
                         domain: domain.tag(),
@@ -291,9 +309,10 @@ impl DomainStreams {
 
 /// Why a set of persisted domain states could not be restored.
 ///
-/// Both variants NAME THE DOMAIN. A restore failure that said only "a stream was bad" would leave
-/// the reader unable to tell whether their mutations, their food, or their lineage decisions were
-/// the ones that could not be resumed — and those have very different consequences for a run.
+/// Domain-specific variants name the affected domain. A stream failure that said only "a stream
+/// was bad" would leave the reader unable to tell whether their mutations, food, or lineage
+/// decisions were the ones that could not be resumed, and those have very different consequences
+/// for a run.
 #[derive(Debug, thiserror::Error)]
 pub enum DomainStreamRestoreError {
     /// The checkpoint envelope version is unsupported.
@@ -307,15 +326,11 @@ pub enum DomainStreamRestoreError {
         expected: &'static str,
     },
 
-    /// The checkpoint mapping codec is unsupported.
+    /// The checkpoint state-object codec is unsupported.
     #[error(
         "random-domain checkpoint codec version {found} does not match supported version {expected}"
     )]
     CodecVersion { found: u16, expected: u16 },
-
-    /// The checkpoint names a domain this build does not understand.
-    #[error("the checkpoint carries an unexpected random stream domain `{domain}`")]
-    UnexpectedDomain { domain: String },
 
     /// A stream state claims it belongs to a different root/domain derivation.
     #[error("the `{domain}` domain's embedded seed {found} does not match derived seed {expected}")]
@@ -324,19 +339,6 @@ pub enum DomainStreamRestoreError {
         found: u64,
         expected: u64,
     },
-
-    /// The checkpoint carried no state for this domain.
-    ///
-    /// Refused rather than re-derived: silently re-deriving from the root seed would look like a
-    /// successful restore while rewinding that one domain to tick zero, and every other domain
-    /// would resume perfectly — so nothing downstream would necessarily notice that the resumed
-    /// run had quietly begun re-rolling its mutations from the beginning.
-    #[error(
-        "the checkpoint carries no random stream for the `{domain}` domain; refusing to \
-         re-derive it, because that would silently rewind {domain} to its initial state while \
-         every other domain resumed correctly"
-    )]
-    MissingDomain { domain: &'static str },
 
     /// The domain's state was present but could not be restored.
     #[error("the `{domain}` domain's random stream could not be restored: {source}")]
@@ -498,20 +500,19 @@ mod tests {
         }
 
         let checkpoint = original.checkpoint();
-        let expected: BTreeMap<RngDomain, Vec<u64>> = RngDomain::ALL
-            .into_iter()
-            .map(|domain| {
-                let draws = (0..8).map(|_| original.stream(domain).next_u64()).collect();
-                (domain, draws)
-            })
-            .collect();
+        let expected: [Vec<u64>; RngDomain::ALL.len()] = RngDomain::ALL.map(|domain| {
+            (0..8)
+                .map(|_| original.stream(domain).next_u64())
+                .collect()
+        });
 
         let mut restored =
             DomainStreams::restore(&checkpoint).expect("a checkpoint we just took must restore");
         for domain in RngDomain::ALL {
             let draws: Vec<u64> = (0..8).map(|_| restored.stream(domain).next_u64()).collect();
             assert_eq!(
-                &draws, &expected[&domain],
+                &draws,
+                &expected[domain.index()],
                 "domain {domain:?} diverged after restore — the resumed run is not the run it \
                  claims to continue"
             );
@@ -519,36 +520,69 @@ mod tests {
     }
 
     #[test]
-    fn a_checkpoint_missing_a_domain_is_refused_rather_than_re_derived() {
+    fn a_checkpoint_missing_a_domain_is_rejected_during_decode() {
         // The dangerous failure. Silently re-deriving a missing domain from the root seed would
         // look like a successful restore while REWINDING that domain to tick zero — and the other
         // domains would match perfectly, so nothing downstream would necessarily notice.
-        let original = DomainStreams::from_root_seed(9);
-        let mut checkpoint = original.checkpoint();
-        checkpoint.streams.remove(RngDomain::Mutation.tag());
+        let checkpoint = DomainStreams::from_root_seed(9).checkpoint();
+        let mut encoded = serde_json::to_value(checkpoint).expect("checkpoint encodes as JSON");
+        encoded["streams"]
+            .as_object_mut()
+            .expect("domain streams encode as an object")
+            .remove(RngDomain::Mutation.tag())
+            .expect("mutation field is present in a complete checkpoint");
+        let error = serde_json::from_value::<DomainStreamsCheckpoint>(encoded)
+            .expect_err("a checkpoint without the mutation field must not decode");
 
         assert!(
-            DomainStreams::restore(&checkpoint).is_err(),
-            "a checkpoint with NO mutation stream was accepted. That domain would have been \
+            error.to_string().contains("mutation"),
+            "a checkpoint with NO mutation stream was decoded. That domain would have been \
              silently rewound to its initial state while every other domain resumed correctly — \
-            a resumed run that quietly re-rolls its mutations is not the run it claims to be."
+             a resumed run that quietly re-rolls its mutations is not the run it claims to be: \
+             {error}"
         );
     }
 
     #[test]
-    fn a_checkpoint_with_an_unexpected_domain_is_refused() {
-        let original = DomainStreams::from_root_seed(9);
-        let mut checkpoint = original.checkpoint();
-        checkpoint.streams.insert(
-            "future-domain".to_owned(),
-            SmallRngStream::seed_from_u64(99).checkpoint(),
+    fn a_checkpoint_with_an_unexpected_domain_is_rejected_during_decode() {
+        let checkpoint = DomainStreams::from_root_seed(9).checkpoint();
+        let mut encoded = serde_json::to_value(checkpoint).expect("checkpoint encodes as JSON");
+        let future_state = encoded["streams"][RngDomain::Environment.tag()].clone();
+        encoded["streams"]
+            .as_object_mut()
+            .expect("domain streams encode as an object")
+            .insert("future-domain".to_owned(), future_state);
+        let error = serde_json::from_value::<DomainStreamsCheckpoint>(encoded)
+            .expect_err("a checkpoint with an unknown domain must not decode");
+
+        assert!(
+            error.to_string().contains("future-domain"),
+            "unexpected domain decode failure did not name the rejected field: {error}"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_with_a_duplicate_domain_is_rejected_during_decode() {
+        let checkpoint = DomainStreams::from_root_seed(9).checkpoint();
+        let encoded = serde_json::to_string(&checkpoint).expect("checkpoint encodes as JSON");
+        let food_entry = format!(
+            "\"food\":{}",
+            serde_json::to_string(&checkpoint.streams.food)
+                .expect("Food-domain checkpoint encodes as JSON")
+        );
+        let duplicate_food = format!("{food_entry},{food_entry}");
+        let duplicated = encoded.replacen(&food_entry, &duplicate_food, 1);
+        assert_ne!(
+            duplicated, encoded,
+            "duplicate-field fixture failed to locate the Food-domain field"
         );
 
-        assert!(matches!(
-            DomainStreams::restore(&checkpoint),
-            Err(DomainStreamRestoreError::UnexpectedDomain { domain })
-                if domain == "future-domain"
-        ));
+        let error = serde_json::from_str::<DomainStreamsCheckpoint>(&duplicated)
+            .expect_err("a checkpoint with duplicate Food fields must not decode");
+        assert!(
+            error.to_string().contains("duplicate field `food`"),
+            "duplicate-domain decode failure did not identify the repeated field: {error}"
+        );
     }
 
     #[test]
@@ -580,10 +614,8 @@ mod tests {
     #[test]
     fn checkpoint_rejects_a_stream_derived_from_another_root() {
         let mut checkpoint = DomainStreams::from_root_seed(9).checkpoint();
-        checkpoint.streams.insert(
-            RngDomain::Food.tag().to_owned(),
-            SmallRngStream::seed_from_u64(derive_domain_seed(10, RngDomain::Food)).checkpoint(),
-        );
+        checkpoint.streams.food =
+            SmallRngStream::seed_from_u64(derive_domain_seed(10, RngDomain::Food)).checkpoint();
 
         assert!(matches!(
             DomainStreams::restore(&checkpoint),

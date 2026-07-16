@@ -3,7 +3,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
-    BootstrapEvidenceV0, CharacterizationTraceV1, ControlServerConfig, ControlServerReservation,
+    BootstrapEvidenceV0, CharacterizationTraceV2, ControlServerConfig, ControlServerReservation,
     RunIdentityV1, RunManifestV3, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
     WorldStepDriver,
     precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
@@ -652,7 +652,7 @@ fn run_characterization_v0(
     identity
         .validate()
         .context("invalid characterization run identity")?;
-    let trace = CharacterizationTraceV1::capture_with_scenario_and_session(
+    let trace = CharacterizationTraceV2::capture_with_scenario_and_session(
         identity,
         scenario,
         &mut world,
@@ -673,7 +673,7 @@ fn run_characterization_v0(
         }
         fs::write(path, bytes).with_context(|| {
             format!(
-                "failed to write V1 characterization trace to {}",
+                "failed to write V2 characterization trace to {}",
                 path.display()
             )
         })?;
@@ -681,9 +681,9 @@ fn run_characterization_v0(
         let stdout = io::stdout();
         let mut lock = stdout.lock();
         lock.write_all(&bytes)
-            .context("failed to write V1 characterization trace to stdout")?;
+            .context("failed to write V2 characterization trace to stdout")?;
         lock.flush()
-            .context("failed to flush V1 characterization trace to stdout")?;
+            .context("failed to flush V2 characterization trace to stdout")?;
     }
 
     Ok(())
@@ -4049,9 +4049,14 @@ mod tests {
 
         run_characterization_v0(&cli, config, scenario, 0)
             .expect("capture zero-tick characterization");
-        let trace: CharacterizationTraceV1 =
+        let trace: CharacterizationTraceV2 =
             serde_json::from_slice(&fs::read(output).expect("read characterization artifact"))
                 .expect("decode characterization trace");
+        assert_eq!(
+            trace.schema,
+            scriptbots_app::CHARACTERIZATION_TRACE_V2_SCHEMA
+        );
+        assert_eq!(trace.schema_version, 2);
         let root_seed = trace.manifest.root_seed;
         assert_eq!(
             trace.manifest.normalized_config["rng_seed"],

@@ -15,6 +15,7 @@ use scriptbots_core::{
     PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope, Tick,
     WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
+    rng_domains::{DomainStreams, DomainStreamsCheckpoint, RngDomain},
 };
 use scriptbots_runtime::RunId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1033,12 +1034,12 @@ fn validate_v3_thread_policy(manifest: &Value) -> Result<(), StorageError> {
 }
 
 const RUN_MANIFEST_V3_RANDOM_DOMAINS: [&str; 6] = [
-    "environment",
-    "food",
-    "population",
-    "lineage",
-    "mutation",
-    "crossover",
+    RngDomain::Environment.tag(),
+    RngDomain::Food.tag(),
+    RngDomain::Population.tag(),
+    RngDomain::Lineage.tag(),
+    RngDomain::Mutation.tag(),
+    RngDomain::Crossover.tag(),
 ];
 
 fn validate_v3_random_streams(
@@ -1089,6 +1090,20 @@ fn validate_v3_random_streams(
     for domain in RUN_MANIFEST_V3_RANDOM_DOMAINS {
         validate_v3_random_stream_state(manifest, domain)?;
     }
+
+    let checkpoint: DomainStreamsCheckpoint = serde_json::from_value(
+        manifest_required_value(manifest, "/random_streams")?.clone(),
+    )
+    .map_err(|error| {
+        manifest_projection_error(format!(
+            "/random_streams cannot be decoded as a domain-stream checkpoint: {error}"
+        ))
+    })?;
+    DomainStreams::restore(&checkpoint).map_err(|error| {
+        manifest_projection_error(format!(
+            "/random_streams is not a restorable domain-stream checkpoint: {error}"
+        ))
+    })?;
     Ok(())
 }
 

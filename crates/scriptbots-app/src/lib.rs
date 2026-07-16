@@ -20,10 +20,10 @@ pub type SharedAnalytics = AnalyticsSnapshotProvider;
 pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3";
 /// Compatible V3 minor schema used when a manifest carries bootstrap execution evidence.
 pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.1";
-/// Schema identifier for a sequence of V1 world characterization points.
-pub const CHARACTERIZATION_TRACE_V1_SCHEMA: &str = "scriptbots.characterization-trace.v1";
+/// Schema identifier for a sequence of V2 world characterization points.
+pub const CHARACTERIZATION_TRACE_V2_SCHEMA: &str = "scriptbots.characterization-trace.v2";
 /// Safety bound for the temporary characterization runner.
-pub const MAX_CHARACTERIZATION_TICKS_V1: u64 = 256;
+pub const MAX_CHARACTERIZATION_TICKS_V2: u64 = 256;
 /// Maximum UTF-8 byte length for an experiment or variant identifier.
 pub const MAX_RUN_IDENTITY_ID_BYTES: usize = 128;
 /// Maximum UTF-8 byte length for the explicit live-run policy identifier.
@@ -361,6 +361,7 @@ impl RunIdentityV1 {
 /// does not override the characterization digest's exclusions or claim that replay can reconstruct
 /// the world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RunManifestV3 {
     pub schema: String,
     pub schema_version: u16,
@@ -812,7 +813,7 @@ impl RunManifestV3 {
     }
 }
 
-/// One boundary captured in a V1 characterization trace.
+/// One boundary captured in a V2 characterization trace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TracePointV0 {
     pub tick: u64,
@@ -822,7 +823,8 @@ pub struct TracePointV0 {
 
 /// Bounded fixed-seed characterization trace for the current implementation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CharacterizationTraceV1 {
+#[serde(deny_unknown_fields)]
+pub struct CharacterizationTraceV2 {
     pub schema: String,
     pub schema_version: u16,
     pub digest_algorithm: String,
@@ -831,10 +833,10 @@ pub struct CharacterizationTraceV1 {
     pub points: Vec<TracePointV0>,
 }
 
-/// Failures produced while capturing a V1 characterization trace.
+/// Failures produced while capturing a V2 characterization trace.
 #[derive(Debug, Error)]
-pub enum CharacterizationTraceErrorV1 {
-    #[error("requested {requested} ticks, but characterization V1 is capped at {maximum}")]
+pub enum CharacterizationTraceErrorV2 {
+    #[error("requested {requested} ticks, but characterization V2 is capped at {maximum}")]
     ExcessiveTickCount { requested: u64, maximum: u64 },
     #[error(transparent)]
     Manifest(#[from] RunManifestError),
@@ -846,7 +848,7 @@ pub enum CharacterizationTraceErrorV1 {
     Serialization(#[from] serde_json::Error),
 }
 
-impl CharacterizationTraceV1 {
+impl CharacterizationTraceV2 {
     /// Capture tick zero and every boundary through `ticks` from a persistence-disabled world.
     ///
     /// When `world.config().persistence_interval` is nonzero, use
@@ -856,7 +858,7 @@ impl CharacterizationTraceV1 {
         scenario_id: impl Into<String>,
         world: &mut WorldState,
         ticks: u64,
-    ) -> Result<Self, CharacterizationTraceErrorV1> {
+    ) -> Result<Self, CharacterizationTraceErrorV2> {
         Self::capture_with_scenario(
             identity,
             ScenarioIdentityV0::caller_seeded(scenario_id),
@@ -874,7 +876,7 @@ impl CharacterizationTraceV1 {
         scenario: ScenarioIdentityV0,
         world: &mut WorldState,
         ticks: u64,
-    ) -> Result<Self, CharacterizationTraceErrorV1> {
+    ) -> Result<Self, CharacterizationTraceErrorV2> {
         Self::capture_with_scenario_and_step(identity, scenario, world, ticks, |world| world.step())
     }
 
@@ -885,7 +887,7 @@ impl CharacterizationTraceV1 {
         world: &mut WorldState,
         persistence: &mut PersistenceAdmissionSession,
         ticks: u64,
-    ) -> Result<Self, CharacterizationTraceErrorV1> {
+    ) -> Result<Self, CharacterizationTraceErrorV2> {
         Self::capture_with_scenario_and_step(identity, scenario, world, ticks, |world| {
             persistence.step(world)
         })
@@ -897,11 +899,11 @@ impl CharacterizationTraceV1 {
         world: &mut WorldState,
         ticks: u64,
         mut step: impl FnMut(&mut WorldState) -> Result<TickEvents, scriptbots_core::WorldStepError>,
-    ) -> Result<Self, CharacterizationTraceErrorV1> {
-        if ticks > MAX_CHARACTERIZATION_TICKS_V1 {
-            return Err(CharacterizationTraceErrorV1::ExcessiveTickCount {
+    ) -> Result<Self, CharacterizationTraceErrorV2> {
+        if ticks > MAX_CHARACTERIZATION_TICKS_V2 {
+            return Err(CharacterizationTraceErrorV2::ExcessiveTickCount {
                 requested: ticks,
-                maximum: MAX_CHARACTERIZATION_TICKS_V1,
+                maximum: MAX_CHARACTERIZATION_TICKS_V2,
             });
         }
 
@@ -931,8 +933,8 @@ impl CharacterizationTraceV1 {
         }
 
         Ok(Self {
-            schema: CHARACTERIZATION_TRACE_V1_SCHEMA.to_owned(),
-            schema_version: 1,
+            schema: CHARACTERIZATION_TRACE_V2_SCHEMA.to_owned(),
+            schema_version: 2,
             digest_algorithm: "fnv1a64-v0".to_owned(),
             manifest,
             manifest_digest,
@@ -1768,7 +1770,7 @@ mod characterization_tests {
     fn traces_are_bounded_include_tick_zero_and_diverge_by_seed() {
         let trace_for = |seed: u64| {
             let mut world = test_world(Some(seed));
-            CharacterizationTraceV1::capture(
+            CharacterizationTraceV2::capture(
                 test_run_identity(u128::from(seed)),
                 "trace-test",
                 &mut world,
@@ -1779,7 +1781,9 @@ mod characterization_tests {
         let trace_a = trace_for(0xC0FFEE);
         let trace_b = trace_for(0xC0FFEE);
         let trace_c = trace_for(0xBAD5EED);
-        let sequence = |trace: &CharacterizationTraceV1| {
+        assert_eq!(trace_a.schema, CHARACTERIZATION_TRACE_V2_SCHEMA);
+        assert_eq!(trace_a.schema_version, 2);
+        let sequence = |trace: &CharacterizationTraceV2| {
             trace
                 .points
                 .iter()
@@ -1793,6 +1797,22 @@ mod characterization_tests {
         assert_eq!(trace_a.points[4].tick, 4);
         assert_eq!(sequence(&trace_a), sequence(&trace_b));
         assert_ne!(sequence(&trace_a), sequence(&trace_c));
+
+        let mut trace_with_unknown_field =
+            serde_json::to_value(&trace_a).expect("trace JSON value");
+        trace_with_unknown_field["unknown_trace_field"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<CharacterizationTraceV2>(trace_with_unknown_field).is_err(),
+            "the V2 trace contract must reject unknown top-level fields"
+        );
+        let mut manifest_with_unknown_field =
+            serde_json::to_value(&trace_a.manifest).expect("manifest JSON value");
+        manifest_with_unknown_field["unknown_manifest_field"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<RunManifestV3>(manifest_with_unknown_field).is_err(),
+            "the V3 manifest contract must reject unknown top-level fields"
+        );
+
         // These post-tick digests freeze the explicit energy-only ground-food
         // policy: eating changes energy and reproduction progress, not health.
         assert_eq!(
@@ -1827,13 +1847,13 @@ mod characterization_tests {
 
         let mut world = test_world(Some(1));
         assert!(matches!(
-            CharacterizationTraceV1::capture(
+            CharacterizationTraceV2::capture(
                 test_run_identity(1),
                 "too-long",
                 &mut world,
-                MAX_CHARACTERIZATION_TICKS_V1 + 1,
+                MAX_CHARACTERIZATION_TICKS_V2 + 1,
             ),
-            Err(CharacterizationTraceErrorV1::ExcessiveTickCount { .. })
+            Err(CharacterizationTraceErrorV2::ExcessiveTickCount { .. })
         ));
     }
 
@@ -1860,7 +1880,7 @@ mod characterization_tests {
             .expect("characterization founder is finite");
 
         let identity = test_run_identity(0x05E5_510A);
-        let direct_error = CharacterizationTraceV1::capture(
+        let direct_error = CharacterizationTraceV2::capture(
             identity.clone(),
             "direct-enabled-trace",
             &mut world,
@@ -1869,7 +1889,7 @@ mod characterization_tests {
         .expect_err("direct capture must not bypass the bound persistence session");
         assert!(matches!(
             direct_error,
-            CharacterizationTraceErrorV1::Step(WorldStepError::PersistenceSession(
+            CharacterizationTraceErrorV2::Step(WorldStepError::PersistenceSession(
                 PersistenceSessionError::SessionRequired { tick: 1 }
             ))
         ));
@@ -1880,7 +1900,7 @@ mod characterization_tests {
         );
         assert_eq!(persistence.last_admitted_tick(), None);
 
-        let trace = CharacterizationTraceV1::capture_with_scenario_and_session(
+        let trace = CharacterizationTraceV2::capture_with_scenario_and_session(
             identity,
             ScenarioIdentityV0::caller_seeded("session-enabled-trace"),
             &mut world,

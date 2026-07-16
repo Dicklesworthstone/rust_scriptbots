@@ -4,6 +4,7 @@ use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
     Generation, MetricSample, PersistenceBatch, Position, Tick, TickSummary,
+    rng_domains::DomainStreams,
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
@@ -29,30 +30,9 @@ fn temp_db_path(label: &str) -> String {
         .to_owned()
 }
 
-fn random_stream_state_fixture() -> serde_json::Value {
-    serde_json::json!({
-        "algorithm": "test-small-rng",
-        "version": 1,
-        "codec_version": 1,
-        "state": [1, 2, 3, 4]
-    })
-}
-
-fn random_streams_checkpoint_fixture() -> serde_json::Value {
-    serde_json::json!({
-        "version": 1,
-        "algorithm": "scriptbots.rng-domains.v1",
-        "codec_version": 1,
-        "root_seed": u64::MAX,
-        "streams": {
-            "environment": random_stream_state_fixture(),
-            "food": random_stream_state_fixture(),
-            "population": random_stream_state_fixture(),
-            "lineage": random_stream_state_fixture(),
-            "mutation": random_stream_state_fixture(),
-            "crossover": random_stream_state_fixture()
-        }
-    })
+fn random_streams_checkpoint_fixture(root_seed: u64) -> serde_json::Value {
+    serde_json::to_value(DomainStreams::from_root_seed(root_seed).checkpoint())
+        .expect("fixture domain-stream checkpoint is serializable")
 }
 
 fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunManifestRecord {
@@ -88,7 +68,7 @@ fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunMani
             "source": "test-fixture",
             "overridden": null
         },
-        "random_streams": random_streams_checkpoint_fixture(),
+        "random_streams": random_streams_checkpoint_fixture(u64::MAX),
         "next_agent_uid": 2,
         "next_spawn_ordinal": 1,
         "next_birth_ordinal": 0,
@@ -685,7 +665,7 @@ fn v3_manifest_requires_exactly_six_strict_random_domain_states() {
     mutate_manifest(&mut missing_domain, |value| {
         value["random_streams"]["streams"]
             .as_object_mut()
-            .expect("domain stream map")
+            .expect("fixed domain stream object")
             .remove("mutation");
     });
     let error = manifest_validation_error(missing_domain);
@@ -698,10 +678,11 @@ fn v3_manifest_requires_exactly_six_strict_random_domain_states() {
 
     let mut extra_domain = manifest(run_id, "extra-domain", 1_700_000_000_024);
     mutate_manifest(&mut extra_domain, |value| {
+        let extra_state = value["random_streams"]["streams"]["environment"].clone();
         value["random_streams"]["streams"]
             .as_object_mut()
-            .expect("domain stream map")
-            .insert("analytics".to_owned(), random_stream_state_fixture());
+            .expect("fixed domain stream object")
+            .insert("analytics".to_owned(), extra_state);
     });
     let error = manifest_validation_error(extra_domain);
     assert!(
@@ -771,6 +752,42 @@ fn v3_manifest_binds_domain_checkpoint_metadata_and_rejects_v2() {
     let error = manifest_validation_error(legacy);
     assert!(
         error.contains("unsupported run manifest schema version 2"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn v3_manifest_requires_every_random_domain_checkpoint_to_restore() {
+    let run_id = RunId::from_namespace_sequence(0xc011_1de0, 7);
+
+    let foreign_checkpoint = random_streams_checkpoint_fixture(7);
+    let foreign_mutation = foreign_checkpoint["streams"]["mutation"].clone();
+    let mut wrong_derived_seed = manifest(run_id, "wrong-derived-seed", 1_700_000_000_030);
+    mutate_manifest(&mut wrong_derived_seed, |value| {
+        value["random_streams"]["streams"]["mutation"] = foreign_mutation;
+    });
+    let error = manifest_validation_error(wrong_derived_seed);
+    assert!(
+        error.contains("/random_streams is not a restorable domain-stream checkpoint")
+            && error.contains("mutation")
+            && error.contains("embedded seed"),
+        "unexpected error: {error}"
+    );
+
+    let mut invalid_continuation =
+        manifest(run_id, "invalid-continuation", 1_700_000_000_031);
+    mutate_manifest(&mut invalid_continuation, |value| {
+        value["random_streams"]["streams"]["crossover"]["state"]
+            .as_array_mut()
+            .expect("crossover random-stream state")
+            .pop()
+            .expect("real checkpoint state is nonempty");
+    });
+    let error = manifest_validation_error(invalid_continuation);
+    assert!(
+        error.contains("/random_streams is not a restorable domain-stream checkpoint")
+            && error.contains("crossover")
+            && error.contains("invalid random-stream state length"),
         "unexpected error: {error}"
     );
 }

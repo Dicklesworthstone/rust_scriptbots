@@ -192,29 +192,13 @@ fn a_food_draw_moves_only_the_food_rng_domain() {
         .expect("food-advanced V1.3 digest");
 
     assert_ne!(
-        before
-            .rng
-            .domains
-            .get(RngDomain::Food.tag())
-            .expect("Food digest before draw"),
-        after
-            .rng
-            .domains
-            .get(RngDomain::Food.tag())
-            .expect("Food digest after draw"),
+        before.rng.domains.get(RngDomain::Food),
+        after.rng.domains.get(RngDomain::Food),
         "advancing the Food stream did not move its domain digest"
     );
     assert_eq!(
-        before
-            .rng
-            .domains
-            .get(RngDomain::Mutation.tag())
-            .expect("Mutation digest before Food draw"),
-        after
-            .rng
-            .domains
-            .get(RngDomain::Mutation.tag())
-            .expect("Mutation digest after Food draw"),
+        before.rng.domains.get(RngDomain::Mutation),
+        after.rng.domains.get(RngDomain::Mutation),
         "a Food draw perturbed the Mutation-domain continuation"
     );
     for domain in RngDomain::ALL {
@@ -222,16 +206,8 @@ fn a_food_draw_moves_only_the_food_rng_domain() {
             continue;
         }
         assert_eq!(
-            before
-                .rng
-                .domains
-                .get(domain.tag())
-                .expect("control digest contains every RNG domain"),
-            after
-                .rng
-                .domains
-                .get(domain.tag())
-                .expect("food-advanced digest contains every RNG domain"),
+            before.rng.domains.get(domain),
+            after.rng.domains.get(domain),
             "a Food draw perturbed the {} RNG domain",
             domain.tag()
         );
@@ -367,6 +343,28 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
         .map(|domain| domain.tag().to_owned())
         .collect();
     assert_eq!(domain_keys, expected_domain_keys);
+
+    let mut missing_domain = json.clone();
+    missing_domain["rng"]["domains"]
+        .as_object_mut()
+        .expect("mutable V1.3 RNG domains")
+        .remove(RngDomain::Food.tag());
+    assert!(
+        serde_json::from_value::<WorldDigestV1>(missing_domain).is_err(),
+        "an RNG digest missing the Food field decoded successfully"
+    );
+    let mut unknown_domain = json.clone();
+    unknown_domain["rng"]["domains"]
+        .as_object_mut()
+        .expect("mutable V1.3 RNG domains")
+        .insert(
+            "future-domain".to_owned(),
+            serde_json::Value::String("0000000000000000".to_owned()),
+        );
+    assert!(
+        serde_json::from_value::<WorldDigestV1>(unknown_domain).is_err(),
+        "an RNG digest with an unknown domain field decoded successfully"
+    );
 
     for required in [
         "codec_version",
