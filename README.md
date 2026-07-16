@@ -524,7 +524,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   { "rng_seed": 42 }
   ```
 - The root seed deterministically derives all six domain streams and every stable agent/offspring substream. The canonical launch manifest is `scriptbots.run-manifest.v3.3`: it records the six-domain checkpoint, exact `AgentSubstreamProtocolV1`, and UID-ordered `AgentRngCounterStateV1` launch rows. Once the tick-zero V1.6 start digest is bound, the bootstrap form is `scriptbots.run-manifest.v3.5`; it must bind the same root, protocol, counters, registry semantics, locomotion model, and `WorldDigestV1` evidence rather than describing a different launch state. Neither form collapses the domains back into one ambiguous global stream.
-- The bd-1kxd keyed-substream schema and implementation are closed with pinned native and WASM DSR evidence. The V1.6 locomotion-contract movement in bd-2i1 remains in the code-first/batch-verify phase until its goldens and performance baseline are reviewed and promoted through DSR.
+- The `bd-1kxd` keyed-substream schema and the `bd-2i1` V1.6 locomotion contract are closed with pinned DSR evidence. The reviewed exact-class full performance baseline was promoted byte-for-byte in `39fc2f0`, and the final same-class comparison passed in DSR `0.1.0-bd2i1-perf-compare-quiet1.20260716T160817Z`. `bd-hiv1` remains open for the separate movement-noise and spike-speed consumers that must use legacy wheel effort rather than physical displacement.
 - For CPU thread control during profiling, prefer the standard `RAYON_NUM_THREADS` env var.
 
 ### Data model & spatial indexing

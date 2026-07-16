@@ -525,7 +525,7 @@ Create focused fixtures for:
 
 - eye view direction, FOV falloff, density, and color channels;
 - blood sensor half-FOV and wounded-target scaling;
-- [Currently In Progress — `bd-2i1`] exact legacy two-rotation heading/movement by default, with
+- [Completed — `bd-2i1`] exact legacy two-rotation heading/movement by default, with
   conventional differential drive selectable for experiments;
 - neural output channel mapping;
 - food intake, health/energy changes, and metabolic drains;
@@ -2091,11 +2091,13 @@ claim that world integration early.
   `scriptbots.world-checkpoint.v1.2`/codec-3 with `postcard+blake3-v3`. The digest and trace bind
   `AgentSubstreamProtocolV1` plus counters ordered by stable UID. The checkpoint validates the exact
   protocol and one counter object per saved UID before any evaluator or agent reconstruction;
-- [Currently In Progress — `bd-2i1`, code-first/batch-verify] Advance the current science surfaces
+- [Completed — `bd-2i1`] Advance the current science surfaces
   to `scriptbots.world-digest.v1.6`/codec-6, `scriptbots.world-step-trace.v1.6`/codec-6, and
   `scriptbots.world-checkpoint.v1.3`/codec-4 with `postcard+blake3-v4`. The new identities bind the
   selected `locomotion_model` into future-affecting configuration and prevent legacy-default and
-  differential experiments from sharing a digest or checkpoint contract;
+  differential experiments from sharing a digest or checkpoint contract. Completion evidence is
+  `377e469`, `9ce716d`, `39fc2f0`, and DSR
+  `0.1.0-bd2i1-perf-compare-quiet1.20260716T160817Z`;
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical base V3 plus the then-current
   V3.1 bootstrap minor with the fixed six-domain continuation object; `bd-h547` advanced that
   bootstrap minor to V3.2 for adapter-attested V1.4 evidence. `bd-1kxd` now advances the canonical
@@ -2103,7 +2105,9 @@ claim that world integration early.
   `scriptbots.run-manifest.v3.4`, which binds those exact launch values to the tick-zero V1.5
   digest. `bd-2i1` advances only the bootstrap form to `scriptbots.run-manifest.v3.5` so the
   selected locomotion model is bound through the tick-zero V1.6 digest. The V3.5 schema movement
-  remains code-first and DSR-pending.
+  is complete under the same pinned DSR evidence. `bd-hiv1` remains open for the separate
+  movement-noise and spike-speed consumers that must use legacy wheel effort rather than physical
+  displacement.
 
 **Exit (completed — `bd-3n7p`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`):** fixed
 runs have a canonical first-divergence oracle and checkpoint schema before runtime/replay work.
@@ -2115,27 +2119,31 @@ runs have a canonical first-divergence oracle and checkpoint schema before runti
 - [Completed — `bd-2cd1`, `a547201`, DSR `bd-2cd1-verify-5` and `bd-2cd1-perf-compare-1`]
   Routed every world stochastic boundary through one of six explicit global domains, persisted a
   strict fixed six-field checkpoint, and exposed every domain independently in the canonical digest;
-- [Currently In Progress — `bd-1kxd`] Replace shared agent-affecting domain consumption with
+- [Completed — `bd-1kxd`, DSR
+  `rust_scriptbots_bd_h547_1kxd_verify-darwin-arm64-run-1784199104-97370`] Replace shared agent-affecting domain consumption with
   stable substreams derived from root seed, `AgentUid`, fixed operation/domain tag, and a persisted
   agent-local ordinal. Reproduction admission and partner choice use separate keyed streams from one
   attempt ordinal. Successful offspring use directional `OffspringRngIdentityV1` with the primary
   parent's local birth ordinal; body, runtime, brain-genome, initialization, and evaluator-state
   operations each own a distinct stream that is constructed once and threaded through the complete
   operation.
-- [Currently In Progress — `bd-1kxd`] Store exact `AgentRngCountersV1` values with each stable
+- [Completed — `bd-1kxd`, same pinned DSR evidence] Store exact `AgentRngCountersV1` values with each stable
   agent. Counter claims are transactional: failure restores the full preimage together with parent
   energy/progress, staged offspring, population insertions, and any later claims in reverse order.
   The parent-local RNG birth ordinal does not replace or alias the run-wide demographic
   `AgentIdentity::birth_ordinal`.
-- [Currently In Progress — `bd-1kxd`] Advance digest/trace/checkpoint and manifest contracts as
+- [Completed — `bd-1kxd`, same pinned DSR evidence] Advance digest/trace/checkpoint and manifest contracts as
   recorded in Phase 1.8, then prove multi-tick distant-agent noninteraction, dense-association
   permutation invariance, deterministic lineage-derived offspring, strict counter
   encode/decode/digest divergence, and checkpoint continuation.
-- [Proof pending — `bd-1kxd`] Run the pinned DSR native and WASM lanes over the integrated source.
+- [Completed — `bd-1kxd`, DSR
+  `rust_scriptbots_bd_h547_1kxd_verify-darwin-arm64-run-1784199104-97370`] The pinned native and
+  WASM lanes passed over the integrated source.
   GitHub Actions and direct Cargo/RCH evidence are not accepted for this exit.
 
-**Exit (pending `bd-1kxd`):** unrelated agent insertion or analytics cadence does not perturb
-existing agent streams.
+**Exit (completed — `bd-1kxd`, DSR
+`rust_scriptbots_bd_h547_1kxd_verify-darwin-arm64-run-1784199104-97370`):** unrelated agent insertion
+or analytics cadence does not perturb existing agent streams.
 
 #### 1.10 resource ledger and meadow tuning
 

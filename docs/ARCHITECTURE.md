@@ -276,9 +276,13 @@ reconstruction envelope for the core science state whose equality those digests 
   interpretation change must additionally bump the family schema/codec. The envelope excludes
   storage/session ownership, retained analytics/history, configuration-audit provenance,
   UI/render state, and run-bundle discovery; application resume remains Phase 4.1.
-- **The keyed-substream move is still under proof.** bd-1kxd is in its code-first/batch-verify
-  phase. The schema and rollback contract above require pinned DSR-only native and WASM evidence
-  before the bead can close; hosted workflow results are not accepted.
+- **The keyed-substream move is closed under pinned DSR proof.** `bd-1kxd` closed the agent-keyed
+  RNG schema with native and WASM DSR evidence. `bd-2i1` closed the selected locomotion model's
+  V1.6 digest/trace contract, V1.3 checkpoint, V3.5 bootstrap manifest, reviewed semantic goldens,
+  and exact-class full performance baseline; its final same-class comparison passed in DSR
+  `0.1.0-bd2i1-perf-compare-quiet1.20260716T160817Z`. `bd-hiv1` remains open as the separate
+  correction for movement-noise and spike-speed consumers of wheel effort. Hosted workflow
+  results are not accepted for these contracts.
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`characterization_digest_v0`,
 `WorldState::world_digest_v1`, `WorldDigestV1`);
