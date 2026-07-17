@@ -1,0 +1,51 @@
+{
+  "probe": "bevy_offscreen_png",
+  "bead": "bd-2z0.7.1",
+  "captured_at": "2026-07-17T19:36:17Z",
+  "launch": {
+    "command": "scriptbots-app --mode bevy --dump-bevy-png bevy_capture3.png --storage memory",
+    "env": {
+      "SCRIPTBOTS_MODE": "bevy",
+      "SCRIPTBOTS_CONTROL_REST_ENABLED": "0",
+      "SCRIPTBOTS_CONTROL_MCP": "disabled",
+      "WGPU_BACKEND": "metal",
+      "RUST_LOG": "info"
+    },
+    "exit_code": 0,
+    "bounded": true,
+    "duration_seconds": 28.9,
+    "result": "real_capture"
+  },
+  "capture": {
+    "path": "bevy_offscreen_1600x900.png",
+    "format": "PNG image data, 1600 x 900, 8-bit/color RGBA, non-interlaced",
+    "bytes": 50458,
+    "sha256": "dd293180381d65d6218b73d384a9529867c6031a5614f3d0ed074ceb469f4c17",
+    "content": "live Bevy/wgpu world canvas: food-density field, terrain and water border cells; NOT a CPU surrogate",
+    "seed_note": "each capture run pins a fresh random seed, so per-run frames differ by design"
+  },
+  "backend": {
+    "renderer": "bevy 0.17.3",
+    "api": "wgpu 26 (bevy-pinned line)",
+    "adapter": "Apple M4",
+    "adapter_backend": "Metal",
+    "adapter_class": "Integrated",
+    "max_texture_2d": 16384,
+    "timestamp_queries": true,
+    "evidence_log_line": "GPU capability report for the Bevy snapshot adapter=Apple M4 backend=Metal class=Integrated max_texture_2d=Some(16384) timestamp_queries=true"
+  },
+  "fingerprint": {
+    "source_commit": "d490d28 + bevy probe fix",
+    "rustc": "rustc 1.99.0-nightly (14cae6813 2026-07-08)",
+    "toolchain": "nightly-2026-07-09",
+    "target": "aarch64-apple-darwin",
+    "os": "macOS 26.5 (25F71)",
+    "hardware": "Apple M4, Metal 4",
+    "features": "bevy_render"
+  },
+  "hardware_blocker": null,
+  "api_red_found_and_fixed": {
+    "error": "E0432: unresolved import `bevy::render::render_resource::wgpu` (module re-export removed in bevy 0.17)",
+    "fix": "scriptbots-bevy gained a direct `wgpu = \"26\"` edge (same line bevy 0.17 uses, one wgpu universe); probe now names the adapter in the dump path"
+  }
+}

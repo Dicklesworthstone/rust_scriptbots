@@ -251,12 +251,11 @@ pub struct EffectiveRenderSettings {
 ///
 /// Returns `None` when no adapter is available (headless/software-only
 /// environments); callers must treat that as the software/Potato path, never
-/// as an error. VRAM is not reliably exposed by wgpu 27, so `vram_bytes`
-/// stays `None` until a backend-specific lane proves otherwise (documented
-/// in bd-2z0.14.3.3).
+/// as an error. VRAM is not reliably exposed by the bevy-pinned wgpu 26 line,
+/// so `vram_bytes` stays `None` until a backend-specific lane proves otherwise
+/// (documented in bd-2z0.14.3.3).
 #[must_use]
 pub fn probe_gpu_capability() -> Option<GpuInfo> {
-    use bevy::render::render_resource::wgpu;
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -4649,6 +4648,39 @@ mod tests {
             snapshot: Some(snapshot),
             simulation: Some(simulation),
         }
+    }
+
+    #[test]
+    fn gpu_probe_reports_sane_fields_or_none() {
+        // On GPU-less CI the probe may legitimately return None; when an
+        // adapter exists the report must be complete and coherent.
+        if let Some(report) = probe_gpu_capability() {
+            assert!(!report.name.is_empty(), "adapter name must be non-empty");
+            assert!(!report.backend.is_empty());
+            assert!(report.max_texture_2d.unwrap_or(0) >= 2048);
+        }
+    }
+
+    #[test]
+    fn effective_settings_honor_explicit_tiers_and_auto() {
+        let explicit = resolve_effective_render_settings(&RenderSettings {
+            quality: Some(RenderQuality::Low),
+            ..RenderSettings::default()
+        });
+        assert_eq!(explicit.tier, RenderQuality::Low);
+        assert!(!explicit.features.ssao, "Low has no SSAO");
+
+        let auto = resolve_effective_render_settings(&RenderSettings::default());
+        assert!(
+            matches!(
+                auto.tier,
+                RenderQuality::Potato
+                    | RenderQuality::Low
+                    | RenderQuality::Medium
+                    | RenderQuality::High
+            ),
+            "auto resolves onto the ladder, never Ultra"
+        );
     }
 
     #[test]

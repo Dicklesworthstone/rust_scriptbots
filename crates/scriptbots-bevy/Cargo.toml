@@ -12,3 +12,6 @@ scriptbots-core = { path = "../scriptbots-core" }
 tracing = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 slotmap = { workspace = true }
+# Direct adapter probing for the capability report; version-locked to bevy's own wgpu
+# line so the probe and the renderer share one wgpu universe (bevy 0.17 uses wgpu 26).
+wgpu = { version = "26", default-features = false, features = ["metal", "wgsl"] }

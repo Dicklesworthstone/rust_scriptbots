@@ -10123,6 +10123,7 @@ dependencies = [
  "scriptbots-core",
  "slotmap",
  "tracing",
+ "wgpu 26.0.1",
 ]
 
 [[package]]

@@ -1,0 +1,41 @@
+{
+  "probe": "gpui_offscreen_png",
+  "bead": "bd-2z0.7.1",
+  "captured_at": "2026-07-17T16:55:33Z",
+  "launch": {
+    "command": "scriptbots-app --mode gui --dump-png gpui_capture.png --png-size 1280x720 --storage memory",
+    "env": {
+      "SCRIPTBOTS_MODE": "gui",
+      "SCRIPTBOTS_CONTROL_REST_ENABLED": "0",
+      "SCRIPTBOTS_CONTROL_MCP": "disabled",
+      "RUST_LOG": "info"
+    },
+    "exit_code": 0,
+    "bounded": true,
+    "duration_seconds": 13.7,
+    "result": "real_capture"
+  },
+  "capture": {
+    "path": "gpui_offscreen_1280x720.png",
+    "format": "PNG image data, 1280 x 720, 8-bit/color RGBA, non-interlaced",
+    "bytes": 39460,
+    "sha256": "9269a2b34938c698c299fa1d125cee9e72c1ec4393811416ab5856350b3edc3f",
+    "content": "live GPUI world canvas: food-density field, terrain and water border cells; NOT a CPU surrogate",
+    "log": "gpui_offscreen.log"
+  },
+  "backend": {
+    "renderer": "gpui",
+    "api": "Metal (GPUI native, no wgpu hop)",
+    "window": "offscreen render target (--dump-png), no visible window required"
+  },
+  "fingerprint": {
+    "source_commit": "d490d28",
+    "rustc": "rustc 1.99.0-nightly (14cae6813 2026-07-08)",
+    "toolchain": "nightly-2026-07-09",
+    "target": "aarch64-apple-darwin",
+    "os": "macOS 26.5 (25F71)",
+    "hardware": "Apple M4, Metal 4",
+    "features": "gui"
+  },
+  "hardware_blocker": null
+}

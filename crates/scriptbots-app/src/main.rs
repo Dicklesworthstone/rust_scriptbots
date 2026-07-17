@@ -4,8 +4,8 @@ use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
     BootstrapEvidenceV0, CharacterizationTraceV2, ControlServerConfig, ControlServerReservation,
-    RunIdentityV1, RunManifestV3, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
-    WorldStepDriver,
+    RunIdentityV1, RunManifestV3, ScenarioDocumentV1, ScenarioIdentityV0, SharedAnalytics,
+    SharedWorld, ThreadPolicyV0, WorldStepDriver,
     precedence::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
@@ -166,7 +166,17 @@ fn main() -> Result<()> {
         run_det_child(&config, tick_limit, cli.brain)?;
         return Ok(());
     }
-    let (config, launch_scenario, config_overrides) = compose_config_with_scenario(&cli)?;
+    let (config, mut launch_scenario, config_overrides) = compose_config_with_scenario(&cli)?;
+    // Resolve the effective bootstrap policy once: an explicit CLI/env value outranks
+    // the scenario document's policy; the document outranks the built-in zero default.
+    // The manifest, REST scenario view, and TUI header all read this same value.
+    let effective_bootstrap_ticks = if cli_bootstrap_explicit(&cli) {
+        cli.bootstrap_ticks
+    } else {
+        launch_scenario.bootstrap_ticks
+    };
+    launch_scenario.bootstrap_ticks = effective_bootstrap_ticks;
+    let launch_scenario_shared = Arc::new(launch_scenario.clone());
 
     if let Some(ticks) = cli.characterize_v0 {
         run_characterization_v0(&cli, config, launch_scenario, config_overrides, ticks)?;
@@ -184,7 +194,8 @@ fn main() -> Result<()> {
         None
     };
     let control_reservation = if resolved_renderer.is_some() {
-        let control_config = ControlServerConfig::try_from_env()?;
+        let mut control_config = ControlServerConfig::try_from_env()?;
+        control_config.scenario = Some(Arc::clone(&launch_scenario_shared));
         Some(ControlServerReservation::prepare(control_config)?)
     } else {
         None
@@ -355,13 +366,13 @@ fn main() -> Result<()> {
             std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1");
         }
     }
-    let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
+        let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
         config,
         BootstrapRequest {
             brain_preset: cli.brain,
             storage_mode: cli.storage,
             thresholds,
-            bootstrap_ticks: cli.bootstrap_ticks,
+            bootstrap_ticks: effective_bootstrap_ticks,
             thread_policy: policy,
             scenario: launch_scenario,
             config_overrides,
@@ -419,6 +430,21 @@ fn main() -> Result<()> {
         }
         #[cfg(feature = "bevy_render")]
         if let Some(path) = cli.dump_bevy_png.as_ref() {
+            // Name the exact adapter a snapshot came from: offscreen captures must never
+            // be mistaken for CPU-surrogate output (bd-2z0.7.1).
+            match scriptbots_bevy::probe_gpu_capability() {
+                Some(gpu) => info!(
+                    adapter = %gpu.name,
+                    backend = %gpu.backend,
+                    class = ?gpu.class,
+                    max_texture_2d = ?gpu.max_texture_2d,
+                    timestamp_queries = gpu.timestamp_queries,
+                    "GPU capability report for the Bevy snapshot"
+                ),
+                None => warn!(
+                    "no GPU adapter detected; the Bevy snapshot uses the software visual path"
+                ),
+            }
             let (w, h) = cli
                 .png_size
                 .as_deref()
@@ -465,6 +491,7 @@ fn main() -> Result<()> {
             control_runtime: &control_runtime,
             command_drain,
             command_submit,
+            scenario: Arc::clone(&launch_scenario_shared),
         };
         let render_result = renderer.run(context);
         let control_result = control_runtime.shutdown();
@@ -1391,6 +1418,38 @@ fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
 /// Compose the effective configuration, its exact ordered layer provenance, and every
 /// cross-layer displacement in one pass.
 ///
+/// Load and validate a versioned scenario document, returning it with its exact
+/// source bytes (those bytes ARE the provenance — digests must cover what was read,
+/// not a re-serialization).
+fn load_scenario_document(path: &std::path::Path) -> Result<(ScenarioDocumentV1, Vec<u8>)> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!("failed to read scenario document {}", path.display())
+    })?;
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let document = match extension.as_str() {
+        "toml" => ScenarioDocumentV1::parse_toml(&bytes),
+        "ron" => ScenarioDocumentV1::parse_ron(&bytes),
+        other => anyhow::bail!(
+            "unsupported scenario document format '.{other}' for {}; expected .toml or .ron",
+            path.display()
+        ),
+    }
+    .with_context(|| format!("invalid scenario document {}", path.display()))?;
+    Ok((document, bytes))
+}
+
+/// Whether the operator explicitly named a bootstrap count on the CLI or in the
+/// environment. An explicit value outranks a scenario document's bootstrap policy;
+/// an unset flag lets the document (if any) speak.
+fn cli_bootstrap_explicit(cli: &AppCli) -> bool {
+    cli.bootstrap_ticks != DEFAULT_BOOTSTRAP_TICKS
+        || std::env::var_os("SCRIPTBOTS_BOOTSTRAP_TICKS").is_some()
+}
+
 /// Layer order, most general first: built-in defaults -> configuration files (in
 /// order) -> environment -> CLI. Statement GATHERING (file reads, environment reads,
 /// flag interpretation) happens here; the merge itself is the pure
@@ -1409,12 +1468,21 @@ fn compose_config_with_scenario(
         history_capacity: 600,
         ..ScriptBotsConfig::default()
     };
-    let scenario_id = if cli.config_layers.is_empty() {
-        "scriptbots-app-default-v1"
-    } else {
-        "scriptbots-app-layered-v1"
+    let scenario_document = match &cli.scenario {
+        Some(path) => Some(load_scenario_document(path)?),
+        None => None,
     };
-    let mut scenario = ScenarioIdentityV0::caller_seeded(scenario_id);
+    let mut scenario = match &scenario_document {
+        Some((document, _bytes)) => document.to_identity(),
+        None => {
+            let scenario_id = if cli.config_layers.is_empty() {
+                "scriptbots-app-default-v1"
+            } else {
+                "scriptbots-app-layered-v1"
+            };
+            ScenarioIdentityV0::caller_seeded(scenario_id)
+        }
+    };
     scenario.population_recipe = format!(
         "fixed-4x4-registered-brain-grid-v1;brain={}",
         cli.brain.as_str()
@@ -1431,6 +1499,18 @@ fn compose_config_with_scenario(
     );
 
     let mut statements: Vec<ConfigLayerStatement> = Vec::new();
+    // A scenario document speaks first among file layers: its identity is the run's,
+    // its config body is the most general file statement, and `--config` files, the
+    // environment, and the CLI can all still displace it later in the order.
+    if let Some((document, source_bytes)) = &scenario_document {
+        info!(id = %document.id, "Applying scenario document");
+        scenario.record_config_layer(ConfigLayerKind::File, source_bytes);
+        statements.push(ConfigLayerStatement {
+            kind: ConfigLayerKind::File,
+            label: format!("scenario:{} ({})", cli.scenario.as_ref().expect("scenario document implies --scenario").display(), document.id),
+            fields: document.config.clone(),
+        });
+    }
     for path in &cli.config_layers {
         let (fields, source_bytes) = load_config_layer_with_source(path)?;
         info!(layer = %path.display(), "Applying configuration layer");
@@ -1955,6 +2035,13 @@ struct AppCli {
         value_delimiter = ';'
     )]
     config_layers: Vec<PathBuf>,
+    /// Versioned scenario document (TOML or RON) — a stable, schema-tagged scenario
+    /// identity whose config body applies as the first file layer (after defaults,
+    /// before every `--config` file) and whose id/schema_version/bootstrap policy are
+    /// recorded in the run manifest. `--bootstrap-ticks` overrides the document's
+    /// bootstrap policy.
+    #[arg(long = "scenario", value_name = "FILE")]
+    scenario: Option<PathBuf>,
     /// RNG seed override for deterministic runs.
     ///
     /// `SCRIPTBOTS_RNG_SEED` supplies the same knob through the environment layer,
@@ -2863,15 +2950,17 @@ fn run_headless_simulation(
 
     emit_sense_startup_contract();
     let simulation_result = (|| -> Result<WorldDigestV1> {
-        for _ in 0..tick_limit {
+        for index in 0..tick_limit {
+            // The final tick's batch carries the canonical world digest so the simulated
+            // stream stays structurally aligned with a recorded one.
+            if index + 1 == tick_limit {
+                world.request_replay_world_digest();
+            }
             persistence.step(&mut world)?;
         }
-        // Record the final canonical digest as a replay event before the final partial
-        // batch so the simulated stream stays structurally aligned with a recorded one.
         let final_digest = world
             .world_digest_v1()
             .context("failed to capture the final headless WorldDigestV1")?;
-        world.record_replay_world_digest(final_digest.overall.clone());
         persistence
             .finalize(&mut world)
             .context("failed to admit the final partial replay batch")?;
@@ -3472,7 +3561,10 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
             "RngSample(scope={scope:?}, min={range_min:.3}, max={range_max:.3}, value={value:.3})"
         ),
         ReplayEventKind::WorldDigest { overall } => {
-            format!("WorldDigest(agent={:?}, overall={overall})", event.agent_uid)
+            format!(
+                "WorldDigest(agent={:?}, overall={overall})",
+                event.agent_uid
+            )
         }
     }
 }
