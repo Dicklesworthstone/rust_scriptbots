@@ -258,7 +258,10 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
     // ------------------------------------------------------------------
     // Phase 5: a perturbed candidate reports its first divergence.
     // ------------------------------------------------------------------
-    let perturbed = produce_run(&perturbed_db, &["food_max=0.05".to_owned()]);
+    let perturbed = produce_run(
+        &perturbed_db,
+        &["food_max=0.05".to_owned(), "food_respawn_amount=0.01".to_owned()],
+    );
     assert!(
         perturbed.status.success(),
         "perturbed terminal run failed: {}",
