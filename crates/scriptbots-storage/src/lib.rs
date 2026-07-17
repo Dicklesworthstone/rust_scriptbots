@@ -62,18 +62,21 @@ pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
     "-lock-pending",
 ];
 
-/// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 6;
+const SCRIPTBOTS_SCHEMA_V6_VERSION: i64 = 6;
 
-/// Canonical fresh-install DDL for the run-scoped ScriptBots persistence schema.
+/// Current schema version for new ScriptBots run databases.
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 7;
+
+/// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
 /// Run identifiers, explicitly lossless manifest scalars, opaque identifiers, canonical JSON,
 /// and digests use text. Scientific counters retain the existing checked signed-integer boundary.
 /// This is deliberately a clean lineage: existing v3-v5 databases require an explicit
 /// export/import migration rather than an in-place rewrite.
 ///
-/// This DDL is exported for read-only schema inspection and FrankenSQLite conformance probes. It
-/// is not a supported file-writer API; production scientific writes must use [`StoragePipeline`].
+/// Fresh installs apply this bootstrap before the additive V7 migration. This DDL is exported for
+/// read-only schema inspection and FrankenSQLite conformance probes. It is not a supported
+/// file-writer API; production scientific writes must use [`StoragePipeline`].
 pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
     CREATE TABLE runs (
         run_id TEXT PRIMARY KEY CHECK (run_id <> ''),
@@ -439,6 +442,130 @@ pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
     PRAGMA user_version = 6;
 "#;
 
+/// Additive host-journal archive and progress ledger for canonical runtime evidence.
+///
+/// The archive retains each canonical payload permanently. It deliberately does not project
+/// commands or scientific domains into normalized tables; those projections belong to the
+/// separate host-journal integration layer.
+pub const SCRIPTBOTS_SCHEMA_V7: &str = r#"
+    CREATE TABLE host_journal_progress (
+        run_id TEXT NOT NULL,
+        host_session_id TEXT NOT NULL CHECK (
+            length(host_session_id) = 16
+            AND host_session_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        admitted_journal_prefix TEXT NOT NULL CHECK (
+            length(admitted_journal_prefix) = 16
+            AND admitted_journal_prefix NOT GLOB '*[^0-9a-f]*'
+        ),
+        applied_journal_prefix TEXT NOT NULL CHECK (
+            length(applied_journal_prefix) = 16
+            AND applied_journal_prefix NOT GLOB '*[^0-9a-f]*'
+        ),
+        committed_volatile_journal_prefix TEXT NOT NULL CHECK (
+            length(committed_volatile_journal_prefix) = 16
+            AND committed_volatile_journal_prefix NOT GLOB '*[^0-9a-f]*'
+        ),
+        durable_journal_prefix TEXT NOT NULL CHECK (
+            length(durable_journal_prefix) = 16
+            AND durable_journal_prefix NOT GLOB '*[^0-9a-f]*'
+        ),
+        admitted_event_prefix TEXT NOT NULL CHECK (
+            length(admitted_event_prefix) = 16
+            AND admitted_event_prefix NOT GLOB '*[^0-9a-f]*'
+        ),
+        applied_event_prefix TEXT NOT NULL CHECK (
+            length(applied_event_prefix) = 16
+            AND applied_event_prefix NOT GLOB '*[^0-9a-f]*'
+        ),
+        committed_volatile_event_prefix TEXT NOT NULL CHECK (
+            length(committed_volatile_event_prefix) = 16
+            AND committed_volatile_event_prefix NOT GLOB '*[^0-9a-f]*'
+        ),
+        durable_event_prefix TEXT NOT NULL CHECK (
+            length(durable_event_prefix) = 16
+            AND durable_event_prefix NOT GLOB '*[^0-9a-f]*'
+        ),
+        shutdown_sequence TEXT CHECK (
+            shutdown_sequence IS NULL
+            OR (
+                length(shutdown_sequence) = 16
+                AND shutdown_sequence NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        PRIMARY KEY (run_id, host_session_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id),
+        CHECK (durable_journal_prefix <= committed_volatile_journal_prefix),
+        CHECK (committed_volatile_journal_prefix <= applied_journal_prefix),
+        CHECK (applied_journal_prefix <= admitted_journal_prefix),
+        CHECK (durable_event_prefix <= committed_volatile_event_prefix),
+        CHECK (committed_volatile_event_prefix <= applied_event_prefix),
+        CHECK (applied_event_prefix <= admitted_event_prefix),
+        CHECK (admitted_event_prefix <= admitted_journal_prefix),
+        CHECK (applied_event_prefix <= applied_journal_prefix),
+        CHECK (committed_volatile_event_prefix <= committed_volatile_journal_prefix),
+        CHECK (durable_event_prefix <= durable_journal_prefix),
+        CHECK (shutdown_sequence IS NULL OR shutdown_sequence <= admitted_journal_prefix)
+    );
+
+    CREATE TABLE host_journal_archive (
+        run_id TEXT NOT NULL,
+        host_session_id TEXT NOT NULL CHECK (
+            length(host_session_id) = 16
+            AND host_session_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        journal_sequence TEXT NOT NULL CHECK (
+            length(journal_sequence) = 16
+            AND journal_sequence NOT GLOB '*[^0-9a-f]*'
+        ),
+        payload_version INTEGER NOT NULL CHECK (payload_version > 0),
+        payload_digest TEXT NOT NULL CHECK (
+            length(payload_digest) = 64
+            AND payload_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        payload_json TEXT NOT NULL CHECK (payload_json <> ''),
+        PRIMARY KEY (run_id, host_session_id, journal_sequence),
+        FOREIGN KEY (run_id, host_session_id)
+            REFERENCES host_journal_progress (run_id, host_session_id)
+    );
+
+    CREATE TABLE host_journal_batch_ledger (
+        run_id TEXT NOT NULL,
+        host_session_id TEXT NOT NULL CHECK (
+            length(host_session_id) = 16
+            AND host_session_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        journal_sequence TEXT NOT NULL CHECK (
+            length(journal_sequence) = 16
+            AND journal_sequence NOT GLOB '*[^0-9a-f]*'
+        ),
+        scientific_event_sequence TEXT CHECK (
+            scientific_event_sequence IS NULL
+            OR (
+                length(scientific_event_sequence) = 16
+                AND scientific_event_sequence NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        persistence_batch_id INTEGER CHECK (
+            persistence_batch_id IS NULL OR persistence_batch_id > 0
+        ),
+        state TEXT NOT NULL CHECK (
+            state IN ('admitted', 'applied', 'committed_volatile', 'durable')
+        ),
+        PRIMARY KEY (run_id, host_session_id, journal_sequence),
+        FOREIGN KEY (run_id, host_session_id, journal_sequence)
+            REFERENCES host_journal_archive (run_id, host_session_id, journal_sequence),
+        FOREIGN KEY (run_id, persistence_batch_id)
+            REFERENCES storage_batch_ledger (run_id, batch_id)
+    );
+    CREATE UNIQUE INDEX host_journal_batch_ledger_run_session_event_unique
+        ON host_journal_batch_ledger (run_id, host_session_id, scientific_event_sequence);
+    CREATE INDEX host_journal_batch_ledger_run_session_state_sequence_index
+        ON host_journal_batch_ledger (run_id, host_session_id, state, journal_sequence);
+
+    PRAGMA user_version = 7;
+"#;
+
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaObject {
     object_type: String,
@@ -463,13 +590,19 @@ impl SchemaObject {
 fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
     let result = MigrationRunner::new()
         .add(
-            SCRIPTBOTS_SCHEMA_VERSION,
+            SCRIPTBOTS_SCHEMA_V6_VERSION,
             "create_multi_run_schema",
             SCRIPTBOTS_SCHEMA_V6,
         )
+        .add(
+            SCRIPTBOTS_SCHEMA_VERSION,
+            "add_host_journal_archive",
+            SCRIPTBOTS_SCHEMA_V7,
+        )
         .run(connection)?;
     let applied_is_valid = result.applied.is_empty()
-        || (result.applied.len() == 1 && result.applied[0] == SCRIPTBOTS_SCHEMA_VERSION);
+        || result.applied == [SCRIPTBOTS_SCHEMA_VERSION]
+        || result.applied == [SCRIPTBOTS_SCHEMA_V6_VERSION, SCRIPTBOTS_SCHEMA_VERSION];
     if result.current != SCRIPTBOTS_SCHEMA_VERSION || !applied_is_valid {
         return Err(StorageError::InvalidData {
             context: "_schema_migrations",
@@ -5787,16 +5920,19 @@ impl Storage {
             "SELECT version, name FROM _schema_migrations
              ORDER BY version ASC",
         )?;
-        if migrations.len() != 1 {
+        if migrations.len() != 2 {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_schema",
                 reason: format!(
-                    "expected exactly one ScriptBots v6 migration, found {}",
+                    "expected exactly two ScriptBots migrations through v7, found {}",
                     migrations.len()
                 ),
             });
         }
-        let expected_migrations = [(SCRIPTBOTS_SCHEMA_VERSION, "create_multi_run_schema")];
+        let expected_migrations = [
+            (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
+            (SCRIPTBOTS_SCHEMA_VERSION, "add_host_journal_archive"),
+        ];
         for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
             let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
             let actual_name: String = decode(row, 1, "_schema_migrations.name")?;
@@ -10059,6 +10195,9 @@ mod tests {
     ) -> Result<Vec<(String, String, String, String)>, StorageError> {
         const INTERNAL_TABLES: &[&str] = &[
             "_schema_migrations",
+            "host_journal_archive",
+            "host_journal_batch_ledger",
+            "host_journal_progress",
             "storage_batch_ledger",
             "storage_outbox",
             "storage_progress",
@@ -11040,7 +11179,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v6_schema_records_exact_ledger_and_is_idempotent()
+    fn fresh_v7_schema_records_exact_ledger_and_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&connection)?;
@@ -11048,15 +11187,21 @@ mod tests {
         let first_schema = read_schema_objects(&connection)?;
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 1);
-        assert_eq!(
-            decode::<i64>(&migrations[0], 0, "_schema_migrations.version")?,
-            SCRIPTBOTS_SCHEMA_VERSION
-        );
-        assert_eq!(
-            decode::<String>(&migrations[0], 1, "_schema_migrations.name")?,
-            "create_multi_run_schema"
-        );
+        assert_eq!(migrations.len(), 2);
+        let expected = [
+            (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
+            (SCRIPTBOTS_SCHEMA_VERSION, "add_host_journal_archive"),
+        ];
+        for (row, (expected_version, expected_name)) in migrations.iter().zip(expected) {
+            assert_eq!(
+                decode::<i64>(row, 0, "_schema_migrations.version")?,
+                expected_version
+            );
+            assert_eq!(
+                decode::<String>(row, 1, "_schema_migrations.name")?,
+                expected_name
+            );
+        }
         let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
         assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
 
@@ -11066,10 +11211,266 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _schema_migrations")?
             .get_typed(0)?;
         assert_eq!(
-            migration_count, 1,
+            migration_count, 2,
             "idempotent install duplicated its ledger"
         );
         connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v6_schema_upgrades_additively_to_the_exact_v7_lineage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        let v6_result = MigrationRunner::new()
+            .add(
+                SCRIPTBOTS_SCHEMA_V6_VERSION,
+                "create_multi_run_schema",
+                SCRIPTBOTS_SCHEMA_V6,
+            )
+            .run(&connection)?;
+        assert_eq!(v6_result.current, SCRIPTBOTS_SCHEMA_V6_VERSION);
+        assert_eq!(v6_result.applied, [SCRIPTBOTS_SCHEMA_V6_VERSION]);
+        let v6_scientific_schema = normalized_scientific_schema(&connection)?;
+
+        install_scriptbots_schema(&connection)?;
+
+        assert_eq!(
+            normalized_scientific_schema(&connection)?,
+            v6_scientific_schema,
+            "the additive host-journal migration changed the frozen V6 scientific schema"
+        );
+        let migrations = connection
+            .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
+        assert_eq!(migrations.len(), 2);
+        assert_eq!(
+            decode::<i64>(&migrations[1], 0, "_schema_migrations.version")?,
+            SCRIPTBOTS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            decode::<String>(&migrations[1], 1, "_schema_migrations.name")?,
+            "add_host_journal_archive"
+        );
+        let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v7_host_journal_schema_enforces_identity_ordering_and_foreign_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Storage::memory_for_run(unattributed_manifest_at(RunId::new(0x707), 707))?;
+        let connection = storage.connection()?;
+        connection.execute("PRAGMA foreign_keys = ON")?;
+        let run_id = sqlite_run_id(storage.run_id());
+        let run_param = std::slice::from_ref(&run_id);
+
+        connection.execute_with_params(
+            "INSERT INTO host_journal_progress (
+                run_id, host_session_id,
+                admitted_journal_prefix, applied_journal_prefix,
+                committed_volatile_journal_prefix, durable_journal_prefix,
+                admitted_event_prefix, applied_event_prefix,
+                committed_volatile_event_prefix, durable_event_prefix,
+                shutdown_sequence
+             ) VALUES (
+                ?1, '00000000000000ab',
+                '0000000000000004', '0000000000000003',
+                '0000000000000002', '0000000000000001',
+                '0000000000000003', '0000000000000002',
+                '0000000000000001', '0000000000000001',
+                '0000000000000004'
+             )",
+            run_param,
+        )?;
+        assert!(
+            connection
+                .execute_with_params(
+                    "INSERT INTO host_journal_progress (
+                        run_id, host_session_id,
+                        admitted_journal_prefix, applied_journal_prefix,
+                        committed_volatile_journal_prefix, durable_journal_prefix,
+                        admitted_event_prefix, applied_event_prefix,
+                        committed_volatile_event_prefix, durable_event_prefix
+                     ) VALUES (
+                        ?1, '00000000000000AC',
+                        '0000000000000001', '0000000000000001',
+                        '0000000000000001', '0000000000000001',
+                        '0000000000000001', '0000000000000001',
+                        '0000000000000001', '0000000000000001'
+                     )",
+                    run_param,
+                )
+                .is_err(),
+            "an uppercase host-session identity bypassed the lowercase fixed-hex check"
+        );
+        assert!(
+            connection
+                .execute_with_params(
+                    "INSERT INTO host_journal_progress (
+                        run_id, host_session_id,
+                        admitted_journal_prefix, applied_journal_prefix,
+                        committed_volatile_journal_prefix, durable_journal_prefix,
+                        admitted_event_prefix, applied_event_prefix,
+                        committed_volatile_event_prefix, durable_event_prefix
+                     ) VALUES (
+                        ?1, '00000000000000ac',
+                        '0000000000000001', '0000000000000002',
+                        '0000000000000001', '0000000000000001',
+                        '0000000000000001', '0000000000000001',
+                        '0000000000000001', '0000000000000001'
+                     )",
+                    run_param,
+                )
+                .is_err(),
+            "an applied prefix advanced beyond admission"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO host_journal_progress (
+                        run_id, host_session_id,
+                        admitted_journal_prefix, applied_journal_prefix,
+                        committed_volatile_journal_prefix, durable_journal_prefix,
+                        admitted_event_prefix, applied_event_prefix,
+                        committed_volatile_event_prefix, durable_event_prefix
+                     ) VALUES (
+                        'missing-run', '00000000000000ac',
+                        '0000000000000000', '0000000000000000',
+                        '0000000000000000', '0000000000000000',
+                        '0000000000000000', '0000000000000000',
+                        '0000000000000000', '0000000000000000'
+                     )",
+                )
+                .is_err(),
+            "host-journal progress did not require a registered run"
+        );
+
+        connection.execute_with_params(
+            "INSERT INTO host_journal_archive (
+                run_id, host_session_id, journal_sequence,
+                payload_version, payload_digest, payload_json
+             ) VALUES (
+                ?1, '00000000000000ab', '0000000000000001', 1,
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '{}'
+             )",
+            run_param,
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO host_journal_archive (
+                run_id, host_session_id, journal_sequence,
+                payload_version, payload_digest, payload_json
+             ) VALUES (
+                ?1, '00000000000000ab', '0000000000000002', 1,
+                'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}'
+             )",
+            run_param,
+        )?;
+        assert!(
+            connection
+                .execute_with_params(
+                    "INSERT INTO host_journal_archive (
+                        run_id, host_session_id, journal_sequence,
+                        payload_version, payload_digest, payload_json
+                     ) VALUES (
+                        ?1, '00000000000000ab', '000000000000000A', 1,
+                        'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', '{}'
+                     )",
+                    run_param,
+                )
+                .is_err(),
+            "an uppercase journal sequence bypassed the lowercase fixed-hex check"
+        );
+        assert!(
+            connection
+                .execute_with_params(
+                    "INSERT INTO host_journal_archive (
+                        run_id, host_session_id, journal_sequence,
+                        payload_version, payload_digest, payload_json
+                     ) VALUES (
+                        ?1, '00000000000000ab', '0000000000000003', 1,
+                        'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', ''
+                     )",
+                    run_param,
+                )
+                .is_err(),
+            "an empty canonical journal payload was accepted"
+        );
+        assert!(
+            connection
+                .execute_with_params(
+                    "INSERT INTO host_journal_archive (
+                        run_id, host_session_id, journal_sequence,
+                        payload_version, payload_digest, payload_json
+                     ) VALUES (
+                        ?1, '00000000000000ac', '0000000000000001', 1,
+                        'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', '{}'
+                     )",
+                    run_param,
+                )
+                .is_err(),
+            "an archive row existed without its session progress parent"
+        );
+
+        connection.execute_with_params(
+            "INSERT INTO host_journal_batch_ledger (
+                run_id, host_session_id, journal_sequence,
+                scientific_event_sequence, persistence_batch_id, state
+             ) VALUES (
+                ?1, '00000000000000ab', '0000000000000001',
+                '0000000000000001', NULL, 'durable'
+             )",
+            run_param,
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO host_journal_batch_ledger (
+                run_id, host_session_id, journal_sequence,
+                scientific_event_sequence, persistence_batch_id, state
+             ) VALUES (
+                ?1, '00000000000000ab', '0000000000000002',
+                NULL, NULL, 'admitted'
+             )",
+            run_param,
+        )?;
+        assert!(
+            connection
+                .execute_with_params(
+                    "UPDATE host_journal_batch_ledger
+                     SET scientific_event_sequence = '0000000000000001'
+                     WHERE run_id = ?1 AND host_session_id = '00000000000000ab'
+                       AND journal_sequence = '0000000000000002'",
+                    run_param,
+                )
+                .is_err(),
+            "a scientific event sequence mapped to more than one journal batch"
+        );
+        assert!(
+            connection
+                .execute_with_params(
+                    "UPDATE host_journal_batch_ledger
+                     SET persistence_batch_id = 99
+                     WHERE run_id = ?1 AND host_session_id = '00000000000000ab'
+                       AND journal_sequence = '0000000000000002'",
+                    run_param,
+                )
+                .is_err(),
+            "a journal batch linked a nonexistent persistence batch"
+        );
+        assert!(
+            connection
+                .execute_with_params(
+                    "UPDATE host_journal_batch_ledger
+                     SET state = 'compacted'
+                     WHERE run_id = ?1 AND host_session_id = '00000000000000ab'
+                       AND journal_sequence = '0000000000000002'",
+                    run_param,
+                )
+                .is_err(),
+            "the permanent archive ledger accepted an unknown state"
+        );
+
+        storage.close()?;
         Ok(())
     }
 
@@ -11088,7 +11489,7 @@ mod tests {
         let connection = Connection::open(":memory:")?;
         MigrationRunner::new()
             .add(
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V6_VERSION,
                 "deliberately_failing_v6",
                 FAILING_V6,
             )
@@ -11272,11 +11673,11 @@ mod tests {
         create_valid_database(&future)?;
         add_schema_object(
             &future,
-            "INSERT INTO _schema_migrations (version, name) VALUES (7, 'future_schema')",
+            "INSERT INTO _schema_migrations (version, name) VALUES (8, 'future_schema')",
         )?;
         assert_recovery_refused_without_database_mutation(
             &future,
-            "expected exactly one ScriptBots v6 migration",
+            "expected exactly two ScriptBots migrations through v7",
         )?;
 
         let legacy = temp_db_path("storage-recovery-legacy-v5-lineage");
@@ -11296,7 +11697,22 @@ mod tests {
         legacy_connection.close()?;
         assert_recovery_refused_without_database_mutation(
             &legacy,
-            "expected exactly one ScriptBots v6 migration",
+            "expected exactly two ScriptBots migrations through v7",
+        )?;
+
+        let v6_only = temp_db_path("storage-recovery-v6-only-lineage");
+        let v6_connection = Connection::open(v6_only.to_string_lossy().as_ref())?;
+        MigrationRunner::new()
+            .add(
+                SCRIPTBOTS_SCHEMA_V6_VERSION,
+                "create_multi_run_schema",
+                SCRIPTBOTS_SCHEMA_V6,
+            )
+            .run(&v6_connection)?;
+        v6_connection.close()?;
+        assert_recovery_refused_without_database_mutation(
+            &v6_only,
+            "expected exactly two ScriptBots migrations through v7",
         )?;
 
         let mismatched_user_version = temp_db_path("storage-recovery-user-version-mismatch");
@@ -11304,7 +11720,7 @@ mod tests {
         add_schema_object(&mismatched_user_version, "PRAGMA user_version = 5")?;
         assert_recovery_refused_without_database_mutation(
             &mismatched_user_version,
-            "migration ledger is v6, but PRAGMA user_version is 5",
+            "migration ledger is v7, but PRAGMA user_version is 5",
         )?;
         Ok(())
     }
@@ -11320,8 +11736,9 @@ mod tests {
                 name TEXT NOT NULL,
                 applied_at TEXT NOT NULL
              );
-             INSERT INTO _schema_migrations (version, name, applied_at)
-             VALUES (6, 'create_multi_run_schema', 'forged');
+             INSERT INTO _schema_migrations (version, name, applied_at) VALUES
+                (6, 'create_multi_run_schema', 'forged'),
+                (7, 'add_host_journal_archive', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -11331,7 +11748,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 6;",
+             PRAGMA user_version = 7;",
         )?;
         connection.close()?;
 
