@@ -5962,7 +5962,7 @@ fn read_host_journal_events(
                 remaining_bytes,
             )?;
             let journaled = archive
-                .journaled_event(EventCommitment::Durable)?
+                .into_journaled_event(EventCommitment::Durable)?
                 .ok_or(StorageError::InvalidData {
                     context: "host_journal_archive.scientific",
                     reason: format!("durable event {} has no scientific payload", next.get()),

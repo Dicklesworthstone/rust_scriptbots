@@ -236,17 +236,39 @@ fn validate_scientific_archive_boundary(
     command: Option<&CommandEnvelope>,
     has_persistence: bool,
 ) -> Result<(), StorageError> {
-    if command.is_none() && scientific.is_none() {
-        return Err(StorageError::InvalidData {
-            context: "host_journal_archive.payload_json",
-            reason: "journal batch must contain a command or scientific boundary".to_owned(),
-        });
-    }
-    if command.is_some_and(|envelope| !envelope.command.requires_journal()) {
-        return Err(StorageError::InvalidData {
-            context: "host_journal_archive.command",
-            reason: "command does not require a journal record".to_owned(),
-        });
+    match command.map(|envelope| &envelope.command) {
+        None if scientific.is_none() => {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.payload_json",
+                reason: "journal batch must contain a command or scientific boundary".to_owned(),
+            });
+        }
+        Some(command) if !command.requires_journal() => {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.command",
+                reason: "command does not require a journal record".to_owned(),
+            });
+        }
+        Some(HostCommand::Step) if scientific.is_none() => {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.scientific",
+                reason: "a successful step command requires its scientific boundary".to_owned(),
+            });
+        }
+        Some(HostCommand::UpdateConfig(_)) if scientific.is_some() || has_persistence => {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.command",
+                reason: "an update-config journal batch must be command-only".to_owned(),
+            });
+        }
+        Some(HostCommand::Shutdown) if scientific.is_some() => {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.command",
+                reason: "a shutdown journal batch may carry only its final persistence tail"
+                    .to_owned(),
+            });
+        }
+        _ => {}
     }
     let shutdown = command
         .is_some_and(|envelope| matches!(&envelope.command, HostCommand::Shutdown));
@@ -458,18 +480,18 @@ impl HostJournalArchive {
         self.persistence.take()
     }
 
-    pub(super) fn journaled_event(
-        &self,
+    pub(super) fn into_journaled_event(
+        self,
         commitment: EventCommitment,
     ) -> Result<Option<JournaledScientificEvent>, StorageError> {
         let Some(sequence) = self.event_sequence()? else {
             return Ok(None);
         };
-        let boundary = self.scientific.clone().ok_or(StorageError::InvalidData {
+        let batch_id = self.batch_id()?;
+        let boundary = self.scientific.ok_or(StorageError::InvalidData {
             context: "host_journal_archive.scientific",
             reason: "scientific event sequence has no payload".to_owned(),
         })?;
-        let batch_id = self.batch_id()?;
         Ok(Some(JournaledScientificEvent {
             event: Arc::new(ScientificEvent {
                 session_id: batch_id.session_id(),
@@ -635,6 +657,25 @@ pub(super) struct JournalReaderPublisher {
     inner: Arc<JournalReaderInner>,
 }
 
+fn journal_event_commitment(
+    guarantee: EventCatchUpGuarantee,
+    state: &JournalReceiptState,
+) -> Result<EventCommitment, StorageError> {
+    match (guarantee, state) {
+        (EventCatchUpGuarantee::CrashDurable, JournalReceiptState::Durable) => {
+            Ok(EventCommitment::Durable)
+        }
+        (
+            EventCatchUpGuarantee::LiveMemory,
+            JournalReceiptState::CommittedVolatile,
+        ) => Ok(EventCommitment::CommittedVolatile),
+        (guarantee, invalid) => Err(StorageError::InvalidData {
+            context: "host_journal_reader.commitment",
+            reason: format!("reader guarantee {guarantee:?} cannot publish receipt {invalid:?}"),
+        }),
+    }
+}
+
 impl JournalReaderPublisher {
     pub(super) fn new(
         session_id: HostSessionId,
@@ -694,26 +735,11 @@ impl JournalReaderPublisher {
         batch: &JournalBatch,
         state: &JournalReceiptState,
     ) -> Result<(), StorageError> {
+        let commitment = journal_event_commitment(self.inner.guarantee, state)?;
         let (Some(sequence), Some(boundary)) =
             (batch.scientific_event_sequence(), batch.scientific())
         else {
             return Ok(());
-        };
-        let commitment = match (self.inner.guarantee, state) {
-            (EventCatchUpGuarantee::CrashDurable, JournalReceiptState::Durable) => {
-                EventCommitment::Durable
-            }
-            (EventCatchUpGuarantee::LiveMemory, JournalReceiptState::CommittedVolatile) => {
-                EventCommitment::CommittedVolatile
-            }
-            (guarantee, invalid) => {
-                return Err(StorageError::InvalidData {
-                    context: "host_journal_reader.commitment",
-                    reason: format!(
-                        "reader guarantee {guarantee:?} cannot publish receipt {invalid:?}"
-                    ),
-                });
-            }
         };
         let current = self.inner.view.load_full();
         if current.identities.contains(&(sequence, batch.id())) {
@@ -772,6 +798,11 @@ impl JournalReaderPublisher {
                     };
                     next.memory_bytes = next.memory_bytes.saturating_sub(evicted_bytes);
                 }
+                next.identities = next
+                    .memory_events
+                    .iter()
+                    .map(|(event, _bytes)| (event.event.sequence, event.event.batch_id))
+                    .collect();
                 next.available = next.memory_events.front().zip(next.memory_events.back()).map(
                     |(first, last)| EventSequenceRange {
                         first: first.0.event.sequence,
@@ -1319,5 +1350,184 @@ impl JournalPort for StorageJournalPort {
 
     fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
         self.shutdown_requirement
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scriptbots_core::{
+        ScriptBotsConfig, Tick, TickCombatSummary, TickEvents, TickSummary,
+    };
+    use scriptbots_runtime::{CommandId, HostRevisions};
+
+    fn applied() -> AppliedCommand {
+        AppliedCommand {
+            tick: Tick(1),
+            revisions: HostRevisions::default(),
+        }
+    }
+
+    fn scientific() -> ScientificBoundary {
+        ScientificBoundary::new(
+            TickEvents {
+                tick: Tick(1),
+                charts_flushed: false,
+                epoch_rolled: false,
+                food_respawned: None,
+            },
+            TickSummary {
+                tick: Tick(1),
+                agent_count: 0,
+                births: 0,
+                deaths: 0,
+                total_energy: 0.0,
+                average_energy: 0.0,
+                average_health: 0.0,
+                max_age: 0,
+                spike_hits: 0,
+            },
+            Vec::new(),
+            Vec::new(),
+            TickCombatSummary::default(),
+            0,
+            None,
+        )
+    }
+
+    #[test]
+    fn archive_shape_matrix_accepts_only_runtime_producible_batches() {
+        let applied = applied();
+        let scientific = scientific();
+        let step = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+        let update = CommandEnvelope::new(
+            CommandId::new(2),
+            HostCommand::UpdateConfig(Box::new(ScriptBotsConfig::default())),
+        );
+        let shutdown = CommandEnvelope::new(CommandId::new(3), HostCommand::Shutdown);
+
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                Some(EventSequence::new(1)),
+                applied,
+                Some(&scientific),
+                None,
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                Some(EventSequence::new(1)),
+                applied,
+                Some(&scientific),
+                Some(&step),
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&update),
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&shutdown),
+                true,
+            )
+            .is_ok()
+        );
+
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&step),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                Some(EventSequence::new(1)),
+                applied,
+                Some(&scientific),
+                Some(&update),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                Some(EventSequence::new(1)),
+                applied,
+                Some(&scientific),
+                Some(&shutdown),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&update),
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn journal_reader_rejects_receipts_from_the_wrong_storage_mode() {
+        assert_eq!(
+            journal_event_commitment(
+                EventCatchUpGuarantee::CrashDurable,
+                &JournalReceiptState::Durable,
+            )
+            .expect("file readers accept durable truth"),
+            EventCommitment::Durable
+        );
+        assert_eq!(
+            journal_event_commitment(
+                EventCatchUpGuarantee::LiveMemory,
+                &JournalReceiptState::CommittedVolatile,
+            )
+            .expect("memory readers accept volatile truth"),
+            EventCommitment::CommittedVolatile
+        );
+        assert!(
+            journal_event_commitment(
+                EventCatchUpGuarantee::CrashDurable,
+                &JournalReceiptState::CommittedVolatile,
+            )
+            .is_err()
+        );
+        assert!(
+            journal_event_commitment(
+                EventCatchUpGuarantee::LiveMemory,
+                &JournalReceiptState::Durable,
+            )
+            .is_err()
+        );
     }
 }
