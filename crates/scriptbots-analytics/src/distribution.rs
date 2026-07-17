@@ -226,9 +226,14 @@ mod tests {
             "a normal sample has near-zero excess kurtosis; got {}",
             s.excess_kurtosis
         );
+        // Assert at alpha=0.001, not 0.05: Jarque-Bera on a genuinely normal sample follows
+        // chi-square(2) under the null, so it rejects at whatever alpha we pick that fraction of the
+        // time REGARDLESS of the skew/kurtosis bounds above (at n=3000 those bounds are looser than
+        // the JB threshold). At 0.05 this test would be ~5% flaky; at 0.001 it is ~0.1% flaky.
         assert!(
-            !s.rejects_normality(0.05),
-            "a genuinely normal sample was flagged non-normal (p={:.4})",
+            !s.rejects_normality(0.001),
+            "a genuinely normal sample was flagged non-normal even at alpha=0.001 (JB={:.3}, p={:.5})",
+            s.jarque_bera,
             s.jb_p_value
         );
     }

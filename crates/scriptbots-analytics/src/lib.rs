@@ -243,6 +243,7 @@ impl Registry {
                 Box::new(MetricSummary),
                 Box::new(MetricChangepoints),
                 Box::new(RunComparison),
+                Box::new(MetricDistribution),
             ],
         }
     }
@@ -868,6 +869,166 @@ impl Report for RunComparison {
                     row.cohens_dz,
                     row.fraction_positive,
                     if row.significant_fdr { "yes" } else { "no" },
+                );
+            }
+        }
+
+        let output = base_output(
+            self.name(),
+            cx,
+            machine.metrics.len(),
+            serde_json::to_value(&machine)?,
+            md,
+        )?;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
+    }
+}
+
+/// `metric-distribution`: per-metric shape and normality (bd-2z0.11.6 item 2).
+///
+/// For every metric the run recorded, reports its skewness and excess kurtosis and runs a
+/// Jarque-Bera normality test ([`distribution`]) — a native, `erf`-free assessment of "is this
+/// metric normal, and how is it shaped?". A skewed or heavy-tailed metric is exactly the case
+/// where a mean-and-SD summary (the `metric-summary` report) understates the story, so this is its
+/// companion. Full distribution FITTING (candidate lognormal/gamma) stays with the `fsci` adapter
+/// decision (bd-2z0.11.3).
+struct MetricDistribution;
+
+#[derive(Debug, Serialize)]
+struct MetricDistributionMachine {
+    /// Significance level for the normality verdict.
+    alpha: f64,
+    /// True when the bounded metric read hit its cap.
+    truncated: bool,
+    /// Metrics with at least four values (the minimum for a shape test).
+    metrics_examined: usize,
+    /// How many were flagged non-normal at `alpha`.
+    non_normal: usize,
+    metrics: Vec<MetricDistributionRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricDistributionRow {
+    name: String,
+    n: usize,
+    mean: f64,
+    std_dev: f64,
+    skewness: f64,
+    excess_kurtosis: f64,
+    jarque_bera: f64,
+    jb_p_value: f64,
+    /// A constant metric: no shape, reported as such rather than as "looks normal".
+    degenerate: bool,
+    /// Jarque-Bera rejects normality at `alpha`. Never true for a degenerate metric.
+    non_normal: bool,
+}
+
+impl Report for MetricDistribution {
+    fn name(&self) -> &'static str {
+        "metric-distribution"
+    }
+
+    fn description(&self) -> &'static str {
+        "Per-metric shape (skewness, kurtosis) and a Jarque-Bera normality test over a finished run"
+    }
+
+    fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
+        let alpha = params
+            .get("alpha")
+            .map(str::parse::<f64>)
+            .transpose()
+            .map_err(|e| AnalyticsError::BadParam {
+                name: "alpha".to_owned(),
+                reason: e.to_string(),
+            })?
+            .unwrap_or(0.05);
+
+        let read_started = Instant::now();
+        let readings = cx.reader.recent_metrics(METRIC_SUMMARY_ROW_LIMIT)?;
+        let truncated = readings.len() >= METRIC_SUMMARY_ROW_LIMIT;
+        log_report_stage("read", &read_started, readings.len());
+
+        let render_started = Instant::now();
+        let mut by_metric: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for PersistedMetric { name, value, .. } in readings {
+            by_metric.entry(name).or_default().push(value);
+        }
+
+        let mut rows = Vec::with_capacity(by_metric.len());
+        let mut non_normal = 0usize;
+        for (name, values) in by_metric {
+            // The shape test needs at least four points; a shorter series is skipped rather than
+            // reported with a meaningless statistic.
+            if values.len() < 4 {
+                continue;
+            }
+            let summary = distribution::summarize(&values).map_err(|e| metric_stats_error(&e))?;
+            let is_non_normal = summary.rejects_normality(alpha);
+            if is_non_normal {
+                non_normal += 1;
+            }
+            rows.push(MetricDistributionRow {
+                name,
+                n: summary.n,
+                mean: summary.mean,
+                std_dev: summary.std_dev,
+                skewness: summary.skewness,
+                excess_kurtosis: summary.excess_kurtosis,
+                jarque_bera: summary.jarque_bera,
+                jb_p_value: summary.jb_p_value,
+                degenerate: summary.degenerate,
+                non_normal: is_non_normal,
+            });
+        }
+
+        let machine = MetricDistributionMachine {
+            alpha,
+            truncated,
+            metrics_examined: rows.len(),
+            non_normal,
+            metrics: rows,
+        };
+
+        let mut md = String::new();
+        let _ = writeln!(md, "# Metric distributions\n");
+        let _ = writeln!(
+            md,
+            "_alpha={}, {} of {} metrics flagged non-normal (Jarque-Bera)._\n",
+            machine.alpha, machine.non_normal, machine.metrics_examined
+        );
+        if machine.truncated {
+            let _ = writeln!(
+                md,
+                "> **Note:** the metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; the shape \
+                 is over recent history, not the whole run.\n"
+            );
+        }
+        if machine.metrics.is_empty() {
+            let _ = writeln!(md, "_No metric had at least four values to characterize._");
+        } else {
+            let _ = writeln!(md, "| metric | n | mean | sd | skew | ex.kurt | JB | p | normal? |");
+            let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|");
+            for row in &machine.metrics {
+                let verdict = if row.degenerate {
+                    "constant"
+                } else if row.non_normal {
+                    "no"
+                } else {
+                    "yes"
+                };
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {:.4} | {:.4} | {:+.3} | {:+.3} | {:.2} | {:.4} | {} |",
+                    row.name,
+                    row.n,
+                    row.mean,
+                    row.std_dev,
+                    row.skewness,
+                    row.excess_kurtosis,
+                    row.jarque_bera,
+                    row.jb_p_value,
+                    verdict,
                 );
             }
         }

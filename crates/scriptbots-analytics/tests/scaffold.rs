@@ -330,6 +330,7 @@ fn registry_lists_builtin_reports_with_descriptions() {
             "metric-summary",
             "metric-changepoints",
             "compare-runs",
+            "metric-distribution",
         ]
     );
     assert!(listed.iter().all(|(_, d)| !d.is_empty()));
