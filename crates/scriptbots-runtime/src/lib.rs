@@ -1970,14 +1970,10 @@ impl CommandLifecycleEvidence {
                     return Err(CommandLifecycleEvidenceError::TerminalTickRegressed);
                 }
                 if terminal.revisions.control < admitted.revisions.control {
-                    return Err(
-                        CommandLifecycleEvidenceError::TerminalControlRevisionRegressed,
-                    );
+                    return Err(CommandLifecycleEvidenceError::TerminalControlRevisionRegressed);
                 }
                 if terminal.revisions.scientific < admitted.revisions.scientific {
-                    return Err(
-                        CommandLifecycleEvidenceError::TerminalScientificRevisionRegressed,
-                    );
+                    return Err(CommandLifecycleEvidenceError::TerminalScientificRevisionRegressed);
                 }
                 if terminal.revisions.config < admitted.revisions.config {
                     return Err(CommandLifecycleEvidenceError::TerminalConfigRevisionRegressed);
@@ -2027,11 +2023,9 @@ impl CommandLifecycleEvidence {
     #[must_use]
     pub fn is_applied_shutdown(&self) -> bool {
         matches!(&self.envelope.command, HostCommand::Shutdown)
-            && self
-                .terminal()
-                .is_some_and(|transition| {
-                    matches!(&transition.application, ApplicationState::Applied(_))
-                })
+            && self.terminal().is_some_and(|transition| {
+                matches!(&transition.application, ApplicationState::Applied(_))
+            })
     }
 
     /// Whether this terminal lifecycle is tracked by runtime journal receipts.
@@ -2317,19 +2311,19 @@ fn retained_application_state_bytes(application: &ApplicationState) -> usize {
     }
 }
 
-fn retained_command_lifecycle_bytes(
-    lifecycle: Option<&CommandLifecycleEvidence>,
-) -> usize {
+fn retained_command_lifecycle_bytes(lifecycle: Option<&CommandLifecycleEvidence>) -> usize {
     let Some(lifecycle) = lifecycle else {
         return 0;
     };
-    let mut retained = retained_command_bytes(Some(&lifecycle.envelope)).saturating_add(
-        retained_vec_bytes::<CommandLifecycleTransition>(lifecycle.transitions.capacity()),
-    );
-    for transition in &lifecycle.transitions {
-        retained = retained.saturating_add(retained_application_state_bytes(
-            &transition.application,
+    let mut retained =
+        retained_command_bytes(Some(&lifecycle.envelope)).saturating_add(retained_vec_bytes::<
+            CommandLifecycleTransition,
+        >(
+            lifecycle.transitions.capacity(),
         ));
+    for transition in &lifecycle.transitions {
+        retained =
+            retained.saturating_add(retained_application_state_bytes(&transition.application));
     }
     retained
 }
@@ -2926,25 +2920,23 @@ fn validate_status_combination(
                 return Err(StatusCombinationError::MissingAdmissionSequence);
             }
         }
-        ApplicationState::Rejected(reason) => {
-            match reason {
-                RejectionReason::ControlRevisionConflict { .. }
-                | RejectionReason::ScientificRevisionConflict { .. }
-                | RejectionReason::ConfigRevisionConflict { .. }
-                    if admission_sequence.is_none() =>
-                {
-                    return Err(StatusCombinationError::ConflictMissingAdmission);
-                }
-                RejectionReason::Validation { .. }
-                | RejectionReason::Overloaded { .. }
-                | RejectionReason::HostStopping
-                    if admission_sequence.is_some() =>
-                {
-                    return Err(StatusCombinationError::PreAdmissionRejectionWasAdmitted);
-                }
-                _ => {}
+        ApplicationState::Rejected(reason) => match reason {
+            RejectionReason::ControlRevisionConflict { .. }
+            | RejectionReason::ScientificRevisionConflict { .. }
+            | RejectionReason::ConfigRevisionConflict { .. }
+                if admission_sequence.is_none() =>
+            {
+                return Err(StatusCombinationError::ConflictMissingAdmission);
             }
-        }
+            RejectionReason::Validation { .. }
+            | RejectionReason::Overloaded { .. }
+            | RejectionReason::HostStopping
+                if admission_sequence.is_some() =>
+            {
+                return Err(StatusCombinationError::PreAdmissionRejectionWasAdmitted);
+            }
+            _ => {}
+        },
     }
     Ok(())
 }
@@ -6648,11 +6640,7 @@ mod tests {
             Some(AdmissionSequence::new(9)),
             vec![
                 CommandLifecycleTransition::new(0, initial, ApplicationState::Admitted),
-                CommandLifecycleTransition::new(
-                    1,
-                    terminal,
-                    ApplicationState::Applied(terminal),
-                ),
+                CommandLifecycleTransition::new(1, terminal, ApplicationState::Applied(terminal)),
             ],
         )
         .expect("valid command lifecycle");
@@ -6660,7 +6648,10 @@ mod tests {
         assert_eq!(evidence.schema_version(), COMMAND_LIFECYCLE_SCHEMA_VERSION);
         assert_eq!(evidence.source_client_namespace(), 0xfeed_beef);
         assert_eq!(evidence.envelope(), &envelope);
-        assert_eq!(evidence.admission_sequence(), Some(AdmissionSequence::new(9)));
+        assert_eq!(
+            evidence.admission_sequence(),
+            Some(AdmissionSequence::new(9))
+        );
         assert_eq!(evidence.transitions()[0].boundary(), initial);
         assert_eq!(evidence.transitions()[1].ordinal(), 1);
         assert!(evidence.requires_runtime_journal());
@@ -7266,13 +7257,7 @@ mod tests {
         let rejected = ApplicationState::Rejected(RejectionReason::HostStopping);
         for journal in journals.clone() {
             assert!(
-                CommandStatus::try_new(
-                    CommandId::new(2),
-                    None,
-                    rejected.clone(),
-                    journal,
-                )
-                .is_ok()
+                CommandStatus::try_new(CommandId::new(2), None, rejected.clone(), journal,).is_ok()
             );
         }
         assert_eq!(

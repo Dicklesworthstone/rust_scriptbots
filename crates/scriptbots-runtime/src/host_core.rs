@@ -4,18 +4,18 @@ use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, BrainProjection,
     BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId,
     CommandLifecycleEvidence, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt,
-    EventCatchUp, EventCatchUpGuarantee,
-    EventCatchUpLocator, EventCatchUpUnavailableReason, EventCommitment, EventHub,
-    EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot, EventSequence,
-    EventSequenceRange, FoodLayerSnapshot, HostAccessError, HostBlocker, HostCommand,
-    HostDriveInterest, HostEvent, HostEventKind, HostFault, HostHealth, HostLifecycle, HostPort,
-    HostRevisions, HostSessionId, HydrologyLayerSnapshot, HydrologyTileSnapshot, JournalAdmission,
-    JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt, JournalReceiptState,
-    JournalState, JournaledScientificEvent, LayerRevision, ManualHostDriver, ManualInstant,
-    PlaybackSnapshot, ProtocolEventSequence, RejectionReason, RenderSnapshot, ScientificBoundary,
-    ScientificBoundaryFault, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
-    SnapshotBuildStats, SnapshotHub, SnapshotLayerRevisions, SnapshotLayers, SnapshotRevision,
-    StatusCombinationError, TerrainLayerSnapshot, TerrainTileSnapshot,
+    EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason,
+    EventCommitment, EventHub, EventJournalReader, EventPage, EventPageSource,
+    EventRetentionSnapshot, EventSequence, EventSequenceRange, FoodLayerSnapshot, HostAccessError,
+    HostBlocker, HostCommand, HostDriveInterest, HostEvent, HostEventKind, HostFault, HostHealth,
+    HostLifecycle, HostPort, HostRevisions, HostSessionId, HydrologyLayerSnapshot,
+    HydrologyTileSnapshot, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure,
+    JournalPort, JournalReceipt, JournalReceiptState, JournalState, JournaledScientificEvent,
+    LayerRevision, ManualHostDriver, ManualInstant, PlaybackSnapshot, ProtocolEventSequence,
+    RejectionReason, RenderSnapshot, ScientificBoundary, ScientificBoundaryFault, ScientificEvent,
+    ScientificRevision, ShutdownCommitRequirement, SnapshotBuildStats, SnapshotHub,
+    SnapshotLayerRevisions, SnapshotLayers, SnapshotRevision, StatusCombinationError,
+    TerrainLayerSnapshot, TerrainTileSnapshot,
 };
 use arc_swap::ArcSwap;
 use scriptbots_core::{
@@ -567,12 +567,7 @@ impl SharedHostState {
         // notification. A saturated notification lane must not orphan a
         // terminal status whose audit slot has already been reserved.
         self.pending_audits.push_back((audit_order, command_id));
-        self.insert_status(
-            envelope,
-            envelope_digest,
-            status.clone(),
-            Some(audit_order),
-        )?;
+        self.insert_status(envelope, envelope_digest, status.clone(), Some(audit_order))?;
         Ok(status)
     }
 
@@ -623,10 +618,7 @@ impl SharedHostState {
         Ok(())
     }
 
-    fn compact_command_envelope(
-        &mut self,
-        command_id: CommandId,
-    ) -> Result<(), HostAccessError> {
+    fn compact_command_envelope(&mut self, command_id: CommandId) -> Result<(), HostAccessError> {
         self.commands
             .get_mut(&command_id)
             .ok_or_else(|| protocol_violation("command authority disappeared before compaction"))?
@@ -1942,8 +1934,7 @@ impl HostCore {
 
     fn drain_pending_command_audits(&mut self) -> Result<bool, HostAccessError> {
         loop {
-            let Some((command_id, order, lifecycle)) =
-                self.shared.borrow().next_pending_audit()?
+            let Some((command_id, order, lifecycle)) = self.shared.borrow().next_pending_audit()?
             else {
                 return Ok(false);
             };
@@ -4674,8 +4665,7 @@ mod tests {
         assert_eq!(receipt.commands_completed, commands.len());
         let journal = journal_state.borrow();
         assert_eq!(journal.attempts.len(), commands.len());
-        for (index, ((command_id, _), batch)) in
-            commands.iter().zip(&journal.attempts).enumerate()
+        for (index, ((command_id, _), batch)) in commands.iter().zip(&journal.attempts).enumerate()
         {
             let lifecycle = batch
                 .command_lifecycle()
@@ -4689,14 +4679,14 @@ mod tests {
             assert_eq!(lifecycle.transitions().len(), 2);
             assert_eq!(lifecycle.transitions()[0].ordinal(), 0);
             assert_eq!(
-                lifecycle.transitions()[0]
-                    .boundary()
-                    .revisions
-                    .control,
+                lifecycle.transitions()[0].boundary().revisions.control,
                 ControlRevision::new(0)
             );
             let terminal = lifecycle.terminal().expect("terminal control transition");
-            assert!(matches!(terminal.application(), ApplicationState::Applied(_)));
+            assert!(matches!(
+                terminal.application(),
+                ApplicationState::Applied(_)
+            ));
             assert_eq!(
                 terminal.boundary().revisions.control,
                 ControlRevision::new(u64::try_from(index + 1).expect("control revision"))
@@ -4909,11 +4899,7 @@ mod tests {
         let mut config = core.world.config().clone();
         config.food_growth_rate = 0.02;
         submit(&mut port, 1, HostCommand::Step);
-        submit(
-            &mut port,
-            2,
-            HostCommand::UpdateConfig(Box::new(config)),
-        );
+        submit(&mut port, 2, HostCommand::UpdateConfig(Box::new(config)));
 
         let receipt = core
             .drive(ManualInstant::from_nanos(0))
@@ -4927,7 +4913,9 @@ mod tests {
                 .expect("successful command lifecycle");
             assert_eq!(lifecycle.transitions().len(), 2);
             assert!(matches!(
-                lifecycle.terminal().map(CommandLifecycleTransition::application),
+                lifecycle
+                    .terminal()
+                    .map(CommandLifecycleTransition::application),
                 Some(ApplicationState::Applied(_))
             ));
             assert!(batch.requires_runtime_journal());
@@ -5006,7 +4994,10 @@ mod tests {
             conflict.transitions()[0].boundary(),
             conflict.transitions()[1].boundary()
         );
-        assert_eq!(failed.transitions()[0].boundary(), failed.transitions()[1].boundary());
+        assert_eq!(
+            failed.transitions()[0].boundary(),
+            failed.transitions()[1].boundary()
+        );
         assert_eq!(status(&mut port, 1).journal(), &JournalState::Pending);
         assert_eq!(status(&mut port, 2).journal(), &JournalState::Pending);
         drop(journal);
@@ -5038,10 +5029,7 @@ mod tests {
         let retained = core
             .pending_journal_batch()
             .expect("retained control audit");
-        assert!(Arc::ptr_eq(
-            &retained,
-            &journal_state.borrow().attempts[0]
-        ));
+        assert!(Arc::ptr_eq(&retained, &journal_state.borrow().attempts[0]));
         assert!(
             core.shared
                 .borrow()
@@ -5108,7 +5096,10 @@ mod tests {
         let blocked = core
             .drive(ManualInstant::from_nanos(0))
             .expect("blocked shutdown audit ordering");
-        assert!(matches!(blocked.blocker, Some(HostBlocker::JournalFull { .. })));
+        assert!(matches!(
+            blocked.blocker,
+            Some(HostBlocker::JournalFull { .. })
+        ));
         assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Running);
         assert!(matches!(
             status(&mut port, 1).application(),
