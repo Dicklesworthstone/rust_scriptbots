@@ -4,6 +4,7 @@ pub mod ancestry;
 pub mod channels;
 mod checkpoint;
 pub mod detect;
+pub mod narrative_text;
 pub mod rng_domains;
 pub mod sense_fixed;
 
