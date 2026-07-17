@@ -15,3 +15,6 @@ tracing = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-runtime = { path = "../scriptbots-runtime" }
 crossbeam-channel = "0.5"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
