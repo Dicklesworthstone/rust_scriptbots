@@ -288,11 +288,11 @@ jobs:
           tool: cargo-audit@0.22.2
 
       - name: Run security audit
-        # Temporary bd-2z0.8.14 exception: latest stable wayland-scanner 0.31.10
-        # reaches RUSTSEC-2026-0194 only while compiling trusted, vendored XML;
-        # its code does not use the NsReader API affected by RUSTSEC-2026-0195.
-        # Upstream has the 0.41 fix but no compatible stable family release yet.
-        # The inverse-path guard prevents either ignore hiding a future consumer.
+        # Suppressions are governed by ci/configs/audit_advisories.toml
+        # (bd-2z0.8.14): every --ignore below requires a complete documented
+        # entry there, and the suppression gate in this job fails on drift in
+        # either direction. The inverse-path guard prevents either ignore
+        # hiding a future consumer of the flagged quick-xml.
         run: |
           set -euo pipefail
           EXPECTED=$'quick-xml v0.39.4\nwayland-scanner v0.31.10 (proc-macro)'
@@ -305,6 +305,16 @@ jobs:
           cargo audit \
             --ignore RUSTSEC-2026-0194 \
             --ignore RUSTSEC-2026-0195
+
+      - name: Advisory-suppression documentation gate (bd-2z0.8.14)
+        run: |
+          bash ci/check_audit_suppressions.sh --self-test
+          bash ci/check_audit_suppressions.sh
+
+      - name: Immutable action-pin guard (bd-2z0.8.14)
+        run: |
+          bash ci/check_action_pins.sh --self-test
+          bash ci/check_action_pins.sh
 
       - name: Franken family license audit guard (bd-2z0.8.15)
         run: |

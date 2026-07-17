@@ -1,0 +1,63 @@
+# Advisory-suppression registry — bd-2z0.8.14 (program bd-2z0.8)
+#
+# This file is the SINGLE SOURCE OF TRUTH for every cargo-audit suppression in
+# this repository. ci/check_audit_suppressions.sh enforces, in CI:
+#
+#   1. Every `--ignore RUSTSEC-*` flag in .github/workflows/*.yml has exactly
+#      one [[advisory]] entry here (undocumented suppression = CI failure).
+#   2. Every entry here has a live `--ignore` flag (stale justification = CI
+#      failure; justifications must not rot after the suppression is removed).
+#   3. Every entry carries non-empty id/package/locked_version/owning_bead/
+#      justification/removal_trigger/reviewed_at/reviewed_by fields.
+#   4. `package` + `locked_version` must still be present in Cargo.lock
+#      (suppression for an absent or silently-bumped package = CI failure;
+#      a version bump without re-review is exactly the drift this gate exists
+#      to catch). This also mechanically enforces the program rule that
+#      suppressions for absent packages are removed, never kept "just in case".
+#   5. .cargo/audit.toml must not exist: it is a second suppression channel
+#      that would bypass this registry.
+#
+# HOW TO ADD A SUPPRESSION (discouraged; last resort only):
+#   - Add the `--ignore` flag in .github/workflows/ci.yml AND one complete
+#     [[advisory]] entry below in the same commit. The CI gate fails on one
+#     without the other. State the exact live dependency path, why the
+#     vulnerable code is unreachable or its input is fully trusted, the
+#     owning bead, and the concrete condition that removes the exception.
+#
+# HOW TO REMOVE A SUPPRESSION (the goal):
+#   - When the removal_trigger is met (e.g. a dependency release moves the
+#     flagged path to a fixed version), bump the dependency through the
+#     bd-2z0.8 dependency lane, delete the `--ignore` flag AND the matching
+#     [[advisory]] entry in the same commit, and record the removal in the
+#     owning bead.
+#
+# RESIDUAL-RISK TRACKING:
+#   Each live entry below IS the residual-risk record: reviewed path, why the
+#   risk is bounded, who reviewed it, and when. Re-review happens whenever the
+#   gate fails (package/version drift) or when the removal trigger fires.
+#   The 2026-07-17 locked-graph audit (GoldenPanther, DSR static analysis of
+#   Cargo.lock @ 2dd7449) verified both entries below: the flagged packages
+#   are present, the sole consumer paths are as documented, and quick-xml
+#   0.41.0 (fixed) is already viable in-tree via the xcb path.
+
+schema = 1
+
+[[advisory]]
+id = "RUSTSEC-2026-0194"
+package = "quick-xml"
+locked_version = "0.39.4"
+owning_bead = "bd-2z0.8.14"
+justification = "Sole in-tree consumer is wayland-scanner 0.31.10 (proc-macro), which reaches the flagged XML reader only while compiling trusted, vendored Wayland protocol XML at build time; no untrusted input crosses the vulnerable path."
+removal_trigger = "A stable wayland-scanner family release that moves its build to quick-xml >= 0.41 (quick-xml 0.41.0 is already in-tree and unflagged via the xcb path, proving viability). Replace this exception in the same dependency-lane change that lands the bump."
+reviewed_at = "2026-07-17"
+reviewed_by = "GoldenPanther locked-graph audit of Cargo.lock @ 2dd7449 (DSR static analysis)"
+
+[[advisory]]
+id = "RUSTSEC-2026-0195"
+package = "quick-xml"
+locked_version = "0.39.4"
+owning_bead = "bd-2z0.8.14"
+justification = "The advisory affects quick-xml's NsReader API; wayland-scanner 0.31.10, the sole consumer of quick-xml 0.39.4, does not use the NsReader API at all, so the flagged surface is unreachable."
+removal_trigger = "Same as RUSTSEC-2026-0194: a stable wayland-scanner family release on quick-xml >= 0.41, landed through the bd-2z0.8 dependency lane."
+reviewed_at = "2026-07-17"
+reviewed_by = "GoldenPanther locked-graph audit of Cargo.lock @ 2dd7449 (DSR static analysis)"
