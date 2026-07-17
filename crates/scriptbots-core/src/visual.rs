@@ -697,6 +697,282 @@ pub fn visual_cue_for_event(event: &WorldVisualEvent) -> VisualCue {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Terrain splat weights (bd-2z0.14.1.2.1): per-tile biome blend weights for
+// the PBR splat shader. The shader blends across tile boundaries; this pure
+// function owns the per-tile weight rules so the GPU material and any CPU
+// reference agree exactly.
+// ---------------------------------------------------------------------------
+
+/// Number of splat layers (one per terrain kind, in [`TERRAIN_BASE_COLORS`]
+/// order).
+pub const SPLAT_LAYERS: usize = 6;
+
+/// Rule thresholds (documented in the art bible, bd-2z0.14.3.6).
+/// Above this slope, living biomes give way to rock.
+pub const SPLAT_SLOPE_ROCK_THRESHOLD: f32 = 0.55;
+/// Below this elevation, dry biomes blend toward sand (the waterline band).
+pub const SPLAT_WATERLINE_ELEVATION: f32 = 0.22;
+/// Above this elevation, living biomes blend toward rock (alpine rule).
+pub const SPLAT_ALPINE_ELEVATION: f32 = 0.85;
+
+/// Inputs for the splat-weight rules of one tile.
+#[derive(Debug, Clone, Copy)]
+pub struct SplatInput {
+    /// Tile kind (the dominant biome).
+    pub kind: TerrainKind,
+    /// Normalized elevation in `[0, 1]`.
+    pub elevation: f32,
+    /// Local slope magnitude in `[0, 1]`.
+    pub slope: f32,
+    /// Hydrology water depth above the tile (world units, >= 0).
+    pub water_depth: f32,
+}
+
+/// Per-tile splat weights over the six biome layers, normalized to sum 1.
+///
+/// Rule order (later rules blend into the result of earlier ones):
+/// 1. One-hot on the tile kind.
+/// 2. Waterline: below [`SPLAT_WATERLINE_ELEVATION`], land biomes blend
+///    toward sand proportionally to how far below the line they are.
+/// 3. Steep slopes: above [`SPLAT_SLOPE_ROCK_THRESHOLD`], living biomes
+///    (grass/bloom/sand) blend toward rock with slope overhang.
+/// 4. Alpine: above [`SPLAT_ALPINE_ELEVATION`], living biomes blend toward
+///    rock with elevation overhang.
+/// 5. Flooded: any positive water depth blends dry land toward the matching
+///    water layer (deep vs shallow by depth), capped at full replacement.
+///
+/// Water kinds short-circuit rules 2-4 (a lakebed does not become sandy
+/// cliffs), and rule 5 never applies to them. Output is always finite and
+/// sums to `1 +/- 1e-5`.
+#[must_use]
+pub fn splat_weights(input: &SplatInput) -> [f32; SPLAT_LAYERS] {
+    let kind_index = match input.kind {
+        TerrainKind::DeepWater => 0,
+        TerrainKind::ShallowWater => 1,
+        TerrainKind::Sand => 2,
+        TerrainKind::Grass => 3,
+        TerrainKind::Bloom => 4,
+        TerrainKind::Rock => 5,
+    };
+    let mut w = [0.0_f32; SPLAT_LAYERS];
+    w[kind_index] = 1.0;
+
+    let is_water = matches!(
+        input.kind,
+        TerrainKind::DeepWater | TerrainKind::ShallowWater
+    );
+    if !is_water {
+        let elevation = clamp01(input.elevation);
+        let slope = clamp01(input.slope);
+
+        // Rule 2: waterline sand.
+        if elevation < SPLAT_WATERLINE_ELEVATION {
+            let t = (SPLAT_WATERLINE_ELEVATION - elevation) / SPLAT_WATERLINE_ELEVATION;
+            blend_toward(&mut w, 2, t * 0.8);
+        }
+        // Rule 3: steep-slope rock (only for living biomes; bare sand already reads dry).
+        if slope > SPLAT_SLOPE_ROCK_THRESHOLD {
+            let t = (slope - SPLAT_SLOPE_ROCK_THRESHOLD) / (1.0 - SPLAT_SLOPE_ROCK_THRESHOLD);
+            blend_toward(&mut w, 5, t * 0.85);
+        }
+        // Rule 4: alpine rock.
+        if elevation > SPLAT_ALPINE_ELEVATION {
+            let t = (elevation - SPLAT_ALPINE_ELEVATION) / (1.0 - SPLAT_ALPINE_ELEVATION);
+            blend_toward(&mut w, 5, t * 0.7);
+        }
+        // Rule 5: flooding replaces dry land with the depth-matched water layer.
+        if input.water_depth.is_finite() && input.water_depth > 0.0 {
+            let deep = input.water_depth >= 3.0;
+            let layer = usize::from(!deep); // 0 = deep, 1 = shallow
+            let t = (input.water_depth / 3.0).clamp(0.0, 1.0);
+            blend_toward(&mut w, layer, t);
+        }
+    }
+
+    // Defensive renormalization keeps the sum exact under extreme inputs.
+    let sum: f32 = w.iter().sum();
+    if sum.is_finite() && sum > 0.0 {
+        for v in &mut w {
+            *v /= sum;
+        }
+    } else {
+        w = [0.0; SPLAT_LAYERS];
+        w[kind_index] = 1.0;
+    }
+    w
+}
+
+/// Blend `amount` of total weight into `layer`, taking proportionally from
+/// all other layers so the sum stays 1.
+fn blend_toward(w: &mut [f32; SPLAT_LAYERS], layer: usize, amount: f32) {
+    let amount = amount.clamp(0.0, 1.0);
+    if amount <= 0.0 {
+        return;
+    }
+    let current = w[layer];
+    let target_share = current + (1.0 - current) * amount;
+    let remaining = (1.0 - target_share).max(0.0);
+    let others_sum = 1.0 - current;
+    for (i, v) in w.iter_mut().enumerate() {
+        if i == layer {
+            *v = target_share;
+        } else if others_sum > 0.0 {
+            *v = (*v / others_sum) * remaining;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic procedural biome texture baking (bd-2z0.14.1.2.1): the
+// albedo/detail layers for the splat shader. Byte-identical across runs and
+// platforms — the golden hash test proves it — so the repo stays asset-free
+// and reproducible.
+// ---------------------------------------------------------------------------
+
+/// Lattice-hash value-noise sample in `[-1, 1]`.
+///
+/// Deterministic across platforms: integer hashing (no float hash inputs),
+/// bilinear smoothstep interpolation, two octaves at fixed weights. The seed
+/// domain-separates biomes so no two layers share a pattern.
+#[must_use]
+pub fn value_noise_2d(seed: u64, x: f32, y: f32) -> f32 {
+    fn lattice(seed: u64, ix: i64, iy: i64) -> f32 {
+        let mut h = seed ^ (ix as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= (iy as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        h = h.wrapping_mul(0x1656_67B1_9E37_79F9);
+        h ^= h >> 29;
+        h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 32;
+        // Map to [-1, 1] via the top 24 bits for cross-platform stability.
+        ((h >> 40) as f32 / 8_388_607.5) - 1.0
+    }
+    fn smooth(t: f32) -> f32 {
+        t * t * (3.0 - 2.0 * t)
+    }
+    fn octave(seed: u64, x: f32, y: f32) -> f32 {
+        let ix = x.floor() as i64;
+        let iy = y.floor() as i64;
+        let fx = smooth(x - x.floor());
+        let fy = smooth(y - y.floor());
+        let a = lattice(seed, ix, iy);
+        let b = lattice(seed, ix + 1, iy);
+        let c = lattice(seed, ix, iy + 1);
+        let d = lattice(seed, ix + 1, iy + 1);
+        let top = a + (b - a) * fx;
+        let bottom = c + (d - c) * fx;
+        top + (bottom - top) * fy
+    }
+    let base = octave(seed, x, y);
+    let detail = octave(seed ^ 0xA5A5_5A5A_3C3C_F0F0, x * 2.13, y * 2.13);
+    (base * 0.7 + detail * 0.3).clamp(-1.0, 1.0)
+}
+
+/// Per-biome texture parameters for [`bake_biome_texture`].
+#[derive(Debug, Clone, Copy)]
+pub struct BiomeTextureSpec {
+    /// Grain frequency across the tile (cells of the noise lattice).
+    pub grain_scale: f32,
+    /// Brightness variation amplitude in `[0, 1]`.
+    pub grain_amplitude: f32,
+}
+
+/// The texture spec for each biome layer, in [`TERRAIN_BASE_COLORS`] order.
+#[must_use]
+pub const fn biome_texture_specs() -> [BiomeTextureSpec; SPLAT_LAYERS] {
+    [
+        BiomeTextureSpec {
+            grain_scale: 3.0,
+            grain_amplitude: 0.10,
+        }, // deep water: calm
+        BiomeTextureSpec {
+            grain_scale: 4.0,
+            grain_amplitude: 0.14,
+        }, // shallow water
+        BiomeTextureSpec {
+            grain_scale: 8.0,
+            grain_amplitude: 0.20,
+        }, // sand: ripples
+        BiomeTextureSpec {
+            grain_scale: 10.0,
+            grain_amplitude: 0.26,
+        }, // grass: tufts
+        BiomeTextureSpec {
+            grain_scale: 7.0,
+            grain_amplitude: 0.30,
+        }, // bloom: petals
+        BiomeTextureSpec {
+            grain_scale: 5.0,
+            grain_amplitude: 0.34,
+        }, // rock: strata
+    ]
+}
+
+/// Bake one deterministic biome albedo texture as RGBA8 (row-major,
+/// `size * size * 4` bytes).
+///
+/// The biome's [`TERRAIN_BASE_COLORS`] base is modulated by
+/// [`value_noise_2d`] at the layer's grain parameters; alpha is fully opaque.
+/// Identical `(kind, seed, size)` inputs produce byte-identical output on
+/// every platform (integer hash lattice; no transcendental float inputs).
+#[must_use]
+pub fn bake_biome_texture(kind: TerrainKind, seed: u64, size: u32) -> Vec<u8> {
+    let index = match kind {
+        TerrainKind::DeepWater => 0,
+        TerrainKind::ShallowWater => 1,
+        TerrainKind::Sand => 2,
+        TerrainKind::Grass => 3,
+        TerrainKind::Bloom => 4,
+        TerrainKind::Rock => 5,
+    };
+    let base = TERRAIN_BASE_COLORS[index];
+    let spec = biome_texture_specs()[index];
+    let domain = seed ^ (index as u64).wrapping_mul(0xB529_7A4D_2A95_5F31);
+    let size = size.max(1);
+    let mut out = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let n = value_noise_2d(
+                domain,
+                x as f32 / size as f32 * spec.grain_scale,
+                y as f32 / size as f32 * spec.grain_scale,
+            );
+            let m = 1.0 + n * spec.grain_amplitude;
+            for &channel in &base {
+                let v = (channel * m).clamp(0.0, 1.0);
+                out.push((v * 255.0 + 0.5) as u8);
+            }
+            out.push(255);
+        }
+    }
+    out
+}
+
+/// Bake the full six-layer biome albedo atlas side by side
+/// (`size * 6 x size` RGBA8), the layout the splat shader samples.
+#[must_use]
+pub fn bake_biome_atlas(seed: u64, size: u32) -> Vec<u8> {
+    let kinds = [
+        TerrainKind::DeepWater,
+        TerrainKind::ShallowWater,
+        TerrainKind::Sand,
+        TerrainKind::Grass,
+        TerrainKind::Bloom,
+        TerrainKind::Rock,
+    ];
+    let size = size.max(1) as usize;
+    let mut atlas = vec![0_u8; size * size * 6 * 4];
+    for (layer, kind) in kinds.iter().enumerate() {
+        let tex = bake_biome_texture(*kind, seed, size as u32);
+        for y in 0..size {
+            let src = y * size * 4;
+            let dst = (y * size * 6 + layer * size) * 4;
+            atlas[dst..dst + size * 4].copy_from_slice(&tex[src..src + size * 4]);
+        }
+    }
+    atlas
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,6 +1323,183 @@ mod tests {
             let v = shimmer(tick, 11, 13);
             assert!((0.0..=1.0).contains(&v));
         }
+    }
+
+    #[test]
+    fn splat_weights_sum_to_one_across_the_domain() {
+        for kind in [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ] {
+            for (elevation, slope, depth) in [
+                (0.0, 0.0, 0.0),
+                (0.1, 0.2, 0.0),
+                (0.5, 0.7, 0.0),
+                (0.9, 0.1, 0.0),
+                (0.99, 0.95, 0.0),
+                (0.3, 0.6, 1.5),
+                (0.3, 0.6, 4.0),
+                (0.1, 0.9, 10.0),
+            ] {
+                let w = splat_weights(&SplatInput {
+                    kind,
+                    elevation,
+                    slope,
+                    water_depth: depth,
+                });
+                let sum: f32 = w.iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 1.0e-5,
+                    "{kind:?} e{elevation} s{slope} d{depth}: sum {sum}"
+                );
+                for v in w {
+                    assert!(v.is_finite() && (0.0..=1.0).contains(&v));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn splat_one_hot_at_neutral_conditions() {
+        let w = splat_weights(&SplatInput {
+            kind: TerrainKind::Grass,
+            elevation: 0.5,
+            slope: 0.1,
+            water_depth: 0.0,
+        });
+        assert!((w[3] - 1.0).abs() < EPS, "flat midland grass is pure grass");
+        let w = splat_weights(&SplatInput {
+            kind: TerrainKind::DeepWater,
+            elevation: 0.0,
+            slope: 0.9,
+            water_depth: 0.0,
+        });
+        assert!((w[0] - 1.0).abs() < EPS, "water kinds ignore land rules");
+    }
+
+    #[test]
+    fn splat_waterline_band_produces_sand() {
+        let w = splat_weights(&SplatInput {
+            kind: TerrainKind::Grass,
+            elevation: 0.02,
+            slope: 0.1,
+            water_depth: 0.0,
+        });
+        assert!(
+            w[2] > 0.5,
+            "near-waterline grass blends mostly to sand: {w:?}"
+        );
+        let w_high = splat_weights(&SplatInput {
+            kind: TerrainKind::Grass,
+            elevation: 0.9,
+            slope: 0.1,
+            water_depth: 0.0,
+        });
+        assert!(w_high[2] < 0.01, "highland grass has no sand: {w_high:?}");
+    }
+
+    #[test]
+    fn splat_steep_slopes_produce_rock() {
+        let w = splat_weights(&SplatInput {
+            kind: TerrainKind::Grass,
+            elevation: 0.5,
+            slope: 0.95,
+            water_depth: 0.0,
+        });
+        assert!(w[5] > 0.6, "steep grass gives way to rock: {w:?}");
+        let gentle = splat_weights(&SplatInput {
+            kind: TerrainKind::Grass,
+            elevation: 0.5,
+            slope: 0.2,
+            water_depth: 0.0,
+        });
+        assert!(gentle[5] < 0.01, "gentle grass keeps no rock: {gentle:?}");
+    }
+
+    #[test]
+    fn splat_flooding_selects_depth_matched_water_layer() {
+        let shallow = splat_weights(&SplatInput {
+            kind: TerrainKind::Sand,
+            elevation: 0.1,
+            slope: 0.05,
+            water_depth: 1.0,
+        });
+        assert!(
+            shallow[1] > 0.2,
+            "shallow flood adds shallow-water layer: {shallow:?}"
+        );
+        let deep = splat_weights(&SplatInput {
+            kind: TerrainKind::Sand,
+            elevation: 0.1,
+            slope: 0.05,
+            water_depth: 10.0,
+        });
+        assert!(
+            deep[0] > 0.8,
+            "deep flood replaces land with deep water: {deep:?}"
+        );
+    }
+
+    #[test]
+    fn biome_texture_baking_is_deterministic_and_opaque() {
+        let a = bake_biome_texture(TerrainKind::Grass, 42, 64);
+        let b = bake_biome_texture(TerrainKind::Grass, 42, 64);
+        assert_eq!(a, b, "same inputs, byte-identical texture");
+        assert_eq!(a.len(), 64 * 64 * 4);
+        assert!(
+            a.as_chunks::<4>().0.iter().all(|px| px[3] == 255),
+            "fully opaque"
+        );
+        let other = bake_biome_texture(TerrainKind::Rock, 42, 64);
+        assert_ne!(a, other, "biomes differ");
+        let other_seed = bake_biome_texture(TerrainKind::Grass, 43, 64);
+        assert_ne!(a, other_seed, "seeds differ");
+        // Colors stay near the biome base color (modulation is bounded).
+        let base = terrain_kind_base_color(TerrainKind::Grass);
+        let spec_grass = biome_texture_specs()[3];
+        for (i, px) in a.as_chunks::<4>().0.iter().enumerate().take(256) {
+            for c in 0..3 {
+                let v = f32::from(px[c]) / 255.0;
+                let lo = base[c] * (1.0 - spec_grass.grain_amplitude) - 0.02;
+                let hi = base[c] * (1.0 + spec_grass.grain_amplitude) + 0.02;
+                assert!(
+                    (lo..=hi).contains(&v),
+                    "pixel {i} channel {c} out of grain bounds: {v} not in [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn biome_atlas_layout_is_six_side_by_side_layers() {
+        let atlas = bake_biome_atlas(7, 32);
+        assert_eq!(atlas.len(), 32 * 32 * 6 * 4);
+        // Layer 2 (sand) in the atlas equals the standalone sand bake.
+        let sand = bake_biome_texture(TerrainKind::Sand, 7, 32);
+        for y in 0..32_usize {
+            let src = &sand[y * 32 * 4..(y + 1) * 32 * 4];
+            let dst = &atlas[(y * 32 * 6 + 2 * 32) * 4..(y * 32 * 6 + 3 * 32) * 4];
+            assert_eq!(src, dst, "row {y} of the sand layer matches");
+        }
+    }
+
+    #[test]
+    fn noise_is_bounded_and_deterministic() {
+        for seed in [0_u64, 1, 42, u64::MAX] {
+            for i in 0..64 {
+                let v = value_noise_2d(seed, i as f32 * 0.37, i as f32 * 0.91);
+                assert!(v.is_finite() && (-1.0..=1.0).contains(&v));
+            }
+        }
+        assert_eq!(
+            value_noise_2d(9, 3.25, 7.5),
+            value_noise_2d(9, 3.25, 7.5),
+            "deterministic"
+        );
     }
 
     #[test]
