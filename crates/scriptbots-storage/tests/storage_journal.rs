@@ -789,7 +789,7 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
 #[allow(
     clippy::drop_non_drop,
     clippy::too_many_lines,
-    reason = "one durable public-boundary matrix proves rejected, control-only, configuration, scientific, and shutdown command lifecycles plus both transition axes"
+    reason = "one durable public-boundary matrix proves rejected, failed, control-only, configuration, scientific, and shutdown command lifecycles plus both transition axes"
 )]
 fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     let path = unique_database_path("command_lifecycle_evidence");
@@ -898,7 +898,38 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     };
     let update_boundary = *update_boundary;
 
-    let step_id = CommandId::from_client_sequence(client_namespace, 10_005);
+    let mut failing_config = expected_updated_config.clone();
+    failing_config.world_width = 80;
+    let expected_failing_config = failing_config.clone();
+    let failed_config_id = CommandId::from_client_sequence(client_namespace, 10_005);
+    let failed_config_envelope = CommandEnvelope::new(
+        failed_config_id,
+        HostCommand::UpdateConfig(Box::new(failing_config)),
+    )
+    .expecting_control_revision(update_boundary.revisions.control)
+    .expecting_scientific_revision(update_boundary.revisions.scientific)
+    .expecting_config_revision(update_boundary.revisions.config);
+    frontend
+        .submit_envelope(failed_config_envelope)
+        .expect("valid live-geometry change is admitted before application failure");
+    let failed_config_status = drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        failed_config_id,
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    let ApplicationState::Failed(failed_config_application) = failed_config_status.application()
+    else {
+        panic!("live-geometry config update did not retain its application failure");
+    };
+    assert_eq!(failed_config_application.code, "config_application");
+    assert_eq!(
+        failed_config_application.message,
+        "invalid configuration: changing world dimensions at runtime is not supported; restart with the new configuration"
+    );
+
+    let step_id = CommandId::from_client_sequence(client_namespace, 10_006);
     let step_envelope = CommandEnvelope::new(step_id, HostCommand::Step)
         .expecting_control_revision(update_boundary.revisions.control)
         .expecting_scientific_revision(update_boundary.revisions.scientific)
@@ -919,7 +950,7 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     let step_boundary = *step_boundary;
     assert_eq!(core.world_tick(), Tick(1));
 
-    let shutdown_id = CommandId::from_client_sequence(client_namespace, 10_006);
+    let shutdown_id = CommandId::from_client_sequence(client_namespace, 10_007);
     let shutdown_envelope = CommandEnvelope::new(shutdown_id, HostCommand::Shutdown)
         .expecting_control_revision(step_boundary.revisions.control)
         .expecting_scientific_revision(step_boundary.revisions.scientific)
@@ -951,9 +982,9 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     let evidence = reader
         .command_journal_evidence(session_id)
         .expect("finished session contains non-vacuous command evidence");
-    assert_eq!(evidence.command_count, 6);
-    assert_eq!(evidence.application_transition_count, 11);
-    assert_eq!(evidence.storage_transition_count, 12);
+    assert_eq!(evidence.command_count, 7);
+    assert_eq!(evidence.application_transition_count, 13);
+    assert_eq!(evidence.storage_transition_count, 14);
 
     let pre_admission = reader
         .command_journal_record(session_id, pre_admission_id)
@@ -1057,6 +1088,70 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     );
     assert_eq!(update_record.scientific_event_sequence, None);
 
+    let failed_config_record = reader
+        .command_journal_record(session_id, failed_config_id)
+        .expect("exact failed configuration lookup");
+    assert_eq!(failed_config_record.batch_id.sequence(), 5);
+    assert_eq!(
+        failed_config_record.lifecycle.source_client_namespace(),
+        client_namespace
+    );
+    assert!(failed_config_record.lifecycle.admission_sequence().is_some());
+    let HostCommand::UpdateConfig(stored_failing_config) =
+        &failed_config_record.lifecycle.envelope().command
+    else {
+        panic!("failed configuration lifecycle changed the command kind");
+    };
+    assert_eq!(stored_failing_config.as_ref(), &expected_failing_config);
+    assert_eq!(
+        failed_config_record
+            .lifecycle
+            .envelope()
+            .expected_control_revision,
+        Some(update_boundary.revisions.control)
+    );
+    assert_eq!(
+        failed_config_record
+            .lifecycle
+            .envelope()
+            .expected_scientific_revision,
+        Some(update_boundary.revisions.scientific)
+    );
+    assert_eq!(
+        failed_config_record
+            .lifecycle
+            .envelope()
+            .expected_config_revision,
+        Some(update_boundary.revisions.config)
+    );
+    assert_eq!(failed_config_record.lifecycle.transitions().len(), 2);
+    assert_eq!(
+        failed_config_record.lifecycle.transitions()[0].ordinal(),
+        0
+    );
+    assert_eq!(
+        failed_config_record.lifecycle.transitions()[0].boundary(),
+        update_boundary
+    );
+    assert_eq!(
+        failed_config_record.lifecycle.transitions()[0].application(),
+        &ApplicationState::Admitted
+    );
+    let failed_terminal = &failed_config_record.lifecycle.transitions()[1];
+    assert_eq!(failed_terminal.ordinal(), 1);
+    assert_eq!(failed_terminal.boundary(), update_boundary);
+    let ApplicationState::Failed(stored_failure) = failed_terminal.application() else {
+        panic!("finished reader changed the failed application state");
+    };
+    assert_eq!(stored_failure.code, "config_application");
+    assert_eq!(
+        stored_failure.message,
+        "invalid configuration: changing world dimensions at runtime is not supported; restart with the new configuration"
+    );
+    assert_eq!(failed_config_record.terminal_boundary, update_boundary);
+    assert_eq!(failed_config_record.scientific_event_sequence, None);
+    assert_eq!(failed_config_record.archive_payload_digest.len(), 64);
+
     let step_record = reader
         .command_journal_record(session_id, step_id)
         .expect("exact applied scientific lookup");
@@ -1085,7 +1180,7 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         .command_journal_record(session_id, shutdown_id)
         .expect("exact applied shutdown lookup");
     assert!(shutdown_record.lifecycle.is_applied_shutdown());
-    assert_eq!(shutdown_record.batch_id.sequence(), 6);
+    assert_eq!(shutdown_record.batch_id.sequence(), 7);
     assert_eq!(
         shutdown_record.lifecycle.envelope().expected_control_revision,
         Some(step_boundary.revisions.control)
@@ -1106,6 +1201,7 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         &rejected_shutdown_record,
         &pause_record,
         &update_record,
+        &failed_config_record,
         &step_record,
         &shutdown_record,
     ] {
@@ -1130,13 +1226,30 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     assert_eq!(first_page.evidence, evidence);
     let cursor = first_page
         .next_after
-        .expect("six commands require a second page");
+        .expect("seven commands require a second page");
     assert_eq!(cursor, first_page.commands[1].cursor());
     let second_page = reader
         .command_journal_page(session_id, Some(cursor), 4, options.max_event_page_bytes)
         .expect("resume at exact normalized command cursor");
     assert_eq!(second_page.commands.len(), 4);
-    assert_eq!(second_page.next_after, None);
+    assert_eq!(second_page.evidence, evidence);
+    assert_eq!(second_page.commands[2], failed_config_record);
+    let final_cursor = second_page
+        .next_after
+        .expect("the bounded second page leaves the shutdown record");
+    assert_eq!(final_cursor, second_page.commands[3].cursor());
+    let final_page = reader
+        .command_journal_page(
+            session_id,
+            Some(final_cursor),
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect("resume at the exact final command cursor");
+    assert_eq!(final_page.commands.len(), 1);
+    assert_eq!(final_page.commands[0], shutdown_record);
+    assert_eq!(final_page.evidence, evidence);
+    assert_eq!(final_page.next_after, None);
 
     let fabricated = CommandJournalCursor {
         command_id: shutdown_id,
