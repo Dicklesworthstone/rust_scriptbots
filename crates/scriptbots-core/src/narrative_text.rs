@@ -159,7 +159,7 @@ mod tests {
     fn fixed_precision_is_centralized_and_stable() {
         assert_eq!(fixed(0.994, 2), "0.99");
         assert_eq!(fixed(0.99, 2), "0.99");
-        assert_eq!(fixed(3.14159, 2), "3.14");
+        assert_eq!(fixed(1.23456, 2), "1.23");
         assert_eq!(fixed(1.0, 2), "1.00");
         assert_eq!(fixed(2.0, 0), "2");
     }

@@ -1870,7 +1870,10 @@ const fn retained_vec_bytes<T>(capacity: usize) -> usize {
     capacity.saturating_mul(size_of::<T>())
 }
 
-fn retained_cow_bytes(value: &std::borrow::Cow<'static, str>) -> usize {
+// The `Cow` variant and owned `String` capacity are the evidence being measured; `&str` would
+// erase both, so this deliberately differs from an ordinary read-only string parameter.
+#[allow(clippy::ptr_arg)]
+const fn retained_cow_bytes(value: &std::borrow::Cow<'static, str>) -> usize {
     match value {
         std::borrow::Cow::Borrowed(_) => 0,
         std::borrow::Cow::Owned(value) => value.capacity(),
