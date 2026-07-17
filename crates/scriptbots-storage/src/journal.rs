@@ -1900,10 +1900,7 @@ mod tests {
         let first_worker_batch = admitted_journal_batch(first_queued)
             .expect("first byte-budgeted command is a journal admission");
         assert_eq!(first_worker_batch.retained_bytes(), first_batch_bytes);
-        assert_eq!(
-            inflight_bytes.load(Ordering::SeqCst),
-            first_batch_bytes
-        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), first_batch_bytes);
 
         let second = frontend
             .step()
@@ -1922,10 +1919,7 @@ mod tests {
             .expect("aggregate byte pressure retains the exact second batch");
         assert_eq!(retained.retained_bytes(), second_batch_bytes);
         assert_eq!(Arc::strong_count(&retained), 2);
-        assert_eq!(
-            inflight_bytes.load(Ordering::SeqCst),
-            first_batch_bytes
-        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), first_batch_bytes);
         assert!(matches!(
             worker_rx.try_recv(),
             Err(xchan::TryRecvError::Empty)
@@ -1981,10 +1975,7 @@ mod tests {
             JournalAdmission::Accepted { batch_id } if batch_id == retained.id()
         ));
         assert!(core.pending_journal_batch().is_none());
-        assert_eq!(
-            inflight_bytes.load(Ordering::SeqCst),
-            second_batch_bytes
-        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), second_batch_bytes);
         let second_queued = worker_rx
             .try_recv()
             .expect("released bytes admit the exact retained second batch");
