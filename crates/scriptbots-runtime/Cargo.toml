@@ -15,6 +15,8 @@ native-asupersync = ["dep:asupersync"]
 [dependencies]
 arc-swap = { workspace = true }
 asupersync = { workspace = true, optional = true }
+blake3 = { workspace = true }
+postcard = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }

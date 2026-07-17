@@ -1621,10 +1621,20 @@ impl HostCommand {
         }
     }
 
-    /// Whether successful application requires an independent journal acknowledgement.
+    /// Whether this command's terminal lifecycle requires a journal acknowledgement.
+    ///
+    /// Lifecycle auditing is universal. Whether a boundary also carries
+    /// scientific or persistence payloads is an independent concern.
     #[must_use]
     pub const fn requires_journal(&self) -> bool {
-        matches!(self, Self::Step | Self::UpdateConfig(_) | Self::Shutdown)
+        match self {
+            Self::Pause
+            | Self::Resume
+            | Self::SetSpeed(_)
+            | Self::Step
+            | Self::UpdateConfig(_)
+            | Self::Shutdown => true,
+        }
     }
 }
 
@@ -1764,9 +1774,13 @@ pub struct JournalFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
 pub enum JournalState {
-    /// This command does not require a journal record.
+    /// No journal record exists for this status.
+    ///
+    /// Runtime-emitted command statuses never use this state: every terminal
+    /// command lifecycle, including control success and rejection, is audited.
+    /// It remains in the wire enum for non-runtime and historical producers.
     NotRequired,
-    /// A required journal record has not committed yet.
+    /// The command's lifecycle record has not committed yet.
     Pending,
     /// The record committed to volatile storage.
     CommittedVolatile,
@@ -1789,6 +1803,21 @@ pub struct CommandLifecycleTransition {
 }
 
 impl CommandLifecycleTransition {
+    /// Construct one transition for later validation by
+    /// [`CommandLifecycleEvidence::try_new`].
+    #[must_use]
+    pub const fn new(
+        ordinal: u32,
+        boundary: AppliedCommand,
+        application: ApplicationState,
+    ) -> Self {
+        Self {
+            ordinal,
+            boundary,
+            application,
+        }
+    }
+
     /// Zero-based position in this command's application lifecycle.
     #[must_use]
     pub const fn ordinal(&self) -> u32 {
@@ -1935,6 +1964,24 @@ impl CommandLifecycleEvidence {
                 {
                     return Err(CommandLifecycleEvidenceError::InvalidAdmittedLifecycle);
                 }
+                let admitted = self.transitions[0].boundary;
+                let terminal = self.transitions[1].boundary;
+                if terminal.tick < admitted.tick {
+                    return Err(CommandLifecycleEvidenceError::TerminalTickRegressed);
+                }
+                if terminal.revisions.control < admitted.revisions.control {
+                    return Err(
+                        CommandLifecycleEvidenceError::TerminalControlRevisionRegressed,
+                    );
+                }
+                if terminal.revisions.scientific < admitted.revisions.scientific {
+                    return Err(
+                        CommandLifecycleEvidenceError::TerminalScientificRevisionRegressed,
+                    );
+                }
+                if terminal.revisions.config < admitted.revisions.config {
+                    return Err(CommandLifecycleEvidenceError::TerminalConfigRevisionRegressed);
+                }
             }
         }
         Ok(())
@@ -1982,16 +2029,18 @@ impl CommandLifecycleEvidence {
         matches!(&self.envelope.command, HostCommand::Shutdown)
             && self
                 .terminal()
-                .is_some_and(|transition| matches!(&transition.application, ApplicationState::Applied(_)))
+                .is_some_and(|transition| {
+                    matches!(&transition.application, ApplicationState::Applied(_))
+                })
     }
 
-    /// Whether this command's successful application requires runtime journal receipts.
+    /// Whether this terminal lifecycle is tracked by runtime journal receipts.
+    ///
+    /// Every lifecycle evidence record offered by the runtime is audited,
+    /// independently of whether the command also carries scientific persistence.
     #[must_use]
     pub fn requires_runtime_journal(&self) -> bool {
-        self.envelope.command.requires_journal()
-            && self
-                .terminal()
-                .is_some_and(|transition| matches!(&transition.application, ApplicationState::Applied(_)))
+        self.envelope.command.requires_journal() && !self.transitions.is_empty()
     }
 }
 
@@ -2047,6 +2096,18 @@ pub enum CommandLifecycleEvidenceError {
     /// An admitted command must contain admitted then one truthful terminal transition.
     #[error("admitted command lifecycle is not admitted followed by applied, rejected, or failed")]
     InvalidAdmittedLifecycle,
+    /// A terminal transition cannot report an earlier scientific tick than admission.
+    #[error("command lifecycle terminal tick precedes its admission tick")]
+    TerminalTickRegressed,
+    /// A terminal transition cannot report an earlier control revision than admission.
+    #[error("command lifecycle terminal control revision precedes its admission revision")]
+    TerminalControlRevisionRegressed,
+    /// A terminal transition cannot report an earlier scientific revision than admission.
+    #[error("command lifecycle terminal scientific revision precedes its admission revision")]
+    TerminalScientificRevisionRegressed,
+    /// A terminal transition cannot report an earlier configuration revision than admission.
+    #[error("command lifecycle terminal configuration revision precedes its admission revision")]
+    TerminalConfigRevisionRegressed,
 }
 
 /// Exact immutable work offered to a nonblocking host-journal adapter.
@@ -2866,9 +2927,6 @@ fn validate_status_combination(
             }
         }
         ApplicationState::Rejected(reason) => {
-            if journal != &JournalState::NotRequired {
-                return Err(StatusCombinationError::RejectedWasJournaled);
-            }
             match reason {
                 RejectionReason::ControlRevisionConflict { .. }
                 | RejectionReason::ScientificRevisionConflict { .. }
@@ -2900,9 +2958,6 @@ pub enum StatusCombinationError {
     /// An application-pending command cannot claim a committed or failed journal outcome.
     #[error("an admitted command may only have journal state not_required or pending")]
     AdmittedJournalAdvanced,
-    /// A rejected command cannot have journal work.
-    #[error("a rejected command must have journal state not_required")]
-    RejectedWasJournaled,
     /// An ordered compare-and-set conflict must retain its admission position.
     #[error("a control revision conflict requires an admission sequence")]
     ConflictMissingAdmission,
@@ -6238,8 +6293,13 @@ mod tests {
             };
 
             if let Some(reason) = rejection {
-                let status = CommandStatus::rejected(envelope.command_id, reason)
-                    .map_err(|error| protocol_violation(error.to_string()))?;
+                let status = CommandStatus::try_new(
+                    envelope.command_id,
+                    None,
+                    ApplicationState::Rejected(reason),
+                    JournalState::Pending,
+                )
+                .map_err(|error| protocol_violation(error.to_string()))?;
                 self.statuses.insert(envelope.command_id, status.clone());
                 self.emit_status(status.clone());
                 return Ok(status);
@@ -6249,16 +6309,11 @@ mod tests {
             self.next_admission = admission
                 .checked_next()
                 .ok_or_else(|| protocol_violation("admission sequence exhausted"))?;
-            let journal = if envelope.command.requires_journal() {
-                JournalState::Pending
-            } else {
-                JournalState::NotRequired
-            };
             let status = CommandStatus::try_new(
                 envelope.command_id,
                 Some(admission),
                 ApplicationState::Admitted,
-                journal,
+                JournalState::Pending,
             )
             .map_err(|error| protocol_violation(error.to_string()))?;
             self.admission_order.push(envelope.command_id);
@@ -6310,7 +6365,6 @@ mod tests {
                 .and_then(CommandStatus::admission_sequence)
                 .ok_or_else(|| protocol_violation("queued command was not admitted"))?;
 
-            let requires_journal = envelope.command.requires_journal();
             let application = if let Some(expected) = envelope.expected_control_revision
                 && expected != self.revisions.control
             {
@@ -6361,15 +6415,13 @@ mod tests {
                 })
             };
 
-            let journal =
-                if matches!(&application, ApplicationState::Rejected(_)) || !requires_journal {
-                    JournalState::NotRequired
-                } else {
-                    JournalState::Durable
-                };
-            let status =
-                CommandStatus::try_new(envelope.command_id, Some(admission), application, journal)
-                    .map_err(|error| protocol_violation(error.to_string()))?;
+            let status = CommandStatus::try_new(
+                envelope.command_id,
+                Some(admission),
+                application,
+                JournalState::Durable,
+            )
+            .map_err(|error| protocol_violation(error.to_string()))?;
             self.statuses.insert(envelope.command_id, status.clone());
             self.emit_status(status);
             if self.lifecycle == HostLifecycle::Stopped {
@@ -6563,6 +6615,167 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the lifecycle wire test covers every independent causal boundary axis"
+    )]
+    fn command_lifecycle_evidence_round_trips_and_rejects_malformed_wire_state() {
+        let command_id = CommandId::from_client_sequence(0xfeed_beef, 42);
+        assert_eq!(command_id.client_namespace(), 0xfeed_beef);
+        assert_eq!(command_id.client_sequence(), 42);
+        let initial = AppliedCommand {
+            tick: Tick(3),
+            revisions: HostRevisions {
+                control: ControlRevision::new(5),
+                scientific: ScientificRevision::new(3),
+                config: ConfigRevision::new(2),
+            },
+        };
+        let terminal = AppliedCommand {
+            tick: Tick(4),
+            revisions: HostRevisions {
+                control: ControlRevision::new(6),
+                scientific: ScientificRevision::new(4),
+                config: ConfigRevision::new(2),
+            },
+        };
+        let envelope = CommandEnvelope::new(command_id, HostCommand::Step)
+            .expecting_control_revision(ControlRevision::new(5))
+            .expecting_scientific_revision(ScientificRevision::new(3))
+            .expecting_config_revision(ConfigRevision::new(2));
+        let evidence = CommandLifecycleEvidence::try_new(
+            envelope.clone(),
+            Some(AdmissionSequence::new(9)),
+            vec![
+                CommandLifecycleTransition::new(0, initial, ApplicationState::Admitted),
+                CommandLifecycleTransition::new(
+                    1,
+                    terminal,
+                    ApplicationState::Applied(terminal),
+                ),
+            ],
+        )
+        .expect("valid command lifecycle");
+
+        assert_eq!(evidence.schema_version(), COMMAND_LIFECYCLE_SCHEMA_VERSION);
+        assert_eq!(evidence.source_client_namespace(), 0xfeed_beef);
+        assert_eq!(evidence.envelope(), &envelope);
+        assert_eq!(evidence.admission_sequence(), Some(AdmissionSequence::new(9)));
+        assert_eq!(evidence.transitions()[0].boundary(), initial);
+        assert_eq!(evidence.transitions()[1].ordinal(), 1);
+        assert!(evidence.requires_runtime_journal());
+
+        let encoded = serde_json::to_vec(&evidence).expect("serialize lifecycle evidence");
+        let decoded: CommandLifecycleEvidence =
+            serde_json::from_slice(&encoded).expect("deserialize lifecycle evidence");
+        assert_eq!(decoded, evidence);
+
+        let mut malformed = serde_json::to_value(&evidence).expect("lifecycle JSON value");
+        malformed["transitions"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<CommandLifecycleEvidence>(malformed).is_err());
+        let mut wrong_source = serde_json::to_value(&evidence).expect("lifecycle JSON value");
+        wrong_source["source_client_namespace"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<CommandLifecycleEvidence>(wrong_source).is_err());
+
+        let failed = ApplicationState::Failed(ApplicationFailure {
+            code: "test_failure".to_owned(),
+            message: "typed terminal boundary test".to_owned(),
+        });
+        let valid_failed = CommandLifecycleEvidence::from_terminal(
+            envelope.clone(),
+            Some(AdmissionSequence::new(9)),
+            initial,
+            terminal,
+            failed.clone(),
+        )
+        .expect("monotonic failed lifecycle");
+        let regressions = [
+            (
+                "tick",
+                AppliedCommand {
+                    tick: Tick(2),
+                    ..terminal
+                },
+                CommandLifecycleEvidenceError::TerminalTickRegressed,
+                "terminal tick precedes",
+            ),
+            (
+                "control",
+                AppliedCommand {
+                    revisions: HostRevisions {
+                        control: ControlRevision::new(4),
+                        ..terminal.revisions
+                    },
+                    ..terminal
+                },
+                CommandLifecycleEvidenceError::TerminalControlRevisionRegressed,
+                "terminal control revision precedes",
+            ),
+            (
+                "scientific",
+                AppliedCommand {
+                    revisions: HostRevisions {
+                        scientific: ScientificRevision::new(2),
+                        ..terminal.revisions
+                    },
+                    ..terminal
+                },
+                CommandLifecycleEvidenceError::TerminalScientificRevisionRegressed,
+                "terminal scientific revision precedes",
+            ),
+            (
+                "config",
+                AppliedCommand {
+                    revisions: HostRevisions {
+                        config: ConfigRevision::new(1),
+                        ..terminal.revisions
+                    },
+                    ..terminal
+                },
+                CommandLifecycleEvidenceError::TerminalConfigRevisionRegressed,
+                "terminal configuration revision precedes",
+            ),
+        ];
+        for (axis, regressed, expected, diagnostic) in regressions {
+            assert_eq!(
+                CommandLifecycleEvidence::from_terminal(
+                    envelope.clone(),
+                    Some(AdmissionSequence::new(9)),
+                    initial,
+                    regressed,
+                    failed.clone(),
+                ),
+                Err(expected)
+            );
+
+            let mut malformed =
+                serde_json::to_value(&valid_failed).expect("failed lifecycle JSON value");
+            match axis {
+                "tick" => malformed["transitions"][1]["boundary"]["tick"] = serde_json::json!(2),
+                "control" => {
+                    malformed["transitions"][1]["boundary"]["revisions"]["control"] =
+                        serde_json::json!(4);
+                }
+                "scientific" => {
+                    malformed["transitions"][1]["boundary"]["revisions"]["scientific"] =
+                        serde_json::json!(2);
+                }
+                "config" => {
+                    malformed["transitions"][1]["boundary"]["revisions"]["config"] =
+                        serde_json::json!(1);
+                }
+                _ => unreachable!("regression fixture axis"),
+            }
+            let error = serde_json::from_value::<CommandLifecycleEvidence>(malformed)
+                .expect_err("causally inverted lifecycle wire state must fail");
+            assert!(
+                error.to_string().contains(diagnostic),
+                "{axis} regression returned unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn run_ids_use_canonical_fixed_width_strings() {
         let namespaced =
             RunId::from_namespace_sequence(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
@@ -6607,15 +6820,11 @@ mod tests {
     }
 
     #[test]
-    fn journal_requirement_matches_the_frozen_command_classes() {
+    fn every_command_class_requires_a_terminal_lifecycle_audit() {
         for command in [
             HostCommand::Pause,
             HostCommand::Resume,
             HostCommand::SetSpeed(1.0),
-        ] {
-            assert!(!command.requires_journal());
-        }
-        for command in [
             HostCommand::Step,
             HostCommand::UpdateConfig(Box::default()),
             HostCommand::Shutdown,
@@ -6637,8 +6846,8 @@ mod tests {
         assert_eq!(first.admission_sequence(), Some(AdmissionSequence::new(1)));
         assert_eq!(second.admission_sequence(), Some(AdmissionSequence::new(2)));
         assert_eq!(third.admission_sequence(), Some(AdmissionSequence::new(3)));
-        assert_eq!(first.journal(), &JournalState::NotRequired);
-        assert_eq!(second.journal(), &JournalState::NotRequired);
+        assert_eq!(first.journal(), &JournalState::Pending);
+        assert_eq!(second.journal(), &JournalState::Pending);
         assert_eq!(third.journal(), &JournalState::Pending);
         assert_eq!(submit_ok(&mut client, second_envelope), second);
 
@@ -6656,7 +6865,7 @@ mod tests {
                     .expect("playback status lookup")
                     .expect("playback status retained")
                     .journal(),
-                &JournalState::NotRequired
+                &JournalState::Durable
             );
         }
         assert_eq!(
@@ -6826,7 +7035,7 @@ mod tests {
             conflict.admission_sequence(),
             Some(AdmissionSequence::new(2))
         );
-        assert_eq!(conflict.journal(), &JournalState::NotRequired);
+        assert_eq!(conflict.journal(), &JournalState::Durable);
 
         let invalid_config = ScriptBotsConfig {
             world_width: 0,
@@ -6842,7 +7051,7 @@ mod tests {
             rejected.application(),
             ApplicationState::Rejected(RejectionReason::Validation { .. })
         ));
-        assert_eq!(rejected.journal(), &JournalState::NotRequired);
+        assert_eq!(rejected.journal(), &JournalState::Pending);
 
         let failed_id = CommandId::new(12);
         let admitted = submit_ok(&mut client, envelope(12, HostCommand::Step));
@@ -7055,21 +7264,23 @@ mod tests {
             }
         }
         let rejected = ApplicationState::Rejected(RejectionReason::HostStopping);
-        assert!(
-            CommandStatus::try_new(
-                CommandId::new(2),
-                None,
-                rejected.clone(),
-                JournalState::NotRequired,
-            )
-            .is_ok()
-        );
+        for journal in journals.clone() {
+            assert!(
+                CommandStatus::try_new(
+                    CommandId::new(2),
+                    None,
+                    rejected.clone(),
+                    journal,
+                )
+                .is_ok()
+            );
+        }
         assert_eq!(
             CommandStatus::try_new(
                 CommandId::new(2),
                 Some(AdmissionSequence::new(2)),
                 rejected.clone(),
-                JournalState::NotRequired,
+                JournalState::Pending,
             ),
             Err(StatusCombinationError::PreAdmissionRejectionWasAdmitted)
         );
@@ -7082,17 +7293,19 @@ mod tests {
                 CommandId::new(2),
                 Some(AdmissionSequence::new(2)),
                 conflict.clone(),
-                JournalState::NotRequired,
+                JournalState::Pending,
             )
             .is_ok()
         );
         assert_eq!(
-            CommandStatus::try_new(CommandId::new(2), None, conflict, JournalState::NotRequired,),
+            CommandStatus::try_new(CommandId::new(2), None, conflict, JournalState::Pending,),
             Err(StatusCombinationError::ConflictMissingAdmission)
         );
         assert_eq!(
-            CommandStatus::try_new(CommandId::new(2), None, rejected, JournalState::Pending,),
-            Err(StatusCombinationError::RejectedWasJournaled)
+            CommandStatus::rejected(CommandId::new(3), RejectionReason::HostStopping)
+                .expect("generic non-runtime rejection")
+                .journal(),
+            &JournalState::NotRequired
         );
         assert_eq!(
             CommandStatus::try_new(
@@ -7149,12 +7362,11 @@ mod tests {
             let sequence = u64::try_from(index).expect("test command count fits u64") + 1;
             status.command_id() == CommandId::from_client_sequence(0x51, sequence)
         }));
-        assert_eq!(statuses[0].journal(), &JournalState::NotRequired);
-        assert_eq!(statuses[1].journal(), &JournalState::NotRequired);
-        assert_eq!(statuses[2].journal(), &JournalState::NotRequired);
-        assert_eq!(statuses[3].journal(), &JournalState::Pending);
-        assert_eq!(statuses[4].journal(), &JournalState::Pending);
-        assert_eq!(statuses[5].journal(), &JournalState::Pending);
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.journal() == &JournalState::Pending)
+        );
 
         let receipt = frontend
             .drive_at(&mut driver, ManualInstant::from_nanos(10))
@@ -7171,7 +7383,7 @@ mod tests {
         assert!(snapshot.playback.paused, "Step must leave playback paused");
         assert_eq!(snapshot.world.tick, 1);
         assert_eq!(snapshot.lifecycle, HostLifecycle::Stopped);
-        for status in &statuses[3..=5] {
+        for status in &statuses {
             assert_eq!(
                 frontend
                     .command_status(status.command_id())

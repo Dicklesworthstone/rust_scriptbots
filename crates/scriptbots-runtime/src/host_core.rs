@@ -407,7 +407,8 @@ struct AdmittedEnvelope {
 
 #[derive(Debug, Clone)]
 struct CommandAuthority {
-    envelope: CommandEnvelope,
+    envelope: Option<CommandEnvelope>,
+    envelope_digest: [u8; blake3::OUT_LEN],
     status: CommandStatus,
     initial_boundary: AppliedCommand,
     application_boundary: AppliedCommand,
@@ -416,8 +417,11 @@ struct CommandAuthority {
 
 impl CommandAuthority {
     fn lifecycle_evidence(&self) -> Result<CommandLifecycleEvidence, HostAccessError> {
+        let envelope = self.envelope.as_ref().cloned().ok_or_else(|| {
+            protocol_violation("command lifecycle envelope was already compacted")
+        })?;
         CommandLifecycleEvidence::from_terminal(
-            self.envelope.clone(),
+            envelope,
             self.status.admission_sequence(),
             self.initial_boundary,
             self.application_boundary,
@@ -427,34 +431,13 @@ impl CommandAuthority {
     }
 }
 
-fn command_envelopes_identical(left: &CommandEnvelope, right: &CommandEnvelope) -> bool {
-    if left.command_id != right.command_id
-        || left.expected_control_revision != right.expected_control_revision
-        || left.expected_scientific_revision != right.expected_scientific_revision
-        || left.expected_config_revision != right.expected_config_revision
-    {
-        return false;
-    }
-    match (&left.command, &right.command) {
-        (HostCommand::Pause, HostCommand::Pause)
-        | (HostCommand::Resume, HostCommand::Resume)
-        | (HostCommand::Step, HostCommand::Step)
-        | (HostCommand::Shutdown, HostCommand::Shutdown) => true,
-        (HostCommand::SetSpeed(left), HostCommand::SetSpeed(right)) => {
-            left.to_bits() == right.to_bits()
-        }
-        (HostCommand::UpdateConfig(left), HostCommand::UpdateConfig(right)) => {
-            // Valid configurations use both typed equality and exact serde wire
-            // equality so signed zero cannot alias. Invalid configurations are
-            // terminal validation evidence and intentionally require a fresh id;
-            // serde formats cannot preserve every non-finite float payload bit.
-            left.validate().is_ok()
-                && right.validate().is_ok()
-                && left == right
-                && serde_json::to_vec(left).ok() == serde_json::to_vec(right).ok()
-        }
-        _ => false,
-    }
+fn command_envelope_digest(
+    envelope: &CommandEnvelope,
+) -> Result<[u8; blake3::OUT_LEN], HostAccessError> {
+    let bytes = postcard::to_allocvec(envelope).map_err(|error| {
+        protocol_violation(format!("could not encode command identity: {error}"))
+    })?;
+    Ok(*blake3::hash(&bytes).as_bytes())
 }
 
 struct SharedHostState {
@@ -497,6 +480,7 @@ impl SharedHostState {
     fn insert_status(
         &mut self,
         envelope: CommandEnvelope,
+        envelope_digest: [u8; blake3::OUT_LEN],
         status: CommandStatus,
         pending_audit_order: Option<u64>,
     ) -> Result<(), HostAccessError> {
@@ -510,7 +494,8 @@ impl SharedHostState {
         let previous = self.commands.insert(
             command_id,
             CommandAuthority {
-                envelope,
+                envelope: Some(envelope),
+                envelope_digest,
                 status: status.clone(),
                 initial_boundary: boundary,
                 application_boundary: boundary,
@@ -566,13 +551,28 @@ impl SharedHostState {
     fn insert_pre_admission_rejection(
         &mut self,
         envelope: CommandEnvelope,
+        envelope_digest: [u8; blake3::OUT_LEN],
         reason: RejectionReason,
     ) -> Result<CommandStatus, HostAccessError> {
         let audit_order = self.reserve_pre_admission_audit()?;
-        let status = CommandStatus::rejected(envelope.command_id, reason).map_err(status_violation)?;
+        let status = CommandStatus::try_new(
+            envelope.command_id,
+            None,
+            ApplicationState::Rejected(reason),
+            JournalState::Pending,
+        )
+        .map_err(status_violation)?;
         let command_id = envelope.command_id;
-        self.insert_status(envelope, status.clone(), Some(audit_order))?;
+        // Make the evidence reachable before the fallible protocol-event
+        // notification. A saturated notification lane must not orphan a
+        // terminal status whose audit slot has already been reserved.
         self.pending_audits.push_back((audit_order, command_id));
+        self.insert_status(
+            envelope,
+            envelope_digest,
+            status.clone(),
+            Some(audit_order),
+        )?;
         Ok(status)
     }
 
@@ -597,17 +597,21 @@ impl SharedHostState {
         command_id: CommandId,
         expected_order: u64,
     ) -> Result<(), HostAccessError> {
-        let authority = self
+        let pending_order = self
             .commands
-            .get_mut(&command_id)
-            .ok_or_else(|| protocol_violation("pending command audit authority is missing"))?;
-        if authority.pending_audit_order != Some(expected_order) {
+            .get(&command_id)
+            .ok_or_else(|| protocol_violation("pending command audit authority is missing"))?
+            .pending_audit_order;
+        if pending_order != Some(expected_order) {
             return Err(protocol_violation("pending command audit order changed"));
         }
         if self.pending_audits.pop_front() != Some((expected_order, command_id)) {
             return Err(protocol_violation("pending command audit queue changed"));
         }
-        authority.pending_audit_order = None;
+        self.commands
+            .get_mut(&command_id)
+            .ok_or_else(|| protocol_violation("pending command audit authority disappeared"))?
+            .pending_audit_order = None;
         Ok(())
     }
 
@@ -616,6 +620,17 @@ impl SharedHostState {
             .pending_audit_count
             .checked_sub(1)
             .ok_or_else(|| protocol_violation("pre-admission audit slot released twice"))?;
+        Ok(())
+    }
+
+    fn compact_command_envelope(
+        &mut self,
+        command_id: CommandId,
+    ) -> Result<(), HostAccessError> {
+        self.commands
+            .get_mut(&command_id)
+            .ok_or_else(|| protocol_violation("command authority disappeared before compaction"))?
+            .envelope = None;
         Ok(())
     }
 
@@ -634,8 +649,9 @@ impl SharedHostState {
         envelope: CommandEnvelope,
         reserve_lifecycle_slot: bool,
     ) -> Result<CommandStatus, HostAccessError> {
+        let envelope_digest = command_envelope_digest(&envelope)?;
         if let Some(authority) = self.commands.get(&envelope.command_id) {
-            if command_envelopes_identical(&authority.envelope, &envelope) {
+            if authority.envelope_digest == envelope_digest {
                 return Ok(authority.status.clone());
             }
             return Err(HostAccessError::CommandIdCollision {
@@ -652,19 +668,25 @@ impl SharedHostState {
         if let Err(error) = envelope.command.validate() {
             return self.insert_pre_admission_rejection(
                 envelope,
+                envelope_digest,
                 RejectionReason::Validation {
                     message: error.to_string(),
                 },
             );
         }
         if self.admission_lifecycle != HostLifecycle::Running {
-            return self.insert_pre_admission_rejection(envelope, RejectionReason::HostStopping);
+            return self.insert_pre_admission_rejection(
+                envelope,
+                envelope_digest,
+                RejectionReason::HostStopping,
+            );
         }
 
         let closes_gate = matches!(&envelope.command, HostCommand::Shutdown);
         if self.queue.len() >= self.command_capacity && !(reserve_lifecycle_slot && closes_gate) {
             return self.insert_pre_admission_rejection(
                 envelope,
+                envelope_digest,
                 RejectionReason::Overloaded {
                     capacity: self.command_capacity,
                 },
@@ -675,16 +697,11 @@ impl SharedHostState {
         self.next_admission = admission
             .checked_next()
             .ok_or_else(|| protocol_violation("admission sequence exhausted"))?;
-        let journal = if envelope.command.requires_journal() {
-            JournalState::Pending
-        } else {
-            JournalState::NotRequired
-        };
         let status = CommandStatus::try_new(
             envelope.command_id,
             Some(admission),
             ApplicationState::Admitted,
-            journal,
+            JournalState::Pending,
         )
         .map_err(status_violation)?;
         if closes_gate {
@@ -695,7 +712,7 @@ impl SharedHostState {
             admission,
             envelope: envelope.clone(),
         });
-        self.insert_status(envelope, status.clone(), None)?;
+        self.insert_status(envelope, envelope_digest, status.clone(), None)?;
         Ok(status)
     }
 }
@@ -1575,6 +1592,11 @@ impl HostCore {
         }
         self.retained_journal = Some(Arc::clone(batch));
         self.retained_blocker = None;
+        if let Some(command_id) = batch.command_id() {
+            self.shared
+                .borrow_mut()
+                .compact_command_envelope(command_id)?;
+        }
         let failure = JournalFailure {
             code: "journal_identity_mismatch".to_owned(),
             message: "journal response echoed a different batch identity".to_owned(),
@@ -1615,6 +1637,11 @@ impl HostCore {
 
     fn fail_closed_batch(&mut self, batch: &Arc<JournalBatch>) -> Result<(), HostAccessError> {
         self.retained_journal = Some(Arc::clone(batch));
+        if let Some(command_id) = batch.command_id() {
+            self.shared
+                .borrow_mut()
+                .compact_command_envelope(command_id)?;
+        }
         self.retained_blocker = Some(HostBlocker::JournalClosed {
             batch_id: batch.id(),
         });
@@ -1994,7 +2021,7 @@ impl HostCore {
                 envelope.command_id,
                 Some(admission),
                 ApplicationState::Rejected(reason),
-                JournalState::NotRequired,
+                JournalState::Pending,
             )
             .map_err(status_violation)?;
             self.complete_status(status)?;
@@ -2027,21 +2054,21 @@ impl HostCore {
             HostCommand::Pause => {
                 self.playback.paused = true;
                 self.revisions.control = next_control;
-                self.complete_applied(retry_envelope.command_id, admission, false)?;
+                self.complete_applied(retry_envelope.command_id, admission)?;
                 let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
                 Ok(ApplyResult::completed(blocked))
             }
             HostCommand::Resume => {
                 self.playback.paused = false;
                 self.revisions.control = next_control;
-                self.complete_applied(retry_envelope.command_id, admission, false)?;
+                self.complete_applied(retry_envelope.command_id, admission)?;
                 let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
                 Ok(ApplyResult::completed(blocked))
             }
             HostCommand::SetSpeed(speed) => {
                 self.playback.speed_multiplier = speed;
                 self.revisions.control = next_control;
-                self.complete_applied(retry_envelope.command_id, admission, false)?;
+                self.complete_applied(retry_envelope.command_id, admission)?;
                 let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
                 Ok(ApplyResult::completed(blocked))
             }
@@ -2074,7 +2101,7 @@ impl HostCore {
         self.revisions.control = next_control;
         self.revisions.config = ConfigRevision::new(self.world.config_revision());
         let applied = self.applied_boundary();
-        self.complete_applied_with(envelope.command_id, admission, applied, true)?;
+        self.complete_applied_with(envelope.command_id, admission, applied)?;
         let blocked = self.offer_journal(envelope, applied, None, None)?;
         Ok(ApplyResult::completed(blocked))
     }
@@ -2148,7 +2175,7 @@ impl HostCore {
             tick,
             revisions: self.revisions,
         };
-        self.complete_applied_with(envelope.command_id, admission, applied, true)?;
+        self.complete_applied_with(envelope.command_id, admission, applied)?;
         let blocked = self.offer_journal(envelope, applied, Some(scientific), persistence)?;
         if let Some(fault) = completed_fault {
             self.latch_completed_step_fault(tick, &fault)?;
@@ -2199,7 +2226,7 @@ impl HostCore {
             .emit(HostEventKind::LifecycleChanged(HostLifecycle::Stopping))?;
         self.revisions.control = next_control;
         let applied = self.applied_boundary();
-        self.complete_applied_with(envelope.command_id, admission, applied, true)?;
+        self.complete_applied_with(envelope.command_id, admission, applied)?;
         let blocked = self.offer_journal(envelope, applied, None, persistence)?;
         self.synchronize_health()?;
         Ok(ApplyResult::completed(blocked))
@@ -2216,14 +2243,8 @@ impl HostCore {
         &self,
         command_id: CommandId,
         admission: AdmissionSequence,
-        requires_journal: bool,
     ) -> Result<(), HostAccessError> {
-        self.complete_applied_with(
-            command_id,
-            admission,
-            self.applied_boundary(),
-            requires_journal,
-        )
+        self.complete_applied_with(command_id, admission, self.applied_boundary())
     }
 
     fn complete_applied_with(
@@ -2231,18 +2252,12 @@ impl HostCore {
         command_id: CommandId,
         admission: AdmissionSequence,
         applied: AppliedCommand,
-        requires_journal: bool,
     ) -> Result<(), HostAccessError> {
-        let journal = if requires_journal {
-            JournalState::Pending
-        } else {
-            JournalState::NotRequired
-        };
         let status = CommandStatus::try_new(
             command_id,
             Some(admission),
             ApplicationState::Applied(applied),
-            journal,
+            JournalState::Pending,
         )
         .map_err(status_violation)?;
         self.complete_status(status)
@@ -2262,7 +2277,7 @@ impl HostCore {
                 code: code.to_owned(),
                 message,
             }),
-            JournalState::NotRequired,
+            JournalState::Pending,
         )
         .map_err(status_violation)?;
         self.complete_status(status)?;
@@ -2285,7 +2300,7 @@ impl HostCore {
             .shared
             .borrow()
             .lifecycle_evidence(envelope.command_id)?;
-        if lifecycle.envelope() != &envelope {
+        if command_envelope_digest(lifecycle.envelope())? != command_envelope_digest(&envelope)? {
             return Err(protocol_violation(
                 "journal command differs from its retained lifecycle envelope",
             ));
@@ -2394,6 +2409,11 @@ impl HostCore {
         }
         match admission {
             JournalAdmission::Accepted { .. } => {
+                if let Some(command_id) = batch.command_id() {
+                    self.shared
+                        .borrow_mut()
+                        .compact_command_envelope(command_id)?;
+                }
                 if batch.uses_ingress_audit_slot() {
                     self.shared.borrow_mut().release_pre_admission_audit()?;
                 }
@@ -2406,11 +2426,7 @@ impl HostCore {
                 self.inflight_journal.insert(
                     batch.id(),
                     InflightJournal {
-                        command_id: if batch.requires_runtime_journal() {
-                            batch.command_id()
-                        } else {
-                            None
-                        },
+                        command_id: batch.command_id(),
                         scientific_event: batch.scientific_event_sequence(),
                         shutdown_requirement,
                         committed_volatile: false,
@@ -2424,6 +2440,11 @@ impl HostCore {
             }
             JournalAdmission::Full { capacity, .. } => {
                 self.retained_journal = Some(Arc::clone(batch));
+                if let Some(command_id) = batch.command_id() {
+                    self.shared
+                        .borrow_mut()
+                        .compact_command_envelope(command_id)?;
+                }
                 self.retained_blocker = Some(HostBlocker::JournalFull {
                     batch_id: batch.id(),
                     capacity,
@@ -4494,8 +4515,16 @@ mod tests {
     fn deduplication_and_control_cas_never_reapply_or_advance_on_conflict() {
         let (mut core, mut port) = host(true);
         let original = submit(&mut port, 1, HostCommand::Pause);
-        let duplicate = submit(&mut port, 1, HostCommand::Step);
+        let duplicate = submit(&mut port, 1, HostCommand::Pause);
         assert_eq!(duplicate, original);
+        assert_eq!(port.queue_depth(), 1);
+        assert_eq!(
+            port.submit(envelope(1, HostCommand::Step)),
+            Err(HostAccessError::CommandIdCollision {
+                command_id: CommandId::new(1),
+            })
+        );
+        assert_eq!(port.queue_depth(), 1);
 
         let winner =
             envelope(2, HostCommand::Resume).expecting_control_revision(ControlRevision::new(1));
@@ -4526,20 +4555,34 @@ mod tests {
             let (mut core, mut port) = host(true);
             let mut admitted = 0;
             let mut overloaded = 0;
+            let mut evidence_backpressured = 0;
             for offset in 0..requested {
                 let id = u128::try_from(offset + 1).expect("test id");
-                let result = submit(&mut port, id, HostCommand::Step);
-                match result.application() {
-                    ApplicationState::Admitted => admitted += 1,
-                    ApplicationState::Rejected(RejectionReason::Overloaded { capacity: 32 }) => {
-                        overloaded += 1;
-                        assert_eq!(result.admission_sequence(), None);
+                match port.submit(envelope(id, HostCommand::Step)) {
+                    Ok(result) => match result.application() {
+                        ApplicationState::Admitted => admitted += 1,
+                        ApplicationState::Rejected(RejectionReason::Overloaded {
+                            capacity: 32,
+                        }) => {
+                            overloaded += 1;
+                            assert_eq!(result.admission_sequence(), None);
+                        }
+                        other => panic!("unexpected burst result: {other:?}"),
+                    },
+                    Err(HostAccessError::CommandEvidenceBackpressure { capacity: 32 }) => {
+                        evidence_backpressured += 1;
                     }
-                    other => panic!("unexpected burst result: {other:?}"),
+                    Err(other) => panic!("unexpected burst error: {other:?}"),
                 }
             }
-            assert_eq!(admitted, requested.min(32));
-            assert_eq!(overloaded, requested.saturating_sub(32));
+            let expected_admitted = requested.min(32);
+            let expected_overloaded = requested.saturating_sub(32).min(32);
+            assert_eq!(admitted, expected_admitted);
+            assert_eq!(overloaded, expected_overloaded);
+            assert_eq!(
+                evidence_backpressured,
+                requested - expected_admitted - expected_overloaded
+            );
             assert_eq!(port.queue_depth(), requested.min(32));
             let receipt = core
                 .drive(ManualInstant::from_nanos(0))
@@ -4597,6 +4640,522 @@ mod tests {
             let count = limit.min(state.receipts.len());
             state.receipts.drain(..count).collect()
         }
+    }
+
+    #[test]
+    fn control_successes_emit_ordered_application_lifecycles_and_advance_on_receipt() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(90),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("control lifecycle host");
+        let mut port = core.local_port();
+        let commands = [
+            (CommandId::from_client_sequence(11, 1), HostCommand::Pause),
+            (CommandId::from_client_sequence(11, 2), HostCommand::Resume),
+            (
+                CommandId::from_client_sequence(11, 3),
+                HostCommand::SetSpeed(2.0),
+            ),
+        ];
+        for (command_id, command) in &commands {
+            port.submit(CommandEnvelope::new(*command_id, command.clone()))
+                .expect("control admission");
+        }
+
+        let receipt = core
+            .drive(ManualInstant::from_nanos(0))
+            .expect("control lifecycle boundary");
+        assert_eq!(receipt.commands_completed, commands.len());
+        let journal = journal_state.borrow();
+        assert_eq!(journal.attempts.len(), commands.len());
+        for (index, ((command_id, _), batch)) in
+            commands.iter().zip(&journal.attempts).enumerate()
+        {
+            let lifecycle = batch
+                .command_lifecycle()
+                .expect("control command lifecycle");
+            assert_eq!(
+                lifecycle.schema_version(),
+                crate::COMMAND_LIFECYCLE_SCHEMA_VERSION
+            );
+            assert_eq!(lifecycle.source_client_namespace(), 11);
+            assert_eq!(lifecycle.envelope().command_id, *command_id);
+            assert_eq!(lifecycle.transitions().len(), 2);
+            assert_eq!(lifecycle.transitions()[0].ordinal(), 0);
+            assert_eq!(
+                lifecycle.transitions()[0]
+                    .boundary()
+                    .revisions
+                    .control,
+                ControlRevision::new(0)
+            );
+            let terminal = lifecycle.terminal().expect("terminal control transition");
+            assert!(matches!(terminal.application(), ApplicationState::Applied(_)));
+            assert_eq!(
+                terminal.boundary().revisions.control,
+                ControlRevision::new(u64::try_from(index + 1).expect("control revision"))
+            );
+            assert!(batch.requires_runtime_journal());
+            assert_eq!(
+                status(&mut port, command_id.get()).journal(),
+                &JournalState::Pending
+            );
+        }
+        drop(journal);
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("control lifecycle receipts");
+        for (command_id, _) in &commands {
+            assert_eq!(
+                status(&mut port, command_id.get()).journal(),
+                &JournalState::Durable
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejection_is_a_command_only_audit_with_no_admission() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(91),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("validation lifecycle host");
+        let mut port = core.local_port();
+        let rejected = submit(&mut port, 1, HostCommand::SetSpeed(-1.0));
+        let duplicate = submit(&mut port, 1, HostCommand::SetSpeed(-1.0));
+        assert_eq!(duplicate, rejected);
+        assert_eq!(rejected.journal(), &JournalState::Pending);
+        assert!(matches!(
+            rejected.application(),
+            ApplicationState::Rejected(RejectionReason::Validation { .. })
+        ));
+
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("validation audit boundary");
+        let journal = journal_state.borrow();
+        assert_eq!(journal.attempts.len(), 1);
+        let lifecycle = journal.attempts[0]
+            .command_lifecycle()
+            .expect("validation lifecycle");
+        assert_eq!(lifecycle.admission_sequence(), None);
+        assert_eq!(lifecycle.transitions().len(), 1);
+        assert!(matches!(
+            lifecycle.transitions()[0].application(),
+            ApplicationState::Rejected(RejectionReason::Validation { .. })
+        ));
+        assert_eq!(lifecycle.transitions()[0].boundary().tick, Tick(0));
+        assert!(journal.attempts[0].scientific().is_none());
+        assert!(journal.attempts[0].persistence().is_none());
+        drop(journal);
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("validation audit receipt");
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Durable);
+    }
+
+    #[test]
+    fn config_identity_preserves_nan_bits_and_compacts_audited_envelopes() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(97),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("config identity host");
+        let mut port = core.local_port();
+        let mut envelopes = Vec::new();
+        for sequence in 1_u128..=8 {
+            let mut config = ScriptBotsConfig::default();
+            config.initial_food = f32::from_bits(0x7fc0_0001);
+            config.neuroflow.hidden_layers = vec![64; 64];
+            let envelope = CommandEnvelope::new(
+                CommandId::new(sequence),
+                HostCommand::UpdateConfig(Box::new(config)),
+            );
+            let rejected = port
+                .submit(envelope.clone())
+                .expect("non-finite config has inspectable rejection");
+            assert!(matches!(
+                rejected.application(),
+                ApplicationState::Rejected(RejectionReason::Validation { .. })
+            ));
+            assert_eq!(rejected.journal(), &JournalState::Pending);
+            assert_eq!(
+                port.submit(envelope.clone())
+                    .expect("same-bit NaN retry is idempotent"),
+                rejected
+            );
+            envelopes.push(envelope);
+        }
+
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("config rejection audits");
+        assert_eq!(journal_state.borrow().attempts.len(), envelopes.len());
+        for envelope in &envelopes {
+            let command_id = envelope.command_id;
+            let authority_status = {
+                let shared = core.shared.borrow();
+                let authority = shared
+                    .commands
+                    .get(&command_id)
+                    .expect("config command authority");
+                assert!(
+                    authority.envelope.is_none(),
+                    "accepted lifecycle handoff must compact the full config envelope"
+                );
+                authority.status.clone()
+            };
+            assert_eq!(
+                port.submit(envelope.clone())
+                    .expect("exact retry uses compact identity"),
+                authority_status
+            );
+
+            let mut changed = envelope.clone();
+            let HostCommand::UpdateConfig(config) = &mut changed.command else {
+                panic!("test envelope is an update-config command");
+            };
+            config.initial_food = f32::from_bits(0x7fc0_0002);
+            assert_eq!(
+                port.submit(changed),
+                Err(HostAccessError::CommandIdCollision { command_id })
+            );
+        }
+
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("config rejection audit receipts");
+        for envelope in &envelopes {
+            assert_eq!(
+                port.submit(envelope.clone())
+                    .expect("exact retry remains idempotent after receipt")
+                    .journal(),
+                &JournalState::Durable
+            );
+        }
+    }
+
+    #[test]
+    fn overload_audit_drains_before_the_earlier_admitted_science_command() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut test_options = options(true);
+        test_options.command_capacity = 1;
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(92),
+            world(0),
+            test_options,
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("overload audit host");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        let overloaded = submit(&mut port, 2, HostCommand::Pause);
+        assert!(matches!(
+            overloaded.application(),
+            ApplicationState::Rejected(RejectionReason::Overloaded { capacity: 1 })
+        ));
+
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("ordered overload audit");
+        let journal = journal_state.borrow();
+        assert_eq!(journal.attempts.len(), 2);
+        assert_eq!(journal.attempts[0].command_id(), Some(CommandId::new(2)));
+        assert!(matches!(
+            journal.attempts[0]
+                .command_lifecycle()
+                .and_then(CommandLifecycleEvidence::terminal)
+                .map(CommandLifecycleTransition::application),
+            Some(ApplicationState::Rejected(RejectionReason::Overloaded {
+                capacity: 1
+            }))
+        ));
+        assert_eq!(journal.attempts[1].command_id(), Some(CommandId::new(1)));
+        assert!(journal.attempts[1].scientific().is_some());
+        assert!(matches!(
+            journal.attempts[1]
+                .command_lifecycle()
+                .and_then(CommandLifecycleEvidence::terminal)
+                .map(CommandLifecycleTransition::application),
+            Some(ApplicationState::Applied(_))
+        ));
+    }
+
+    #[test]
+    fn successful_step_and_config_batches_carry_applied_lifecycle_evidence() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(96),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("successful lifecycle host");
+        let mut port = core.local_port();
+        let mut config = core.world.config().clone();
+        config.food_growth_rate = 0.02;
+        submit(&mut port, 1, HostCommand::Step);
+        submit(
+            &mut port,
+            2,
+            HostCommand::UpdateConfig(Box::new(config)),
+        );
+
+        let receipt = core
+            .drive(ManualInstant::from_nanos(0))
+            .expect("step and config lifecycle boundary");
+        assert_eq!(receipt.commands_completed, 2);
+        let journal = journal_state.borrow();
+        assert_eq!(journal.attempts.len(), 2);
+        for batch in &journal.attempts {
+            let lifecycle = batch
+                .command_lifecycle()
+                .expect("successful command lifecycle");
+            assert_eq!(lifecycle.transitions().len(), 2);
+            assert!(matches!(
+                lifecycle.terminal().map(CommandLifecycleTransition::application),
+                Some(ApplicationState::Applied(_))
+            ));
+            assert!(batch.requires_runtime_journal());
+        }
+        assert!(matches!(
+            &journal.attempts[0]
+                .command_lifecycle()
+                .expect("step lifecycle")
+                .envelope()
+                .command,
+            HostCommand::Step
+        ));
+        assert!(journal.attempts[0].scientific().is_some());
+        assert!(matches!(
+            &journal.attempts[1]
+                .command_lifecycle()
+                .expect("config lifecycle")
+                .envelope()
+                .command,
+            HostCommand::UpdateConfig(_)
+        ));
+        assert!(journal.attempts[1].scientific().is_none());
+    }
+
+    #[test]
+    fn admitted_revision_conflicts_and_failures_keep_their_application_boundaries() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(93),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("terminal lifecycle host");
+        let mut port = core.local_port();
+        port.submit(
+            envelope(1, HostCommand::Pause)
+                .expecting_scientific_revision(ScientificRevision::new(7)),
+        )
+        .expect("conflicting admission");
+        core.latched_fault = Some(HostFault::Scientific {
+            tick: Tick(0),
+            code: "injected".to_owned(),
+            message: "test fault".to_owned(),
+        });
+        submit(&mut port, 2, HostCommand::Step);
+
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("conflict and failure audits");
+        let journal = journal_state.borrow();
+        assert_eq!(journal.attempts.len(), 2);
+        let conflict = journal.attempts[0]
+            .command_lifecycle()
+            .expect("conflict lifecycle");
+        assert!(matches!(
+            conflict.terminal().map(CommandLifecycleTransition::application),
+            Some(ApplicationState::Rejected(
+                RejectionReason::ScientificRevisionConflict {
+                    expected,
+                    actual,
+                }
+            )) if *expected == ScientificRevision::new(7)
+                && *actual == ScientificRevision::new(0)
+        ));
+        let failed = journal.attempts[1]
+            .command_lifecycle()
+            .expect("failure lifecycle");
+        assert!(matches!(
+            failed.terminal().map(CommandLifecycleTransition::application),
+            Some(ApplicationState::Failed(ApplicationFailure { code, .. }))
+                if code == "science_blocked"
+        ));
+        assert_eq!(
+            conflict.transitions()[0].boundary(),
+            conflict.transitions()[1].boundary()
+        );
+        assert_eq!(failed.transitions()[0].boundary(), failed.transitions()[1].boundary());
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Pending);
+        assert_eq!(status(&mut port, 2).journal(), &JournalState::Pending);
+        drop(journal);
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("conflict and failure audit receipts");
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Durable);
+        assert_eq!(status(&mut port, 2).journal(), &JournalState::Durable);
+    }
+
+    #[test]
+    fn full_control_audit_retries_the_exact_arc() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState {
+            full: true,
+            ..FakeJournalState::default()
+        }));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(94),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("full control audit host");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Pause);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("full control audit boundary");
+        let retained = core
+            .pending_journal_batch()
+            .expect("retained control audit");
+        assert!(Arc::ptr_eq(
+            &retained,
+            &journal_state.borrow().attempts[0]
+        ));
+        assert!(
+            core.shared
+                .borrow()
+                .commands
+                .get(&CommandId::new(1))
+                .expect("control authority")
+                .envelope
+                .is_none(),
+            "the retained exact batch supersedes the authority envelope"
+        );
+        assert_eq!(
+            port.submit(envelope(1, HostCommand::Pause))
+                .expect("exact retry uses compact identity")
+                .journal(),
+            &JournalState::Pending
+        );
+        assert_eq!(
+            port.submit(envelope(1, HostCommand::Resume)),
+            Err(HostAccessError::CommandIdCollision {
+                command_id: CommandId::new(1)
+            })
+        );
+
+        journal_state.borrow_mut().full = false;
+        let retried = core
+            .retry_retained_journal()
+            .expect("control audit retry")
+            .expect("retained admission result");
+        assert!(retried.is_accepted());
+        assert!(Arc::ptr_eq(
+            &journal_state.borrow().attempts[0],
+            &journal_state.borrow().attempts[1]
+        ));
+        assert!(core.pending_journal_batch().is_none());
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Pending);
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("control audit receipt");
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Durable);
+    }
+
+    #[test]
+    fn pending_host_stopping_audit_blocks_shutdown_then_stopped_ingress_fails_typed() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState {
+            full: true,
+            ..FakeJournalState::default()
+        }));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(95),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("shutdown audit host");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Shutdown);
+        let stopping = submit(&mut port, 2, HostCommand::Pause);
+        assert!(matches!(
+            stopping.application(),
+            ApplicationState::Rejected(RejectionReason::HostStopping)
+        ));
+
+        let blocked = core
+            .drive(ManualInstant::from_nanos(0))
+            .expect("blocked shutdown audit ordering");
+        assert!(matches!(blocked.blocker, Some(HostBlocker::JournalFull { .. })));
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Running);
+        assert!(matches!(
+            status(&mut port, 1).application(),
+            ApplicationState::Admitted
+        ));
+        {
+            let journal = journal_state.borrow();
+            assert_eq!(journal.attempts.len(), 1);
+            assert_eq!(journal.attempts[0].command_id(), Some(CommandId::new(2)));
+            assert!(matches!(
+                journal.attempts[0]
+                    .command_lifecycle()
+                    .and_then(CommandLifecycleEvidence::terminal)
+                    .map(CommandLifecycleTransition::application),
+                Some(ApplicationState::Rejected(RejectionReason::HostStopping))
+            ));
+        }
+        journal_state.borrow_mut().full = false;
+        core.retry_retained_journal()
+            .expect("stopping audit retry")
+            .expect("retained stopping audit");
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("shutdown applies after audit admission");
+        {
+            let journal = journal_state.borrow();
+            assert_eq!(journal.attempts.len(), 3);
+            assert!(Arc::ptr_eq(&journal.attempts[0], &journal.attempts[1]));
+            assert_eq!(journal.attempts[2].command_id(), Some(CommandId::new(1)));
+            assert!(journal.attempts[2].is_applied_shutdown());
+            assert!(matches!(
+                journal.attempts[2]
+                    .command_lifecycle()
+                    .and_then(CommandLifecycleEvidence::terminal)
+                    .map(CommandLifecycleTransition::application),
+                Some(ApplicationState::Applied(_))
+            ));
+        }
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopping);
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("durable shutdown audit receipts");
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        assert_eq!(
+            port.submit(envelope(3, HostCommand::Pause)),
+            Err(HostAccessError::CommandEvidenceClosed {
+                lifecycle: HostLifecycle::Stopped,
+            })
+        );
     }
 
     #[test]
