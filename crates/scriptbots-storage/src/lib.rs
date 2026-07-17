@@ -3750,12 +3750,9 @@ impl HostJournalPageMetadata {
         expected_sequence: u64,
         progress: HostJournalProgress,
     ) -> Result<Self, StorageError> {
-        let encoded_sequence: String =
-            decode(row, 0, "host_journal_archive.journal_sequence")?;
-        let sequence = decode_journal_u64(
-            "host_journal_archive.journal_sequence",
-            &encoded_sequence,
-        )?;
+        let encoded_sequence: String = decode(row, 0, "host_journal_archive.journal_sequence")?;
+        let sequence =
+            decode_journal_u64("host_journal_archive.journal_sequence", &encoded_sequence)?;
         if sequence != expected_sequence || sequence > progress.admitted_journal {
             return Err(StorageError::InvalidData {
                 context: "host_journal_archive.journal_sequence",
@@ -3776,14 +3773,12 @@ impl HostJournalPageMetadata {
             });
         }
         let payload_digest = decode(row, 2, "host_journal_archive.payload_digest")?;
-        let raw_payload_bytes: i64 =
-            decode(row, 3, "host_journal_archive.payload_json.length")?;
-        let payload_bytes = usize::try_from(raw_payload_bytes).map_err(|error| {
-            StorageError::InvalidData {
+        let raw_payload_bytes: i64 = decode(row, 3, "host_journal_archive.payload_json.length")?;
+        let payload_bytes =
+            usize::try_from(raw_payload_bytes).map_err(|error| StorageError::InvalidData {
                 context: "host_journal_archive.payload_json",
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
         if payload_bytes == 0 || payload_bytes > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
             return Err(StorageError::InvalidData {
                 context: "host_journal_archive.payload_json",
@@ -3807,16 +3802,13 @@ impl HostJournalPageMetadata {
                 .map(EventSequence::new)
             })
             .transpose()?;
-        let linked_persistence = decode::<Option<i64>>(
-            row,
-            5,
-            "host_journal_batch_ledger.persistence_batch_id",
-        )?
-        .map(|raw| {
-            checked_u64("host_journal_batch_ledger.persistence_batch_id", raw)
-                .and_then(PersistenceBatchId::new)
-        })
-        .transpose()?;
+        let linked_persistence =
+            decode::<Option<i64>>(row, 5, "host_journal_batch_ledger.persistence_batch_id")?
+                .map(|raw| {
+                    checked_u64("host_journal_batch_ledger.persistence_batch_id", raw)
+                        .and_then(PersistenceBatchId::new)
+                })
+                .transpose()?;
         let encoded_state: String = decode(row, 6, "host_journal_batch_ledger.state")?;
         let state = HostJournalState::decode(&encoded_state)?;
         let expected_state = if sequence <= progress.durable_journal {
@@ -3877,12 +3869,11 @@ fn load_finished_host_journal_record(
     progress: HostJournalProgress,
     metadata: &HostJournalPageMetadata,
 ) -> Result<HostJournalRecord, StorageError> {
-    let payload_length = i64::try_from(metadata.payload_bytes).map_err(|error| {
-        StorageError::InvalidData {
+    let payload_length =
+        i64::try_from(metadata.payload_bytes).map_err(|error| StorageError::InvalidData {
             context: "host_journal_archive.payload_json",
             reason: error.to_string(),
-        }
-    })?;
+        })?;
     let payload_row = connection.query_row_with_params(
         "SELECT payload_json FROM host_journal_archive
          WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
@@ -3968,8 +3959,7 @@ fn load_finished_host_journal_record(
             "storage_batch_ledger.tick",
             decode(storage_row, 0, "storage_batch_ledger.tick")?,
         )?;
-        let storage_digest: String =
-            decode(storage_row, 1, "storage_batch_ledger.payload_digest")?;
+        let storage_digest: String = decode(storage_row, 1, "storage_batch_ledger.payload_digest")?;
         let storage_state: String = decode(storage_row, 2, "storage_batch_ledger.state")?;
         if storage_tick != applied_tick || storage_digest != expected_digest {
             return Err(StorageError::InvalidData {
@@ -3987,8 +3977,7 @@ fn load_finished_host_journal_record(
             });
         }
         if (metadata.state >= HostJournalState::Applied && storage_state == "admitted")
-            || (metadata.state >= HostJournalState::CommittedVolatile
-                && storage_state != "durable")
+            || (metadata.state >= HostJournalState::CommittedVolatile && storage_state != "durable")
         {
             return Err(StorageError::InvalidData {
                 context: "host_journal_batch_ledger.persistence_batch_id",
@@ -5088,12 +5077,9 @@ impl StorageReader {
                 reason: "record limit must be nonzero".to_owned(),
             });
         }
-        let query_limit = checked_query_limit(
-            "host_journal_conformance.record_limit",
-            record_limit,
-        )?;
-        if page_payload_byte_limit == 0
-            || page_payload_byte_limit > MAX_HOST_JOURNAL_ARCHIVE_BYTES
+        let query_limit =
+            checked_query_limit("host_journal_conformance.record_limit", record_limit)?;
+        if page_payload_byte_limit == 0 || page_payload_byte_limit > MAX_HOST_JOURNAL_ARCHIVE_BYTES
         {
             return Err(StorageError::InvalidData {
                 context: "host_journal_conformance.page_payload_byte_limit",
@@ -5125,8 +5111,7 @@ impl StorageReader {
 
         let connection = self.finished_connection()?;
         let integrity_check = Self::conformance_integrity_check(connection)?;
-        let progress =
-            Self::finished_host_journal_progress(connection, self.run_id, session_id)?;
+        let progress = Self::finished_host_journal_progress(connection, self.run_id, session_id)?;
         if after_sequence > progress.admitted_journal {
             return Err(StorageError::InvalidData {
                 context: "host_journal_conformance.after",
@@ -5173,12 +5158,12 @@ impl StorageReader {
             })?;
             let metadata =
                 HostJournalPageMetadata::decode(row, session_id, expected_sequence, progress)?;
-            let next_page_bytes = page_payload_bytes.checked_add(metadata.payload_bytes).ok_or(
-                StorageError::InvalidData {
+            let next_page_bytes = page_payload_bytes
+                .checked_add(metadata.payload_bytes)
+                .ok_or(StorageError::InvalidData {
                     context: "host_journal_conformance.page_payload_byte_limit",
                     reason: "page payload byte accounting overflowed".to_owned(),
-                },
-            )?;
+                })?;
             if next_page_bytes > page_payload_byte_limit {
                 if records.is_empty() {
                     return Err(StorageError::InvalidData {
@@ -5224,8 +5209,8 @@ impl StorageReader {
                 ),
             });
         }
-        let next_after = (cursor < progress.admitted_journal)
-            .then_some(JournalBatchId::new(session_id, cursor));
+        let next_after =
+            (cursor < progress.admitted_journal).then_some(JournalBatchId::new(session_id, cursor));
         Ok(HostJournalSessionPage {
             run_id: self.run_id,
             session_id,
@@ -13058,9 +13043,7 @@ mod tests {
             .get_typed::<i64>(0)
             .expect("ledger count");
         let scientific_event_count = connection
-            .query_row(
-                "SELECT COUNT(scientific_event_sequence) FROM host_journal_batch_ledger",
-            )
+            .query_row("SELECT COUNT(scientific_event_sequence) FROM host_journal_batch_ledger")
             .expect("scientific event count row")
             .get_typed::<i64>(0)
             .expect("scientific event count");
@@ -13229,9 +13212,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let analytics = loop {
             let snapshot = provider.snapshot();
-            if snapshot.last_failure.as_deref().is_some_and(|failure| {
-                failure.detail.contains(&format!("{point:?}"))
-            }) {
+            if snapshot
+                .last_failure
+                .as_deref()
+                .is_some_and(|failure| failure.detail.contains(&format!("{point:?}")))
+            {
                 break snapshot;
             }
             assert!(
@@ -13434,11 +13419,7 @@ mod tests {
             &mut baseline_nanos,
         );
         assert_eq!(baseline_status.journal(), &JournalState::Durable);
-        drop_fault_host(
-            baseline_pipeline,
-            baseline_core,
-            baseline_frontend,
-        );
+        drop_fault_host(baseline_pipeline, baseline_core, baseline_frontend);
         let baseline = journal_database_snapshot(&baseline_path);
         assert_complete_journal_prefix(&baseline, 1, 1);
         assert_eq!(baseline.tick_count, 1);
@@ -13469,12 +13450,7 @@ mod tests {
                 command.command_id(),
                 &mut next_nanos,
             );
-            assert_journal_fault_status(
-                &pipeline,
-                &status,
-                point,
-                FailureCommitState::RolledBack,
-            );
+            assert_journal_fault_status(&pipeline, &status, point, FailureCommitState::RolledBack);
             drop_fault_host(pipeline, core, frontend);
 
             let rolled_back = journal_database_snapshot(&path);
@@ -13504,14 +13480,15 @@ mod tests {
     fn host_journal_lost_rollback_ack_is_indeterminate_but_reopen_safe() {
         let path = temp_db_path("host-journal-lost-rollback-ack");
         let path = path.to_string_lossy().into_owned();
-        let (pipeline, mut core, mut frontend) =
-            fault_test_host(&path, HostSessionId::new(0x20a));
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x20a));
         arm_host_journal_fault(&path, HostJournalFaultPoint::PersistenceAfterTicks);
         arm_host_journal_fault(
             &path,
             HostJournalFaultPoint::PersistenceRollbackAcknowledgementLost,
         );
-        let command = frontend.step().expect("step with lost rollback acknowledgement");
+        let command = frontend
+            .step()
+            .expect("step with lost rollback acknowledgement");
         let mut next_nanos = 0;
         let status = drive_journal_command_to_terminal(
             &mut frontend,
@@ -13720,8 +13697,7 @@ mod tests {
     fn host_journal_analytics_publication_fault_keeps_the_durable_event_exactly_once() {
         let path = temp_db_path("host-journal-analytics-publication");
         let path = path.to_string_lossy().into_owned();
-        let (pipeline, mut core, mut frontend) =
-            fault_test_host(&path, HostSessionId::new(0x206));
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x206));
         arm_host_journal_fault(&path, HostJournalFaultPoint::BeforeAnalyticsPublication);
         let command = frontend.step().expect("analytics-faulted step command");
         let mut next_nanos = 0;
@@ -13776,10 +13752,7 @@ mod tests {
         drop(frontend);
         drop(core);
 
-        arm_host_journal_fault(
-            &path,
-            HostJournalFaultPoint::BeforeShutdownCheckpointClose,
-        );
+        arm_host_journal_fault(&path, HostJournalFaultPoint::BeforeShutdownCheckpointClose);
         let error = pipeline
             .shutdown()
             .expect_err("checkpoint/close fence must fail the storage shutdown receipt");
@@ -13797,9 +13770,7 @@ mod tests {
         assert_eq!(failure.operation, StorageOperation::Close);
         assert_eq!(failure.commit_state, FailureCommitState::Committed);
         assert!(
-            failure
-                .detail
-                .contains("BeforeShutdownCheckpointClose"),
+            failure.detail.contains("BeforeShutdownCheckpointClose"),
             "shutdown close failure lost its deterministic boundary: {failure:?}"
         );
         let analytics = pipeline.analytics_provider().snapshot();
@@ -13820,8 +13791,7 @@ mod tests {
     fn host_journal_reopen_scan_fault_releases_the_writer_without_mutation() {
         let path = temp_db_path("host-journal-reopen-scan");
         let path = path.to_string_lossy().into_owned();
-        let (pipeline, mut core, mut frontend) =
-            fault_test_host(&path, HostSessionId::new(0x208));
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x208));
         let command = frontend.step().expect("durable step before reopen fault");
         let mut next_nanos = 0;
         let status = drive_journal_command_to_terminal(

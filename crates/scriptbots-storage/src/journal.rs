@@ -1752,7 +1752,11 @@ mod tests {
             worker_batch.retained_bytes()
         );
 
-        std::thread::sleep(options.receipt_timeout.saturating_add(Duration::from_millis(1)));
+        std::thread::sleep(
+            options
+                .receipt_timeout
+                .saturating_add(Duration::from_millis(1)),
+        );
         shared
             .cache_terminal(batch_id, &JournalReceiptState::CommittedVolatile)
             .expect("worker publishes terminal truth before its channel notification");
@@ -1897,7 +1901,11 @@ mod tests {
             worker_batch.retained_bytes()
         );
 
-        std::thread::sleep(options.receipt_timeout.saturating_add(Duration::from_millis(1)));
+        std::thread::sleep(
+            options
+                .receipt_timeout
+                .saturating_add(Duration::from_millis(1)),
+        );
         let timed_out = frontend
             .drive_at(&mut core, ManualInstant::from_nanos(1))
             .expect("deadline polling is nonblocking and returns terminal failure");
@@ -1951,7 +1959,9 @@ mod tests {
                 .is_empty()
         );
 
-        let second = frontend.step().expect("later step enters host command order");
+        let second = frontend
+            .step()
+            .expect("later step enters host command order");
         let blocked = frontend
             .drive_at(&mut core, ManualInstant::from_nanos(3))
             .expect("latched journal failure rejects later science deterministically");

@@ -18,10 +18,10 @@ use scriptbots_core::{
     BrainActivations, BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision,
     BrainInspectionUnavailable, ControlCommand, ControlDisposition, FoodGrid, Generation,
     IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position,
-    RenderTonemapMode, SENSOR_LAYOUT,
-    ScriptBotsConfig, SelectedBrainTelemetryOutcome, SelectionMode, SelectionState,
-    SelectionUpdate, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
-    TraitModifiers, Velocity, WorldState, WorldStepDriver, apply_control_command,
+    RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig, SelectedBrainTelemetryOutcome,
+    SelectionMode, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TerrainLayer,
+    TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver,
+    apply_control_command,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{

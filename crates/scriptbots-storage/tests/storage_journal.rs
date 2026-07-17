@@ -303,10 +303,7 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     };
     assert_eq!(live_catch_up.source, EventPageSource::Durable);
     assert_eq!(live_catch_up.events.len(), 1);
-    assert_eq!(
-        live_catch_up.events[0].commitment,
-        EventCommitment::Durable
-    );
+    assert_eq!(live_catch_up.events[0].commitment, EventCommitment::Durable);
     let expected_first_event = live_catch_up.events[0].clone();
 
     let live_hot_suffix = frontend
@@ -338,10 +335,7 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     );
     assert_eq!(shutdown_status.journal(), &JournalState::Durable);
     assert!(
-        matches!(
-            shutdown_status.application(),
-            ApplicationState::Applied(_)
-        ),
+        matches!(shutdown_status.application(), ApplicationState::Applied(_)),
         "durable shutdown must retain its exact applied boundary"
     );
     let ApplicationState::Applied(shutdown_applied) = shutdown_status.application() else {
@@ -368,10 +362,7 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
         first: EventSequence::new(1),
         last: EventSequence::new(2),
     };
-    assert_eq!(
-        reader.available_range(),
-        Some(complete_event_range)
-    );
+    assert_eq!(reader.available_range(), Some(complete_event_range));
     let retention = reader
         .retention_snapshot()
         .expect("reopened reader retains its complete durable event range");
@@ -404,12 +395,7 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     let finished_reader = StorageReader::open_finished_for_run(&path, run_id)
         .expect("open the immutable finished run for typed journal conformance");
     let journal_page = finished_reader
-        .host_journal_session_conformance_page(
-            session_id,
-            None,
-            16,
-            options.max_event_page_bytes,
-        )
+        .host_journal_session_conformance_page(session_id, None, 16, options.max_event_page_bytes)
         .expect("read one bounded canonical page covering the complete journal session");
     assert_eq!(journal_page.run_id, run_id);
     assert_eq!(journal_page.session_id, session_id);
@@ -447,10 +433,7 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
 
     assert_eq!(first_record.batch_id, JournalBatchId::new(session_id, 1));
     assert_eq!(second_record.batch_id, JournalBatchId::new(session_id, 2));
-    assert_eq!(
-        shutdown_record.batch_id,
-        JournalBatchId::new(session_id, 3)
-    );
+    assert_eq!(shutdown_record.batch_id, JournalBatchId::new(session_id, 3));
     for record in [first_record, second_record, shutdown_record] {
         assert_eq!(record.state, HostJournalRecordState::Durable);
     }
@@ -495,12 +478,7 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     assert_eq!(shutdown_record.event, None);
 
     let first_page = finished_reader
-        .host_journal_session_conformance_page(
-            session_id,
-            None,
-            1,
-            options.max_event_page_bytes,
-        )
+        .host_journal_session_conformance_page(session_id, None, 1, options.max_event_page_bytes)
         .expect("read the first single-record conformance page");
     assert_eq!(first_page.records.len(), 1);
     assert_eq!(
