@@ -722,7 +722,7 @@ struct PairedMetricSeries {
 type MetricsByTick = BTreeMap<String, BTreeMap<u64, f64>>;
 
 fn index_metrics_by_tick(readings: Vec<PersistedMetric>) -> MetricsByTick {
-    let mut indexed = BTreeMap::new();
+    let mut indexed: MetricsByTick = BTreeMap::new();
     for PersistedMetric { tick, name, value } in readings {
         indexed.entry(name).or_default().insert(tick, value);
     }
