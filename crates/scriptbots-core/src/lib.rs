@@ -7,6 +7,7 @@ pub mod detect;
 pub mod economy;
 pub mod narrative_text;
 pub mod rng_domains;
+mod replay;
 pub mod sense_fixed;
 pub mod visual;
 
@@ -5920,6 +5921,10 @@ pub enum ReplayEventKind {
         range_max: f32,
         value: f32,
     },
+    /// Canonical `WorldDigestV1.overall` recorded once at a clean boundary by the driving
+    /// application, so replay verification can prove the entire final science state — not
+    /// just the event stream — reproduced exactly.
+    WorldDigest { overall: String },
 }
 
 /// Lightweight wrapper pairing an agent context with a replay event.
@@ -8456,6 +8461,357 @@ const fn default_post_effect_enabled() -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// GPU capability classification + adaptive quality governance (bd-2z0.14.3.3).
+//
+// The frontend (Bevy/wgpu) probes the adapter and fills the plain-data
+// [`GpuInfo`]; everything DECIDED from it — the initial tier and every later
+// frame-governor transition — is pure, deterministic, and unit-tested here so
+// behavior never depends on which frontend asked.
+// ---------------------------------------------------------------------------
+
+/// GPU device classification reported by the frontend after adapter probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuClass {
+    /// Dedicated GPU (metal/vulkan/d3d12 hardware device).
+    Discrete,
+    /// Integrated GPU sharing system memory.
+    Integrated,
+    /// Virtualized GPU (VM passthrough or virtual device).
+    Virtual,
+    /// Software rasterizer (llvmpipe/lavapipe/warp) — not GPU-accelerated in
+    /// any meaningful sense; must never silently claim acceleration.
+    Software,
+    /// Classification unavailable.
+    Unknown,
+}
+
+/// Plain-data GPU capability report, filled by the frontend from its adapter
+/// and logged once at startup (and embedded in the run manifest's render
+/// section and every capture's metadata).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuInfo {
+    /// Adapter name as reported by the driver.
+    pub name: String,
+    /// Backend label (e.g. `metal`, `vulkan`, `dx12`, `gl`).
+    pub backend: String,
+    /// Device classification.
+    pub class: GpuClass,
+    /// Detected VRAM/dedicated memory in bytes when the backend exposes it.
+    pub vram_bytes: Option<u64>,
+    /// Maximum 2D texture dimension.
+    pub max_texture_2d: Option<u32>,
+    /// Whether GPU timestamp queries are available (perf instrumentation).
+    pub timestamp_queries: bool,
+}
+
+/// VRAM at or above which an integrated GPU earns Medium instead of Low.
+const INTEGRATED_MEDIUM_VRAM_BYTES: u64 = 4_u64 * 1024 * 1024 * 1024;
+
+/// Initial quality tier for a GPU class when the operator leaves
+/// [`RenderQuality::Auto`] (the default). Explicit operator tiers always win;
+/// `Ultra` is never auto-selected — it is an explicit opt-in.
+#[must_use]
+pub const fn initial_tier_for(class: GpuClass, vram_bytes: Option<u64>) -> RenderQuality {
+    match class {
+        GpuClass::Software => RenderQuality::Potato,
+        GpuClass::Virtual => RenderQuality::Low,
+        GpuClass::Integrated => match vram_bytes {
+            Some(v) if v >= INTEGRATED_MEDIUM_VRAM_BYTES => RenderQuality::Medium,
+            _ => RenderQuality::Low,
+        },
+        GpuClass::Discrete => RenderQuality::High,
+        GpuClass::Unknown => RenderQuality::Medium,
+    }
+}
+
+/// The canonical per-tier feature matrix.
+///
+/// Every frontend reads this instead of inventing its own tier semantics, so
+/// `Medium` means the same thing in the 3D renderer, the terminal canvas, and
+/// the capture harness. Fields are deliberately coarse; frontends document
+/// how each maps onto their pipelines (e.g. shadow resolution tiers).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TierFeatures {
+    /// Enable shadow mapping at all.
+    pub shadows: bool,
+    /// Shadow map resolution per cascade (0 when shadows are off).
+    pub shadow_resolution: u32,
+    /// Cascade count (0 when shadows are off).
+    pub shadow_cascades: u8,
+    /// HDR bloom post pass.
+    pub bloom: bool,
+    /// Screen-space ambient occlusion.
+    pub ssao: bool,
+    /// Anti-aliasing mode for the tier.
+    pub anti_aliasing: RenderAntiAliasing,
+    /// Atmospheric fog enabled.
+    pub fog: bool,
+    /// Maximum live GPU particles.
+    pub particles_max: u32,
+    /// Terrain texture detail divisor (1 = full, 2 = half, 4 = quarter res).
+    pub terrain_detail_divisor: u8,
+    /// Water reflection mode: 0 = none, 1 = static env, 2 = planar.
+    pub water_reflections: u8,
+    /// Terminal frontend: sub-cell canvas enabled (braille/half-block).
+    pub tui_subcell: bool,
+    /// Terminal frontend: non-essential animations enabled.
+    pub tui_animation: bool,
+}
+
+/// The feature matrix row for one quality tier.
+///
+/// `Auto` resolves through [`initial_tier_for`] first; this table only takes
+/// concrete tiers and treats `Auto` as `Medium` defensively.
+#[must_use]
+pub const fn tier_features(tier: RenderQuality) -> TierFeatures {
+    match tier {
+        RenderQuality::Potato => TierFeatures {
+            shadows: false,
+            shadow_resolution: 0,
+            shadow_cascades: 0,
+            bloom: false,
+            ssao: false,
+            anti_aliasing: RenderAntiAliasing::Off,
+            fog: false,
+            particles_max: 512,
+            terrain_detail_divisor: 4,
+            water_reflections: 0,
+            tui_subcell: true,
+            tui_animation: false,
+        },
+        RenderQuality::Low => TierFeatures {
+            shadows: true,
+            shadow_resolution: 1024,
+            shadow_cascades: 1,
+            bloom: false,
+            ssao: false,
+            anti_aliasing: RenderAntiAliasing::Fxaa,
+            fog: false,
+            particles_max: 2_048,
+            terrain_detail_divisor: 2,
+            water_reflections: 0,
+            tui_subcell: true,
+            tui_animation: false,
+        },
+        RenderQuality::Auto | RenderQuality::Medium => TierFeatures {
+            shadows: true,
+            shadow_resolution: 2048,
+            shadow_cascades: 2,
+            bloom: true,
+            ssao: false,
+            anti_aliasing: RenderAntiAliasing::Fxaa,
+            fog: true,
+            particles_max: 8_192,
+            terrain_detail_divisor: 1,
+            water_reflections: 1,
+            tui_subcell: true,
+            tui_animation: true,
+        },
+        RenderQuality::High => TierFeatures {
+            shadows: true,
+            shadow_resolution: 2048,
+            shadow_cascades: 4,
+            bloom: true,
+            ssao: true,
+            anti_aliasing: RenderAntiAliasing::Taa,
+            fog: true,
+            particles_max: 32_768,
+            terrain_detail_divisor: 1,
+            water_reflections: 1,
+            tui_subcell: true,
+            tui_animation: true,
+        },
+        RenderQuality::Ultra => TierFeatures {
+            shadows: true,
+            shadow_resolution: 4096,
+            shadow_cascades: 4,
+            bloom: true,
+            ssao: true,
+            anti_aliasing: RenderAntiAliasing::Taa,
+            fog: true,
+            particles_max: 65_536,
+            terrain_detail_divisor: 1,
+            water_reflections: 2,
+            tui_subcell: true,
+            tui_animation: true,
+        },
+    }
+}
+
+/// Ordered ladder used by the governor (`Auto` never appears here).
+const TIER_LADDER: [RenderQuality; 5] = [
+    RenderQuality::Potato,
+    RenderQuality::Low,
+    RenderQuality::Medium,
+    RenderQuality::High,
+    RenderQuality::Ultra,
+];
+
+/// What the governor decided after evaluating a completed window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernorAction {
+    /// Hold the current tier.
+    Hold,
+    /// Step one ladder rung down (frame budget blown).
+    StepDown,
+    /// Step one ladder rung up (sustained headroom).
+    StepUp,
+}
+
+/// Adaptive frame-time governor: a deterministic closed loop that steps the
+/// quality tier down when the frame budget is blown and back up after
+/// sustained headroom, with hysteresis and minimum dwell so it cannot flap.
+///
+/// Determinism contract: transitions are driven ONLY by the injected frame
+/// times and the config knobs — same observation stream, same decisions, on
+/// every platform. The governor never fires when the operator picked an
+/// explicit tier (`Auto` only), and never steps above `ceiling`.
+#[derive(Debug, Clone)]
+pub struct RenderGovernor {
+    ceiling_ladder_index: usize,
+    current_ladder_index: usize,
+    budget_ms: f32,
+    window: Vec<f32>,
+    window_capacity: usize,
+    consecutive_blowout_windows: u32,
+    consecutive_headroom_windows: u32,
+    windows_since_transition: u32,
+}
+
+impl RenderGovernor {
+    /// Windows of budget violation required before stepping down.
+    pub const BLOWOUT_WINDOWS_REQUIRED: u32 = 3;
+    /// Windows of headroom required before stepping up.
+    pub const HEADROOM_WINDOWS_REQUIRED: u32 = 8;
+    /// Windows that must pass after any transition before another is allowed.
+    pub const DWELL_WINDOWS: u32 = 2;
+
+    /// Create a governor at `initial` tier with the frame budget `budget_ms`
+    /// (e.g. 16.6 for 60 fps) and a p95 window of `window_frames` samples.
+    #[must_use]
+    pub fn new(initial: RenderQuality, ceiling: RenderQuality, budget_ms: f32) -> Self {
+        let ladder_index = |tier: RenderQuality| {
+            TIER_LADDER
+                .iter()
+                .position(|t| *t == tier)
+                .unwrap_or(2) // Medium when Auto/unknown sneaks in
+        };
+        Self {
+            ceiling_ladder_index: ladder_index(ceiling),
+            current_ladder_index: ladder_index(initial),
+            budget_ms: budget_ms.max(1.0),
+            window: Vec::with_capacity(240),
+            window_capacity: 120,
+            consecutive_blowout_windows: 0,
+            consecutive_headroom_windows: 0,
+            windows_since_transition: 0,
+        }
+    }
+
+    /// The tier the governor currently runs at.
+    #[must_use]
+    pub fn current_tier(&self) -> RenderQuality {
+        TIER_LADDER[self.current_ladder_index]
+    }
+
+    /// Feed one frame time (milliseconds). Cheap: pushes into the window and
+    /// evaluates only when the window fills.
+    pub fn observe(&mut self, frame_ms: f32) {
+        if frame_ms.is_finite() && frame_ms >= 0.0 {
+            self.window.push(frame_ms);
+        } else {
+            // Non-finite frames count as budget blowouts, never as headroom.
+            self.window.push(self.budget_ms * 4.0);
+        }
+        if self.window.len() >= self.window_capacity {
+            let action = self.evaluate_window();
+            self.window.clear();
+            self.apply(action);
+        }
+    }
+
+    /// The p95 frame time of the current window (for logging), or 0 when the
+    /// window is empty.
+    #[must_use]
+    pub fn window_p95(&self) -> f32 {
+        percentile95(&self.window)
+    }
+
+    fn evaluate_window(&mut self) -> GovernorAction {
+        self.windows_since_transition += 1;
+        let p95 = percentile95(&self.window);
+        if p95 > self.budget_ms {
+            self.consecutive_blowout_windows += 1;
+            self.consecutive_headroom_windows = 0;
+        } else if p95 < self.budget_ms * 0.6 {
+            self.consecutive_headroom_windows += 1;
+            self.consecutive_blowout_windows = 0;
+        } else {
+            self.consecutive_blowout_windows = 0;
+            self.consecutive_headroom_windows = 0;
+        }
+
+        if self.windows_since_transition < Self::DWELL_WINDOWS {
+            return GovernorAction::Hold;
+        }
+        if self.consecutive_blowout_windows >= Self::BLOWOUT_WINDOWS_REQUIRED
+            && self.current_ladder_index > 0
+        {
+            return GovernorAction::StepDown;
+        }
+        if self.consecutive_headroom_windows >= Self::HEADROOM_WINDOWS_REQUIRED
+            && self.current_ladder_index < self.ceiling_ladder_index
+        {
+            return GovernorAction::StepUp;
+        }
+        GovernorAction::Hold
+    }
+
+    fn apply(&mut self, action: GovernorAction) {
+        match action {
+            GovernorAction::Hold => {}
+            GovernorAction::StepDown => {
+                if self.current_ladder_index > 0 {
+                    self.current_ladder_index -= 1;
+                    self.windows_since_transition = 0;
+                    self.consecutive_blowout_windows = 0;
+                    tracing::info!(
+                        new_tier = ?self.current_tier(),
+                        reason = "frame budget p95 exceeded for consecutive windows",
+                        "adaptive render governor stepped quality down"
+                    );
+                }
+            }
+            GovernorAction::StepUp => {
+                if self.current_ladder_index < self.ceiling_ladder_index {
+                    self.current_ladder_index += 1;
+                    self.windows_since_transition = 0;
+                    self.consecutive_headroom_windows = 0;
+                    tracing::info!(
+                        new_tier = ?self.current_tier(),
+                        reason = "sustained frame-time headroom",
+                        "adaptive render governor stepped quality up"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Deterministic p95 over a small window (sorted copy; windows are <= 240
+/// samples so this is cheap and branch-simple).
+fn percentile95(window: &[f32]) -> f32 {
+    if window.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = window.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let index = ((sorted.len() - 1) * 95 + 50) / 100;
+    sorted[index]
+}
+
 /// Fog density presets mirroring the historical `SB_WGPU_FOG` vocabulary.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -9154,6 +9510,12 @@ pub struct ScriptBotsConfig {
     pub narrative_capacity: usize,
     /// Interval (ticks) between persistence flushes. 0 disables persistence.
     pub persistence_interval: u32,
+    /// Maximum replay events recorded per tick; `0` disables production replay emission.
+    /// Runs opting into replay verification should set this at or above their peak agent
+    /// count so every live agent is recorded every tick. The zero default keeps
+    /// production runs byte-identical to their pre-instrumentation baselines.
+    #[serde(default)]
+    pub replay_event_tick_cap: usize,
     /// Sampling cadence for analytics families.
     pub analytics_stride: AnalyticsStride,
     /// NeuroFlow runtime configuration.
@@ -9260,6 +9622,7 @@ impl Default for ScriptBotsConfig {
             narrative_interval: default_narrative_interval(),
             narrative_capacity: default_narrative_capacity(),
             persistence_interval: 0,
+            replay_event_tick_cap: 0,
             analytics_stride: AnalyticsStride::default(),
             neuroflow: NeuroflowSettings {
                 enabled: true,
@@ -18721,6 +19084,7 @@ impl WorldState {
         let brain_evaluation = observed_stage!(WorldStepStage::Brains, { self.stage_brains() });
         observed_stage!(WorldStepStage::Actuation, {
             self.stage_actuation();
+            self.record_replay_action_events();
         });
         observed_stage!(WorldStepStage::TemperatureDiscomfort, {
             let before = self.capture_resource_amounts();
@@ -37570,6 +37934,131 @@ mod tests {
         assert!(map_legacy_render_env("SB_WGPU_FXAA", "maybe").is_none());
         assert!(map_legacy_render_env("SCRIPTBOTS_RENDER_QUALITY", "ludicrous").is_none());
         assert!(map_legacy_render_env("SB_WGPU_UNKNOWN", "1").is_none());
+    }
+
+    #[test]
+    fn initial_tier_maps_gpu_classes_without_surprises() {
+        assert_eq!(
+            initial_tier_for(GpuClass::Software, None),
+            RenderQuality::Potato
+        );
+        assert_eq!(initial_tier_for(GpuClass::Virtual, None), RenderQuality::Low);
+        assert_eq!(initial_tier_for(GpuClass::Unknown, None), RenderQuality::Medium);
+        assert_eq!(initial_tier_for(GpuClass::Discrete, None), RenderQuality::High);
+        assert_eq!(
+            initial_tier_for(GpuClass::Integrated, Some(2_u64 * 1024 * 1024 * 1024)),
+            RenderQuality::Low
+        );
+        assert_eq!(
+            initial_tier_for(GpuClass::Integrated, Some(8_u64 * 1024 * 1024 * 1024)),
+            RenderQuality::Medium
+        );
+        for class in [
+            GpuClass::Discrete,
+            GpuClass::Integrated,
+            GpuClass::Virtual,
+            GpuClass::Software,
+            GpuClass::Unknown,
+        ] {
+            assert_ne!(
+                initial_tier_for(class, Some(u64::MAX)),
+                RenderQuality::Ultra,
+                "Ultra is an explicit opt-in, never auto-selected"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_features_matrix_progresses_monotonically() {
+        let potato = tier_features(RenderQuality::Potato);
+        let low = tier_features(RenderQuality::Low);
+        let medium = tier_features(RenderQuality::Medium);
+        let high = tier_features(RenderQuality::High);
+        let ultra = tier_features(RenderQuality::Ultra);
+        assert!(!potato.shadows && potato.shadow_cascades == 0);
+        assert!(low.shadows && low.shadow_cascades == 1);
+        assert!(medium.bloom && !medium.ssao);
+        assert!(high.ssao && high.anti_aliasing == RenderAntiAliasing::Taa);
+        assert_eq!(ultra.water_reflections, 2);
+        let ladder = [potato, low, medium, high, ultra];
+        for pair in ladder.windows(2) {
+            assert!(pair[1].particles_max >= pair[0].particles_max);
+            assert!(pair[1].shadow_resolution >= pair[0].shadow_resolution);
+            assert!(pair[1].terrain_detail_divisor <= pair[0].terrain_detail_divisor);
+        }
+        assert_eq!(tier_features(RenderQuality::Auto), medium);
+    }
+
+    fn drive_frames(governor: &mut RenderGovernor, frames: &[f32]) {
+        for &frame in frames {
+            governor.observe(frame);
+        }
+    }
+
+    #[test]
+    fn governor_steps_down_after_sustained_blowout() {
+        let mut governor = RenderGovernor::new(RenderQuality::High, RenderQuality::High, 16.6);
+        // 3 full windows of blown frames (120 each) trigger a step-down on the
+        // third window boundary.
+        drive_frames(&mut governor, &[40.0; 240]);
+        assert_eq!(governor.current_tier(), RenderQuality::High);
+        drive_frames(&mut governor, &[40.0; 120]);
+        assert_eq!(
+            governor.current_tier(),
+            RenderQuality::Medium,
+            "three consecutive blown windows must step down"
+        );
+    }
+
+    #[test]
+    fn governor_steps_up_only_after_sustained_headroom_and_respects_ceiling() {
+        let mut governor = RenderGovernor::new(RenderQuality::Low, RenderQuality::Medium, 16.6);
+        // Headroom: p95 < 60% of budget for 8 windows.
+        drive_frames(&mut governor, &[4.0; 120 * 8]);
+        assert_eq!(governor.current_tier(), RenderQuality::Medium);
+        // Ceiling reached: more headroom cannot step past Medium.
+        drive_frames(&mut governor, &[4.0; 120 * 8]);
+        assert_eq!(governor.current_tier(), RenderQuality::Medium);
+    }
+
+    #[test]
+    fn governor_never_flaps_and_never_leaves_the_ladder() {
+        let mut governor = RenderGovernor::new(RenderQuality::Medium, RenderQuality::High, 16.6);
+        // Alternating blown/headroom windows must not produce back-to-back transitions.
+        for _ in 0..6 {
+            drive_frames(&mut governor, &[40.0; 120]);
+            drive_frames(&mut governor, &[4.0; 120]);
+        }
+        let tier = governor.current_tier();
+        assert!(matches!(
+            tier,
+            RenderQuality::Potato
+                | RenderQuality::Low
+                | RenderQuality::Medium
+                | RenderQuality::High
+        ));
+        // Potato is the floor: endless blowout parks at Potato, never below.
+        let mut floor = RenderGovernor::new(RenderQuality::Low, RenderQuality::High, 16.6);
+        drive_frames(&mut floor, &[999.0; 120 * 12]);
+        assert_eq!(floor.current_tier(), RenderQuality::Potato);
+    }
+
+    #[test]
+    fn governor_is_deterministic_and_hardens_nan_frames() {
+        let stream: Vec<f32> = (0..120 * 6)
+            .map(|i| if i % 7 == 0 { 30.0 } else { 10.0 })
+            .collect();
+        let mut a = RenderGovernor::new(RenderQuality::High, RenderQuality::High, 16.6);
+        let mut b = RenderGovernor::new(RenderQuality::High, RenderQuality::High, 16.6);
+        drive_frames(&mut a, &stream);
+        drive_frames(&mut b, &stream);
+        assert_eq!(a.current_tier(), b.current_tier());
+        // NaN/infinite frames count as blowout, never crash or count as headroom.
+        let mut poison = RenderGovernor::new(RenderQuality::High, RenderQuality::High, 16.6);
+        for _ in 0..120 * 3 {
+            poison.observe(f32::NAN);
+        }
+        assert_eq!(poison.current_tier(), RenderQuality::Medium);
     }
 
     #[test]
