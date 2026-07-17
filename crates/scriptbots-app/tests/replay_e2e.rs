@@ -104,12 +104,9 @@ fn strip_ansi(input: &str) -> String {
     cleaned
 }
 
-fn csv_lines(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
-        .lines()
-        .map(str::to_owned)
-        .collect()
+fn csv_lines(path: &Path) -> std::io::Result<Vec<String>> {
+    let contents = fs::read_to_string(path)?;
+    Ok(contents.lines().map(str::to_owned).collect())
 }
 
 #[test]
@@ -187,7 +184,7 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
         stderr_text(&ticks_export)
     );
 
-    let metric_rows = csv_lines(&metrics_csv);
+    let metric_rows = csv_lines(&metrics_csv).expect("read exported metrics CSV");
     assert_eq!(metric_rows[0], "tick,name,value", "metrics CSV header");
     assert!(metric_rows.len() > 1, "metrics CSV must carry rows");
     let mut previous: Option<(u64, String)> = None;
@@ -207,7 +204,7 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
         previous = Some((tick, fields[1].to_owned()));
     }
 
-    let tick_rows = csv_lines(&ticks_csv);
+    let tick_rows = csv_lines(&ticks_csv).expect("read exported ticks CSV");
     assert_eq!(
         tick_rows[0],
         "tick,epoch,closed,agent_count,births,deaths,total_energy,average_energy,average_health",
@@ -264,7 +261,10 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
     // ------------------------------------------------------------------
     let perturbed = produce_run(
         &perturbed_db,
-        &["food_max=0.05".to_owned(), "food_respawn_amount=0.01".to_owned()],
+        &[
+            "food_max=0.05".to_owned(),
+            "food_respawn_amount=0.01".to_owned(),
+        ],
     );
     assert!(
         perturbed.status.success(),
