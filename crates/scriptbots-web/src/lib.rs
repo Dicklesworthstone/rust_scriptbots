@@ -863,14 +863,22 @@ mod tests {
                 (expected - actual).abs()
             )
         };
-        let float_field =
-            |subject: &str, field: &str, expected: f32, actual: f32| -> std::result::Result<(), String> {
-                if (expected - actual).abs() <= PARITY_TOLERANCE {
-                    Ok(())
-                } else {
-                    Err(report(subject, field, f64::from(expected), f64::from(actual)))
-                }
-            };
+        let float_field = |subject: &str,
+                           field: &str,
+                           expected: f32,
+                           actual: f32|
+         -> std::result::Result<(), String> {
+            if (expected - actual).abs() <= PARITY_TOLERANCE {
+                Ok(())
+            } else {
+                Err(report(
+                    subject,
+                    field,
+                    f64::from(expected),
+                    f64::from(actual),
+                ))
+            }
+        };
         let exact = |subject: &str, field: &str, matches: bool, detail: String| {
             if matches {
                 Ok(())
@@ -901,7 +909,11 @@ mod tests {
             "summary",
             "agents.len",
             expected.agents.len() == actual.agents.len(),
-            format!("expected {}, actual {}", expected.agents.len(), actual.agents.len()),
+            format!(
+                "expected {}, actual {}",
+                expected.agents.len(),
+                actual.agents.len()
+            ),
         )?;
         float_field(
             "summary",
@@ -943,7 +955,12 @@ mod tests {
             float_field(&subject, "heading", want.heading, got.heading)?;
             float_field(&subject, "health", want.health, got.health)?;
             float_field(&subject, "energy", want.energy, got.energy)?;
-            float_field(&subject, "spike_length", want.spike_length, got.spike_length)?;
+            float_field(
+                &subject,
+                "spike_length",
+                want.spike_length,
+                got.spike_length,
+            )?;
             float_field(
                 &subject,
                 "herbivore_tendency",
@@ -972,7 +989,10 @@ mod tests {
                 &subject,
                 "generation",
                 want.generation == got.generation,
-                format!("expected {:?}, actual {:?}", want.generation, got.generation),
+                format!(
+                    "expected {:?}, actual {:?}",
+                    want.generation, got.generation
+                ),
             )?;
             exact(
                 &subject,
@@ -1000,8 +1020,7 @@ mod tests {
             let effective_config = spec.config();
             let config_hash = parity_config_hash(&effective_config);
 
-            let mut reference_world =
-                WorldState::new(effective_config).expect("reference world");
+            let mut reference_world = WorldState::new(effective_config).expect("reference world");
             let mut mlp_cache = None;
             seed_agents(
                 &mut reference_world,
@@ -1029,7 +1048,10 @@ mod tests {
                 &reference_snapshot,
                 &harness_snapshot,
             ) {
-                panic!("same-runtime harness divergence (seed {}): {divergence}", case.seed);
+                panic!(
+                    "same-runtime harness divergence (seed {}): {divergence}",
+                    case.seed
+                );
             }
         }
     }
@@ -1198,9 +1220,12 @@ mod tests {
                     .tick(checkpoint.tick - current_tick)
                     .expect("wasm parity simulation should accept each step");
                 current_tick = checkpoint.tick;
-                if let Err(divergence) =
-                    compare_snapshots(config_hash, checkpoint.tick, &checkpoint.snapshot, &snapshot)
-                {
+                if let Err(divergence) = compare_snapshots(
+                    config_hash,
+                    checkpoint.tick,
+                    &checkpoint.snapshot,
+                    &snapshot,
+                ) {
                     panic!(
                         "NATIVE-vs-WASM divergence (seed {}): {divergence}",
                         case.seed
