@@ -1,6 +1,9 @@
 //! Public-boundary coverage for the HostCore storage-journal adapter.
 
-use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
+use scriptbots_core::{
+    BrainRunner, INPUT_SIZE, OUTPUT_SIZE, ScriptBotsConfig, Tick, WorldState,
+    channels::OutputChannel,
+};
 use scriptbots_runtime::{
     ApplicationState, CommandId, CommandStatus, EventCatchUp, EventCatchUpGuarantee,
     EventCatchUpState, EventCommitment, EventJournalReader, EventPageSource, EventPoll,
@@ -9,9 +12,9 @@ use scriptbots_runtime::{
     NullFrontend, PlaybackSnapshot,
 };
 use scriptbots_storage::{
-    HostJournalPrefixes, HostJournalRecordState, HostJournalSessionPage, PersistenceGuarantee,
-    StorageError, StorageEventJournalReader, StorageIntegrityCheckResult, StorageJournalOptions,
-    StoragePipeline, StorageReader,
+    DomainEventExpectation, DomainEventPayload, HostJournalPrefixes, HostJournalRecordState,
+    HostJournalSessionPage, PersistenceGuarantee, StorageError, StorageEventJournalReader,
+    StorageIntegrityCheckResult, StorageJournalOptions, StoragePipeline, StorageReader,
 };
 use std::{
     sync::Arc,
@@ -33,6 +36,61 @@ fn compact_world() -> WorldState {
         ..ScriptBotsConfig::default()
     })
     .expect("compact deterministic journal world")
+}
+
+#[derive(Debug)]
+struct AlwaysSpikeBrain;
+
+impl BrainRunner for AlwaysSpikeBrain {
+    fn kind(&self) -> &'static str {
+        "storage-journal-always-spike"
+    }
+
+    fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        let mut outputs = [0.0; OUTPUT_SIZE];
+        outputs[OutputChannel::SpikeTarget.index()] = 1.0;
+        outputs
+    }
+}
+
+fn eventful_cadence_world() -> WorldState {
+    let mut world = WorldState::new(ScriptBotsConfig {
+        world_width: 64,
+        world_height: 64,
+        food_cell_size: 16,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        rng_seed: Some(0xd0_5e_52),
+        closed: false,
+        population_minimum: 0,
+        population_spawn_interval: 1,
+        population_spawn_count: 8,
+        population_crossover_chance: 0.0,
+        reproduction_attempt_chance: 0.0,
+        spike_radius: 100.0,
+        spike_damage: 1_000.0,
+        spike_energy_cost: 0.0,
+        spike_growth_rate: 1.0,
+        spike_min_length: 0.1,
+        spike_alignment_cosine: 0.0,
+        spike_speed_damage_bonus: 0.0,
+        spike_length_damage_bonus: 0.0,
+        carnivore_threshold: 0.999_999,
+        history_capacity: 8,
+        persistence_interval: 3,
+        ..ScriptBotsConfig::default()
+    })
+    .expect("deterministic lifecycle/combat journal world");
+    world
+        .brain_registry_mut()
+        .expect("fresh world permits brain registration")
+        .register("storage-journal-always-spike", |_| {
+            Ok(Box::new(AlwaysSpikeBrain))
+        });
+    world
 }
 
 fn host_options(scientific_event_capacity: usize) -> HostCoreOptions {
@@ -610,9 +668,233 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
         "host_journal_conformance.after",
     );
 
+    let empty_domain_evidence = finished_reader
+        .domain_event_evidence(session_id, DomainEventExpectation::AllowEmpty)
+        .expect("two empty scientific boundaries still have explicit projection coverage");
+    assert_eq!(empty_domain_evidence.scientific_event_count, 2);
+    assert_eq!(empty_domain_evidence.domain_event_count, 0);
+    let empty_domain_page = finished_reader
+        .domain_event_page(session_id, None, 16, options.max_event_page_bytes)
+        .expect("honestly empty normalized domain page");
+    assert!(empty_domain_page.events.is_empty());
+    assert_eq!(empty_domain_page.next_after, None);
+    assert_eq!(empty_domain_page.evidence, empty_domain_evidence);
+    let no_evidence = finished_reader
+        .domain_event_evidence(session_id, DomainEventExpectation::RequireNonEmpty)
+        .expect_err("a scenario-declared event requirement must fail closed on zero rows");
+    assert!(
+        matches!(
+            no_evidence,
+            StorageError::NoEvidence {
+                context: "host_domain_events",
+                ..
+            }
+        ),
+        "non-vacuity must remain a typed NoEvidence outcome"
+    );
+
     finished_reader
         .close()
         .expect("close the immutable finished-run conformance reader");
+
+    // The uniquely named database is intentionally retained; this test performs no file deletion.
+}
+
+#[test]
+#[allow(
+    clippy::drop_non_drop,
+    clippy::too_many_lines,
+    reason = "one public-boundary test proves per-tick lifecycle/combat projection, deferred persistence cadence, durable reopen, typed non-vacuity, and bounded cursor paging together"
+)]
+fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistence() {
+    let path = unique_database_path("domain_event_cadence");
+    let mut pipeline = StoragePipeline::create_unattributed_file(&path)
+        .expect("new uniquely named file storage pipeline");
+    let run_id = pipeline.run_id();
+    let session_id = HostSessionId::new(0x1004);
+    let options = StorageJournalOptions::default();
+    let journal = pipeline
+        .journal_port(session_id, options)
+        .expect("file domain journal port");
+    let mut core = HostCore::with_journal(
+        session_id,
+        eventful_cadence_world(),
+        host_options(8),
+        Box::new(journal),
+    )
+    .expect("host backed by the durable domain journal");
+    let mut frontend = NullFrontend::new(core.local_port(), 0x2004);
+    let mut next_nanos = 0;
+
+    let first = frontend.step().expect("population-injection step");
+    drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        first.command_id(),
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    let second = frontend.step().expect("combat/death step");
+    drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        second.command_id(),
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    assert_eq!(core.world_tick(), Tick(2));
+
+    let shutdown = frontend.shutdown().expect("ordered durable shutdown");
+    drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        shutdown.command_id(),
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    assert_eq!(
+        pipeline
+            .shutdown()
+            .expect("close durable domain storage")
+            .guarantee,
+        PersistenceGuarantee::Durable
+    );
+    drop(frontend);
+    drop(core);
+    drop(pipeline);
+
+    let reader = StorageReader::open_finished_for_run(&path, run_id)
+        .expect("reopen immutable domain-event evidence");
+    let journal_page = reader
+        .host_journal_session_conformance_page(session_id, None, 16, options.max_event_page_bytes)
+        .expect("load exact Step/Step/Shutdown canonical archives");
+    assert_eq!(journal_page.records.len(), 3);
+    assert_eq!(journal_page.progress.events.durable, 2);
+
+    let mut expected_payloads = Vec::new();
+    for record in &journal_page.records {
+        let Some(event) = &record.event else {
+            continue;
+        };
+        expected_payloads.extend(
+            event
+                .event
+                .boundary
+                .births()
+                .iter()
+                .cloned()
+                .map(DomainEventPayload::Birth),
+        );
+        expected_payloads.extend(
+            event
+                .event
+                .boundary
+                .deaths()
+                .iter()
+                .cloned()
+                .map(DomainEventPayload::Death),
+        );
+        let combat = event.event.boundary.combat();
+        if combat.spike_attempts != 0 || combat.spike_hits != 0 {
+            expected_payloads.push(DomainEventPayload::Combat(combat));
+        }
+    }
+    assert!(
+        expected_payloads
+            .iter()
+            .any(|payload| matches!(payload, DomainEventPayload::Birth(_))),
+        "the first scientific boundary must retain scheduled arrivals"
+    );
+    assert!(
+        expected_payloads
+            .iter()
+            .any(|payload| matches!(payload, DomainEventPayload::Death(_))),
+        "the second scientific boundary must retain combat deaths"
+    );
+    assert!(
+        expected_payloads.iter().any(|payload| matches!(
+            payload,
+            DomainEventPayload::Combat(combat)
+                if combat.spike_attempts != 0 && combat.spike_hits != 0
+        )),
+        "the second scientific boundary must retain nonzero aggregate combat"
+    );
+
+    let evidence = reader
+        .domain_event_evidence(session_id, DomainEventExpectation::RequireNonEmpty)
+        .expect("scenario-declared lifecycle/combat evidence is non-vacuous");
+    assert_eq!(evidence.scientific_event_count, 2);
+    assert_eq!(
+        evidence.domain_event_count,
+        u64::try_from(expected_payloads.len()).expect("bounded test evidence count fits u64")
+    );
+    let domain_page = reader
+        .domain_event_page(session_id, None, 4_096, options.max_event_page_bytes)
+        .expect("load the complete bounded typed domain-event page");
+    assert_eq!(domain_page.next_after, None);
+    assert_eq!(domain_page.evidence, evidence);
+    assert_eq!(
+        domain_page
+            .events
+            .iter()
+            .map(|event| event.payload.clone())
+            .collect::<Vec<_>>(),
+        expected_payloads,
+        "normalized rows must reproduce the complete canonical boundary payloads"
+    );
+    for event in &domain_page.events {
+        assert_eq!(event.archive_payload_digest.len(), 64);
+        assert!(
+            event
+                .archive_payload_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert!(matches!(event.journal_batch_id.sequence(), 1 | 2));
+    }
+
+    let first_page = reader
+        .domain_event_page(session_id, None, 1, options.max_event_page_bytes)
+        .expect("read first single-row domain page");
+    assert_eq!(first_page.events.len(), 1);
+    let first_cursor = first_page
+        .next_after
+        .expect("nontrivial evidence has a second domain row");
+    assert_eq!(first_cursor, first_page.events[0].cursor());
+    let second_page = reader
+        .domain_event_page(
+            session_id,
+            Some(first_cursor),
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect("resume after the exact typed domain cursor");
+    assert_eq!(second_page.events.len(), 1);
+    assert_ne!(second_page.events[0].cursor(), first_cursor);
+
+    let fabricated_cursor = scriptbots_storage::DomainEventCursor {
+        event_ordinal: first_cursor.event_ordinal.saturating_add(10_000),
+        ..first_cursor
+    };
+    let cursor_error = reader
+        .domain_event_page(
+            session_id,
+            Some(fabricated_cursor),
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect_err("a fabricated cursor cannot skip normalized evidence");
+    assert!(matches!(
+        cursor_error,
+        StorageError::InvalidData {
+            context: "host_domain_events.after",
+            ..
+        }
+    ));
+
+    reader
+        .close()
+        .expect("close immutable domain-event reader");
 
     // The uniquely named database is intentionally retained; this test performs no file deletion.
 }

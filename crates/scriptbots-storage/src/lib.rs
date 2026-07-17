@@ -5,9 +5,11 @@
 mod journal;
 
 pub use journal::{
-    HostJournalPrefixes, HostJournalRecord, HostJournalRecordState, HostJournalSessionPage,
-    HostJournalSessionProgress, StorageEventJournalReader, StorageIntegrityCheckResult,
-    StorageJournalOptions, StorageJournalPort,
+    DomainEventCursor, DomainEventEvidence, DomainEventExpectation, DomainEventKind, DomainEventPage,
+    DomainEventPayload, DomainEventRecord, HostJournalPrefixes, HostJournalRecord,
+    HostJournalRecordState, HostJournalSessionPage, HostJournalSessionProgress,
+    StorageEventJournalReader, StorageIntegrityCheckResult, StorageJournalOptions,
+    StorageJournalPort,
 };
 
 use arc_swap::ArcSwap;
@@ -19,8 +21,8 @@ use fsqlite::{
 };
 use journal::{
     HOST_JOURNAL_ARCHIVE_VERSION, HostJournalArchive, JournalReaderBackend, JournalReaderPublisher,
-    JournalSessionShared, PreparedHostJournalArchive, decode_journal_u64, encode_journal_u64,
-    prepare_host_journal_archive,
+    JournalSessionShared, PreparedDomainEventProjection, PreparedHostJournalArchive,
+    decode_journal_u64, encode_journal_u64, prepare_host_journal_archive,
 };
 use scriptbots_core::{
     AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding,
@@ -163,9 +165,10 @@ pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
 ];
 
 const SCRIPTBOTS_SCHEMA_V6_VERSION: i64 = 6;
+const SCRIPTBOTS_SCHEMA_V7_VERSION: i64 = 7;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 7;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 8;
 
 /// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
@@ -174,9 +177,9 @@ pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 7;
 /// This is deliberately a clean lineage: existing v3-v5 databases require an explicit
 /// export/import migration rather than an in-place rewrite.
 ///
-/// Fresh installs apply this bootstrap before the additive V7 migration. This DDL is exported for
-/// read-only schema inspection and FrankenSQLite conformance probes. It is not a supported
-/// file-writer API; production scientific writes must use [`StoragePipeline`].
+/// Fresh installs apply this bootstrap before the additive V7 and V8 migrations. This DDL is
+/// exported for read-only schema inspection and FrankenSQLite conformance probes. It is not a
+/// supported file-writer API; production scientific writes must use [`StoragePipeline`].
 pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
     CREATE TABLE runs (
         run_id TEXT PRIMARY KEY CHECK (run_id <> ''),
@@ -666,6 +669,88 @@ pub const SCRIPTBOTS_SCHEMA_V7: &str = r#"
     PRAGMA user_version = 7;
 "#;
 
+/// Additive normalized domain-event projection bound to the canonical host archive.
+///
+/// A projection-batch row exists for every scientific boundary, including boundaries that emit
+/// zero lifecycle/combat rows. That explicit zero is what lets readers distinguish honest empty
+/// evidence from a missing projection. Event ordinals are deterministic within one contiguous
+/// scientific-event sequence. The copied archive digest binds each row to its canonical source;
+/// it is deliberately named as an archive payload digest and is never presented as a world-state
+/// digest.
+pub const SCRIPTBOTS_SCHEMA_V8: &str = r#"
+    CREATE TABLE host_domain_event_batches (
+        run_id TEXT NOT NULL,
+        host_session_id TEXT NOT NULL CHECK (
+            length(host_session_id) = 16
+            AND host_session_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        scientific_event_sequence TEXT NOT NULL CHECK (
+            length(scientific_event_sequence) = 16
+            AND scientific_event_sequence NOT GLOB '*[^0-9a-f]*'
+            AND scientific_event_sequence <> '0000000000000000'
+        ),
+        journal_sequence TEXT NOT NULL CHECK (
+            length(journal_sequence) = 16
+            AND journal_sequence NOT GLOB '*[^0-9a-f]*'
+            AND journal_sequence <> '0000000000000000'
+        ),
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        event_count INTEGER NOT NULL CHECK (event_count >= 0),
+        archive_payload_digest TEXT NOT NULL CHECK (
+            length(archive_payload_digest) = 64
+            AND archive_payload_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        PRIMARY KEY (run_id, host_session_id, scientific_event_sequence),
+        UNIQUE (run_id, host_session_id, journal_sequence),
+        UNIQUE (
+            run_id, host_session_id, scientific_event_sequence, journal_sequence
+        ),
+        FOREIGN KEY (run_id, host_session_id, journal_sequence)
+            REFERENCES host_journal_batch_ledger (run_id, host_session_id, journal_sequence)
+    );
+    CREATE INDEX host_domain_event_batches_run_session_journal_index
+        ON host_domain_event_batches (run_id, host_session_id, journal_sequence);
+
+    CREATE TABLE host_domain_events (
+        run_id TEXT NOT NULL,
+        host_session_id TEXT NOT NULL CHECK (
+            length(host_session_id) = 16
+            AND host_session_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        scientific_event_sequence TEXT NOT NULL CHECK (
+            length(scientific_event_sequence) = 16
+            AND scientific_event_sequence NOT GLOB '*[^0-9a-f]*'
+            AND scientific_event_sequence <> '0000000000000000'
+        ),
+        event_ordinal INTEGER NOT NULL CHECK (event_ordinal >= 0),
+        journal_sequence TEXT NOT NULL CHECK (
+            length(journal_sequence) = 16
+            AND journal_sequence NOT GLOB '*[^0-9a-f]*'
+            AND journal_sequence <> '0000000000000000'
+        ),
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        kind TEXT NOT NULL CHECK (kind IN ('birth', 'death', 'combat')),
+        actor_agent_uid INTEGER CHECK (actor_agent_uid IS NULL OR actor_agent_uid >= 0),
+        payload_json TEXT NOT NULL CHECK (payload_json <> ''),
+        archive_payload_digest TEXT NOT NULL CHECK (
+            length(archive_payload_digest) = 64
+            AND archive_payload_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        PRIMARY KEY (run_id, host_session_id, scientific_event_sequence, event_ordinal),
+        FOREIGN KEY (
+            run_id, host_session_id, scientific_event_sequence, journal_sequence
+        ) REFERENCES host_domain_event_batches (
+            run_id, host_session_id, scientific_event_sequence, journal_sequence
+        )
+    );
+    CREATE INDEX host_domain_events_run_session_kind_sequence_index
+        ON host_domain_events (
+            run_id, host_session_id, kind, scientific_event_sequence, event_ordinal
+        );
+
+    PRAGMA user_version = 8;
+"#;
+
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaObject {
     object_type: String,
@@ -695,14 +780,25 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
             SCRIPTBOTS_SCHEMA_V6,
         )
         .add(
-            SCRIPTBOTS_SCHEMA_VERSION,
+            SCRIPTBOTS_SCHEMA_V7_VERSION,
             "add_host_journal_archive",
             SCRIPTBOTS_SCHEMA_V7,
+        )
+        .add(
+            SCRIPTBOTS_SCHEMA_VERSION,
+            "add_host_domain_event_projection",
+            SCRIPTBOTS_SCHEMA_V8,
         )
         .run(connection)?;
     let applied_is_valid = result.applied.is_empty()
         || result.applied == [SCRIPTBOTS_SCHEMA_VERSION]
-        || result.applied == [SCRIPTBOTS_SCHEMA_V6_VERSION, SCRIPTBOTS_SCHEMA_VERSION];
+        || result.applied == [SCRIPTBOTS_SCHEMA_V7_VERSION, SCRIPTBOTS_SCHEMA_VERSION]
+        || result.applied
+            == [
+                SCRIPTBOTS_SCHEMA_V6_VERSION,
+                SCRIPTBOTS_SCHEMA_V7_VERSION,
+                SCRIPTBOTS_SCHEMA_VERSION,
+            ];
     if result.current != SCRIPTBOTS_SCHEMA_VERSION || !applied_is_valid {
         return Err(StorageError::InvalidData {
             context: "_schema_migrations",
@@ -2322,6 +2418,12 @@ pub enum StorageError {
     TerminallyFailed,
     #[error("invalid storage data in {context}: {reason}")]
     InvalidData {
+        context: &'static str,
+        reason: String,
+    },
+    /// A caller-declared evidence requirement was evaluated honestly and found no qualifying rows.
+    #[error("no storage evidence in {context}: {reason}")]
+    NoEvidence {
         context: &'static str,
         reason: String,
     },
@@ -5221,6 +5323,578 @@ impl StorageReader {
         })
     }
 
+    fn finished_domain_event_evidence(
+        &self,
+        session_id: HostSessionId,
+        expectation: DomainEventExpectation,
+    ) -> Result<DomainEventEvidence, StorageError> {
+        let connection = self.finished_connection()?;
+        let progress = Self::finished_host_journal_progress(connection, self.run_id, session_id)?;
+        let session = encode_journal_u64(session_id.get());
+        let batch_row = connection.query_row_with_params(
+            "SELECT COUNT(*), MIN(scientific_event_sequence),
+                    MAX(scientific_event_sequence), COALESCE(SUM(event_count), 0)
+             FROM host_domain_event_batches
+             WHERE run_id = ?1 AND host_session_id = ?2",
+            &[sqlite_run_id(self.run_id), session.as_str().into()],
+        )?;
+        let batch_count = checked_u64(
+            "host_domain_event_batches.count",
+            decode(&batch_row, 0, "host_domain_event_batches.count")?,
+        )?;
+        let minimum: Option<String> = decode(
+            &batch_row,
+            1,
+            "host_domain_event_batches.minimum_sequence",
+        )?;
+        let maximum: Option<String> = decode(
+            &batch_row,
+            2,
+            "host_domain_event_batches.maximum_sequence",
+        )?;
+        let declared_event_count = checked_u64(
+            "host_domain_event_batches.total_event_count",
+            decode(
+                &batch_row,
+                3,
+                "host_domain_event_batches.total_event_count",
+            )?,
+        )?;
+        let expected_bounds = (progress.durable_event != 0)
+            .then_some((encode_journal_u64(1), encode_journal_u64(progress.durable_event)));
+        if batch_count != progress.durable_event
+            || minimum.as_deref() != expected_bounds.as_ref().map(|bounds| bounds.0.as_str())
+            || maximum.as_deref() != expected_bounds.as_ref().map(|bounds| bounds.1.as_str())
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_event_batches.scientific_event_sequence",
+                reason: format!(
+                    "finished session {} has durable event prefix {} but projection count/bounds are {batch_count}/{minimum:?}/{maximum:?}",
+                    session_id.get(),
+                    progress.durable_event
+                ),
+            });
+        }
+        let event_row = connection.query_row_with_params(
+            "SELECT COUNT(*) FROM host_domain_events
+             WHERE run_id = ?1 AND host_session_id = ?2",
+            &[sqlite_run_id(self.run_id), session.as_str().into()],
+        )?;
+        let stored_event_count = checked_u64(
+            "host_domain_events.count",
+            decode(&event_row, 0, "host_domain_events.count")?,
+        )?;
+        if stored_event_count != declared_event_count {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.event_count",
+                reason: format!(
+                    "projection batches declare {declared_event_count} rows but store {stored_event_count}"
+                ),
+            });
+        }
+        if expectation == DomainEventExpectation::RequireNonEmpty && stored_event_count == 0 {
+            return Err(StorageError::NoEvidence {
+                context: "host_domain_events",
+                reason: format!(
+                    "session {} was required to emit a lifecycle or combat event, but all {} durable scientific boundaries projected zero rows",
+                    session_id.get(),
+                    progress.durable_event
+                ),
+            });
+        }
+        Ok(DomainEventEvidence {
+            scientific_event_count: progress.durable_event,
+            domain_event_count: stored_event_count,
+        })
+    }
+
+    /// Validate complete normalized-domain coverage and evaluate an explicit non-vacuity policy.
+    ///
+    /// A projection-batch row is required for every durable scientific sequence, including honest
+    /// zero-row boundaries. [`DomainEventExpectation::RequireNonEmpty`] therefore returns the typed
+    /// [`StorageError::NoEvidence`] outcome when a scenario promised lifecycle or combat evidence
+    /// but the fully covered session emitted none.
+    pub fn domain_event_evidence(
+        &self,
+        session_id: HostSessionId,
+        expectation: DomainEventExpectation,
+    ) -> Result<DomainEventEvidence, StorageError> {
+        self.finished_domain_event_evidence(session_id, expectation)
+    }
+
+    /// Read one bounded page of normalized birth, death, and aggregate-combat evidence.
+    ///
+    /// The exact cursor must name an existing row, preventing a caller from skipping evidence by
+    /// inventing a later ordinal. Rows are ordered by contiguous scientific sequence and zero-based
+    /// local ordinal. The immutable finished-reader open already validates every projection batch
+    /// against its canonical archive, including zero-row batches; this page additionally validates
+    /// cursor identity, sequence coverage, local ordering, typed canonical payloads, archive-digest
+    /// links, and aggregate payload bytes before exposing a record.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the public page boundary validates cursor, sequence coverage, two resource bounds, typed payloads, and source-archive links before exposing evidence"
+    )]
+    pub fn domain_event_page(
+        &self,
+        session_id: HostSessionId,
+        after: Option<DomainEventCursor>,
+        record_limit: usize,
+        page_payload_byte_limit: usize,
+    ) -> Result<DomainEventPage, StorageError> {
+        if record_limit == 0 {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.record_limit",
+                reason: "record limit must be nonzero".to_owned(),
+            });
+        }
+        let query_limit = checked_query_limit("host_domain_events.record_limit", record_limit)?;
+        if page_payload_byte_limit == 0 || page_payload_byte_limit > MAX_HOST_JOURNAL_ARCHIVE_BYTES
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.page_payload_byte_limit",
+                reason: format!(
+                    "page payload byte limit {page_payload_byte_limit} is outside the bounded 1..={MAX_HOST_JOURNAL_ARCHIVE_BYTES} range"
+                ),
+            });
+        }
+        let evidence =
+            self.finished_domain_event_evidence(session_id, DomainEventExpectation::AllowEmpty)?;
+        let connection = self.finished_connection()?;
+        let session = encode_journal_u64(session_id.get());
+        let (after_sequence, after_ordinal) = match after {
+            Some(cursor) if cursor.session_id != session_id => {
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_events.after",
+                    reason: format!(
+                        "cursor session {} does not match requested session {}",
+                        cursor.session_id.get(),
+                        session_id.get()
+                    ),
+                });
+            }
+            Some(cursor) if cursor.scientific_event_sequence.get() == 0 => {
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_events.after",
+                    reason: "cursor scientific-event sequence must be nonzero".to_owned(),
+                });
+            }
+            Some(cursor) => {
+                let encoded = encode_journal_u64(cursor.scientific_event_sequence.get());
+                let ordinal = i64::try_from(cursor.event_ordinal).map_err(|error| {
+                    StorageError::InvalidData {
+                        context: "host_domain_events.after",
+                        reason: error.to_string(),
+                    }
+                })?;
+                let cursor_rows = connection.query_with_params(
+                    "SELECT projection.event_count
+                     FROM host_domain_events AS event
+                     JOIN host_domain_event_batches AS projection
+                       ON projection.run_id = event.run_id
+                      AND projection.host_session_id = event.host_session_id
+                      AND projection.scientific_event_sequence = event.scientific_event_sequence
+                      AND projection.journal_sequence = event.journal_sequence
+                     WHERE event.run_id = ?1 AND event.host_session_id = ?2
+                       AND event.scientific_event_sequence = ?3 AND event.event_ordinal = ?4",
+                    &[
+                        sqlite_run_id(self.run_id),
+                        session.as_str().into(),
+                        encoded.as_str().into(),
+                        ordinal.into(),
+                    ],
+                )?;
+                let [cursor_row] = cursor_rows.as_slice() else {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.after",
+                        reason: format!(
+                            "cursor ({}, {}) names {} normalized rows",
+                            cursor.scientific_event_sequence.get(),
+                            cursor.event_ordinal,
+                            cursor_rows.len()
+                        ),
+                    });
+                };
+                let event_count = checked_u64(
+                    "host_domain_event_batches.event_count",
+                    decode(
+                        cursor_row,
+                        0,
+                        "host_domain_event_batches.event_count",
+                    )?,
+                )?;
+                if cursor.event_ordinal >= event_count {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.after",
+                        reason: "cursor ordinal is outside its projection batch".to_owned(),
+                    });
+                }
+                (cursor.scientific_event_sequence.get(), ordinal)
+            }
+            None => (0, -1),
+        };
+        if after_sequence > evidence.scientific_event_count {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.after",
+                reason: format!(
+                    "cursor scientific event {after_sequence} exceeds durable prefix {}",
+                    evidence.scientific_event_count
+                ),
+            });
+        }
+        let after_encoded = encode_journal_u64(after_sequence);
+        let metadata_rows = connection.query_with_params(
+            "SELECT event.scientific_event_sequence, event.event_ordinal,
+                    event.journal_sequence, event.tick, event.kind, event.actor_agent_uid,
+                    length(CAST(event.payload_json AS BLOB)), event.archive_payload_digest,
+                    projection.event_count, projection.tick, projection.journal_sequence,
+                    projection.archive_payload_digest, ledger.state,
+                    ledger.scientific_event_sequence, archive.payload_digest
+             FROM host_domain_events AS event
+             JOIN host_domain_event_batches AS projection
+               ON projection.run_id = event.run_id
+              AND projection.host_session_id = event.host_session_id
+              AND projection.scientific_event_sequence = event.scientific_event_sequence
+              AND projection.journal_sequence = event.journal_sequence
+             JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = projection.run_id
+              AND ledger.host_session_id = projection.host_session_id
+              AND ledger.journal_sequence = projection.journal_sequence
+             JOIN host_journal_archive AS archive
+               ON archive.run_id = ledger.run_id
+              AND archive.host_session_id = ledger.host_session_id
+              AND archive.journal_sequence = ledger.journal_sequence
+             WHERE event.run_id = ?1 AND event.host_session_id = ?2
+               AND (
+                    event.scientific_event_sequence > ?3
+                    OR (
+                        event.scientific_event_sequence = ?3
+                        AND event.event_ordinal > ?4
+                    )
+               )
+             ORDER BY event.scientific_event_sequence ASC, event.event_ordinal ASC
+             LIMIT ?5",
+            &[
+                sqlite_run_id(self.run_id),
+                session.as_str().into(),
+                after_encoded.as_str().into(),
+                after_ordinal.into(),
+                query_limit.into(),
+            ],
+        )?;
+
+        let mut events = Vec::with_capacity(metadata_rows.len());
+        let mut page_payload_bytes = 0_usize;
+        let mut prior_sequence = after_sequence;
+        let mut prior_ordinal = after.map(|cursor| cursor.event_ordinal);
+        let mut prior_event_count = after
+            .map(|cursor| {
+                let row = connection.query_row_with_params(
+                    "SELECT event_count FROM host_domain_event_batches
+                     WHERE run_id = ?1 AND host_session_id = ?2
+                       AND scientific_event_sequence = ?3",
+                    &[
+                        sqlite_run_id(self.run_id),
+                        session.as_str().into(),
+                        encode_journal_u64(cursor.scientific_event_sequence.get())
+                            .as_str()
+                            .into(),
+                    ],
+                )?;
+                checked_u64(
+                    "host_domain_event_batches.event_count",
+                    decode(&row, 0, "host_domain_event_batches.event_count")?,
+                )
+            })
+            .transpose()?;
+        for row in &metadata_rows {
+            let encoded_event: String =
+                decode(row, 0, "host_domain_events.scientific_event_sequence")?;
+            let sequence = decode_journal_u64(
+                "host_domain_events.scientific_event_sequence",
+                &encoded_event,
+            )?;
+            let ordinal = checked_u64(
+                "host_domain_events.event_ordinal",
+                decode(row, 1, "host_domain_events.event_ordinal")?,
+            )?;
+            let journal: String = decode(row, 2, "host_domain_events.journal_sequence")?;
+            let tick = checked_u64(
+                "host_domain_events.tick",
+                decode(row, 3, "host_domain_events.tick")?,
+            )?;
+            let kind = DomainEventKind::decode(&decode::<String>(
+                row,
+                4,
+                "host_domain_events.kind",
+            )?)?;
+            let actor_raw: Option<i64> = decode(row, 5, "host_domain_events.actor_agent_uid")?;
+            let actor = actor_raw
+                .map(|value| checked_u64("host_domain_events.actor_agent_uid", value))
+                .transpose()?
+                .map(AgentUid);
+            let payload_bytes = usize::try_from(decode::<i64>(
+                row,
+                6,
+                "host_domain_events.payload_json.length",
+            )?)
+            .map_err(|error| StorageError::InvalidData {
+                context: "host_domain_events.payload_json",
+                reason: error.to_string(),
+            })?;
+            let event_digest: String =
+                decode(row, 7, "host_domain_events.archive_payload_digest")?;
+            let event_count = checked_u64(
+                "host_domain_event_batches.event_count",
+                decode(row, 8, "host_domain_event_batches.event_count")?,
+            )?;
+            let projection_tick = checked_u64(
+                "host_domain_event_batches.tick",
+                decode(row, 9, "host_domain_event_batches.tick")?,
+            )?;
+            let projection_journal: String =
+                decode(row, 10, "host_domain_event_batches.journal_sequence")?;
+            let projection_digest: String = decode(
+                row,
+                11,
+                "host_domain_event_batches.archive_payload_digest",
+            )?;
+            let ledger_state: String =
+                decode(row, 12, "host_journal_batch_ledger.state")?;
+            let ledger_event: String = decode(
+                row,
+                13,
+                "host_journal_batch_ledger.scientific_event_sequence",
+            )?;
+            let archive_digest: String =
+                decode(row, 14, "host_journal_archive.payload_digest")?;
+            if HostJournalState::decode(&ledger_state)? != HostJournalState::Durable
+                || encoded_event != ledger_event
+                || journal != projection_journal
+                || tick != projection_tick
+                || event_digest != projection_digest
+                || event_digest != archive_digest
+                || ordinal >= event_count
+            {
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_events.archive_binding",
+                    reason: format!(
+                        "normalized event ({sequence}, {ordinal}) is not exactly bound to one durable canonical archive"
+                    ),
+                });
+            }
+            if sequence == prior_sequence {
+                let expected_ordinal = prior_ordinal
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(StorageError::InvalidData {
+                        context: "host_domain_events.event_ordinal",
+                        reason: "event ordinal space is exhausted".to_owned(),
+                    })?;
+                if ordinal != expected_ordinal {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.event_ordinal",
+                        reason: format!(
+                            "scientific event {sequence} expected ordinal {expected_ordinal}, found {ordinal}"
+                        ),
+                    });
+                }
+            } else {
+                if sequence <= prior_sequence || ordinal != 0 {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.scientific_event_sequence",
+                        reason: format!(
+                            "domain-event order advanced from ({prior_sequence}, {prior_ordinal:?}) to ({sequence}, {ordinal})"
+                        ),
+                    });
+                }
+                if let (Some(previous_ordinal), Some(previous_count)) =
+                    (prior_ordinal, prior_event_count)
+                    && previous_ordinal.checked_add(1) != Some(previous_count)
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.event_ordinal",
+                        reason: format!(
+                            "page skipped the suffix of scientific event {prior_sequence} after ordinal {previous_ordinal}"
+                        ),
+                    });
+                }
+            }
+            let next_page_bytes = page_payload_bytes.checked_add(payload_bytes).ok_or(
+                StorageError::InvalidData {
+                    context: "host_domain_events.page_payload_byte_limit",
+                    reason: "page payload byte accounting overflowed".to_owned(),
+                },
+            )?;
+            if payload_bytes == 0 || next_page_bytes > page_payload_byte_limit {
+                if events.is_empty() {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.page_payload_byte_limit",
+                        reason: format!(
+                            "domain event ({sequence}, {ordinal}) requires {payload_bytes} bytes, exceeding the page limit {page_payload_byte_limit}"
+                        ),
+                    });
+                }
+                break;
+            }
+            let payload_row = connection.query_row_with_params(
+                "SELECT payload_json FROM host_domain_events
+                 WHERE run_id = ?1 AND host_session_id = ?2
+                   AND scientific_event_sequence = ?3 AND event_ordinal = ?4
+                   AND length(CAST(payload_json AS BLOB)) = ?5",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    encoded_event.as_str().into(),
+                    i64::try_from(ordinal)
+                        .map_err(|error| StorageError::InvalidData {
+                            context: "host_domain_events.event_ordinal",
+                            reason: error.to_string(),
+                        })?
+                        .into(),
+                    i64::try_from(payload_bytes)
+                        .map_err(|error| StorageError::InvalidData {
+                            context: "host_domain_events.payload_json",
+                            reason: error.to_string(),
+                        })?
+                        .into(),
+                ],
+            )?;
+            let payload_json: String =
+                decode(&payload_row, 0, "host_domain_events.payload_json")?;
+            let payload = DomainEventPayload::decode_json(kind, &payload_json)?;
+            if actor != payload.actor_agent_uid() {
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_events.actor_agent_uid",
+                    reason: "normalized actor differs from its typed payload".to_owned(),
+                });
+            }
+            match &payload {
+                DomainEventPayload::Birth(record) if record.tick.0 != tick => {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.tick",
+                        reason: "birth payload tick differs from its normalized row".to_owned(),
+                    });
+                }
+                DomainEventPayload::Death(record) if record.tick.0 != tick => {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.tick",
+                        reason: "death payload tick differs from its normalized row".to_owned(),
+                    });
+                }
+                DomainEventPayload::Combat(combat)
+                    if combat.spike_attempts == 0 && combat.spike_hits == 0 =>
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.payload_json",
+                        reason: "zero aggregate combat payload must not be projected".to_owned(),
+                    });
+                }
+                _ => {}
+            }
+            let journal_sequence = decode_journal_u64(
+                "host_domain_events.journal_sequence",
+                &journal,
+            )?;
+            events.push(DomainEventRecord {
+                session_id,
+                scientific_event_sequence: EventSequence::new(sequence),
+                event_ordinal: ordinal,
+                journal_batch_id: JournalBatchId::new(session_id, journal_sequence),
+                tick: Tick(tick),
+                payload,
+                archive_payload_digest: event_digest,
+            });
+            page_payload_bytes = next_page_bytes;
+            prior_sequence = sequence;
+            prior_ordinal = Some(ordinal);
+            prior_event_count = Some(event_count);
+        }
+
+        if let Some(last) = events.last() {
+            let covered_row = connection.query_row_with_params(
+                "SELECT COUNT(*) FROM host_domain_event_batches
+                 WHERE run_id = ?1 AND host_session_id = ?2
+                   AND scientific_event_sequence > ?3 AND scientific_event_sequence <= ?4",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    after_encoded.as_str().into(),
+                    encode_journal_u64(last.scientific_event_sequence.get())
+                        .as_str()
+                        .into(),
+                ],
+            )?;
+            let covered = checked_u64(
+                "host_domain_event_batches.sequence_coverage",
+                decode(
+                    &covered_row,
+                    0,
+                    "host_domain_event_batches.sequence_coverage",
+                )?,
+            )?;
+            let expected = last
+                .scientific_event_sequence
+                .get()
+                .checked_sub(after_sequence)
+                .ok_or(StorageError::InvalidData {
+                    context: "host_domain_event_batches.scientific_event_sequence",
+                    reason: "domain-event sequence coverage underflowed".to_owned(),
+                })?;
+            if covered != expected {
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_event_batches.scientific_event_sequence",
+                    reason: format!(
+                        "page crossed {expected} scientific boundaries but found {covered} projection batches"
+                    ),
+                });
+            }
+        } else if after.is_none() && evidence.domain_event_count != 0 {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.event_count",
+                reason: format!(
+                    "finished evidence declares {} domain events but the first page is empty",
+                    evidence.domain_event_count
+                ),
+            });
+        }
+        let next_after = if let Some(last) = events.last() {
+            let cursor = last.cursor();
+            let more = connection.query_with_params(
+                "SELECT 1 FROM host_domain_events
+                 WHERE run_id = ?1 AND host_session_id = ?2
+                   AND (
+                        scientific_event_sequence > ?3
+                        OR (
+                            scientific_event_sequence = ?3 AND event_ordinal > ?4
+                        )
+                   )
+                 LIMIT 1",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    encode_journal_u64(cursor.scientific_event_sequence.get())
+                        .as_str()
+                        .into(),
+                    i64::try_from(cursor.event_ordinal)
+                        .map_err(|error| StorageError::InvalidData {
+                            context: "host_domain_events.event_ordinal",
+                            reason: error.to_string(),
+                        })?
+                        .into(),
+                ],
+            )?;
+            (!more.is_empty()).then_some(cursor)
+        } else {
+            None
+        };
+        Ok(DomainEventPage {
+            run_id: self.run_id,
+            session_id,
+            events,
+            next_after,
+            evidence,
+        })
+    }
+
     /// Return the maximum durable tick, if the database contains tick rows.
     pub fn max_tick(&self) -> Result<Option<u64>, StorageError> {
         let row = self.connection()?.query_row_with_params(
@@ -7043,18 +7717,22 @@ impl Storage {
             "SELECT version, name FROM _schema_migrations
              ORDER BY version ASC",
         )?;
-        if migrations.len() != 2 {
+        if migrations.len() != 3 {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_schema",
                 reason: format!(
-                    "expected exactly two ScriptBots migrations through v7, found {}",
+                    "expected exactly three ScriptBots migrations through v8, found {}",
                     migrations.len()
                 ),
             });
         }
         let expected_migrations = [
             (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
-            (SCRIPTBOTS_SCHEMA_VERSION, "add_host_journal_archive"),
+            (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_host_domain_event_projection",
+            ),
         ];
         for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
             let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
@@ -7482,6 +8160,55 @@ impl Storage {
                 ),
             });
         }
+        let projection_orphan = connection.query_with_params(
+            "SELECT projection.host_session_id, projection.scientific_event_sequence
+             FROM host_domain_event_batches AS projection
+             LEFT JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = projection.run_id
+              AND ledger.host_session_id = projection.host_session_id
+              AND ledger.journal_sequence = projection.journal_sequence
+             WHERE projection.run_id = ?1 AND ledger.journal_sequence IS NULL
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = projection_orphan.first() {
+            let session: String = decode(row, 0, "host_domain_event_batches.host_session_id")?;
+            let sequence: String = decode(
+                row,
+                1,
+                "host_domain_event_batches.scientific_event_sequence",
+            )?;
+            return Err(StorageError::InvalidData {
+                context: "host_domain_event_batches.identity",
+                reason: format!(
+                    "domain projection ({session}, {sequence}) has no matching host-journal ledger"
+                ),
+            });
+        }
+        let event_orphan = connection.query_with_params(
+            "SELECT event.host_session_id, event.scientific_event_sequence, event.event_ordinal
+             FROM host_domain_events AS event
+             LEFT JOIN host_domain_event_batches AS projection
+               ON projection.run_id = event.run_id
+              AND projection.host_session_id = event.host_session_id
+              AND projection.scientific_event_sequence = event.scientific_event_sequence
+              AND projection.journal_sequence = event.journal_sequence
+             WHERE event.run_id = ?1 AND projection.scientific_event_sequence IS NULL
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = event_orphan.first() {
+            let session: String = decode(row, 0, "host_domain_events.host_session_id")?;
+            let sequence: String =
+                decode(row, 1, "host_domain_events.scientific_event_sequence")?;
+            let ordinal: i64 = decode(row, 2, "host_domain_events.event_ordinal")?;
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.identity",
+                reason: format!(
+                    "domain event ({session}, {sequence}, {ordinal}) has no matching projection batch"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -7742,6 +8469,16 @@ impl Storage {
                 }
 
                 let applied_tick = archive.applied().tick.0;
+                let expected_domain_events =
+                    archive.prepare_domain_event_projection(&payload_digest)?;
+                Self::validate_domain_event_projection_for_connection(
+                    connection,
+                    run_id,
+                    batch_id,
+                    event_sequence,
+                    state,
+                    expected_domain_events.as_ref(),
+                )?;
                 let persistence = archive.take_persistence();
                 if persistence.is_none() && linked_batch.is_some() {
                     return Err(StorageError::InvalidData {
@@ -8697,11 +9434,282 @@ impl Storage {
         HostJournalState::decode(&state)
     }
 
+    fn insert_domain_event_projection(
+        transaction: &Transaction<'_>,
+        run_id: RunId,
+        projection: &PreparedDomainEventProjection,
+    ) -> Result<(), FrankenError> {
+        let session = encode_journal_u64(projection.batch_id.session_id().get());
+        let journal = encode_journal_u64(projection.batch_id.sequence());
+        let event = encode_journal_u64(projection.scientific_event_sequence.get());
+        let tick = i64::try_from(projection.tick.0)
+            .map_err(|error| FrankenError::Internal(error.to_string()))?;
+        let event_count = i64::try_from(projection.events.len())
+            .map_err(|error| FrankenError::Internal(error.to_string()))?;
+        let batch_rows = transaction.execute_with_params(
+            "INSERT INTO host_domain_event_batches (
+                run_id, host_session_id, scientific_event_sequence,
+                journal_sequence, tick, event_count, archive_payload_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                event.as_str().into(),
+                journal.as_str().into(),
+                tick.into(),
+                event_count.into(),
+                projection.archive_payload_digest.as_str().into(),
+            ],
+        )?;
+        if batch_rows != 1 {
+            return Err(FrankenError::Internal(format!(
+                "domain-event projection inserted {batch_rows} batch rows"
+            )));
+        }
+        for prepared in &projection.events {
+            let ordinal = i64::try_from(prepared.ordinal)
+                .map_err(|error| FrankenError::Internal(error.to_string()))?;
+            let actor_agent_uid = prepared
+                .payload
+                .actor_agent_uid()
+                .map(|uid| i64::try_from(uid.0))
+                .transpose()
+                .map_err(|error| FrankenError::Internal(error.to_string()))?;
+            let event_rows = transaction.execute_with_params(
+                "INSERT INTO host_domain_events (
+                    run_id, host_session_id, scientific_event_sequence, event_ordinal,
+                    journal_sequence, tick, kind, actor_agent_uid, payload_json,
+                    archive_payload_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    sqlite_run_id(run_id),
+                    session.as_str().into(),
+                    event.as_str().into(),
+                    ordinal.into(),
+                    journal.as_str().into(),
+                    tick.into(),
+                    prepared.payload.kind().as_str().into(),
+                    sqlite_optional_i64(actor_agent_uid),
+                    prepared.payload_json.as_str().into(),
+                    projection.archive_payload_digest.as_str().into(),
+                ],
+            )?;
+            if event_rows != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "domain-event projection inserted {event_rows} rows for ordinal {}",
+                    prepared.ordinal
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_domain_event_projection_for_connection(
+        connection: &Connection,
+        run_id: RunId,
+        batch_id: JournalBatchId,
+        event_sequence: Option<EventSequence>,
+        state: HostJournalState,
+        expected: Option<&PreparedDomainEventProjection>,
+    ) -> Result<(), StorageError> {
+        if event_sequence.is_some() != expected.is_some() {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_event_batches.scientific_event_sequence",
+                reason: "canonical scientific identity and prepared projection disagree"
+                .to_owned(),
+            });
+        }
+        if let Some(projection) = expected
+            && (projection.batch_id != batch_id
+                || Some(projection.scientific_event_sequence) != event_sequence)
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_event_batches.identity",
+                reason: format!(
+                    "prepared projection {:?}/{} does not match journal batch {batch_id:?} and event {event_sequence:?}",
+                    projection.batch_id,
+                    projection.scientific_event_sequence.get()
+                ),
+            });
+        }
+        let session = encode_journal_u64(batch_id.session_id().get());
+        let journal = encode_journal_u64(batch_id.sequence());
+        let rows = connection.query_with_params(
+            "SELECT scientific_event_sequence, tick, event_count, archive_payload_digest
+             FROM host_domain_event_batches
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                journal.as_str().into(),
+            ],
+        )?;
+        if state < HostJournalState::Applied || expected.is_none() {
+            if !rows.is_empty() {
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_event_batches.journal_sequence",
+                    reason: format!(
+                        "{} journal batch {batch_id:?} unexpectedly has {} domain projections",
+                        state.as_str(),
+                        rows.len()
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        let Some(expected) = expected else {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_event_batches.scientific_event_sequence",
+                reason: "applied scientific boundary has no prepared domain projection".to_owned(),
+            });
+        };
+        let [row] = rows.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_event_batches.journal_sequence",
+                reason: format!(
+                    "applied journal batch {batch_id:?} has {} domain projections",
+                    rows.len()
+                ),
+            });
+        };
+        let encoded_event: String = decode(
+            row,
+            0,
+            "host_domain_event_batches.scientific_event_sequence",
+        )?;
+        let actual_event = EventSequence::new(decode_journal_u64(
+            "host_domain_event_batches.scientific_event_sequence",
+            &encoded_event,
+        )?);
+        let actual_tick = checked_u64(
+            "host_domain_event_batches.tick",
+            decode(row, 1, "host_domain_event_batches.tick")?,
+        )?;
+        let actual_count = checked_u64(
+            "host_domain_event_batches.event_count",
+            decode(row, 2, "host_domain_event_batches.event_count")?,
+        )?;
+        let actual_digest: String = decode(
+            row,
+            3,
+            "host_domain_event_batches.archive_payload_digest",
+        )?;
+        let expected_count = u64::try_from(expected.events.len()).map_err(|error| {
+            StorageError::InvalidData {
+                context: "host_domain_event_batches.event_count",
+                reason: error.to_string(),
+            }
+        })?;
+        if actual_event != expected.scientific_event_sequence
+            || actual_tick != expected.tick.0
+            || actual_count != expected_count
+            || actual_digest != expected.archive_payload_digest
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_event_batches",
+                reason: format!(
+                    "projection metadata for journal batch {batch_id:?} does not match its canonical archive"
+                ),
+            });
+        }
+
+        let event_rows = connection.query_with_params(
+            "SELECT event_ordinal, journal_sequence, tick, kind, actor_agent_uid,
+                    payload_json, archive_payload_digest
+             FROM host_domain_events
+             WHERE run_id = ?1 AND host_session_id = ?2
+               AND scientific_event_sequence = ?3
+             ORDER BY event_ordinal ASC",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                encoded_event.as_str().into(),
+            ],
+        )?;
+        if event_rows.len() != expected.events.len() {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.event_count",
+                reason: format!(
+                    "scientific event {} declares {} rows but stores {}",
+                    actual_event.get(),
+                    expected.events.len(),
+                    event_rows.len()
+                ),
+            });
+        }
+        for (row, prepared) in event_rows.iter().zip(&expected.events) {
+            let ordinal = checked_u64(
+                "host_domain_events.event_ordinal",
+                decode(row, 0, "host_domain_events.event_ordinal")?,
+            )?;
+            let row_journal: String = decode(row, 1, "host_domain_events.journal_sequence")?;
+            let row_tick = checked_u64(
+                "host_domain_events.tick",
+                decode(row, 2, "host_domain_events.tick")?,
+            )?;
+            let kind = DomainEventKind::decode(&decode::<String>(
+                row,
+                3,
+                "host_domain_events.kind",
+            )?)?;
+            let actor_raw: Option<i64> = decode(row, 4, "host_domain_events.actor_agent_uid")?;
+            let actor = actor_raw
+                .map(|value| checked_u64("host_domain_events.actor_agent_uid", value))
+                .transpose()?
+                .map(AgentUid);
+            let payload_json: String = decode(row, 5, "host_domain_events.payload_json")?;
+            let payload = DomainEventPayload::decode_json(kind, &payload_json)?;
+            let row_digest: String =
+                decode(row, 6, "host_domain_events.archive_payload_digest")?;
+            if ordinal != prepared.ordinal
+                || row_journal != journal
+                || row_tick != expected.tick.0
+                || actor != prepared.payload.actor_agent_uid()
+                || payload != prepared.payload
+                || payload_json != prepared.payload_json
+                || row_digest != expected.archive_payload_digest
+            {
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_events",
+                    reason: format!(
+                        "normalized row {ordinal} for scientific event {} does not match its canonical archive",
+                        actual_event.get()
+                    ),
+                });
+            }
+            match &payload {
+                DomainEventPayload::Birth(record) if record.tick.0 != row_tick => {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.tick",
+                        reason: "birth payload tick differs from its normalized row".to_owned(),
+                    });
+                }
+                DomainEventPayload::Death(record) if record.tick.0 != row_tick => {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.tick",
+                        reason: "death payload tick differs from its normalized row".to_owned(),
+                    });
+                }
+                DomainEventPayload::Combat(combat)
+                    if combat.spike_attempts == 0 && combat.spike_hits == 0 =>
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.payload_json",
+                        reason: "zero aggregate combat payload must not be projected".to_owned(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn advance_host_journal_state(
         &self,
         batch_id: JournalBatchId,
         event_sequence: Option<EventSequence>,
         target: HostJournalState,
+        domain_events: Option<&PreparedDomainEventProjection>,
     ) -> Result<(), StorageError> {
         let previous = match target {
             HostJournalState::Admitted => return Ok(()),
@@ -8711,6 +9719,16 @@ impl Storage {
         };
         let current = self.host_journal_state(batch_id)?;
         if current >= target {
+            if target == HostJournalState::Applied {
+                Self::validate_domain_event_projection_for_connection(
+                    self.connection()?,
+                    self.run_id,
+                    batch_id,
+                    event_sequence,
+                    current,
+                    domain_events,
+                )?;
+            }
             return Ok(());
         }
         if current != previous {
@@ -8798,6 +9816,31 @@ impl Storage {
             }
         };
         execute_transaction_with_retry(self.connection()?, |transaction| {
+            if target == HostJournalState::Applied {
+                match (event_sequence, domain_events) {
+                    (Some(sequence), Some(projection))
+                        if sequence == projection.scientific_event_sequence
+                            && batch_id == projection.batch_id =>
+                    {
+                        Self::insert_domain_event_projection(
+                            transaction,
+                            self.run_id,
+                            projection,
+                        )?;
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(FrankenError::Internal(
+                            "applied journal state and domain-event projection identities disagree"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            } else if domain_events.is_some() {
+                return Err(FrankenError::Internal(
+                    "domain-event projection is only valid for the applied transition".to_owned(),
+                ));
+            }
             let ledger_rows = transaction.execute_with_params(
                 "UPDATE host_journal_batch_ledger
                  SET state = ?1
@@ -8839,6 +9882,7 @@ impl Storage {
         event_sequence: Option<EventSequence>,
         applied_tick: u64,
         persistence: Option<StorageBuffer>,
+        domain_events: Option<&PreparedDomainEventProjection>,
     ) -> Result<JournalReceiptState, StorageError> {
         if let Some(prepared) = persistence {
             let (receipt, newly_admitted) = self.stage_outbox(applied_tick, &prepared)?;
@@ -8854,7 +9898,12 @@ impl Storage {
             )?;
             self.flush()?;
         }
-        self.advance_host_journal_state(batch_id, event_sequence, HostJournalState::Applied)?;
+        self.advance_host_journal_state(
+            batch_id,
+            event_sequence,
+            HostJournalState::Applied,
+            domain_events,
+        )?;
         if self
             .connection()?
             .query_row_with_params(
@@ -8877,6 +9926,7 @@ impl Storage {
             batch_id,
             event_sequence,
             HostJournalState::CommittedVolatile,
+            None,
         )?;
         if self.file_backed() {
             #[cfg(test)]
@@ -8885,7 +9935,12 @@ impl Storage {
                 HostJournalFaultPoint::BeforeDurableMarker,
                 "host_journal_batch_ledger.state",
             )?;
-            self.advance_host_journal_state(batch_id, event_sequence, HostJournalState::Durable)?;
+            self.advance_host_journal_state(
+                batch_id,
+                event_sequence,
+                HostJournalState::Durable,
+                None,
+            )?;
             Ok(JournalReceiptState::Durable)
         } else {
             Ok(JournalReceiptState::CommittedVolatile)
@@ -9002,8 +10057,16 @@ impl Storage {
                 });
             }
             let applied_tick = archive.applied().tick.0;
+            let domain_events =
+                archive.prepare_domain_event_projection(&payload_digest)?;
             let persistence = archive.take_persistence();
-            self.complete_host_journal_archive(batch_id, archive_event, applied_tick, persistence)?;
+            self.complete_host_journal_archive(
+                batch_id,
+                archive_event,
+                applied_tick,
+                persistence,
+                domain_events.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -12128,6 +13191,7 @@ fn storage_worker(
                         batch.scientific_event_sequence(),
                         batch.applied().tick.0,
                         prepared.persistence.take(),
+                        prepared.domain_events.as_ref(),
                     )?;
                     Ok((pending, receipt_state))
                 })();
@@ -13950,6 +15014,8 @@ mod tests {
             "host_journal_archive",
             "host_journal_batch_ledger",
             "host_journal_progress",
+            "host_domain_event_batches",
+            "host_domain_events",
             "storage_batch_ledger",
             "storage_outbox",
             "storage_progress",
@@ -14931,7 +15997,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v7_schema_records_exact_ledger_and_is_idempotent()
+    fn fresh_v8_schema_records_exact_ledger_and_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&connection)?;
@@ -14939,10 +16005,14 @@ mod tests {
         let first_schema = read_schema_objects(&connection)?;
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 2);
+        assert_eq!(migrations.len(), 3);
         let expected = [
             (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
-            (SCRIPTBOTS_SCHEMA_VERSION, "add_host_journal_archive"),
+            (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_host_domain_event_projection",
+            ),
         ];
         for (row, (expected_version, expected_name)) in migrations.iter().zip(expected) {
             assert_eq!(
@@ -14963,7 +16033,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _schema_migrations")?
             .get_typed(0)?;
         assert_eq!(
-            migration_count, 2,
+            migration_count, 3,
             "idempotent install duplicated its ledger"
         );
         connection.close()?;
@@ -14971,7 +16041,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_schema_upgrades_additively_to_the_exact_v7_lineage()
+    fn v6_schema_upgrades_additively_to_the_exact_v8_lineage()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         let v6_result = MigrationRunner::new()
@@ -14994,14 +16064,22 @@ mod tests {
         );
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 2);
+        assert_eq!(migrations.len(), 3);
         assert_eq!(
             decode::<i64>(&migrations[1], 0, "_schema_migrations.version")?,
-            SCRIPTBOTS_SCHEMA_VERSION
+            SCRIPTBOTS_SCHEMA_V7_VERSION
         );
         assert_eq!(
             decode::<String>(&migrations[1], 1, "_schema_migrations.name")?,
             "add_host_journal_archive"
+        );
+        assert_eq!(
+            decode::<i64>(&migrations[2], 0, "_schema_migrations.version")?,
+            SCRIPTBOTS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            decode::<String>(&migrations[2], 1, "_schema_migrations.name")?,
+            "add_host_domain_event_projection"
         );
         let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
         assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
@@ -15425,11 +16503,11 @@ mod tests {
         create_valid_database(&future)?;
         add_schema_object(
             &future,
-            "INSERT INTO _schema_migrations (version, name) VALUES (8, 'future_schema')",
+            "INSERT INTO _schema_migrations (version, name) VALUES (9, 'future_schema')",
         )?;
         assert_recovery_refused_without_database_mutation(
             &future,
-            "expected exactly two ScriptBots migrations through v7",
+            "expected exactly three ScriptBots migrations through v8",
         )?;
 
         let legacy = temp_db_path("storage-recovery-legacy-v5-lineage");
@@ -15449,7 +16527,7 @@ mod tests {
         legacy_connection.close()?;
         assert_recovery_refused_without_database_mutation(
             &legacy,
-            "expected exactly two ScriptBots migrations through v7",
+            "expected exactly three ScriptBots migrations through v8",
         )?;
 
         let v6_only = temp_db_path("storage-recovery-v6-only-lineage");
@@ -15464,7 +16542,7 @@ mod tests {
         v6_connection.close()?;
         assert_recovery_refused_without_database_mutation(
             &v6_only,
-            "expected exactly two ScriptBots migrations through v7",
+            "expected exactly three ScriptBots migrations through v8",
         )?;
 
         let mismatched_user_version = temp_db_path("storage-recovery-user-version-mismatch");
@@ -15472,7 +16550,7 @@ mod tests {
         add_schema_object(&mismatched_user_version, "PRAGMA user_version = 5")?;
         assert_recovery_refused_without_database_mutation(
             &mismatched_user_version,
-            "migration ledger is v7, but PRAGMA user_version is 5",
+            "migration ledger is v8, but PRAGMA user_version is 5",
         )?;
         Ok(())
     }
@@ -15490,7 +16568,8 @@ mod tests {
              );
              INSERT INTO _schema_migrations (version, name, applied_at) VALUES
                 (6, 'create_multi_run_schema', 'forged'),
-                (7, 'add_host_journal_archive', 'forged');
+                (7, 'add_host_journal_archive', 'forged'),
+                (8, 'add_host_domain_event_projection', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -15500,7 +16579,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 7;",
+             PRAGMA user_version = 8;",
         )?;
         connection.close()?;
 

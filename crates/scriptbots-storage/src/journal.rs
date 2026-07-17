@@ -7,6 +7,7 @@ use super::{
 };
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
+use scriptbots_core::{AgentUid, BirthRecord, DeathRecord, Tick, TickCombatSummary};
 use scriptbots_runtime::{
     AppliedCommand, CommandEnvelope, EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator,
     EventCatchUpUnavailableReason, EventCommitment, EventJournalReader, EventPage, EventPageSource,
@@ -195,6 +196,258 @@ pub struct HostJournalSessionPage {
     pub next_after: Option<JournalBatchId>,
     /// Typed evidence that the offline integrity conformance gate passed.
     pub integrity_check: StorageIntegrityCheckResult,
+}
+
+/// Stable normalized kind of one scientific domain event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainEventKind {
+    /// Complete agent-arrival record from the scientific boundary.
+    Birth,
+    /// Complete agent-removal record from the scientific boundary.
+    Death,
+    /// Nonzero aggregate combat counters for one scientific tick.
+    Combat,
+}
+
+impl DomainEventKind {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Birth => "birth",
+            Self::Death => "death",
+            Self::Combat => "combat",
+        }
+    }
+
+    pub(super) fn decode(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "birth" => Ok(Self::Birth),
+            "death" => Ok(Self::Death),
+            "combat" => Ok(Self::Combat),
+            _ => Err(StorageError::InvalidData {
+                context: "host_domain_events.kind",
+                reason: format!("unknown normalized domain-event kind {value:?}"),
+            }),
+        }
+    }
+}
+
+/// Complete typed payload retained for one normalized domain event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DomainEventPayload {
+    /// Full birth/arrival record, including lineage and origin metadata.
+    Birth(BirthRecord),
+    /// Full death record, including cause and combat flags.
+    Death(DeathRecord),
+    /// Aggregate combat counters for the tick. Pairwise edges belong to the interaction journal.
+    Combat(TickCombatSummary),
+}
+
+impl DomainEventPayload {
+    /// Stable normalized kind corresponding to this payload.
+    #[must_use]
+    pub const fn kind(&self) -> DomainEventKind {
+        match self {
+            Self::Birth(_) => DomainEventKind::Birth,
+            Self::Death(_) => DomainEventKind::Death,
+            Self::Combat(_) => DomainEventKind::Combat,
+        }
+    }
+
+    pub(super) const fn actor_agent_uid(&self) -> Option<AgentUid> {
+        match self {
+            Self::Birth(record) => Some(record.agent_uid),
+            Self::Death(record) => Some(record.agent_uid),
+            Self::Combat(_) => None,
+        }
+    }
+
+    pub(super) fn encode_json(&self) -> Result<String, StorageError> {
+        let encoded = match self {
+            Self::Birth(record) => serde_json::to_string(record),
+            Self::Death(record) => serde_json::to_string(record),
+            Self::Combat(record) => serde_json::to_string(record),
+        };
+        encoded.map_err(|error| StorageError::InvalidData {
+            context: "host_domain_events.payload_json",
+            reason: error.to_string(),
+        })
+    }
+
+    pub(super) fn decode_json(
+        kind: DomainEventKind,
+        payload_json: &str,
+    ) -> Result<Self, StorageError> {
+        let payload = match kind {
+            DomainEventKind::Birth => serde_json::from_str(payload_json).map(Self::Birth),
+            DomainEventKind::Death => serde_json::from_str(payload_json).map(Self::Death),
+            DomainEventKind::Combat => serde_json::from_str(payload_json).map(Self::Combat),
+        }
+        .map_err(|error| StorageError::InvalidData {
+            context: "host_domain_events.payload_json",
+            reason: error.to_string(),
+        })?;
+        if payload.encode_json()? != payload_json {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.payload_json",
+                reason: "payload is valid JSON but not in canonical normalized form".to_owned(),
+            });
+        }
+        Ok(payload)
+    }
+}
+
+/// Exact cursor for one normalized domain-event row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DomainEventCursor {
+    /// Host session that owns the scientific sequence.
+    pub session_id: HostSessionId,
+    /// Contiguous scientific boundary sequence.
+    pub scientific_event_sequence: EventSequence,
+    /// Zero-based deterministic ordinal within that boundary.
+    pub event_ordinal: u64,
+}
+
+/// One normalized lifecycle or aggregate-combat event bound to its canonical archive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomainEventRecord {
+    /// Host session that owns this event.
+    pub session_id: HostSessionId,
+    /// Contiguous scientific boundary sequence.
+    pub scientific_event_sequence: EventSequence,
+    /// Zero-based deterministic ordinal within the scientific boundary.
+    pub event_ordinal: u64,
+    /// Total journal identity whose canonical archive supplied this row.
+    pub journal_batch_id: JournalBatchId,
+    /// Scientific tick recorded by the canonical boundary.
+    pub tick: Tick,
+    /// Full typed domain payload.
+    pub payload: DomainEventPayload,
+    /// BLAKE3 digest of the canonical host-journal archive payload.
+    ///
+    /// This binds the projection to its source archive. It is not a world-state digest.
+    pub archive_payload_digest: String,
+}
+
+impl DomainEventRecord {
+    /// Cursor that resumes immediately after this exact row.
+    #[must_use]
+    pub const fn cursor(&self) -> DomainEventCursor {
+        DomainEventCursor {
+            session_id: self.session_id,
+            scientific_event_sequence: self.scientific_event_sequence,
+            event_ordinal: self.event_ordinal,
+        }
+    }
+}
+
+/// Whether a domain-evidence query permits a genuinely empty projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainEventExpectation {
+    /// Empty evidence is valid for scenarios that do not promise domain events.
+    AllowEmpty,
+    /// At least one normalized domain event is required; zero rows fail closed.
+    RequireNonEmpty,
+}
+
+/// Validated counts for one finished host session's normalized domain evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DomainEventEvidence {
+    /// Number of contiguous durable scientific boundaries covered by projections.
+    pub scientific_event_count: u64,
+    /// Total normalized birth, death, and aggregate-combat rows.
+    pub domain_event_count: u64,
+}
+
+/// One bounded page of normalized domain events in scientific-sequence order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomainEventPage {
+    /// Durable run selected by the finished storage reader.
+    pub run_id: RunId,
+    /// Host session whose normalized events this page describes.
+    pub session_id: HostSessionId,
+    /// Rows ordered by scientific sequence then deterministic local ordinal.
+    pub events: Vec<DomainEventRecord>,
+    /// Cursor for the next page, or `None` when the durable projection is exhausted.
+    pub next_after: Option<DomainEventCursor>,
+    /// Complete validated evidence counts for the session.
+    pub evidence: DomainEventEvidence,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PreparedDomainEvent {
+    pub(super) ordinal: u64,
+    pub(super) payload: DomainEventPayload,
+    pub(super) payload_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PreparedDomainEventProjection {
+    pub(super) batch_id: JournalBatchId,
+    pub(super) scientific_event_sequence: EventSequence,
+    pub(super) tick: Tick,
+    pub(super) archive_payload_digest: String,
+    pub(super) events: Vec<PreparedDomainEvent>,
+}
+
+impl PreparedDomainEventProjection {
+    fn new(
+        batch_id: JournalBatchId,
+        scientific_event_sequence: EventSequence,
+        tick: Tick,
+        scientific: &ScientificBoundary,
+        archive_payload_digest: &str,
+    ) -> Result<Self, StorageError> {
+        let combat = scientific.combat();
+        let event_capacity = scientific
+            .births()
+            .len()
+            .saturating_add(scientific.deaths().len())
+            .saturating_add(usize::from(combat.spike_attempts != 0 || combat.spike_hits != 0));
+        let mut events = Vec::with_capacity(event_capacity);
+        for birth in scientific.births() {
+            let payload = DomainEventPayload::Birth(birth.clone());
+            let payload_json = payload.encode_json()?;
+            events.push(PreparedDomainEvent {
+                ordinal: u64::try_from(events.len()).map_err(|error| StorageError::InvalidData {
+                    context: "host_domain_events.event_ordinal",
+                    reason: error.to_string(),
+                })?,
+                payload,
+                payload_json,
+            });
+        }
+        for death in scientific.deaths() {
+            let payload = DomainEventPayload::Death(death.clone());
+            let payload_json = payload.encode_json()?;
+            events.push(PreparedDomainEvent {
+                ordinal: u64::try_from(events.len()).map_err(|error| StorageError::InvalidData {
+                    context: "host_domain_events.event_ordinal",
+                    reason: error.to_string(),
+                })?,
+                payload,
+                payload_json,
+            });
+        }
+        if combat.spike_attempts != 0 || combat.spike_hits != 0 {
+            let payload = DomainEventPayload::Combat(combat);
+            let payload_json = payload.encode_json()?;
+            events.push(PreparedDomainEvent {
+                ordinal: u64::try_from(events.len()).map_err(|error| StorageError::InvalidData {
+                    context: "host_domain_events.event_ordinal",
+                    reason: error.to_string(),
+                })?,
+                payload,
+                payload_json,
+            });
+        }
+        Ok(Self {
+            batch_id,
+            scientific_event_sequence,
+            tick,
+            archive_payload_digest: archive_payload_digest.to_owned(),
+            events,
+        })
+    }
 }
 
 pub(super) fn encode_journal_u64(value: u64) -> String {
@@ -569,6 +822,31 @@ impl HostJournalArchive {
         self.applied
     }
 
+    pub(super) fn prepare_domain_event_projection(
+        &self,
+        archive_payload_digest: &str,
+    ) -> Result<Option<PreparedDomainEventProjection>, StorageError> {
+        match (self.event_sequence()?, self.scientific.as_ref()) {
+            (Some(sequence), Some(scientific)) => PreparedDomainEventProjection::new(
+                self.batch_id()?,
+                sequence,
+                self.applied.tick,
+                scientific,
+                archive_payload_digest,
+            )
+            .map(Some),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(StorageError::InvalidData {
+                context: "host_journal_archive.scientific",
+                reason: "scientific event sequence has no canonical payload".to_owned(),
+            }),
+            (None, Some(_)) => Err(StorageError::InvalidData {
+                context: "host_journal_archive.scientific_event_sequence",
+                reason: "scientific payload has no canonical event sequence".to_owned(),
+            }),
+        }
+    }
+
     pub(super) fn is_shutdown(&self) -> bool {
         self.command
             .as_ref()
@@ -657,6 +935,7 @@ pub(super) struct PreparedHostJournalArchive {
     pub(super) payload_json: String,
     pub(super) payload_digest: String,
     pub(super) persistence: Option<StorageBuffer>,
+    pub(super) domain_events: Option<PreparedDomainEventProjection>,
 }
 
 fn encode_host_journal_archive(
@@ -726,10 +1005,30 @@ pub(super) fn prepare_host_journal_archive(
         persistence: persistence.as_ref(),
     };
     let (payload_json, payload_digest) = encode_host_journal_archive(&archive, maximum_bytes)?;
+    let domain_events = match (
+        batch.scientific_event_sequence(),
+        batch.scientific().map(Arc::as_ref),
+    ) {
+        (Some(sequence), Some(scientific)) => Some(PreparedDomainEventProjection::new(
+            batch_id,
+            sequence,
+            batch.applied().tick,
+            scientific,
+            &payload_digest,
+        )?),
+        (None, None) => None,
+        _ => {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.scientific_event_sequence",
+                reason: "scientific payload and event sequence must be present together".to_owned(),
+            });
+        }
+    };
     Ok(PreparedHostJournalArchive {
         payload_json,
         payload_digest,
         persistence,
+        domain_events,
     })
 }
 
