@@ -5605,19 +5605,18 @@ impl ExistingStorageLease {
     }
 }
 
+type HostJournalIndex = (
+    Option<EventSequenceRange>,
+    VecDeque<(EventSequence, JournalBatchId)>,
+);
+
 fn load_host_journal_index(
     path: &str,
     lease: &ExistingStorageLease,
     run_id: RunId,
     session_id: HostSessionId,
     identity_limit: usize,
-) -> Result<
-    (
-        Option<EventSequenceRange>,
-        VecDeque<(EventSequence, JournalBatchId)>,
-    ),
-    StorageError,
-> {
+) -> Result<HostJournalIndex, StorageError> {
     let identity_limit = checked_query_limit("host_journal_index.identity_limit", identity_limit)?;
     lease.verify_path(path)?;
     let connection = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -7137,13 +7136,13 @@ impl Storage {
                             .to_owned(),
                     });
                 }
-                if archive.is_shutdown() {
-                    if observed_shutdown.replace(journal_sequence).is_some() {
-                        return Err(StorageError::InvalidData {
-                            context: "host_journal_progress.shutdown_sequence",
-                            reason: "more than one archive encodes a shutdown command".to_owned(),
-                        });
-                    }
+                if archive.is_shutdown()
+                    && observed_shutdown.replace(journal_sequence).is_some()
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_progress.shutdown_sequence",
+                        reason: "more than one archive encodes a shutdown command".to_owned(),
+                    });
                 }
 
                 let applied_tick = archive.applied().tick.0;
@@ -10791,7 +10790,6 @@ impl StoragePipeline {
         }
         match reply_rx.recv_deadline(Instant::now() + self.sink.deadlines.admission_ack) {
             Ok(Ok(())) => Ok(StorageJournalPort::new(
-                session_id,
                 self.sink.tx.clone(),
                 Arc::clone(&self.sink.admission),
                 Arc::clone(&shared),
@@ -11327,14 +11325,13 @@ fn storage_worker(
                         match storage.enqueue_staged(receipt.batch_id, prepared) {
                             Ok(flushed) => {
                                 state.pending_permits.push((receipt.batch_id, permit));
-                                if flushed {
-                                    if let Err(error) =
+                                if flushed
+                                    && let Err(error) =
                                         flush_worker_storage(&mut storage, &mut state, &analytics)
-                                    {
-                                        analytics.publish_worker_error(&error, true);
-                                        storage.abandon_after_error();
-                                        return Some(error);
-                                    }
+                                {
+                                    analytics.publish_worker_error(&error, true);
+                                    storage.abandon_after_error();
+                                    return Some(error);
                                 }
                             }
                             Err(error) => {

@@ -1131,7 +1131,6 @@ impl std::fmt::Debug for StorageJournalPort {
 
 impl StorageJournalPort {
     pub(super) fn new(
-        session_id: HostSessionId,
         tx: xchan::Sender<StorageCommand>,
         admission: Arc<Mutex<AdmissionState>>,
         shared: Arc<JournalSessionShared>,
@@ -1141,7 +1140,7 @@ impl StorageJournalPort {
         shutdown_requirement: ShutdownCommitRequirement,
     ) -> Self {
         Self {
-            session_id,
+            session_id: publisher.inner.session_id,
             tx,
             admission,
             shared,
@@ -1474,7 +1473,7 @@ mod tests {
         let step = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
         let update = CommandEnvelope::new(
             CommandId::new(2),
-            HostCommand::UpdateConfig(Box::new(ScriptBotsConfig::default())),
+            HostCommand::UpdateConfig(Box::default()),
         );
         let shutdown = CommandEnvelope::new(CommandId::new(3), HostCommand::Shutdown);
 
