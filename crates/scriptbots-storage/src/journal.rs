@@ -7,14 +7,19 @@ use super::{
 };
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
-use scriptbots_core::{AgentUid, BirthRecord, DeathRecord, Tick, TickCombatSummary};
+use scriptbots_core::{
+    AgentUid, BirthRecord, DeathRecord, ScriptBotsConfig, Tick, TickCombatSummary,
+};
 use scriptbots_runtime::{
-    AppliedCommand, CommandEnvelope, EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator,
+    AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, CommandEnvelope,
+    CommandId, CommandLifecycleEvidence, CommandLifecycleTransition, ConfigRevision,
+    ControlRevision, EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator,
     EventCatchUpUnavailableReason, EventCommitment, EventJournalReader, EventPage, EventPageSource,
     EventRetentionSnapshot, EventSequence, EventSequenceRange, HostAccessError, HostCommand,
-    HostSessionId, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort,
-    JournalReceipt, JournalReceiptState, JournaledScientificEvent, RunId, ScientificBoundary,
-    ScientificEvent, ShutdownCommitRequirement,
+    HostRevisions, HostSessionId, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure,
+    JournalPort, JournalReceipt, JournalReceiptState, JournaledScientificEvent, RejectionReason,
+    RunId, ScientificBoundary, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
+    COMMAND_LIFECYCLE_SCHEMA_VERSION,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -33,7 +38,7 @@ const DEFAULT_JOURNAL_INFLIGHT_BYTES: usize = 256 << 20;
 const DEFAULT_JOURNAL_IDENTITY_CAPACITY: usize = 512;
 const DEFAULT_EVENT_PAGE_BYTES: usize = 64 << 20;
 const MAX_JOURNAL_BYTES: usize = 1 << 30;
-pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 1;
+pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 2;
 
 /// Bounded admission and catch-up limits for one HostCore journal adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,14 +169,122 @@ impl HostJournalRecordState {
 pub struct HostJournalRecord {
     /// Stable session-scoped archive identity and total journal order.
     pub batch_id: JournalBatchId,
-    /// Exact command envelope carried by this record, when command-driven.
-    pub command: Option<CommandEnvelope>,
-    /// Exact tick and revision boundary at which the record applied.
+    /// Complete validated command application lifecycle, when command-driven.
+    pub command_lifecycle: Option<CommandLifecycleEvidence>,
+    /// Exact terminal tick and revision boundary of this record.
+    ///
+    /// For rejected and failed commands this is an observation boundary, not an application.
     pub applied: AppliedCommand,
     /// Complete canonical scientific event, when this record advanced science.
     pub event: Option<JournaledScientificEvent>,
     /// Persisted ledger state cross-checked against the session prefixes.
     pub state: HostJournalRecordState,
+}
+
+/// Storage-ledger transition recorded after a command's application lifecycle was archived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStorageTransitionKind {
+    /// The archive transaction committed to the configured volatile storage boundary.
+    CommittedVolatile,
+    /// The archive reached the file-backed crash-durability boundary.
+    Durable,
+}
+
+impl CommandStorageTransitionKind {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CommittedVolatile => "committed_volatile",
+            Self::Durable => "durable",
+        }
+    }
+
+    pub(super) fn decode(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "committed_volatile" => Ok(Self::CommittedVolatile),
+            "durable" => Ok(Self::Durable),
+            _ => Err(StorageError::InvalidData {
+                context: "host_command_storage_transitions.storage_state",
+                reason: format!("unknown command storage transition {value:?}"),
+            }),
+        }
+    }
+}
+
+/// One ordered storage-ledger transition bound to a command's canonical archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandStorageTransition {
+    /// Zero-based position on the storage axis.
+    pub ordinal: u32,
+    /// Storage state established at this transition.
+    pub kind: CommandStorageTransitionKind,
+}
+
+/// Exact cursor for one command row in total host-journal order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandJournalCursor {
+    /// Host session that owns the command.
+    pub session_id: HostSessionId,
+    /// Total host-journal position of the command archive.
+    pub journal_sequence: u64,
+    /// Stable idempotency identity at that exact position.
+    pub command_id: CommandId,
+}
+
+/// Fully validated normalized command evidence from one canonical host archive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandJournalRecord {
+    /// Total host-journal identity whose canonical archive supplied this command.
+    pub batch_id: JournalBatchId,
+    /// Complete runtime-validated application lifecycle.
+    pub lifecycle: CommandLifecycleEvidence,
+    /// Terminal tick and revisions, whether applied, rejected, or failed.
+    pub terminal_boundary: AppliedCommand,
+    /// Scientific event produced by an applied step, when present.
+    pub scientific_event_sequence: Option<EventSequence>,
+    /// Ordered storage-ledger transitions, distinct from application transitions.
+    pub storage_transitions: Vec<CommandStorageTransition>,
+    /// BLAKE3 digest of the canonical host-journal archive payload.
+    ///
+    /// This binds the projection to its source archive. It is not a world-state digest.
+    pub archive_payload_digest: String,
+}
+
+impl CommandJournalRecord {
+    /// Exact cursor that resumes after this command row.
+    #[must_use]
+    pub fn cursor(&self) -> CommandJournalCursor {
+        CommandJournalCursor {
+            session_id: self.batch_id.session_id(),
+            journal_sequence: self.batch_id.sequence(),
+            command_id: self.lifecycle.envelope().command_id,
+        }
+    }
+}
+
+/// Complete validated command-projection counts for one finished host session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandJournalEvidence {
+    /// Number of normalized command records.
+    pub command_count: u64,
+    /// Number of ordered runtime application transitions.
+    pub application_transition_count: u64,
+    /// Number of ordered storage-ledger transitions.
+    pub storage_transition_count: u64,
+}
+
+/// One bounded page of normalized command evidence in host-journal order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandJournalPage {
+    /// Durable run selected by the finished storage reader.
+    pub run_id: RunId,
+    /// Host session whose commands this page describes.
+    pub session_id: HostSessionId,
+    /// Commands ordered by total host-journal sequence.
+    pub commands: Vec<CommandJournalRecord>,
+    /// Exact cursor for the next page, or `None` at the tip.
+    pub next_after: Option<CommandJournalCursor>,
+    /// Complete non-vacuous evidence counts for the session.
+    pub evidence: CommandJournalEvidence,
 }
 
 /// Successful result of the offline FrankenSQLite integrity conformance gate.
@@ -450,6 +563,593 @@ impl PreparedDomainEventProjection {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct PreparedCommandApplicationTransition {
+    pub(super) ordinal: u32,
+    pub(super) boundary: AppliedCommand,
+    pub(super) application: ApplicationState,
+    pub(super) application_postcard_hex: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PreparedCommandProjection {
+    pub(super) batch_id: JournalBatchId,
+    pub(super) lifecycle: CommandLifecycleEvidence,
+    pub(super) envelope_postcard_hex: String,
+    pub(super) command_payload_postcard_hex: String,
+    pub(super) terminal_boundary: AppliedCommand,
+    pub(super) scientific_event_sequence: Option<EventSequence>,
+    pub(super) archive_payload_digest: String,
+    pub(super) application_transitions: Vec<PreparedCommandApplicationTransition>,
+}
+
+impl PreparedCommandProjection {
+    fn new(
+        batch_id: JournalBatchId,
+        lifecycle: &CommandLifecycleEvidence,
+        terminal_boundary: AppliedCommand,
+        scientific_event_sequence: Option<EventSequence>,
+        archive_payload_digest: &str,
+    ) -> Result<Self, StorageError> {
+        lifecycle
+            .validate()
+            .map_err(|error| StorageError::InvalidData {
+                context: "host_command_records.lifecycle",
+                reason: error.to_string(),
+            })?;
+        let terminal = lifecycle.terminal().ok_or(StorageError::InvalidData {
+            context: "host_command_records.terminal_boundary",
+            reason: "validated lifecycle has no terminal transition".to_owned(),
+        })?;
+        if terminal.boundary() != terminal_boundary {
+            return Err(StorageError::InvalidData {
+                context: "host_command_records.terminal_boundary",
+                reason: "command terminal boundary differs from its host-journal archive"
+                    .to_owned(),
+            });
+        }
+        let envelope_postcard_hex = encode_command_envelope_postcard_hex(
+            "host_command_records.envelope_postcard_hex",
+            lifecycle.envelope(),
+        )?;
+        let command_payload_postcard_hex = encode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &lifecycle.envelope().command,
+        )?;
+        let application_transitions = lifecycle
+            .transitions()
+            .iter()
+            .map(|transition| {
+                let application_postcard_hex = encode_application_state_postcard_hex(
+                    "host_command_application_transitions.application_postcard_hex",
+                    transition.application(),
+                )?;
+                Ok(PreparedCommandApplicationTransition {
+                    ordinal: transition.ordinal(),
+                    boundary: transition.boundary(),
+                    application: transition.application().clone(),
+                    application_postcard_hex,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        Ok(Self {
+            batch_id,
+            lifecycle: lifecycle.clone(),
+            envelope_postcard_hex,
+            command_payload_postcard_hex,
+            terminal_boundary,
+            scientific_event_sequence,
+            archive_payload_digest: archive_payload_digest.to_owned(),
+            application_transitions,
+        })
+    }
+
+    pub(super) const fn command_id(&self) -> CommandId {
+        self.lifecycle.envelope().command_id
+    }
+}
+
+/// Postcard-safe wire mirror for [`HostCommand`].
+///
+/// The runtime enum is internally tagged for its JSON protocol, a representation
+/// that asks binary deserializers to implement `deserialize_any`. Postcard
+/// deliberately does not. This externally tagged mirror keeps the durable binary
+/// contract independent of that JSON representation and stores `SetSpeed` by raw
+/// IEEE-754 bits so even a rejected non-finite request remains exact evidence.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+enum HostCommandPostcardV1 {
+    Pause,
+    Resume,
+    SetSpeedBits(u32),
+    Step,
+    UpdateConfig(Box<ScriptBotsConfig>),
+    Shutdown,
+}
+
+impl HostCommandPostcardV1 {
+    fn from_runtime(command: &HostCommand) -> Self {
+        match command {
+            HostCommand::Pause => Self::Pause,
+            HostCommand::Resume => Self::Resume,
+            HostCommand::SetSpeed(speed) => Self::SetSpeedBits(speed.to_bits()),
+            HostCommand::Step => Self::Step,
+            HostCommand::UpdateConfig(config) => Self::UpdateConfig(config.clone()),
+            HostCommand::Shutdown => Self::Shutdown,
+        }
+    }
+
+    fn into_runtime(self) -> HostCommand {
+        match self {
+            Self::Pause => HostCommand::Pause,
+            Self::Resume => HostCommand::Resume,
+            Self::SetSpeedBits(bits) => HostCommand::SetSpeed(f32::from_bits(bits)),
+            Self::Step => HostCommand::Step,
+            Self::UpdateConfig(config) => HostCommand::UpdateConfig(config),
+            Self::Shutdown => HostCommand::Shutdown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CommandEnvelopePostcardV1 {
+    command_id: u128,
+    expected_control_revision: Option<u64>,
+    expected_scientific_revision: Option<u64>,
+    expected_config_revision: Option<u64>,
+    command: HostCommandPostcardV1,
+}
+
+impl CommandEnvelopePostcardV1 {
+    fn from_runtime(envelope: &CommandEnvelope) -> Self {
+        Self {
+            command_id: envelope.command_id.get(),
+            expected_control_revision: envelope.expected_control_revision.map(|value| value.get()),
+            expected_scientific_revision: envelope
+                .expected_scientific_revision
+                .map(|value| value.get()),
+            expected_config_revision: envelope.expected_config_revision.map(|value| value.get()),
+            command: HostCommandPostcardV1::from_runtime(&envelope.command),
+        }
+    }
+
+    fn into_runtime(self) -> CommandEnvelope {
+        CommandEnvelope {
+            command_id: CommandId::new(self.command_id),
+            expected_control_revision: self.expected_control_revision.map(ControlRevision::new),
+            expected_scientific_revision: self
+                .expected_scientific_revision
+                .map(ScientificRevision::new),
+            expected_config_revision: self.expected_config_revision.map(ConfigRevision::new),
+            command: self.command.into_runtime(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct AppliedCommandPostcardV1 {
+    tick: u64,
+    control_revision: u64,
+    scientific_revision: u64,
+    config_revision: u64,
+}
+
+impl AppliedCommandPostcardV1 {
+    const fn from_runtime(applied: AppliedCommand) -> Self {
+        Self {
+            tick: applied.tick.0,
+            control_revision: applied.revisions.control.get(),
+            scientific_revision: applied.revisions.scientific.get(),
+            config_revision: applied.revisions.config.get(),
+        }
+    }
+
+    const fn into_runtime(self) -> AppliedCommand {
+        AppliedCommand {
+            tick: Tick(self.tick),
+            revisions: HostRevisions {
+                control: ControlRevision::new(self.control_revision),
+                scientific: ScientificRevision::new(self.scientific_revision),
+                config: ConfigRevision::new(self.config_revision),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+enum RejectionReasonPostcardV1 {
+    Validation {
+        message: String,
+    },
+    ControlRevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
+    ScientificRevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
+    ConfigRevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
+    Overloaded {
+        capacity: u64,
+    },
+    HostStopping,
+}
+
+impl RejectionReasonPostcardV1 {
+    fn from_runtime(
+        rejection: &RejectionReason,
+        context: &'static str,
+    ) -> Result<Self, StorageError> {
+        match rejection {
+            RejectionReason::Validation { message } => Ok(Self::Validation {
+                message: message.clone(),
+            }),
+            RejectionReason::ControlRevisionConflict { expected, actual } => {
+                Ok(Self::ControlRevisionConflict {
+                    expected: expected.get(),
+                    actual: actual.get(),
+                })
+            }
+            RejectionReason::ScientificRevisionConflict { expected, actual } => {
+                Ok(Self::ScientificRevisionConflict {
+                    expected: expected.get(),
+                    actual: actual.get(),
+                })
+            }
+            RejectionReason::ConfigRevisionConflict { expected, actual } => {
+                Ok(Self::ConfigRevisionConflict {
+                    expected: expected.get(),
+                    actual: actual.get(),
+                })
+            }
+            RejectionReason::Overloaded { capacity } => Ok(Self::Overloaded {
+                capacity: u64::try_from(*capacity).map_err(|error| StorageError::InvalidData {
+                    context,
+                    reason: format!("overload capacity cannot be represented on the wire: {error}"),
+                })?,
+            }),
+            RejectionReason::HostStopping => Ok(Self::HostStopping),
+        }
+    }
+
+    fn into_runtime(self, context: &'static str) -> Result<RejectionReason, StorageError> {
+        match self {
+            Self::Validation { message } => Ok(RejectionReason::Validation { message }),
+            Self::ControlRevisionConflict { expected, actual } => {
+                Ok(RejectionReason::ControlRevisionConflict {
+                    expected: ControlRevision::new(expected),
+                    actual: ControlRevision::new(actual),
+                })
+            }
+            Self::ScientificRevisionConflict { expected, actual } => {
+                Ok(RejectionReason::ScientificRevisionConflict {
+                    expected: ScientificRevision::new(expected),
+                    actual: ScientificRevision::new(actual),
+                })
+            }
+            Self::ConfigRevisionConflict { expected, actual } => {
+                Ok(RejectionReason::ConfigRevisionConflict {
+                    expected: ConfigRevision::new(expected),
+                    actual: ConfigRevision::new(actual),
+                })
+            }
+            Self::Overloaded { capacity } => Ok(RejectionReason::Overloaded {
+                capacity: usize::try_from(capacity).map_err(|error| StorageError::InvalidData {
+                    context,
+                    reason: format!(
+                        "overload capacity cannot be represented on this host: {error}"
+                    ),
+                })?,
+            }),
+            Self::HostStopping => Ok(RejectionReason::HostStopping),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationFailurePostcardV1 {
+    code: String,
+    message: String,
+}
+
+impl ApplicationFailurePostcardV1 {
+    fn from_runtime(failure: &ApplicationFailure) -> Self {
+        Self {
+            code: failure.code.clone(),
+            message: failure.message.clone(),
+        }
+    }
+
+    fn into_runtime(self) -> ApplicationFailure {
+        ApplicationFailure {
+            code: self.code,
+            message: self.message,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+enum ApplicationStatePostcardV1 {
+    Admitted,
+    Applied(AppliedCommandPostcardV1),
+    Rejected(RejectionReasonPostcardV1),
+    Failed(ApplicationFailurePostcardV1),
+}
+
+impl ApplicationStatePostcardV1 {
+    fn from_runtime(
+        application: &ApplicationState,
+        context: &'static str,
+    ) -> Result<Self, StorageError> {
+        match application {
+            ApplicationState::Admitted => Ok(Self::Admitted),
+            ApplicationState::Applied(applied) => {
+                Ok(Self::Applied(AppliedCommandPostcardV1::from_runtime(*applied)))
+            }
+            ApplicationState::Rejected(rejection) => Ok(Self::Rejected(
+                RejectionReasonPostcardV1::from_runtime(rejection, context)?,
+            )),
+            ApplicationState::Failed(failure) => Ok(Self::Failed(
+                ApplicationFailurePostcardV1::from_runtime(failure),
+            )),
+        }
+    }
+
+    fn into_runtime(self, context: &'static str) -> Result<ApplicationState, StorageError> {
+        match self {
+            Self::Admitted => Ok(ApplicationState::Admitted),
+            Self::Applied(applied) => Ok(ApplicationState::Applied(applied.into_runtime())),
+            Self::Rejected(rejection) => {
+                Ok(ApplicationState::Rejected(rejection.into_runtime(context)?))
+            }
+            Self::Failed(failure) => Ok(ApplicationState::Failed(failure.into_runtime())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CommandLifecycleTransitionPostcardV1 {
+    ordinal: u32,
+    boundary: AppliedCommandPostcardV1,
+    application: ApplicationStatePostcardV1,
+}
+
+impl CommandLifecycleTransitionPostcardV1 {
+    fn from_runtime(
+        transition: &CommandLifecycleTransition,
+        context: &'static str,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            ordinal: transition.ordinal(),
+            boundary: AppliedCommandPostcardV1::from_runtime(transition.boundary()),
+            application: ApplicationStatePostcardV1::from_runtime(
+                transition.application(),
+                context,
+            )?,
+        })
+    }
+
+    fn into_runtime(
+        self,
+        context: &'static str,
+    ) -> Result<CommandLifecycleTransition, StorageError> {
+        Ok(CommandLifecycleTransition::new(
+            self.ordinal,
+            self.boundary.into_runtime(),
+            self.application.into_runtime(context)?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CommandLifecyclePostcardV1 {
+    schema_version: u16,
+    source_client_namespace: u64,
+    envelope: CommandEnvelopePostcardV1,
+    admission_sequence: Option<u64>,
+    transitions: Vec<CommandLifecycleTransitionPostcardV1>,
+}
+
+impl CommandLifecyclePostcardV1 {
+    fn from_runtime(
+        lifecycle: &CommandLifecycleEvidence,
+        context: &'static str,
+    ) -> Result<Self, StorageError> {
+        lifecycle
+            .validate()
+            .map_err(|error| StorageError::InvalidData {
+                context,
+                reason: error.to_string(),
+            })?;
+        Ok(Self {
+            schema_version: lifecycle.schema_version(),
+            source_client_namespace: lifecycle.source_client_namespace(),
+            envelope: CommandEnvelopePostcardV1::from_runtime(lifecycle.envelope()),
+            admission_sequence: lifecycle.admission_sequence().map(|value| value.get()),
+            transitions: lifecycle
+                .transitions()
+                .iter()
+                .map(|transition| {
+                    CommandLifecycleTransitionPostcardV1::from_runtime(transition, context)
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?,
+        })
+    }
+
+    fn into_runtime(
+        self,
+        context: &'static str,
+    ) -> Result<CommandLifecycleEvidence, StorageError> {
+        if self.schema_version != COMMAND_LIFECYCLE_SCHEMA_VERSION {
+            return Err(StorageError::InvalidData {
+                context,
+                reason: format!(
+                    "unsupported command lifecycle schema version {}, expected {COMMAND_LIFECYCLE_SCHEMA_VERSION}",
+                    self.schema_version
+                ),
+            });
+        }
+        let envelope = self.envelope.into_runtime();
+        if self.source_client_namespace != envelope.command_id.client_namespace() {
+            return Err(StorageError::InvalidData {
+                context,
+                reason: format!(
+                    "command source namespace {} does not match command id namespace {}",
+                    self.source_client_namespace,
+                    envelope.command_id.client_namespace()
+                ),
+            });
+        }
+        let admission_sequence = self.admission_sequence.map(AdmissionSequence::new);
+        let transitions = self
+            .transitions
+            .into_iter()
+            .map(|transition| transition.into_runtime(context))
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        CommandLifecycleEvidence::try_new(envelope, admission_sequence, transitions).map_err(
+            |error| StorageError::InvalidData {
+                context,
+                reason: error.to_string(),
+            },
+        )
+    }
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_lower_hex(context: &'static str, encoded: &str) -> Result<Vec<u8>, StorageError> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+
+    if encoded.is_empty() || encoded.len() % 2 != 0 {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: "postcard hex must have a nonzero even length".to_owned(),
+        });
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = nibble(pair[0]).ok_or(StorageError::InvalidData {
+            context,
+            reason: "postcard hex must use lowercase hexadecimal characters".to_owned(),
+        })?;
+        let low = nibble(pair[1]).ok_or(StorageError::InvalidData {
+            context,
+            reason: "postcard hex must use lowercase hexadecimal characters".to_owned(),
+        })?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn encode_postcard_hex<T: serde::Serialize + ?Sized>(
+    context: &'static str,
+    value: &T,
+) -> Result<String, StorageError> {
+    postcard::to_allocvec(value)
+        .map(|bytes| encode_lower_hex(&bytes))
+        .map_err(|error| StorageError::InvalidData {
+            context,
+            reason: error.to_string(),
+        })
+}
+
+fn decode_postcard_hex<T: serde::de::DeserializeOwned>(
+    context: &'static str,
+    encoded: &str,
+) -> Result<T, StorageError> {
+    let bytes = decode_lower_hex(context, encoded)?;
+    postcard::from_bytes(&bytes).map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })
+}
+
+pub(super) fn encode_command_envelope_postcard_hex(
+    context: &'static str,
+    envelope: &CommandEnvelope,
+) -> Result<String, StorageError> {
+    encode_postcard_hex(context, &CommandEnvelopePostcardV1::from_runtime(envelope))
+}
+
+pub(super) fn decode_command_envelope_postcard_hex(
+    context: &'static str,
+    encoded: &str,
+) -> Result<CommandEnvelope, StorageError> {
+    decode_postcard_hex::<CommandEnvelopePostcardV1>(context, encoded)
+        .map(CommandEnvelopePostcardV1::into_runtime)
+}
+
+pub(super) fn encode_host_command_postcard_hex(
+    context: &'static str,
+    command: &HostCommand,
+) -> Result<String, StorageError> {
+    encode_postcard_hex(context, &HostCommandPostcardV1::from_runtime(command))
+}
+
+pub(super) fn decode_host_command_postcard_hex(
+    context: &'static str,
+    encoded: &str,
+) -> Result<HostCommand, StorageError> {
+    decode_postcard_hex::<HostCommandPostcardV1>(context, encoded)
+        .map(HostCommandPostcardV1::into_runtime)
+}
+
+pub(super) fn encode_application_state_postcard_hex(
+    context: &'static str,
+    application: &ApplicationState,
+) -> Result<String, StorageError> {
+    encode_postcard_hex(
+        context,
+        &ApplicationStatePostcardV1::from_runtime(application, context)?,
+    )
+}
+
+pub(super) fn decode_application_state_postcard_hex(
+    context: &'static str,
+    encoded: &str,
+) -> Result<ApplicationState, StorageError> {
+    decode_postcard_hex::<ApplicationStatePostcardV1>(context, encoded)?.into_runtime(context)
+}
+
+fn encode_command_lifecycle_postcard_hex(
+    context: &'static str,
+    lifecycle: &CommandLifecycleEvidence,
+) -> Result<String, StorageError> {
+    encode_postcard_hex(
+        context,
+        &CommandLifecyclePostcardV1::from_runtime(lifecycle, context)?,
+    )
+}
+
+fn decode_command_lifecycle_postcard_hex(
+    context: &'static str,
+    encoded: &str,
+) -> Result<CommandLifecycleEvidence, StorageError> {
+    decode_postcard_hex::<CommandLifecyclePostcardV1>(context, encoded)?.into_runtime(context)
+}
+
 pub(super) fn encode_journal_u64(value: u64) -> String {
     format!("{value:016x}")
 }
@@ -569,6 +1269,65 @@ impl Write for CanonicalJsonComparator<'_> {
     }
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedCommandLifecycle {
+    schema_version: u16,
+    postcard_hex: String,
+}
+
+impl EncodedCommandLifecycle {
+    fn encode(lifecycle: &CommandLifecycleEvidence) -> Result<Self, StorageError> {
+        lifecycle
+            .validate()
+            .map_err(|error| StorageError::InvalidData {
+                context: "host_journal_archive.command_lifecycle",
+                reason: error.to_string(),
+            })?;
+        Ok(Self {
+            schema_version: lifecycle.schema_version(),
+            postcard_hex: encode_command_lifecycle_postcard_hex(
+                "host_journal_archive.command_lifecycle.postcard_hex",
+                lifecycle,
+            )?,
+        })
+    }
+
+    fn decode(&self) -> Result<CommandLifecycleEvidence, StorageError> {
+        if self.schema_version != COMMAND_LIFECYCLE_SCHEMA_VERSION {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.command_lifecycle.schema_version",
+                reason: format!(
+                    "unsupported version {}, expected {COMMAND_LIFECYCLE_SCHEMA_VERSION}",
+                    self.schema_version
+                ),
+            });
+        }
+        let lifecycle = decode_command_lifecycle_postcard_hex(
+            "host_journal_archive.command_lifecycle.postcard_hex",
+            &self.postcard_hex,
+        )?;
+        lifecycle
+            .validate()
+            .map_err(|error| StorageError::InvalidData {
+                context: "host_journal_archive.command_lifecycle",
+                reason: error.to_string(),
+            })?;
+        if lifecycle.schema_version() != self.schema_version
+            || encode_command_lifecycle_postcard_hex(
+                "host_journal_archive.command_lifecycle.postcard_hex",
+                &lifecycle,
+            )? != self.postcard_hex
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.command_lifecycle.postcard_hex",
+                reason: "command lifecycle is not in canonical postcard form".to_owned(),
+            });
+        }
+        Ok(lifecycle)
+    }
+}
+
 #[derive(serde::Serialize)]
 struct HostJournalArchiveRef<'a> {
     version: u32,
@@ -576,7 +1335,7 @@ struct HostJournalArchiveRef<'a> {
     host_session_id: &'a str,
     journal_sequence: &'a str,
     scientific_event_sequence: Option<&'a str>,
-    command: Option<&'a CommandEnvelope>,
+    command_lifecycle: Option<&'a EncodedCommandLifecycle>,
     applied: AppliedCommand,
     scientific: Option<&'a ScientificBoundary>,
     persistence: Option<&'a StorageBuffer>,
@@ -587,50 +1346,97 @@ fn validate_scientific_archive_boundary(
     event_sequence: Option<EventSequence>,
     applied: AppliedCommand,
     scientific: Option<&ScientificBoundary>,
-    command: Option<&CommandEnvelope>,
+    command_lifecycle: Option<&CommandLifecycleEvidence>,
     has_persistence: bool,
 ) -> Result<(), StorageError> {
-    match command.map(|envelope| &envelope.command) {
+    match command_lifecycle {
         None if scientific.is_none() => {
             return Err(StorageError::InvalidData {
                 context: "host_journal_archive.payload_json",
-                reason: "journal batch must contain a command or scientific boundary".to_owned(),
-            });
-        }
-        Some(command) if !command.requires_journal() => {
-            return Err(StorageError::InvalidData {
-                context: "host_journal_archive.command",
-                reason: "command does not require a journal record".to_owned(),
-            });
-        }
-        Some(HostCommand::Step) if scientific.is_none() => {
-            return Err(StorageError::InvalidData {
-                context: "host_journal_archive.scientific",
-                reason: "a successful step command requires its scientific boundary".to_owned(),
-            });
-        }
-        Some(HostCommand::UpdateConfig(_)) if scientific.is_some() || has_persistence => {
-            return Err(StorageError::InvalidData {
-                context: "host_journal_archive.command",
-                reason: "an update-config journal batch must be command-only".to_owned(),
-            });
-        }
-        Some(HostCommand::Shutdown) if scientific.is_some() => {
-            return Err(StorageError::InvalidData {
-                context: "host_journal_archive.command",
-                reason: "a shutdown journal batch may carry only its final persistence tail"
+                reason: "journal batch must contain command lifecycle evidence or a scientific boundary"
                     .to_owned(),
             });
         }
-        _ => {}
+        Some(lifecycle) => {
+            lifecycle
+                .validate()
+                .map_err(|error| StorageError::InvalidData {
+                    context: "host_journal_archive.command_lifecycle",
+                    reason: error.to_string(),
+                })?;
+            let terminal = lifecycle.terminal().ok_or(StorageError::InvalidData {
+                context: "host_journal_archive.command_lifecycle",
+                reason: "validated command lifecycle has no terminal transition".to_owned(),
+            })?;
+            if terminal.boundary() != applied {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.applied",
+                    reason: "archive terminal boundary differs from command lifecycle evidence"
+                        .to_owned(),
+                });
+            }
+            match terminal.application() {
+                ApplicationState::Applied(_) => match &lifecycle.envelope().command {
+                    HostCommand::Pause | HostCommand::Resume | HostCommand::SetSpeed(_)
+                        if scientific.is_some() || event_sequence.is_some() || has_persistence =>
+                    {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_archive.command_lifecycle",
+                            reason: "an applied control command must be command-only".to_owned(),
+                        });
+                    }
+                    HostCommand::Step if scientific.is_none() || event_sequence.is_none() => {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_archive.scientific",
+                            reason: "an applied step command requires its scientific boundary"
+                                .to_owned(),
+                        });
+                    }
+                    HostCommand::UpdateConfig(_)
+                        if scientific.is_some() || event_sequence.is_some() || has_persistence =>
+                    {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_archive.command_lifecycle",
+                            reason: "an applied update-config command must be command-only"
+                                .to_owned(),
+                        });
+                    }
+                    HostCommand::Shutdown if scientific.is_some() || event_sequence.is_some() => {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_archive.command_lifecycle",
+                            reason: "an applied shutdown may carry only its final persistence tail"
+                                .to_owned(),
+                        });
+                    }
+                    _ => {}
+                },
+                ApplicationState::Rejected(_) | ApplicationState::Failed(_)
+                    if scientific.is_some() || event_sequence.is_some() || has_persistence =>
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_archive.command_lifecycle",
+                        reason: "a rejected or failed command must be command-only".to_owned(),
+                    });
+                }
+                ApplicationState::Admitted => {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_archive.command_lifecycle",
+                        reason: "archive command lifecycle is not terminal".to_owned(),
+                    });
+                }
+                ApplicationState::Rejected(_) | ApplicationState::Failed(_) => {}
+            }
+        }
+        None => {}
     }
-    let shutdown =
-        command.is_some_and(|envelope| matches!(&envelope.command, HostCommand::Shutdown));
-    if has_persistence && scientific.is_none() && !shutdown {
+    if has_persistence
+        && scientific.is_none()
+        && !command_lifecycle.is_some_and(CommandLifecycleEvidence::is_applied_shutdown)
+    {
         return Err(StorageError::InvalidData {
             context: "host_journal_archive.persistence",
             reason:
-                "persistence without a scientific boundary is reserved for the final shutdown tail"
+                "persistence without science is reserved for an applied shutdown's final tail"
                     .to_owned(),
         });
     }
@@ -676,7 +1482,7 @@ pub(super) struct HostJournalArchive {
     host_session_id: String,
     journal_sequence: String,
     scientific_event_sequence: Option<String>,
-    command: Option<CommandEnvelope>,
+    command_lifecycle: Option<EncodedCommandLifecycle>,
     applied: AppliedCommand,
     scientific: Option<ScientificBoundary>,
     persistence: Option<StorageBuffer>,
@@ -781,12 +1587,17 @@ impl HostJournalArchive {
                     .map(EventSequence::new)
             })
             .transpose()?;
+        let command_lifecycle = self
+            .command_lifecycle
+            .as_ref()
+            .map(EncodedCommandLifecycle::decode)
+            .transpose()?;
         validate_scientific_archive_boundary(
             sequence,
             event_sequence,
             self.applied,
             self.scientific.as_ref(),
-            self.command.as_ref(),
+            command_lifecycle.as_ref(),
             self.persistence.is_some(),
         )?;
         if let Some(persistence) = &self.persistence {
@@ -847,10 +1658,31 @@ impl HostJournalArchive {
         }
     }
 
-    pub(super) fn is_shutdown(&self) -> bool {
-        self.command
+    pub(super) fn prepare_command_projection(
+        &self,
+        archive_payload_digest: &str,
+    ) -> Result<Option<PreparedCommandProjection>, StorageError> {
+        self.command_lifecycle
             .as_ref()
-            .is_some_and(|envelope| matches!(&envelope.command, HostCommand::Shutdown))
+            .map(|encoded| {
+                let lifecycle = encoded.decode()?;
+                PreparedCommandProjection::new(
+                    self.batch_id()?,
+                    &lifecycle,
+                    self.applied,
+                    self.event_sequence()?,
+                    archive_payload_digest,
+                )
+            })
+            .transpose()
+    }
+
+    pub(super) fn is_applied_shutdown(&self) -> Result<bool, StorageError> {
+        self.command_lifecycle
+            .as_ref()
+            .map(EncodedCommandLifecycle::decode)
+            .transpose()
+            .map(|lifecycle| lifecycle.is_some_and(|value| value.is_applied_shutdown()))
     }
 
     pub(super) fn take_persistence(&mut self) -> Option<StorageBuffer> {
@@ -888,8 +1720,12 @@ impl HostJournalArchive {
     ) -> Result<HostJournalRecord, StorageError> {
         let event_sequence = self.event_sequence()?;
         let batch_id = self.batch_id()?;
+        let command_lifecycle = self
+            .command_lifecycle
+            .as_ref()
+            .map(EncodedCommandLifecycle::decode)
+            .transpose()?;
         let Self {
-            command,
             applied,
             scientific,
             ..
@@ -922,7 +1758,7 @@ impl HostJournalArchive {
         };
         Ok(HostJournalRecord {
             batch_id,
-            command,
+            command_lifecycle,
             applied,
             event,
             state,
@@ -936,6 +1772,7 @@ pub(super) struct PreparedHostJournalArchive {
     pub(super) payload_digest: String,
     pub(super) persistence: Option<StorageBuffer>,
     pub(super) domain_events: Option<PreparedDomainEventProjection>,
+    pub(super) command: Option<PreparedCommandProjection>,
 }
 
 fn encode_host_journal_archive(
@@ -969,7 +1806,7 @@ pub(super) fn prepare_host_journal_archive(
         batch.scientific_event_sequence(),
         batch.applied(),
         batch.scientific().map(Arc::as_ref),
-        batch.command(),
+        batch.command_lifecycle(),
         batch.persistence().is_some(),
     )?;
     let persistence = batch
@@ -993,13 +1830,17 @@ pub(super) fn prepare_host_journal_archive(
     let scientific_event_sequence = batch
         .scientific_event_sequence()
         .map(|sequence| encode_journal_u64(sequence.get()));
+    let command_lifecycle = batch
+        .command_lifecycle()
+        .map(EncodedCommandLifecycle::encode)
+        .transpose()?;
     let archive = HostJournalArchiveRef {
         version: HOST_JOURNAL_ARCHIVE_VERSION,
         run_id,
         host_session_id: &host_session_id,
         journal_sequence: &journal_sequence,
         scientific_event_sequence: scientific_event_sequence.as_deref(),
-        command: batch.command(),
+        command_lifecycle: command_lifecycle.as_ref(),
         applied: batch.applied(),
         scientific: batch.scientific().map(Arc::as_ref),
         persistence: persistence.as_ref(),
@@ -1024,11 +1865,24 @@ pub(super) fn prepare_host_journal_archive(
             });
         }
     };
+    let command = batch
+        .command_lifecycle()
+        .map(|lifecycle| {
+            PreparedCommandProjection::new(
+                batch_id,
+                lifecycle,
+                batch.applied(),
+                batch.scientific_event_sequence(),
+                &payload_digest,
+            )
+        })
+        .transpose()?;
     Ok(PreparedHostJournalArchive {
         payload_json,
         payload_digest,
         persistence,
         domain_events,
+        command,
     })
 }
 
@@ -1797,10 +2651,7 @@ impl JournalPort for StorageJournalPort {
                         u64::MAX
                     }
                 };
-                if batch
-                    .command()
-                    .is_some_and(|envelope| matches!(&envelope.command, HostCommand::Shutdown))
-                {
+                if batch.is_applied_shutdown() {
                     self.open = false;
                 }
                 JournalAdmission::Accepted { batch_id }
@@ -1913,8 +2764,10 @@ mod tests {
         TickSummary, WorldState,
     };
     use scriptbots_runtime::{
-        ApplicationState, CommandId, HostBlocker, HostCore, HostCoreOptions, HostFault, HostHealth,
+        AdmissionSequence, ApplicationFailure, ApplicationState, CommandId,
+        CommandLifecycleTransition, HostBlocker, HostCore, HostCoreOptions, HostFault, HostHealth,
         HostRevisions, JournalState, ManualInstant, NullFrontend, PlaybackSnapshot,
+        RejectionReason,
     };
 
     fn applied() -> AppliedCommand {
@@ -1949,6 +2802,65 @@ mod tests {
             0,
             None,
         )
+    }
+
+    fn applied_lifecycle(
+        envelope: CommandEnvelope,
+        boundary: AppliedCommand,
+    ) -> CommandLifecycleEvidence {
+        CommandLifecycleEvidence::try_new(
+            envelope,
+            Some(AdmissionSequence::new(1)),
+            vec![
+                CommandLifecycleTransition::new(0, boundary, ApplicationState::Admitted),
+                CommandLifecycleTransition::new(
+                    1,
+                    boundary,
+                    ApplicationState::Applied(boundary),
+                ),
+            ],
+        )
+        .expect("valid applied command lifecycle")
+    }
+
+    fn rejected_lifecycle(
+        envelope: CommandEnvelope,
+        boundary: AppliedCommand,
+    ) -> CommandLifecycleEvidence {
+        CommandLifecycleEvidence::try_new(
+            envelope,
+            None,
+            vec![CommandLifecycleTransition::new(
+                0,
+                boundary,
+                ApplicationState::Rejected(RejectionReason::Validation {
+                    message: "invalid command".to_owned(),
+                }),
+            )],
+        )
+        .expect("valid pre-admission rejection lifecycle")
+    }
+
+    fn failed_lifecycle(
+        envelope: CommandEnvelope,
+        boundary: AppliedCommand,
+    ) -> CommandLifecycleEvidence {
+        CommandLifecycleEvidence::try_new(
+            envelope,
+            Some(AdmissionSequence::new(1)),
+            vec![
+                CommandLifecycleTransition::new(0, boundary, ApplicationState::Admitted),
+                CommandLifecycleTransition::new(
+                    1,
+                    boundary,
+                    ApplicationState::Failed(ApplicationFailure {
+                        code: "application_failed".to_owned(),
+                        message: "deterministic failure".to_owned(),
+                    }),
+                ),
+            ],
+        )
+        .expect("valid failed command lifecycle")
     }
 
     fn timeout_test_world() -> WorldState {
@@ -2604,7 +3516,7 @@ mod tests {
             second_status.application(),
             ApplicationState::Failed(failure) if failure.code == "science_blocked"
         ));
-        assert_eq!(second_status.journal(), &JournalState::NotRequired);
+        assert_eq!(second_status.journal(), &JournalState::Pending);
     }
 
     #[test]
@@ -2638,7 +3550,12 @@ mod tests {
         let host_session_id = encode_journal_u64(session_id.get());
         let journal_sequence = encode_journal_u64(batch_id.sequence());
         let scientific_event_sequence = encode_journal_u64(1);
-        let command = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+        let command = applied_lifecycle(
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            applied(),
+        );
+        let encoded_command =
+            EncodedCommandLifecycle::encode(&command).expect("encode command lifecycle");
         let scientific = scientific();
         let archive = HostJournalArchiveRef {
             version: HOST_JOURNAL_ARCHIVE_VERSION,
@@ -2646,7 +3563,7 @@ mod tests {
             host_session_id: &host_session_id,
             journal_sequence: &journal_sequence,
             scientific_event_sequence: Some(&scientific_event_sequence),
-            command: Some(&command),
+            command_lifecycle: Some(&encoded_command),
             applied: applied(),
             scientific: Some(&scientific),
             persistence: Some(&persistence),
@@ -2676,10 +3593,37 @@ mod tests {
     fn archive_shape_matrix_accepts_only_runtime_producible_batches() {
         let applied = applied();
         let scientific = scientific();
-        let step = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
-        let update =
-            CommandEnvelope::new(CommandId::new(2), HostCommand::UpdateConfig(Box::default()));
-        let shutdown = CommandEnvelope::new(CommandId::new(3), HostCommand::Shutdown);
+        let step = applied_lifecycle(
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            applied,
+        );
+        let update = applied_lifecycle(
+            CommandEnvelope::new(
+                CommandId::new(2),
+                HostCommand::UpdateConfig(Box::default()),
+            ),
+            applied,
+        );
+        let shutdown = applied_lifecycle(
+            CommandEnvelope::new(CommandId::new(3), HostCommand::Shutdown),
+            applied,
+        );
+        let control = applied_lifecycle(
+            CommandEnvelope::new(CommandId::new(4), HostCommand::Pause),
+            applied,
+        );
+        let rejected_step = rejected_lifecycle(
+            CommandEnvelope::new(CommandId::new(5), HostCommand::Step),
+            applied,
+        );
+        let rejected_shutdown = rejected_lifecycle(
+            CommandEnvelope::new(CommandId::new(6), HostCommand::Shutdown),
+            applied,
+        );
+        let failed_shutdown = failed_lifecycle(
+            CommandEnvelope::new(CommandId::new(7), HostCommand::Shutdown),
+            applied,
+        );
 
         assert!(
             validate_scientific_archive_boundary(
@@ -2711,6 +3655,44 @@ mod tests {
             validate_scientific_archive_boundary(1, None, applied, None, Some(&shutdown), true,)
                 .is_ok()
         );
+        assert!(
+            validate_scientific_archive_boundary(1, None, applied, None, Some(&control), false,)
+                .is_ok()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&rejected_step),
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&rejected_shutdown),
+                false,
+            )
+            .is_ok()
+        );
+        assert!(!rejected_shutdown.is_applied_shutdown());
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&failed_shutdown),
+                false,
+            )
+            .is_ok()
+        );
 
         assert!(
             validate_scientific_archive_boundary(1, None, applied, None, Some(&step), false,)
@@ -2741,6 +3723,98 @@ mod tests {
         assert!(
             validate_scientific_archive_boundary(1, None, applied, None, Some(&update), true,)
                 .is_err()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                Some(EventSequence::new(1)),
+                applied,
+                Some(&scientific),
+                Some(&rejected_step),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&rejected_shutdown),
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejected_nonfinite_command_round_trips_losslessly_through_archive_v2() {
+        let nan_bits = 0x7fc0_1234_u32;
+        let speed = f32::from_bits(nan_bits);
+        let lifecycle = rejected_lifecycle(
+            CommandEnvelope::new(CommandId::new(0x44), HostCommand::SetSpeed(speed)),
+            applied(),
+        );
+        let encoded =
+            EncodedCommandLifecycle::encode(&lifecycle).expect("encode nonfinite rejection");
+        let noncanonical = EncodedCommandLifecycle {
+            schema_version: encoded.schema_version,
+            postcard_hex: format!("{}00", encoded.postcard_hex),
+        };
+        let noncanonical_error = noncanonical
+            .decode()
+            .expect_err("postcard payload with ignored trailing bytes was accepted as canonical");
+        assert!(matches!(
+            noncanonical_error,
+            StorageError::InvalidData {
+                context: "host_journal_archive.command_lifecycle.postcard_hex",
+                ..
+            }
+        ));
+        let run_id = RunId::new(0x44);
+        let session_id = HostSessionId::new(0x44);
+        let batch_id = JournalBatchId::new(session_id, 1);
+        let host_session_id = encode_journal_u64(session_id.get());
+        let journal_sequence = encode_journal_u64(1);
+        let archive = HostJournalArchiveRef {
+            version: HOST_JOURNAL_ARCHIVE_VERSION,
+            run_id,
+            host_session_id: &host_session_id,
+            journal_sequence: &journal_sequence,
+            scientific_event_sequence: None,
+            command_lifecycle: Some(&encoded),
+            applied: applied(),
+            scientific: None,
+            persistence: None,
+        };
+        let (payload_json, payload_digest) =
+            encode_host_journal_archive(&archive, MAX_JOURNAL_BYTES)
+                .expect("encode lossless command archive");
+        assert!(payload_json.contains("\"postcard_hex\""));
+        let decoded = HostJournalArchive::decode(
+            &payload_json,
+            &payload_digest,
+            run_id,
+            batch_id,
+            MAX_JOURNAL_BYTES,
+        )
+        .expect("decode lossless command archive");
+        let projection = decoded
+            .prepare_command_projection(&payload_digest)
+            .expect("prepare normalized command")
+            .expect("command projection exists");
+        let HostCommand::SetSpeed(decoded_speed) = &projection.lifecycle.envelope().command else {
+            panic!("decoded lifecycle changed rejected command kind");
+        };
+        assert_eq!(decoded_speed.to_bits(), nan_bits);
+        assert_eq!(
+            projection.command_payload_postcard_hex,
+            encode_host_command_postcard_hex(
+                "host_command_records.command_payload_postcard_hex",
+                &HostCommand::SetSpeed(speed),
+            )
+            .expect("encode original rejected command")
         );
     }
 

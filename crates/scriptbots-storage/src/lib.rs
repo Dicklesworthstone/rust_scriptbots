@@ -5,6 +5,8 @@
 mod journal;
 
 pub use journal::{
+    CommandJournalCursor, CommandJournalEvidence, CommandJournalPage, CommandJournalRecord,
+    CommandStorageTransition, CommandStorageTransitionKind,
     DomainEventCursor, DomainEventEvidence, DomainEventExpectation, DomainEventKind, DomainEventPage,
     DomainEventPayload, DomainEventRecord, HostJournalPrefixes, HostJournalRecord,
     HostJournalRecordState, HostJournalSessionPage, HostJournalSessionProgress,
@@ -21,8 +23,11 @@ use fsqlite::{
 };
 use journal::{
     HOST_JOURNAL_ARCHIVE_VERSION, HostJournalArchive, JournalReaderBackend, JournalReaderPublisher,
-    JournalSessionShared, PreparedDomainEventProjection, PreparedHostJournalArchive,
-    decode_journal_u64, encode_journal_u64, prepare_host_journal_archive,
+    JournalSessionShared, PreparedCommandProjection, PreparedDomainEventProjection,
+    PreparedHostJournalArchive, decode_application_state_postcard_hex,
+    decode_command_envelope_postcard_hex, decode_host_command_postcard_hex, decode_journal_u64,
+    encode_application_state_postcard_hex, encode_command_envelope_postcard_hex,
+    encode_host_command_postcard_hex, encode_journal_u64, prepare_host_journal_archive,
 };
 use scriptbots_core::{
     AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding,
@@ -34,9 +39,9 @@ use scriptbots_core::{
     world_counters_digest_v1,
 };
 use scriptbots_runtime::{
-    EventCommitment, EventSequence, EventSequenceRange, HostCommand, HostSessionId, JournalBatch,
-    JournalBatchId, JournalFailure, JournalReceipt, JournalReceiptState, JournaledScientificEvent,
-    RunId, ShutdownCommitRequirement,
+    ApplicationState, CommandId, EventCommitment, EventSequence, EventSequenceRange, HostCommand,
+    HostSessionId, JournalBatch, JournalBatchId, JournalFailure, JournalReceipt,
+    JournalReceiptState, JournaledScientificEvent, RunId, ShutdownCommitRequirement,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
@@ -166,9 +171,10 @@ pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
 
 const SCRIPTBOTS_SCHEMA_V6_VERSION: i64 = 6;
 const SCRIPTBOTS_SCHEMA_V7_VERSION: i64 = 7;
+const SCRIPTBOTS_SCHEMA_V8_VERSION: i64 = 8;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 8;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 9;
 
 /// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
@@ -751,6 +757,190 @@ pub const SCRIPTBOTS_SCHEMA_V8: &str = r#"
     PRAGMA user_version = 8;
 "#;
 
+/// Additive normalized command-lifecycle projection bound to canonical host archives.
+///
+/// Runtime application transitions and storage-ledger transitions intentionally occupy separate
+/// tables. An archive reaching the storage `applied` state inserts the complete runtime lifecycle;
+/// later volatile and durable commits append only storage transitions. Every copied digest is
+/// explicitly an archive payload digest and must never be interpreted as a world-state digest.
+pub const SCRIPTBOTS_SCHEMA_V9: &str = r#"
+    CREATE TABLE host_command_records (
+        run_id TEXT NOT NULL,
+        host_session_id TEXT NOT NULL CHECK (
+            length(host_session_id) = 16
+            AND host_session_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        command_id TEXT NOT NULL CHECK (
+            length(command_id) = 32
+            AND command_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        source_client_namespace TEXT NOT NULL CHECK (
+            length(source_client_namespace) = 16
+            AND source_client_namespace NOT GLOB '*[^0-9a-f]*'
+        ),
+        client_sequence TEXT NOT NULL CHECK (
+            length(client_sequence) = 16
+            AND client_sequence NOT GLOB '*[^0-9a-f]*'
+        ),
+        admission_sequence TEXT CHECK (
+            admission_sequence IS NULL
+            OR (
+                length(admission_sequence) = 16
+                AND admission_sequence NOT GLOB '*[^0-9a-f]*'
+                AND admission_sequence <> '0000000000000000'
+            )
+        ),
+        lifecycle_schema_version INTEGER NOT NULL CHECK (lifecycle_schema_version > 0),
+        expected_control_revision TEXT CHECK (
+            expected_control_revision IS NULL
+            OR (
+                length(expected_control_revision) = 16
+                AND expected_control_revision NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        expected_scientific_revision TEXT CHECK (
+            expected_scientific_revision IS NULL
+            OR (
+                length(expected_scientific_revision) = 16
+                AND expected_scientific_revision NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        expected_config_revision TEXT CHECK (
+            expected_config_revision IS NULL
+            OR (
+                length(expected_config_revision) = 16
+                AND expected_config_revision NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        envelope_postcard_hex TEXT NOT NULL CHECK (
+            envelope_postcard_hex <> ''
+            AND length(envelope_postcard_hex) % 2 = 0
+            AND envelope_postcard_hex NOT GLOB '*[^0-9a-f]*'
+        ),
+        command_payload_postcard_hex TEXT NOT NULL CHECK (
+            command_payload_postcard_hex <> ''
+            AND length(command_payload_postcard_hex) % 2 = 0
+            AND command_payload_postcard_hex NOT GLOB '*[^0-9a-f]*'
+        ),
+        journal_sequence TEXT NOT NULL CHECK (
+            length(journal_sequence) = 16
+            AND journal_sequence NOT GLOB '*[^0-9a-f]*'
+            AND journal_sequence <> '0000000000000000'
+        ),
+        terminal_tick TEXT NOT NULL CHECK (
+            length(terminal_tick) = 16
+            AND terminal_tick NOT GLOB '*[^0-9a-f]*'
+        ),
+        terminal_control_revision TEXT NOT NULL CHECK (
+            length(terminal_control_revision) = 16
+            AND terminal_control_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        terminal_scientific_revision TEXT NOT NULL CHECK (
+            length(terminal_scientific_revision) = 16
+            AND terminal_scientific_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        terminal_config_revision TEXT NOT NULL CHECK (
+            length(terminal_config_revision) = 16
+            AND terminal_config_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        scientific_event_sequence TEXT CHECK (
+            scientific_event_sequence IS NULL
+            OR (
+                length(scientific_event_sequence) = 16
+                AND scientific_event_sequence NOT GLOB '*[^0-9a-f]*'
+                AND scientific_event_sequence <> '0000000000000000'
+            )
+        ),
+        archive_payload_digest TEXT NOT NULL CHECK (
+            length(archive_payload_digest) = 64
+            AND archive_payload_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        application_transition_count INTEGER NOT NULL CHECK (
+            application_transition_count > 0
+        ),
+        PRIMARY KEY (run_id, host_session_id, command_id),
+        UNIQUE (run_id, host_session_id, journal_sequence),
+        FOREIGN KEY (run_id, host_session_id, journal_sequence)
+            REFERENCES host_journal_batch_ledger (run_id, host_session_id, journal_sequence)
+    );
+    CREATE INDEX host_command_records_run_session_source_sequence_index
+        ON host_command_records (
+            run_id, host_session_id, source_client_namespace, client_sequence
+        );
+
+    CREATE TABLE host_command_application_transitions (
+        run_id TEXT NOT NULL,
+        host_session_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        transition_ordinal INTEGER NOT NULL CHECK (transition_ordinal >= 0),
+        journal_sequence TEXT NOT NULL CHECK (
+            length(journal_sequence) = 16
+            AND journal_sequence NOT GLOB '*[^0-9a-f]*'
+            AND journal_sequence <> '0000000000000000'
+        ),
+        boundary_tick TEXT NOT NULL CHECK (
+            length(boundary_tick) = 16
+            AND boundary_tick NOT GLOB '*[^0-9a-f]*'
+        ),
+        boundary_control_revision TEXT NOT NULL CHECK (
+            length(boundary_control_revision) = 16
+            AND boundary_control_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        boundary_scientific_revision TEXT NOT NULL CHECK (
+            length(boundary_scientific_revision) = 16
+            AND boundary_scientific_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        boundary_config_revision TEXT NOT NULL CHECK (
+            length(boundary_config_revision) = 16
+            AND boundary_config_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        application_state TEXT NOT NULL CHECK (
+            application_state IN ('admitted', 'applied', 'rejected', 'failed')
+        ),
+        application_postcard_hex TEXT NOT NULL CHECK (
+            application_postcard_hex <> ''
+            AND length(application_postcard_hex) % 2 = 0
+            AND application_postcard_hex NOT GLOB '*[^0-9a-f]*'
+        ),
+        archive_payload_digest TEXT NOT NULL CHECK (
+            length(archive_payload_digest) = 64
+            AND archive_payload_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        PRIMARY KEY (run_id, host_session_id, command_id, transition_ordinal),
+        FOREIGN KEY (run_id, host_session_id, command_id)
+            REFERENCES host_command_records (run_id, host_session_id, command_id)
+    );
+
+    CREATE TABLE host_command_storage_transitions (
+        run_id TEXT NOT NULL,
+        host_session_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        transition_ordinal INTEGER NOT NULL CHECK (transition_ordinal IN (0, 1)),
+        journal_sequence TEXT NOT NULL CHECK (
+            length(journal_sequence) = 16
+            AND journal_sequence NOT GLOB '*[^0-9a-f]*'
+            AND journal_sequence <> '0000000000000000'
+        ),
+        storage_state TEXT NOT NULL CHECK (
+            storage_state IN ('committed_volatile', 'durable')
+        ),
+        archive_payload_digest TEXT NOT NULL CHECK (
+            length(archive_payload_digest) = 64
+            AND archive_payload_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        PRIMARY KEY (run_id, host_session_id, command_id, transition_ordinal),
+        UNIQUE (run_id, host_session_id, command_id, storage_state),
+        CHECK (
+            (transition_ordinal = 0 AND storage_state = 'committed_volatile')
+            OR (transition_ordinal = 1 AND storage_state = 'durable')
+        ),
+        FOREIGN KEY (run_id, host_session_id, command_id)
+            REFERENCES host_command_records (run_id, host_session_id, command_id)
+    );
+
+    PRAGMA user_version = 9;
+"#;
+
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaObject {
     object_type: String,
@@ -772,7 +962,40 @@ impl SchemaObject {
     }
 }
 
+fn refuse_lossy_command_lifecycle_migration(connection: &Connection) -> Result<(), StorageError> {
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version")?
+        .get_typed(0)?;
+    if user_version >= SCRIPTBOTS_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let archive_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'host_journal_archive'",
+        )?
+        .get_typed(0)?;
+    if archive_table_count == 0 {
+        return Ok(());
+    }
+    let archive_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM host_journal_archive")?
+        .get_typed(0)?;
+    if archive_count != 0 {
+        return Err(StorageError::InvalidData {
+            context: "_schema_migrations.command_lifecycle",
+            reason: format!(
+                "refusing pre-v9 migration with {archive_count} existing host-journal archive row(s): archive v1 lacks complete lifecycle evidence; export/import the run or use a current-run database"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
+    // This preflight must precede MigrationRunner: its ledger, DDL, and user-version writes are
+    // intentionally never attempted when old envelope-only archives cannot populate V9 exactly.
+    refuse_lossy_command_lifecycle_migration(connection)?;
     let result = MigrationRunner::new()
         .add(
             SCRIPTBOTS_SCHEMA_V6_VERSION,
@@ -785,18 +1008,30 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
             SCRIPTBOTS_SCHEMA_V7,
         )
         .add(
-            SCRIPTBOTS_SCHEMA_VERSION,
+            SCRIPTBOTS_SCHEMA_V8_VERSION,
             "add_host_domain_event_projection",
             SCRIPTBOTS_SCHEMA_V8,
+        )
+        .add(
+            SCRIPTBOTS_SCHEMA_VERSION,
+            "add_host_command_lifecycle_projection",
+            SCRIPTBOTS_SCHEMA_V9,
         )
         .run(connection)?;
     let applied_is_valid = result.applied.is_empty()
         || result.applied == [SCRIPTBOTS_SCHEMA_VERSION]
-        || result.applied == [SCRIPTBOTS_SCHEMA_V7_VERSION, SCRIPTBOTS_SCHEMA_VERSION]
+        || result.applied == [SCRIPTBOTS_SCHEMA_V8_VERSION, SCRIPTBOTS_SCHEMA_VERSION]
+        || result.applied
+            == [
+                SCRIPTBOTS_SCHEMA_V7_VERSION,
+                SCRIPTBOTS_SCHEMA_V8_VERSION,
+                SCRIPTBOTS_SCHEMA_VERSION,
+            ]
         || result.applied
             == [
                 SCRIPTBOTS_SCHEMA_V6_VERSION,
                 SCRIPTBOTS_SCHEMA_V7_VERSION,
+                SCRIPTBOTS_SCHEMA_V8_VERSION,
                 SCRIPTBOTS_SCHEMA_VERSION,
             ];
     if result.current != SCRIPTBOTS_SCHEMA_VERSION || !applied_is_valid {
@@ -3749,6 +3984,15 @@ impl HostJournalState {
     }
 }
 
+const fn command_application_state_name(application: &ApplicationState) -> &'static str {
+    match application {
+        ApplicationState::Admitted => "admitted",
+        ApplicationState::Applied(_) => "applied",
+        ApplicationState::Rejected(_) => "rejected",
+        ApplicationState::Failed(_) => "failed",
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct HostJournalProgress {
     admitted_journal: u64,
@@ -4003,7 +4247,7 @@ fn load_finished_host_journal_record(
         });
     }
     let marks_shutdown = progress.shutdown_sequence == Some(metadata.sequence);
-    if archive.is_shutdown() != marks_shutdown {
+    if archive.is_applied_shutdown()? != marks_shutdown {
         return Err(StorageError::InvalidData {
             context: "host_journal_progress.shutdown_sequence",
             reason: format!(
@@ -4012,6 +4256,15 @@ fn load_finished_host_journal_record(
             ),
         });
     }
+
+    let command = archive.prepare_command_projection(&metadata.payload_digest)?;
+    Storage::validate_command_projection_for_connection(
+        connection,
+        run_id,
+        batch_id,
+        metadata.state,
+        command.as_ref(),
+    )?;
 
     let applied_tick = archive.applied().tick.0;
     let persistence = archive.take_persistence();
@@ -4091,6 +4344,120 @@ fn load_finished_host_journal_record(
         }
     }
     archive.into_public_record(metadata.state.public())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the immutable command loader receives already-bounded metadata and revalidates its exact canonical archive binding"
+)]
+fn load_finished_command_journal_record(
+    connection: &Connection,
+    run_id: RunId,
+    session_id: HostSessionId,
+    journal_sequence: u64,
+    expected_command_id: CommandId,
+    payload_digest: &str,
+    payload_bytes: usize,
+) -> Result<CommandJournalRecord, StorageError> {
+    if payload_bytes == 0 || payload_bytes > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
+        return Err(StorageError::InvalidData {
+            context: "host_journal_archive.payload_json",
+            reason: format!(
+                "command archive has {payload_bytes} bytes outside the bounded 1..={MAX_HOST_JOURNAL_ARCHIVE_BYTES} range"
+            ),
+        });
+    }
+    let session = encode_journal_u64(session_id.get());
+    let journal = encode_journal_u64(journal_sequence);
+    let payload_row = connection.query_row_with_params(
+        "SELECT payload_json FROM host_journal_archive
+         WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+           AND payload_digest = ?4 AND length(CAST(payload_json AS BLOB)) = ?5",
+        &[
+            sqlite_run_id(run_id),
+            session.as_str().into(),
+            journal.as_str().into(),
+            payload_digest.into(),
+            i64::try_from(payload_bytes)
+                .map_err(|error| StorageError::InvalidData {
+                    context: "host_journal_archive.payload_json",
+                    reason: error.to_string(),
+                })?
+                .into(),
+        ],
+    )?;
+    let payload_json: String = decode(&payload_row, 0, "host_journal_archive.payload_json")?;
+    let batch_id = JournalBatchId::new(session_id, journal_sequence);
+    let archive = HostJournalArchive::decode(
+        &payload_json,
+        payload_digest,
+        run_id,
+        batch_id,
+        MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+    )?;
+    let projection = archive
+        .prepare_command_projection(payload_digest)?
+        .ok_or(StorageError::InvalidData {
+            context: "host_command_records.command_id",
+            reason: format!(
+                "normalized command {expected_command_id} points to a command-free archive"
+            ),
+        })?;
+    if projection.command_id() != expected_command_id {
+        return Err(StorageError::InvalidData {
+            context: "host_command_records.command_id",
+            reason: format!(
+                "normalized command {expected_command_id} points to canonical command {}",
+                projection.command_id()
+            ),
+        });
+    }
+    Storage::validate_command_projection_for_connection(
+        connection,
+        run_id,
+        batch_id,
+        HostJournalState::Durable,
+        Some(&projection),
+    )?;
+    let transition_rows = connection.query_with_params(
+        "SELECT transition_ordinal, storage_state
+         FROM host_command_storage_transitions
+         WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3
+         ORDER BY transition_ordinal ASC",
+        &[
+            sqlite_run_id(run_id),
+            session.as_str().into(),
+            expected_command_id.to_string().into(),
+        ],
+    )?;
+    let storage_transitions = transition_rows
+        .iter()
+        .map(|row| {
+            Ok(CommandStorageTransition {
+                ordinal: checked_u32(
+                    "host_command_storage_transitions.transition_ordinal",
+                    decode(
+                        row,
+                        0,
+                        "host_command_storage_transitions.transition_ordinal",
+                    )?,
+                )?,
+                kind: CommandStorageTransitionKind::decode(&decode::<String>(
+                    row,
+                    1,
+                    "host_command_storage_transitions.storage_state",
+                )?)?,
+            })
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    Ok(CommandJournalRecord {
+        batch_id,
+        lifecycle: projection.lifecycle,
+        terminal_boundary: projection.terminal_boundary,
+        scientific_event_sequence: projection.scientific_event_sequence,
+        storage_transitions,
+        archive_payload_digest: projection.archive_payload_digest,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5320,6 +5687,430 @@ impl StorageReader {
             records,
             next_after,
             integrity_check,
+        })
+    }
+
+    fn finished_command_journal_evidence(
+        &self,
+        session_id: HostSessionId,
+    ) -> Result<CommandJournalEvidence, StorageError> {
+        let connection = self.finished_connection()?;
+        let progress = Self::finished_host_journal_progress(connection, self.run_id, session_id)?;
+        let session = encode_journal_u64(session_id.get());
+        let record_row = connection.query_row_with_params(
+            "SELECT COUNT(*), COALESCE(SUM(application_transition_count), 0)
+             FROM host_command_records
+             WHERE run_id = ?1 AND host_session_id = ?2",
+            &[sqlite_run_id(self.run_id), session.as_str().into()],
+        )?;
+        let command_count = checked_u64(
+            "host_command_records.count",
+            decode(&record_row, 0, "host_command_records.count")?,
+        )?;
+        let declared_application_count = checked_u64(
+            "host_command_records.application_transition_count",
+            decode(
+                &record_row,
+                1,
+                "host_command_records.application_transition_count",
+            )?,
+        )?;
+        if command_count == 0 {
+            return Err(StorageError::NoEvidence {
+                context: "host_command_records",
+                reason: format!(
+                    "finished session {} has {} durable journal records{} but zero normalized commands",
+                    session_id.get(),
+                    progress.durable_journal,
+                    progress.shutdown_sequence.map_or("", |_| " and an applied shutdown barrier")
+                ),
+            });
+        }
+        let bound_row = connection.query_row_with_params(
+            "SELECT COUNT(*)
+             FROM host_command_records AS command
+             JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = command.run_id
+              AND ledger.host_session_id = command.host_session_id
+              AND ledger.journal_sequence = command.journal_sequence
+             JOIN host_journal_archive AS archive
+               ON archive.run_id = command.run_id
+              AND archive.host_session_id = command.host_session_id
+              AND archive.journal_sequence = command.journal_sequence
+             WHERE command.run_id = ?1 AND command.host_session_id = ?2
+               AND ledger.state = 'durable'
+               AND command.archive_payload_digest = archive.payload_digest
+               AND (
+                    command.scientific_event_sequence = ledger.scientific_event_sequence
+                    OR (
+                        command.scientific_event_sequence IS NULL
+                        AND ledger.scientific_event_sequence IS NULL
+                    )
+               )",
+            &[sqlite_run_id(self.run_id), session.as_str().into()],
+        )?;
+        let bound_count = checked_u64(
+            "host_command_records.archive_binding",
+            decode(&bound_row, 0, "host_command_records.archive_binding")?,
+        )?;
+        if bound_count != command_count {
+            return Err(StorageError::InvalidData {
+                context: "host_command_records.archive_binding",
+                reason: format!(
+                    "{command_count} command records exist but only {bound_count} are exactly bound to durable canonical archives"
+                ),
+            });
+        }
+        let application_row = connection.query_row_with_params(
+            "SELECT COUNT(*)
+             FROM host_command_application_transitions AS transition
+             JOIN host_command_records AS command
+               ON command.run_id = transition.run_id
+              AND command.host_session_id = transition.host_session_id
+              AND command.command_id = transition.command_id
+             WHERE transition.run_id = ?1 AND transition.host_session_id = ?2
+               AND transition.journal_sequence = command.journal_sequence
+               AND transition.archive_payload_digest = command.archive_payload_digest",
+            &[sqlite_run_id(self.run_id), session.as_str().into()],
+        )?;
+        let application_transition_count = checked_u64(
+            "host_command_application_transitions.count",
+            decode(
+                &application_row,
+                0,
+                "host_command_application_transitions.count",
+            )?,
+        )?;
+        if application_transition_count != declared_application_count {
+            return Err(StorageError::InvalidData {
+                context: "host_command_application_transitions.transition_ordinal",
+                reason: format!(
+                    "command records declare {declared_application_count} application transitions but exactly bind {application_transition_count}"
+                ),
+            });
+        }
+        let storage_row = connection.query_row_with_params(
+            "SELECT COUNT(*)
+             FROM host_command_storage_transitions AS transition
+             JOIN host_command_records AS command
+               ON command.run_id = transition.run_id
+              AND command.host_session_id = transition.host_session_id
+              AND command.command_id = transition.command_id
+             WHERE transition.run_id = ?1 AND transition.host_session_id = ?2
+               AND transition.journal_sequence = command.journal_sequence
+               AND transition.archive_payload_digest = command.archive_payload_digest",
+            &[sqlite_run_id(self.run_id), session.as_str().into()],
+        )?;
+        let storage_transition_count = checked_u64(
+            "host_command_storage_transitions.count",
+            decode(
+                &storage_row,
+                0,
+                "host_command_storage_transitions.count",
+            )?,
+        )?;
+        let expected_storage_count = command_count.checked_mul(2).ok_or(
+            StorageError::InvalidData {
+                context: "host_command_storage_transitions.count",
+                reason: "durable command storage-transition count overflowed".to_owned(),
+            },
+        )?;
+        if storage_transition_count != expected_storage_count {
+            return Err(StorageError::InvalidData {
+                context: "host_command_storage_transitions.transition_ordinal",
+                reason: format!(
+                    "{command_count} durable commands require {expected_storage_count} storage transitions, found {storage_transition_count}"
+                ),
+            });
+        }
+        Ok(CommandJournalEvidence {
+            command_count,
+            application_transition_count,
+            storage_transition_count,
+        })
+    }
+
+    /// Validate complete, non-vacuous normalized command evidence for a finished session.
+    ///
+    /// Application and storage transitions are counted independently. A finished session with no
+    /// command records returns typed [`StorageError::NoEvidence`], including the impossible case
+    /// where an applied-shutdown marker exists without its command projection.
+    pub fn command_journal_evidence(
+        &self,
+        session_id: HostSessionId,
+    ) -> Result<CommandJournalEvidence, StorageError> {
+        self.finished_command_journal_evidence(session_id)
+    }
+
+    /// Read one exact command by its typed source/idempotency identity.
+    pub fn command_journal_record(
+        &self,
+        session_id: HostSessionId,
+        command_id: CommandId,
+    ) -> Result<CommandJournalRecord, StorageError> {
+        let connection = self.finished_connection()?;
+        Self::finished_host_journal_progress(connection, self.run_id, session_id)?;
+        let session = encode_journal_u64(session_id.get());
+        let rows = connection.query_with_params(
+            "SELECT command.journal_sequence, archive.payload_version,
+                    archive.payload_digest, length(CAST(archive.payload_json AS BLOB)),
+                    ledger.state
+             FROM host_command_records AS command
+             JOIN host_journal_archive AS archive
+               ON archive.run_id = command.run_id
+              AND archive.host_session_id = command.host_session_id
+              AND archive.journal_sequence = command.journal_sequence
+             JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = command.run_id
+              AND ledger.host_session_id = command.host_session_id
+              AND ledger.journal_sequence = command.journal_sequence
+             WHERE command.run_id = ?1 AND command.host_session_id = ?2
+               AND command.command_id = ?3",
+            &[
+                sqlite_run_id(self.run_id),
+                session.as_str().into(),
+                command_id.to_string().into(),
+            ],
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(StorageError::NoEvidence {
+                context: "host_command_records.command_id",
+                reason: format!(
+                    "session {} has {} normalized records for command {command_id}",
+                    session_id.get(),
+                    rows.len()
+                ),
+            });
+        };
+        let journal: String = decode(row, 0, "host_command_records.journal_sequence")?;
+        let journal_sequence =
+            decode_journal_u64("host_command_records.journal_sequence", &journal)?;
+        let payload_version: i64 = decode(row, 1, "host_journal_archive.payload_version")?;
+        let ledger_state: String = decode(row, 4, "host_journal_batch_ledger.state")?;
+        if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION)
+            || HostJournalState::decode(&ledger_state)? != HostJournalState::Durable
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_command_records.archive_binding",
+                reason: format!(
+                    "command {command_id} is not bound to archive v{HOST_JOURNAL_ARCHIVE_VERSION} in durable storage"
+                ),
+            });
+        }
+        let payload_digest: String = decode(row, 2, "host_journal_archive.payload_digest")?;
+        let payload_bytes = usize::try_from(decode::<i64>(
+            row,
+            3,
+            "host_journal_archive.payload_json.length",
+        )?)
+        .map_err(|error| StorageError::InvalidData {
+            context: "host_journal_archive.payload_json",
+            reason: error.to_string(),
+        })?;
+        load_finished_command_journal_record(
+            connection,
+            self.run_id,
+            session_id,
+            journal_sequence,
+            command_id,
+            &payload_digest,
+            payload_bytes,
+        )
+    }
+
+    /// Read one bounded page of normalized commands in total host-journal order.
+    ///
+    /// A cursor must name an existing command at its exact journal sequence and command id, so a
+    /// caller cannot invent a cursor that skips evidence. The byte limit bounds aggregate archive
+    /// allocation independently of the storage-wide 4096-record ceiling.
+    pub fn command_journal_page(
+        &self,
+        session_id: HostSessionId,
+        after: Option<CommandJournalCursor>,
+        record_limit: usize,
+        page_payload_byte_limit: usize,
+    ) -> Result<CommandJournalPage, StorageError> {
+        if record_limit == 0 {
+            return Err(StorageError::InvalidData {
+                context: "host_command_records.record_limit",
+                reason: "record limit must be nonzero".to_owned(),
+            });
+        }
+        let query_limit = checked_query_limit("host_command_records.record_limit", record_limit)?;
+        if page_payload_byte_limit == 0 || page_payload_byte_limit > MAX_HOST_JOURNAL_ARCHIVE_BYTES
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_command_records.page_payload_byte_limit",
+                reason: format!(
+                    "page payload byte limit {page_payload_byte_limit} is outside the bounded 1..={MAX_HOST_JOURNAL_ARCHIVE_BYTES} range"
+                ),
+            });
+        }
+        let evidence = self.finished_command_journal_evidence(session_id)?;
+        let connection = self.finished_connection()?;
+        let session = encode_journal_u64(session_id.get());
+        let after_sequence = match after {
+            Some(cursor) if cursor.session_id != session_id => {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_records.after",
+                    reason: format!(
+                        "cursor session {} does not match requested session {}",
+                        cursor.session_id.get(),
+                        session_id.get()
+                    ),
+                });
+            }
+            Some(cursor) if cursor.journal_sequence == 0 => {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_records.after",
+                    reason: "cursor journal sequence must be nonzero".to_owned(),
+                });
+            }
+            Some(cursor) => {
+                let cursor_rows = connection.query_with_params(
+                    "SELECT 1 FROM host_command_records
+                     WHERE run_id = ?1 AND host_session_id = ?2
+                       AND journal_sequence = ?3 AND command_id = ?4",
+                    &[
+                        sqlite_run_id(self.run_id),
+                        session.as_str().into(),
+                        encode_journal_u64(cursor.journal_sequence).as_str().into(),
+                        cursor.command_id.to_string().into(),
+                    ],
+                )?;
+                if cursor_rows.len() != 1 {
+                    return Err(StorageError::InvalidData {
+                        context: "host_command_records.after",
+                        reason: format!(
+                            "cursor ({}, {}) names {} normalized command rows",
+                            cursor.journal_sequence,
+                            cursor.command_id,
+                            cursor_rows.len()
+                        ),
+                    });
+                }
+                cursor.journal_sequence
+            }
+            None => 0,
+        };
+        let rows = connection.query_with_params(
+            "SELECT command.command_id, command.journal_sequence,
+                    archive.payload_version, archive.payload_digest,
+                    length(CAST(archive.payload_json AS BLOB)), ledger.state
+             FROM host_command_records AS command
+             JOIN host_journal_archive AS archive
+               ON archive.run_id = command.run_id
+              AND archive.host_session_id = command.host_session_id
+              AND archive.journal_sequence = command.journal_sequence
+             JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = command.run_id
+              AND ledger.host_session_id = command.host_session_id
+              AND ledger.journal_sequence = command.journal_sequence
+             WHERE command.run_id = ?1 AND command.host_session_id = ?2
+               AND command.journal_sequence > ?3
+             ORDER BY command.journal_sequence ASC
+             LIMIT ?4",
+            &[
+                sqlite_run_id(self.run_id),
+                session.as_str().into(),
+                encode_journal_u64(after_sequence).as_str().into(),
+                query_limit.into(),
+            ],
+        )?;
+        let mut commands = Vec::with_capacity(rows.len());
+        let mut page_payload_bytes = 0_usize;
+        let mut prior_sequence = after_sequence;
+        for row in &rows {
+            let command_id_text: String = decode(row, 0, "host_command_records.command_id")?;
+            let command_id: CommandId = serde_json::from_str(&format!("\"{command_id_text}\""))
+                .map_err(|error| StorageError::InvalidData {
+                    context: "host_command_records.command_id",
+                    reason: error.to_string(),
+                })?;
+            let journal: String = decode(row, 1, "host_command_records.journal_sequence")?;
+            let journal_sequence =
+                decode_journal_u64("host_command_records.journal_sequence", &journal)?;
+            if journal_sequence <= prior_sequence {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_records.journal_sequence",
+                    reason: format!(
+                        "command page did not advance after journal {prior_sequence}; found {journal_sequence}"
+                    ),
+                });
+            }
+            let payload_version: i64 = decode(row, 2, "host_journal_archive.payload_version")?;
+            let ledger_state: String = decode(row, 5, "host_journal_batch_ledger.state")?;
+            if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION)
+                || HostJournalState::decode(&ledger_state)? != HostJournalState::Durable
+            {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_records.archive_binding",
+                    reason: format!(
+                        "command {command_id} is not bound to a current durable canonical archive"
+                    ),
+                });
+            }
+            let payload_bytes = usize::try_from(decode::<i64>(
+                row,
+                4,
+                "host_journal_archive.payload_json.length",
+            )?)
+            .map_err(|error| StorageError::InvalidData {
+                context: "host_journal_archive.payload_json",
+                reason: error.to_string(),
+            })?;
+            let next_page_bytes = page_payload_bytes.checked_add(payload_bytes).ok_or(
+                StorageError::InvalidData {
+                    context: "host_command_records.page_payload_byte_limit",
+                    reason: "command page byte accounting overflowed".to_owned(),
+                },
+            )?;
+            if payload_bytes == 0 || next_page_bytes > page_payload_byte_limit {
+                if commands.is_empty() {
+                    return Err(StorageError::InvalidData {
+                        context: "host_command_records.page_payload_byte_limit",
+                        reason: format!(
+                            "command {command_id} requires {payload_bytes} archive bytes, exceeding page limit {page_payload_byte_limit}"
+                        ),
+                    });
+                }
+                break;
+            }
+            let payload_digest: String = decode(row, 3, "host_journal_archive.payload_digest")?;
+            commands.push(load_finished_command_journal_record(
+                connection,
+                self.run_id,
+                session_id,
+                journal_sequence,
+                command_id,
+                &payload_digest,
+                payload_bytes,
+            )?);
+            page_payload_bytes = next_page_bytes;
+            prior_sequence = journal_sequence;
+        }
+        let next_after = if let Some(last) = commands.last() {
+            let cursor = last.cursor();
+            let more = connection.query_with_params(
+                "SELECT 1 FROM host_command_records
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence > ?3
+                 LIMIT 1",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    encode_journal_u64(cursor.journal_sequence).as_str().into(),
+                ],
+            )?;
+            (!more.is_empty()).then_some(cursor)
+        } else {
+            None
+        };
+        Ok(CommandJournalPage {
+            run_id: self.run_id,
+            session_id,
+            commands,
+            next_after,
+            evidence,
         })
     }
 
@@ -7717,11 +8508,11 @@ impl Storage {
             "SELECT version, name FROM _schema_migrations
              ORDER BY version ASC",
         )?;
-        if migrations.len() != 3 {
+        if migrations.len() != 4 {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_schema",
                 reason: format!(
-                    "expected exactly three ScriptBots migrations through v8, found {}",
+                    "expected exactly four ScriptBots migrations through v9, found {}",
                     migrations.len()
                 ),
             });
@@ -7730,8 +8521,12 @@ impl Storage {
             (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V8_VERSION,
                 "add_host_domain_event_projection",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_host_command_lifecycle_projection",
             ),
         ];
         for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
@@ -8209,6 +9004,99 @@ impl Storage {
                 ),
             });
         }
+        let command_orphan = connection.query_with_params(
+            "SELECT command.host_session_id, command.command_id
+             FROM host_command_records AS command
+             LEFT JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = command.run_id
+              AND ledger.host_session_id = command.host_session_id
+              AND ledger.journal_sequence = command.journal_sequence
+             LEFT JOIN host_journal_archive AS archive
+               ON archive.run_id = command.run_id
+              AND archive.host_session_id = command.host_session_id
+              AND archive.journal_sequence = command.journal_sequence
+             WHERE command.run_id = ?1
+               AND (ledger.journal_sequence IS NULL OR archive.journal_sequence IS NULL)
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = command_orphan.first() {
+            let session: String = decode(row, 0, "host_command_records.host_session_id")?;
+            let command_id: String = decode(row, 1, "host_command_records.command_id")?;
+            return Err(StorageError::InvalidData {
+                context: "host_command_records.identity",
+                reason: format!(
+                    "command record ({session}, {command_id}) has no matching canonical archive ledger"
+                ),
+            });
+        }
+        let application_orphan = connection.query_with_params(
+            "SELECT transition.host_session_id, transition.command_id,
+                    transition.transition_ordinal
+             FROM host_command_application_transitions AS transition
+             LEFT JOIN host_command_records AS command
+               ON command.run_id = transition.run_id
+              AND command.host_session_id = transition.host_session_id
+              AND command.command_id = transition.command_id
+             WHERE transition.run_id = ?1 AND command.command_id IS NULL
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = application_orphan.first() {
+            let session: String = decode(
+                row,
+                0,
+                "host_command_application_transitions.host_session_id",
+            )?;
+            let command_id: String = decode(
+                row,
+                1,
+                "host_command_application_transitions.command_id",
+            )?;
+            let ordinal: i64 = decode(
+                row,
+                2,
+                "host_command_application_transitions.transition_ordinal",
+            )?;
+            return Err(StorageError::InvalidData {
+                context: "host_command_application_transitions.identity",
+                reason: format!(
+                    "application transition ({session}, {command_id}, {ordinal}) has no command record"
+                ),
+            });
+        }
+        let storage_orphan = connection.query_with_params(
+            "SELECT transition.host_session_id, transition.command_id,
+                    transition.transition_ordinal
+             FROM host_command_storage_transitions AS transition
+             LEFT JOIN host_command_records AS command
+               ON command.run_id = transition.run_id
+              AND command.host_session_id = transition.host_session_id
+              AND command.command_id = transition.command_id
+             WHERE transition.run_id = ?1 AND command.command_id IS NULL
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = storage_orphan.first() {
+            let session: String = decode(
+                row,
+                0,
+                "host_command_storage_transitions.host_session_id",
+            )?;
+            let command_id: String =
+                decode(row, 1, "host_command_storage_transitions.command_id")?;
+            let ordinal: i64 = decode(
+                row,
+                2,
+                "host_command_storage_transitions.transition_ordinal",
+            )?;
+            return Err(StorageError::InvalidData {
+                context: "host_command_storage_transitions.identity",
+                reason: format!(
+                    "storage transition ({session}, {command_id}, {ordinal}) has no command record"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -8461,7 +9349,9 @@ impl Storage {
                             .to_owned(),
                     });
                 }
-                if archive.is_shutdown() && observed_shutdown.replace(journal_sequence).is_some() {
+                if archive.is_applied_shutdown()?
+                    && observed_shutdown.replace(journal_sequence).is_some()
+                {
                     return Err(StorageError::InvalidData {
                         context: "host_journal_progress.shutdown_sequence",
                         reason: "more than one archive encodes a shutdown command".to_owned(),
@@ -8478,6 +9368,14 @@ impl Storage {
                     event_sequence,
                     state,
                     expected_domain_events.as_ref(),
+                )?;
+                let expected_command = archive.prepare_command_projection(&payload_digest)?;
+                Self::validate_command_projection_for_connection(
+                    connection,
+                    run_id,
+                    batch_id,
+                    state,
+                    expected_command.as_ref(),
                 )?;
                 let persistence = archive.take_persistence();
                 if persistence.is_none() && linked_batch.is_some() {
@@ -9229,7 +10127,11 @@ impl Storage {
                     ),
                 });
             }
-            HostJournalState::decode(state.as_deref().expect("checked above"))?;
+            let state = state.ok_or(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.state",
+                reason: format!("journal batch {batch_id:?} has no ledger state"),
+            })?;
+            HostJournalState::decode(&state)?;
             return Ok(false);
         }
 
@@ -9261,9 +10163,7 @@ impl Storage {
                 });
             }
         }
-        let is_shutdown = batch
-            .command()
-            .is_some_and(|envelope| matches!(&envelope.command, HostCommand::Shutdown));
+        let is_shutdown = batch.is_applied_shutdown();
         if progress.shutdown_sequence.is_some() {
             return Err(StorageError::InvalidData {
                 context: "host_journal_progress.shutdown_sequence",
@@ -9704,12 +10604,517 @@ impl Storage {
         Ok(())
     }
 
+    fn insert_command_projection(
+        transaction: &Transaction<'_>,
+        run_id: RunId,
+        projection: &PreparedCommandProjection,
+    ) -> Result<(), FrankenError> {
+        let lifecycle = &projection.lifecycle;
+        let envelope = lifecycle.envelope();
+        let session = encode_journal_u64(projection.batch_id.session_id().get());
+        let journal = encode_journal_u64(projection.batch_id.sequence());
+        let command_id = projection.command_id().to_string();
+        let source = encode_journal_u64(lifecycle.source_client_namespace());
+        let client_sequence = encode_journal_u64(envelope.command_id.client_sequence());
+        let admission = lifecycle
+            .admission_sequence()
+            .map(|sequence| encode_journal_u64(sequence.get()));
+        let expected_control = envelope
+            .expected_control_revision
+            .map(|revision| encode_journal_u64(revision.get()));
+        let expected_scientific = envelope
+            .expected_scientific_revision
+            .map(|revision| encode_journal_u64(revision.get()));
+        let expected_config = envelope
+            .expected_config_revision
+            .map(|revision| encode_journal_u64(revision.get()));
+        let terminal_tick = encode_journal_u64(projection.terminal_boundary.tick.0);
+        let terminal_control =
+            encode_journal_u64(projection.terminal_boundary.revisions.control.get());
+        let terminal_scientific =
+            encode_journal_u64(projection.terminal_boundary.revisions.scientific.get());
+        let terminal_config =
+            encode_journal_u64(projection.terminal_boundary.revisions.config.get());
+        let scientific_event = projection
+            .scientific_event_sequence
+            .map(|sequence| encode_journal_u64(sequence.get()));
+        let transition_count = i64::try_from(projection.application_transitions.len())
+            .map_err(|error| FrankenError::Internal(error.to_string()))?;
+        let record_rows = transaction.execute_with_params(
+            "INSERT INTO host_command_records (
+                run_id, host_session_id, command_id,
+                source_client_namespace, client_sequence, admission_sequence,
+                lifecycle_schema_version,
+                expected_control_revision, expected_scientific_revision,
+                expected_config_revision, envelope_postcard_hex, command_payload_postcard_hex,
+                journal_sequence, terminal_tick, terminal_control_revision,
+                terminal_scientific_revision, terminal_config_revision,
+                scientific_event_sequence, archive_payload_digest,
+                application_transition_count
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+             )",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                command_id.as_str().into(),
+                source.as_str().into(),
+                client_sequence.as_str().into(),
+                sqlite_optional_text(admission.as_deref()),
+                i64::from(lifecycle.schema_version()).into(),
+                sqlite_optional_text(expected_control.as_deref()),
+                sqlite_optional_text(expected_scientific.as_deref()),
+                sqlite_optional_text(expected_config.as_deref()),
+                projection.envelope_postcard_hex.as_str().into(),
+                projection.command_payload_postcard_hex.as_str().into(),
+                journal.as_str().into(),
+                terminal_tick.as_str().into(),
+                terminal_control.as_str().into(),
+                terminal_scientific.as_str().into(),
+                terminal_config.as_str().into(),
+                sqlite_optional_text(scientific_event.as_deref()),
+                projection.archive_payload_digest.as_str().into(),
+                transition_count.into(),
+            ],
+        )?;
+        if record_rows != 1 {
+            return Err(FrankenError::Internal(format!(
+                "command projection inserted {record_rows} records"
+            )));
+        }
+        for transition in &projection.application_transitions {
+            let boundary_tick = encode_journal_u64(transition.boundary.tick.0);
+            let boundary_control =
+                encode_journal_u64(transition.boundary.revisions.control.get());
+            let boundary_scientific =
+                encode_journal_u64(transition.boundary.revisions.scientific.get());
+            let boundary_config =
+                encode_journal_u64(transition.boundary.revisions.config.get());
+            let transition_rows = transaction.execute_with_params(
+                "INSERT INTO host_command_application_transitions (
+                    run_id, host_session_id, command_id, transition_ordinal,
+                    journal_sequence, boundary_tick, boundary_control_revision,
+                    boundary_scientific_revision, boundary_config_revision,
+                    application_state, application_postcard_hex, archive_payload_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                &[
+                    sqlite_run_id(run_id),
+                    session.as_str().into(),
+                    command_id.as_str().into(),
+                    i64::from(transition.ordinal).into(),
+                    journal.as_str().into(),
+                    boundary_tick.as_str().into(),
+                    boundary_control.as_str().into(),
+                    boundary_scientific.as_str().into(),
+                    boundary_config.as_str().into(),
+                    command_application_state_name(&transition.application).into(),
+                    transition.application_postcard_hex.as_str().into(),
+                    projection.archive_payload_digest.as_str().into(),
+                ],
+            )?;
+            if transition_rows != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "command projection inserted {transition_rows} rows for application ordinal {}",
+                    transition.ordinal
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_command_storage_transition(
+        transaction: &Transaction<'_>,
+        run_id: RunId,
+        projection: &PreparedCommandProjection,
+        target: HostJournalState,
+    ) -> Result<(), FrankenError> {
+        let (ordinal, kind) = match target {
+            HostJournalState::CommittedVolatile => {
+                (0_i64, CommandStorageTransitionKind::CommittedVolatile)
+            }
+            HostJournalState::Durable => (1_i64, CommandStorageTransitionKind::Durable),
+            HostJournalState::Admitted | HostJournalState::Applied => {
+                return Err(FrankenError::Internal(format!(
+                    "{} is not a command storage transition",
+                    target.as_str()
+                )));
+            }
+        };
+        let session = encode_journal_u64(projection.batch_id.session_id().get());
+        let journal = encode_journal_u64(projection.batch_id.sequence());
+        let command_id = projection.command_id().to_string();
+        let rows = transaction.execute_with_params(
+            "INSERT INTO host_command_storage_transitions (
+                run_id, host_session_id, command_id, transition_ordinal,
+                journal_sequence, storage_state, archive_payload_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                command_id.as_str().into(),
+                ordinal.into(),
+                journal.as_str().into(),
+                kind.as_str().into(),
+                projection.archive_payload_digest.as_str().into(),
+            ],
+        )?;
+        if rows != 1 {
+            return Err(FrankenError::Internal(format!(
+                "command {} storage transition inserted {rows} rows",
+                kind.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fail-closed validator compares every normalized command field and both ordered transition axes with its canonical archive"
+    )]
+    fn validate_command_projection_for_connection(
+        connection: &Connection,
+        run_id: RunId,
+        batch_id: JournalBatchId,
+        state: HostJournalState,
+        expected: Option<&PreparedCommandProjection>,
+    ) -> Result<(), StorageError> {
+        if expected.is_some_and(|projection| projection.batch_id != batch_id) {
+            return Err(StorageError::InvalidData {
+                context: "host_command_records.journal_sequence",
+                reason: "prepared command projection belongs to a different journal batch"
+                    .to_owned(),
+            });
+        }
+        let session = encode_journal_u64(batch_id.session_id().get());
+        let journal = encode_journal_u64(batch_id.sequence());
+        let record_rows = connection.query_with_params(
+            "SELECT command_id, source_client_namespace, client_sequence,
+                    admission_sequence, lifecycle_schema_version,
+                    expected_control_revision, expected_scientific_revision,
+                    expected_config_revision, envelope_postcard_hex,
+                    command_payload_postcard_hex,
+                    terminal_tick, terminal_control_revision,
+                    terminal_scientific_revision, terminal_config_revision,
+                    scientific_event_sequence, archive_payload_digest,
+                    application_transition_count
+             FROM host_command_records
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                journal.as_str().into(),
+            ],
+        )?;
+        let application_rows = connection.query_with_params(
+            "SELECT command_id, transition_ordinal, boundary_tick,
+                    boundary_control_revision, boundary_scientific_revision,
+                    boundary_config_revision, application_state, application_postcard_hex,
+                    archive_payload_digest
+             FROM host_command_application_transitions
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+             ORDER BY transition_ordinal ASC",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                journal.as_str().into(),
+            ],
+        )?;
+        let storage_rows = connection.query_with_params(
+            "SELECT command_id, transition_ordinal, storage_state, archive_payload_digest
+             FROM host_command_storage_transitions
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+             ORDER BY transition_ordinal ASC",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                journal.as_str().into(),
+            ],
+        )?;
+        if state < HostJournalState::Applied || expected.is_none() {
+            if !record_rows.is_empty() || !application_rows.is_empty() || !storage_rows.is_empty() {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_records.journal_sequence",
+                    reason: format!(
+                        "{} journal batch {batch_id:?} unexpectedly has command projection rows {}/{}/{}",
+                        state.as_str(),
+                        record_rows.len(),
+                        application_rows.len(),
+                        storage_rows.len()
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        let expected = expected.ok_or(StorageError::InvalidData {
+            context: "host_command_records.journal_sequence",
+            reason: "applied command archive has no prepared command projection".to_owned(),
+        })?;
+        let [record] = record_rows.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "host_command_records.journal_sequence",
+                reason: format!(
+                    "command journal batch {batch_id:?} has {} normalized records",
+                    record_rows.len()
+                ),
+            });
+        };
+        let lifecycle = &expected.lifecycle;
+        let envelope = lifecycle.envelope();
+        let command_id = expected.command_id().to_string();
+        let source = encode_journal_u64(lifecycle.source_client_namespace());
+        let client_sequence = encode_journal_u64(envelope.command_id.client_sequence());
+        let admission = lifecycle
+            .admission_sequence()
+            .map(|sequence| encode_journal_u64(sequence.get()));
+        let expected_control = envelope
+            .expected_control_revision
+            .map(|revision| encode_journal_u64(revision.get()));
+        let expected_scientific = envelope
+            .expected_scientific_revision
+            .map(|revision| encode_journal_u64(revision.get()));
+        let expected_config = envelope
+            .expected_config_revision
+            .map(|revision| encode_journal_u64(revision.get()));
+        let scientific_event = expected
+            .scientific_event_sequence
+            .map(|sequence| encode_journal_u64(sequence.get()));
+        let terminal = expected.terminal_boundary;
+        let stored_transition_count = checked_u64(
+            "host_command_records.application_transition_count",
+            decode(record, 16, "host_command_records.application_transition_count")?,
+        )?;
+        let expected_transition_count =
+            u64::try_from(expected.application_transitions.len()).map_err(|error| {
+                StorageError::InvalidData {
+                    context: "host_command_records.application_transition_count",
+                    reason: error.to_string(),
+                }
+            })?;
+        let stored_envelope_hex: String =
+            decode(record, 8, "host_command_records.envelope_postcard_hex")?;
+        let stored_command_hex: String = decode(
+            record,
+            9,
+            "host_command_records.command_payload_postcard_hex",
+        )?;
+        let decoded_envelope = decode_command_envelope_postcard_hex(
+            "host_command_records.envelope_postcard_hex",
+            &stored_envelope_hex,
+        )?;
+        let decoded_command = decode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &stored_command_hex,
+        )?;
+        let canonical_envelope = encode_command_envelope_postcard_hex(
+            "host_command_records.envelope_postcard_hex",
+            &decoded_envelope,
+        )?;
+        let canonical_command = encode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &decoded_command,
+        )?;
+        let envelope_command = encode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &decoded_envelope.command,
+        )?;
+        if decode::<String>(record, 0, "host_command_records.command_id")? != command_id
+            || decode::<String>(record, 1, "host_command_records.source_client_namespace")?
+                != source
+            || decode::<String>(record, 2, "host_command_records.client_sequence")?
+                != client_sequence
+            || decode::<Option<String>>(record, 3, "host_command_records.admission_sequence")?
+                != admission
+            || decode::<i64>(record, 4, "host_command_records.lifecycle_schema_version")?
+                != i64::from(lifecycle.schema_version())
+            || decode::<Option<String>>(
+                record,
+                5,
+                "host_command_records.expected_control_revision",
+            )? != expected_control
+            || decode::<Option<String>>(
+                record,
+                6,
+                "host_command_records.expected_scientific_revision",
+            )? != expected_scientific
+            || decode::<Option<String>>(
+                record,
+                7,
+                "host_command_records.expected_config_revision",
+            )? != expected_config
+            || stored_envelope_hex != expected.envelope_postcard_hex
+            || stored_command_hex != expected.command_payload_postcard_hex
+            || canonical_envelope != stored_envelope_hex
+            || canonical_command != stored_command_hex
+            || envelope_command != stored_command_hex
+            || decode::<String>(record, 10, "host_command_records.terminal_tick")?
+                != encode_journal_u64(terminal.tick.0)
+            || decode::<String>(record, 11, "host_command_records.terminal_control_revision")?
+                != encode_journal_u64(terminal.revisions.control.get())
+            || decode::<String>(
+                record,
+                12,
+                "host_command_records.terminal_scientific_revision",
+            )? != encode_journal_u64(terminal.revisions.scientific.get())
+            || decode::<String>(record, 13, "host_command_records.terminal_config_revision")?
+                != encode_journal_u64(terminal.revisions.config.get())
+            || decode::<Option<String>>(
+                record,
+                14,
+                "host_command_records.scientific_event_sequence",
+            )? != scientific_event
+            || decode::<String>(record, 15, "host_command_records.archive_payload_digest")?
+                != expected.archive_payload_digest
+            || stored_transition_count != expected_transition_count
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_command_records",
+                reason: format!(
+                    "normalized command record for journal batch {batch_id:?} differs from its canonical archive"
+                ),
+            });
+        }
+        if application_rows.len() != expected.application_transitions.len() {
+            return Err(StorageError::InvalidData {
+                context: "host_command_application_transitions.transition_ordinal",
+                reason: format!(
+                    "command {command_id} declares {} application transitions but stores {}",
+                    expected.application_transitions.len(),
+                    application_rows.len()
+                ),
+            });
+        }
+        for (row, transition) in application_rows
+            .iter()
+            .zip(&expected.application_transitions)
+        {
+            let ordinal = checked_u32(
+                "host_command_application_transitions.transition_ordinal",
+                decode(
+                    row,
+                    1,
+                    "host_command_application_transitions.transition_ordinal",
+                )?,
+            )?;
+            let application_postcard_hex: String = decode(
+                row,
+                7,
+                "host_command_application_transitions.application_postcard_hex",
+            )?;
+            let decoded_application = decode_application_state_postcard_hex(
+                "host_command_application_transitions.application_postcard_hex",
+                &application_postcard_hex,
+            )?;
+            let canonical_application = encode_application_state_postcard_hex(
+                "host_command_application_transitions.application_postcard_hex",
+                &decoded_application,
+            )?;
+            if decode::<String>(row, 0, "host_command_application_transitions.command_id")?
+                != command_id
+                || ordinal != transition.ordinal
+                || decode::<String>(row, 2, "host_command_application_transitions.boundary_tick")?
+                    != encode_journal_u64(transition.boundary.tick.0)
+                || decode::<String>(
+                    row,
+                    3,
+                    "host_command_application_transitions.boundary_control_revision",
+                )? != encode_journal_u64(transition.boundary.revisions.control.get())
+                || decode::<String>(
+                    row,
+                    4,
+                    "host_command_application_transitions.boundary_scientific_revision",
+                )? != encode_journal_u64(transition.boundary.revisions.scientific.get())
+                || decode::<String>(
+                    row,
+                    5,
+                    "host_command_application_transitions.boundary_config_revision",
+                )? != encode_journal_u64(transition.boundary.revisions.config.get())
+                || decode::<String>(
+                    row,
+                    6,
+                    "host_command_application_transitions.application_state",
+                )? != command_application_state_name(&transition.application)
+                || application_postcard_hex != transition.application_postcard_hex
+                || canonical_application != application_postcard_hex
+                || decode::<String>(
+                    row,
+                    8,
+                    "host_command_application_transitions.archive_payload_digest",
+                )? != expected.archive_payload_digest
+            {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_application_transitions",
+                    reason: format!(
+                        "application transition {ordinal} for command {command_id} differs from its canonical archive"
+                    ),
+                });
+            }
+        }
+        let expected_storage: &[CommandStorageTransitionKind] = match state {
+            HostJournalState::Admitted | HostJournalState::Applied => &[],
+            HostJournalState::CommittedVolatile => {
+                &[CommandStorageTransitionKind::CommittedVolatile]
+            }
+            HostJournalState::Durable => &[
+                CommandStorageTransitionKind::CommittedVolatile,
+                CommandStorageTransitionKind::Durable,
+            ],
+        };
+        if storage_rows.len() != expected_storage.len() {
+            return Err(StorageError::InvalidData {
+                context: "host_command_storage_transitions.transition_ordinal",
+                reason: format!(
+                    "{} command {command_id} requires {} storage transitions but stores {}",
+                    state.as_str(),
+                    expected_storage.len(),
+                    storage_rows.len()
+                ),
+            });
+        }
+        for (ordinal, (row, expected_kind)) in
+            storage_rows.iter().zip(expected_storage).enumerate()
+        {
+            let stored_ordinal = checked_usize(
+                "host_command_storage_transitions.transition_ordinal",
+                decode(
+                    row,
+                    1,
+                    "host_command_storage_transitions.transition_ordinal",
+                )?,
+            )?;
+            let kind = CommandStorageTransitionKind::decode(&decode::<String>(
+                row,
+                2,
+                "host_command_storage_transitions.storage_state",
+            )?)?;
+            if decode::<String>(row, 0, "host_command_storage_transitions.command_id")?
+                != command_id
+                || stored_ordinal != ordinal
+                || kind != *expected_kind
+                || decode::<String>(
+                    row,
+                    3,
+                    "host_command_storage_transitions.archive_payload_digest",
+                )? != expected.archive_payload_digest
+            {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_storage_transitions",
+                    reason: format!(
+                        "storage transition {stored_ordinal} for command {command_id} is not exactly bound to its ledger state"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn advance_host_journal_state(
         &self,
         batch_id: JournalBatchId,
         event_sequence: Option<EventSequence>,
         target: HostJournalState,
         domain_events: Option<&PreparedDomainEventProjection>,
+        command: Option<&PreparedCommandProjection>,
     ) -> Result<(), StorageError> {
         let previous = match target {
             HostJournalState::Admitted => return Ok(()),
@@ -9718,17 +11123,22 @@ impl Storage {
             HostJournalState::Durable => HostJournalState::CommittedVolatile,
         };
         let current = self.host_journal_state(batch_id)?;
+        Self::validate_domain_event_projection_for_connection(
+            self.connection()?,
+            self.run_id,
+            batch_id,
+            event_sequence,
+            current,
+            domain_events,
+        )?;
+        Self::validate_command_projection_for_connection(
+            self.connection()?,
+            self.run_id,
+            batch_id,
+            current,
+            command,
+        )?;
         if current >= target {
-            if target == HostJournalState::Applied {
-                Self::validate_domain_event_projection_for_connection(
-                    self.connection()?,
-                    self.run_id,
-                    batch_id,
-                    event_sequence,
-                    current,
-                    domain_events,
-                )?;
-            }
             return Ok(());
         }
         if current != previous {
@@ -9788,7 +11198,12 @@ impl Storage {
         let event = event.map(encode_journal_u64);
         let prior_event = encode_journal_u64(target_event);
         let progress_sql = match target {
-            HostJournalState::Admitted => unreachable!("handled above"),
+            HostJournalState::Admitted => {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.state",
+                    reason: "admission is not an advance transition".to_owned(),
+                });
+            }
             HostJournalState::Applied => {
                 "UPDATE host_journal_progress
                  SET applied_journal_prefix = ?1,
@@ -9836,10 +11251,16 @@ impl Storage {
                         ));
                     }
                 }
-            } else if domain_events.is_some() {
-                return Err(FrankenError::Internal(
-                    "domain-event projection is only valid for the applied transition".to_owned(),
-                ));
+                if let Some(projection) = command {
+                    Self::insert_command_projection(transaction, self.run_id, projection)?;
+                }
+            } else if let Some(projection) = command {
+                Self::insert_command_storage_transition(
+                    transaction,
+                    self.run_id,
+                    projection,
+                    target,
+                )?;
             }
             let ledger_rows = transaction.execute_with_params(
                 "UPDATE host_journal_batch_ledger
@@ -9873,6 +11294,21 @@ impl Storage {
             }
             Ok(())
         })?;
+        Self::validate_domain_event_projection_for_connection(
+            self.connection()?,
+            self.run_id,
+            batch_id,
+            event_sequence,
+            target,
+            domain_events,
+        )?;
+        Self::validate_command_projection_for_connection(
+            self.connection()?,
+            self.run_id,
+            batch_id,
+            target,
+            command,
+        )?;
         Ok(())
     }
 
@@ -9883,6 +11319,7 @@ impl Storage {
         applied_tick: u64,
         persistence: Option<StorageBuffer>,
         domain_events: Option<&PreparedDomainEventProjection>,
+        command: Option<&PreparedCommandProjection>,
     ) -> Result<JournalReceiptState, StorageError> {
         if let Some(prepared) = persistence {
             let (receipt, newly_admitted) = self.stage_outbox(applied_tick, &prepared)?;
@@ -9903,6 +11340,7 @@ impl Storage {
             event_sequence,
             HostJournalState::Applied,
             domain_events,
+            command,
         )?;
         if self
             .connection()?
@@ -9926,7 +11364,8 @@ impl Storage {
             batch_id,
             event_sequence,
             HostJournalState::CommittedVolatile,
-            None,
+            domain_events,
+            command,
         )?;
         if self.file_backed() {
             #[cfg(test)]
@@ -9939,7 +11378,8 @@ impl Storage {
                 batch_id,
                 event_sequence,
                 HostJournalState::Durable,
-                None,
+                domain_events,
+                command,
             )?;
             Ok(JournalReceiptState::Durable)
         } else {
@@ -10059,6 +11499,7 @@ impl Storage {
             let applied_tick = archive.applied().tick.0;
             let domain_events =
                 archive.prepare_domain_event_projection(&payload_digest)?;
+            let command = archive.prepare_command_projection(&payload_digest)?;
             let persistence = archive.take_persistence();
             self.complete_host_journal_archive(
                 batch_id,
@@ -10066,6 +11507,7 @@ impl Storage {
                 applied_tick,
                 persistence,
                 domain_events.as_ref(),
+                command.as_ref(),
             )?;
         }
         Ok(())
@@ -13192,6 +14634,7 @@ fn storage_worker(
                         batch.applied().tick.0,
                         prepared.persistence.take(),
                         prepared.domain_events.as_ref(),
+                        prepared.command.as_ref(),
                     )?;
                     Ok((pending, receipt_state))
                 })();
@@ -13711,6 +15154,25 @@ fn replay_row_from_event(
                 }),
             )
         }
+        ReplayEventKind::WorldDigest { overall } => {
+            if overall.len() != 16
+                || !overall
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.world_digest",
+                    reason: format!(
+                        "world digest payload at tick {tick}, seq {seq} is not a lowercase 16-digit hex string"
+                    ),
+                });
+            }
+            (
+                "world:digest".to_string(),
+                "world_digest".to_string(),
+                json!({ "overall": overall }),
+            )
+        }
     };
 
     Ok(ReplayEventRow {
@@ -13826,6 +15288,11 @@ struct RngSamplePayload {
     value: f32,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorldDigestPayload {
+    overall: String,
+}
+
 fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageError> {
     let agent_uid = decode_agent_uid(row.agent_uid, row.tick, row.seq)?;
     let kind = match row.event_type.as_str() {
@@ -13876,6 +15343,25 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
                 range_min: payload.range_min,
                 range_max: payload.range_max,
                 value: payload.value,
+            }
+        }
+        "world_digest" => {
+            let payload: WorldDigestPayload = parse_payload(row)?;
+            if payload.overall.len() != 16
+                || !payload
+                    .overall
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(StorageError::ReplayParse {
+                    tick: row.tick,
+                    seq: row.seq,
+                    reason: "world digest payload is not a lowercase 16-digit hex string"
+                        .to_string(),
+                });
+            }
+            ReplayEventKind::WorldDigest {
+                overall: payload.overall,
             }
         }
         other => {
@@ -14622,6 +16108,32 @@ mod tests {
         assert_eq!(after.ledger_count, 1);
         assert_eq!(after.tick_count, 1);
         assert_complete_journal_prefix(&after, 1, 1);
+        let reader = StorageReader::open_finished(&path)
+            .expect("open recovered command projection under immutable lease");
+        let evidence = reader
+            .command_journal_evidence(HostSessionId::new(0x201))
+            .expect("recovery regenerated non-vacuous command evidence");
+        assert_eq!(evidence.command_count, 1);
+        assert_eq!(evidence.application_transition_count, 2);
+        assert_eq!(evidence.storage_transition_count, 2);
+        reader
+            .close()
+            .expect("close first recovered command reader");
+
+        recover_fault_database(&path);
+        let second_recovery = journal_database_snapshot(&path);
+        assert_eq!(second_recovery, after);
+        let reader = StorageReader::open_finished(&path)
+            .expect("reopen command projection after idempotent recovery");
+        assert_eq!(
+            reader
+                .command_journal_evidence(HostSessionId::new(0x201))
+                .expect("idempotent recovery retained exact command evidence"),
+            evidence
+        );
+        reader
+            .close()
+            .expect("close idempotently recovered command reader");
     }
 
     #[test]
@@ -15016,6 +16528,9 @@ mod tests {
             "host_journal_progress",
             "host_domain_event_batches",
             "host_domain_events",
+            "host_command_records",
+            "host_command_application_transitions",
+            "host_command_storage_transitions",
             "storage_batch_ledger",
             "storage_outbox",
             "storage_progress",
@@ -15997,7 +17512,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v8_schema_records_exact_ledger_and_is_idempotent()
+    fn fresh_v9_schema_records_exact_ledger_and_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&connection)?;
@@ -16005,13 +17520,17 @@ mod tests {
         let first_schema = read_schema_objects(&connection)?;
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 3);
+        assert_eq!(migrations.len(), 4);
         let expected = [
             (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V8_VERSION,
                 "add_host_domain_event_projection",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_host_command_lifecycle_projection",
             ),
         ];
         for (row, (expected_version, expected_name)) in migrations.iter().zip(expected) {
@@ -16033,7 +17552,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _schema_migrations")?
             .get_typed(0)?;
         assert_eq!(
-            migration_count, 3,
+            migration_count, 4,
             "idempotent install duplicated its ledger"
         );
         connection.close()?;
@@ -16041,7 +17560,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_schema_upgrades_additively_to_the_exact_v8_lineage()
+    fn v6_schema_upgrades_additively_to_the_exact_v9_lineage()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         let v6_result = MigrationRunner::new()
@@ -16064,7 +17583,7 @@ mod tests {
         );
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 3);
+        assert_eq!(migrations.len(), 4);
         assert_eq!(
             decode::<i64>(&migrations[1], 0, "_schema_migrations.version")?,
             SCRIPTBOTS_SCHEMA_V7_VERSION
@@ -16075,14 +17594,125 @@ mod tests {
         );
         assert_eq!(
             decode::<i64>(&migrations[2], 0, "_schema_migrations.version")?,
-            SCRIPTBOTS_SCHEMA_VERSION
+            SCRIPTBOTS_SCHEMA_V8_VERSION
         );
         assert_eq!(
             decode::<String>(&migrations[2], 1, "_schema_migrations.name")?,
             "add_host_domain_event_projection"
         );
+        assert_eq!(
+            decode::<i64>(&migrations[3], 0, "_schema_migrations.version")?,
+            SCRIPTBOTS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            decode::<String>(&migrations[3], 1, "_schema_migrations.name")?,
+            "add_host_command_lifecycle_projection"
+        );
         let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
         assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn nonempty_v8_host_journal_refuses_v9_before_any_migration_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        MigrationRunner::new()
+            .add(
+                SCRIPTBOTS_SCHEMA_V6_VERSION,
+                "create_multi_run_schema",
+                SCRIPTBOTS_SCHEMA_V6,
+            )
+            .add(
+                SCRIPTBOTS_SCHEMA_V7_VERSION,
+                "add_host_journal_archive",
+                SCRIPTBOTS_SCHEMA_V7,
+            )
+            .add(
+                SCRIPTBOTS_SCHEMA_V8_VERSION,
+                "add_host_domain_event_projection",
+                SCRIPTBOTS_SCHEMA_V8,
+            )
+            .run(&connection)?;
+        connection.execute("PRAGMA foreign_keys = OFF")?;
+        connection.execute(
+            "INSERT INTO host_journal_archive (
+                run_id, host_session_id, journal_sequence,
+                payload_version, payload_digest, payload_json
+             ) VALUES (
+                'legacy-run', '0000000000000001', '0000000000000001',
+                1,
+                '0000000000000000000000000000000000000000000000000000000000000000',
+                '{}'
+             )",
+        )?;
+
+        let version_before: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        let ledger_before = connection
+            .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    decode::<i64>(&row, 0, "_schema_migrations.version")?,
+                    decode::<String>(&row, 1, "_schema_migrations.name")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let v9_objects_before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN (
+                    'host_command_records',
+                    'host_command_records_run_session_source_sequence_index',
+                    'host_command_application_transitions',
+                    'host_command_storage_transitions'
+                 )",
+            )?
+            .get_typed(0)?;
+        assert_eq!(version_before, SCRIPTBOTS_SCHEMA_V8_VERSION);
+        assert_eq!(ledger_before.len(), 3);
+        assert_eq!(v9_objects_before, 0);
+
+        let error = install_scriptbots_schema(&connection)
+            .expect_err("nonempty envelope-only V8 archive migrated lossy into V9");
+        let (context, reason) = match error {
+            StorageError::InvalidData { context, reason } => (context, reason),
+            other => panic!("unexpected pre-migration refusal: {other}"),
+        };
+        assert_eq!(context, "_schema_migrations.command_lifecycle");
+        assert!(reason.contains("archive v1 lacks complete lifecycle evidence"));
+        assert!(reason.contains("export/import the run or use a current-run database"));
+
+        let version_after: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        let ledger_after = connection
+            .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    decode::<i64>(&row, 0, "_schema_migrations.version")?,
+                    decode::<String>(&row, 1, "_schema_migrations.name")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let v9_objects_after: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN (
+                    'host_command_records',
+                    'host_command_records_run_session_source_sequence_index',
+                    'host_command_application_transitions',
+                    'host_command_storage_transitions'
+                 )",
+            )?
+            .get_typed(0)?;
+        let archive_count_after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM host_journal_archive")?
+            .get_typed(0)?;
+        assert_eq!(version_after, version_before);
+        assert_eq!(ledger_after, ledger_before);
+        assert_eq!(v9_objects_after, v9_objects_before);
+        assert_eq!(archive_count_after, 1);
         connection.close()?;
         Ok(())
     }
@@ -16503,11 +18133,11 @@ mod tests {
         create_valid_database(&future)?;
         add_schema_object(
             &future,
-            "INSERT INTO _schema_migrations (version, name) VALUES (9, 'future_schema')",
+            "INSERT INTO _schema_migrations (version, name) VALUES (10, 'future_schema')",
         )?;
         assert_recovery_refused_without_database_mutation(
             &future,
-            "expected exactly three ScriptBots migrations through v8",
+            "expected exactly four ScriptBots migrations through v9",
         )?;
 
         let legacy = temp_db_path("storage-recovery-legacy-v5-lineage");
@@ -16527,7 +18157,7 @@ mod tests {
         legacy_connection.close()?;
         assert_recovery_refused_without_database_mutation(
             &legacy,
-            "expected exactly three ScriptBots migrations through v8",
+            "expected exactly four ScriptBots migrations through v9",
         )?;
 
         let v6_only = temp_db_path("storage-recovery-v6-only-lineage");
@@ -16542,7 +18172,7 @@ mod tests {
         v6_connection.close()?;
         assert_recovery_refused_without_database_mutation(
             &v6_only,
-            "expected exactly three ScriptBots migrations through v8",
+            "expected exactly four ScriptBots migrations through v9",
         )?;
 
         let mismatched_user_version = temp_db_path("storage-recovery-user-version-mismatch");
@@ -16550,7 +18180,7 @@ mod tests {
         add_schema_object(&mismatched_user_version, "PRAGMA user_version = 5")?;
         assert_recovery_refused_without_database_mutation(
             &mismatched_user_version,
-            "migration ledger is v8, but PRAGMA user_version is 5",
+            "migration ledger is v9, but PRAGMA user_version is 5",
         )?;
         Ok(())
     }
@@ -16569,7 +18199,8 @@ mod tests {
              INSERT INTO _schema_migrations (version, name, applied_at) VALUES
                 (6, 'create_multi_run_schema', 'forged'),
                 (7, 'add_host_journal_archive', 'forged'),
-                (8, 'add_host_domain_event_projection', 'forged');
+                (8, 'add_host_domain_event_projection', 'forged'),
+                (9, 'add_host_command_lifecycle_projection', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -16579,7 +18210,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 8;",
+             PRAGMA user_version = 9;",
         )?;
         connection.close()?;
 

@@ -1,22 +1,25 @@
 //! Public-boundary coverage for the HostCore storage-journal adapter.
 
+use fsqlite::Connection;
 use scriptbots_core::{
-    BrainRunner, INPUT_SIZE, OUTPUT_SIZE, ScriptBotsConfig, Tick, WorldState,
+    AgentData, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, Tick, WorldState,
     channels::OutputChannel,
 };
 use scriptbots_runtime::{
-    ApplicationState, CommandId, CommandStatus, EventCatchUp, EventCatchUpGuarantee,
-    EventCatchUpState, EventCommitment, EventJournalReader, EventPageSource, EventPoll,
-    EventSequence, HostBlocker, HostCommand, HostCore, HostCoreOptions, HostLifecycle,
-    HostSessionId, JournalAdmission, JournalBatchId, JournalState, LocalHostPort, ManualInstant,
-    NullFrontend, PlaybackSnapshot,
+    ApplicationState, CommandEnvelope, CommandId, CommandStatus, ControlRevision, EventCatchUp,
+    EventCatchUpGuarantee, EventCatchUpState, EventCommitment, EventJournalReader,
+    EventPageSource, EventPoll, EventSequence, HostBlocker, HostCommand, HostCore,
+    HostCoreOptions, HostLifecycle, HostSessionId, JournalAdmission, JournalBatchId, JournalState,
+    LocalHostPort, ManualInstant, NullFrontend, PlaybackSnapshot, RejectionReason,
 };
 use scriptbots_storage::{
-    DomainEventExpectation, DomainEventPayload, HostJournalPrefixes, HostJournalRecordState,
-    HostJournalSessionPage, PersistenceGuarantee, StorageError, StorageEventJournalReader,
-    StorageIntegrityCheckResult, StorageJournalOptions, StoragePipeline, StorageReader,
+    CommandJournalCursor, CommandStorageTransitionKind, DomainEventExpectation,
+    DomainEventPayload, HostJournalPrefixes, HostJournalRecordState, HostJournalSessionPage,
+    PersistenceGuarantee, StorageError, StorageEventJournalReader, StorageIntegrityCheckResult,
+    StorageJournalOptions, StoragePipeline, StorageReader,
 };
 use std::{
+    fs,
     sync::Arc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -67,7 +70,7 @@ fn eventful_cadence_world() -> WorldState {
         closed: false,
         population_minimum: 0,
         population_spawn_interval: 1,
-        population_spawn_count: 8,
+        population_spawn_count: 1,
         population_crossover_chance: 0.0,
         reproduction_attempt_chance: 0.0,
         spike_radius: 100.0,
@@ -78,18 +81,46 @@ fn eventful_cadence_world() -> WorldState {
         spike_alignment_cosine: 0.0,
         spike_speed_damage_bonus: 0.0,
         spike_length_damage_bonus: 0.0,
-        carnivore_threshold: 0.999_999,
+        carnivore_threshold: 0.5,
         history_capacity: 8,
         persistence_interval: 3,
         ..ScriptBotsConfig::default()
     })
     .expect("deterministic lifecycle/combat journal world");
-    world
+    let attacker_brain = world
         .brain_registry_mut()
         .expect("fresh world permits brain registration")
         .register("storage-journal-always-spike", |_| {
             Ok(Box::new(AlwaysSpikeBrain))
         });
+    let attacker = world
+        .try_spawn_agent_with(
+            AgentData {
+                position: Position::new(10.0, 10.0),
+                heading: 0.0,
+                health: 2.0,
+                spike_length: 1.0,
+                ..AgentData::default()
+            },
+            |runtime| runtime.herbivore_tendency = 0.0,
+        )
+        .expect("deterministic seeded combat attacker");
+    world
+        .try_spawn_agent_with(
+            AgentData {
+                position: Position::new(12.0, 10.0),
+                heading: 0.0,
+                health: 0.1,
+                ..AgentData::default()
+            },
+            |runtime| runtime.herbivore_tendency = 1.0,
+        )
+        .expect("deterministic seeded combat victim");
+    assert!(
+        world
+            .bind_agent_brain(attacker, attacker_brain)
+            .expect("bind deterministic combat attacker")
+    );
     world
 }
 
@@ -496,44 +527,98 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
         assert_eq!(record.state, HostJournalRecordState::Durable);
     }
 
-    assert!(
-        first_record.command.is_some(),
-        "first journal record must retain its exact command"
-    );
-    let Some(first_command) = first_record.command.as_ref() else {
+    let Some(first_lifecycle) = first_record.command_lifecycle.as_ref() else {
         return;
     };
+    let first_command = first_lifecycle.envelope();
     assert_eq!(first_command.command_id, first_command_id);
     assert_eq!(first_command.expected_control_revision, None);
     assert!(matches!(&first_command.command, HostCommand::Step));
     assert_eq!(first_record.applied, first_applied);
     assert_eq!(first_record.event.as_ref(), Some(&expected_first_event));
 
-    assert!(
-        second_record.command.is_some(),
-        "second journal record must retain its exact command"
-    );
-    let Some(second_command) = second_record.command.as_ref() else {
+    let Some(second_lifecycle) = second_record.command_lifecycle.as_ref() else {
         return;
     };
+    let second_command = second_lifecycle.envelope();
     assert_eq!(second_command.command_id, second_command_id);
     assert_eq!(second_command.expected_control_revision, None);
     assert!(matches!(&second_command.command, HostCommand::Step));
     assert_eq!(second_record.applied, second_applied);
     assert_eq!(second_record.event.as_ref(), Some(&expected_second_event));
 
-    assert!(
-        shutdown_record.command.is_some(),
-        "shutdown journal record must retain its exact command"
-    );
-    let Some(shutdown_command) = shutdown_record.command.as_ref() else {
+    let Some(shutdown_lifecycle) = shutdown_record.command_lifecycle.as_ref() else {
         return;
     };
+    let shutdown_command = shutdown_lifecycle.envelope();
     assert_eq!(shutdown_command.command_id, shutdown_command_id);
     assert_eq!(shutdown_command.expected_control_revision, None);
     assert!(matches!(&shutdown_command.command, HostCommand::Shutdown));
+    assert!(shutdown_lifecycle.is_applied_shutdown());
     assert_eq!(shutdown_record.applied, shutdown_applied);
     assert_eq!(shutdown_record.event, None);
+
+    let command_evidence = finished_reader
+        .command_journal_evidence(session_id)
+        .expect("finished Step/Step/Shutdown session has non-vacuous command evidence");
+    assert_eq!(command_evidence.command_count, 3);
+    assert_eq!(command_evidence.application_transition_count, 6);
+    assert_eq!(command_evidence.storage_transition_count, 6);
+    let exact_first = finished_reader
+        .command_journal_record(session_id, first_command_id)
+        .expect("exact typed command lookup");
+    assert_eq!(exact_first.batch_id, JournalBatchId::new(session_id, 1));
+    assert_eq!(exact_first.lifecycle, first_lifecycle.clone());
+    assert_eq!(exact_first.terminal_boundary, first_applied);
+    assert_eq!(exact_first.scientific_event_sequence, Some(EventSequence::new(1)));
+    assert_eq!(exact_first.archive_payload_digest.len(), 64);
+    assert_eq!(exact_first.storage_transitions.len(), 2);
+    assert_eq!(
+        exact_first.storage_transitions[0].kind,
+        CommandStorageTransitionKind::CommittedVolatile
+    );
+    assert_eq!(
+        exact_first.storage_transitions[1].kind,
+        CommandStorageTransitionKind::Durable
+    );
+    let command_first_page = finished_reader
+        .command_journal_page(session_id, None, 1, options.max_event_page_bytes)
+        .expect("first exact command page");
+    assert_eq!(command_first_page.commands.len(), 1);
+    assert_eq!(command_first_page.evidence, command_evidence);
+    let first_command_cursor = command_first_page
+        .next_after
+        .expect("Step/Step/Shutdown has a second command");
+    assert_eq!(first_command_cursor, command_first_page.commands[0].cursor());
+    let command_second_page = finished_reader
+        .command_journal_page(
+            session_id,
+            Some(first_command_cursor),
+            2,
+            options.max_event_page_bytes,
+        )
+        .expect("resume after exact command cursor");
+    assert_eq!(command_second_page.commands.len(), 2);
+    assert_eq!(command_second_page.next_after, None);
+    let fabricated_command_cursor = CommandJournalCursor {
+        command_id: shutdown_command_id,
+        ..first_command_cursor
+    };
+    let fabricated_error = finished_reader
+        .command_journal_page(
+            session_id,
+            Some(fabricated_command_cursor),
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect_err("cursor command id must match its exact journal sequence");
+    assert!(matches!(
+        fabricated_error,
+        StorageError::InvalidData {
+            context: "host_command_records.after",
+            ..
+        }
+    ));
 
     let first_page = finished_reader
         .host_journal_session_conformance_page(session_id, None, 1, options.max_event_page_bytes)
@@ -704,6 +789,438 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
 #[allow(
     clippy::drop_non_drop,
     clippy::too_many_lines,
+    reason = "one durable public-boundary matrix proves rejected, control-only, configuration, scientific, and shutdown command lifecycles plus both transition axes"
+)]
+fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
+    let path = unique_database_path("command_lifecycle_evidence");
+    let mut pipeline = StoragePipeline::create_unattributed_file(&path)
+        .expect("new uniquely named command-evidence database");
+    let run_id = pipeline.run_id();
+    let session_id = HostSessionId::new(0x1052);
+    let options = StorageJournalOptions::default();
+    let journal = pipeline
+        .journal_port(session_id, options)
+        .expect("file command-evidence journal port");
+    let mut core = HostCore::with_journal(
+        session_id,
+        compact_world(),
+        host_options(8),
+        Box::new(journal),
+    )
+    .expect("host backed by durable command evidence");
+    let client_namespace = 0x2052;
+    let mut frontend = NullFrontend::new(core.local_port(), client_namespace);
+    let mut next_nanos = 0;
+
+    let nan_bits = 0x7fc0_5252_u32;
+    let pre_admission_rejection = frontend
+        .set_speed(f32::from_bits(nan_bits))
+        .expect("invalid nonfinite speed remains a queryable rejected command");
+    let pre_admission_id = pre_admission_rejection.command_id();
+    let pre_admission_status = drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        pre_admission_id,
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    assert!(matches!(
+        pre_admission_status.application(),
+        ApplicationState::Rejected(RejectionReason::Validation { .. })
+    ));
+
+    let rejected_shutdown = frontend
+        .submit(
+            HostCommand::Shutdown,
+            Some(ControlRevision::new(u64::MAX)),
+        )
+        .expect("revision-conflicting shutdown enters ordered command audit");
+    let rejected_shutdown_id = rejected_shutdown.command_id();
+    let rejected_shutdown_status = drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        rejected_shutdown_id,
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    assert!(matches!(
+        rejected_shutdown_status.application(),
+        ApplicationState::Rejected(RejectionReason::ControlRevisionConflict { .. })
+    ));
+    assert_ne!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+
+    let pause = frontend.pause().expect("applied control-only pause");
+    let pause_id = pause.command_id();
+    let pause_status = drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        pause_id,
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    let ApplicationState::Applied(pause_boundary) = pause_status.application() else {
+        panic!("pause did not retain its applied boundary");
+    };
+    let pause_boundary = *pause_boundary;
+
+    let updated_config = ScriptBotsConfig {
+        world_width: 64,
+        world_height: 64,
+        food_cell_size: 16,
+        rng_seed: Some(0x5eed),
+        closed: true,
+        history_capacity: 8,
+        persistence_interval: 1,
+        food_growth_rate: 0.0025,
+        ..ScriptBotsConfig::default()
+    };
+    let expected_updated_config = updated_config.clone();
+    let update_id = CommandId::from_client_sequence(client_namespace, 10_004);
+    let update_envelope = CommandEnvelope::new(
+        update_id,
+        HostCommand::UpdateConfig(Box::new(updated_config)),
+    )
+    .expecting_control_revision(pause_boundary.revisions.control)
+    .expecting_scientific_revision(pause_boundary.revisions.scientific)
+    .expecting_config_revision(pause_boundary.revisions.config);
+    frontend
+        .submit_envelope(update_envelope)
+        .expect("applied command-only configuration replacement");
+    let update_status = drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        update_id,
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    let ApplicationState::Applied(update_boundary) = update_status.application() else {
+        panic!("update-config did not retain its applied boundary");
+    };
+    let update_boundary = *update_boundary;
+
+    let step_id = CommandId::from_client_sequence(client_namespace, 10_005);
+    let step_envelope = CommandEnvelope::new(step_id, HostCommand::Step)
+        .expecting_control_revision(update_boundary.revisions.control)
+        .expecting_scientific_revision(update_boundary.revisions.scientific)
+        .expecting_config_revision(update_boundary.revisions.config);
+    frontend
+        .submit_envelope(step_envelope)
+        .expect("applied scientific step");
+    let step_status = drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        step_id,
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    let ApplicationState::Applied(step_boundary) = step_status.application() else {
+        panic!("step did not retain its applied boundary");
+    };
+    let step_boundary = *step_boundary;
+    assert_eq!(core.world_tick(), Tick(1));
+
+    let shutdown_id = CommandId::from_client_sequence(client_namespace, 10_006);
+    let shutdown_envelope = CommandEnvelope::new(shutdown_id, HostCommand::Shutdown)
+        .expecting_control_revision(step_boundary.revisions.control)
+        .expecting_scientific_revision(step_boundary.revisions.scientific)
+        .expecting_config_revision(step_boundary.revisions.config);
+    frontend
+        .submit_envelope(shutdown_envelope)
+        .expect("final applied shutdown");
+    drive_until_journal_state(
+        &mut frontend,
+        &mut core,
+        shutdown_id,
+        &JournalState::Durable,
+        &mut next_nanos,
+    );
+    assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+    assert_eq!(
+        pipeline
+            .shutdown()
+            .expect("close durable command-evidence storage")
+            .guarantee,
+        PersistenceGuarantee::Durable
+    );
+    drop(frontend);
+    drop(core);
+    drop(pipeline);
+
+    let reader = StorageReader::open_finished_for_run(&path, run_id)
+        .expect("reopen immutable command evidence");
+    let evidence = reader
+        .command_journal_evidence(session_id)
+        .expect("finished session contains non-vacuous command evidence");
+    assert_eq!(evidence.command_count, 6);
+    assert_eq!(evidence.application_transition_count, 11);
+    assert_eq!(evidence.storage_transition_count, 12);
+
+    let pre_admission = reader
+        .command_journal_record(session_id, pre_admission_id)
+        .expect("exact pre-admission rejection lookup");
+    assert_eq!(pre_admission.batch_id.sequence(), 1);
+    assert_eq!(pre_admission.lifecycle.source_client_namespace(), client_namespace);
+    assert_eq!(pre_admission.lifecycle.admission_sequence(), None);
+    assert_eq!(pre_admission.lifecycle.transitions().len(), 1);
+    assert!(matches!(
+        pre_admission.lifecycle.terminal().map(|transition| transition.application()),
+        Some(ApplicationState::Rejected(RejectionReason::Validation { .. }))
+    ));
+    let HostCommand::SetSpeed(stored_speed) = &pre_admission.lifecycle.envelope().command else {
+        panic!("pre-admission lifecycle changed the rejected command kind");
+    };
+    assert_eq!(stored_speed.to_bits(), nan_bits);
+    assert_eq!(pre_admission.scientific_event_sequence, None);
+
+    let rejected_shutdown_record = reader
+        .command_journal_record(session_id, rejected_shutdown_id)
+        .expect("exact admitted rejection lookup");
+    assert_eq!(rejected_shutdown_record.batch_id.sequence(), 2);
+    assert!(rejected_shutdown_record.lifecycle.admission_sequence().is_some());
+    assert_eq!(rejected_shutdown_record.lifecycle.transitions().len(), 2);
+    assert!(matches!(
+        rejected_shutdown_record
+            .lifecycle
+            .terminal()
+            .map(|transition| transition.application()),
+        Some(ApplicationState::Rejected(
+            RejectionReason::ControlRevisionConflict { .. }
+        ))
+    ));
+    assert!(!rejected_shutdown_record.lifecycle.is_applied_shutdown());
+    assert_eq!(rejected_shutdown_record.scientific_event_sequence, None);
+    assert_eq!(
+        rejected_shutdown_record
+            .lifecycle
+            .envelope()
+            .expected_control_revision,
+        Some(ControlRevision::new(u64::MAX))
+    );
+    assert_eq!(
+        rejected_shutdown_record
+            .lifecycle
+            .envelope()
+            .expected_scientific_revision,
+        None
+    );
+    assert_eq!(
+        rejected_shutdown_record
+            .lifecycle
+            .envelope()
+            .expected_config_revision,
+        None
+    );
+
+    let pause_record = reader
+        .command_journal_record(session_id, pause_id)
+        .expect("exact applied control lookup");
+    assert!(matches!(
+        &pause_record.lifecycle.envelope().command,
+        HostCommand::Pause
+    ));
+    assert!(matches!(
+        pause_record.lifecycle.terminal().map(|transition| transition.application()),
+        Some(ApplicationState::Applied(_))
+    ));
+    assert_eq!(pause_record.scientific_event_sequence, None);
+
+    let update_record = reader
+        .command_journal_record(session_id, update_id)
+        .expect("exact applied configuration lookup");
+    let HostCommand::UpdateConfig(stored_config) = &update_record.lifecycle.envelope().command else {
+        panic!("configuration lifecycle changed the command kind");
+    };
+    assert_eq!(stored_config.as_ref(), &expected_updated_config);
+    assert_eq!(
+        stored_config.food_growth_rate.to_bits(),
+        expected_updated_config.food_growth_rate.to_bits(),
+        "postcard command projection must preserve exact configuration float bits"
+    );
+    assert!(matches!(
+        update_record.lifecycle.terminal().map(|transition| transition.application()),
+        Some(ApplicationState::Applied(_))
+    ));
+    assert_eq!(
+        update_record.lifecycle.envelope().expected_control_revision,
+        Some(pause_boundary.revisions.control)
+    );
+    assert_eq!(
+        update_record
+            .lifecycle
+            .envelope()
+            .expected_scientific_revision,
+        Some(pause_boundary.revisions.scientific)
+    );
+    assert_eq!(
+        update_record.lifecycle.envelope().expected_config_revision,
+        Some(pause_boundary.revisions.config)
+    );
+    assert_eq!(update_record.scientific_event_sequence, None);
+
+    let step_record = reader
+        .command_journal_record(session_id, step_id)
+        .expect("exact applied scientific lookup");
+    assert!(matches!(
+        &step_record.lifecycle.envelope().command,
+        HostCommand::Step
+    ));
+    assert_eq!(
+        step_record.lifecycle.envelope().expected_control_revision,
+        Some(update_boundary.revisions.control)
+    );
+    assert_eq!(
+        step_record
+            .lifecycle
+            .envelope()
+            .expected_scientific_revision,
+        Some(update_boundary.revisions.scientific)
+    );
+    assert_eq!(
+        step_record.lifecycle.envelope().expected_config_revision,
+        Some(update_boundary.revisions.config)
+    );
+    assert_eq!(step_record.scientific_event_sequence, Some(EventSequence::new(1)));
+
+    let shutdown_record = reader
+        .command_journal_record(session_id, shutdown_id)
+        .expect("exact applied shutdown lookup");
+    assert!(shutdown_record.lifecycle.is_applied_shutdown());
+    assert_eq!(shutdown_record.batch_id.sequence(), 6);
+    assert_eq!(
+        shutdown_record.lifecycle.envelope().expected_control_revision,
+        Some(step_boundary.revisions.control)
+    );
+    assert_eq!(
+        shutdown_record
+            .lifecycle
+            .envelope()
+            .expected_scientific_revision,
+        Some(step_boundary.revisions.scientific)
+    );
+    assert_eq!(
+        shutdown_record.lifecycle.envelope().expected_config_revision,
+        Some(step_boundary.revisions.config)
+    );
+    for record in [
+        &pre_admission,
+        &rejected_shutdown_record,
+        &pause_record,
+        &update_record,
+        &step_record,
+        &shutdown_record,
+    ] {
+        assert_eq!(record.storage_transitions.len(), 2);
+        assert_eq!(record.storage_transitions[0].ordinal, 0);
+        assert_eq!(
+            record.storage_transitions[0].kind,
+            CommandStorageTransitionKind::CommittedVolatile
+        );
+        assert_eq!(record.storage_transitions[1].ordinal, 1);
+        assert_eq!(
+            record.storage_transitions[1].kind,
+            CommandStorageTransitionKind::Durable
+        );
+        assert_eq!(record.archive_payload_digest.len(), 64);
+    }
+
+    let first_page = reader
+        .command_journal_page(session_id, None, 2, options.max_event_page_bytes)
+        .expect("first bounded command page");
+    assert_eq!(first_page.commands.len(), 2);
+    assert_eq!(first_page.evidence, evidence);
+    let cursor = first_page
+        .next_after
+        .expect("six commands require a second page");
+    assert_eq!(cursor, first_page.commands[1].cursor());
+    let second_page = reader
+        .command_journal_page(session_id, Some(cursor), 4, options.max_event_page_bytes)
+        .expect("resume at exact normalized command cursor");
+    assert_eq!(second_page.commands.len(), 4);
+    assert_eq!(second_page.next_after, None);
+
+    let fabricated = CommandJournalCursor {
+        command_id: shutdown_id,
+        ..cursor
+    };
+    let fabricated_error = reader
+        .command_journal_page(
+            session_id,
+            Some(fabricated),
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect_err("fabricated command cursor cannot skip evidence");
+    assert!(matches!(
+        fabricated_error,
+        StorageError::InvalidData {
+            context: "host_command_records.after",
+            ..
+        }
+    ));
+    let missing = reader
+        .command_journal_record(
+            session_id,
+            CommandId::from_client_sequence(client_namespace, 10_000),
+        )
+        .expect_err("exact missing command lookup is non-vacuous");
+    assert!(matches!(
+        missing,
+        StorageError::NoEvidence {
+            context: "host_command_records.command_id",
+            ..
+        }
+    ));
+
+    reader
+        .close()
+        .expect("close immutable command-evidence reader");
+
+    let corrupted_path = unique_database_path("command_transition_ordinal_corruption");
+    fs::copy(&path, &corrupted_path).expect("copy finished command database for corruption proof");
+    let connection = Connection::open(&corrupted_path)
+        .expect("open copied command database for deliberate corruption");
+    let changed = connection
+        .execute_with_params(
+            "UPDATE host_command_application_transitions
+             SET transition_ordinal = 2
+             WHERE command_id = ?1 AND transition_ordinal = 1",
+            &[pause_id.to_string().into()],
+        )
+        .expect("tamper one application transition ordinal");
+    assert_eq!(changed, 1);
+    connection
+        .close()
+        .expect("close deliberately corrupted command database");
+    let corruption = match StorageReader::open_finished_for_run(&corrupted_path, run_id) {
+        Err(error) => error,
+        Ok(reader) => {
+            reader
+                .close()
+                .expect("close unexpectedly admitted corrupted command reader");
+            panic!("finished reader admitted a command transition ordinal gap");
+        }
+    };
+    assert!(
+        matches!(
+            corruption,
+            StorageError::InvalidData {
+                context: "host_command_application_transitions",
+                ..
+            } | StorageError::InvalidData {
+                context: "host_command_application_transitions.transition_ordinal",
+                ..
+            }
+        ),
+        "unexpected command-corruption refusal: {corruption}"
+    );
+
+    // The uniquely named database is intentionally retained; this test performs no file deletion.
+}
+
+#[test]
+#[allow(
+    clippy::drop_non_drop,
+    clippy::too_many_lines,
     reason = "one public-boundary test proves per-tick lifecycle/combat projection, deferred persistence cadence, durable reopen, typed non-vacuity, and bounded cursor paging together"
 )]
 fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistence() {
@@ -726,7 +1243,9 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
     let mut frontend = NullFrontend::new(core.local_port(), 0x2004);
     let mut next_nanos = 0;
 
-    let first = frontend.step().expect("population-injection step");
+    let first = frontend
+        .step()
+        .expect("first pre-cadence scientific boundary");
     drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -734,7 +1253,9 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
         &JournalState::Durable,
         &mut next_nanos,
     );
-    let second = frontend.step().expect("combat/death step");
+    let second = frontend
+        .step()
+        .expect("second pre-cadence scientific boundary");
     drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -803,13 +1324,13 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
         expected_payloads
             .iter()
             .any(|payload| matches!(payload, DomainEventPayload::Birth(_))),
-        "the first scientific boundary must retain scheduled arrivals"
+        "the first two pre-cadence scientific boundaries must retain scheduled arrivals"
     );
     assert!(
         expected_payloads
             .iter()
             .any(|payload| matches!(payload, DomainEventPayload::Death(_))),
-        "the second scientific boundary must retain combat deaths"
+        "the first two pre-cadence scientific boundaries must retain combat deaths"
     );
     assert!(
         expected_payloads.iter().any(|payload| matches!(
@@ -817,7 +1338,7 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
             DomainEventPayload::Combat(combat)
                 if combat.spike_attempts != 0 && combat.spike_hits != 0
         )),
-        "the second scientific boundary must retain nonzero aggregate combat"
+        "the first two pre-cadence scientific boundaries must retain nonzero aggregate combat"
     );
 
     let evidence = reader
@@ -895,6 +1416,59 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
     reader
         .close()
         .expect("close immutable domain-event reader");
+
+    let domain_corruptions = [
+        (
+            "domain_sequence_corruption",
+            "UPDATE host_domain_event_batches
+             SET scientific_event_sequence = 'ffffffffffffffff'
+             WHERE scientific_event_sequence = '0000000000000001'",
+        ),
+        (
+            "domain_ordinal_corruption",
+            "UPDATE host_domain_events
+             SET event_ordinal = event_ordinal + 10000
+             WHERE scientific_event_sequence = '0000000000000001'
+               AND event_ordinal = 0",
+        ),
+        (
+            "domain_digest_corruption",
+            "UPDATE host_domain_event_batches
+             SET archive_payload_digest =
+                 '0000000000000000000000000000000000000000000000000000000000000000'
+             WHERE scientific_event_sequence = '0000000000000001'",
+        ),
+    ];
+    for (label, mutation) in domain_corruptions {
+        let corrupted_path = unique_database_path(label);
+        fs::copy(&path, &corrupted_path)
+            .expect("copy finished domain database for corruption proof");
+        let connection = Connection::open(&corrupted_path)
+            .expect("open copied domain database for deliberate corruption");
+        connection
+            .execute("PRAGMA foreign_keys = OFF")
+            .expect("isolate deliberate projection corruption from foreign-key enforcement");
+        let changed = connection
+            .execute(mutation)
+            .expect("tamper normalized domain projection");
+        assert!(changed > 0, "domain corruption fixture must change a row");
+        connection
+            .close()
+            .expect("close deliberately corrupted domain database");
+        let corruption = match StorageReader::open_finished_for_run(&corrupted_path, run_id) {
+            Err(error) => error,
+            Ok(reader) => {
+                reader
+                    .close()
+                    .expect("close unexpectedly admitted corrupted domain reader");
+                panic!("finished reader admitted {label}");
+            }
+        };
+        assert!(
+            matches!(corruption, StorageError::InvalidData { .. }),
+            "unexpected {label} refusal: {corruption}"
+        );
+    }
 
     // The uniquely named database is intentionally retained; this test performs no file deletion.
 }
