@@ -2611,6 +2611,9 @@ These become separate implementation beads for terrain, camera/input, HUD, and c
 
 #### 4.1 command/event journal and product checkpoint integration
 
+**Status:** [Currently In Progress — sequenced command/status and domain-event journal slice
+`bd-2z0.5.2`, TopazCastle, 2026-07-17]
+
 - persist the already-defined canonical manifest/digest schemas;
 - sequenced commands and status transitions;
 - nonempty domain events;
