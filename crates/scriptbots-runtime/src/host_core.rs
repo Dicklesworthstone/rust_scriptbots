@@ -2,8 +2,9 @@
 
 use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, BrainProjection,
-    BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId, CommandStatus,
-    ConfigRevision, ControlRevision, DriveReceipt, EventCatchUp, EventCatchUpGuarantee,
+    BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId,
+    CommandLifecycleEvidence, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt,
+    EventCatchUp, EventCatchUpGuarantee,
     EventCatchUpLocator, EventCatchUpUnavailableReason, EventCommitment, EventHub,
     EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot, EventSequence,
     EventSequenceRange, FoodLayerSnapshot, HostAccessError, HostBlocker, HostCommand,
@@ -404,6 +405,58 @@ struct AdmittedEnvelope {
     envelope: CommandEnvelope,
 }
 
+#[derive(Debug, Clone)]
+struct CommandAuthority {
+    envelope: CommandEnvelope,
+    status: CommandStatus,
+    initial_boundary: AppliedCommand,
+    application_boundary: AppliedCommand,
+    pending_audit_order: Option<u64>,
+}
+
+impl CommandAuthority {
+    fn lifecycle_evidence(&self) -> Result<CommandLifecycleEvidence, HostAccessError> {
+        CommandLifecycleEvidence::from_terminal(
+            self.envelope.clone(),
+            self.status.admission_sequence(),
+            self.initial_boundary,
+            self.application_boundary,
+            self.status.application().clone(),
+        )
+        .map_err(|error| protocol_violation(format!("invalid command lifecycle evidence: {error}")))
+    }
+}
+
+fn command_envelopes_identical(left: &CommandEnvelope, right: &CommandEnvelope) -> bool {
+    if left.command_id != right.command_id
+        || left.expected_control_revision != right.expected_control_revision
+        || left.expected_scientific_revision != right.expected_scientific_revision
+        || left.expected_config_revision != right.expected_config_revision
+    {
+        return false;
+    }
+    match (&left.command, &right.command) {
+        (HostCommand::Pause, HostCommand::Pause)
+        | (HostCommand::Resume, HostCommand::Resume)
+        | (HostCommand::Step, HostCommand::Step)
+        | (HostCommand::Shutdown, HostCommand::Shutdown) => true,
+        (HostCommand::SetSpeed(left), HostCommand::SetSpeed(right)) => {
+            left.to_bits() == right.to_bits()
+        }
+        (HostCommand::UpdateConfig(left), HostCommand::UpdateConfig(right)) => {
+            // Valid configurations use both typed equality and exact serde wire
+            // equality so signed zero cannot alias. Invalid configurations are
+            // terminal validation evidence and intentionally require a fresh id;
+            // serde formats cannot preserve every non-finite float payload bit.
+            left.validate().is_ok()
+                && right.validate().is_ok()
+                && left == right
+                && serde_json::to_vec(left).ok() == serde_json::to_vec(right).ok()
+        }
+        _ => false,
+    }
+}
+
 struct SharedHostState {
     session_id: HostSessionId,
     command_capacity: usize,
@@ -411,12 +464,16 @@ struct SharedHostState {
     next_event: ProtocolEventSequence,
     protocol_event_capacity: usize,
     admission_lifecycle: HostLifecycle,
+    audit_gate_closed: bool,
     shutdown_command_id: Option<CommandId>,
     queue: VecDeque<AdmittedEnvelope>,
-    statuses: HashMap<CommandId, CommandStatus>,
+    commands: HashMap<CommandId, CommandAuthority>,
+    next_audit_order: u64,
+    pending_audit_count: usize,
+    pending_audits: VecDeque<(u64, CommandId)>,
     last_applied: Option<(AdmissionSequence, CommandId)>,
     events: VecDeque<HostEvent>,
-    visible_tick: Tick,
+    visible_boundary: AppliedCommand,
 }
 
 impl SharedHostState {
@@ -431,10 +488,39 @@ impl SharedHostState {
         self.events.push_back(HostEvent {
             session_id: self.session_id,
             sequence,
-            tick: self.visible_tick,
+            tick: self.visible_boundary.tick,
             kind,
         });
         Ok(())
+    }
+
+    fn insert_status(
+        &mut self,
+        envelope: CommandEnvelope,
+        status: CommandStatus,
+        pending_audit_order: Option<u64>,
+    ) -> Result<(), HostAccessError> {
+        let command_id = status.command_id();
+        let boundary = match status.application() {
+            ApplicationState::Applied(applied) => *applied,
+            ApplicationState::Admitted
+            | ApplicationState::Rejected(_)
+            | ApplicationState::Failed(_) => self.visible_boundary,
+        };
+        let previous = self.commands.insert(
+            command_id,
+            CommandAuthority {
+                envelope,
+                status: status.clone(),
+                initial_boundary: boundary,
+                application_boundary: boundary,
+                pending_audit_order,
+            },
+        );
+        if previous.is_some() {
+            return Err(protocol_violation("command authority was inserted twice"));
+        }
+        self.emit(HostEventKind::CommandStatusChanged(status))
     }
 
     fn store_status(&mut self, status: CommandStatus) -> Result<(), HostAccessError> {
@@ -446,8 +532,101 @@ impl SharedHostState {
         {
             self.last_applied = Some((admission, status.command_id()));
         }
-        self.statuses.insert(status.command_id(), status.clone());
+        let visible_boundary = self.visible_boundary;
+        let authority = self
+            .commands
+            .get_mut(&status.command_id())
+            .ok_or_else(|| protocol_violation("command status has no envelope authority"))?;
+        if authority.status.application() != status.application() {
+            authority.application_boundary = match status.application() {
+                ApplicationState::Applied(applied) => *applied,
+                ApplicationState::Admitted
+                | ApplicationState::Rejected(_)
+                | ApplicationState::Failed(_) => visible_boundary,
+            };
+        }
+        authority.status = status.clone();
         self.emit(HostEventKind::CommandStatusChanged(status))
+    }
+
+    fn reserve_pre_admission_audit(&mut self) -> Result<u64, HostAccessError> {
+        if self.pending_audit_count >= self.command_capacity {
+            return Err(HostAccessError::CommandEvidenceBackpressure {
+                capacity: self.command_capacity,
+            });
+        }
+        let order = self.next_audit_order;
+        self.next_audit_order = order
+            .checked_add(1)
+            .ok_or_else(|| protocol_violation("command audit order exhausted"))?;
+        self.pending_audit_count += 1;
+        Ok(order)
+    }
+
+    fn insert_pre_admission_rejection(
+        &mut self,
+        envelope: CommandEnvelope,
+        reason: RejectionReason,
+    ) -> Result<CommandStatus, HostAccessError> {
+        let audit_order = self.reserve_pre_admission_audit()?;
+        let status = CommandStatus::rejected(envelope.command_id, reason).map_err(status_violation)?;
+        let command_id = envelope.command_id;
+        self.insert_status(envelope, status.clone(), Some(audit_order))?;
+        self.pending_audits.push_back((audit_order, command_id));
+        Ok(status)
+    }
+
+    fn next_pending_audit(
+        &self,
+    ) -> Result<Option<(CommandId, u64, CommandLifecycleEvidence)>, HostAccessError> {
+        let Some((order, command_id)) = self.pending_audits.front().copied() else {
+            return Ok(None);
+        };
+        let authority = self
+            .commands
+            .get(&command_id)
+            .ok_or_else(|| protocol_violation("pending command audit authority is missing"))?;
+        if authority.pending_audit_order != Some(order) {
+            return Err(protocol_violation("pending command audit lost its order"));
+        }
+        Ok(Some((command_id, order, authority.lifecycle_evidence()?)))
+    }
+
+    fn claim_pending_audit(
+        &mut self,
+        command_id: CommandId,
+        expected_order: u64,
+    ) -> Result<(), HostAccessError> {
+        let authority = self
+            .commands
+            .get_mut(&command_id)
+            .ok_or_else(|| protocol_violation("pending command audit authority is missing"))?;
+        if authority.pending_audit_order != Some(expected_order) {
+            return Err(protocol_violation("pending command audit order changed"));
+        }
+        if self.pending_audits.pop_front() != Some((expected_order, command_id)) {
+            return Err(protocol_violation("pending command audit queue changed"));
+        }
+        authority.pending_audit_order = None;
+        Ok(())
+    }
+
+    fn release_pre_admission_audit(&mut self) -> Result<(), HostAccessError> {
+        self.pending_audit_count = self
+            .pending_audit_count
+            .checked_sub(1)
+            .ok_or_else(|| protocol_violation("pre-admission audit slot released twice"))?;
+        Ok(())
+    }
+
+    fn lifecycle_evidence(
+        &self,
+        command_id: CommandId,
+    ) -> Result<CommandLifecycleEvidence, HostAccessError> {
+        self.commands
+            .get(&command_id)
+            .ok_or_else(|| protocol_violation("command lifecycle authority is missing"))?
+            .lifecycle_evidence()
     }
 
     fn submit(
@@ -455,40 +634,41 @@ impl SharedHostState {
         envelope: CommandEnvelope,
         reserve_lifecycle_slot: bool,
     ) -> Result<CommandStatus, HostAccessError> {
-        if let Some(status) = self.statuses.get(&envelope.command_id) {
-            return Ok(status.clone());
+        if let Some(authority) = self.commands.get(&envelope.command_id) {
+            if command_envelopes_identical(&authority.envelope, &envelope) {
+                return Ok(authority.status.clone());
+            }
+            return Err(HostAccessError::CommandIdCollision {
+                command_id: envelope.command_id,
+            });
+        }
+
+        if self.audit_gate_closed || self.admission_lifecycle == HostLifecycle::Stopped {
+            return Err(HostAccessError::CommandEvidenceClosed {
+                lifecycle: self.admission_lifecycle,
+            });
         }
 
         if let Err(error) = envelope.command.validate() {
-            let status = CommandStatus::rejected(
-                envelope.command_id,
+            return self.insert_pre_admission_rejection(
+                envelope,
                 RejectionReason::Validation {
                     message: error.to_string(),
                 },
-            )
-            .map_err(status_violation)?;
-            self.store_status(status.clone())?;
-            return Ok(status);
+            );
         }
         if self.admission_lifecycle != HostLifecycle::Running {
-            let status =
-                CommandStatus::rejected(envelope.command_id, RejectionReason::HostStopping)
-                    .map_err(status_violation)?;
-            self.store_status(status.clone())?;
-            return Ok(status);
+            return self.insert_pre_admission_rejection(envelope, RejectionReason::HostStopping);
         }
 
         let closes_gate = matches!(&envelope.command, HostCommand::Shutdown);
         if self.queue.len() >= self.command_capacity && !(reserve_lifecycle_slot && closes_gate) {
-            let status = CommandStatus::rejected(
-                envelope.command_id,
+            return self.insert_pre_admission_rejection(
+                envelope,
                 RejectionReason::Overloaded {
                     capacity: self.command_capacity,
                 },
-            )
-            .map_err(status_violation)?;
-            self.store_status(status.clone())?;
-            return Ok(status);
+            );
         }
 
         let admission = self.next_admission;
@@ -513,9 +693,9 @@ impl SharedHostState {
         }
         self.queue.push_back(AdmittedEnvelope {
             admission,
-            envelope,
+            envelope: envelope.clone(),
         });
-        self.store_status(status.clone())?;
+        self.insert_status(envelope, status.clone(), None)?;
         Ok(status)
     }
 }
@@ -552,7 +732,12 @@ impl HostPort for LocalHostPort {
         &mut self,
         command_id: CommandId,
     ) -> Result<Option<CommandStatus>, HostAccessError> {
-        Ok(self.shared.borrow().statuses.get(&command_id).cloned())
+        Ok(self
+            .shared
+            .borrow()
+            .commands
+            .get(&command_id)
+            .map(|authority| authority.status.clone()))
     }
 
     fn snapshot_after(
@@ -1057,12 +1242,19 @@ impl HostCore {
             next_event: ProtocolEventSequence::new(1),
             protocol_event_capacity: options.protocol_event_capacity,
             admission_lifecycle: HostLifecycle::Running,
+            audit_gate_closed: false,
             shutdown_command_id: None,
             queue: VecDeque::with_capacity(options.command_capacity),
-            statuses: HashMap::new(),
+            commands: HashMap::new(),
+            next_audit_order: 1,
+            pending_audit_count: 0,
+            pending_audits: VecDeque::with_capacity(options.command_capacity),
             last_applied: None,
             events: VecDeque::with_capacity(options.protocol_event_capacity),
-            visible_tick: world.tick(),
+            visible_boundary: AppliedCommand {
+                tick: world.tick(),
+                revisions,
+            },
         }));
         Ok(Self {
             session_id,
@@ -1136,9 +1328,9 @@ impl HostCore {
             return self
                 .shared
                 .borrow()
-                .statuses
+                .commands
                 .get(&command_id)
-                .cloned()
+                .map(|authority| authority.status.clone())
                 .ok_or_else(|| protocol_violation("shutdown command status is missing"));
         }
 
@@ -1148,7 +1340,7 @@ impl HostCore {
                 .checked_add(1)
                 .ok_or_else(|| protocol_violation("lifecycle command sequence exhausted"))?;
             let candidate = CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
-            if !self.shared.borrow().statuses.contains_key(&candidate) {
+            if !self.shared.borrow().commands.contains_key(&candidate) {
                 break candidate;
             }
         };
@@ -1170,7 +1362,8 @@ impl HostCore {
         let shared = self.shared.borrow();
         shared
             .shutdown_command_id
-            .and_then(|command_id| shared.statuses.get(&command_id).cloned())
+            .and_then(|command_id| shared.commands.get(&command_id))
+            .map(|authority| authority.status.clone())
     }
 
     /// Latest immutable host publication.
@@ -1254,9 +1447,11 @@ impl HostCore {
         if self.event_pressure.is_some() {
             return HostDriveInterest::Draining;
         }
-        if !self.shared.borrow().queue.is_empty() {
+        let shared = self.shared.borrow();
+        if shared.pending_audit_count != 0 || !shared.queue.is_empty() {
             return HostDriveInterest::ReadyNow;
         }
+        drop(shared);
         let journal_drain_required = self.inflight_journal.values().any(|entry| {
             !entry.committed_volatile
                 || matches!(
@@ -1358,10 +1553,7 @@ impl HostCore {
         };
         self.active_journal_batch = Some(Arc::clone(&batch));
         let admission = self.journal.try_admit(&batch);
-        let shutdown = batch
-            .command()
-            .is_some_and(|command| matches!(&command.command, HostCommand::Shutdown));
-        let result = self.finish_journal_admission(&batch, admission, shutdown, true);
+        let result = self.finish_journal_admission(&batch, admission, true);
         if result.is_ok() {
             self.active_journal_batch = None;
         }
@@ -1387,7 +1579,9 @@ impl HostCore {
             code: "journal_identity_mismatch".to_owned(),
             message: "journal response echoed a different batch identity".to_owned(),
         };
-        if let Some(command_id) = batch.command_id() {
+        if batch.requires_runtime_journal()
+            && let Some(command_id) = batch.command_id()
+        {
             self.update_command_journal(command_id, JournalState::Failed(failure.clone()))?;
         }
         if let Some(event_sequence) = batch.scientific_event_sequence() {
@@ -1428,7 +1622,9 @@ impl HostCore {
             code: "journal_closed".to_owned(),
             message: "journal admission gate is permanently closed".to_owned(),
         };
-        if let Some(command_id) = batch.command_id() {
+        if batch.requires_runtime_journal()
+            && let Some(command_id) = batch.command_id()
+        {
             self.update_command_journal(command_id, JournalState::Failed(failure.clone()))?;
         }
         if let Some(event_sequence) = batch.scientific_event_sequence() {
@@ -1525,9 +1721,9 @@ impl HostCore {
         let current = self
             .shared
             .borrow()
-            .statuses
+            .commands
             .get(&command_id)
-            .cloned()
+            .map(|authority| authority.status.clone())
             .ok_or_else(|| protocol_violation("journal receipt command status is missing"))?;
         if current.journal() == &journal
             || matches!(
@@ -1709,12 +1905,29 @@ impl HostCore {
         self.summary_history = summary_history;
         self.next_snapshot = following_revision;
         self.last_published_scientific = self.revisions.scientific;
-        self.shared.borrow_mut().visible_tick = self.world.tick();
+        self.shared.borrow_mut().visible_boundary = self.applied_boundary();
         Ok(())
     }
 
     fn pop_command(&self) -> Option<AdmittedEnvelope> {
         self.shared.borrow_mut().queue.pop_front()
+    }
+
+    fn drain_pending_command_audits(&mut self) -> Result<bool, HostAccessError> {
+        loop {
+            let Some((command_id, order, lifecycle)) =
+                self.shared.borrow().next_pending_audit()?
+            else {
+                return Ok(false);
+            };
+            self.ensure_journal_sequence_available()?;
+            self.shared
+                .borrow_mut()
+                .claim_pending_audit(command_id, order)?;
+            if self.offer_command_lifecycle(lifecycle)? {
+                return Ok(true);
+            }
+        }
     }
 
     fn next_command_requires_scientific_event(&self) -> bool {
@@ -1734,7 +1947,7 @@ impl HostCore {
 
     fn complete_status(&self, status: CommandStatus) -> Result<(), HostAccessError> {
         let mut shared = self.shared.borrow_mut();
-        shared.visible_tick = self.world.tick();
+        shared.visible_boundary = self.applied_boundary();
         shared.store_status(status)
     }
 
@@ -1746,9 +1959,32 @@ impl HostCore {
             admission,
             envelope,
         } = admitted;
-        if let Some(expected) = envelope.expected_control_revision
+        self.ensure_journal_sequence_available()?;
+        let revision_conflict = if let Some(expected) = envelope.expected_control_revision
             && expected != self.revisions.control
         {
+            Some(RejectionReason::ControlRevisionConflict {
+                expected,
+                actual: self.revisions.control,
+            })
+        } else if let Some(expected) = envelope.expected_scientific_revision
+            && expected != self.revisions.scientific
+        {
+            Some(RejectionReason::ScientificRevisionConflict {
+                expected,
+                actual: self.revisions.scientific,
+            })
+        } else if let Some(expected) = envelope.expected_config_revision
+            && expected != self.revisions.config
+        {
+            Some(RejectionReason::ConfigRevisionConflict {
+                expected,
+                actual: self.revisions.config,
+            })
+        } else {
+            None
+        };
+        if let Some(reason) = revision_conflict {
             if matches!(&envelope.command, HostCommand::Shutdown) {
                 let mut shared = self.shared.borrow_mut();
                 shared.admission_lifecycle = HostLifecycle::Running;
@@ -1757,15 +1993,13 @@ impl HostCore {
             let status = CommandStatus::try_new(
                 envelope.command_id,
                 Some(admission),
-                ApplicationState::Rejected(RejectionReason::ControlRevisionConflict {
-                    expected,
-                    actual: self.revisions.control,
-                }),
+                ApplicationState::Rejected(reason),
                 JournalState::NotRequired,
             )
             .map_err(status_violation)?;
             self.complete_status(status)?;
-            return Ok(ApplyResult::completed(false));
+            let blocked = self.offer_terminal_command_audit(envelope.command_id)?;
+            return Ok(ApplyResult::completed(blocked));
         }
 
         if self.latched_fault.is_some()
@@ -1774,20 +2008,13 @@ impl HostCore {
                 HostCommand::Step | HostCommand::UpdateConfig(_)
             )
         {
-            self.complete_failed(
+            let blocked = self.complete_failed(
                 envelope.command_id,
                 admission,
                 "science_blocked",
                 "host science is stopped by a latched fault".to_owned(),
             )?;
-            return Ok(ApplyResult::completed(false));
-        }
-
-        if matches!(
-            &envelope.command,
-            HostCommand::UpdateConfig(_) | HostCommand::Step | HostCommand::Shutdown
-        ) {
-            self.ensure_journal_sequence_available()?;
+            return Ok(ApplyResult::completed(blocked));
         }
 
         let next_control = self
@@ -1801,19 +2028,22 @@ impl HostCore {
                 self.playback.paused = true;
                 self.revisions.control = next_control;
                 self.complete_applied(retry_envelope.command_id, admission, false)?;
-                Ok(ApplyResult::completed(false))
+                let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
+                Ok(ApplyResult::completed(blocked))
             }
             HostCommand::Resume => {
                 self.playback.paused = false;
                 self.revisions.control = next_control;
                 self.complete_applied(retry_envelope.command_id, admission, false)?;
-                Ok(ApplyResult::completed(false))
+                let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
+                Ok(ApplyResult::completed(blocked))
             }
             HostCommand::SetSpeed(speed) => {
                 self.playback.speed_multiplier = speed;
                 self.revisions.control = next_control;
                 self.complete_applied(retry_envelope.command_id, admission, false)?;
-                Ok(ApplyResult::completed(false))
+                let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
+                Ok(ApplyResult::completed(blocked))
             }
             HostCommand::UpdateConfig(config) => {
                 self.apply_config_command(admission, retry_envelope, config, next_control)
@@ -1833,13 +2063,13 @@ impl HostCore {
         next_control: ControlRevision,
     ) -> Result<ApplyResult, HostAccessError> {
         if let Err(error) = self.world.apply_config_update(*config) {
-            self.complete_failed(
+            let blocked = self.complete_failed(
                 envelope.command_id,
                 admission,
                 "config_application",
                 error.to_string(),
             )?;
-            return Ok(ApplyResult::completed(false));
+            return Ok(ApplyResult::completed(blocked));
         }
         self.revisions.control = next_control;
         self.revisions.config = ConfigRevision::new(self.world.config_revision());
@@ -1863,7 +2093,7 @@ impl HostCore {
         let completion = match self.persistence.step_outcome(&mut self.world) {
             Ok(completion) => completion,
             Err(error) => {
-                self.complete_failed(
+                let blocked = self.complete_failed(
                     envelope.command_id,
                     admission,
                     "world_step",
@@ -1875,7 +2105,7 @@ impl HostCore {
                     message: error.to_string(),
                 });
                 self.synchronize_health()?;
-                return Ok(ApplyResult::completed(false));
+                return Ok(ApplyResult::completed(blocked));
             }
         };
         self.playback.paused = true;
@@ -1932,6 +2162,15 @@ impl HostCore {
         envelope: CommandEnvelope,
         next_control: ControlRevision,
     ) -> Result<ApplyResult, HostAccessError> {
+        {
+            let mut shared = self.shared.borrow_mut();
+            if shared.pending_audit_count != 0 {
+                return Err(protocol_violation(
+                    "shutdown application began before pre-admission audits drained",
+                ));
+            }
+            shared.audit_gate_closed = true;
+        }
         let persistence = match self.persistence.stage_final_batch(&mut self.world) {
             Ok(persistence) => persistence,
             Err(error) => {
@@ -1939,7 +2178,7 @@ impl HostCore {
                 self.shared
                     .borrow_mut()
                     .emit(HostEventKind::LifecycleChanged(HostLifecycle::Stopping))?;
-                self.complete_failed(
+                let blocked = self.complete_failed(
                     envelope.command_id,
                     admission,
                     "shutdown_finalization",
@@ -1951,7 +2190,7 @@ impl HostCore {
                     message: error.to_string(),
                 });
                 self.synchronize_health()?;
-                return Ok(ApplyResult::completed(false));
+                return Ok(ApplyResult::completed(blocked));
             }
         };
         self.lifecycle = HostLifecycle::Stopping;
@@ -2010,12 +2249,12 @@ impl HostCore {
     }
 
     fn complete_failed(
-        &self,
+        &mut self,
         command_id: CommandId,
         admission: AdmissionSequence,
         code: &str,
         message: String,
-    ) -> Result<(), HostAccessError> {
+    ) -> Result<bool, HostAccessError> {
         let status = CommandStatus::try_new(
             command_id,
             Some(admission),
@@ -2026,7 +2265,8 @@ impl HostCore {
             JournalState::NotRequired,
         )
         .map_err(status_violation)?;
-        self.complete_status(status)
+        self.complete_status(status)?;
+        self.offer_terminal_command_audit(command_id)
     }
 
     fn offer_journal(
@@ -2041,7 +2281,15 @@ impl HostCore {
             .next_journal_sequence
             .checked_add(1)
             .ok_or_else(|| protocol_violation("journal batch sequence exhausted"))?;
-        let shutdown = matches!(&envelope.command, HostCommand::Shutdown);
+        let lifecycle = self
+            .shared
+            .borrow()
+            .lifecycle_evidence(envelope.command_id)?;
+        if lifecycle.envelope() != &envelope {
+            return Err(protocol_violation(
+                "journal command differs from its retained lifecycle envelope",
+            ));
+        }
         let scientific_event_sequence = scientific
             .as_ref()
             .map(|boundary| {
@@ -2052,14 +2300,52 @@ impl HostCore {
         let batch = Arc::new(JournalBatch::new(
             batch_id,
             scientific_event_sequence,
-            Some(envelope),
+            Some(lifecycle),
             applied,
             scientific,
             persistence,
         ));
         self.active_journal_batch = Some(Arc::clone(&batch));
         let admission = self.journal.try_admit(&batch);
-        let result = self.finish_journal_admission(&batch, admission, shutdown, false);
+        let result = self.finish_journal_admission(&batch, admission, false);
+        if result.is_ok() {
+            self.active_journal_batch = None;
+        }
+        result
+    }
+
+    fn offer_terminal_command_audit(
+        &mut self,
+        command_id: CommandId,
+    ) -> Result<bool, HostAccessError> {
+        let lifecycle = self.shared.borrow().lifecycle_evidence(command_id)?;
+        self.offer_command_lifecycle(lifecycle)
+    }
+
+    fn offer_command_lifecycle(
+        &mut self,
+        lifecycle: CommandLifecycleEvidence,
+    ) -> Result<bool, HostAccessError> {
+        let applied = lifecycle
+            .terminal()
+            .map(|transition| transition.boundary())
+            .ok_or_else(|| protocol_violation("terminal command lifecycle is empty"))?;
+        let batch_id = JournalBatchId::new(self.session_id, self.next_journal_sequence);
+        self.next_journal_sequence = self
+            .next_journal_sequence
+            .checked_add(1)
+            .ok_or_else(|| protocol_violation("journal batch sequence exhausted"))?;
+        let batch = Arc::new(JournalBatch::new(
+            batch_id,
+            None,
+            Some(lifecycle),
+            applied,
+            None,
+            None,
+        ));
+        self.active_journal_batch = Some(Arc::clone(&batch));
+        let admission = self.journal.try_admit(&batch);
+        let result = self.finish_journal_admission(&batch, admission, false);
         if result.is_ok() {
             self.active_journal_batch = None;
         }
@@ -2090,7 +2376,7 @@ impl HostCore {
         ));
         self.active_journal_batch = Some(Arc::clone(&batch));
         let admission = self.journal.try_admit(&batch);
-        let result = self.finish_journal_admission(&batch, admission, false, false);
+        let result = self.finish_journal_admission(&batch, admission, false);
         if result.is_ok() {
             self.active_journal_batch = None;
         }
@@ -2101,7 +2387,6 @@ impl HostCore {
         &mut self,
         batch: &Arc<JournalBatch>,
         admission: JournalAdmission,
-        shutdown: bool,
         was_retained: bool,
     ) -> Result<bool, HostAccessError> {
         if self.retain_identity_violation(batch, admission)? {
@@ -2109,8 +2394,11 @@ impl HostCore {
         }
         match admission {
             JournalAdmission::Accepted { .. } => {
+                if batch.uses_ingress_audit_slot() {
+                    self.shared.borrow_mut().release_pre_admission_audit()?;
+                }
                 self.seal_core_persistence()?;
-                let shutdown_requirement = if shutdown {
+                let shutdown_requirement = if batch.is_applied_shutdown() {
                     Some(self.journal.shutdown_commit_requirement())
                 } else {
                     None
@@ -2118,7 +2406,11 @@ impl HostCore {
                 self.inflight_journal.insert(
                     batch.id(),
                     InflightJournal {
-                        command_id: batch.command_id(),
+                        command_id: if batch.requires_runtime_journal() {
+                            batch.command_id()
+                        } else {
+                            None
+                        },
                         scientific_event: batch.scientific_event_sequence(),
                         shutdown_requirement,
                         committed_volatile: false,
@@ -2196,7 +2488,10 @@ impl HostCore {
         self.revisions.config = ConfigRevision::new(config_revision);
         self.latest_completed_summary = Some(summary.clone());
         let tick = summary.tick;
-        self.shared.borrow_mut().visible_tick = tick;
+        self.shared.borrow_mut().visible_boundary = AppliedCommand {
+            tick,
+            revisions: self.revisions,
+        };
         let completed_fault = completed_fault.as_ref().map(completed_fault_record);
         let mut scientific = ScientificBoundary::new(
             events,
@@ -2288,7 +2583,12 @@ impl ManualHostDriver for HostCore {
         let mut automatic_steps_skipped = 0;
         let mut explicit_step_applied = false;
 
-        if self.retained_journal.is_none() {
+        let audit_blocked = if self.retained_journal.is_none() {
+            self.drain_pending_command_audits()?
+        } else {
+            true
+        };
+        if !audit_blocked {
             loop {
                 if self.next_command_requires_scientific_event()
                     && !self.prepare_scientific_event_slot()?

@@ -229,6 +229,27 @@ impl CommandId {
     pub const fn get(self) -> u128 {
         self.0
     }
+
+    /// Stable client namespace carried in the high 64 bits of this identifier.
+    ///
+    /// This is the source identity used by command-lifecycle evidence until a
+    /// transport supplies a richer authenticated client identity.
+    #[must_use]
+    pub const fn client_namespace(self) -> u64 {
+        let bytes = self.0.to_be_bytes();
+        u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    }
+
+    /// Client-local sequence carried in the low 64 bits of this identifier.
+    #[must_use]
+    pub const fn client_sequence(self) -> u64 {
+        let bytes = self.0.to_be_bytes();
+        u64::from_be_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ])
+    }
 }
 
 impl fmt::Display for CommandId {
@@ -1565,7 +1586,7 @@ impl SnapshotHub {
 }
 
 /// A state-changing request understood by the runtime boundary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum HostCommand {
     /// Pause automatic simulation ticks.
@@ -1608,12 +1629,18 @@ impl HostCommand {
 }
 
 /// A command plus its stable identity and optional control-revision compare-and-set guard.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandEnvelope {
     /// Stable idempotency key. Retrying this id returns its existing status.
     pub command_id: CommandId,
     /// Reject unless this is the host's current control revision.
     pub expected_control_revision: Option<ControlRevision>,
+    /// Reject unless this is the host's current scientific revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_scientific_revision: Option<ScientificRevision>,
+    /// Reject unless this is the host's current configuration revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_config_revision: Option<ConfigRevision>,
     /// Requested operation.
     pub command: HostCommand,
 }
@@ -1625,6 +1652,8 @@ impl CommandEnvelope {
         Self {
             command_id,
             expected_control_revision: None,
+            expected_scientific_revision: None,
+            expected_config_revision: None,
             command,
         }
     }
@@ -1633,6 +1662,20 @@ impl CommandEnvelope {
     #[must_use]
     pub const fn expecting_control_revision(mut self, revision: ControlRevision) -> Self {
         self.expected_control_revision = Some(revision);
+        self
+    }
+
+    /// Add an expected scientific revision for ordered compare-and-set application.
+    #[must_use]
+    pub const fn expecting_scientific_revision(mut self, revision: ScientificRevision) -> Self {
+        self.expected_scientific_revision = Some(revision);
+        self
+    }
+
+    /// Add an expected configuration revision for ordered compare-and-set application.
+    #[must_use]
+    pub const fn expecting_config_revision(mut self, revision: ConfigRevision) -> Self {
+        self.expected_config_revision = Some(revision);
         self
     }
 }
@@ -1652,6 +1695,20 @@ pub enum RejectionReason {
         expected: ControlRevision,
         /// Current host revision.
         actual: ControlRevision,
+    },
+    /// The optimistic scientific-revision guard did not match.
+    ScientificRevisionConflict {
+        /// Revision requested by the client.
+        expected: ScientificRevision,
+        /// Current host revision.
+        actual: ScientificRevision,
+    },
+    /// The optimistic configuration-revision guard did not match.
+    ConfigRevisionConflict {
+        /// Revision requested by the client.
+        expected: ConfigRevision,
+        /// Current host revision.
+        actual: ConfigRevision,
     },
     /// The bounded host admission queue had no capacity for this command.
     Overloaded {
@@ -1719,6 +1776,279 @@ pub enum JournalState {
     Failed(JournalFailure),
 }
 
+/// Stable schema version of [`CommandLifecycleEvidence`].
+pub const COMMAND_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
+
+/// One ordered application-axis transition observed at an exact host boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandLifecycleTransition {
+    ordinal: u32,
+    boundary: AppliedCommand,
+    application: ApplicationState,
+}
+
+impl CommandLifecycleTransition {
+    /// Zero-based position in this command's application lifecycle.
+    #[must_use]
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    /// Tick and revisions visible when this transition was observed.
+    #[must_use]
+    pub const fn boundary(&self) -> AppliedCommand {
+        self.boundary
+    }
+
+    /// Application state established by this transition.
+    #[must_use]
+    pub const fn application(&self) -> &ApplicationState {
+        &self.application
+    }
+}
+
+/// Immutable, serde-stable evidence for one command's application lifecycle.
+///
+/// This record deliberately excludes `CommittedVolatile` and `Durable`: those
+/// are storage-ledger states, not application transitions. The source identity
+/// is the stable high 64-bit client namespace already carried by [`CommandId`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandLifecycleEvidence {
+    schema_version: u16,
+    source_client_namespace: u64,
+    envelope: CommandEnvelope,
+    admission_sequence: Option<AdmissionSequence>,
+    transitions: Vec<CommandLifecycleTransition>,
+}
+
+impl CommandLifecycleEvidence {
+    /// Construct and validate one complete terminal application lifecycle.
+    pub fn try_new(
+        envelope: CommandEnvelope,
+        admission_sequence: Option<AdmissionSequence>,
+        transitions: Vec<CommandLifecycleTransition>,
+    ) -> Result<Self, CommandLifecycleEvidenceError> {
+        let evidence = Self {
+            schema_version: COMMAND_LIFECYCLE_SCHEMA_VERSION,
+            source_client_namespace: envelope.command_id.client_namespace(),
+            envelope,
+            admission_sequence,
+            transitions,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    pub(crate) fn from_terminal(
+        envelope: CommandEnvelope,
+        admission_sequence: Option<AdmissionSequence>,
+        initial_boundary: AppliedCommand,
+        terminal_boundary: AppliedCommand,
+        terminal_application: ApplicationState,
+    ) -> Result<Self, CommandLifecycleEvidenceError> {
+        let transitions = if admission_sequence.is_some() {
+            vec![
+                CommandLifecycleTransition {
+                    ordinal: 0,
+                    boundary: initial_boundary,
+                    application: ApplicationState::Admitted,
+                },
+                CommandLifecycleTransition {
+                    ordinal: 1,
+                    boundary: terminal_boundary,
+                    application: terminal_application,
+                },
+            ]
+        } else {
+            vec![CommandLifecycleTransition {
+                ordinal: 0,
+                boundary: terminal_boundary,
+                application: terminal_application,
+            }]
+        };
+        Self::try_new(envelope, admission_sequence, transitions)
+    }
+
+    /// Validate schema, source, ordinal, admission, and terminal-state invariants.
+    pub fn validate(&self) -> Result<(), CommandLifecycleEvidenceError> {
+        if self.schema_version != COMMAND_LIFECYCLE_SCHEMA_VERSION {
+            return Err(CommandLifecycleEvidenceError::UnsupportedSchema {
+                found: self.schema_version,
+            });
+        }
+        let expected_source = self.envelope.command_id.client_namespace();
+        if self.source_client_namespace != expected_source {
+            return Err(CommandLifecycleEvidenceError::SourceMismatch {
+                expected: expected_source,
+                actual: self.source_client_namespace,
+            });
+        }
+        if self.transitions.is_empty() {
+            return Err(CommandLifecycleEvidenceError::EmptyTransitions);
+        }
+        for (index, transition) in self.transitions.iter().enumerate() {
+            let expected = u32::try_from(index)
+                .map_err(|_| CommandLifecycleEvidenceError::TransitionCountOverflow)?;
+            if transition.ordinal != expected {
+                return Err(CommandLifecycleEvidenceError::NoncontiguousOrdinal {
+                    expected,
+                    actual: transition.ordinal,
+                });
+            }
+            if let ApplicationState::Applied(applied) = &transition.application
+                && *applied != transition.boundary
+            {
+                return Err(CommandLifecycleEvidenceError::AppliedBoundaryMismatch);
+            }
+        }
+
+        match self.admission_sequence {
+            None => {
+                if self.transitions.len() != 1
+                    || !matches!(
+                        &self.transitions[0].application,
+                        ApplicationState::Rejected(
+                            RejectionReason::Validation { .. }
+                                | RejectionReason::Overloaded { .. }
+                                | RejectionReason::HostStopping
+                        )
+                    )
+                {
+                    return Err(CommandLifecycleEvidenceError::InvalidPreAdmissionLifecycle);
+                }
+            }
+            Some(_) => {
+                if self.transitions.len() != 2
+                    || self.transitions[0].application != ApplicationState::Admitted
+                    || !matches!(
+                        &self.transitions[1].application,
+                        ApplicationState::Applied(_)
+                            | ApplicationState::Failed(_)
+                            | ApplicationState::Rejected(
+                                RejectionReason::ControlRevisionConflict { .. }
+                                    | RejectionReason::ScientificRevisionConflict { .. }
+                                    | RejectionReason::ConfigRevisionConflict { .. }
+                            )
+                    )
+                {
+                    return Err(CommandLifecycleEvidenceError::InvalidAdmittedLifecycle);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stable command-lifecycle schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    /// Stable source identity derived from the command id's client namespace.
+    #[must_use]
+    pub const fn source_client_namespace(&self) -> u64 {
+        self.source_client_namespace
+    }
+
+    /// Exact command envelope, including all expected-revision guards.
+    #[must_use]
+    pub const fn envelope(&self) -> &CommandEnvelope {
+        &self.envelope
+    }
+
+    /// Host admission order, absent exactly for pre-admission rejection.
+    #[must_use]
+    pub const fn admission_sequence(&self) -> Option<AdmissionSequence> {
+        self.admission_sequence
+    }
+
+    /// Complete ordered application transition sequence.
+    #[must_use]
+    pub fn transitions(&self) -> &[CommandLifecycleTransition] {
+        &self.transitions
+    }
+
+    /// Terminal application transition.
+    #[must_use]
+    pub fn terminal(&self) -> Option<&CommandLifecycleTransition> {
+        self.transitions.last()
+    }
+
+    /// Whether this record is the successfully applied ordered shutdown barrier.
+    #[must_use]
+    pub fn is_applied_shutdown(&self) -> bool {
+        matches!(&self.envelope.command, HostCommand::Shutdown)
+            && self
+                .terminal()
+                .is_some_and(|transition| matches!(&transition.application, ApplicationState::Applied(_)))
+    }
+
+    /// Whether this command's successful application requires runtime journal receipts.
+    #[must_use]
+    pub fn requires_runtime_journal(&self) -> bool {
+        self.envelope.command.requires_journal()
+            && self
+                .terminal()
+                .is_some_and(|transition| matches!(&transition.application, ApplicationState::Applied(_)))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandLifecycleEvidenceWire {
+    schema_version: u16,
+    source_client_namespace: u64,
+    envelope: CommandEnvelope,
+    admission_sequence: Option<AdmissionSequence>,
+    transitions: Vec<CommandLifecycleTransition>,
+}
+
+impl<'de> Deserialize<'de> for CommandLifecycleEvidence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = CommandLifecycleEvidenceWire::deserialize(deserializer)?;
+        let evidence = Self {
+            schema_version: wire.schema_version,
+            source_client_namespace: wire.source_client_namespace,
+            envelope: wire.envelope,
+            admission_sequence: wire.admission_sequence,
+            transitions: wire.transitions,
+        };
+        evidence.validate().map_err(serde::de::Error::custom)?;
+        Ok(evidence)
+    }
+}
+
+/// Invalid immutable command-lifecycle evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CommandLifecycleEvidenceError {
+    /// The payload declared an unsupported schema revision.
+    #[error("unsupported command lifecycle schema version {found}")]
+    UnsupportedSchema { found: u16 },
+    /// The persisted source did not match the command id namespace.
+    #[error("command source namespace {actual} does not match command id namespace {expected}")]
+    SourceMismatch { expected: u64, actual: u64 },
+    /// A terminal lifecycle must contain evidence.
+    #[error("command lifecycle has no transitions")]
+    EmptyTransitions,
+    /// The transition vector cannot be represented by its wire ordinal.
+    #[error("command lifecycle transition count exceeds u32")]
+    TransitionCountOverflow,
+    /// Transition ordinals must be the exact zero-based vector order.
+    #[error("command lifecycle transition ordinal {actual} does not follow {expected}")]
+    NoncontiguousOrdinal { expected: u32, actual: u32 },
+    /// An applied state's embedded boundary disagreed with its observed boundary.
+    #[error("applied command transition does not match its observed host boundary")]
+    AppliedBoundaryMismatch,
+    /// A non-admitted command must be one exact pre-admission rejection.
+    #[error("command lifecycle without admission is not one pre-admission rejection")]
+    InvalidPreAdmissionLifecycle,
+    /// An admitted command must contain admitted then one truthful terminal transition.
+    #[error("admitted command lifecycle is not admitted followed by applied, rejected, or failed")]
+    InvalidAdmittedLifecycle,
+}
+
 /// Exact immutable work offered to a nonblocking host-journal adapter.
 ///
 /// A host constructs this value from the completed transition and command
@@ -1729,7 +2059,7 @@ pub enum JournalState {
 pub struct JournalBatch {
     id: JournalBatchId,
     scientific_event_sequence: Option<EventSequence>,
-    command: Option<CommandEnvelope>,
+    command_lifecycle: Option<CommandLifecycleEvidence>,
     applied: AppliedCommand,
     scientific: Option<Arc<ScientificBoundary>>,
     persistence: Option<Arc<PersistenceBatch>>,
@@ -1907,6 +2237,42 @@ fn retained_command_bytes(command: Option<&CommandEnvelope>) -> usize {
     ))
 }
 
+fn retained_application_state_bytes(application: &ApplicationState) -> usize {
+    match application {
+        ApplicationState::Rejected(RejectionReason::Validation { message }) => message.capacity(),
+        ApplicationState::Failed(failure) => failure
+            .code
+            .capacity()
+            .saturating_add(failure.message.capacity()),
+        ApplicationState::Admitted
+        | ApplicationState::Applied(_)
+        | ApplicationState::Rejected(
+            RejectionReason::ControlRevisionConflict { .. }
+            | RejectionReason::ScientificRevisionConflict { .. }
+            | RejectionReason::ConfigRevisionConflict { .. }
+            | RejectionReason::Overloaded { .. }
+            | RejectionReason::HostStopping,
+        ) => 0,
+    }
+}
+
+fn retained_command_lifecycle_bytes(
+    lifecycle: Option<&CommandLifecycleEvidence>,
+) -> usize {
+    let Some(lifecycle) = lifecycle else {
+        return 0;
+    };
+    let mut retained = retained_command_bytes(Some(&lifecycle.envelope)).saturating_add(
+        retained_vec_bytes::<CommandLifecycleTransition>(lifecycle.transitions.capacity()),
+    );
+    for transition in &lifecycle.transitions {
+        retained = retained.saturating_add(retained_application_state_bytes(
+            &transition.application,
+        ));
+    }
+    retained
+}
+
 fn retained_scientific_bytes(scientific: Option<&ScientificBoundary>) -> usize {
     let Some(scientific) = scientific else {
         return 0;
@@ -2008,12 +2374,12 @@ fn retained_persistence_bytes(persistence: Option<&PersistenceBatch>) -> usize {
 }
 
 fn journal_batch_retained_bytes(
-    command: Option<&CommandEnvelope>,
+    command_lifecycle: Option<&CommandLifecycleEvidence>,
     scientific: Option<&ScientificBoundary>,
     persistence: Option<&PersistenceBatch>,
 ) -> usize {
     size_of::<JournalBatch>()
-        .saturating_add(retained_command_bytes(command))
+        .saturating_add(retained_command_lifecycle_bytes(command_lifecycle))
         .saturating_add(retained_scientific_bytes(scientific))
         .saturating_add(retained_persistence_bytes(persistence))
 }
@@ -2024,20 +2390,20 @@ impl JournalBatch {
     pub(crate) fn new(
         id: JournalBatchId,
         scientific_event_sequence: Option<EventSequence>,
-        command: Option<CommandEnvelope>,
+        command_lifecycle: Option<CommandLifecycleEvidence>,
         applied: AppliedCommand,
         scientific: Option<Arc<ScientificBoundary>>,
         persistence: Option<Arc<PersistenceBatch>>,
     ) -> Self {
         let retained_bytes = journal_batch_retained_bytes(
-            command.as_ref(),
+            command_lifecycle.as_ref(),
             scientific.as_deref(),
             persistence.as_deref(),
         );
         Self {
             id,
             scientific_event_sequence,
-            command,
+            command_lifecycle,
             applied,
             scientific,
             persistence,
@@ -2060,16 +2426,53 @@ impl JournalBatch {
     /// Command id associated with this batch, or `None` for automatic science.
     #[must_use]
     pub fn command_id(&self) -> Option<CommandId> {
-        self.command.as_ref().map(|command| command.command_id)
+        self.command().map(|command| command.command_id)
     }
 
-    /// Exact command envelope captured at the application boundary.
+    /// Exact command envelope captured in this lifecycle record.
     #[must_use]
     pub const fn command(&self) -> Option<&CommandEnvelope> {
-        self.command.as_ref()
+        match &self.command_lifecycle {
+            Some(lifecycle) => Some(&lifecycle.envelope),
+            None => None,
+        }
     }
 
-    /// Tick and typed revisions captured when the work finished applying.
+    /// Immutable application-lifecycle evidence carried by command-driven work.
+    #[must_use]
+    pub const fn command_lifecycle(&self) -> Option<&CommandLifecycleEvidence> {
+        self.command_lifecycle.as_ref()
+    }
+
+    /// Whether accepting this batch releases one bounded pre-admission audit slot.
+    #[must_use]
+    pub fn uses_ingress_audit_slot(&self) -> bool {
+        self.command_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.admission_sequence.is_none())
+    }
+
+    /// Whether receipts for this batch advance the command's runtime journal axis.
+    #[must_use]
+    pub fn requires_runtime_journal(&self) -> bool {
+        self.command_lifecycle
+            .as_ref()
+            .is_some_and(CommandLifecycleEvidence::requires_runtime_journal)
+    }
+
+    /// Whether this batch is the successfully applied ordered shutdown barrier.
+    #[must_use]
+    pub fn is_applied_shutdown(&self) -> bool {
+        self.command_lifecycle
+            .as_ref()
+            .is_some_and(CommandLifecycleEvidence::is_applied_shutdown)
+    }
+
+    /// Tick and typed revisions at the record's terminal host boundary.
+    ///
+    /// For legacy consumers this remains named `applied`; command consumers must
+    /// inspect [`Self::command_lifecycle`] to distinguish application, rejection,
+    /// and failure truthfully.
     #[must_use]
     pub const fn applied(&self) -> AppliedCommand {
         self.applied
@@ -2467,7 +2870,11 @@ fn validate_status_combination(
                 return Err(StatusCombinationError::RejectedWasJournaled);
             }
             match reason {
-                RejectionReason::ControlRevisionConflict { .. } if admission_sequence.is_none() => {
+                RejectionReason::ControlRevisionConflict { .. }
+                | RejectionReason::ScientificRevisionConflict { .. }
+                | RejectionReason::ConfigRevisionConflict { .. }
+                    if admission_sequence.is_none() =>
+                {
                     return Err(StatusCombinationError::ConflictMissingAdmission);
                 }
                 RejectionReason::Validation { .. }
@@ -3561,6 +3968,24 @@ pub enum HostAccessError {
     /// The transport or in-process port is no longer connected.
     #[error("host port disconnected")]
     Disconnected,
+    /// A stable command id was retried with a different canonical envelope.
+    #[error("command id {command_id} was already used for a different command envelope")]
+    CommandIdCollision {
+        /// Reused id whose original payload remains authoritative.
+        command_id: CommandId,
+    },
+    /// The bounded pre-admission evidence lane cannot accept another terminal status.
+    #[error("command evidence backpressure at capacity {capacity}")]
+    CommandEvidenceBackpressure {
+        /// Maximum number of returned pre-admission statuses awaiting journal admission.
+        capacity: usize,
+    },
+    /// The ordered shutdown barrier closed the command-evidence ingress path.
+    #[error("command evidence ingress is closed while host lifecycle is {lifecycle:?}")]
+    CommandEvidenceClosed {
+        /// Lifecycle observed when the caller attempted submission.
+        lifecycle: HostLifecycle,
+    },
     /// A host implementation violated the public ordering contract.
     #[error("host protocol violation: {message}")]
     ProtocolViolation {
@@ -5063,14 +5488,26 @@ mod tests {
         let persistence =
             charged_persistence(&dynamic_text, replay_outputs, genome_bytes, &birth, &death);
         let scientific = charged_scientific(&dynamic_text, birth, death);
+        let applied = AppliedCommand {
+            tick: Tick(1),
+            revisions: HostRevisions::default(),
+        };
+        let lifecycle = CommandLifecycleEvidence::from_terminal(
+            charged_config_command(config_layers),
+            Some(AdmissionSequence::new(1)),
+            AppliedCommand {
+                tick: Tick(0),
+                revisions: HostRevisions::default(),
+            },
+            applied,
+            ApplicationState::Applied(applied),
+        )
+        .expect("charged command lifecycle");
         Arc::new(JournalBatch::new(
             JournalBatchId::new(HostSessionId::new(70), 1),
             Some(EventSequence::new(1)),
-            Some(charged_config_command(config_layers)),
-            AppliedCommand {
-                tick: Tick(1),
-                revisions: HostRevisions::default(),
-            },
+            Some(lifecycle),
+            applied,
             Some(scientific),
             Some(persistence),
         ))
