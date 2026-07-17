@@ -10,7 +10,7 @@ use scriptbots_analytics::{ReaderCtx, Registry, ReportParams};
 use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
 use scriptbots_storage::Storage;
 
-fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
+const fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
     PersistenceBatch {
         summary: TickSummary {
             tick: Tick(tick),
@@ -40,10 +40,10 @@ struct Normal {
     state: u64,
 }
 impl Normal {
-    fn new(seed: u64) -> Self {
+    const fn new(seed: u64) -> Self {
         Self { state: seed }
     }
-    fn bits(&mut self) -> u64 {
+    const fn bits(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

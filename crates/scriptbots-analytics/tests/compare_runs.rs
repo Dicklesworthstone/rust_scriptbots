@@ -9,7 +9,7 @@ use scriptbots_analytics::{ReaderCtx, Registry, ReportParams};
 use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
 use scriptbots_storage::Storage;
 
-fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
+const fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
     PersistenceBatch {
         summary: TickSummary {
             tick: Tick(tick),
@@ -36,7 +36,9 @@ fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
 /// Small deterministic pseudo-noise so no metric's paired differences are perfectly constant (a
 /// constant difference gives an infinite standardized effect size and a degenerate test).
 fn wobble(tick: u64, salt: u64) -> f64 {
-    ((tick.wrapping_mul(7).wrapping_add(salt) % 11) as f64 - 5.0) * 0.1
+    let bucket = u32::try_from(tick.wrapping_mul(7).wrapping_add(salt) % 11)
+        .expect("modulo 11 always fits in u32");
+    (f64::from(bucket) - 5.0) * 0.1
 }
 
 /// Build a run database. `shifting_base` sets the level of the `shifting` metric; both runs use the
