@@ -1042,17 +1042,17 @@ mod tests {
                 .tick(case.same_runtime_ticks)
                 .expect("harness simulation should accept each step");
 
-            if let Err(divergence) = compare_snapshots(
+            let parity = compare_snapshots(
                 config_hash,
                 case.same_runtime_ticks,
                 &reference_snapshot,
                 &harness_snapshot,
-            ) {
-                panic!(
-                    "same-runtime harness divergence (seed {}): {divergence}",
-                    case.seed
-                );
-            }
+            );
+            assert!(
+                parity.is_ok(),
+                "same-runtime harness divergence (seed {}): {parity:?}",
+                case.seed
+            );
         }
     }
 
@@ -1220,17 +1220,17 @@ mod tests {
                     .tick(checkpoint.tick - current_tick)
                     .expect("wasm parity simulation should accept each step");
                 current_tick = checkpoint.tick;
-                if let Err(divergence) = compare_snapshots(
+                let parity = compare_snapshots(
                     config_hash,
                     checkpoint.tick,
                     &checkpoint.snapshot,
                     &snapshot,
-                ) {
-                    panic!(
-                        "NATIVE-vs-WASM divergence (seed {}): {divergence}",
-                        case.seed
-                    );
-                }
+                );
+                assert!(
+                    parity.is_ok(),
+                    "NATIVE-vs-WASM divergence (seed {}): {parity:?}",
+                    case.seed
+                );
             }
         }
     }
