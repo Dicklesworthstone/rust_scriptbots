@@ -1469,7 +1469,7 @@ fn legacy_v5_database_is_refused_before_its_primary_file_is_mutated()
     assert!(
         error
             .to_string()
-            .contains("expected exactly one ScriptBots v6 migration, found 3"),
+            .contains("expected exactly two ScriptBots migrations through v7, found 3"),
         "unexpected legacy-schema refusal: {error}"
     );
     let after = fs::read(&path)?;
