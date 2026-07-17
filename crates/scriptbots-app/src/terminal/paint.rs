@@ -29,17 +29,65 @@ impl SubPixel {
     }
 }
 
+/// Sub-cell rendering mode: how many sub-pixels one terminal cell carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubCellMode {
+    /// 2×4 braille dots: eight sub-pixels per cell, highest resolution.
+    Braille,
+    /// 1×2 via `▀`: upper sub-pixel is the foreground, lower the background.
+    HalfBlock,
+    /// 2×2 quadrant blocks.
+    Quadrant,
+}
+
+impl SubCellMode {
+    /// Sub-pixels per terminal cell as `(width, height)`.
+    #[must_use]
+    pub const fn cell_pixel_size(self) -> (usize, usize) {
+        match self {
+            Self::Braille => (2, 4),
+            Self::HalfBlock => (1, 2),
+            Self::Quadrant => (2, 2),
+        }
+    }
+}
+
+/// One composited terminal cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellGlyph {
+    /// Character to draw.
+    pub ch: char,
+    /// Foreground color.
+    pub fg: QuantizedColor,
+    /// Background color.
+    pub bg: QuantizedColor,
+}
+
+/// A cell invalidated since the previous composite, with its new content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirtyCell {
+    /// Terminal cell column.
+    pub cell_x: u16,
+    /// Terminal cell row.
+    pub cell_y: u16,
+    /// The cell's freshly composited content.
+    pub glyph: CellGlyph,
+}
+
 /// Grow-only sub-pixel buffer.
 ///
 /// `ensure_size` never shrinks and never reallocates when the requested area
 /// already fits, so steady-state frames perform zero allocations; the
 /// `grow_events` counter exists so tests can prove that claim instead of
-/// assuming it.
+/// assuming it. Every write marks its sub-pixel dirty, and
+/// [`Self::composite_dirty`] emits exactly the terminal cells whose
+/// sub-pixels changed — unchanged cells cost nothing.
 #[derive(Debug, Default)]
 pub struct PixelBuffer {
     width: usize,
     height: usize,
     pixels: Vec<SubPixel>,
+    dirty: Vec<bool>,
     grow_events: usize,
 }
 
@@ -61,6 +109,9 @@ impl PixelBuffer {
         }
         self.pixels.clear();
         self.pixels.resize(needed, SubPixel::default());
+        self.dirty.clear();
+        // A resize invalidates the whole surface.
+        self.dirty.resize(needed, true);
         self.width = width;
         self.height = height;
     }
@@ -91,8 +142,19 @@ impl PixelBuffer {
     }
 
     /// Mutable sub-pixel access; `None` outside the logical area.
+    ///
+    /// Marks the sub-pixel dirty eagerly: a caller holding `&mut` is assumed
+    /// to write. The alternative — diffing on composite — would charge every
+    /// unchanged cell for the comparison, which is the exact cost dirty
+    /// tracking exists to remove.
     pub fn get_mut(&mut self, x: usize, y: usize) -> Option<&mut SubPixel> {
-        (x < self.width && y < self.height).then(|| &mut self.pixels[y * self.width + x])
+        if x < self.width && y < self.height {
+            let index = y * self.width + x;
+            self.dirty[index] = true;
+            Some(&mut self.pixels[index])
+        } else {
+            None
+        }
     }
 
     /// Composite `source` over the sub-pixel at `(x, y)` using source-over
@@ -108,6 +170,136 @@ impl PixelBuffer {
             destination.b = source.b.mul_add(src_a, destination.b * inv);
             destination.a = src_a.mul_add(1.0, destination.a * inv).clamp(0.0, 1.0);
         }
+    }
+}
+
+impl PixelBuffer {
+    /// Invalidate the whole surface (first frame, palette change, mode
+    /// change — anything that must repaint every cell).
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty.clear();
+        self.dirty.resize(self.pixels.len(), true);
+    }
+
+    /// Composite every terminal cell containing a dirty sub-pixel, append the
+    /// results to `out` (cleared first), clear their dirtiness, and return
+    /// how many cells were emitted. Unchanged cells are never visited beyond
+    /// the dirty-bit scan — that is the whole contract.
+    pub fn composite_dirty(
+        &mut self,
+        mode: SubCellMode,
+        depth: ColorDepth,
+        dither: DitherMode,
+        out: &mut Vec<DirtyCell>,
+    ) -> usize {
+        out.clear();
+        let (pixel_w, pixel_h) = mode.cell_pixel_size();
+        if self.width == 0 || self.height == 0 {
+            return 0;
+        }
+        let cells_x = self.width.div_ceil(pixel_w);
+        let cells_y = self.height.div_ceil(pixel_h);
+        for cell_y in 0..cells_y {
+            for cell_x in 0..cells_x {
+                let mut cell_dirty = false;
+                'scan: for dy in 0..pixel_h {
+                    for dx in 0..pixel_w {
+                        let x = cell_x * pixel_w + dx;
+                        let y = cell_y * pixel_h + dy;
+                        if x < self.width && y < self.height && self.dirty[y * self.width + x] {
+                            cell_dirty = true;
+                            break 'scan;
+                        }
+                    }
+                }
+                if !cell_dirty {
+                    continue;
+                }
+                for dy in 0..pixel_h {
+                    for dx in 0..pixel_w {
+                        let x = cell_x * pixel_w + dx;
+                        let y = cell_y * pixel_h + dy;
+                        if x < self.width && y < self.height {
+                            self.dirty[y * self.width + x] = false;
+                        }
+                    }
+                }
+                let glyph = self.composite_cell(mode, depth, dither, cell_x, cell_y);
+                out.push(DirtyCell {
+                    cell_x: u16::try_from(cell_x).unwrap_or(u16::MAX),
+                    cell_y: u16::try_from(cell_y).unwrap_or(u16::MAX),
+                    glyph,
+                });
+            }
+        }
+        out.len()
+    }
+
+    fn sub_pixel_or_empty(&self, x: usize, y: usize) -> SubPixel {
+        self.get(x, y).copied().unwrap_or_default()
+    }
+
+    fn composite_cell(
+        &self,
+        mode: SubCellMode,
+        depth: ColorDepth,
+        dither: DitherMode,
+        cell_x: usize,
+        cell_y: usize,
+    ) -> CellGlyph {
+        let (pixel_w, pixel_h) = mode.cell_pixel_size();
+        let base_x = cell_x * pixel_w;
+        let base_y = cell_y * pixel_h;
+
+        if matches!(mode, SubCellMode::HalfBlock) {
+            // Pure two-pixel color mapping: coverage does not gate it.
+            let upper = self.sub_pixel_or_empty(base_x, base_y);
+            let lower = self.sub_pixel_or_empty(base_x, base_y + 1);
+            return CellGlyph {
+                ch: HALF_BLOCK_CHAR,
+                fg: quantize(upper, cell_x, cell_y, depth, dither),
+                bg: quantize(lower, cell_x, cell_y, depth, dither),
+            };
+        }
+
+        let mut lit_sum = [0.0_f32; 3];
+        let mut lit_count = 0_u32;
+        let mut unlit_sum = [0.0_f32; 3];
+        let mut unlit_count = 0_u32;
+        let mut lit = [[false; 2]; 4];
+        for dy in 0..pixel_h {
+            for dx in 0..pixel_w {
+                let pixel = self.sub_pixel_or_empty(base_x + dx, base_y + dy);
+                if pixel.a >= COVERAGE_THRESHOLD {
+                    lit[dy][dx] = true;
+                    lit_sum[0] += pixel.r;
+                    lit_sum[1] += pixel.g;
+                    lit_sum[2] += pixel.b;
+                    lit_count += 1;
+                } else {
+                    unlit_sum[0] += pixel.r;
+                    unlit_sum[1] += pixel.g;
+                    unlit_sum[2] += pixel.b;
+                    unlit_count += 1;
+                }
+            }
+        }
+        let average = |sum: [f32; 3], count: u32| -> SubPixel {
+            if count == 0 {
+                SubPixel::default()
+            } else {
+                let n = count as f32;
+                SubPixel::new(sum[0] / n, sum[1] / n, sum[2] / n, 1.0)
+            }
+        };
+        let fg = quantize(average(lit_sum, lit_count), cell_x, cell_y, depth, dither);
+        let bg = quantize(average(unlit_sum, unlit_count), cell_x, cell_y, depth, dither);
+        let ch = match mode {
+            SubCellMode::Braille => braille_char([lit[0], lit[1], lit[2], lit[3]]),
+            SubCellMode::Quadrant => quadrant_char(lit[0][0], lit[0][1], lit[1][0], lit[1][1]),
+            SubCellMode::HalfBlock => unreachable!("handled above"),
+        };
+        CellGlyph { ch, fg, bg }
     }
 }
 
@@ -450,6 +642,94 @@ mod tests {
         // Growing beyond capacity is exactly one more growth event.
         buffer.ensure_size(160, 80);
         assert_eq!(buffer.grow_events(), 2);
+    }
+
+    #[test]
+    fn dirty_tracking_invalidates_exactly_the_touched_cells() {
+        let mut buffer = PixelBuffer::new();
+        let mut out = Vec::new();
+        // 8x8 sub-pixels = 4x2 braille cells.
+        buffer.ensure_size(8, 8);
+        let full = buffer.composite_dirty(
+            SubCellMode::Braille,
+            ColorDepth::TrueColor,
+            DitherMode::None,
+            &mut out,
+        );
+        assert_eq!(full, 8, "a resize invalidates every cell");
+
+        // No writes -> nothing dirty -> zero cost, zero cells.
+        assert_eq!(
+            buffer.composite_dirty(
+                SubCellMode::Braille,
+                ColorDepth::TrueColor,
+                DitherMode::None,
+                &mut out,
+            ),
+            0
+        );
+
+        // One sub-pixel write invalidates exactly its braille cell (1, 1).
+        buffer.blend_over(3, 5, SubPixel::new(1.0, 1.0, 1.0, 1.0));
+        let emitted = buffer.composite_dirty(
+            SubCellMode::Braille,
+            ColorDepth::TrueColor,
+            DitherMode::None,
+            &mut out,
+        );
+        assert_eq!(emitted, 1);
+        assert_eq!((out[0].cell_x, out[0].cell_y), (1, 1));
+        // Sub-pixel (3,5) inside cell (1,1) is local (1,1) => braille dot 5
+        // (right column, second row): 0x2800 | 0x10.
+        assert_eq!(out[0].glyph.ch, '\u{2810}');
+        assert_eq!(out[0].glyph.fg, QuantizedColor::True(255, 255, 255));
+
+        // And it composites clean afterwards.
+        assert_eq!(
+            buffer.composite_dirty(
+                SubCellMode::Braille,
+                ColorDepth::TrueColor,
+                DitherMode::None,
+                &mut out,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn half_block_cells_map_upper_to_fg_and_lower_to_bg() {
+        let mut buffer = PixelBuffer::new();
+        buffer.ensure_size(1, 2);
+        buffer.blend_over(0, 0, SubPixel::new(1.0, 0.0, 0.0, 1.0));
+        buffer.blend_over(0, 1, SubPixel::new(0.0, 0.0, 1.0, 1.0));
+        let mut out = Vec::new();
+        let emitted = buffer.composite_dirty(
+            SubCellMode::HalfBlock,
+            ColorDepth::TrueColor,
+            DitherMode::None,
+            &mut out,
+        );
+        assert_eq!(emitted, 1);
+        assert_eq!(out[0].glyph.ch, HALF_BLOCK_CHAR);
+        assert_eq!(out[0].glyph.fg, QuantizedColor::True(255, 0, 0));
+        assert_eq!(out[0].glyph.bg, QuantizedColor::True(0, 0, 255));
+    }
+
+    #[test]
+    fn quadrant_cells_light_by_coverage_threshold() {
+        let mut buffer = PixelBuffer::new();
+        buffer.ensure_size(2, 2);
+        buffer.blend_over(0, 0, SubPixel::new(0.0, 1.0, 0.0, 1.0));
+        buffer.blend_over(1, 1, SubPixel::new(0.0, 1.0, 0.0, 0.4)); // below threshold
+        let mut out = Vec::new();
+        buffer.composite_dirty(
+            SubCellMode::Quadrant,
+            ColorDepth::TrueColor,
+            DitherMode::None,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].glyph.ch, '\u{2598}', "only the upper-left is lit");
     }
 
     #[test]
