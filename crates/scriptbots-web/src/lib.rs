@@ -752,125 +752,461 @@ mod tests {
         assert!(simulation.persistence.fault().is_none());
     }
 
-    #[wasm_bindgen_test]
-    fn wasm_harness_matches_native_world() {
-        let cases = [
-            (
-                480_u32,
-                360_u32,
-                32_usize,
-                24_u32,
-                8102_u64,
-                SeedStrategy::Wander,
-                None,
-            ),
-            (
-                640,
-                480,
-                48,
-                40,
-                1337,
-                SeedStrategy::None,
-                Some(BrainPreset::Mlp),
-            ),
-            (320, 320, 16, 64, 202501u64, SeedStrategy::Wander, None),
-        ];
+    /// One scenario of the parity matrix, used identically by the same-runtime
+    /// determinism test, the native fixture generator, and the cross-architecture
+    /// comparison test — one shared table so no side can silently drift onto a
+    /// different scenario, which is exactly how the old test went wrong.
+    #[derive(Clone, Copy)]
+    struct ParityCase {
+        width: u32,
+        height: u32,
+        population: usize,
+        same_runtime_ticks: u32,
+        seed: u64,
+        strategy: SeedStrategy,
+        default_brain: Option<BrainPreset>,
+    }
 
-        for (width, height, population, ticks, seed, strategy, default_brain) in cases {
-            let config = ScriptBotsConfig {
-                world_width: width,
-                world_height: height,
+    /// Cumulative checkpoint ticks captured in the committed fixture.
+    #[cfg(not(target_arch = "wasm32"))]
+    const PARITY_CHECKPOINT_TICKS: [u32; 4] = [1, 8, 64, 150];
+    /// Per-field float tolerance for parity comparison. A genuine libm divergence
+    /// (native vs wasm sin/cos/atan2/powf) becomes a DOCUMENTED per-field policy in
+    /// the fixture header, never a silent loosening of this constant.
+    const PARITY_TOLERANCE: f32 = 1e-5;
+    #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
+    const PARITY_FIXTURE_SCHEMA: &str = "scriptbots-web.native-parity.v1";
+
+    fn parity_cases() -> [ParityCase; 3] {
+        [
+            ParityCase {
+                width: 480,
+                height: 360,
+                population: 32,
+                same_runtime_ticks: 24,
+                seed: 8102,
+                strategy: SeedStrategy::Wander,
+                default_brain: None,
+            },
+            ParityCase {
+                width: 640,
+                height: 480,
+                population: 48,
+                same_runtime_ticks: 40,
+                seed: 1337,
+                strategy: SeedStrategy::None,
+                default_brain: Some(BrainPreset::Mlp),
+            },
+            ParityCase {
+                // 160 ticks is past the default population_spawn_interval (100): if
+                // either side ever runs a raw config again instead of the shared
+                // spec.config(), scheduled spawning fires on one side only and this
+                // case goes red instead of hiding the mismatch below tick 100.
+                width: 320,
+                height: 320,
+                population: 16,
+                same_runtime_ticks: 160,
+                seed: 202_501,
+                strategy: SeedStrategy::Wander,
+                default_brain: None,
+            },
+        ]
+    }
+
+    fn parity_spec(case: ParityCase) -> SimSpec {
+        SimSpec::new(
+            ScriptBotsConfig {
+                world_width: case.width,
+                world_height: case.height,
                 // Ensure food_cell_size divides world dimensions evenly.
                 food_cell_size: 20,
-                rng_seed: Some(seed),
+                rng_seed: Some(case.seed),
                 ..ScriptBotsConfig::default()
-            };
+            },
+            case.population,
+            Some(case.seed),
+            SnapshotFormat::Json,
+            case.strategy,
+            case.default_brain,
+        )
+    }
 
-            // Native world execution
-            let mut native_world = WorldState::new(config.clone()).expect("native world");
+    /// FNV-1a64 over the postcard encoding of the effective config, so a divergence
+    /// report identifies WHICH scenario diverged from CI output alone.
+    fn parity_config_hash(config: &ScriptBotsConfig) -> u64 {
+        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let bytes = to_allocvec(config).expect("config postcard-encodes");
+        let mut hash = OFFSET_BASIS;
+        for byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
+
+    /// Compare two snapshots field by field; `Err` carries the FIRST divergence with
+    /// tick, agent index, field name, both values, absolute delta, and the config
+    /// hash — enough to diagnose from CI output alone.
+    #[allow(clippy::too_many_lines)]
+    fn compare_snapshots(
+        config_hash: u64,
+        tick: u32,
+        expected: &SimulationSnapshot,
+        actual: &SimulationSnapshot,
+    ) -> std::result::Result<(), String> {
+        let report = |subject: &str, field: &str, expected: f64, actual: f64| {
+            format!(
+                "first divergence at tick {tick}, {subject}, field `{field}`: \
+                 expected {expected:.9}, actual {actual:.9}, |delta|={:.9}, \
+                 config_hash={config_hash:#018x}",
+                (expected - actual).abs()
+            )
+        };
+        let float_field =
+            |subject: &str, field: &str, expected: f32, actual: f32| -> std::result::Result<(), String> {
+                if (expected - actual).abs() <= PARITY_TOLERANCE {
+                    Ok(())
+                } else {
+                    Err(report(subject, field, f64::from(expected), f64::from(actual)))
+                }
+            };
+        let exact = |subject: &str, field: &str, matches: bool, detail: String| {
+            if matches {
+                Ok(())
+            } else {
+                Err(format!(
+                    "first divergence at tick {tick}, {subject}, field `{field}`: {detail}, \
+                     config_hash={config_hash:#018x}"
+                ))
+            }
+        };
+
+        exact(
+            "summary",
+            "tick",
+            expected.tick == actual.tick,
+            format!("expected {}, actual {}", expected.tick, actual.tick),
+        )?;
+        exact(
+            "summary",
+            "agent_count",
+            expected.summary.agent_count == actual.summary.agent_count,
+            format!(
+                "expected {}, actual {}",
+                expected.summary.agent_count, actual.summary.agent_count
+            ),
+        )?;
+        exact(
+            "summary",
+            "agents.len",
+            expected.agents.len() == actual.agents.len(),
+            format!("expected {}, actual {}", expected.agents.len(), actual.agents.len()),
+        )?;
+        float_field(
+            "summary",
+            "total_energy",
+            expected.summary.total_energy,
+            actual.summary.total_energy,
+        )?;
+        float_field(
+            "summary",
+            "average_energy",
+            expected.summary.average_energy,
+            actual.summary.average_energy,
+        )?;
+        float_field(
+            "summary",
+            "average_health",
+            expected.summary.average_health,
+            actual.summary.average_health,
+        )?;
+
+        for (index, (want, got)) in expected.agents.iter().zip(actual.agents.iter()).enumerate() {
+            let subject = format!("agent[{index}] (uid {:?})", want.uid);
+            exact(
+                &subject,
+                "id",
+                want.id == got.id,
+                format!("expected {:?}, actual {:?}", want.id, got.id),
+            )?;
+            exact(
+                &subject,
+                "uid",
+                want.uid == got.uid,
+                format!("expected {:?}, actual {:?}", want.uid, got.uid),
+            )?;
+            float_field(&subject, "position.x", want.position[0], got.position[0])?;
+            float_field(&subject, "position.y", want.position[1], got.position[1])?;
+            float_field(&subject, "velocity.x", want.velocity[0], got.velocity[0])?;
+            float_field(&subject, "velocity.y", want.velocity[1], got.velocity[1])?;
+            float_field(&subject, "heading", want.heading, got.heading)?;
+            float_field(&subject, "health", want.health, got.health)?;
+            float_field(&subject, "energy", want.energy, got.energy)?;
+            float_field(&subject, "spike_length", want.spike_length, got.spike_length)?;
+            float_field(
+                &subject,
+                "herbivore_tendency",
+                want.herbivore_tendency,
+                got.herbivore_tendency,
+            )?;
+            exact(
+                &subject,
+                "color",
+                want.color == got.color,
+                format!("expected {:?}, actual {:?}", want.color, got.color),
+            )?;
+            exact(
+                &subject,
+                "boost",
+                want.boost == got.boost,
+                format!("expected {}, actual {}", want.boost, got.boost),
+            )?;
+            exact(
+                &subject,
+                "age",
+                want.age == got.age,
+                format!("expected {}, actual {}", want.age, got.age),
+            )?;
+            exact(
+                &subject,
+                "generation",
+                want.generation == got.generation,
+                format!("expected {:?}, actual {:?}", want.generation, got.generation),
+            )?;
+            exact(
+                &subject,
+                "brain_key",
+                want.brain_key == got.brain_key,
+                format!("expected {:?}, actual {:?}", want.brain_key, got.brain_key),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Same-runtime determinism of the harness wrapper: a reference world built from
+    /// the IDENTICAL effective config must match the wrapped simulation step for
+    /// step. This is NOT cross-architecture parity — both sides execute in whatever
+    /// runtime runs this test; true native-vs-wasm parity is the committed-fixture
+    /// test below. (Renamed from `wasm_harness_matches_native_world`, which claimed
+    /// parity this structure cannot prove while its reference side ALSO ran a
+    /// different scenario: a raw config whose default population_spawn_interval=100
+    /// never fired under the old <=64-tick cases, while the harness zeroed it.)
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn wasm_harness_matches_reference_world_in_the_same_runtime() {
+        for case in parity_cases() {
+            let spec = parity_spec(case);
+            let effective_config = spec.config();
+            let config_hash = parity_config_hash(&effective_config);
+
+            let mut reference_world =
+                WorldState::new(effective_config).expect("reference world");
             let mut mlp_cache = None;
             seed_agents(
-                &mut native_world,
-                population,
-                strategy,
-                default_brain,
+                &mut reference_world,
+                case.population,
+                case.strategy,
+                case.default_brain,
                 &mut mlp_cache,
             )
-            .expect("seed native world");
-            for _ in 0..ticks {
-                native_world
+            .expect("seed reference world");
+            for _ in 0..case.same_runtime_ticks {
+                reference_world
                     .step()
-                    .expect("native conformance world should accept each simulation step");
+                    .expect("reference world should accept each simulation step");
             }
-            let native_snapshot = SimulationSnapshot::from_world(&native_world);
+            let reference_snapshot = SimulationSnapshot::from_world(&reference_world);
 
-            // WASM harness execution (same config + seed)
-            let mut sim = Simulation::new(SimSpec::new(
-                config,
-                population,
-                Some(seed),
-                SnapshotFormat::Json,
-                strategy,
-                default_brain,
-            ))
-            .expect("sim");
-            let wasm_snapshot = sim
-                .tick(ticks)
-                .expect("WASM conformance simulation should accept each step");
+            let mut sim = Simulation::new(spec).expect("sim");
+            let harness_snapshot = sim
+                .tick(case.same_runtime_ticks)
+                .expect("harness simulation should accept each step");
 
-            assert_eq!(native_snapshot.tick, wasm_snapshot.tick);
-            assert_eq!(
-                native_snapshot.summary.agent_count,
-                wasm_snapshot.summary.agent_count
-            );
-            assert_eq!(native_snapshot.agents.len(), wasm_snapshot.agents.len());
-
-            assert_float_eq(
-                native_snapshot.summary.total_energy,
-                wasm_snapshot.summary.total_energy,
-            );
-            assert_float_eq(
-                native_snapshot.summary.average_energy,
-                wasm_snapshot.summary.average_energy,
-            );
-            assert_float_eq(
-                native_snapshot.summary.average_health,
-                wasm_snapshot.summary.average_health,
-            );
-
-            for (expected, actual) in native_snapshot
-                .agents
-                .iter()
-                .zip(wasm_snapshot.agents.iter())
-            {
-                assert_eq!(expected.id, actual.id);
-                assert_eq!(expected.uid, actual.uid);
-                assert_float_eq(expected.position[0], actual.position[0]);
-                assert_float_eq(expected.position[1], actual.position[1]);
-                assert_float_eq(expected.velocity[0], actual.velocity[0]);
-                assert_float_eq(expected.velocity[1], actual.velocity[1]);
-                assert_float_eq(expected.heading, actual.heading);
-                assert_float_eq(expected.health, actual.health);
-                assert_float_eq(expected.energy, actual.energy);
-                assert_eq!(expected.color, actual.color);
-                assert_float_eq(expected.spike_length, actual.spike_length);
-                assert_eq!(expected.boost, actual.boost);
-                assert_eq!(expected.age, actual.age);
-                assert_eq!(expected.generation, actual.generation);
-                assert_float_eq(expected.herbivore_tendency, actual.herbivore_tendency);
-                assert_eq!(expected.brain_key, actual.brain_key);
+            if let Err(divergence) = compare_snapshots(
+                config_hash,
+                case.same_runtime_ticks,
+                &reference_snapshot,
+                &harness_snapshot,
+            ) {
+                panic!("same-runtime harness divergence (seed {}): {divergence}", case.seed);
             }
         }
     }
 
-    fn assert_float_eq(left: f32, right: f32) {
-        let delta = (left - right).abs();
-        assert!(
-            delta <= 1e-5,
-            "expected {:.6} ~= {:.6} (Δ={:.6})",
-            left,
-            right,
-            delta
+    /// The committed cross-architecture fixture: native-computed snapshots for the
+    /// shared parity cases at the checkpoint ticks. Version the SCHEMA, not the
+    /// bytes: if the snapshot projection changes (coordinate with bd-2z0.12.1),
+    /// regenerate as `native_parity_v2.postcard` with a bumped schema string rather
+    /// than mutating v1 in place.
+    #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
+    #[derive(Serialize, Deserialize)]
+    struct ParityFixtureV1 {
+        schema: String,
+        tolerance: f32,
+        cases: Vec<ParityFixtureCase>,
+    }
+
+    #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
+    #[derive(Serialize, Deserialize)]
+    struct ParityFixtureCase {
+        width: u32,
+        height: u32,
+        population: u32,
+        seed: u64,
+        strategy: SeedStrategy,
+        default_brain: Option<BrainPreset>,
+        config_hash: u64,
+        checkpoints: Vec<ParityCheckpoint>,
+    }
+
+    #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
+    #[derive(Serialize, Deserialize)]
+    struct ParityCheckpoint {
+        tick: u32,
+        snapshot: SimulationSnapshot,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn build_parity_fixture() -> ParityFixtureV1 {
+        let cases = parity_cases()
+            .into_iter()
+            .map(|case| {
+                let spec = parity_spec(case);
+                let config_hash = parity_config_hash(&spec.config());
+                let mut sim = Simulation::new(spec).expect("fixture simulation");
+                let mut checkpoints = Vec::with_capacity(PARITY_CHECKPOINT_TICKS.len());
+                let mut current_tick = 0_u32;
+                for target in PARITY_CHECKPOINT_TICKS {
+                    let snapshot = sim
+                        .tick(target - current_tick)
+                        .expect("fixture simulation should accept each step");
+                    current_tick = target;
+                    checkpoints.push(ParityCheckpoint {
+                        tick: target,
+                        snapshot,
+                    });
+                }
+                ParityFixtureCase {
+                    width: case.width,
+                    height: case.height,
+                    population: u32::try_from(case.population).expect("population fits u32"),
+                    seed: case.seed,
+                    strategy: case.strategy,
+                    default_brain: case.default_brain,
+                    config_hash,
+                    checkpoints,
+                }
+            })
+            .collect();
+        ParityFixtureV1 {
+            schema: PARITY_FIXTURE_SCHEMA.to_owned(),
+            tolerance: PARITY_TOLERANCE,
+            cases,
+        }
+    }
+
+    /// Regenerate the committed cross-architecture fixture. NATIVE ONLY. Legitimate
+    /// only after an INTENTIONAL semantic change, regenerated in the same commit,
+    /// with the digest-change rationale in the commit message (same discipline as a
+    /// characterization re-pin). Through the repo's DSR lane, the underlying
+    /// command is:
+    ///
+    /// ```text
+    /// SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE=1 \
+    ///   cargo test -p scriptbots-web --lib native_parity_fixture_generator -- --ignored
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "fixture writer; run explicitly with SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE=1"]
+    fn native_parity_fixture_generator() {
+        if std::env::var("SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE").as_deref() != Ok("1") {
+            eprintln!(
+                "native_parity_fixture_generator: SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE!=1; \
+                 refusing to touch the committed fixture"
+            );
+            return;
+        }
+        // Determinism proof before anything is written: two independent builds of
+        // the fixture must be byte-identical, or the fixture would encode luck.
+        let first = to_allocvec(&build_parity_fixture()).expect("encode fixture");
+        let second = to_allocvec(&build_parity_fixture()).expect("encode fixture again");
+        assert_eq!(
+            first, second,
+            "fixture generation is not deterministic; refusing to write"
         );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/native_parity_v1.postcard");
+        std::fs::create_dir_all(path.parent().expect("fixture parent"))
+            .expect("create fixture directory");
+        std::fs::write(&path, &first).expect("write fixture");
+        eprintln!(
+            "wrote {} ({} bytes, schema {PARITY_FIXTURE_SCHEMA})",
+            path.display(),
+            first.len()
+        );
+    }
+
+    /// TRUE cross-architecture parity: wasm-computed snapshots against the committed
+    /// NATIVE-generated fixture. Gated behind the `native-parity-fixture` feature
+    /// only because `include_bytes!` needs the fixture to exist at compile time;
+    /// enable the feature (and eventually make it default) once the generator's
+    /// output is committed. If a genuine libm divergence appears, the deliverable is
+    /// a documented per-field tolerance policy recorded in the fixture header — not
+    /// a silent loosening.
+    #[cfg(feature = "native-parity-fixture")]
+    #[wasm_bindgen_test]
+    fn wasm_matches_committed_native_fixture() {
+        let bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/native_parity_v1.postcard"
+        ));
+        let fixture: ParityFixtureV1 =
+            postcard::from_bytes(bytes).expect("decode committed native fixture");
+        assert_eq!(
+            fixture.schema, PARITY_FIXTURE_SCHEMA,
+            "fixture schema mismatch; regenerate as a new versioned file"
+        );
+        assert_eq!(
+            fixture.tolerance, PARITY_TOLERANCE,
+            "fixture tolerance no longer matches the compiled policy"
+        );
+        let cases = parity_cases();
+        assert_eq!(
+            fixture.cases.len(),
+            cases.len(),
+            "fixture case count no longer matches the shared parity table"
+        );
+
+        for (case, fixed) in cases.into_iter().zip(fixture.cases.iter()) {
+            assert_eq!(
+                (case.width, case.height, case.seed),
+                (fixed.width, fixed.height, fixed.seed),
+                "fixture scenario drifted from the shared parity table; regenerate"
+            );
+            let spec = parity_spec(case);
+            let config_hash = parity_config_hash(&spec.config());
+            assert_eq!(
+                config_hash, fixed.config_hash,
+                "effective config no longer matches the fixture's; the scenario \
+                 changed semantically — regenerate the fixture in the same commit"
+            );
+            let mut sim = Simulation::new(spec).expect("wasm parity simulation");
+            let mut current_tick = 0_u32;
+            for checkpoint in &fixed.checkpoints {
+                let snapshot = sim
+                    .tick(checkpoint.tick - current_tick)
+                    .expect("wasm parity simulation should accept each step");
+                current_tick = checkpoint.tick;
+                if let Err(divergence) =
+                    compare_snapshots(config_hash, checkpoint.tick, &checkpoint.snapshot, &snapshot)
+                {
+                    panic!(
+                        "NATIVE-vs-WASM divergence (seed {}): {divergence}",
+                        case.seed
+                    );
+                }
+            }
+        }
     }
 }

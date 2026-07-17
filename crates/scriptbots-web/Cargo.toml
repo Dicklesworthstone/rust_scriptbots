@@ -20,6 +20,13 @@ scriptbots-brain = { path = "../scriptbots-brain", default-features = false, fea
 postcard = { workspace = true }
 js-sys = "0.3.73"
 
+[features]
+# Enables the cross-architecture parity test that compares wasm execution against
+# the committed native-generated fixture (tests/fixtures/native_parity_v1.postcard).
+# Off by default only because the fixture file must exist before the test can be
+# compiled (include_bytes!); enable once the generator has produced and committed it.
+native-parity-fixture = []
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3.54"
 
