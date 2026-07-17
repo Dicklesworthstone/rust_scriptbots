@@ -54,7 +54,9 @@ fn produce_run(database: &Path, extra_set: &[String]) -> Output {
         .arg("--set")
         .arg(format!("rng_seed={SEED}"))
         .arg("--set")
-        .arg("persistence_interval=1");
+        .arg("persistence_interval=1")
+        .arg("--set")
+        .arg("replay_event_tick_cap=65536");
     for update in extra_set {
         cmd.arg("--set").arg(update);
     }
@@ -235,7 +237,9 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
         .arg("--set")
         .arg(format!("rng_seed={SEED}"))
         .arg("--set")
-        .arg("persistence_interval=1");
+        .arg("persistence_interval=1")
+        .arg("--set")
+        .arg("replay_event_tick_cap=65536");
     let verified = verify.output().expect("failed to run replay verification");
     let verify_out = strip_ansi(&format!(
         "{}{}",
@@ -279,7 +283,9 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
         .arg("--set")
         .arg(format!("rng_seed={SEED}"))
         .arg("--set")
-        .arg("persistence_interval=1");
+        .arg("persistence_interval=1")
+        .arg("--set")
+        .arg("replay_event_tick_cap=65536");
     let compared = compare.output().expect("failed to run replay comparison");
     let compare_out = strip_ansi(&format!(
         "{}{}",
