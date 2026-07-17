@@ -284,6 +284,22 @@ impl TerminalRenderer {
             report.record(app.snapshot(), buffer);
         }
 
+        // bd-2z0.8.9.8: bind the final canonical digest into the replay stream so replay
+        // verification can compare final science state, and surface it in headless logs.
+        {
+            let mut world = app.world.lock().expect("terminal world mutex poisoned");
+            let digest = world
+                .world_digest_v1()
+                .context("failed to capture the final headless WorldDigestV1")?;
+            let overall = digest.overall.clone();
+            world.record_replay_world_digest(overall.clone());
+            tracing::info!(
+                tick = app.snapshot().tick.0,
+                world_digest = %overall,
+                "recorded final world digest into the replay stream"
+            );
+        }
+
         report.finalize();
 
         if let Some(path) = report_file_path_from_env() {

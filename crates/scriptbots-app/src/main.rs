@@ -2681,15 +2681,23 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
             "Simulated tick count differs from requested limit"
         );
     }
-    // The current run database has no canonical replay-digest stream yet. Pass
-    // that absence explicitly so event equality cannot be promoted into a
-    // replay-verification success without the later digest instrumentation.
+    // The replay-digest stream is real: drivers record one `WorldDigest` event per clean
+    // boundary, and both sides must carry it for verification to be non-vacuous.
+    let recorded_digest_events = persisted_events
+        .iter()
+        .filter(|entry| matches!(entry.event.kind, ReplayEventKind::WorldDigest { .. }))
+        .count();
+    let simulated_digest_events = replay_run
+        .events
+        .iter()
+        .filter(|entry| matches!(entry.event.kind, ReplayEventKind::WorldDigest { .. }))
+        .count();
     require_non_vacuous_replay(
         tick_limit,
         persisted_events.len(),
         replay_run.events.len(),
-        0,
-        0,
+        recorded_digest_events,
+        simulated_digest_events,
     )?;
     let diff = diff_event_stream(&persisted_events, &replay_run.events);
 
@@ -2709,11 +2717,14 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
     simulated_sorted.sort_by(|a, b| a.0.cmp(b.0));
 
     println!(
-        "{} Replaying {} ticks ({} recorded events) against {}",
+        "{} Replaying {} ticks ({} recorded events) against {} (seed {})",
         "▶".bright_blue().bold(),
         tick_limit,
         persisted_events.len(),
-        db_display.cyan()
+        db_display.cyan(),
+        config
+            .rng_seed
+            .map_or_else(|| "<unset>".to_owned(), |seed| seed.to_string())
     );
     print_event_counts("recorded", &recorded_map, None);
     print_event_counts("simulated", &simulated_counts, Some(&recorded_map));
@@ -2722,10 +2733,11 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
         report_divergence("recorded", "simulated", divergence)?;
     } else {
         println!(
-            "{} Replay matched {} events across {} ticks",
+            "{} Replay matched {} events across {} ticks (final digest {})",
             "✔".green().bold(),
             replay_run.events.len().green(),
-            simulated_tick_count.green()
+            simulated_tick_count.green(),
+            replay_run.final_digest.overall.cyan()
         );
     }
 
@@ -2850,21 +2862,24 @@ fn run_headless_simulation(
     seed_agents(&mut world, &brain_keys)?;
 
     emit_sense_startup_contract();
-    let simulation_result = (|| -> Result<()> {
+    let simulation_result = (|| -> Result<WorldDigestV1> {
         for _ in 0..tick_limit {
             persistence.step(&mut world)?;
         }
+        // Record the final canonical digest as a replay event before the final partial
+        // batch so the simulated stream stays structurally aligned with a recorded one.
+        let final_digest = world
+            .world_digest_v1()
+            .context("failed to capture the final headless WorldDigestV1")?;
+        world.record_replay_world_digest(final_digest.overall.clone());
         persistence
             .finalize(&mut world)
             .context("failed to admit the final partial replay batch")?;
-        Ok(())
+        Ok(final_digest)
     })();
     let sense_summary = SenseRunSummary::capture(&world);
     emit_sense_run_end(sense_summary, simulation_result.is_ok());
-    simulation_result?;
-    let final_digest = world
-        .world_digest_v1()
-        .context("failed to capture the final headless WorldDigestV1")?;
+    let final_digest = simulation_result?;
     drop(world);
     drop(persistence);
 
@@ -3367,6 +3382,7 @@ fn count_event_kinds(events: &[PersistedReplayEvent]) -> HashMap<&'static str, u
             ReplayEventKind::BrainOutputs { .. } => "brain_outputs",
             ReplayEventKind::Action { .. } => "action",
             ReplayEventKind::RngSample { .. } => "rng_sample",
+            ReplayEventKind::WorldDigest { .. } => "world_digest",
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -3453,9 +3469,11 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
             range_max,
             value,
         } => format!(
-            "RngSample(scope={:?}, min={:.3}, max={:.3}, value={:.3})",
-            scope, range_min, range_max, value
+            "RngSample(scope={scope:?}, min={range_min:.3}, max={range_max:.3}, value={value:.3})"
         ),
+        ReplayEventKind::WorldDigest { overall } => {
+            format!("WorldDigest(agent={:?}, overall={overall})", event.agent_uid)
+        }
     }
 }
 
@@ -3464,7 +3482,7 @@ fn print_event_counts(
     counts: &HashMap<String, u64>,
     reference: Option<&HashMap<String, u64>>,
 ) {
-    let keys = ["brain_outputs", "action", "rng_sample"];
+    let keys = ["brain_outputs", "action", "rng_sample", "world_digest"];
     println!("  {}", label.cyan().bold());
     for key in keys {
         let value = counts.get(key).copied().unwrap_or(0);
