@@ -10,7 +10,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 
 | Library | Door | Pin | Feature gate | Status |
 |---|---|---|---|---|
-| `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB; clean V6 multi-run/provenance schema |
+| `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `e536d7f8ca102b3eb5236bef48514582379f9346` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB; clean V6 multi-run/provenance schema |
 | `asupersync` 0.3.9 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.9` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | production native ingress/lifecycle plus bounded legacy-app command ingress |
 | `franken-kernel` / `-evidence` / `-decision` 0.3.x | transitive | crates.io | n/a | in tree via fsqlite |
 | `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` (`ft-api`, `ft-core`, `ft-kernel-cpu`, `ft-nn`, `ft-optim`) | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | code-first FtBrain implemented; bd-2z0.3.12.3 compile/determinism/benchmark proof pending |
