@@ -358,6 +358,8 @@ pub struct HostClient<P> {
 pub struct CommandEnvelope {
     pub command_id: CommandId,
     pub expected_control_revision: Option<ControlRevision>,
+    pub expected_scientific_revision: Option<ScientificRevision>,
+    pub expected_config_revision: Option<ConfigRevision>,
     pub command: HostCommand,
 }
 
@@ -373,10 +375,10 @@ pub struct CommandStatus {
 `JournalState` independently represents `NotRequired`, `Pending`, `CommittedVolatile`, `Durable`,
 and `Failed`. `CommandId`, host admission sequence, control revision, scientific revision, config
 revision, snapshot revision, and event sequence are distinct types. The host deduplicates retrying
-`CommandId`s, preserves queryable status after client disconnect, and uses only `ControlRevision`
-as the optimistic command CAS token. That guard is checked at the envelope's ordered application
-boundary, so a conflict retains its `AdmissionSequence` while validation, overload, and a closed
-admission gate remain pre-admission rejections. A single-step command received while running
+`CommandId`s and preserves queryable status after client disconnect. Optional control,
+scientific, and configuration revision guards are checked at the envelope's ordered application
+boundary, so any guard conflict retains its `AdmissionSequence` while validation, overload, and a
+closed admission gate remain pre-admission rejections. A single-step command received while running
 atomically pauses, advances once, and remains paused. Shutdown uses a formally ordered admission
 rule rather than bypassing total order invisibly.
 
@@ -902,17 +904,27 @@ A strict reproducible run must have a clean source tree or embed an exact review
 
 ### 7.2 command log
 
-Persist each state-changing command with:
+Persist every terminal runtime command lifecycle with:
 
 - command ID;
 - source/client ID;
 - host admission sequence;
-- expected scientific/config revisions;
+- expected control/scientific/config revisions;
 - payload and schema version;
 - admitted/applied/durable/rejected/failed status transitions;
 - actual application tick/scientific revision and durable event sequence.
 
 Replay consumes the manifest plus applied command log. It does not infer configuration from a partially populated database.
+
+**Implementation status (`bd-2z0.5.2`; source commits `211bfa2` and `ae8cea3`,
+centralized DSR batch pending):** runtime lifecycle schema v1 retains the exact command envelope,
+client namespace/sequence, optional admission sequence, and contiguous application transitions.
+The V9 projection keeps `admitted`/`applied`/`rejected`/`failed` application transitions separate
+from `committed_volatile`/`durable` storage transitions and binds both axes to the canonical host
+archive digest. Finished-run reads use `command_journal_evidence`, `command_journal_record`, and
+bounded `command_journal_page`; absent evidence, projection corruption, and fabricated cursors fail
+closed. A live command may expose `JournalState::Failed`, but failed storage is not presented as
+valid immutable finished-session evidence.
 
 ### 7.3 domain event log
 
@@ -929,6 +941,15 @@ Record scientifically meaningful events:
 - explicit warnings such as unbound brain or non-finite state.
 
 Do not record every floating-point operation by default. Detailed trace mode is opt-in and bounded.
+
+**Current `bd-2z0.5.2` slice (source commit `ae8cea3`, centralized DSR batch pending):** V8 writes
+one archive-bound projection-batch row for every contiguous durable scientific boundary, including
+honest zero-row boundaries. It retains exact births, exact deaths, and nonzero aggregate combat
+counters in deterministic local order. Finished-run evidence and bounded pages validate sequence
+coverage, ordinals, typed canonical payloads, archive bindings, and exact cursors;
+`RequireNonEmpty` returns typed `NoEvidence` for a vacuous expected-event scenario. Pairwise
+attacker/victim edges remain `bd-2z0.5.9`; the other event families listed above are not claimed by
+this slice.
 
 ### 7.4 replay success criteria
 
@@ -1006,7 +1027,7 @@ Every table is scoped by `run_id`. The minimum normalized schema includes:
 - `state_digests`;
 - `artifacts`.
 
-The completed V6 schema applies this boundary to every scientific and
+The completed V6 base schema applies this boundary to every scientific and
 operational table, including the persistence ledger, outbox, progress,
 commands, checkpoints, replay events, artifacts, genomes, lineage, and
 interactions. `RunId` is a canonical nonzero 128-bit identifier serialized as
@@ -1015,6 +1036,13 @@ a run is atomic, rejects duplicate IDs, and requires every earlier run to have
 reached its durable watermark. Readers must select a run explicitly once a
 database contains more than one, and run discovery is a bounded, structurally
 validated catalog page rather than an unbounded scan.
+
+The additive storage lineage now reserves V7 for the canonical host archive and ledger, V8 for the
+per-scientific-boundary domain-event projection, and V9 for normalized command records with
+separate application and storage transition projections. V8/V9 source is committed at `ae8cea3`
+with centralized DSR proof pending. Because V7/V8 archive version 1 did not retain complete command
+lifecycle transitions, a nonempty pre-V9 host archive is refused before any migration mutation;
+empty V6/V7/V8 schemas may advance additively, and no missing lifecycle evidence is inferred.
 
 Production startup now materializes the seed before world construction, then
 registers the complete canonical V3 manifest before persistence is bound or
@@ -2611,16 +2639,22 @@ These become separate implementation beads for terrain, camera/input, HUD, and c
 
 #### 4.1 command/event journal and product checkpoint integration
 
-**Status:** [Currently In Progress — sequenced command/status and domain-event journal slice
-`bd-2z0.5.2`, TopazCastle, 2026-07-17]
+**Status:** [Currently In Progress — runtime lifecycle source committed at `211bfa2`; V8/V9
+storage projections committed at `ae8cea3`; centralized DSR union pending — `bd-2z0.5.2`,
+TopazCastle, 2026-07-17]
 
 - persist the already-defined canonical manifest/digest schemas;
-- sequenced commands and status transitions;
-- nonempty domain events;
-- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.3`/codec-4
-  `postcard+blake3-v4` science envelope, then
+- sequenced commands and separate application/storage status transitions
+  (source complete; DSR pending);
+- nonempty exact birth/death and aggregate-combat domain events
+  (source complete; DSR pending);
+- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.3`/codec-5
+  `postcard+blake3-v5` science envelope, then
   reconstruct host-owned persistence/session state around the restored core world;
 - checkpoint resume and first-divergence verification.
+
+`bd-2z0.5.2` completes only the command/domain journal slice; checkpoint discovery, host/session
+resume, replay, and first-divergence verification remain separate open work in this phase.
 
 **Exit:** tick-zero and checkpoint replay match in the bit-exact lane and empty evidence is rejected.
 
