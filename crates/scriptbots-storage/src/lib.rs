@@ -3171,14 +3171,57 @@ pub struct PersistedReplayEvent {
 /// hand-written `fetch_sub` calls WILL eventually violate — one early return that
 /// forgets it, and the counter creeps up until the sink refuses everything and
 /// persistence dies quietly in a long run rather than loudly in a test.
+#[derive(Debug)]
 struct InFlightPermit {
     counter: Arc<AtomicUsize>,
     bytes: usize,
 }
 
+impl InFlightPermit {
+    /// Atomically reserve `bytes` without ever allowing the counter to wrap.
+    ///
+    /// The successful compare-exchange is the admission linearization point. A
+    /// losing caller retries against the observed total; an unrepresentable sum
+    /// is refused as `usize::MAX` rather than wrapping to a deceptively small
+    /// counter value.
+    fn try_acquire(
+        counter: &Arc<AtomicUsize>,
+        bytes: usize,
+        maximum: usize,
+    ) -> Result<Self, usize> {
+        let mut current = counter.load(Ordering::SeqCst);
+        loop {
+            let Some(would_be) = current.checked_add(bytes) else {
+                return Err(usize::MAX);
+            };
+            if would_be > maximum {
+                return Err(would_be);
+            }
+            match counter.compare_exchange(
+                current,
+                would_be,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Ok(Self {
+                        counter: Arc::clone(counter),
+                        bytes,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 impl Drop for InFlightPermit {
     fn drop(&mut self) {
-        self.counter.fetch_sub(self.bytes, Ordering::SeqCst);
+        let previous = self.counter.fetch_sub(self.bytes, Ordering::SeqCst);
+        debug_assert!(
+            previous >= self.bytes,
+            "in-flight byte permit released more bytes than were reserved"
+        );
     }
 }
 
@@ -3218,25 +3261,31 @@ impl Default for PayloadBudget {
 
 /// Estimated bytes and record count for a batch, WITHOUT allocating it.
 ///
-/// Deterministic and cheap: it reads the vector lengths and multiplies by each
-/// row's in-memory size. It deliberately does NOT serialize — serializing to find
+/// Deterministic and cheap: it walks borrowed rows, dynamic strings, and nested
+/// replay outputs without cloning or serializing any of them. Serializing to find
 /// out whether something is too big to serialize is the bug, not the check.
 ///
 /// The estimate is an approximation of the heap the prepared batch will occupy,
 /// and it does not need to be exact. It needs to be MONOTONIC in the batch's size
-/// and computable in constant time, which it is.
+/// and conservative for every variable-size field copied by preparation. Every
+/// addition and multiplication saturates so a pathological shape becomes an
+/// oversized refusal instead of wrapping below a cap.
 #[must_use]
 pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
-    let events = payload.metrics.len()
-        + payload.events.len()
-        + payload.agents.len()
-        + payload.births.len()
-        + payload.deaths.len()
-        + payload.replay_events.len();
+    let events = [
+        payload.metrics.len(),
+        payload.events.len(),
+        payload.agents.len(),
+        payload.births.len(),
+        payload.deaths.len(),
+        payload.replay_events.len(),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add);
 
-    // Per-record sizes, plus a per-record allowance for the strings and JSON each
-    // row carries on the heap. Fixed constants keep this deterministic across
-    // platforms and feature sets, which a `size_of` chain would not be.
+    // Per-record fixed allocations. Variable strings and nested replay outputs
+    // are charged separately below. Fixed constants keep this deterministic
+    // across platforms and feature sets, which a `size_of` chain would not be.
     const METRIC_BYTES: usize = 96;
     const EVENT_BYTES: usize = 256;
     const AGENT_BYTES: usize = 512;
@@ -3245,13 +3294,76 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
     const REPLAY_BYTES: usize = 512;
     const SUMMARY_BYTES: usize = 256;
 
-    let bytes = SUMMARY_BYTES
-        + payload.metrics.len().saturating_mul(METRIC_BYTES)
-        + payload.events.len().saturating_mul(EVENT_BYTES)
-        + payload.agents.len().saturating_mul(AGENT_BYTES)
-        + payload.births.len().saturating_mul(BIRTH_BYTES)
-        + payload.deaths.len().saturating_mul(DEATH_BYTES)
-        + payload.replay_events.len().saturating_mul(REPLAY_BYTES);
+    // A JSON string byte can expand to six ASCII bytes (`\u00xx`). The prepared
+    // row owns one raw copy and the outbox encoder transiently owns the escaped
+    // representation. Metric names have a second raw copy in PendingAnalytics.
+    const OWNED_STRING_AND_OUTBOX_MULTIPLIER: usize = 7;
+    const METRIC_NAME_MULTIPLIER: usize = 8;
+    // Preparation temporarily materializes each brain output as a serde_json
+    // value, then as inner JSON, then again escaped inside the outbox payload.
+    // 128 bytes per f32 conservatively covers all three representations.
+    const REPLAY_OUTPUT_BYTES: usize = 128;
+
+    let mut bytes = SUMMARY_BYTES;
+    for (count, row_bytes) in [
+        (payload.metrics.len(), METRIC_BYTES),
+        (payload.events.len(), EVENT_BYTES),
+        (payload.agents.len(), AGENT_BYTES),
+        (payload.births.len(), BIRTH_BYTES),
+        (payload.deaths.len(), DEATH_BYTES),
+        (payload.replay_events.len(), REPLAY_BYTES),
+    ] {
+        bytes = bytes.saturating_add(count.saturating_mul(row_bytes));
+    }
+
+    for metric in &payload.metrics {
+        bytes = bytes
+            .saturating_add(metric.name.len().saturating_mul(METRIC_NAME_MULTIPLIER));
+    }
+    for event in &payload.events {
+        if let PersistenceEventKind::Custom(name) = &event.kind {
+            bytes = bytes.saturating_add(
+                name.len()
+                    .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
+            );
+        }
+    }
+    for agent in &payload.agents {
+        let binding_bytes = if agent.runtime.brain.registry_key().is_some() {
+            // `registry:` plus the longest decimal u64, without formatting it.
+            "registry:".len().saturating_add(20)
+        } else {
+            agent
+                .runtime
+                .brain
+                .kind()
+                .map_or("unbound".len(), str::len)
+        };
+        bytes = bytes.saturating_add(
+            binding_bytes.saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
+        );
+    }
+    for birth in &payload.births {
+        if let Some(kind) = &birth.brain_kind {
+            bytes = bytes.saturating_add(
+                kind.len()
+                    .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
+            );
+        }
+    }
+    for death in &payload.deaths {
+        if let Some(kind) = &death.brain_kind {
+            bytes = bytes.saturating_add(
+                kind.len()
+                    .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
+            );
+        }
+    }
+    for event in &payload.replay_events {
+        if let ReplayEventKind::BrainOutputs { outputs } = &event.kind {
+            bytes = bytes.saturating_add(outputs.len().saturating_mul(REPLAY_OUTPUT_BYTES));
+        }
+    }
 
     (bytes, events)
 }
@@ -7575,6 +7687,7 @@ pub struct PredatorStats {
 enum StorageCommand {
     Persist {
         batch: Box<PreparedPersistenceBatch>,
+        permit: InFlightPermit,
         reply: xchan::Sender<Result<AdmissionReceipt, StorageWorkerError>>,
     },
     Flush {
@@ -7673,6 +7786,12 @@ struct WorkerState {
     guarantee: PersistenceGuarantee,
     watermarks: PersistenceWatermarks,
     pending_analytics: Vec<(PersistenceBatchId, PendingAnalytics)>,
+    /// Byte reservations for batches still buffered or awaiting finalization.
+    ///
+    /// A command-count bound cannot constrain these allocations. Keeping each
+    /// permit beside its admitted batch makes every terminal return and panic
+    /// release the outstanding total automatically when `WorkerState` drops.
+    pending_permits: Vec<(PersistenceBatchId, InFlightPermit)>,
 }
 
 #[derive(Clone, Copy)]
@@ -7823,8 +7942,8 @@ impl StorageSink {
         // MEASURE BEFORE ALLOCATING. `from_batch` below materializes the entire
         // batch; if the batch is pathological, the memory is already gone by the
         // time any deadline or admission gate gets a say. So the size is computed
-        // from the batch's own shape first — constant time, no serialization —
-        // and an oversized batch is refused here, having allocated nothing.
+        // from the batch's borrowed shape first — no cloning or serialization —
+        // and an oversized batch is refused here, having allocated nothing new.
         //
         // This is a NotAdmitted outcome in the strictest sense: the caller still
         // holds the exact payload it tried to submit, so the exact-retry semantics
@@ -7842,26 +7961,18 @@ impl StorageSink {
 
         // Total in-flight back-pressure. A stream of individually-legal batches
         // can still exhaust memory if the writer falls behind, so the buffered
-        // total is bounded too. Reserved BEFORE preparation, and released on every
-        // exit below.
-        let previous = self.inflight_bytes.fetch_add(bytes, Ordering::SeqCst);
-        let would_be = previous.saturating_add(bytes);
-        if would_be > self.budget.max_inflight_bytes {
-            // Release immediately: this batch never became in-flight.
-            self.inflight_bytes.fetch_sub(bytes, Ordering::SeqCst);
-            return Err(StorageError::InFlightBytesExhausted {
-                tick,
-                would_be,
-                max_inflight: self.budget.max_inflight_bytes,
-            });
-        }
-        // From here on, `bytes` is reserved and MUST be released exactly once on
-        // every path out of this function. `InFlightPermit` does that on drop, so
-        // an early return, an error, or a panic cannot leak it.
-        let _permit = InFlightPermit {
-            counter: Arc::clone(&self.inflight_bytes),
+        // total is bounded too. The CAS both checks and reserves without the
+        // fetch-add-then-undo window or integer wraparound.
+        let permit = InFlightPermit::try_acquire(
+            &self.inflight_bytes,
             bytes,
-        };
+            self.budget.max_inflight_bytes,
+        )
+        .map_err(|would_be| StorageError::InFlightBytesExhausted {
+            tick,
+            would_be,
+            max_inflight: self.budget.max_inflight_bytes,
+        })?;
 
         let prepared = PreparedPersistenceBatch::from_batch(payload).inspect_err(|error| {
             let worker_error = StorageWorkerError::Internal {
@@ -7906,6 +8017,7 @@ impl StorageSink {
         let send_result = self.tx.send_deadline(
             StorageCommand::Persist {
                 batch: Box::new(prepared),
+                permit,
                 reply: reply_tx,
             },
             enqueue_deadline,
@@ -9175,7 +9287,11 @@ fn storage_worker(
 
     while let Ok(command) = rx.recv() {
         match command {
-            StorageCommand::Persist { batch, reply } => {
+            StorageCommand::Persist {
+                batch,
+                permit,
+                reply,
+            } => {
                 let PreparedPersistenceBatch {
                     tick,
                     storage: prepared,
@@ -9196,16 +9312,18 @@ fn storage_worker(
                         }
                         state.pending_analytics.push((receipt.batch_id, pending));
                         match storage.enqueue_staged(receipt.batch_id, prepared) {
-                            Ok(true) => {
-                                if let Err(error) =
-                                    flush_worker_storage(&mut storage, &mut state, &analytics)
-                                {
-                                    analytics.publish_worker_error(&error, true);
-                                    storage.abandon_after_error();
-                                    return Some(error);
+                            Ok(flushed) => {
+                                state.pending_permits.push((receipt.batch_id, permit));
+                                if flushed {
+                                    if let Err(error) =
+                                        flush_worker_storage(&mut storage, &mut state, &analytics)
+                                    {
+                                        analytics.publish_worker_error(&error, true);
+                                        storage.abandon_after_error();
+                                        return Some(error);
+                                    }
                                 }
                             }
-                            Ok(false) => {}
                             Err(error) => {
                                 let worker_error = worker_error_from_storage(
                                     StorageOperation::Persist,
@@ -9310,6 +9428,24 @@ fn publish_committed_state(state: &mut WorkerState, analytics: &AnalyticsSnapsho
     }
 }
 
+/// Release byte reservations only after the exact corresponding outbox prefix
+/// has completed its mode-specific finalization boundary.
+///
+/// File-backed batches require the durable marker. Volatile batches have no
+/// durable watermark, so successful outbox deletion after apply is represented
+/// by the applied prefix returned from `finalize_applied_outbox`.
+fn release_finalized_permits(state: &mut WorkerState) {
+    let finalized = match state.guarantee {
+        PersistenceGuarantee::Durable => state.watermarks.durable,
+        PersistenceGuarantee::CommittedVolatile => state.watermarks.applied,
+    }
+    .map_or(0, PersistenceBatchId::get);
+    let eligible = state
+        .pending_permits
+        .partition_point(|(batch_id, _)| batch_id.get() <= finalized);
+    drop(state.pending_permits.drain(..eligible));
+}
+
 fn flush_worker_storage(
     storage: &mut Storage,
     state: &mut WorkerState,
@@ -9352,6 +9488,7 @@ fn flush_worker_storage(
         }
     };
     publish_committed_state(state, analytics);
+    release_finalized_permits(state);
     Ok(FlushReceipt {
         committed_tick: state.committed_tick,
         guarantee: state.guarantee,
@@ -10189,6 +10326,16 @@ mod tests {
             deaths: Vec::new(),
             replay_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn in_flight_reservation_refuses_atomic_counter_overflow() {
+        let initial = usize::MAX - 4;
+        let counter = Arc::new(AtomicUsize::new(initial));
+        let would_be = InFlightPermit::try_acquire(&counter, 8, usize::MAX)
+            .expect_err("an unrepresentable reservation must be refused");
+        assert_eq!(would_be, usize::MAX);
+        assert_eq!(counter.load(Ordering::SeqCst), initial);
     }
 
     fn synchronize_lifecycle_counts(batch: &mut PersistenceBatch) {

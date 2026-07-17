@@ -5,8 +5,12 @@
 //! fully materialized before any deadline or admission check can refuse it. The
 //! memory is gone by the time anyone gets a say.
 
-use scriptbots_core::{PersistenceBatch, Tick, TickSummary};
-use scriptbots_storage::{PayloadBudget, StoragePipeline, estimate_batch_size};
+use scriptbots_core::{
+    MetricSample, PersistenceBatch, PersistenceEvent, PersistenceEventKind, ReplayEvent,
+    ReplayEventKind, Tick, TickSummary,
+};
+use scriptbots_storage::{PayloadBudget, StorageError, StoragePipeline, estimate_batch_size};
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_db(label: &str) -> String {
@@ -77,6 +81,89 @@ fn the_size_estimate_is_deterministic_monotonic_and_allocates_nothing() {
     );
     assert_eq!(small_events, 10);
     assert_eq!(large_events, 1_000);
+}
+
+#[test]
+fn long_dynamic_strings_and_nested_brain_outputs_cross_the_byte_cap() {
+    let baseline = batch(1, 0);
+    let (baseline_bytes, _) = estimate_batch_size(&baseline);
+
+    let mut long_metric = batch(2, 0);
+    long_metric
+        .metrics
+        .push(MetricSample::new("m".repeat(16_384), 1.0));
+    let (long_metric_bytes, long_metric_events) = estimate_batch_size(&long_metric);
+    assert!(
+        long_metric_bytes > baseline_bytes.saturating_add(16_384),
+        "the estimator must charge both prepared copies and the escaped outbox form of a metric name"
+    );
+
+    let mut long_custom_event = batch(3, 0);
+    long_custom_event.events.push(PersistenceEvent::new(
+        PersistenceEventKind::Custom(Cow::Owned("event".repeat(4_096))),
+        1,
+    ));
+    let (long_event_bytes, long_event_events) = estimate_batch_size(&long_custom_event);
+    assert!(
+        long_event_bytes > baseline_bytes.saturating_add(16_384),
+        "the estimator must charge dynamic custom-event strings"
+    );
+
+    let mut empty_outputs = batch(4, 0);
+    empty_outputs.replay_events.push(ReplayEvent {
+        agent_uid: None,
+        kind: ReplayEventKind::BrainOutputs {
+            outputs: Vec::new(),
+        },
+    });
+    let (empty_output_bytes, _) = estimate_batch_size(&empty_outputs);
+
+    let mut nested_outputs = batch(5, 0);
+    nested_outputs.replay_events.push(ReplayEvent {
+        agent_uid: None,
+        kind: ReplayEventKind::BrainOutputs {
+            outputs: vec![0.25; 4_096],
+        },
+    });
+    let (nested_output_bytes, nested_output_events) = estimate_batch_size(&nested_outputs);
+    assert!(
+        nested_output_bytes > empty_output_bytes.saturating_add(4_096),
+        "one replay row with a large nested output vector must not look like one fixed-size event"
+    );
+
+    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("pipeline");
+
+    pipeline.set_payload_budget(PayloadBudget {
+        max_batch_bytes: baseline_bytes.saturating_add(1_024),
+        max_batch_events: long_metric_events.max(long_event_events),
+        max_inflight_bytes: usize::MAX,
+    });
+    assert!(matches!(
+        pipeline.submit(&long_metric),
+        Err(StorageError::PayloadTooLarge { .. })
+    ));
+    assert!(matches!(
+        pipeline.submit(&long_custom_event),
+        Err(StorageError::PayloadTooLarge { .. })
+    ));
+
+    pipeline.set_payload_budget(PayloadBudget {
+        max_batch_bytes: empty_output_bytes,
+        max_batch_events: nested_output_events,
+        max_inflight_bytes: usize::MAX,
+    });
+    assert!(matches!(
+        pipeline.submit(&nested_outputs),
+        Err(StorageError::PayloadTooLarge { .. })
+    ));
+
+    pipeline.shutdown().expect("shutdown");
 }
 
 #[test]
@@ -197,4 +284,66 @@ fn the_in_flight_permit_is_released_on_every_path_including_the_refusal_path() -
     pipeline.shutdown().expect("shutdown");
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+#[test]
+fn a_buffered_batch_holds_its_permit_until_flush_or_shutdown() {
+    // Maximal row thresholds deterministically keep an admitted batch buffered:
+    // the worker acknowledges its durable-outbox admission but cannot release the
+    // byte reservation until an explicit finalization barrier.
+    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("pipeline");
+    let first = batch(1, 2);
+    let (bytes, events) = estimate_batch_size(&first);
+    let max_inflight = bytes.saturating_mul(2).saturating_sub(1);
+    pipeline.set_payload_budget(PayloadBudget {
+        max_batch_bytes: bytes,
+        max_batch_events: events,
+        max_inflight_bytes: max_inflight,
+    });
+
+    pipeline.submit(&first).expect("first admission");
+    assert_eq!(
+        pipeline.inflight_bytes(),
+        bytes,
+        "an admission acknowledgement must not release a still-buffered payload"
+    );
+
+    let error = pipeline
+        .submit(&batch(2, 2))
+        .expect_err("a second same-sized batch must exceed the buffered byte ceiling");
+    assert!(matches!(
+        error,
+        StorageError::InFlightBytesExhausted {
+            would_be,
+            max_inflight: observed_max,
+            ..
+        } if would_be == bytes.saturating_mul(2) && observed_max == max_inflight
+    ));
+    assert_eq!(
+        pipeline.inflight_bytes(),
+        bytes,
+        "a refused reservation must leave the first permit intact"
+    );
+
+    pipeline.flush_and_wait().expect("flush");
+    assert_eq!(
+        pipeline.inflight_bytes(),
+        0,
+        "successful flush and finalization must release the buffered permit"
+    );
+
+    pipeline.submit(&batch(3, 2)).expect("post-flush admission");
+    assert_eq!(pipeline.inflight_bytes(), bytes);
+    pipeline.shutdown().expect("shutdown");
+    assert_eq!(
+        pipeline.inflight_bytes(),
+        0,
+        "shutdown finalization must release the final buffered permit"
+    );
 }
