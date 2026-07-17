@@ -111,13 +111,13 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - REST and MCP run as supervised sibling tasks. An unexpected error or clean task exit stops the sibling, preserves the original failure as the root cause, and publishes failed runtime health; the TUI, GPUI, and Bevy frontends observe that health and terminate with the same root failure. Graceful shutdown joins both tasks and releases both listeners.
 - That supervision guarantee covers ordinary returned errors and task exits. Debug/test builds use unwinding boundaries to exercise panic reporting, while the shipped `panic = "abort"` release profile intentionally cannot recover from a panic or promise destructor-based cleanup after one.
 - Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The presentation boundary is not yet complete, however: GPUI contains its characterized double-drive by making the HUD the sole interim simulation driver and the world window read-only, and it now services explicit playback before paused/accumulator early returns. `HostCore` and its native lifecycle are implemented, but TUI/GPUI/Bevy and the live server transports remain on their interim adapters until the dedicated migration beads replace them.
-- `scriptbots-runtime` owns the renderer-neutral command, two-axis status, snapshot, event-cursor, and manual-drive contracts plus the exact sole-owner `HostCore`. Its optional `native-asupersync` feature drives that same `!Send` host as one current-thread root future at absolute deadlines. Commands and journal-ready signals wake the owner, catch-up is bounded and reported, quiescent paused worlds have no periodic timer, and ordered shutdown retains its exact host and journal obligations without spawning or detaching a simulation task.
+- `scriptbots-runtime` owns the renderer-neutral command, two-axis status, snapshot, event-cursor, and manual-drive contracts plus the exact sole-owner `HostCore`. Command lifecycle schema v1 retains the exact envelope, client namespace/sequence, optional admission order, typed control/scientific/config guards, and contiguous application transitions; every terminal runtime outcome has a journal obligation. Its optional `native-asupersync` feature drives that same `!Send` host as one current-thread root future at absolute deadlines. Commands and journal-ready signals wake the owner, catch-up is bounded and reported, quiescent paused worlds have no periodic timer, and ordered shutdown retains its exact host and journal obligations without spawning or detaching a simulation task. The lifecycle persistence source is committed under `bd-2z0.5.2`; centralized DSR proof is pending.
 - Brain introspection is an explicit read-only projection, never a per-tick side effect. A client issues a revisioned request for up to eight stable `AgentUid` values; core and each brain family enforce independent bounds for layers, names, values, edges, source scalars, and retained payload. Responses carry the exact source tick and typed unavailable/clipped status, while TUI and GPUI cache by client, stable identity, and source tick. With no request, no brain is inspected and NeuroFlow performs no inspection JSON serialization; digest-neutrality and next-output purity are tested across the supported families.
 - Control surfaces are transport-agnostic; both REST and MCP use the same safe `ControlHandle` and enqueue commands with back-pressure.
 
 ### Crate roles
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
-- **`scriptbots-runtime`**: Renderer-neutral command, two-axis status, snapshot, and event-cursor contracts with typed revision domains; the sole-owner `HostCore`; a pure injected-time fixed-deadline adapter; and an optional Asupersync `=0.3.9` native lifecycle. It depends on core but not storage, servers, or renderers. The default and WASM-facing surface remains runtime-neutral; Asupersync is activated only by `native-asupersync` on native targets.
+- **`scriptbots-runtime`**: Renderer-neutral command, immutable lifecycle evidence, two-axis status, snapshot, and event-cursor contracts with typed revision domains; the sole-owner `HostCore`; a pure injected-time fixed-deadline adapter; and an optional Asupersync `=0.3.9` native lifecycle. It depends on core but not storage, servers, or renderers. The default and WASM-facing surface remains runtime-neutral; Asupersync is activated only by `native-asupersync` on native targets.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
 - **`scriptbots-brain-ml`**: Feature selection and the retained `ml.placeholder` sensor-copy probe for Candle, Tract, and tch, plus the non-default code-first Frankentorch `FtBrain` family. The FtBrain source is implemented under `brain-ft`; its pinned DSR compile, determinism, and benchmark proof remains pending under `bd-2z0.3.12.3`.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
@@ -130,12 +130,12 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 ## Current status
 - Workspace scaffolding, shared lints, and profiles are in place.
 - `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
-- `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, opaque client ports, cursors, manual-drive contract, sole-owner `HostCore`, pure fixed-deadline driver, and optional current-thread Asupersync lifecycle are implemented. Legacy frontend and transport migration remains pending.
+- `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, schema-v1 lifecycle evidence, opaque client ports, cursors, manual-drive contract, sole-owner `HostCore`, pure fixed-deadline driver, and optional current-thread Asupersync lifecycle are implemented. The `bd-2z0.5.2` lifecycle source is centralized-DSR-pending; legacy frontend and transport migration remains pending.
 - `scriptbots-render`: GPUI window + HUD + canvas renderer with camera controls, selection highlights, and diagnostics overlay; audio is optional via `kira` feature.
 - `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The full cross-feature/platform startup matrix remains a Phase 0.4 acceptance gate.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
 - `scriptbots-brain-neuro`: NeuroFlow-backed brain available behind the `neuro` feature (runtime toggles below).
-- `scriptbots-storage`: the exact FrankenSQLite source is pinned; its bounded worker now has a file-backed durable outbox, stable per-batch identities, monotonic admitted/applied/durable watermarks, ordered startup recovery, controller wait deadlines, supervised worker ownership, exact recovery identity/schema proof, and a clean V6 multi-run schema. Same-thread writes use the same outbox protocol, and terminal receipt/join errors preserve one exact typed root cause. Deadlines do not cancel an in-flight database call or bound the supervised reaper. Strict-run host policy and full command/replay journals remain tracked in the active plan.
+- `scriptbots-storage`: the exact FrankenSQLite source is pinned; its bounded worker now has a file-backed durable outbox, stable per-batch identities, monotonic admitted/applied/durable watermarks, ordered startup recovery, controller wait deadlines, supervised worker ownership, exact recovery identity/schema proof, and a V6 run-scoped base schema with V7 canonical host archives. Code-first V8 domain-event and V9 command-lifecycle projections are committed under `bd-2z0.5.2`, with centralized DSR proof pending. Same-thread writes use the same outbox protocol, and terminal receipt/join errors preserve one exact typed root cause. Deadlines do not cancel an in-flight database call or bound the supervised reaper. Strict-run host policy, pairwise interactions, checkpoint/replay integration, and run bundles remain open.
 
 See the active recovery roadmap in `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md` for staged milestones and acceptance gates. The older GPUI port plan is historical evidence, not current policy.
 
@@ -628,12 +628,14 @@ Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baselin
 - **Thread-confined, single-writer connection:** `fsqlite::Connection` is deliberately `!Send + !Sync`. The storage worker creates, uses, explicitly closes, and drops its connection on that worker thread. File writers hold a nonblocking OS advisory lease on a persistent companion lock file; process-local path/inode tracking is only defense in depth. No connection-owning value is shared through `Arc<Mutex<_>>`.
 - **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. Configurable `StorageDeadlines` bound startup, admission-gate, command-enqueue, receipt, flush, and shutdown acknowledgement waits, but cannot cancel a database call already executing on the owner thread or bound the supervised reaper. Validation, closed-gate, queue-send, and rolled-back outbox failures are definitely `NotAdmitted`; the external admission session retains the exact completed batch and acknowledgement fault while the world's payload-free `Pending` marker blocks later science ticks until explicit retry succeeds. A lost or timed-out acknowledgement remains typed as `Indeterminate` at the world boundary, but retrying the unchanged canonical payload is idempotent and reuses its stable batch ID; a conflicting payload is rejected by its BLAKE3 identity. Timed-out shutdown retains the exact pending receipt and worker handle for retry; dropping the controller hands both to an independent supervised reaper rather than abandoning connection ownership. `submit_with_receipt` returns the batch ID after the exact payload enters the worker outbox and reports `Durable` for a file database or `CommittedVolatile` for memory. That receipt proves admission, not scientific-table application. Same-thread `Storage::persist` now follows the identical outbox identity and watermark protocol; exact duplicates remain idempotent, conflicting payloads are typed refusals, raw insert SQL is confined to a non-production conformance test, and receipt plus shutdown/join retain the same typed terminal cause (`bd-2z0.8.9.4.4`).
 - **Durable recovery and watermarks:** each file-backed batch advances three monotonic, separately queryable prefixes: `admitted` after the outbox transaction, `applied` in the same transaction as all scientific-table rows, and `durable` in a later marker transaction that permits outbox-payload compaction. Startup replays admitted-but-unapplied payloads in order and finalizes applied-but-not-durable batches without duplicating rows. Exact duplicate retries reuse the original batch identity; a different payload for an already admitted tick is rejected. Flush and shutdown receipts include all three watermarks.
+- **V8 scientific evidence (centralized DSR pending):** every durable scientific sequence has an archive-bound projection batch, including honest zero-row boundaries. Exact births, exact deaths, and nonzero aggregate-combat counters retain deterministic local order. Bounded typed evidence/pages reject sequence gaps, duplicate or corrupt ordinals, fabricated cursors, and an expected-but-empty scenario with typed `NoEvidence`; pairwise attacker/victim edges remain `bd-2z0.5.9`.
+- **V9 command evidence (centralized DSR pending):** normalized records retain the exact command envelope, source/client identity, optional admission order, all three revision guards, terminal boundary, and canonical archive digest. Runtime `admitted`/`applied`/`rejected`/`failed` transitions remain distinct from storage `committed_volatile`/`durable` transitions. Finished files expose bounded `StorageReader::command_journal_evidence`, `command_journal_record`, and `command_journal_page`; a nonempty pre-V9 archive is refused before migration because archive v1 cannot supply missing lifecycle evidence.
 - **Complete typed ancestry origins:** every agent insertion emits exactly one immutable `born`, `seeded`, or `injected` origin row under a globally unique stable agent UID. Only `born` rows have a global demographic `AgentIdentity::birth_ordinal` or contribute to demographic birth totals; ancestry and offline rebuilds consume all three origins plus exact death causes. Natural-offspring RNG instead uses the primary parent's local `birth` continuation in `AgentRngCountersV1`, which is directional lineage state and may share the same numeric value in different families without collision because the parent UID also participates. Completing any scientific tick while persistence is disabled creates a history gap, even when that tick has no lifecycle or replay rows, because its summary, metrics, and snapshot were not admitted. That world refuses to re-enable persistence; start a new world and storage identity instead of creating a run database with a hidden interval.
 - **Lock-free frontend reads:** the worker atomically publishes immutable `Arc<AnalyticsSnapshot>` latest-value state. GUI, TUI, and API consumers load it without a mutex and may skip stale snapshots; they never run SQL while rendering.
 
 ### Tables and query examples
 
-The initial single-run schema creates `ticks`, `metrics`, `events`, `replay_events`, `agents`, `births`, and `deaths`. The rearchitecture roadmap evolves this into a versioned, `run_id`-scoped schema for matched-seed experiments without preserving pre-release database compatibility.
+The V6 base schema run-scopes scientific and operational tables for matched-seed experiments. V7 adds the canonical host archive/ledger, V8 adds per-scientific-boundary domain evidence, and V9 adds normalized command records with separate application/storage transitions. Unsupported pre-release data is refused rather than guessed or destructively rewritten. Use the bounded typed command/domain readers above for journal evidence; the SQL below illustrates run-scoped scientific reporting only.
 
 Representative SQLite-compatible query shapes include:
 
@@ -641,7 +643,8 @@ Representative SQLite-compatible query shapes include:
 -- Latest metrics snapshot
 select name, value
 from metrics
-where tick = (select max(tick) from metrics)
+where run_id = ?1
+  and tick = (select max(tick) from metrics where run_id = ?1)
 order by name;
 
 -- Top predators by average energy
@@ -650,6 +653,7 @@ select agent_id,
        max(spike_length) as max_spike_length,
        max(tick) as last_tick
 from agents
+where run_id = ?1
 group by agent_id
 order by avg_energy desc
 limit 10;
@@ -657,6 +661,7 @@ limit 10;
 -- Event totals for a run report
 select kind, sum(count) as total
 from events
+where run_id = ?1
 group by kind
 order by kind;
 ```
@@ -919,7 +924,7 @@ Runtime constraints:
 
 ### Control bus architecture
 - The live app still owns a bounded MPMC `CommandBus`; REST, MCP, CLI, and interim frontend drivers enqueue legacy `ControlCommand`s and drain them at simulation boundaries.
-- The new `scriptbots-runtime` crate defines the replacement protocol surface: stable command identity, one admission order, a single `ControlRevision` CAS token, independent application/journal status axes, immutable snapshots, and independent event cursors.
+- The new `scriptbots-runtime` crate defines the replacement protocol surface: stable command identity, one admission order, optional typed control/scientific/config revision guards checked at the ordered application boundary, independent application/journal status axes, immutable snapshots, and independent event cursors.
 - `HostCore` is now the implemented command/science authority, and the optional native runner supplies fixed-deadline wake, cancellation, bounded catch-up, and durability-gated shutdown around that exact same host. This does not claim the live app has migrated: later adapter beads move REST/MCP, GPUI, Bevy, TUI, headless, and WASM callers away from the legacy bus.
 
 ## Contributing
@@ -980,7 +985,7 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.
 3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
-4. Storage: durable outbox, exact identity/schema recovery, direct-write/root-cause unification, and the V6 multi-run schema are integrated; next add strict-run pause/fail-closed host policy and complete command/replay journals.
+4. Storage: durable outbox, exact identity/schema recovery, direct-write/root-cause unification, and the V6/V7 base/archive lineage are integrated. V8/V9 command/domain projections are code-first and centralized-DSR-pending; remaining work includes strict-run host policy, pairwise interactions, product checkpoint/replay integration, and run bundles.
 5. Runtime: renderer-neutral protocol, sole-owner `HostCore`, and fixed-deadline native lifecycle landed; next publish canonical multi-subscriber projections and migrate every frontend and transport adapter off the legacy app-owned drivers.
 6. Rendering: HUD/overlays/inspector polish; performance diagnostics.
 7. DSR packaging and verification: release builds, binaries, and WASM/browser evidence from the pinned repository profile.

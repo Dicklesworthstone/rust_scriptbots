@@ -1,6 +1,6 @@
 # Franken Ecosystem Integration — Program Guide (bd-2js6)
 
-Last reconciled: **2026-07-16** (update this line whenever a program bead
+Last reconciled: **2026-07-17** (update this line whenever a program bead
 closes — that is part of each bead's close checklist by convention). This
 document is what a new contributor reads INSTEAD of re-running the six-repo
 survey that produced the program. Style: terse, factual. Authority order when
@@ -10,7 +10,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 
 | Library | Door | Pin | Feature gate | Status |
 |---|---|---|---|---|
-| `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `e536d7f8ca102b3eb5236bef48514582379f9346` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB; clean V6 multi-run/provenance schema |
+| `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `e536d7f8ca102b3eb5236bef48514582379f9346` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB; V6 run-scoped base + V7 canonical host archive; code-first V8/V9 projections await centralized DSR proof |
 | `asupersync` 0.3.9 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.9` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | production native ingress/lifecycle plus bounded legacy-app command ingress |
 | `franken-kernel` / `-evidence` / `-decision` 0.3.x | transitive | crates.io | n/a | in tree via fsqlite |
 | `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` (`ft-api`, `ft-core`, `ft-kernel-cpu`, `ft-nn`, `ft-optim`) | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | code-first FtBrain implemented; bd-2z0.3.12.3 compile/determinism/benchmark proof pending |
@@ -108,7 +108,7 @@ release-packaging obligation: bd-2z0.13.6).
    `ci/check_franken_licenses.sh`).
 8. **Determinism first**: the world tick stays synchronous; brains and buses
    must prove same-seed bit-identity across thread counts before shipping.
-9. **V6 is run-bound and fail-closed**: canonical nonzero 128-bit `RunId`
+9. **The V6 base is run-bound and fail-closed**: canonical nonzero 128-bit `RunId`
    scopes every scientific and operational row. Writers own one run; append is
    atomic and allowed only after prior runs are fully durable. Multi-run reads
    select a run explicitly, catalog discovery is bounded and structurally
@@ -119,7 +119,18 @@ release-packaging obligation: bd-2z0.13.6).
    start `counters` digest bound by `world_counters_digest_v1` to the tick-zero
    allocation cursors, protocol, and counter rows. V3-V5 files are refused
    without rewrite (`bd-2z0.5.1`; `bd-1kxd`).
-10. **Every supported scientific write uses one outbox protocol**: both
+10. **V8/V9 make runtime evidence explicit rather than inferential**: every
+    scientific sequence, including an honest zero-event boundary, has one V8
+    domain projection. V9 records runtime application transitions separately
+    from storage commitment transitions while retaining the exact command
+    envelope, source/client identity, optional admission order, all three
+    revision guards, terminal boundary, and canonical archive digest. Bounded
+    typed readers fail closed on sequence gaps, duplicate/corrupt ordinals,
+    fabricated cursors, and expected-but-empty evidence. V8/V9 source is
+    code-first under `bd-2z0.5.2` and does not become accepted until its
+    centralized DSR union is green; pairwise attacker/victim edges remain
+    `bd-2z0.5.9`.
+11. **Every supported scientific write uses one outbox protocol**: both
     `StoragePipeline` and same-thread `Storage::persist` assign a stable BLAKE3
     batch identity before applying rows, advance explicit admitted/applied/durable
     watermarks, reuse exact retries, and reject changed payloads. Raw agent insert
@@ -144,8 +155,14 @@ and review log). Status at last reconcile:
   run-bound recovery/readers, and bounded catalog; DSR workspace-verified at
   `8861e55f`), bd-2z0.8.9.4.4 (all supported writes use the durable outbox;
   exact typed terminal causes survive receipt plus shutdown/join; DSR
-  workspace-verified at `60e06b3`).
-- **OPEN, currently in progress**: bd-2z0.3.12.3 **[Currently In Progress]**
+  workspace-verified at `60e06b3`), bd-2z0.8.9.11 (fsqlite advanced to
+  `e536d7f8ca102b3eb5236bef48514582379f9346` with the coupled single
+  asupersync `=0.3.9` universe at `2807abe`; claim-site correction
+  `ece6ebf`).
+- **OPEN, currently in progress**: bd-2z0.5.2 **[Currently In Progress]**
+  (schema-v1 runtime lifecycle evidence at `211bfa2`; V8 domain and V9 command
+  projections at `ae8cea3`; centralized DSR union still pending), and
+  bd-2z0.3.12.3 **[Currently In Progress]**
   (real code-first FtBrain source exists; pinned DSR compile, determinism, and
   benchmark proof plus the F32 `vector_to_parameters` disposition remain
   pending).
