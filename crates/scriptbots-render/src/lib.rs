@@ -18,7 +18,7 @@ use scriptbots_core::{
     BrainActivations, BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision,
     BrainInspectionUnavailable, ControlCommand, ControlDisposition, FoodGrid, Generation,
     IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position,
-    RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig, SelectedBrainTelemetryOutcome,
+    RenderTonemapMode, SENSOR_LAYOUT, SensorAttribution, SensorKind, ScriptBotsConfig, SelectedBrainTelemetryOutcome,
     SelectionMode, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TerrainLayer,
     TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver,
     apply_control_command,
@@ -6349,6 +6349,7 @@ impl SimulationView {
             )))
             .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Sensors"))
             .child(sensor_bars)
+            .child(render_sense_attribution(detail))
             .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Outputs"))
             .child(output_bars)
             .child({
@@ -8086,6 +8087,177 @@ impl SimulationView {
 /// Every channel is shown. The old version truncated sensors to the first eight,
 /// which silently hid blood, temperature, and the whole of eye 3 — the channels a
 /// user is most likely to be hunting for when an agent behaves strangely.
+/// Bounded contributor list requested per focused agent (bd-16g.4.2).
+const SENSE_PROBE_MAX_CONTRIBUTORS: usize = 12;
+/// Contributor rows shown before the panel defers to the truncation count.
+const SENSE_PROBE_VISIBLE_CONTRIBUTORS: usize = 8;
+
+/// Truthful per-channel provenance tag (bd-16g.4.2): attribution only exists
+/// for neighbour-derived channels, and the panel must say where every other
+/// channel comes from instead of implying "no neighbours detected".
+const fn sensor_source_tag(kind: SensorKind) -> &'static str {
+    match kind {
+        SensorKind::EyeDensity
+        | SensorKind::EyeRed
+        | SensorKind::EyeGreen
+        | SensorKind::EyeBlue
+        | SensorKind::Sound
+        | SensorKind::Smell
+        | SensorKind::Hearing
+        | SensorKind::Blood => "nbr",
+        SensorKind::Food => "grid",
+        SensorKind::Health | SensorKind::Clock => "self",
+        SensorKind::Temperature => "pos",
+    }
+}
+
+/// Egocentric sense attribution for the focused agent (bd-16g.4.2).
+///
+/// Renders `SensorAttribution` verbatim: clamped values, an explicit `⚠raw`
+/// marker on saturated channels (contributions legitimately sum above 1.0 —
+/// normalising them would destroy the information), eye rows labeled with
+/// their true relative angle and FOV, `SENSOR_LAYOUT`-derived source tags,
+/// and the strongest contributors with their perceived colours.
+fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
+    let container = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(0x1e3a5f))
+        .bg(rgb(0x0d1826))
+        .px_2()
+        .py_2();
+
+    let Some(attribution) = detail.sense_attribution.as_ref() else {
+        return container.child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x64748b))
+                .child("Sense attribution unavailable (agent vanished this frame)"),
+        );
+    };
+
+    let truncation = if attribution.truncated > 0 {
+        format!(" (+{} truncated)", attribution.truncated)
+    } else {
+        String::new()
+    };
+    let mut panel = container.child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+        "Sense attribution · t{} · {} contributors{truncation}",
+        attribution.tick.0,
+        attribution.contributions.len(),
+    )));
+
+    for eye in 0..NUM_EYES {
+        let mut rgb_seen = [0.0_f32; 3];
+        let mut density = 0.0_f32;
+        let mut saturated = false;
+        let mut cells = String::new();
+        for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye == Some(eye)) {
+            let index = channel.index;
+            let clamped = attribution.clamped[index];
+            match channel.kind {
+                SensorKind::EyeDensity => density = clamped,
+                SensorKind::EyeRed => rgb_seen[0] = clamped,
+                SensorKind::EyeGreen => rgb_seen[1] = clamped,
+                SensorKind::EyeBlue => rgb_seen[2] = clamped,
+                _ => {}
+            }
+            if attribution.saturated[index] {
+                saturated = true;
+                cells.push_str(&format!(" ⚠{}={:.1}", channel.name, attribution.raw[index]));
+            }
+        }
+        let direction = detail.eye_directions[eye].to_degrees();
+        let fov = detail.eye_fovs[eye].to_degrees();
+        let marker = if saturated { cells.as_str() } else { "" };
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(color_swatch(rgb_seen))
+                .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                    "eye{eye} ∠{direction:+.0}° fov {fov:.0}° · ρ{density:.2}{marker}"
+                ))),
+        );
+    }
+
+    let mut scalar_line = String::new();
+    for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye.is_none()) {
+        let index = channel.index;
+        scalar_line.push_str(&format!(
+            "{} {:.2}[{}]",
+            channel.name,
+            attribution.clamped[index],
+            sensor_source_tag(channel.kind)
+        ));
+        if attribution.saturated[index] {
+            scalar_line.push_str(&format!("⚠{:.1}", attribution.raw[index]));
+        }
+        scalar_line.push_str("  ");
+    }
+    panel = panel.child(
+        div()
+            .text_xs()
+            .text_color(rgb(0x94a3b8))
+            .child(scalar_line.trim_end().to_owned()),
+    );
+
+    if attribution.contributions.is_empty() {
+        panel = panel.child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x64748b))
+                .child("no neighbours within sense radius (self/grid channels stay live)"),
+        );
+    } else {
+        for contribution in attribution
+            .contributions
+            .iter()
+            .take(SENSE_PROBE_VISIBLE_CONTRIBUTORS)
+        {
+            let dominant_eye = contribution
+                .eye_density
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map_or(0, |(eye, _)| eye);
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(color_swatch(contribution.color))
+                    .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                        "#{} ∠{:+.0}° d{:.0} eye{} Σ{:.2}",
+                        contribution.source_uid.0,
+                        contribution.bearing.to_degrees(),
+                        contribution.distance,
+                        dominant_eye,
+                        contribution.total,
+                    ))),
+            );
+        }
+        let hidden = attribution
+            .contributions
+            .len()
+            .saturating_sub(SENSE_PROBE_VISIBLE_CONTRIBUTORS);
+        if hidden > 0 {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(format!("… +{hidden} weaker contributors")),
+            );
+        }
+    }
+
+    panel
+}
+
 fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
     let mut rows: Vec<Div> = Vec::new();
     let max_val = values
@@ -10400,6 +10572,14 @@ struct AgentInspectorDetails {
     brain_request_revision: Option<u64>,
     brain_payload_bytes: Option<usize>,
     brain_inspection_status: Option<String>,
+    /// Per-neighbour attribution of what this agent perceives (bd-16g.4.2),
+    /// computed in core and rendered verbatim — never re-derived by the UI.
+    sense_attribution: Option<SensorAttribution>,
+    /// Eye directions relative to the heading, radians; pairs with
+    /// `sense_attribution` so cones can be labeled at their true angles.
+    eye_directions: [f32; NUM_EYES],
+    /// Clamped per-eye fields of view, radians.
+    eye_fovs: [f32; NUM_EYES],
 }
 
 #[derive(Clone)]
@@ -10471,6 +10651,12 @@ impl AgentInspectorDetails {
 
         let brain_descriptor = agent_runtime.brain.describe().to_string();
 
+        // On-demand, bounded, single-agent query (bd-16g.4.2): same cost
+        // class as the per-frame brain inspection above.
+        let sense_attribution = world.explain_sensors(agent_id, SENSE_PROBE_MAX_CONTRIBUTORS);
+        let eye_directions = agent_runtime.eye_direction;
+        let eye_fovs = agent_runtime.eye_fov;
+
         Some(Self {
             agent_id,
             label,
@@ -10491,6 +10677,9 @@ impl AgentInspectorDetails {
             brain_request_revision,
             brain_payload_bytes,
             brain_inspection_status,
+            sense_attribution,
+            eye_directions,
+            eye_fovs,
         })
     }
 }
