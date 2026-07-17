@@ -7,16 +7,16 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::{
     ApplicationState, CommandEnvelope, CommandId, CommandStatus, ControlRevision, EventCatchUp,
-    EventCatchUpGuarantee, EventCatchUpState, EventCommitment, EventJournalReader,
-    EventPageSource, EventPoll, EventSequence, HostBlocker, HostCommand, HostCore,
-    HostCoreOptions, HostLifecycle, HostSessionId, JournalAdmission, JournalBatchId, JournalState,
-    LocalHostPort, ManualInstant, NullFrontend, PlaybackSnapshot, RejectionReason,
+    EventCatchUpGuarantee, EventCatchUpState, EventCommitment, EventJournalReader, EventPageSource,
+    EventPoll, EventSequence, HostBlocker, HostCommand, HostCore, HostCoreOptions, HostLifecycle,
+    HostSessionId, JournalAdmission, JournalBatchId, JournalState, LocalHostPort, ManualInstant,
+    NullFrontend, PlaybackSnapshot, RejectionReason,
 };
 use scriptbots_storage::{
-    CommandJournalCursor, CommandStorageTransitionKind, DomainEventExpectation,
-    DomainEventPayload, HostJournalPrefixes, HostJournalRecordState, HostJournalSessionPage,
-    PersistenceGuarantee, StorageError, StorageEventJournalReader, StorageIntegrityCheckResult,
-    StorageJournalOptions, StoragePipeline, StorageReader,
+    CommandJournalCursor, CommandStorageTransitionKind, DomainEventExpectation, DomainEventPayload,
+    HostJournalPrefixes, HostJournalRecordState, HostJournalSessionPage, PersistenceGuarantee,
+    StorageError, StorageEventJournalReader, StorageIntegrityCheckResult, StorageJournalOptions,
+    StoragePipeline, StorageReader,
 };
 use std::{
     fs,
@@ -570,7 +570,10 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     assert_eq!(exact_first.batch_id, JournalBatchId::new(session_id, 1));
     assert_eq!(exact_first.lifecycle, first_lifecycle.clone());
     assert_eq!(exact_first.terminal_boundary, first_applied);
-    assert_eq!(exact_first.scientific_event_sequence, Some(EventSequence::new(1)));
+    assert_eq!(
+        exact_first.scientific_event_sequence,
+        Some(EventSequence::new(1))
+    );
     assert_eq!(exact_first.archive_payload_digest.len(), 64);
     assert_eq!(exact_first.storage_transitions.len(), 2);
     assert_eq!(
@@ -589,7 +592,10 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     let first_command_cursor = command_first_page
         .next_after
         .expect("Step/Step/Shutdown has a second command");
-    assert_eq!(first_command_cursor, command_first_page.commands[0].cursor());
+    assert_eq!(
+        first_command_cursor,
+        command_first_page.commands[0].cursor()
+    );
     let command_second_page = finished_reader
         .command_journal_page(
             session_id,
@@ -830,10 +836,7 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     ));
 
     let rejected_shutdown = frontend
-        .submit(
-            HostCommand::Shutdown,
-            Some(ControlRevision::new(u64::MAX)),
-        )
+        .submit(HostCommand::Shutdown, Some(ControlRevision::new(u64::MAX)))
         .expect("revision-conflicting shutdown enters ordered command audit");
     let rejected_shutdown_id = rejected_shutdown.command_id();
     let rejected_shutdown_status = drive_until_journal_state(
@@ -990,12 +993,20 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         .command_journal_record(session_id, pre_admission_id)
         .expect("exact pre-admission rejection lookup");
     assert_eq!(pre_admission.batch_id.sequence(), 1);
-    assert_eq!(pre_admission.lifecycle.source_client_namespace(), client_namespace);
+    assert_eq!(
+        pre_admission.lifecycle.source_client_namespace(),
+        client_namespace
+    );
     assert_eq!(pre_admission.lifecycle.admission_sequence(), None);
     assert_eq!(pre_admission.lifecycle.transitions().len(), 1);
     assert!(matches!(
-        pre_admission.lifecycle.terminal().map(|transition| transition.application()),
-        Some(ApplicationState::Rejected(RejectionReason::Validation { .. }))
+        pre_admission
+            .lifecycle
+            .terminal()
+            .map(|transition| transition.application()),
+        Some(ApplicationState::Rejected(
+            RejectionReason::Validation { .. }
+        ))
     ));
     let HostCommand::SetSpeed(stored_speed) = &pre_admission.lifecycle.envelope().command else {
         panic!("pre-admission lifecycle changed the rejected command kind");
@@ -1007,7 +1018,12 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         .command_journal_record(session_id, rejected_shutdown_id)
         .expect("exact admitted rejection lookup");
     assert_eq!(rejected_shutdown_record.batch_id.sequence(), 2);
-    assert!(rejected_shutdown_record.lifecycle.admission_sequence().is_some());
+    assert!(
+        rejected_shutdown_record
+            .lifecycle
+            .admission_sequence()
+            .is_some()
+    );
     assert_eq!(rejected_shutdown_record.lifecycle.transitions().len(), 2);
     assert!(matches!(
         rejected_shutdown_record
@@ -1050,7 +1066,10 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         HostCommand::Pause
     ));
     assert!(matches!(
-        pause_record.lifecycle.terminal().map(|transition| transition.application()),
+        pause_record
+            .lifecycle
+            .terminal()
+            .map(|transition| transition.application()),
         Some(ApplicationState::Applied(_))
     ));
     assert_eq!(pause_record.scientific_event_sequence, None);
@@ -1058,7 +1077,8 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     let update_record = reader
         .command_journal_record(session_id, update_id)
         .expect("exact applied configuration lookup");
-    let HostCommand::UpdateConfig(stored_config) = &update_record.lifecycle.envelope().command else {
+    let HostCommand::UpdateConfig(stored_config) = &update_record.lifecycle.envelope().command
+    else {
         panic!("configuration lifecycle changed the command kind");
     };
     assert_eq!(stored_config.as_ref(), &expected_updated_config);
@@ -1068,7 +1088,10 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         "postcard command projection must preserve exact configuration float bits"
     );
     assert!(matches!(
-        update_record.lifecycle.terminal().map(|transition| transition.application()),
+        update_record
+            .lifecycle
+            .terminal()
+            .map(|transition| transition.application()),
         Some(ApplicationState::Applied(_))
     ));
     assert_eq!(
@@ -1096,7 +1119,12 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         failed_config_record.lifecycle.source_client_namespace(),
         client_namespace
     );
-    assert!(failed_config_record.lifecycle.admission_sequence().is_some());
+    assert!(
+        failed_config_record
+            .lifecycle
+            .admission_sequence()
+            .is_some()
+    );
     let HostCommand::UpdateConfig(stored_failing_config) =
         &failed_config_record.lifecycle.envelope().command
     else {
@@ -1125,10 +1153,7 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         Some(update_boundary.revisions.config)
     );
     assert_eq!(failed_config_record.lifecycle.transitions().len(), 2);
-    assert_eq!(
-        failed_config_record.lifecycle.transitions()[0].ordinal(),
-        0
-    );
+    assert_eq!(failed_config_record.lifecycle.transitions()[0].ordinal(), 0);
     assert_eq!(
         failed_config_record.lifecycle.transitions()[0].boundary(),
         update_boundary
@@ -1174,7 +1199,10 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         step_record.lifecycle.envelope().expected_config_revision,
         Some(update_boundary.revisions.config)
     );
-    assert_eq!(step_record.scientific_event_sequence, Some(EventSequence::new(1)));
+    assert_eq!(
+        step_record.scientific_event_sequence,
+        Some(EventSequence::new(1))
+    );
 
     let shutdown_record = reader
         .command_journal_record(session_id, shutdown_id)
@@ -1182,7 +1210,10 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     assert!(shutdown_record.lifecycle.is_applied_shutdown());
     assert_eq!(shutdown_record.batch_id.sequence(), 7);
     assert_eq!(
-        shutdown_record.lifecycle.envelope().expected_control_revision,
+        shutdown_record
+            .lifecycle
+            .envelope()
+            .expected_control_revision,
         Some(step_boundary.revisions.control)
     );
     assert_eq!(
@@ -1193,7 +1224,10 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         Some(step_boundary.revisions.scientific)
     );
     assert_eq!(
-        shutdown_record.lifecycle.envelope().expected_config_revision,
+        shutdown_record
+            .lifecycle
+            .envelope()
+            .expected_config_revision,
         Some(step_boundary.revisions.config)
     );
     for record in [
@@ -1526,9 +1560,7 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
         }
     ));
 
-    reader
-        .close()
-        .expect("close immutable domain-event reader");
+    reader.close().expect("close immutable domain-event reader");
 
     let domain_corruptions = [
         (
