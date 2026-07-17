@@ -11,7 +11,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | Library | Door | Pin | Feature gate | Status |
 |---|---|---|---|---|
 | `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB; clean V6 multi-run/provenance schema |
-| `asupersync` 0.3.6 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.6` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | production native ingress/lifecycle plus bounded legacy-app command ingress |
+| `asupersync` 0.3.9 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.9` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | production native ingress/lifecycle plus bounded legacy-app command ingress |
 | `franken-kernel` / `-evidence` / `-decision` 0.3.x | transitive | crates.io | n/a | in tree via fsqlite |
 | `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` (`ft-api`, `ft-core`, `ft-kernel-cpu`, `ft-nn`, `ft-optim`) | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | code-first FtBrain implemented; bd-2z0.3.12.3 compile/determinism/benchmark proof pending |
 | everything else (ftui, fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
@@ -24,7 +24,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
   region-owned background services, LabRuntime deterministic chaos testing of the persistence
   protocol, `Cx::scoped_cpu` spike as a cancellable rayon alternative,
   BrowserRuntime evaluation for `scriptbots-web`. Decision lineage:
-  bd-2z0.4.3 (closed spike, `=0.3.6`); beads bd-2z0.4.12/.13/.14,
+  bd-2z0.4.3 (closed spike, `=0.3.9`); beads bd-2z0.4.12/.13/.14,
   bd-2z0.8.9.15, bd-2z0.12.4. Immutable latest snapshots use the canonical
   `SnapshotHub`; Bevy consumes that hub directly under bd-2z0.7.2 rather than
   adding an Asupersync watch competitor.
@@ -73,7 +73,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 
 | Library | crates.io? | Toolchain | wasm32 | License |
 |---|---|---|---|---|
-| asupersync | yes (0.3.6 in lock) | stable subset exists; nightly default | **yes** (BrowserRuntime, incl. deterministic profile) | MIT+Rider |
+| asupersync | yes (0.3.9 in lock) | stable subset exists; nightly default | **yes** (BrowserRuntime, incl. deterministic profile) | MIT+Rider |
 | fsqlite | git-pin only | MSRV 1.85 | experimental upstream | MIT+Rider |
 | ftui family | yes (0.5.0) + git rev for lifecycle fix | stable-ish | yes (ftui-web) | MIT+Rider |
 | fnx-classes/-algorithms | **yes 0.2.0 — git repo unusable** (absolute `/dp/frankentui` path dep) | stable-ish | **no** (rayon) | MIT+Rider |

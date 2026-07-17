@@ -23,6 +23,45 @@ incompatible, scientific output changes without an approved version boundary,
 licensing is unclear, or the migration crosses the review circuit breakers in
 the rearchitecture plan.
 
+## 2026-07-17 — Advance the FrankenSQLite pin to e536d7f coupled with asupersync 0.3.9 (bd-2z0.8.9.11)
+
+- **Bead:** `bd-2z0.8.9.11`
+- **Change class:** one coupled dependency-family advancement (exact-revision
+  git pin plus registry floor); no persistence-semantics change is mixed in
+- **Before:** `fsqlite = "=0.1.16"` at immutable revision
+  `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78`; `asupersync = "=0.3.6"`.
+- **Target:** `fsqlite = "=0.1.16"` at immutable revision
+  `e536d7f8ca102b3eb5236bef48514582379f9346` (upstream HEAD at qualification;
+  189 commits ahead — 63 perf, 41 fix, 31 docs, 23 test, 11 chore, 8 style,
+  2 refactor, 1 revert, 1 additive feature; the bead's original `a293a252…`
+  candidate was verified to already be an ancestor of the previous pin).
+  `asupersync = "=0.3.9"`.
+- **Why coupled:** e536d7f declares `asupersync "0.3.9"`; a solo fsqlite bump
+  would resolve two asupersync versions and trip
+  `ci/check_asupersync_universe.sh`. The joint delta keeps a single universe
+  at 0.3.9. The facade remains `0.1.16` and the `native` feature is intact.
+- **Verification (full qualification record in the bead):** workspace
+  `cargo check --all-targets` clean; `native-asupersync` feature check clean;
+  `scriptbots-storage` 116/116 plus every integration suite including the
+  bd-2z0.8.9.7 durability proofs; `scriptbots-core` 318 pass with the only 2
+  failures reproduced on unmodified main (`bd-t3d0`, not candidate-induced);
+  `scriptbots-runtime` 80/80; clippy `-D warnings` clean on
+  storage/core/runtime/app; `ci/check_fsqlite_pin.sh` reports
+  manifest == lock == AGENTS.md; shipped-app smoke (16 headless ticks) —
+  recovery watermarks 16/16/16/16 and nonempty CSV exports; cross-version
+  recovery of a 1eec0d2-written database under e536d7f confirmed with
+  identical watermarks.
+- **Scoped compatibility note:** the e536d7f VFS refuses exFAT-class
+  filesystems at open (`CannotOpen`) where the previous pin tolerated them.
+  Run databases must live on POSIX-capable filesystems (APFS, ext4); CI and
+  default layouts are unaffected.
+- **Residual follow-ups:** DSR perf-lane qualification of the 63 upstream
+  perf commits; the reverse recovery direction (1eec0d2 binary opening an
+  e536d7f-written database) was not exercised and must not be relied on.
+- **Rollback:** restore the exact `Cargo.toml` rev/version lines and relock
+  to `1eec0d2…` / `0.3.6`; per the note above, only roll back before relying
+  on databases written after this delta.
+
 ## 2026-07-13 — Admit Frankentorch behind `brain-ft`
 
 - **Bead:** `bd-2z0.3.12.1`

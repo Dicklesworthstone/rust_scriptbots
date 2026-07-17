@@ -28,7 +28,7 @@ repository = "https://github.com/Dicklesworthstone/rust_scriptbots"
 [workspace.dependencies]
 anyhow = "1.0.103"
 arc-swap = "1.9.2"
-asupersync = { version = "=0.3.6", default-features = false }
+asupersync = { version = "=0.3.9", default-features = false }
 blake3 = "1.8.5"
 libc = "0.2.186"
 libm = "0.2.16"
@@ -50,7 +50,7 @@ wfc = "0.10.7"
 direction = "0.18.0"
 rand08 = { package = "rand", version = "0.8.5" }
 
-fsqlite = { version = "=0.1.16", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "1eec0d2669d0a7938e155b62ce8ebcd72e5bed78", default-features = false, features = ["native"] }
+fsqlite = { version = "=0.1.16", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "e536d7f8ca102b3eb5236bef48514582379f9346", default-features = false, features = ["native"] }
 ft-api = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-core = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-kernel-cpu = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
