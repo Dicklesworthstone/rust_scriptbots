@@ -1819,8 +1819,24 @@ mod tests {
             .drive_at(&mut core, ManualInstant::from_nanos(1))
             .expect("closed size gate blocks later science deterministically");
         assert_eq!(blocked.scientific_steps, 0);
-        assert_eq!(blocked.blocker, Some(HostBlocker::ScientificFault));
+        assert_eq!(blocked.commands_completed, 0);
+        assert_eq!(
+            blocked.blocker,
+            Some(HostBlocker::JournalClosed {
+                batch_id: retained.id(),
+            })
+        );
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Journal { batch_id, failure })
+                if *batch_id == retained.id() && failure.code == "journal_closed"
+        ));
         assert_eq!(core.world_tick(), Tick(1));
+        let still_retained = core
+            .pending_journal_batch()
+            .expect("later science preserves the exact closed batch");
+        assert!(Arc::ptr_eq(&retained, &still_retained));
+        drop(still_retained);
         assert!(matches!(
             worker_rx.try_recv(),
             Err(xchan::TryRecvError::Empty)
@@ -1829,11 +1845,8 @@ mod tests {
             .command_status(later.command_id())
             .expect("later command status query")
             .expect("later command remains queryable");
-        assert!(matches!(
-            later_status.application(),
-            ApplicationState::Failed(failure) if failure.code == "science_blocked"
-        ));
-        assert_eq!(later_status.journal(), &JournalState::NotRequired);
+        assert_eq!(later_status.application(), &ApplicationState::Admitted);
+        assert_eq!(later_status.journal(), &JournalState::Pending);
 
         drop(core);
         assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
