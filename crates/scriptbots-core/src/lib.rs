@@ -8,6 +8,7 @@ pub mod economy;
 pub mod narrative_text;
 pub mod rng_domains;
 pub mod sense_fixed;
+pub mod visual;
 
 pub use checkpoint::{
     CheckpointBrainRegistryRequirementV1, CheckpointBrainRegistryRequirementsV1,
