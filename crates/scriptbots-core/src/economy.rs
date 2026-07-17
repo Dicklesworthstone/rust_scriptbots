@@ -21,9 +21,7 @@
 //! never map iteration, never wall-clock. Identical input sequences produce
 //! bit-identical [`EpochFlows`] on every platform and thread count.
 
-use crate::{
-    RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick,
-};
+use crate::{RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -97,9 +95,7 @@ pub enum EconomyAggregationError {
         expected: usize,
     },
     /// The tick's flow rows are not in stable enum order.
-    #[error(
-        "tick {tick} flow row {index} is {actual:?} but stable order requires {expected:?}"
-    )]
+    #[error("tick {tick} flow row {index} is {actual:?} but stable order requires {expected:?}")]
     MisorderedFlowSet {
         /// Tick whose report was misordered.
         tick: u64,
@@ -111,7 +107,9 @@ pub enum EconomyAggregationError {
         expected: ResourceFlowKind,
     },
     /// Ticks must arrive in strictly increasing order.
-    #[error("tick {actual} arrived at or before tick {previous}; aggregation requires strictly increasing ticks")]
+    #[error(
+        "tick {actual} arrived at or before tick {previous}; aggregation requires strictly increasing ticks"
+    )]
     NonMonotonicTick {
         /// Last accepted tick.
         previous: u64,
@@ -343,8 +341,7 @@ impl EpochAggregator {
             let stock = EconomyStock::ALL[stock_index];
             let residual_sum = self.residual_sums[stock_index].value();
             let gross_flow = self.gross_flow[stock_index].value();
-            let cumulative_tolerance =
-                EPOCH_RESIDUAL_RELATIVE_TOLERANCE * gross_flow.max(1.0);
+            let cumulative_tolerance = EPOCH_RESIDUAL_RELATIVE_TOLERANCE * gross_flow.max(1.0);
             let worst_category = per_category
                 .iter()
                 .map(|flow| stock.lane(flow.delta).abs())
@@ -596,7 +593,10 @@ mod tests {
 
         assert!(epoch.complete);
         assert_eq!(epoch.epoch, 0);
-        assert_eq!((epoch.first_tick, epoch.last_tick, epoch.tick_count), (10, 12, 3));
+        assert_eq!(
+            (epoch.first_tick, epoch.last_tick, epoch.tick_count),
+            (10, 12, 3)
+        );
 
         let metabolism = &epoch.per_category[ResourceFlowKind::BasalMetabolism as usize];
         assert!((metabolism.delta.energy - -0.3).abs() < 1.0e-15);
@@ -609,11 +609,17 @@ mod tests {
         assert!((energy_row.residual_sum - -2.0e-9).abs() < 1.0e-22);
         assert_eq!(energy_row.residual_max_abs, 3.0e-9);
         assert_eq!(energy_row.argmax_tick, Some(11));
-        assert_eq!(energy_row.worst_category, Some(ResourceFlowKind::BasalMetabolism));
+        assert_eq!(
+            energy_row.worst_category,
+            Some(ResourceFlowKind::BasalMetabolism)
+        );
         assert!(energy_row.within_tolerance);
 
         let food_row = epoch.residual[0];
-        assert_eq!(food_row.worst_category, Some(ResourceFlowKind::FoodDynamics));
+        assert_eq!(
+            food_row.worst_category,
+            Some(ResourceFlowKind::FoodDynamics)
+        );
         assert_eq!(food_row.gross_flow, 0.75);
     }
 
@@ -631,7 +637,11 @@ mod tests {
         swapped.flows.swap(0, 1);
         assert!(matches!(
             aggregator.observe(&swapped),
-            Err(EconomyAggregationError::MisorderedFlowSet { tick: 6, index: 0, .. })
+            Err(EconomyAggregationError::MisorderedFlowSet {
+                tick: 6,
+                index: 0,
+                ..
+            })
         ));
 
         // Rejected ticks must leave the aggregator untouched.
@@ -664,7 +674,10 @@ mod tests {
         let replay = ledger_tick(9, &[], zero_amounts());
         assert!(matches!(
             aggregator.observe(&replay),
-            Err(EconomyAggregationError::NonMonotonicTick { previous: 9, actual: 9 })
+            Err(EconomyAggregationError::NonMonotonicTick {
+                previous: 9,
+                actual: 9
+            })
         ));
     }
 
@@ -690,12 +703,18 @@ mod tests {
         let partial = aggregator.finish().expect("partial epoch");
         assert!(!partial.complete);
         assert_eq!(partial.epoch, 1);
-        assert_eq!((partial.first_tick, partial.last_tick, partial.tick_count), (3, 3, 1));
+        assert_eq!(
+            (partial.first_tick, partial.last_tick, partial.tick_count),
+            (3, 3, 1)
+        );
 
         // Monotonicity carries across epochs: replaying tick 3 must fail.
         assert!(matches!(
             aggregator.observe(&ledger_tick(3, &[], zero_amounts())),
-            Err(EconomyAggregationError::NonMonotonicTick { previous: 3, actual: 3 })
+            Err(EconomyAggregationError::NonMonotonicTick {
+                previous: 3,
+                actual: 3
+            })
         ));
     }
 
@@ -736,6 +755,9 @@ mod tests {
         assert_eq!(lane.value(), 1.0);
 
         let naive = (1.0e16_f64 + 1.0) - 1.0e16;
-        assert_eq!(naive, 0.0, "if this fails, the fixture no longer proves anything");
+        assert_eq!(
+            naive, 0.0,
+            "if this fails, the fixture no longer proves anything"
+        );
     }
 }
