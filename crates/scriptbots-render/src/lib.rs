@@ -8150,6 +8150,86 @@ fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
         attribution.contributions.len(),
     )));
 
+    // True-angle strip: the agent's full [-180°, +180°] egocentric field
+    // unrolled at 1px/degree. Each eye covers its real angular span at its
+    // real direction, tinted by what it perceives; contributor ticks sit at
+    // their true bearings. Heading (0°) is the center line.
+    {
+        let strip_width = 360.0_f32;
+        let clamp_x = |x: f32| x.clamp(0.0, strip_width - 2.0);
+        let mut strip = div()
+            .relative()
+            .w(px(strip_width))
+            .h(px(16.0))
+            .rounded_sm()
+            .bg(rgb(0x0a1420));
+        for eye in 0..NUM_EYES {
+            let mut seen = [0.0_f32; 3];
+            let mut density = 0.0_f32;
+            for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye == Some(eye)) {
+                let clamped = attribution.clamped[channel.index];
+                match channel.kind {
+                    SensorKind::EyeDensity => density = clamped,
+                    SensorKind::EyeRed => seen[0] = clamped,
+                    SensorKind::EyeGreen => seen[1] = clamped,
+                    SensorKind::EyeBlue => seen[2] = clamped,
+                    _ => {}
+                }
+            }
+            let direction = detail.eye_directions[eye].to_degrees();
+            let fov = detail.eye_fovs[eye].to_degrees().max(1.0);
+            let left = clamp_x(strip_width / 2.0 + direction - fov / 2.0);
+            let width = fov.min(strip_width - left).max(1.0);
+            // Density scales brightness; an empty cone stays faintly visible
+            // so its coverage is still readable.
+            let brightness = density.mul_add(0.75, 0.25);
+            let tint = [
+                seen[0] * brightness,
+                seen[1] * brightness,
+                seen[2] * brightness,
+            ];
+            strip = strip.child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(3.0))
+                    .w(px(width))
+                    .h(px(10.0))
+                    .rounded_sm()
+                    .bg(rgb_from_triplet(tint)),
+            );
+        }
+        // Contributor bearings as full-height ticks in their perceived colour.
+        for contribution in &attribution.contributions {
+            let x = clamp_x(strip_width / 2.0 + contribution.bearing.to_degrees());
+            strip = strip.child(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(0.0))
+                    .w(px(2.0))
+                    .h(px(16.0))
+                    .bg(rgb_from_triplet(contribution.color)),
+            );
+        }
+        // Heading line at 0°.
+        strip = strip.child(
+            div()
+                .absolute()
+                .left(px(strip_width / 2.0 - 1.0))
+                .top(px(0.0))
+                .w(px(1.0))
+                .h(px(16.0))
+                .bg(rgb(0x64748b)),
+        );
+        panel = panel.child(strip).child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x475569))
+                .child("-180°            eye cones at true angles · ticks = contributors            +180°"),
+        );
+    }
+
     for eye in 0..NUM_EYES {
         let mut rgb_seen = [0.0_f32; 3];
         let mut density = 0.0_f32;
