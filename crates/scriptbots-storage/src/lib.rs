@@ -2,6 +2,10 @@
 
 //! FrankenSQLite-backed persistence layer for ScriptBots.
 
+mod journal;
+
+pub use journal::{StorageEventJournalReader, StorageJournalOptions, StorageJournalPort};
+
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use fsqlite::{
@@ -18,12 +22,21 @@ use scriptbots_core::{
     rng_domains::{AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain},
     world_counters_digest_v1,
 };
-use scriptbots_runtime::RunId;
+use journal::{
+    HOST_JOURNAL_ARCHIVE_VERSION, HostJournalArchive, JournalReaderBackend,
+    JournalReaderPublisher, PreparedHostJournalArchive, decode_journal_u64, encode_journal_u64,
+    prepare_host_journal_archive,
+};
+use scriptbots_runtime::{
+    EventCommitment, EventSequence, EventSequenceRange, HostCommand, HostSessionId, JournalBatch,
+    JournalBatchId, JournalFailure, JournalReceipt, JournalReceiptState,
+    JournaledScientificEvent, RunId, ShutdownCommitRequirement,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -48,8 +61,58 @@ const DEFAULT_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
 const MAX_STORAGE_QUERY_PAGE: usize = 4_096;
+const MAX_HOST_JOURNAL_ARCHIVE_BYTES: usize = 256 << 20;
 const OUTBOX_PAYLOAD_VERSION: u32 = 4;
 const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum HostJournalFaultPoint {
+    AdmissionBeforeProgress,
+    AfterArchiveBeforeApplication,
+    BeforePersistenceFlush,
+    BeforeDurableMarker,
+    BeforePublication,
+    AfterPublicationBeforeReceipt,
+}
+
+#[cfg(test)]
+fn host_journal_faults() -> &'static Mutex<BTreeSet<(String, HostJournalFaultPoint)>> {
+    static FAULTS: OnceLock<Mutex<BTreeSet<(String, HostJournalFaultPoint)>>> = OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn arm_host_journal_fault(path: &str, point: HostJournalFaultPoint) {
+    let inserted = host_journal_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((path.to_owned(), point));
+    assert!(inserted, "host-journal fault {point:?} already armed for {path}");
+}
+
+#[cfg(test)]
+fn take_host_journal_fault(path: &str, point: HostJournalFaultPoint) -> bool {
+    host_journal_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(path.to_owned(), point))
+}
+
+#[cfg(test)]
+fn fail_at_host_journal_fault(
+    path: &str,
+    point: HostJournalFaultPoint,
+    context: &'static str,
+) -> Result<(), StorageError> {
+    if take_host_journal_fault(path, point) {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: format!("injected host-journal fault at {point:?}"),
+        });
+    }
+    Ok(())
+}
 
 /// Files FrankenSQLite may create beside its primary database.
 pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
@@ -3512,6 +3575,103 @@ struct StorageBuffer {
     replay_events: Vec<ReplayEventRow>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum HostJournalState {
+    Admitted,
+    Applied,
+    CommittedVolatile,
+    Durable,
+}
+
+impl HostJournalState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Applied => "applied",
+            Self::CommittedVolatile => "committed_volatile",
+            Self::Durable => "durable",
+        }
+    }
+
+    fn decode(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "admitted" => Ok(Self::Admitted),
+            "applied" => Ok(Self::Applied),
+            "committed_volatile" => Ok(Self::CommittedVolatile),
+            "durable" => Ok(Self::Durable),
+            _ => Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.state",
+                reason: format!("unknown host-journal state {value:?}"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HostJournalProgress {
+    admitted_journal: u64,
+    applied_journal: u64,
+    committed_volatile_journal: u64,
+    durable_journal: u64,
+    admitted_event: u64,
+    applied_event: u64,
+    committed_volatile_event: u64,
+    durable_event: u64,
+    shutdown_sequence: Option<u64>,
+}
+
+impl HostJournalProgress {
+    fn decode(row: &Row) -> Result<Self, StorageError> {
+        fn field(row: &Row, index: usize, context: &'static str) -> Result<u64, StorageError> {
+            let encoded: String = decode(row, index, context)?;
+            decode_journal_u64(context, &encoded)
+        }
+
+        let shutdown_sequence: Option<String> =
+            decode(row, 8, "host_journal_progress.shutdown_sequence")?;
+        Ok(Self {
+            admitted_journal: field(
+                row,
+                0,
+                "host_journal_progress.admitted_journal_prefix",
+            )?,
+            applied_journal: field(row, 1, "host_journal_progress.applied_journal_prefix")?,
+            committed_volatile_journal: field(
+                row,
+                2,
+                "host_journal_progress.committed_volatile_journal_prefix",
+            )?,
+            durable_journal: field(row, 3, "host_journal_progress.durable_journal_prefix")?,
+            admitted_event: field(row, 4, "host_journal_progress.admitted_event_prefix")?,
+            applied_event: field(row, 5, "host_journal_progress.applied_event_prefix")?,
+            committed_volatile_event: field(
+                row,
+                6,
+                "host_journal_progress.committed_volatile_event_prefix",
+            )?,
+            durable_event: field(row, 7, "host_journal_progress.durable_event_prefix")?,
+            shutdown_sequence: shutdown_sequence
+                .as_deref()
+                .map(|encoded| {
+                    decode_journal_u64("host_journal_progress.shutdown_sequence", encoded)
+                })
+                .transpose()?,
+        })
+    }
+
+    const fn prefixes(self, state: HostJournalState) -> (u64, u64) {
+        match state {
+            HostJournalState::Admitted => (self.admitted_journal, self.admitted_event),
+            HostJournalState::Applied => (self.applied_journal, self.applied_event),
+            HostJournalState::CommittedVolatile => (
+                self.committed_volatile_journal,
+                self.committed_volatile_event,
+            ),
+            HostJournalState::Durable => (self.durable_journal, self.durable_event),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct OutboxPayload {
     version: u32,
@@ -5457,6 +5617,385 @@ impl ExistingStorageLease {
     }
 }
 
+fn load_host_journal_index(
+    path: &str,
+    lease: &ExistingStorageLease,
+    run_id: RunId,
+    session_id: HostSessionId,
+    identity_limit: usize,
+) -> Result<
+    (
+        Option<EventSequenceRange>,
+        VecDeque<(EventSequence, JournalBatchId)>,
+    ),
+    StorageError,
+> {
+    let identity_limit = checked_query_limit("host_journal_index.identity_limit", identity_limit)?;
+    lease.verify_path(path)?;
+    let connection = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let result = (|| {
+        lease.bind_connection(&connection, path)?;
+        Storage::validate_existing_scriptbots_schema(&connection)?;
+        let session = encode_journal_u64(session_id.get());
+        let rows = connection.query_with_params(
+            "SELECT admitted_journal_prefix, applied_journal_prefix,
+                    committed_volatile_journal_prefix, durable_journal_prefix,
+                    admitted_event_prefix, applied_event_prefix,
+                    committed_volatile_event_prefix, durable_event_prefix,
+                    shutdown_sequence
+             FROM host_journal_progress
+             WHERE run_id = ?1 AND host_session_id = ?2",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+            ],
+        )?;
+        let [progress] = rows.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.host_session_id",
+                reason: format!(
+                    "run {run_id} session {} has {} progress rows",
+                    session_id.get(),
+                    rows.len()
+                ),
+            });
+        };
+        let progress = HostJournalProgress::decode(progress)?;
+        let durable_event = progress.durable_event;
+        if durable_event == 0 {
+            return Ok((None, VecDeque::new()));
+        }
+        for boundary in [1, durable_event] {
+            let encoded_boundary = encode_journal_u64(boundary);
+            let boundary_rows = connection.query_with_params(
+                "SELECT journal_sequence, state
+                 FROM host_journal_batch_ledger
+                 WHERE run_id = ?1 AND host_session_id = ?2
+                   AND scientific_event_sequence = ?3",
+                &[
+                    sqlite_run_id(run_id),
+                    session.as_str().into(),
+                    encoded_boundary.as_str().into(),
+                ],
+            )?;
+            let [boundary_row] = boundary_rows.as_slice() else {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.scientific_event_sequence",
+                    reason: format!(
+                        "durable boundary event {boundary} has {} ledger rows",
+                        boundary_rows.len()
+                    ),
+                });
+            };
+            let journal: String =
+                decode(boundary_row, 0, "host_journal_batch_ledger.journal_sequence")?;
+            if decode_journal_u64("host_journal_batch_ledger.journal_sequence", &journal)? == 0 {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.journal_sequence",
+                    reason: "durable boundary references journal sequence zero".to_owned(),
+                });
+            }
+            let state: String =
+                decode(boundary_row, 1, "host_journal_batch_ledger.state")?;
+            if state != HostJournalState::Durable.as_str() {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.state",
+                    reason: format!(
+                        "durable boundary event {boundary} has non-durable state {state:?}"
+                    ),
+                });
+            }
+        }
+        let identity_rows = connection.query_with_params(
+            "SELECT scientific_event_sequence, journal_sequence
+             FROM host_journal_batch_ledger
+             WHERE run_id = ?1 AND host_session_id = ?2
+               AND state = 'durable' AND scientific_event_sequence IS NOT NULL
+             ORDER BY scientific_event_sequence DESC
+             LIMIT ?3",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                identity_limit.into(),
+            ],
+        )?;
+        if identity_rows.is_empty() {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.scientific_event_sequence",
+                reason: "nonzero durable event prefix has no bounded identity suffix".to_owned(),
+            });
+        }
+        let mut identities = VecDeque::with_capacity(identity_rows.len());
+        let suffix_len = u64::try_from(identity_rows.len()).map_err(|error| {
+            StorageError::InvalidData {
+                context: "host_journal_batch_ledger.scientific_event_sequence",
+                reason: error.to_string(),
+            }
+        })?;
+        let mut expected_event = durable_event
+            .checked_sub(suffix_len)
+            .and_then(|prefix| prefix.checked_add(1))
+            .ok_or(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.scientific_event_sequence",
+                reason: "bounded durable identity suffix exceeds its event prefix".to_owned(),
+            })?;
+        for row in identity_rows.into_iter().rev() {
+            let event: String =
+                decode(&row, 0, "host_journal_batch_ledger.scientific_event_sequence")?;
+            let journal: String =
+                decode(&row, 1, "host_journal_batch_ledger.journal_sequence")?;
+            let event = decode_journal_u64(
+                "host_journal_batch_ledger.scientific_event_sequence",
+                &event,
+            )?;
+            if event != expected_event {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.scientific_event_sequence",
+                    reason: format!(
+                        "bounded durable suffix expected event {expected_event}, found {event}"
+                    ),
+                });
+            }
+            expected_event = expected_event.saturating_add(1);
+            identities.push_back((
+                EventSequence::new(event),
+                JournalBatchId::new(
+                    session_id,
+                    decode_journal_u64(
+                        "host_journal_batch_ledger.journal_sequence",
+                        &journal,
+                    )?,
+                ),
+            ));
+        }
+        if identities.back().map(|(event, _batch)| event.get()) != Some(durable_event) {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.scientific_event_sequence",
+                reason: "bounded durable identity suffix does not end at the durable prefix"
+                    .to_owned(),
+            });
+        }
+        Ok((
+            Some(EventSequenceRange {
+                first: EventSequence::new(1),
+                last: EventSequence::new(durable_event),
+            }),
+            identities,
+        ))
+    })();
+    let verify_result = lease.verify_path(path);
+    let close_result = connection
+        .close_without_checkpoint()
+        .map_err(StorageError::from);
+    let index = result?;
+    verify_result?;
+    close_result?;
+    Ok(index)
+}
+
+fn read_host_journal_events(
+    path: &str,
+    lease: &ExistingStorageLease,
+    run_id: RunId,
+    session_id: HostSessionId,
+    range: EventSequenceRange,
+    limit: usize,
+    maximum_bytes: usize,
+) -> Result<Vec<JournaledScientificEvent>, StorageError> {
+    if !range.is_valid() {
+        return Err(StorageError::InvalidData {
+            context: "host_journal_reader.range",
+            reason: "event range must be nonempty and ordered".to_owned(),
+        });
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = usize::try_from(checked_query_limit("host_journal_reader.limit", limit)?)
+        .map_err(|error| StorageError::InvalidData {
+            context: "host_journal_reader.limit",
+            reason: error.to_string(),
+        })?;
+    let maximum_bytes = maximum_bytes.min(MAX_HOST_JOURNAL_ARCHIVE_BYTES);
+    if maximum_bytes == 0 {
+        return Err(StorageError::InvalidData {
+            context: "host_journal_reader.maximum_bytes",
+            reason: "event page byte limit must be nonzero".to_owned(),
+        });
+    }
+
+    lease.verify_path(path)?;
+    let connection = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let result = (|| {
+        lease.bind_connection(&connection, path)?;
+        Storage::validate_existing_scriptbots_schema(&connection)?;
+        let session = encode_journal_u64(session_id.get());
+        let progress = connection.query_with_params(
+            "SELECT durable_event_prefix
+             FROM host_journal_progress
+             WHERE run_id = ?1 AND host_session_id = ?2",
+            &[
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+            ],
+        )?;
+        let [progress] = progress.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.host_session_id",
+                reason: "durable reader session is not registered for this run".to_owned(),
+            });
+        };
+        let durable_event: String =
+            decode(progress, 0, "host_journal_progress.durable_event_prefix")?;
+        let durable_event = EventSequence::new(decode_journal_u64(
+            "host_journal_progress.durable_event_prefix",
+            &durable_event,
+        )?);
+        let available = EventSequenceRange {
+            first: EventSequence::new(1),
+            last: durable_event,
+        };
+        if !available.contains_range(range) {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_reader.range",
+                reason: format!(
+                    "requested {}..={} is outside durable 1..={}",
+                    range.first.get(),
+                    range.last.get(),
+                    durable_event.get()
+                ),
+            });
+        }
+
+        let mut events = Vec::with_capacity(limit);
+        let mut remaining_bytes = maximum_bytes;
+        let mut next = range.first;
+        while events.len() < limit && range.contains(next) {
+            let event = encode_journal_u64(next.get());
+            let metadata = connection.query_with_params(
+                "SELECT archive.journal_sequence, archive.payload_version,
+                        archive.payload_digest, length(CAST(archive.payload_json AS BLOB))
+                 FROM host_journal_batch_ledger AS ledger
+                 JOIN host_journal_archive AS archive
+                   ON archive.run_id = ledger.run_id
+                  AND archive.host_session_id = ledger.host_session_id
+                  AND archive.journal_sequence = ledger.journal_sequence
+                 WHERE ledger.run_id = ?1 AND ledger.host_session_id = ?2
+                   AND ledger.scientific_event_sequence = ?3 AND ledger.state = 'durable'",
+                &[
+                    sqlite_run_id(run_id),
+                    session.as_str().into(),
+                    event.as_str().into(),
+                ],
+            )?;
+            let [metadata] = metadata.as_slice() else {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.scientific_event_sequence",
+                    reason: format!(
+                        "durable event {} has {} ledger rows",
+                        next.get(),
+                        metadata.len()
+                    ),
+                });
+            };
+            let journal: String =
+                decode(metadata, 0, "host_journal_archive.journal_sequence")?;
+            let payload_version: i64 =
+                decode(metadata, 1, "host_journal_archive.payload_version")?;
+            if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.payload_version",
+                    reason: format!(
+                        "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
+                    ),
+                });
+            }
+            let digest: String =
+                decode(metadata, 2, "host_journal_archive.payload_digest")?;
+            let payload_bytes: i64 =
+                decode(metadata, 3, "host_journal_archive.payload_json.length")?;
+            let payload_bytes = usize::try_from(payload_bytes).map_err(|error| {
+                StorageError::InvalidData {
+                    context: "host_journal_archive.payload_json",
+                    reason: error.to_string(),
+                }
+            })?;
+            if payload_bytes > remaining_bytes {
+                if events.is_empty() {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_reader.maximum_bytes",
+                        reason: format!(
+                            "event {} requires {payload_bytes} bytes, exceeding the {maximum_bytes}-byte page bound",
+                            next.get()
+                        ),
+                    });
+                }
+                break;
+            }
+            let payload_row = connection.query_row_with_params(
+                "SELECT payload_json FROM host_journal_archive
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+                   AND length(CAST(payload_json AS BLOB)) = ?4",
+                &[
+                    sqlite_run_id(run_id),
+                    session.as_str().into(),
+                    journal.as_str().into(),
+                    i64::try_from(payload_bytes)
+                        .map_err(|error| StorageError::InvalidData {
+                            context: "host_journal_archive.payload_json",
+                            reason: error.to_string(),
+                        })?
+                        .into(),
+                ],
+            )?;
+            let payload_json: String =
+                decode(&payload_row, 0, "host_journal_archive.payload_json")?;
+            let batch_id = JournalBatchId::new(
+                session_id,
+                decode_journal_u64("host_journal_archive.journal_sequence", &journal)?,
+            );
+            let archive = HostJournalArchive::decode(
+                &payload_json,
+                &digest,
+                run_id,
+                batch_id,
+                remaining_bytes,
+            )?;
+            let journaled = archive
+                .journaled_event(EventCommitment::Durable)?
+                .ok_or(StorageError::InvalidData {
+                    context: "host_journal_archive.scientific",
+                    reason: format!("durable event {} has no scientific payload", next.get()),
+                })?;
+            if journaled.event.sequence != next {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.scientific_event_sequence",
+                    reason: format!(
+                        "ledger event {} decoded archive event {}",
+                        next.get(),
+                        journaled.event.sequence.get()
+                    ),
+                });
+            }
+            remaining_bytes -= payload_bytes;
+            events.push(journaled);
+            let Some(following) = next.checked_next() else {
+                break;
+            };
+            next = following;
+        }
+        Ok(events)
+    })();
+    let verify_result = lease.verify_path(path);
+    let close_result = connection
+        .close_without_checkpoint()
+        .map_err(StorageError::from);
+    let events = result?;
+    verify_result?;
+    close_result?;
+    Ok(events)
+}
+
 fn filesystem_identity_probe_prefix(database_path: &Path) -> String {
     // This is an ephemeral ownership tag, not canonical filesystem identity or authentication.
     // It lets diagnostics distinguish simultaneous probes for different database paths.
@@ -5895,6 +6434,10 @@ impl Storage {
             storage.terminally_failed = true;
             return Err(error);
         }
+        if let Err(error) = storage.validate_host_journal_invariants() {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
         if let Err(error) = storage.recover_outbox() {
             storage.terminally_failed = true;
             return Err(error);
@@ -5912,6 +6455,10 @@ impl Storage {
                             reason: "batch id space exhausted".to_owned(),
                         })
                 })?;
+        if let Err(error) = storage.recover_host_journal_archives() {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
         Ok(storage)
     }
 
@@ -6208,8 +6755,10 @@ impl Storage {
              FROM storage_progress
              ORDER BY run_id ASC",
         )?;
+        let mut run_ids = Vec::with_capacity(progress.len());
         for row in progress {
             let run_id = decode_run_id(&row, 0, "storage_progress.run_id")?;
+            run_ids.push(run_id);
             let admitted: i64 = decode(&row, 1, "storage_progress.admitted_batch_id")?;
             let applied: i64 = decode(&row, 2, "storage_progress.applied_batch_id")?;
             let durable: i64 = decode(&row, 3, "storage_progress.durable_batch_id")?;
@@ -6230,6 +6779,549 @@ impl Storage {
                 reason: format!(
                     "cannot append a run while {outbox} durable outbox payload(s) remain"
                 ),
+            });
+        }
+        let unfinished_journal = connection.query(
+            "SELECT run_id, host_session_id, admitted_journal_prefix, durable_journal_prefix
+             FROM host_journal_progress
+             WHERE admitted_journal_prefix != durable_journal_prefix
+             ORDER BY run_id ASC, host_session_id ASC
+             LIMIT 1",
+        )?;
+        if let Some(row) = unfinished_journal.first() {
+            let run_id = decode_run_id(row, 0, "host_journal_progress.run_id")?;
+            let session: String = decode(row, 1, "host_journal_progress.host_session_id")?;
+            let admitted: String =
+                decode(row, 2, "host_journal_progress.admitted_journal_prefix")?;
+            let durable: String =
+                decode(row, 3, "host_journal_progress.durable_journal_prefix")?;
+            return Err(StorageError::InvalidData {
+                context: "storage.append_run",
+                reason: format!(
+                    "run {run_id} host session {session} is not fully durable (admitted={admitted}, durable={durable}); recover it before appending another run"
+                ),
+            });
+        }
+        for run_id in run_ids {
+            Self::validate_host_journal_invariants_for_connection(connection, run_id, true)?;
+        }
+        Ok(())
+    }
+
+    fn validate_host_journal_invariants(&self) -> Result<(), StorageError> {
+        Self::validate_host_journal_invariants_for_connection(
+            self.connection()?,
+            self.run_id,
+            self.file_backed(),
+        )
+    }
+
+    fn validate_host_journal_invariants_for_connection(
+        connection: &Connection,
+        run_id: RunId,
+        file_backed: bool,
+    ) -> Result<(), StorageError> {
+        let page_limit = checked_query_limit(
+            "host_journal_invariants.page_limit",
+            MAX_STORAGE_QUERY_PAGE,
+        )?;
+        let mut session_cursor = String::new();
+        loop {
+            let sessions = connection.query_with_params(
+                "SELECT host_session_id
+                 FROM host_journal_progress
+                 WHERE run_id = ?1 AND host_session_id > ?2
+                 ORDER BY host_session_id ASC
+                 LIMIT ?3",
+                &[
+                    sqlite_run_id(run_id),
+                    session_cursor.as_str().into(),
+                    page_limit.into(),
+                ],
+            )?;
+            if sessions.is_empty() {
+                break;
+            }
+            for row in &sessions {
+                let encoded_session: String =
+                    decode(row, 0, "host_journal_progress.host_session_id")?;
+                let session_id = HostSessionId::new(decode_journal_u64(
+                    "host_journal_progress.host_session_id",
+                    &encoded_session,
+                )?);
+                Self::validate_host_journal_session_invariants(
+                    connection,
+                    run_id,
+                    session_id,
+                    file_backed,
+                    page_limit,
+                )?;
+                session_cursor = encoded_session;
+            }
+        }
+
+        let archive_orphan = connection.query_with_params(
+            "SELECT archive.host_session_id, archive.journal_sequence
+             FROM host_journal_archive AS archive
+             LEFT JOIN host_journal_progress AS progress
+               ON progress.run_id = archive.run_id
+              AND progress.host_session_id = archive.host_session_id
+             LEFT JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = archive.run_id
+              AND ledger.host_session_id = archive.host_session_id
+              AND ledger.journal_sequence = archive.journal_sequence
+             WHERE archive.run_id = ?1
+               AND (progress.host_session_id IS NULL OR ledger.journal_sequence IS NULL)
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = archive_orphan.first() {
+            let session: String = decode(row, 0, "host_journal_archive.host_session_id")?;
+            let sequence: String = decode(row, 1, "host_journal_archive.journal_sequence")?;
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.identity",
+                reason: format!(
+                    "archive ({session}, {sequence}) has no matching progress and ledger rows"
+                ),
+            });
+        }
+        let ledger_orphan = connection.query_with_params(
+            "SELECT ledger.host_session_id, ledger.journal_sequence
+             FROM host_journal_batch_ledger AS ledger
+             LEFT JOIN host_journal_progress AS progress
+               ON progress.run_id = ledger.run_id
+              AND progress.host_session_id = ledger.host_session_id
+             LEFT JOIN host_journal_archive AS archive
+               ON archive.run_id = ledger.run_id
+              AND archive.host_session_id = ledger.host_session_id
+              AND archive.journal_sequence = ledger.journal_sequence
+             WHERE ledger.run_id = ?1
+               AND (progress.host_session_id IS NULL OR archive.journal_sequence IS NULL)
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = ledger_orphan.first() {
+            let session: String =
+                decode(row, 0, "host_journal_batch_ledger.host_session_id")?;
+            let sequence: String =
+                decode(row, 1, "host_journal_batch_ledger.journal_sequence")?;
+            return Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.identity",
+                reason: format!(
+                    "ledger ({session}, {sequence}) has no matching progress and archive rows"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_host_journal_session_invariants(
+        connection: &Connection,
+        run_id: RunId,
+        session_id: HostSessionId,
+        file_backed: bool,
+        page_limit: i64,
+    ) -> Result<(), StorageError> {
+        let session = encode_journal_u64(session_id.get());
+        let progress_rows = connection.query_with_params(
+            "SELECT admitted_journal_prefix, applied_journal_prefix,
+                    committed_volatile_journal_prefix, durable_journal_prefix,
+                    admitted_event_prefix, applied_event_prefix,
+                    committed_volatile_event_prefix, durable_event_prefix,
+                    shutdown_sequence
+             FROM host_journal_progress
+             WHERE run_id = ?1 AND host_session_id = ?2",
+            &[sqlite_run_id(run_id), session.as_str().into()],
+        )?;
+        let [progress_row] = progress_rows.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.host_session_id",
+                reason: format!(
+                    "run {run_id} session {} has {} progress rows during validation",
+                    session_id.get(),
+                    progress_rows.len()
+                ),
+            });
+        };
+        let progress = HostJournalProgress::decode(progress_row)?;
+        if progress.durable_journal > progress.committed_volatile_journal
+            || progress.committed_volatile_journal > progress.applied_journal
+            || progress.applied_journal > progress.admitted_journal
+            || progress.durable_event > progress.committed_volatile_event
+            || progress.committed_volatile_event > progress.applied_event
+            || progress.applied_event > progress.admitted_event
+            || progress.admitted_event > progress.admitted_journal
+            || progress.applied_event > progress.applied_journal
+            || progress.committed_volatile_event > progress.committed_volatile_journal
+            || progress.durable_event > progress.durable_journal
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress",
+                reason: format!(
+                    "session {} has inconsistent journal/event prefixes",
+                    session_id.get()
+                ),
+            });
+        }
+        if !file_backed && (progress.durable_journal != 0 || progress.durable_event != 0) {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.durable_journal_prefix",
+                reason: "a memory journal cannot contain durable prefixes".to_owned(),
+            });
+        }
+
+        let mut journal_cursor = String::new();
+        let mut last_journal = 0_u64;
+        let mut admitted_events = 0_u64;
+        let mut applied_events = 0_u64;
+        let mut committed_events = 0_u64;
+        let mut durable_events = 0_u64;
+        let mut observed_shutdown = None;
+        loop {
+            let rows = connection.query_with_params(
+                "SELECT archive.journal_sequence, archive.payload_version,
+                        archive.payload_digest,
+                        length(CAST(archive.payload_json AS BLOB)),
+                        ledger.scientific_event_sequence,
+                        ledger.persistence_batch_id, ledger.state
+                 FROM host_journal_archive AS archive
+                 JOIN host_journal_batch_ledger AS ledger
+                   ON ledger.run_id = archive.run_id
+                  AND ledger.host_session_id = archive.host_session_id
+                  AND ledger.journal_sequence = archive.journal_sequence
+                 WHERE archive.run_id = ?1 AND archive.host_session_id = ?2
+                   AND archive.journal_sequence > ?3
+                 ORDER BY archive.journal_sequence ASC
+                 LIMIT ?4",
+                &[
+                    sqlite_run_id(run_id),
+                    session.as_str().into(),
+                    journal_cursor.as_str().into(),
+                    page_limit.into(),
+                ],
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let encoded_journal: String =
+                    decode(row, 0, "host_journal_archive.journal_sequence")?;
+                let journal_sequence = decode_journal_u64(
+                    "host_journal_archive.journal_sequence",
+                    &encoded_journal,
+                )?;
+                let expected_journal = last_journal.checked_add(1).ok_or(
+                    StorageError::InvalidData {
+                        context: "host_journal_archive.journal_sequence",
+                        reason: "journal sequence space is exhausted".to_owned(),
+                    },
+                )?;
+                if journal_sequence != expected_journal
+                    || journal_sequence > progress.admitted_journal
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_archive.journal_sequence",
+                        reason: format!(
+                            "session {} expected journal {expected_journal}, found {journal_sequence} with admitted prefix {}",
+                            session_id.get(),
+                            progress.admitted_journal
+                        ),
+                    });
+                }
+                last_journal = journal_sequence;
+                journal_cursor = encoded_journal;
+
+                let payload_version: i64 =
+                    decode(row, 1, "host_journal_archive.payload_version")?;
+                if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_archive.payload_version",
+                        reason: format!(
+                            "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
+                        ),
+                    });
+                }
+                let payload_digest: String =
+                    decode(row, 2, "host_journal_archive.payload_digest")?;
+                let payload_bytes: i64 =
+                    decode(row, 3, "host_journal_archive.payload_json.length")?;
+                let payload_bytes = usize::try_from(payload_bytes).map_err(|error| {
+                    StorageError::InvalidData {
+                        context: "host_journal_archive.payload_json",
+                        reason: error.to_string(),
+                    }
+                })?;
+                if payload_bytes == 0 || payload_bytes > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_archive.payload_json",
+                        reason: format!(
+                            "payload has {payload_bytes} bytes outside the bounded 1..={MAX_HOST_JOURNAL_ARCHIVE_BYTES} range"
+                        ),
+                    });
+                }
+                let encoded_event: Option<String> =
+                    decode(row, 4, "host_journal_batch_ledger.scientific_event_sequence")?;
+                let event_sequence = encoded_event
+                    .as_deref()
+                    .map(|encoded| {
+                        decode_journal_u64(
+                            "host_journal_batch_ledger.scientific_event_sequence",
+                            encoded,
+                        )
+                        .map(EventSequence::new)
+                    })
+                    .transpose()?;
+                if let Some(event_sequence) = event_sequence {
+                    let expected_event = admitted_events.checked_add(1).ok_or(
+                        StorageError::InvalidData {
+                            context: "host_journal_batch_ledger.scientific_event_sequence",
+                            reason: "scientific-event sequence space is exhausted".to_owned(),
+                        },
+                    )?;
+                    if event_sequence.get() != expected_event {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_batch_ledger.scientific_event_sequence",
+                            reason: format!(
+                                "session {} expected event {expected_event}, found {}",
+                                session_id.get(),
+                                event_sequence.get()
+                            ),
+                        });
+                    }
+                    admitted_events = expected_event;
+                }
+                let linked_batch_raw: Option<i64> =
+                    decode(row, 5, "host_journal_batch_ledger.persistence_batch_id")?;
+                let linked_batch = linked_batch_raw
+                    .map(|raw| {
+                        checked_u64("host_journal_batch_ledger.persistence_batch_id", raw)
+                            .and_then(PersistenceBatchId::new)
+                    })
+                    .transpose()?;
+                let encoded_state: String =
+                    decode(row, 6, "host_journal_batch_ledger.state")?;
+                let state = HostJournalState::decode(&encoded_state)?;
+                let expected_state = if journal_sequence <= progress.durable_journal {
+                    HostJournalState::Durable
+                } else if journal_sequence <= progress.committed_volatile_journal {
+                    HostJournalState::CommittedVolatile
+                } else if journal_sequence <= progress.applied_journal {
+                    HostJournalState::Applied
+                } else {
+                    HostJournalState::Admitted
+                };
+                if state != expected_state {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_batch_ledger.state",
+                        reason: format!(
+                            "journal {journal_sequence} is {}, but progress requires {}",
+                            state.as_str(),
+                            expected_state.as_str()
+                        ),
+                    });
+                }
+                if event_sequence.is_some() {
+                    if state >= HostJournalState::Applied {
+                        applied_events += 1;
+                    }
+                    if state >= HostJournalState::CommittedVolatile {
+                        committed_events += 1;
+                    }
+                    if state >= HostJournalState::Durable {
+                        durable_events += 1;
+                    }
+                }
+
+                let payload_row = connection.query_row_with_params(
+                    "SELECT payload_json FROM host_journal_archive
+                     WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+                       AND length(CAST(payload_json AS BLOB)) = ?4",
+                    &[
+                        sqlite_run_id(run_id),
+                        session.as_str().into(),
+                        journal_cursor.as_str().into(),
+                        i64::try_from(payload_bytes)
+                            .map_err(|error| StorageError::InvalidData {
+                                context: "host_journal_archive.payload_json",
+                                reason: error.to_string(),
+                            })?
+                            .into(),
+                    ],
+                )?;
+                let payload_json: String =
+                    decode(&payload_row, 0, "host_journal_archive.payload_json")?;
+                let batch_id = JournalBatchId::new(session_id, journal_sequence);
+                let mut archive = HostJournalArchive::decode(
+                    &payload_json,
+                    &payload_digest,
+                    run_id,
+                    batch_id,
+                    MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+                )?;
+                if archive.event_sequence()? != event_sequence {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_batch_ledger.scientific_event_sequence",
+                        reason: "ledger event identity does not match its canonical archive"
+                            .to_owned(),
+                    });
+                }
+                if archive.is_shutdown() {
+                    if observed_shutdown.replace(journal_sequence).is_some() {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_progress.shutdown_sequence",
+                            reason: "more than one archive encodes a shutdown command".to_owned(),
+                        });
+                    }
+                }
+
+                let applied_tick = archive.applied().tick.0;
+                let persistence = archive.take_persistence();
+                if persistence.is_none() && linked_batch.is_some() {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_batch_ledger.persistence_batch_id",
+                        reason: format!(
+                            "journal {journal_sequence} links persistence without an archived payload"
+                        ),
+                    });
+                }
+                if persistence.is_some()
+                    && state >= HostJournalState::Applied
+                    && linked_batch.is_none()
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_batch_ledger.persistence_batch_id",
+                        reason: format!(
+                            "{} journal {journal_sequence} has archived persistence but no ledger link",
+                            state.as_str()
+                        ),
+                    });
+                }
+                if let (Some(persistence), Some(linked_batch)) =
+                    (persistence.as_ref(), linked_batch)
+                {
+                    let (_payload, expected_digest) =
+                        persistence.encode_outbox(run_id, applied_tick)?;
+                    let storage_rows = connection.query_with_params(
+                        "SELECT tick, payload_digest, state
+                         FROM storage_batch_ledger
+                         WHERE run_id = ?1 AND batch_id = ?2",
+                        &[
+                            sqlite_run_id(run_id),
+                            linked_batch.as_i64().into(),
+                        ],
+                    )?;
+                    let [storage_row] = storage_rows.as_slice() else {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_batch_ledger.persistence_batch_id",
+                            reason: format!(
+                                "linked persistence batch {} has {} ledger rows",
+                                linked_batch.get(),
+                                storage_rows.len()
+                            ),
+                        });
+                    };
+                    let storage_tick = checked_u64(
+                        "storage_batch_ledger.tick",
+                        decode(storage_row, 0, "storage_batch_ledger.tick")?,
+                    )?;
+                    let storage_digest: String =
+                        decode(storage_row, 1, "storage_batch_ledger.payload_digest")?;
+                    let storage_state: String =
+                        decode(storage_row, 2, "storage_batch_ledger.state")?;
+                    if storage_tick != applied_tick || storage_digest != expected_digest {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_batch_ledger.persistence_batch_id",
+                            reason: format!(
+                                "journal {journal_sequence} persistence link does not match its archived tick/digest"
+                            ),
+                        });
+                    }
+                    if !matches!(storage_state.as_str(), "admitted" | "applied" | "durable") {
+                        return Err(StorageError::InvalidData {
+                            context: "storage_batch_ledger.state",
+                            reason: format!("unknown persistence state {storage_state:?}"),
+                        });
+                    }
+                    if (state >= HostJournalState::Applied && storage_state == "admitted")
+                        || (state == HostJournalState::Durable && storage_state != "durable")
+                        || (file_backed
+                            && state >= HostJournalState::CommittedVolatile
+                            && storage_state != "durable")
+                    {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_batch_ledger.persistence_batch_id",
+                            reason: format!(
+                                "host state {} is inconsistent with persistence state {storage_state:?}",
+                                state.as_str()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        if last_journal != progress.admitted_journal
+            || admitted_events != progress.admitted_event
+            || applied_events != progress.applied_event
+            || committed_events != progress.committed_volatile_event
+            || durable_events != progress.durable_event
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress",
+                reason: format!(
+                    "session {} observed journal/events {last_journal}/{admitted_events}/{applied_events}/{committed_events}/{durable_events}, progress records {}/{}/{}/{}/{}",
+                    session_id.get(),
+                    progress.admitted_journal,
+                    progress.admitted_event,
+                    progress.applied_event,
+                    progress.committed_volatile_event,
+                    progress.durable_event
+                ),
+            });
+        }
+        match (progress.shutdown_sequence, observed_shutdown) {
+            (None, None) => {}
+            (Some(marker), Some(observed))
+                if marker == observed && marker == progress.admitted_journal => {}
+            (marker, observed) => {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_progress.shutdown_sequence",
+                    reason: format!(
+                        "shutdown marker {marker:?}, archive {observed:?}, and final admitted journal {} disagree",
+                        progress.admitted_journal
+                    ),
+                });
+            }
+        }
+
+        let archive_without_ledger = connection.query_with_params(
+            "SELECT archive.journal_sequence
+             FROM host_journal_archive AS archive
+             LEFT JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = archive.run_id
+              AND ledger.host_session_id = archive.host_session_id
+              AND ledger.journal_sequence = archive.journal_sequence
+             WHERE archive.run_id = ?1 AND archive.host_session_id = ?2
+               AND ledger.journal_sequence IS NULL
+             LIMIT 1",
+            &[sqlite_run_id(run_id), session.as_str().into()],
+        )?;
+        let ledger_without_archive = connection.query_with_params(
+            "SELECT ledger.journal_sequence
+             FROM host_journal_batch_ledger AS ledger
+             LEFT JOIN host_journal_archive AS archive
+               ON archive.run_id = ledger.run_id
+              AND archive.host_session_id = ledger.host_session_id
+              AND archive.journal_sequence = ledger.journal_sequence
+             WHERE ledger.run_id = ?1 AND ledger.host_session_id = ?2
+               AND archive.journal_sequence IS NULL
+             LIMIT 1",
+            &[sqlite_run_id(run_id), session.as_str().into()],
+        )?;
+        if !archive_without_ledger.is_empty() || !ledger_without_archive.is_empty() {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.identity",
+                reason: "archive and ledger identities are not one-to-one".to_owned(),
             });
         }
         Ok(())
@@ -6695,6 +7787,682 @@ impl Storage {
         self.validate_new_birth_identities(prepared)?;
         self.validate_new_death_uids(prepared)?;
         self.validate_new_ancestry_relationships(prepared)
+    }
+
+    fn load_host_journal_progress(
+        &self,
+        session_id: HostSessionId,
+    ) -> Result<Option<HostJournalProgress>, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT admitted_journal_prefix, applied_journal_prefix,
+                    committed_volatile_journal_prefix, durable_journal_prefix,
+                    admitted_event_prefix, applied_event_prefix,
+                    committed_volatile_event_prefix, durable_event_prefix,
+                    shutdown_sequence
+             FROM host_journal_progress
+             WHERE run_id = ?1 AND host_session_id = ?2",
+            &[
+                sqlite_run_id(self.run_id),
+                encode_journal_u64(session_id.get()).as_str().into(),
+            ],
+        )?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => HostJournalProgress::decode(row).map(Some),
+            rows => Err(StorageError::InvalidData {
+                context: "host_journal_progress.host_session_id",
+                reason: format!(
+                    "run {} session {} has {} progress rows",
+                    self.run_id,
+                    session_id.get(),
+                    rows.len()
+                ),
+            }),
+        }
+    }
+
+    fn register_host_journal_session(
+        &self,
+        session_id: HostSessionId,
+    ) -> Result<(), StorageError> {
+        if let Some(progress) = self.load_host_journal_progress(session_id)? {
+            if progress.admitted_journal == 0
+                && progress.applied_journal == 0
+                && progress.committed_volatile_journal == 0
+                && progress.durable_journal == 0
+                && progress.admitted_event == 0
+                && progress.applied_event == 0
+                && progress.committed_volatile_event == 0
+                && progress.durable_event == 0
+                && progress.shutdown_sequence.is_none()
+            {
+                return Ok(());
+            }
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.host_session_id",
+                reason: format!(
+                    "host session {} already has admitted journal history and cannot restart at sequence one",
+                    session_id.get()
+                ),
+            });
+        }
+
+        let session_count = self.connection()?.query_row_with_params(
+            "SELECT COUNT(*) FROM host_journal_progress WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let session_count: i64 = decode(
+            &session_count,
+            0,
+            "host_journal_progress.session_count",
+        )?;
+        if session_count >= i64::try_from(DEFAULT_COMMAND_CAPACITY).map_err(|error| {
+            StorageError::InvalidData {
+                context: "host_journal_progress.session_count",
+                reason: error.to_string(),
+            }
+        })? {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.session_count",
+                reason: format!(
+                    "run {} already retains the bounded maximum of {DEFAULT_COMMAND_CAPACITY} host journal sessions",
+                    self.run_id
+                ),
+            });
+        }
+
+        let zero = encode_journal_u64(0);
+        let session = encode_journal_u64(session_id.get());
+        execute_transaction_with_retry(self.connection()?, |transaction| {
+            let inserted = transaction.execute_with_params(
+                "INSERT INTO host_journal_progress (
+                    run_id, host_session_id,
+                    admitted_journal_prefix, applied_journal_prefix,
+                    committed_volatile_journal_prefix, durable_journal_prefix,
+                    admitted_event_prefix, applied_event_prefix,
+                    committed_volatile_event_prefix, durable_event_prefix,
+                    shutdown_sequence
+                 ) VALUES (?1, ?2, ?3, ?3, ?3, ?3, ?3, ?3, ?3, ?3, NULL)",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    zero.as_str().into(),
+                ],
+            )?;
+            if inserted != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "host-journal registration inserted {inserted} progress rows"
+                )));
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn admit_host_journal_archive(
+        &self,
+        batch: &JournalBatch,
+        prepared: &PreparedHostJournalArchive,
+    ) -> Result<bool, StorageError> {
+        let batch_id = batch.id();
+        let session_id = batch_id.session_id();
+        let sequence = batch_id.sequence();
+        let event_sequence = batch.scientific_event_sequence().map(EventSequence::get);
+        if sequence == 0 || event_sequence == Some(0) {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.journal_sequence",
+                reason: "journal and scientific-event sequences must be nonzero".to_owned(),
+            });
+        }
+        let session = encode_journal_u64(session_id.get());
+        let journal_sequence = encode_journal_u64(sequence);
+        let existing = self.connection()?.query_with_params(
+            "SELECT archive.payload_version, archive.payload_digest, archive.payload_json,
+                    ledger.state
+             FROM host_journal_archive AS archive
+             LEFT JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = archive.run_id
+              AND ledger.host_session_id = archive.host_session_id
+              AND ledger.journal_sequence = archive.journal_sequence
+             WHERE archive.run_id = ?1 AND archive.host_session_id = ?2
+               AND archive.journal_sequence = ?3",
+            &[
+                sqlite_run_id(self.run_id),
+                session.as_str().into(),
+                journal_sequence.as_str().into(),
+            ],
+        )?;
+        if let Some(row) = existing.first() {
+            if existing.len() != 1 {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.journal_sequence",
+                    reason: format!("archive identity has {} rows", existing.len()),
+                });
+            }
+            let payload_version: i64 = decode(row, 0, "host_journal_archive.payload_version")?;
+            let payload_digest: String = decode(row, 1, "host_journal_archive.payload_digest")?;
+            let payload_json: String = decode(row, 2, "host_journal_archive.payload_json")?;
+            let state: Option<String> = decode(row, 3, "host_journal_batch_ledger.state")?;
+            if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION)
+                || payload_digest != prepared.payload_digest
+                || payload_json != prepared.payload_json
+                || state.is_none()
+            {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.payload_digest",
+                    reason: format!(
+                        "journal batch {batch_id:?} was already admitted with different canonical evidence"
+                    ),
+                });
+            }
+            HostJournalState::decode(state.as_deref().expect("checked above"))?;
+            return Ok(false);
+        }
+
+        let progress = self.load_host_journal_progress(session_id)?.ok_or(
+            StorageError::InvalidData {
+                context: "host_journal_progress.host_session_id",
+                reason: format!("host session {} was not registered", session_id.get()),
+            },
+        )?;
+        let previous_sequence = sequence - 1;
+        if progress.admitted_journal != previous_sequence {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.admitted_journal_prefix",
+                reason: format!(
+                    "journal batch {sequence} does not follow admitted prefix {}",
+                    progress.admitted_journal
+                ),
+            });
+        }
+        if let Some(event_sequence) = event_sequence {
+            let previous_event = event_sequence - 1;
+            if progress.admitted_event != previous_event {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_progress.admitted_event_prefix",
+                    reason: format!(
+                        "scientific event {event_sequence} does not follow admitted prefix {}",
+                        progress.admitted_event
+                    ),
+                });
+            }
+        }
+        let is_shutdown = batch
+            .command()
+            .is_some_and(|envelope| matches!(&envelope.command, HostCommand::Shutdown));
+        if progress.shutdown_sequence.is_some() {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.shutdown_sequence",
+                reason: "journal admission continued after the shutdown batch".to_owned(),
+            });
+        }
+
+        let event = event_sequence.map(encode_journal_u64);
+        let previous_event = encode_journal_u64(progress.admitted_event);
+        let previous_journal = encode_journal_u64(previous_sequence);
+        execute_transaction_with_retry(self.connection()?, |transaction| {
+            let archive_rows = transaction.execute_with_params(
+                "INSERT INTO host_journal_archive (
+                    run_id, host_session_id, journal_sequence,
+                    payload_version, payload_digest, payload_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    journal_sequence.as_str().into(),
+                    i64::from(HOST_JOURNAL_ARCHIVE_VERSION).into(),
+                    prepared.payload_digest.as_str().into(),
+                    prepared.payload_json.as_str().into(),
+                ],
+            )?;
+            let ledger_rows = transaction.execute_with_params(
+                "INSERT INTO host_journal_batch_ledger (
+                    run_id, host_session_id, journal_sequence,
+                    scientific_event_sequence, persistence_batch_id, state
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, 'admitted')",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    journal_sequence.as_str().into(),
+                    sqlite_optional_text(event.as_deref()),
+                ],
+            )?;
+            #[cfg(test)]
+            if take_host_journal_fault(
+                &self.path,
+                HostJournalFaultPoint::AdmissionBeforeProgress,
+            ) {
+                return Err(FrankenError::Internal(
+                    "injected host-journal admission fault before progress update".to_owned(),
+                ));
+            }
+            let progress_rows = transaction.execute_with_params(
+                "UPDATE host_journal_progress
+                 SET admitted_journal_prefix = ?1,
+                     admitted_event_prefix = CASE WHEN ?2 IS NULL
+                         THEN admitted_event_prefix ELSE ?2 END,
+                     shutdown_sequence = CASE WHEN ?3 = 1 THEN ?1 ELSE shutdown_sequence END
+                 WHERE run_id = ?4 AND host_session_id = ?5
+                   AND admitted_journal_prefix = ?6
+                   AND (?2 IS NULL OR admitted_event_prefix = ?7)
+                   AND (?3 = 0 OR shutdown_sequence IS NULL)",
+                &[
+                    journal_sequence.as_str().into(),
+                    sqlite_optional_text(event.as_deref()),
+                    sqlite_bool(is_shutdown),
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    previous_journal.as_str().into(),
+                    previous_event.as_str().into(),
+                ],
+            )?;
+            if archive_rows != 1 || ledger_rows != 1 || progress_rows != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "host-journal admission changed archive/ledger/progress rows {archive_rows}/{ledger_rows}/{progress_rows}"
+                )));
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    fn link_host_journal_persistence(
+        &self,
+        batch_id: JournalBatchId,
+        persistence_batch_id: PersistenceBatchId,
+    ) -> Result<(), StorageError> {
+        let session = encode_journal_u64(batch_id.session_id().get());
+        let sequence = encode_journal_u64(batch_id.sequence());
+        let rows = self.connection()?.query_with_params(
+            "SELECT persistence_batch_id
+             FROM host_journal_batch_ledger
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            &[
+                sqlite_run_id(self.run_id),
+                session.as_str().into(),
+                sequence.as_str().into(),
+            ],
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.persistence_batch_id",
+                reason: format!("journal batch {batch_id:?} has {} ledger rows", rows.len()),
+            });
+        };
+        let existing: Option<i64> = decode(row, 0, "host_journal_batch_ledger.persistence_batch_id")?;
+        if let Some(existing) = existing {
+            if existing == persistence_batch_id.as_i64() {
+                return Ok(());
+            }
+            return Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.persistence_batch_id",
+                reason: format!(
+                    "journal batch {batch_id:?} links persistence batch {existing}, not {}",
+                    persistence_batch_id.get()
+                ),
+            });
+        }
+        let updated = self.connection()?.execute_with_params(
+            "UPDATE host_journal_batch_ledger
+             SET persistence_batch_id = ?1
+             WHERE run_id = ?2 AND host_session_id = ?3 AND journal_sequence = ?4
+               AND persistence_batch_id IS NULL",
+            &[
+                persistence_batch_id.as_i64().into(),
+                sqlite_run_id(self.run_id),
+                session.as_str().into(),
+                sequence.as_str().into(),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.persistence_batch_id",
+                reason: format!("link updated {updated} rows for journal batch {batch_id:?}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn host_journal_state(
+        &self,
+        batch_id: JournalBatchId,
+    ) -> Result<HostJournalState, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT state FROM host_journal_batch_ledger
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            &[
+                sqlite_run_id(self.run_id),
+                encode_journal_u64(batch_id.session_id().get())
+                    .as_str()
+                    .into(),
+                encode_journal_u64(batch_id.sequence()).as_str().into(),
+            ],
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.state",
+                reason: format!("journal batch {batch_id:?} has {} ledger rows", rows.len()),
+            });
+        };
+        let state: String = decode(row, 0, "host_journal_batch_ledger.state")?;
+        HostJournalState::decode(&state)
+    }
+
+    fn advance_host_journal_state(
+        &self,
+        batch_id: JournalBatchId,
+        event_sequence: Option<EventSequence>,
+        target: HostJournalState,
+    ) -> Result<(), StorageError> {
+        let previous = match target {
+            HostJournalState::Admitted => return Ok(()),
+            HostJournalState::Applied => HostJournalState::Admitted,
+            HostJournalState::CommittedVolatile => HostJournalState::Applied,
+            HostJournalState::Durable => HostJournalState::CommittedVolatile,
+        };
+        let current = self.host_journal_state(batch_id)?;
+        if current >= target {
+            return Ok(());
+        }
+        if current != previous {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.state",
+                reason: format!(
+                    "journal batch {batch_id:?} cannot transition from {} to {}",
+                    current.as_str(),
+                    target.as_str()
+                ),
+            });
+        }
+        let progress = self
+            .load_host_journal_progress(batch_id.session_id())?
+            .ok_or(StorageError::InvalidData {
+                context: "host_journal_progress.host_session_id",
+                reason: "journal ledger has no progress parent".to_owned(),
+            })?;
+        let (target_journal, target_event) = progress.prefixes(target);
+        let previous_journal = batch_id.sequence().checked_sub(1).ok_or(
+            StorageError::InvalidData {
+                context: "host_journal_batch_ledger.journal_sequence",
+                reason: "zero journal sequence cannot advance a prefix".to_owned(),
+            },
+        )?;
+        if target_journal != previous_journal {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_progress.journal_prefix",
+                reason: format!(
+                    "{} journal prefix is {target_journal}, expected {previous_journal}",
+                    target.as_str()
+                ),
+            });
+        }
+        let event = event_sequence.map(EventSequence::get);
+        if let Some(event) = event {
+            let previous_event = event.checked_sub(1).ok_or(StorageError::InvalidData {
+                context: "host_journal_batch_ledger.scientific_event_sequence",
+                reason: "zero scientific-event sequence cannot advance a prefix".to_owned(),
+            })?;
+            if target_event != previous_event {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_progress.event_prefix",
+                    reason: format!(
+                        "{} event prefix is {target_event}, expected {previous_event}",
+                        target.as_str()
+                    ),
+                });
+            }
+        }
+
+        let session = encode_journal_u64(batch_id.session_id().get());
+        let journal = encode_journal_u64(batch_id.sequence());
+        let prior_journal = encode_journal_u64(previous_journal);
+        let event = event.map(encode_journal_u64);
+        let prior_event = encode_journal_u64(target_event);
+        let progress_sql = match target {
+            HostJournalState::Admitted => unreachable!("handled above"),
+            HostJournalState::Applied => {
+                "UPDATE host_journal_progress
+                 SET applied_journal_prefix = ?1,
+                     applied_event_prefix = CASE WHEN ?2 IS NULL THEN applied_event_prefix ELSE ?2 END
+                 WHERE run_id = ?3 AND host_session_id = ?4
+                   AND applied_journal_prefix = ?5
+                   AND (?2 IS NULL OR applied_event_prefix = ?6)"
+            }
+            HostJournalState::CommittedVolatile => {
+                "UPDATE host_journal_progress
+                 SET committed_volatile_journal_prefix = ?1,
+                     committed_volatile_event_prefix = CASE WHEN ?2 IS NULL
+                         THEN committed_volatile_event_prefix ELSE ?2 END
+                 WHERE run_id = ?3 AND host_session_id = ?4
+                   AND committed_volatile_journal_prefix = ?5
+                   AND (?2 IS NULL OR committed_volatile_event_prefix = ?6)"
+            }
+            HostJournalState::Durable => {
+                "UPDATE host_journal_progress
+                 SET durable_journal_prefix = ?1,
+                     durable_event_prefix = CASE WHEN ?2 IS NULL THEN durable_event_prefix ELSE ?2 END
+                 WHERE run_id = ?3 AND host_session_id = ?4
+                   AND durable_journal_prefix = ?5
+                   AND (?2 IS NULL OR durable_event_prefix = ?6)"
+            }
+        };
+        execute_transaction_with_retry(self.connection()?, |transaction| {
+            let ledger_rows = transaction.execute_with_params(
+                "UPDATE host_journal_batch_ledger
+                 SET state = ?1
+                 WHERE run_id = ?2 AND host_session_id = ?3 AND journal_sequence = ?4
+                   AND state = ?5",
+                &[
+                    target.as_str().into(),
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    journal.as_str().into(),
+                    previous.as_str().into(),
+                ],
+            )?;
+            let progress_rows = transaction.execute_with_params(
+                progress_sql,
+                &[
+                    journal.as_str().into(),
+                    sqlite_optional_text(event.as_deref()),
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    prior_journal.as_str().into(),
+                    prior_event.as_str().into(),
+                ],
+            )?;
+            if ledger_rows != 1 || progress_rows != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "host-journal {} transition changed ledger/progress rows {ledger_rows}/{progress_rows}",
+                    target.as_str()
+                )));
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn complete_host_journal_archive(
+        &mut self,
+        batch_id: JournalBatchId,
+        event_sequence: Option<EventSequence>,
+        applied_tick: u64,
+        persistence: Option<StorageBuffer>,
+    ) -> Result<JournalReceiptState, StorageError> {
+        if let Some(prepared) = persistence {
+            let (receipt, newly_admitted) = self.stage_outbox(applied_tick, &prepared)?;
+            self.link_host_journal_persistence(batch_id, receipt.batch_id)?;
+            if newly_admitted {
+                self.enqueue_staged(receipt.batch_id, prepared)?;
+            }
+            #[cfg(test)]
+            fail_at_host_journal_fault(
+                &self.path,
+                HostJournalFaultPoint::BeforePersistenceFlush,
+                "host_journal_batch_ledger.persistence_flush",
+            )?;
+            self.flush()?;
+        }
+        self.advance_host_journal_state(batch_id, event_sequence, HostJournalState::Applied)?;
+        if self
+            .connection()?
+            .query_row_with_params(
+                "SELECT persistence_batch_id FROM host_journal_batch_ledger
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                &[
+                    sqlite_run_id(self.run_id),
+                    encode_journal_u64(batch_id.session_id().get())
+                        .as_str()
+                        .into(),
+                    encode_journal_u64(batch_id.sequence()).as_str().into(),
+                ],
+            )?
+            .get_typed::<Option<i64>>(0)?
+            .is_some()
+        {
+            self.finalize_applied_outbox()?;
+        }
+        self.advance_host_journal_state(
+            batch_id,
+            event_sequence,
+            HostJournalState::CommittedVolatile,
+        )?;
+        if self.file_backed() {
+            #[cfg(test)]
+            fail_at_host_journal_fault(
+                &self.path,
+                HostJournalFaultPoint::BeforeDurableMarker,
+                "host_journal_batch_ledger.state",
+            )?;
+            self.advance_host_journal_state(
+                batch_id,
+                event_sequence,
+                HostJournalState::Durable,
+            )?;
+            Ok(JournalReceiptState::Durable)
+        } else {
+            Ok(JournalReceiptState::CommittedVolatile)
+        }
+    }
+
+    fn recover_host_journal_archives(&mut self) -> Result<(), StorageError> {
+        loop {
+            let terminal_predicate = if self.file_backed() {
+                "ledger.state <> 'durable'"
+            } else {
+                "ledger.state NOT IN ('committed_volatile', 'durable')"
+            };
+            let metadata_sql = format!(
+                "SELECT archive.host_session_id, archive.journal_sequence,
+                        archive.payload_version, archive.payload_digest,
+                        length(CAST(archive.payload_json AS BLOB)), ledger.scientific_event_sequence,
+                        ledger.state
+                 FROM host_journal_archive AS archive
+                 JOIN host_journal_batch_ledger AS ledger
+                   ON ledger.run_id = archive.run_id
+                  AND ledger.host_session_id = archive.host_session_id
+                  AND ledger.journal_sequence = archive.journal_sequence
+                 WHERE archive.run_id = ?1 AND {terminal_predicate}
+                 ORDER BY archive.host_session_id ASC, archive.journal_sequence ASC
+                 LIMIT 1"
+            );
+            let metadata = self
+                .connection()?
+                .query_with_params(&metadata_sql, &[sqlite_run_id(self.run_id)])?;
+            let Some(row) = metadata.first() else {
+                break;
+            };
+            let session: String = decode(row, 0, "host_journal_archive.host_session_id")?;
+            let sequence: String = decode(row, 1, "host_journal_archive.journal_sequence")?;
+            let payload_version: i64 = decode(row, 2, "host_journal_archive.payload_version")?;
+            if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.payload_version",
+                    reason: format!(
+                        "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
+                    ),
+                });
+            }
+            let payload_digest: String = decode(row, 3, "host_journal_archive.payload_digest")?;
+            let payload_bytes: i64 = decode(row, 4, "host_journal_archive.payload_json.length")?;
+            let payload_bytes = usize::try_from(payload_bytes).map_err(|error| {
+                StorageError::InvalidData {
+                    context: "host_journal_archive.payload_json",
+                    reason: error.to_string(),
+                }
+            })?;
+            if payload_bytes > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.payload_json",
+                    reason: format!(
+                        "payload has {payload_bytes} bytes, exceeding the {MAX_HOST_JOURNAL_ARCHIVE_BYTES}-byte recovery bound"
+                    ),
+                });
+            }
+            let ledger_event: Option<String> =
+                decode(row, 5, "host_journal_batch_ledger.scientific_event_sequence")?;
+            let ledger_state: String = decode(row, 6, "host_journal_batch_ledger.state")?;
+            HostJournalState::decode(&ledger_state)?;
+            let batch_id = JournalBatchId::new(
+                HostSessionId::new(decode_journal_u64(
+                    "host_journal_archive.host_session_id",
+                    &session,
+                )?),
+                decode_journal_u64("host_journal_archive.journal_sequence", &sequence)?,
+            );
+            let payload_row = self.connection()?.query_row_with_params(
+                "SELECT payload_json FROM host_journal_archive
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+                   AND length(CAST(payload_json AS BLOB)) = ?4",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    sequence.as_str().into(),
+                    i64::try_from(payload_bytes)
+                        .map_err(|error| StorageError::InvalidData {
+                            context: "host_journal_archive.payload_json",
+                            reason: error.to_string(),
+                        })?
+                        .into(),
+                ],
+            )?;
+            let payload_json: String =
+                decode(&payload_row, 0, "host_journal_archive.payload_json")?;
+            let mut archive = HostJournalArchive::decode(
+                &payload_json,
+                &payload_digest,
+                self.run_id,
+                batch_id,
+                MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+            )?;
+            let archive_event = archive.event_sequence()?;
+            let ledger_event = ledger_event
+                .as_deref()
+                .map(|encoded| {
+                    decode_journal_u64(
+                        "host_journal_batch_ledger.scientific_event_sequence",
+                        encoded,
+                    )
+                    .map(EventSequence::new)
+                })
+                .transpose()?;
+            if archive_event != ledger_event {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.scientific_event_sequence",
+                    reason: "ledger event identity does not match its canonical archive"
+                        .to_owned(),
+                });
+            }
+            let applied_tick = archive.applied().tick.0;
+            let persistence = archive.take_persistence();
+            self.complete_host_journal_archive(
+                batch_id,
+                archive_event,
+                applied_tick,
+                persistence,
+            )?;
+        }
+        Ok(())
     }
 
     fn stage_outbox(
@@ -7826,6 +9594,16 @@ enum StorageCommand {
         permit: InFlightPermit,
         reply: xchan::Sender<Result<AdmissionReceipt, StorageWorkerError>>,
     },
+    RegisterJournal {
+        session_id: HostSessionId,
+        options: StorageJournalOptions,
+        receipts: xchan::Sender<JournalReceipt>,
+        publisher: JournalReaderPublisher,
+        reply: xchan::Sender<Result<(), StorageError>>,
+    },
+    JournalAdmit {
+        batch: Arc<JournalBatch>,
+    },
     Flush {
         reply: xchan::Sender<Result<FlushReceipt, StorageWorkerError>>,
     },
@@ -7928,6 +9706,13 @@ struct WorkerState {
     /// permit beside its admitted batch makes every terminal return and panic
     /// release the outstanding total automatically when `WorkerState` drops.
     pending_permits: Vec<(PersistenceBatchId, InFlightPermit)>,
+    journal_sessions: BTreeMap<HostSessionId, WorkerJournalSession>,
+}
+
+struct WorkerJournalSession {
+    receipts: Option<xchan::Sender<JournalReceipt>>,
+    publisher: JournalReaderPublisher,
+    maximum_archive_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -8963,6 +10748,132 @@ impl StoragePipeline {
         self.sink.clone()
     }
 
+    /// Register one host session and return its bounded nonblocking journal adapter.
+    ///
+    /// Registration performs only bounded metadata work on the storage owner thread. Journal
+    /// admission itself remains a `try_send` operation; terminal commitment arrives later through
+    /// [`scriptbots_runtime::JournalPort::poll_receipts`].
+    pub fn journal_port(
+        &self,
+        session_id: HostSessionId,
+        options: StorageJournalOptions,
+    ) -> Result<StorageJournalPort, StorageError> {
+        let options = options.validate().map_err(|reason| StorageError::InvalidData {
+            context: "storage.journal_options",
+            reason: reason.to_owned(),
+        })?;
+        if options.max_event_page_bytes > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
+            return Err(StorageError::InvalidData {
+                context: "storage.journal_options.max_event_page_bytes",
+                reason: format!(
+                    "{} exceeds the recovery-safe {MAX_HOST_JOURNAL_ARCHIVE_BYTES}-byte archive maximum",
+                    options.max_event_page_bytes
+                ),
+            });
+        }
+
+        let (backend, shutdown_requirement) = if self.sink.path.as_ref() == ":memory:" {
+            (
+                JournalReaderBackend::Memory,
+                ShutdownCommitRequirement::CommittedVolatile,
+            )
+        } else {
+            let lease = Arc::new(ExistingStorageLease::open(&self.sink.path)?);
+            (
+                JournalReaderBackend::File {
+                    path: Arc::clone(&self.sink.path),
+                    run_id: self.sink.run_id,
+                    lease,
+                },
+                ShutdownCommitRequirement::Durable,
+            )
+        };
+        let publisher = JournalReaderPublisher::new(session_id, backend, options);
+        let (receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
+        let (reply_tx, reply_rx) = xchan::bounded(1);
+        let enqueue_deadline = Instant::now() + self.sink.deadlines.command_enqueue;
+        let admission = lock_admission_gate_until(
+            &self.sink.admission,
+            &self.sink.path,
+            AdmissionGateWait {
+                operation: StorageOperation::Admit,
+                tick: None,
+                commit_state: FailureCommitState::NotAdmitted,
+                deadline: enqueue_deadline,
+                waited: self.sink.deadlines.command_enqueue,
+                recover_poison: false,
+            },
+        )
+        .map_err(StorageError::Worker)?;
+        if !admission.open {
+            return Err(StorageError::Closed);
+        }
+        let command = StorageCommand::RegisterJournal {
+            session_id,
+            options,
+            receipts: receipt_tx,
+            publisher: publisher.clone(),
+            reply: reply_tx,
+        };
+        let send_result = self.sink.tx.send_deadline(command, enqueue_deadline);
+        drop(admission);
+        match send_result {
+            Ok(()) => {}
+            Err(xchan::SendTimeoutError::Timeout(_)) => {
+                return Err(StorageError::Worker(StorageWorkerError::Timeout {
+                    operation: StorageOperation::Admit,
+                    phase: StorageWaitPhase::CommandEnqueue,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    waited: self.sink.deadlines.command_enqueue,
+                    commit_state: FailureCommitState::NotAdmitted,
+                }));
+            }
+            Err(xchan::SendTimeoutError::Disconnected(_)) => {
+                return Err(StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Admit,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::NotAdmitted,
+                    detail: "storage worker disconnected during host-journal registration"
+                        .to_owned(),
+                }));
+            }
+        }
+        match reply_rx.recv_deadline(Instant::now() + self.sink.deadlines.admission_ack) {
+            Ok(Ok(())) => Ok(StorageJournalPort::new(
+                session_id,
+                self.sink.tx.clone(),
+                Arc::clone(&self.sink.admission),
+                receipt_rx,
+                &publisher,
+                options,
+                shutdown_requirement,
+            )),
+            Ok(Err(error)) => Err(error),
+            Err(xchan::RecvTimeoutError::Timeout) => {
+                Err(StorageError::Worker(StorageWorkerError::Timeout {
+                    operation: StorageOperation::Admit,
+                    phase: StorageWaitPhase::Acknowledgement,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    waited: self.sink.deadlines.admission_ack,
+                    commit_state: FailureCommitState::Indeterminate,
+                }))
+            }
+            Err(xchan::RecvTimeoutError::Disconnected) => {
+                Err(StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Admit,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: "storage worker exited before host-journal registration acknowledgement"
+                        .to_owned(),
+                }))
+            }
+        }
+    }
+
     /// Admit a persistence batch to the bounded worker queue.
     /// Set the ceilings this pipeline will admit.
     ///
@@ -9487,6 +11398,197 @@ fn storage_worker(
                         let _ = reply.send(Err(worker_error));
                         storage.abandon_after_error();
                         return Some(terminal_error);
+                    }
+                }
+            }
+            StorageCommand::RegisterJournal {
+                session_id,
+                options,
+                receipts,
+                publisher,
+                reply,
+            } => {
+                let mut installed = false;
+                let result = if state.journal_sessions.contains_key(&session_id) {
+                    Err(StorageError::InvalidData {
+                        context: "host_journal_progress.host_session_id",
+                        reason: format!(
+                            "host session {} already has an active journal port",
+                            session_id.get()
+                        ),
+                    })
+                } else if state.journal_sessions.len() >= DEFAULT_COMMAND_CAPACITY {
+                    Err(StorageError::InvalidData {
+                        context: "host_journal_progress.host_session_id",
+                        reason: format!(
+                            "storage worker already retains the bounded maximum of {DEFAULT_COMMAND_CAPACITY} host journal sessions"
+                        ),
+                    })
+                } else {
+                    storage
+                        .register_host_journal_session(session_id)
+                        .map(|()| {
+                            publisher.install_recovered_index(None, VecDeque::new());
+                            state.journal_sessions.insert(
+                                session_id,
+                                WorkerJournalSession {
+                                    receipts: Some(receipts),
+                                    publisher,
+                                    maximum_archive_bytes: options.max_event_page_bytes,
+                                },
+                            );
+                            installed = true;
+                        })
+                };
+                if reply.send(result).is_err() && installed {
+                    state.journal_sessions.remove(&session_id);
+                }
+            }
+            StorageCommand::JournalAdmit { batch } => {
+                let batch_id = batch.id();
+                let session_id = batch_id.session_id();
+                let tick = Some(batch.applied().tick.0);
+                let Some(session) = state.journal_sessions.get(&session_id) else {
+                    warn!(
+                        path = %path,
+                        ?batch_id,
+                        "discarding a queued host-journal batch after its session was cancelled"
+                    );
+                    continue;
+                };
+                let receipts = session.receipts.clone();
+                let publisher = session.publisher.clone();
+                let maximum_archive_bytes = session.maximum_archive_bytes;
+                let pending_analytics = batch
+                    .persistence()
+                    .map(|persistence| PendingAnalytics::from_batch(persistence))
+                    .transpose();
+                let completed = pending_analytics.and_then(|pending| {
+                    let mut prepared =
+                        prepare_host_journal_archive(run_id, &batch, maximum_archive_bytes)?;
+                    storage.admit_host_journal_archive(&batch, &prepared)?;
+                    #[cfg(test)]
+                    fail_at_host_journal_fault(
+                        &path,
+                        HostJournalFaultPoint::AfterArchiveBeforeApplication,
+                        "host_journal_archive.recovery",
+                    )?;
+                    let receipt_state = storage.complete_host_journal_archive(
+                        batch_id,
+                        batch.scientific_event_sequence(),
+                        batch.applied().tick.0,
+                        prepared.persistence.take(),
+                    )?;
+                    Ok((pending, receipt_state))
+                });
+                match completed {
+                    Ok((pending, receipt_state)) => {
+                        let publication_result = (|| {
+                            #[cfg(test)]
+                            fail_at_host_journal_fault(
+                                &path,
+                                HostJournalFaultPoint::BeforePublication,
+                                "host_journal_reader.publication",
+                            )?;
+                            publisher.publish(&batch, &receipt_state)?;
+                            #[cfg(test)]
+                            fail_at_host_journal_fault(
+                                &path,
+                                HostJournalFaultPoint::AfterPublicationBeforeReceipt,
+                                "host_journal_receipt.publication",
+                            )?;
+                            Ok::<(), StorageError>(())
+                        })();
+                        let mut cancel_receipts = publication_result.is_err();
+                        if publication_result.is_ok()
+                            && let Some(receipts) = receipts.as_ref()
+                        {
+                            let receipt = JournalReceipt::new(batch_id, receipt_state);
+                            match receipts.try_send(receipt) {
+                                Ok(()) => {}
+                                Err(xchan::TrySendError::Disconnected(_receipt)) => {
+                                    cancel_receipts = true;
+                                }
+                                Err(xchan::TrySendError::Full(_receipt)) => {
+                                    let worker_error = StorageWorkerError::Channel {
+                                        operation: StorageOperation::Persist,
+                                        path: path.clone(),
+                                        tick,
+                                        commit_state: FailureCommitState::Committed,
+                                        detail: "terminal host-journal receipt lane exceeded its admission bound"
+                                            .to_owned(),
+                                    };
+                                    analytics.publish_worker_error(&worker_error, true);
+                                    storage.abandon_after_error();
+                                    return Some(worker_error);
+                                }
+                            }
+                        }
+                        state.watermarks = match storage.persistence_watermarks() {
+                            Ok(watermarks) => watermarks,
+                            Err(error) => {
+                                let worker_error = worker_error_from_storage(
+                                    StorageOperation::Persist,
+                                    &path,
+                                    tick,
+                                    FailureCommitState::Committed,
+                                    error,
+                                );
+                                analytics.publish_worker_error(&worker_error, true);
+                                storage.abandon_after_error();
+                                return Some(worker_error);
+                            }
+                        };
+                        if let Some(pending) = pending {
+                            state.admitted_tick = Some(
+                                state
+                                    .admitted_tick
+                                    .map_or(pending.tick, |previous| previous.max(pending.tick)),
+                            );
+                            state.committed_tick = Some(
+                                state
+                                    .committed_tick
+                                    .map_or(pending.tick, |previous| previous.max(pending.tick)),
+                            );
+                            analytics.publish_committed(pending, state.watermarks);
+                        } else {
+                            analytics.publish_progress(state.watermarks);
+                        }
+                        if let Err(error) = publication_result {
+                            warn!(
+                                path = %path,
+                                ?batch_id,
+                                error = %error,
+                                "cancelled host-journal session after terminal storage commitment could not be published to its detached reader"
+                            );
+                        }
+                        if cancel_receipts
+                            && let Some(session) = state.journal_sessions.get_mut(&session_id)
+                        {
+                            session.receipts = None;
+                        }
+                    }
+                    Err(error) => {
+                        let worker_error = worker_error_from_storage(
+                            StorageOperation::Persist,
+                            &path,
+                            tick,
+                            FailureCommitState::Indeterminate,
+                            error,
+                        );
+                        let failure = JournalReceipt::new(
+                            batch_id,
+                            JournalReceiptState::Failed(JournalFailure {
+                                code: "storage_journal_failed".to_owned(),
+                                message: worker_error.to_string(),
+                            }),
+                        );
+                        if let Some(receipts) = receipts {
+                            let _ = receipts.try_send(failure);
+                        }
+                        analytics.publish_worker_error(&worker_error, true);
+                        storage.abandon_after_error();
+                        return Some(worker_error);
                     }
                 }
             }
@@ -10094,7 +12196,12 @@ mod tests {
     use super::*;
     use scriptbots_core::{
         AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
-        PersistenceEventKind, Position, Tick, TickSummary, rng_domains::AgentRngCountersV1,
+        PersistenceEventKind, Position, ScriptBotsConfig, Tick, TickSummary, WorldState,
+        rng_domains::AgentRngCountersV1,
+    };
+    use scriptbots_runtime::{
+        CommandId, CommandStatus, HostCore, HostCoreOptions, HostLifecycle, HostSessionId,
+        JournalState, LocalHostPort, ManualInstant, NullFrontend, PlaybackSnapshot,
     };
     use std::{
         fs,
@@ -10118,6 +12225,341 @@ mod tests {
             timestamp
         ));
         path
+    }
+
+    fn journal_fault_world() -> WorldState {
+        WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(0x51a7_0f5e),
+            closed: true,
+            history_capacity: 8,
+            persistence_interval: 1,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("compact journal fault world")
+    }
+
+    fn journal_fault_host_options() -> HostCoreOptions {
+        HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            },
+            scientific_event_capacity: 2,
+            volatile_event_history_capacity: 8,
+            ..HostCoreOptions::default()
+        }
+    }
+
+    fn drive_journal_command_to_terminal(
+        frontend: &mut NullFrontend<LocalHostPort>,
+        core: &mut HostCore,
+        command_id: CommandId,
+        next_nanos: &mut u64,
+    ) -> CommandStatus {
+        for _ in 0..2_000 {
+            frontend
+                .drive_at(core, ManualInstant::from_nanos(*next_nanos))
+                .expect("fault test drives its matching host");
+            *next_nanos = next_nanos
+                .checked_add(1)
+                .expect("manual test clock does not overflow");
+            let status = frontend
+                .command_status(command_id)
+                .expect("fault test command status query")
+                .expect("fault test command remains retained");
+            if matches!(
+                status.journal(),
+                JournalState::CommittedVolatile
+                    | JournalState::Durable
+                    | JournalState::Failed(_)
+            ) {
+                return status;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("journal command {command_id:?} did not reach a terminal state");
+    }
+
+    #[derive(Debug)]
+    struct JournalDatabaseSnapshot {
+        archive_count: i64,
+        ledger_count: i64,
+        tick_count: i64,
+        admitted_journal: u64,
+        durable_journal: u64,
+        shutdown_sequence: Option<u64>,
+        ledger_state: Option<String>,
+    }
+
+    fn journal_database_snapshot(path: &str) -> JournalDatabaseSnapshot {
+        let connection = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open journal fault database read-only");
+        let archive_count = connection
+            .query_row("SELECT COUNT(*) FROM host_journal_archive")
+            .expect("archive count row")
+            .get_typed::<i64>(0)
+            .expect("archive count");
+        let ledger_count = connection
+            .query_row("SELECT COUNT(*) FROM host_journal_batch_ledger")
+            .expect("ledger count row")
+            .get_typed::<i64>(0)
+            .expect("ledger count");
+        let tick_count = connection
+            .query_row("SELECT COUNT(*) FROM tick_summaries")
+            .expect("tick count row")
+            .get_typed::<i64>(0)
+            .expect("tick count");
+        let progress = connection
+            .query_row(
+                "SELECT admitted_journal_prefix, durable_journal_prefix, shutdown_sequence
+                 FROM host_journal_progress",
+            )
+            .expect("one journal progress row");
+        let admitted: String = progress.get_typed(0).expect("admitted journal prefix");
+        let durable: String = progress.get_typed(1).expect("durable journal prefix");
+        let shutdown: Option<String> = progress.get_typed(2).expect("shutdown marker");
+        let states = connection
+            .query("SELECT state FROM host_journal_batch_ledger ORDER BY journal_sequence")
+            .expect("journal ledger states");
+        let ledger_state = states
+            .last()
+            .map(|row| row.get_typed::<String>(0).expect("journal ledger state"));
+        connection
+            .close_without_checkpoint()
+            .expect("close journal fault reader");
+        JournalDatabaseSnapshot {
+            archive_count,
+            ledger_count,
+            tick_count,
+            admitted_journal: decode_journal_u64("test.admitted_journal", &admitted)
+                .expect("decode admitted journal prefix"),
+            durable_journal: decode_journal_u64("test.durable_journal", &durable)
+                .expect("decode durable journal prefix"),
+            shutdown_sequence: shutdown
+                .as_deref()
+                .map(|encoded| decode_journal_u64("test.shutdown_sequence", encoded))
+                .transpose()
+                .expect("decode shutdown marker"),
+            ledger_state,
+        }
+    }
+
+    fn fault_test_host(
+        path: &str,
+        session_id: HostSessionId,
+    ) -> (
+        StoragePipeline,
+        HostCore,
+        NullFrontend<LocalHostPort>,
+    ) {
+        let pipeline =
+            StoragePipeline::create_unattributed_file(path).expect("fault test storage pipeline");
+        let journal = pipeline
+            .journal_port(session_id, StorageJournalOptions::default())
+            .expect("fault test journal port");
+        let core = HostCore::with_journal(
+            session_id,
+            journal_fault_world(),
+            journal_fault_host_options(),
+            Box::new(journal),
+        )
+        .expect("fault test host core");
+        let frontend = NullFrontend::new(core.local_port(), session_id.get() ^ 0xfeed);
+        (pipeline, core, frontend)
+    }
+
+    fn drop_fault_host(
+        mut pipeline: StoragePipeline,
+        core: HostCore,
+        frontend: NullFrontend<LocalHostPort>,
+    ) {
+        drop(frontend);
+        drop(core);
+        let _ = pipeline.shutdown();
+        drop(pipeline);
+    }
+
+    fn recover_fault_database(path: &str) {
+        let mut recovered =
+            StoragePipeline::recover_existing(path).expect("recover fault-injected journal");
+        recovered
+            .shutdown()
+            .expect("close recovered fault-injected journal");
+    }
+
+    #[test]
+    fn host_journal_archive_transaction_fault_rolls_back_archive_ledger_and_progress() {
+        let path = temp_db_path("host-journal-archive-rollback");
+        let path = path.to_string_lossy().into_owned();
+        let (pipeline, mut core, mut frontend) =
+            fault_test_host(&path, HostSessionId::new(0));
+        arm_host_journal_fault(&path, HostJournalFaultPoint::AdmissionBeforeProgress);
+        let command = frontend.step().expect("faulted step command");
+        let mut next_nanos = 0;
+        let status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert!(matches!(status.journal(), JournalState::Failed(_)));
+        drop_fault_host(pipeline, core, frontend);
+
+        let snapshot = journal_database_snapshot(&path);
+        assert_eq!(snapshot.archive_count, 0);
+        assert_eq!(snapshot.ledger_count, 0);
+        assert_eq!(snapshot.admitted_journal, 0);
+        assert_eq!(snapshot.durable_journal, 0);
+    }
+
+    #[test]
+    fn host_journal_post_archive_fault_recovers_and_applies_exactly_once() {
+        let path = temp_db_path("host-journal-post-archive");
+        let path = path.to_string_lossy().into_owned();
+        let (pipeline, mut core, mut frontend) =
+            fault_test_host(&path, HostSessionId::new(0x201));
+        arm_host_journal_fault(
+            &path,
+            HostJournalFaultPoint::AfterArchiveBeforeApplication,
+        );
+        let command = frontend.step().expect("post-archive faulted step");
+        let mut next_nanos = 0;
+        let status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert!(matches!(status.journal(), JournalState::Failed(_)));
+        drop_fault_host(pipeline, core, frontend);
+        let before = journal_database_snapshot(&path);
+        assert_eq!(before.archive_count, 1);
+        assert_eq!(before.ledger_count, 1);
+        assert_eq!(before.tick_count, 0);
+        assert_eq!(before.ledger_state.as_deref(), Some("admitted"));
+
+        recover_fault_database(&path);
+        let after = journal_database_snapshot(&path);
+        assert_eq!(after.archive_count, 1);
+        assert_eq!(after.ledger_count, 1);
+        assert_eq!(after.tick_count, 1);
+        assert_eq!(after.durable_journal, 1);
+        assert_eq!(after.ledger_state.as_deref(), Some("durable"));
+    }
+
+    #[test]
+    fn host_journal_post_commit_pre_receipt_fault_reopens_without_duplicate_effects() {
+        let path = temp_db_path("host-journal-post-commit-pre-receipt");
+        let path = path.to_string_lossy().into_owned();
+        let (pipeline, mut core, mut frontend) =
+            fault_test_host(&path, HostSessionId::new(0x202));
+        arm_host_journal_fault(
+            &path,
+            HostJournalFaultPoint::AfterPublicationBeforeReceipt,
+        );
+        let command = frontend.step().expect("post-commit faulted step");
+        let mut next_nanos = 0;
+        let status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert!(matches!(status.journal(), JournalState::Failed(_)));
+        drop_fault_host(pipeline, core, frontend);
+        let committed = journal_database_snapshot(&path);
+        assert_eq!(committed.tick_count, 1);
+        assert_eq!(committed.durable_journal, 1);
+
+        recover_fault_database(&path);
+        let reopened = journal_database_snapshot(&path);
+        assert_eq!(reopened.archive_count, 1);
+        assert_eq!(reopened.ledger_count, 1);
+        assert_eq!(reopened.tick_count, 1);
+        assert_eq!(reopened.durable_journal, 1);
+    }
+
+    #[test]
+    fn host_journal_durable_marker_and_publication_faults_fail_closed() {
+        for (suffix, point, expected_state, expected_durable) in [
+            (
+                "durable-marker",
+                HostJournalFaultPoint::BeforeDurableMarker,
+                "committed_volatile",
+                0,
+            ),
+            (
+                "publication",
+                HostJournalFaultPoint::BeforePublication,
+                "durable",
+                1,
+            ),
+        ] {
+            let path = temp_db_path(&format!("host-journal-{suffix}"));
+            let path = path.to_string_lossy().into_owned();
+            let (pipeline, mut core, mut frontend) =
+                fault_test_host(&path, HostSessionId::new(0x203));
+            arm_host_journal_fault(&path, point);
+            let command = frontend.step().expect("faulted journal step");
+            let mut next_nanos = 0;
+            let status = drive_journal_command_to_terminal(
+                &mut frontend,
+                &mut core,
+                command.command_id(),
+                &mut next_nanos,
+            );
+            assert!(matches!(status.journal(), JournalState::Failed(_)));
+            drop_fault_host(pipeline, core, frontend);
+            let failed = journal_database_snapshot(&path);
+            assert_eq!(failed.ledger_state.as_deref(), Some(expected_state));
+            assert_eq!(failed.durable_journal, expected_durable);
+
+            recover_fault_database(&path);
+            let recovered = journal_database_snapshot(&path);
+            assert_eq!(recovered.tick_count, 1);
+            assert_eq!(recovered.durable_journal, 1);
+            assert_eq!(recovered.ledger_state.as_deref(), Some("durable"));
+        }
+    }
+
+    #[test]
+    fn host_journal_flush_fault_keeps_shutdown_cancel_clean() {
+        let path = temp_db_path("host-journal-flush-shutdown");
+        let path = path.to_string_lossy().into_owned();
+        let (pipeline, mut core, mut frontend) =
+            fault_test_host(&path, HostSessionId::new(0x204));
+        arm_host_journal_fault(&path, HostJournalFaultPoint::BeforePersistenceFlush);
+        let step = frontend.step().expect("flush-faulted step");
+        let mut next_nanos = 0;
+        let step_status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            step.command_id(),
+            &mut next_nanos,
+        );
+        assert!(matches!(step_status.journal(), JournalState::Failed(_)));
+        let shutdown = frontend.shutdown().expect("shutdown after flush fault");
+        let shutdown_status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            shutdown.command_id(),
+            &mut next_nanos,
+        );
+        assert!(matches!(shutdown_status.journal(), JournalState::Failed(_)));
+        assert_ne!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        drop_fault_host(pipeline, core, frontend);
+        let failed = journal_database_snapshot(&path);
+        assert_eq!(failed.tick_count, 0);
+        assert_eq!(failed.shutdown_sequence, None);
+
+        recover_fault_database(&path);
+        let recovered = journal_database_snapshot(&path);
+        assert_eq!(recovered.tick_count, 1);
+        assert_eq!(recovered.durable_journal, 1);
+        assert_eq!(recovered.shutdown_sequence, None);
     }
 
     fn unattributed_manifest_at(run_id: RunId, started_at_unix_ms: u64) -> RunManifestRecord {
