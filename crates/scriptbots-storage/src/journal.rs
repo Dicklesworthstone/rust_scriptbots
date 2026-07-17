@@ -11,15 +11,15 @@ use scriptbots_core::{
     AgentUid, BirthRecord, DeathRecord, ScriptBotsConfig, Tick, TickCombatSummary,
 };
 use scriptbots_runtime::{
-    AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, CommandEnvelope,
-    CommandId, CommandLifecycleEvidence, CommandLifecycleTransition, ConfigRevision,
-    ControlRevision, EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator,
-    EventCatchUpUnavailableReason, EventCommitment, EventJournalReader, EventPage, EventPageSource,
-    EventRetentionSnapshot, EventSequence, EventSequenceRange, HostAccessError, HostCommand,
-    HostRevisions, HostSessionId, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure,
-    JournalPort, JournalReceipt, JournalReceiptState, JournaledScientificEvent, RejectionReason,
-    RunId, ScientificBoundary, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
-    COMMAND_LIFECYCLE_SCHEMA_VERSION,
+    AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand,
+    COMMAND_LIFECYCLE_SCHEMA_VERSION, CommandEnvelope, CommandId, CommandLifecycleEvidence,
+    CommandLifecycleTransition, ConfigRevision, ControlRevision, EventCatchUp,
+    EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason, EventCommitment,
+    EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot, EventSequence,
+    EventSequenceRange, HostAccessError, HostCommand, HostRevisions, HostSessionId,
+    JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
+    JournalReceiptState, JournaledScientificEvent, RejectionReason, RunId, ScientificBoundary,
+    ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -515,15 +515,19 @@ impl PreparedDomainEventProjection {
             .births()
             .len()
             .saturating_add(scientific.deaths().len())
-            .saturating_add(usize::from(combat.spike_attempts != 0 || combat.spike_hits != 0));
+            .saturating_add(usize::from(
+                combat.spike_attempts != 0 || combat.spike_hits != 0,
+            ));
         let mut events = Vec::with_capacity(event_capacity);
         for birth in scientific.births() {
             let payload = DomainEventPayload::Birth(birth.clone());
             let payload_json = payload.encode_json()?;
             events.push(PreparedDomainEvent {
-                ordinal: u64::try_from(events.len()).map_err(|error| StorageError::InvalidData {
-                    context: "host_domain_events.event_ordinal",
-                    reason: error.to_string(),
+                ordinal: u64::try_from(events.len()).map_err(|error| {
+                    StorageError::InvalidData {
+                        context: "host_domain_events.event_ordinal",
+                        reason: error.to_string(),
+                    }
                 })?,
                 payload,
                 payload_json,
@@ -533,9 +537,11 @@ impl PreparedDomainEventProjection {
             let payload = DomainEventPayload::Death(death.clone());
             let payload_json = payload.encode_json()?;
             events.push(PreparedDomainEvent {
-                ordinal: u64::try_from(events.len()).map_err(|error| StorageError::InvalidData {
-                    context: "host_domain_events.event_ordinal",
-                    reason: error.to_string(),
+                ordinal: u64::try_from(events.len()).map_err(|error| {
+                    StorageError::InvalidData {
+                        context: "host_domain_events.event_ordinal",
+                        reason: error.to_string(),
+                    }
                 })?,
                 payload,
                 payload_json,
@@ -545,9 +551,11 @@ impl PreparedDomainEventProjection {
             let payload = DomainEventPayload::Combat(combat);
             let payload_json = payload.encode_json()?;
             events.push(PreparedDomainEvent {
-                ordinal: u64::try_from(events.len()).map_err(|error| StorageError::InvalidData {
-                    context: "host_domain_events.event_ordinal",
-                    reason: error.to_string(),
+                ordinal: u64::try_from(events.len()).map_err(|error| {
+                    StorageError::InvalidData {
+                        context: "host_domain_events.event_ordinal",
+                        reason: error.to_string(),
+                    }
                 })?,
                 payload,
                 payload_json,
@@ -759,24 +767,11 @@ impl AppliedCommandPostcardV1 {
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 enum RejectionReasonPostcardV1 {
-    Validation {
-        message: String,
-    },
-    ControlRevisionConflict {
-        expected: u64,
-        actual: u64,
-    },
-    ScientificRevisionConflict {
-        expected: u64,
-        actual: u64,
-    },
-    ConfigRevisionConflict {
-        expected: u64,
-        actual: u64,
-    },
-    Overloaded {
-        capacity: u64,
-    },
+    Validation { message: String },
+    ControlRevisionConflict { expected: u64, actual: u64 },
+    ScientificRevisionConflict { expected: u64, actual: u64 },
+    ConfigRevisionConflict { expected: u64, actual: u64 },
+    Overloaded { capacity: u64 },
     HostStopping,
 }
 
@@ -889,9 +884,9 @@ impl ApplicationStatePostcardV1 {
     ) -> Result<Self, StorageError> {
         match application {
             ApplicationState::Admitted => Ok(Self::Admitted),
-            ApplicationState::Applied(applied) => {
-                Ok(Self::Applied(AppliedCommandPostcardV1::from_runtime(*applied)))
-            }
+            ApplicationState::Applied(applied) => Ok(Self::Applied(
+                AppliedCommandPostcardV1::from_runtime(*applied),
+            )),
             ApplicationState::Rejected(rejection) => Ok(Self::Rejected(
                 RejectionReasonPostcardV1::from_runtime(rejection, context)?,
             )),
@@ -984,10 +979,7 @@ impl CommandLifecyclePostcardV1 {
         })
     }
 
-    fn into_runtime(
-        self,
-        context: &'static str,
-    ) -> Result<CommandLifecycleEvidence, StorageError> {
+    fn into_runtime(self, context: &'static str) -> Result<CommandLifecycleEvidence, StorageError> {
         if self.schema_version != COMMAND_LIFECYCLE_SCHEMA_VERSION {
             return Err(StorageError::InvalidData {
                 context,
@@ -1353,8 +1345,9 @@ fn validate_scientific_archive_boundary(
         None if scientific.is_none() => {
             return Err(StorageError::InvalidData {
                 context: "host_journal_archive.payload_json",
-                reason: "journal batch must contain command lifecycle evidence or a scientific boundary"
-                    .to_owned(),
+                reason:
+                    "journal batch must contain command lifecycle evidence or a scientific boundary"
+                        .to_owned(),
             });
         }
         Some(lifecycle) => {
@@ -1435,9 +1428,8 @@ fn validate_scientific_archive_boundary(
     {
         return Err(StorageError::InvalidData {
             context: "host_journal_archive.persistence",
-            reason:
-                "persistence without science is reserved for an applied shutdown's final tail"
-                    .to_owned(),
+            reason: "persistence without science is reserved for an applied shutdown's final tail"
+                .to_owned(),
         });
     }
     if event_sequence.is_some() != scientific.is_some() {
@@ -2813,11 +2805,7 @@ mod tests {
             Some(AdmissionSequence::new(1)),
             vec![
                 CommandLifecycleTransition::new(0, boundary, ApplicationState::Admitted),
-                CommandLifecycleTransition::new(
-                    1,
-                    boundary,
-                    ApplicationState::Applied(boundary),
-                ),
+                CommandLifecycleTransition::new(1, boundary, ApplicationState::Applied(boundary)),
             ],
         )
         .expect("valid applied command lifecycle")
@@ -3598,10 +3586,7 @@ mod tests {
             applied,
         );
         let update = applied_lifecycle(
-            CommandEnvelope::new(
-                CommandId::new(2),
-                HostCommand::UpdateConfig(Box::default()),
-            ),
+            CommandEnvelope::new(CommandId::new(2), HostCommand::UpdateConfig(Box::default())),
             applied,
         );
         let shutdown = applied_lifecycle(

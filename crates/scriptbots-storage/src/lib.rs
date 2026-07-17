@@ -6,12 +6,11 @@ mod journal;
 
 pub use journal::{
     CommandJournalCursor, CommandJournalEvidence, CommandJournalPage, CommandJournalRecord,
-    CommandStorageTransition, CommandStorageTransitionKind,
-    DomainEventCursor, DomainEventEvidence, DomainEventExpectation, DomainEventKind, DomainEventPage,
-    DomainEventPayload, DomainEventRecord, HostJournalPrefixes, HostJournalRecord,
-    HostJournalRecordState, HostJournalSessionPage, HostJournalSessionProgress,
-    StorageEventJournalReader, StorageIntegrityCheckResult, StorageJournalOptions,
-    StorageJournalPort,
+    CommandStorageTransition, CommandStorageTransitionKind, DomainEventCursor, DomainEventEvidence,
+    DomainEventExpectation, DomainEventKind, DomainEventPage, DomainEventPayload,
+    DomainEventRecord, HostJournalPrefixes, HostJournalRecord, HostJournalRecordState,
+    HostJournalSessionPage, HostJournalSessionProgress, StorageEventJournalReader,
+    StorageIntegrityCheckResult, StorageJournalOptions, StorageJournalPort,
 };
 
 use arc_swap::ArcSwap;
@@ -963,9 +962,7 @@ impl SchemaObject {
 }
 
 fn refuse_lossy_command_lifecycle_migration(connection: &Connection) -> Result<(), StorageError> {
-    let user_version: i64 = connection
-        .query_row("PRAGMA user_version")?
-        .get_typed(0)?;
+    let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
     if user_version >= SCRIPTBOTS_SCHEMA_VERSION {
         return Ok(());
     }
@@ -4395,14 +4392,15 @@ fn load_finished_command_journal_record(
         batch_id,
         MAX_HOST_JOURNAL_ARCHIVE_BYTES,
     )?;
-    let projection = archive
-        .prepare_command_projection(payload_digest)?
-        .ok_or(StorageError::InvalidData {
-            context: "host_command_records.command_id",
-            reason: format!(
-                "normalized command {expected_command_id} points to a command-free archive"
-            ),
-        })?;
+    let projection =
+        archive
+            .prepare_command_projection(payload_digest)?
+            .ok_or(StorageError::InvalidData {
+                context: "host_command_records.command_id",
+                reason: format!(
+                    "normalized command {expected_command_id} points to a command-free archive"
+                ),
+            })?;
     if projection.command_id() != expected_command_id {
         return Err(StorageError::InvalidData {
             context: "host_command_records.command_id",
@@ -5722,7 +5720,9 @@ impl StorageReader {
                     "finished session {} has {} durable journal records{} but zero normalized commands",
                     session_id.get(),
                     progress.durable_journal,
-                    progress.shutdown_sequence.map_or("", |_| " and an applied shutdown barrier")
+                    progress
+                        .shutdown_sequence
+                        .map_or("", |_| " and an applied shutdown barrier")
                 ),
             });
         }
@@ -5803,18 +5803,15 @@ impl StorageReader {
         )?;
         let storage_transition_count = checked_u64(
             "host_command_storage_transitions.count",
-            decode(
-                &storage_row,
-                0,
-                "host_command_storage_transitions.count",
-            )?,
+            decode(&storage_row, 0, "host_command_storage_transitions.count")?,
         )?;
-        let expected_storage_count = command_count.checked_mul(2).ok_or(
-            StorageError::InvalidData {
-                context: "host_command_storage_transitions.count",
-                reason: "durable command storage-transition count overflowed".to_owned(),
-            },
-        )?;
+        let expected_storage_count =
+            command_count
+                .checked_mul(2)
+                .ok_or(StorageError::InvalidData {
+                    context: "host_command_storage_transitions.count",
+                    reason: "durable command storage-transition count overflowed".to_owned(),
+                })?;
         if storage_transition_count != expected_storage_count {
             return Err(StorageError::InvalidData {
                 context: "host_command_storage_transitions.transition_ordinal",
@@ -6059,12 +6056,13 @@ impl StorageReader {
                 context: "host_journal_archive.payload_json",
                 reason: error.to_string(),
             })?;
-            let next_page_bytes = page_payload_bytes.checked_add(payload_bytes).ok_or(
-                StorageError::InvalidData {
-                    context: "host_command_records.page_payload_byte_limit",
-                    reason: "command page byte accounting overflowed".to_owned(),
-                },
-            )?;
+            let next_page_bytes =
+                page_payload_bytes
+                    .checked_add(payload_bytes)
+                    .ok_or(StorageError::InvalidData {
+                        context: "host_command_records.page_payload_byte_limit",
+                        reason: "command page byte accounting overflowed".to_owned(),
+                    })?;
             if payload_bytes == 0 || next_page_bytes > page_payload_byte_limit {
                 if commands.is_empty() {
                     return Err(StorageError::InvalidData {
@@ -6133,26 +6131,18 @@ impl StorageReader {
             "host_domain_event_batches.count",
             decode(&batch_row, 0, "host_domain_event_batches.count")?,
         )?;
-        let minimum: Option<String> = decode(
-            &batch_row,
-            1,
-            "host_domain_event_batches.minimum_sequence",
-        )?;
-        let maximum: Option<String> = decode(
-            &batch_row,
-            2,
-            "host_domain_event_batches.maximum_sequence",
-        )?;
+        let minimum: Option<String> =
+            decode(&batch_row, 1, "host_domain_event_batches.minimum_sequence")?;
+        let maximum: Option<String> =
+            decode(&batch_row, 2, "host_domain_event_batches.maximum_sequence")?;
         let declared_event_count = checked_u64(
             "host_domain_event_batches.total_event_count",
-            decode(
-                &batch_row,
-                3,
-                "host_domain_event_batches.total_event_count",
-            )?,
+            decode(&batch_row, 3, "host_domain_event_batches.total_event_count")?,
         )?;
-        let expected_bounds = (progress.durable_event != 0)
-            .then_some((encode_journal_u64(1), encode_journal_u64(progress.durable_event)));
+        let expected_bounds = (progress.durable_event != 0).then_some((
+            encode_journal_u64(1),
+            encode_journal_u64(progress.durable_event),
+        ));
         if batch_count != progress.durable_event
             || minimum.as_deref() != expected_bounds.as_ref().map(|bounds| bounds.0.as_str())
             || maximum.as_deref() != expected_bounds.as_ref().map(|bounds| bounds.1.as_str())
@@ -6307,11 +6297,7 @@ impl StorageReader {
                 };
                 let event_count = checked_u64(
                     "host_domain_event_batches.event_count",
-                    decode(
-                        cursor_row,
-                        0,
-                        "host_domain_event_batches.event_count",
-                    )?,
+                    decode(cursor_row, 0, "host_domain_event_batches.event_count")?,
                 )?;
                 if cursor.event_ordinal >= event_count {
                     return Err(StorageError::InvalidData {
@@ -6413,11 +6399,8 @@ impl StorageReader {
                 "host_domain_events.tick",
                 decode(row, 3, "host_domain_events.tick")?,
             )?;
-            let kind = DomainEventKind::decode(&decode::<String>(
-                row,
-                4,
-                "host_domain_events.kind",
-            )?)?;
+            let kind =
+                DomainEventKind::decode(&decode::<String>(row, 4, "host_domain_events.kind")?)?;
             let actor_raw: Option<i64> = decode(row, 5, "host_domain_events.actor_agent_uid")?;
             let actor = actor_raw
                 .map(|value| checked_u64("host_domain_events.actor_agent_uid", value))
@@ -6432,8 +6415,7 @@ impl StorageReader {
                 context: "host_domain_events.payload_json",
                 reason: error.to_string(),
             })?;
-            let event_digest: String =
-                decode(row, 7, "host_domain_events.archive_payload_digest")?;
+            let event_digest: String = decode(row, 7, "host_domain_events.archive_payload_digest")?;
             let event_count = checked_u64(
                 "host_domain_event_batches.event_count",
                 decode(row, 8, "host_domain_event_batches.event_count")?,
@@ -6444,20 +6426,15 @@ impl StorageReader {
             )?;
             let projection_journal: String =
                 decode(row, 10, "host_domain_event_batches.journal_sequence")?;
-            let projection_digest: String = decode(
-                row,
-                11,
-                "host_domain_event_batches.archive_payload_digest",
-            )?;
-            let ledger_state: String =
-                decode(row, 12, "host_journal_batch_ledger.state")?;
+            let projection_digest: String =
+                decode(row, 11, "host_domain_event_batches.archive_payload_digest")?;
+            let ledger_state: String = decode(row, 12, "host_journal_batch_ledger.state")?;
             let ledger_event: String = decode(
                 row,
                 13,
                 "host_journal_batch_ledger.scientific_event_sequence",
             )?;
-            let archive_digest: String =
-                decode(row, 14, "host_journal_archive.payload_digest")?;
+            let archive_digest: String = decode(row, 14, "host_journal_archive.payload_digest")?;
             if HostJournalState::decode(&ledger_state)? != HostJournalState::Durable
                 || encoded_event != ledger_event
                 || journal != projection_journal
@@ -6474,12 +6451,12 @@ impl StorageReader {
                 });
             }
             if sequence == prior_sequence {
-                let expected_ordinal = prior_ordinal
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or(StorageError::InvalidData {
+                let expected_ordinal = prior_ordinal.and_then(|value| value.checked_add(1)).ok_or(
+                    StorageError::InvalidData {
                         context: "host_domain_events.event_ordinal",
                         reason: "event ordinal space is exhausted".to_owned(),
-                    })?;
+                    },
+                )?;
                 if ordinal != expected_ordinal {
                     return Err(StorageError::InvalidData {
                         context: "host_domain_events.event_ordinal",
@@ -6509,12 +6486,13 @@ impl StorageReader {
                     });
                 }
             }
-            let next_page_bytes = page_payload_bytes.checked_add(payload_bytes).ok_or(
-                StorageError::InvalidData {
-                    context: "host_domain_events.page_payload_byte_limit",
-                    reason: "page payload byte accounting overflowed".to_owned(),
-                },
-            )?;
+            let next_page_bytes =
+                page_payload_bytes
+                    .checked_add(payload_bytes)
+                    .ok_or(StorageError::InvalidData {
+                        context: "host_domain_events.page_payload_byte_limit",
+                        reason: "page payload byte accounting overflowed".to_owned(),
+                    })?;
             if payload_bytes == 0 || next_page_bytes > page_payload_byte_limit {
                 if events.is_empty() {
                     return Err(StorageError::InvalidData {
@@ -6549,8 +6527,7 @@ impl StorageReader {
                         .into(),
                 ],
             )?;
-            let payload_json: String =
-                decode(&payload_row, 0, "host_domain_events.payload_json")?;
+            let payload_json: String = decode(&payload_row, 0, "host_domain_events.payload_json")?;
             let payload = DomainEventPayload::decode_json(kind, &payload_json)?;
             if actor != payload.actor_agent_uid() {
                 return Err(StorageError::InvalidData {
@@ -6581,10 +6558,8 @@ impl StorageReader {
                 }
                 _ => {}
             }
-            let journal_sequence = decode_journal_u64(
-                "host_domain_events.journal_sequence",
-                &journal,
-            )?;
+            let journal_sequence =
+                decode_journal_u64("host_domain_events.journal_sequence", &journal)?;
             events.push(DomainEventRecord {
                 session_id,
                 scientific_event_sequence: EventSequence::new(sequence),
@@ -8994,8 +8969,7 @@ impl Storage {
         )?;
         if let Some(row) = event_orphan.first() {
             let session: String = decode(row, 0, "host_domain_events.host_session_id")?;
-            let sequence: String =
-                decode(row, 1, "host_domain_events.scientific_event_sequence")?;
+            let sequence: String = decode(row, 1, "host_domain_events.scientific_event_sequence")?;
             let ordinal: i64 = decode(row, 2, "host_domain_events.event_ordinal")?;
             return Err(StorageError::InvalidData {
                 context: "host_domain_events.identity",
@@ -9048,11 +9022,8 @@ impl Storage {
                 0,
                 "host_command_application_transitions.host_session_id",
             )?;
-            let command_id: String = decode(
-                row,
-                1,
-                "host_command_application_transitions.command_id",
-            )?;
+            let command_id: String =
+                decode(row, 1, "host_command_application_transitions.command_id")?;
             let ordinal: i64 = decode(
                 row,
                 2,
@@ -9078,13 +9049,9 @@ impl Storage {
             &[sqlite_run_id(run_id)],
         )?;
         if let Some(row) = storage_orphan.first() {
-            let session: String = decode(
-                row,
-                0,
-                "host_command_storage_transitions.host_session_id",
-            )?;
-            let command_id: String =
-                decode(row, 1, "host_command_storage_transitions.command_id")?;
+            let session: String =
+                decode(row, 0, "host_command_storage_transitions.host_session_id")?;
+            let command_id: String = decode(row, 1, "host_command_storage_transitions.command_id")?;
             let ordinal: i64 = decode(
                 row,
                 2,
@@ -10415,8 +10382,7 @@ impl Storage {
         if event_sequence.is_some() != expected.is_some() {
             return Err(StorageError::InvalidData {
                 context: "host_domain_event_batches.scientific_event_sequence",
-                reason: "canonical scientific identity and prepared projection disagree"
-                .to_owned(),
+                reason: "canonical scientific identity and prepared projection disagree".to_owned(),
             });
         }
         if let Some(projection) = expected
@@ -10489,17 +10455,13 @@ impl Storage {
             "host_domain_event_batches.event_count",
             decode(row, 2, "host_domain_event_batches.event_count")?,
         )?;
-        let actual_digest: String = decode(
-            row,
-            3,
-            "host_domain_event_batches.archive_payload_digest",
-        )?;
-        let expected_count = u64::try_from(expected.events.len()).map_err(|error| {
-            StorageError::InvalidData {
+        let actual_digest: String =
+            decode(row, 3, "host_domain_event_batches.archive_payload_digest")?;
+        let expected_count =
+            u64::try_from(expected.events.len()).map_err(|error| StorageError::InvalidData {
                 context: "host_domain_event_batches.event_count",
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
         if actual_event != expected.scientific_event_sequence
             || actual_tick != expected.tick.0
             || actual_count != expected_count
@@ -10547,11 +10509,8 @@ impl Storage {
                 "host_domain_events.tick",
                 decode(row, 2, "host_domain_events.tick")?,
             )?;
-            let kind = DomainEventKind::decode(&decode::<String>(
-                row,
-                3,
-                "host_domain_events.kind",
-            )?)?;
+            let kind =
+                DomainEventKind::decode(&decode::<String>(row, 3, "host_domain_events.kind")?)?;
             let actor_raw: Option<i64> = decode(row, 4, "host_domain_events.actor_agent_uid")?;
             let actor = actor_raw
                 .map(|value| checked_u64("host_domain_events.actor_agent_uid", value))
@@ -10559,8 +10518,7 @@ impl Storage {
                 .map(AgentUid);
             let payload_json: String = decode(row, 5, "host_domain_events.payload_json")?;
             let payload = DomainEventPayload::decode_json(kind, &payload_json)?;
-            let row_digest: String =
-                decode(row, 6, "host_domain_events.archive_payload_digest")?;
+            let row_digest: String = decode(row, 6, "host_domain_events.archive_payload_digest")?;
             if ordinal != prepared.ordinal
                 || row_journal != journal
                 || row_tick != expected.tick.0
@@ -10685,12 +10643,10 @@ impl Storage {
         }
         for transition in &projection.application_transitions {
             let boundary_tick = encode_journal_u64(transition.boundary.tick.0);
-            let boundary_control =
-                encode_journal_u64(transition.boundary.revisions.control.get());
+            let boundary_control = encode_journal_u64(transition.boundary.revisions.control.get());
             let boundary_scientific =
                 encode_journal_u64(transition.boundary.revisions.scientific.get());
-            let boundary_config =
-                encode_journal_u64(transition.boundary.revisions.config.get());
+            let boundary_config = encode_journal_u64(transition.boundary.revisions.config.get());
             let transition_rows = transaction.execute_with_params(
                 "INSERT INTO host_command_application_transitions (
                     run_id, host_session_id, command_id, transition_ordinal,
@@ -10882,14 +10838,16 @@ impl Storage {
         let terminal = expected.terminal_boundary;
         let stored_transition_count = checked_u64(
             "host_command_records.application_transition_count",
-            decode(record, 16, "host_command_records.application_transition_count")?,
+            decode(
+                record,
+                16,
+                "host_command_records.application_transition_count",
+            )?,
         )?;
-        let expected_transition_count =
-            u64::try_from(expected.application_transitions.len()).map_err(|error| {
-                StorageError::InvalidData {
-                    context: "host_command_records.application_transition_count",
-                    reason: error.to_string(),
-                }
+        let expected_transition_count = u64::try_from(expected.application_transitions.len())
+            .map_err(|error| StorageError::InvalidData {
+                context: "host_command_records.application_transition_count",
+                reason: error.to_string(),
             })?;
         let stored_envelope_hex: String =
             decode(record, 8, "host_command_records.envelope_postcard_hex")?;
@@ -10937,11 +10895,8 @@ impl Storage {
                 6,
                 "host_command_records.expected_scientific_revision",
             )? != expected_scientific
-            || decode::<Option<String>>(
-                record,
-                7,
-                "host_command_records.expected_config_revision",
-            )? != expected_config
+            || decode::<Option<String>>(record, 7, "host_command_records.expected_config_revision")?
+                != expected_config
             || stored_envelope_hex != expected.envelope_postcard_hex
             || stored_command_hex != expected.command_payload_postcard_hex
             || canonical_envelope != stored_envelope_hex
@@ -11071,8 +11026,7 @@ impl Storage {
                 ),
             });
         }
-        for (ordinal, (row, expected_kind)) in
-            storage_rows.iter().zip(expected_storage).enumerate()
+        for (ordinal, (row, expected_kind)) in storage_rows.iter().zip(expected_storage).enumerate()
         {
             let stored_ordinal = checked_usize(
                 "host_command_storage_transitions.transition_ordinal",
@@ -11237,11 +11191,7 @@ impl Storage {
                         if sequence == projection.scientific_event_sequence
                             && batch_id == projection.batch_id =>
                     {
-                        Self::insert_domain_event_projection(
-                            transaction,
-                            self.run_id,
-                            projection,
-                        )?;
+                        Self::insert_domain_event_projection(transaction, self.run_id, projection)?;
                     }
                     (None, None) => {}
                     _ => {
@@ -11497,8 +11447,7 @@ impl Storage {
                 });
             }
             let applied_tick = archive.applied().tick.0;
-            let domain_events =
-                archive.prepare_domain_event_projection(&payload_digest)?;
+            let domain_events = archive.prepare_domain_event_projection(&payload_digest)?;
             let command = archive.prepare_command_projection(&payload_digest)?;
             let persistence = archive.take_persistence();
             self.complete_host_journal_archive(
