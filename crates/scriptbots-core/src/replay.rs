@@ -52,22 +52,42 @@ impl WorldState {
         }
     }
 
-    /// Record the canonical final world digest as one world-scoped replay event.
-    ///
-    /// Replay verification compares this recorded digest against the digest the verifying
-    /// driver records after re-simulation, proving the entire final science state — not
-    /// just the event stream — reproduced exactly. Drivers call this once at a clean
-    /// boundary, after the last science tick and before the final partial batch is
-    /// projected; both the recording and the verifying driver must emit it so the two
-    /// streams stay structurally aligned for ordered diffing.
-    pub fn record_replay_world_digest(&mut self, overall: String) {
+    /// Ask the world to bind the canonical world digest into the replay stream of the next
+    /// projected batch (see [`ReplayEventKind::WorldDigest`]). Drivers call this before the
+    /// final science tick of a recorded run; the projection consumes the request after that
+    /// tick completes, so the digest covers the final post-tick state and rides the same
+    /// admitted batch as the tick's action events. The request is a no-op while emission is
+    /// disabled by `replay_event_tick_cap == 0`.
+    pub fn request_replay_world_digest(&mut self) {
+        if self.config.replay_event_tick_cap > 0 {
+            self.replay_world_digest_pending = true;
+        }
+    }
+
+    /// Compute and append the digest event; invoked once per projection by
+    /// `prepare_persistence`, where it consumes any pending driver request.
+    pub(crate) fn append_requested_replay_world_digest(&mut self) {
+        if !self.replay_world_digest_pending {
+            return;
+        }
+        self.replay_world_digest_pending = false;
         let cap = self.config.replay_event_tick_cap;
         if cap == 0 || self.replay_events.len() >= cap {
             return;
         }
-        self.replay_events.push(ReplayEvent {
-            agent_uid: None,
-            kind: ReplayEventKind::WorldDigest { overall },
-        });
+        match self.world_digest_v1() {
+            Ok(digest) => self.replay_events.push(ReplayEvent {
+                agent_uid: None,
+                kind: ReplayEventKind::WorldDigest {
+                    overall: digest.overall,
+                },
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "replay world digest request could not be satisfied at this boundary"
+                );
+            }
+        }
     }
 }

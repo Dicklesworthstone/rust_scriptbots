@@ -108,7 +108,6 @@ fn csv_lines(path: &Path) -> std::io::Result<Vec<String>> {
 }
 
 #[test]
-#[ignore = "pending bd-2z0.8.9.8 production replay instrumentation (core emission + verify plumb)"]
 fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
     let temp_dir = tempdir().expect("temp run directory");
     let baseline_db = temp_dir.path().join("baseline.sqlite");
@@ -195,8 +194,8 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
             .expect("metrics value is a fixed-precision float");
         if let Some((prev_tick, prev_name)) = previous {
             assert!(
-                tick < prev_tick || (tick == prev_tick && fields[1] <= prev_name.as_str()),
-                "metrics CSV must stay ordered tick DESC, name DESC: {row}"
+                tick > prev_tick || (tick == prev_tick && fields[1] >= prev_name.as_str()),
+                "metrics CSV must stay chronological (tick ASC, name ASC): {row}"
             );
         }
         previous = Some((tick, fields[1].to_owned()));
@@ -215,7 +214,10 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
         assert_eq!(fields.len(), 9, "ticks CSV row shape: {row}");
         let tick: u64 = fields[0].parse().expect("ticks tick is an integer");
         if let Some(prev) = previous_tick {
-            assert!(tick < prev, "ticks CSV must stay ordered tick DESC: {row}");
+            assert!(
+                tick > prev,
+                "ticks CSV must stay chronological (tick ASC): {row}"
+            );
         }
         previous_tick = Some(tick);
     }
