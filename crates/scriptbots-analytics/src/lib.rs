@@ -713,6 +713,137 @@ struct RunComparisonRow {
     significant_fdr: bool,
 }
 
+struct PairedMetricSeries {
+    name: String,
+    control: Vec<f64>,
+    treatment: Vec<f64>,
+}
+
+type MetricsByTick = BTreeMap<String, BTreeMap<u64, f64>>;
+
+fn index_metrics_by_tick(readings: Vec<PersistedMetric>) -> MetricsByTick {
+    let mut indexed = BTreeMap::new();
+    for PersistedMetric { tick, name, value } in readings {
+        indexed.entry(name).or_default().insert(tick, value);
+    }
+    indexed
+}
+
+fn pair_shared_metrics(
+    control: &MetricsByTick,
+    treatment: &MetricsByTick,
+) -> Vec<PairedMetricSeries> {
+    let mut paired = Vec::new();
+    for (name, control_ticks) in control {
+        let Some(treatment_ticks) = treatment.get(name) else {
+            continue;
+        };
+        let mut control_values = Vec::new();
+        let mut treatment_values = Vec::new();
+        for (tick, control_value) in control_ticks {
+            if let Some(treatment_value) = treatment_ticks.get(tick) {
+                control_values.push(*control_value);
+                treatment_values.push(*treatment_value);
+            }
+        }
+        if control_values.len() >= 3 {
+            paired.push(PairedMetricSeries {
+                name: name.clone(),
+                control: control_values,
+                treatment: treatment_values,
+            });
+        }
+    }
+    paired
+}
+
+fn compare_paired_metrics(
+    paired: &[PairedMetricSeries],
+    fdr: f64,
+) -> Result<Vec<RunComparisonRow>, AnalyticsError> {
+    let series: Vec<compare::MetricSeries<'_>> = paired
+        .iter()
+        .map(|pair| compare::MetricSeries {
+            name: pair.name.as_str(),
+            control: pair.control.as_slice(),
+            treatment: pair.treatment.as_slice(),
+        })
+        .collect();
+    let study = compare::compare_metrics(
+        &series,
+        &compare::CompareParams {
+            fdr,
+            ..compare::CompareParams::default()
+        },
+    )
+    .map_err(|error| metric_stats_error(&error))?;
+
+    Ok(study
+        .metrics
+        .iter()
+        .map(|named| {
+            let comparison = &named.comparison;
+            RunComparisonRow {
+                metric: named.metric.clone(),
+                n_pairs: comparison.n_pairs,
+                mean_difference: comparison.mean_difference,
+                ci_lower: comparison.difference_ci.lower,
+                ci_upper: comparison.difference_ci.upper,
+                p_value: comparison.p_value,
+                cohens_dz: comparison.cohens_dz,
+                fraction_positive: comparison.fraction_positive,
+                significant_fdr: comparison.significant_fdr,
+            }
+        })
+        .collect())
+}
+
+fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
+    let mut md = String::new();
+    let _ = writeln!(md, "# Run comparison\n");
+    let _ = writeln!(
+        md,
+        "_treatment=`{}`, FDR={}, {} of {} shared metrics show a certified treatment effect._\n",
+        machine.treatment_db, machine.fdr, machine.significant, machine.metrics_compared
+    );
+    if machine.truncated {
+        let _ = writeln!(
+            md,
+            "> **Note:** a metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; the \
+             comparison is over recent history, not the whole run.\n"
+        );
+    }
+    if machine.metrics.is_empty() {
+        let _ = writeln!(
+            md,
+            "_No metric was present in both runs with enough matched ticks._"
+        );
+        return md;
+    }
+
+    let _ = writeln!(
+        md,
+        "| metric | pairs | Δ (treat−ctrl) | 95% CI | p | d_z | +frac | real? |"
+    );
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
+    for row in &machine.metrics {
+        let _ = writeln!(
+            md,
+            "| {} | {} | {:+.4} | [{:.3}, {:.3}] | {:.4} | {:.3} | {:.2} | {} |",
+            row.metric,
+            row.n_pairs,
+            row.mean_difference,
+            row.ci_lower,
+            row.ci_upper,
+            row.p_value,
+            row.cohens_dz,
+            row.fraction_positive,
+            if row.significant_fdr { "yes" } else { "no" },
+        );
+    }
+    md
+}
+
 impl Report for RunComparison {
     fn name(&self) -> &'static str {
         "compare-runs"
@@ -755,83 +886,13 @@ impl Report for RunComparison {
         );
 
         let render_started = Instant::now();
-        // metric -> (tick -> value), for each run. BTreeMap so tick order and metric order are
-        // stable and the tick intersection below is straightforward.
-        let mut control: BTreeMap<String, BTreeMap<u64, f64>> = BTreeMap::new();
-        for PersistedMetric { tick, name, value } in control_readings {
-            control.entry(name).or_default().insert(tick, value);
-        }
-        let mut treatment: BTreeMap<String, BTreeMap<u64, f64>> = BTreeMap::new();
-        for PersistedMetric { tick, name, value } in treatment_readings {
-            treatment.entry(name).or_default().insert(tick, value);
-        }
-
-        // For every metric present in BOTH runs, pair the values at ticks the two runs share. At
-        // least three pairs are required — a paired test on one or two points is noise.
-        struct Paired {
-            name: String,
-            control: Vec<f64>,
-            treatment: Vec<f64>,
-        }
-        let mut paired: Vec<Paired> = Vec::new();
-        for (name, control_ticks) in &control {
-            let Some(treatment_ticks) = treatment.get(name) else {
-                continue; // metric only present in one run — nothing to compare
-            };
-            let mut control_values = Vec::new();
-            let mut treatment_values = Vec::new();
-            for (tick, control_value) in control_ticks {
-                if let Some(treatment_value) = treatment_ticks.get(tick) {
-                    control_values.push(*control_value);
-                    treatment_values.push(*treatment_value);
-                }
-            }
-            if control_values.len() >= 3 {
-                paired.push(Paired {
-                    name: name.clone(),
-                    control: control_values,
-                    treatment: treatment_values,
-                });
-            }
-        }
-
-        let compare_params = compare::CompareParams {
-            fdr,
-            ..compare::CompareParams::default()
-        };
-        // `series` borrows `paired`, which outlives it and the compare_metrics call below.
-        // `as_str`/`as_slice` are explicit rather than relying on `&String`/`&Vec` coercion at the
-        // struct-field site.
-        let series: Vec<compare::MetricSeries<'_>> = paired
-            .iter()
-            .map(|p| compare::MetricSeries {
-                name: p.name.as_str(),
-                control: p.control.as_slice(),
-                treatment: p.treatment.as_slice(),
-            })
-            .collect();
-        let study = compare::compare_metrics(&series, &compare_params)
-            .map_err(|e| metric_stats_error(&e))?;
-
-        let mut rows = Vec::with_capacity(study.metrics.len());
-        let mut significant = 0usize;
-        for named in &study.metrics {
-            let c = &named.comparison;
-            if c.significant_fdr {
-                significant += 1;
-            }
-            rows.push(RunComparisonRow {
-                metric: named.metric.clone(),
-                n_pairs: c.n_pairs,
-                mean_difference: c.mean_difference,
-                ci_lower: c.difference_ci.lower,
-                ci_upper: c.difference_ci.upper,
-                p_value: c.p_value,
-                cohens_dz: c.cohens_dz,
-                fraction_positive: c.fraction_positive,
-                significant_fdr: c.significant_fdr,
-            });
-        }
+        // BTreeMap keeps both metric and tick order stable. Pair only ticks shared by both runs;
+        // three pairs is the minimum accepted by the paired statistical test.
+        let control = index_metrics_by_tick(control_readings);
+        let treatment = index_metrics_by_tick(treatment_readings);
+        let paired = pair_shared_metrics(&control, &treatment);
+        let rows = compare_paired_metrics(&paired, fdr)?;
+        let significant = rows.iter().filter(|row| row.significant_fdr).count();
 
         let machine = RunComparisonMachine {
             treatment_db: treatment_path.to_owned(),
@@ -842,47 +903,7 @@ impl Report for RunComparison {
             metrics: rows,
         };
 
-        let mut md = String::new();
-        let _ = writeln!(md, "# Run comparison\n");
-        let _ = writeln!(
-            md,
-            "_treatment=`{}`, FDR={}, {} of {} shared metrics show a certified treatment effect._\n",
-            machine.treatment_db, machine.fdr, machine.significant, machine.metrics_compared
-        );
-        if machine.truncated {
-            let _ = writeln!(
-                md,
-                "> **Note:** a metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; the \
-                 comparison is over recent history, not the whole run.\n"
-            );
-        }
-        if machine.metrics.is_empty() {
-            let _ = writeln!(
-                md,
-                "_No metric was present in both runs with enough matched ticks._"
-            );
-        } else {
-            let _ = writeln!(
-                md,
-                "| metric | pairs | Δ (treat−ctrl) | 95% CI | p | d_z | +frac | real? |"
-            );
-            let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
-            for row in &machine.metrics {
-                let _ = writeln!(
-                    md,
-                    "| {} | {} | {:+.4} | [{:.3}, {:.3}] | {:.4} | {:.3} | {:.2} | {} |",
-                    row.metric,
-                    row.n_pairs,
-                    row.mean_difference,
-                    row.ci_lower,
-                    row.ci_upper,
-                    row.p_value,
-                    row.cohens_dz,
-                    row.fraction_positive,
-                    if row.significant_fdr { "yes" } else { "no" },
-                );
-            }
-        }
+        let md = render_run_comparison_markdown(&machine);
 
         let output = base_output(
             self.name(),
@@ -935,6 +956,88 @@ struct MetricDistributionRow {
     non_normal: bool,
 }
 
+fn summarize_metric_distributions(
+    readings: Vec<PersistedMetric>,
+    alpha: f64,
+) -> Result<Vec<MetricDistributionRow>, AnalyticsError> {
+    let mut by_metric: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for PersistedMetric { name, value, .. } in readings {
+        by_metric.entry(name).or_default().push(value);
+    }
+
+    let mut rows = Vec::with_capacity(by_metric.len());
+    for (name, values) in by_metric {
+        if values.len() < 4 {
+            continue;
+        }
+        let summary =
+            distribution::summarize(&values).map_err(|error| metric_stats_error(&error))?;
+        rows.push(MetricDistributionRow {
+            name,
+            n: summary.n,
+            mean: summary.mean,
+            std_dev: summary.std_dev,
+            skewness: summary.skewness,
+            excess_kurtosis: summary.excess_kurtosis,
+            jarque_bera: summary.jarque_bera,
+            jb_p_value: summary.jb_p_value,
+            degenerate: summary.degenerate,
+            non_normal: summary.rejects_normality(alpha),
+        });
+    }
+    Ok(rows)
+}
+
+fn render_metric_distribution_markdown(machine: &MetricDistributionMachine) -> String {
+    let mut md = String::new();
+    let _ = writeln!(md, "# Metric distributions\n");
+    let _ = writeln!(
+        md,
+        "_alpha={}, {} of {} metrics flagged non-normal (Jarque-Bera)._\n",
+        machine.alpha, machine.non_normal, machine.metrics_examined
+    );
+    if machine.truncated {
+        let _ = writeln!(
+            md,
+            "> **Note:** the metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; the shape \
+             is over recent history, not the whole run.\n"
+        );
+    }
+    if machine.metrics.is_empty() {
+        let _ = writeln!(md, "_No metric had at least four values to characterize._");
+        return md;
+    }
+
+    let _ = writeln!(
+        md,
+        "| metric | n | mean | sd | skew | ex.kurt | JB | p | normal? |"
+    );
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|");
+    for row in &machine.metrics {
+        let verdict = if row.degenerate {
+            "constant"
+        } else if row.non_normal {
+            "no"
+        } else {
+            "yes"
+        };
+        let _ = writeln!(
+            md,
+            "| {} | {} | {:.4} | {:.4} | {:+.3} | {:+.3} | {:.2} | {:.4} | {} |",
+            row.name,
+            row.n,
+            row.mean,
+            row.std_dev,
+            row.skewness,
+            row.excess_kurtosis,
+            row.jarque_bera,
+            row.jb_p_value,
+            verdict,
+        );
+    }
+    md
+}
+
 impl Report for MetricDistribution {
     fn name(&self) -> &'static str {
         "metric-distribution"
@@ -961,37 +1064,8 @@ impl Report for MetricDistribution {
         log_report_stage("read", &read_started, readings.len());
 
         let render_started = Instant::now();
-        let mut by_metric: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-        for PersistedMetric { name, value, .. } in readings {
-            by_metric.entry(name).or_default().push(value);
-        }
-
-        let mut rows = Vec::with_capacity(by_metric.len());
-        let mut non_normal = 0usize;
-        for (name, values) in by_metric {
-            // The shape test needs at least four points; a shorter series is skipped rather than
-            // reported with a meaningless statistic.
-            if values.len() < 4 {
-                continue;
-            }
-            let summary = distribution::summarize(&values).map_err(|e| metric_stats_error(&e))?;
-            let is_non_normal = summary.rejects_normality(alpha);
-            if is_non_normal {
-                non_normal += 1;
-            }
-            rows.push(MetricDistributionRow {
-                name,
-                n: summary.n,
-                mean: summary.mean,
-                std_dev: summary.std_dev,
-                skewness: summary.skewness,
-                excess_kurtosis: summary.excess_kurtosis,
-                jarque_bera: summary.jarque_bera,
-                jb_p_value: summary.jb_p_value,
-                degenerate: summary.degenerate,
-                non_normal: is_non_normal,
-            });
-        }
+        let rows = summarize_metric_distributions(readings, alpha)?;
+        let non_normal = rows.iter().filter(|row| row.non_normal).count();
 
         let machine = MetricDistributionMachine {
             alpha,
@@ -1001,51 +1075,7 @@ impl Report for MetricDistribution {
             metrics: rows,
         };
 
-        let mut md = String::new();
-        let _ = writeln!(md, "# Metric distributions\n");
-        let _ = writeln!(
-            md,
-            "_alpha={}, {} of {} metrics flagged non-normal (Jarque-Bera)._\n",
-            machine.alpha, machine.non_normal, machine.metrics_examined
-        );
-        if machine.truncated {
-            let _ = writeln!(
-                md,
-                "> **Note:** the metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; the shape \
-                 is over recent history, not the whole run.\n"
-            );
-        }
-        if machine.metrics.is_empty() {
-            let _ = writeln!(md, "_No metric had at least four values to characterize._");
-        } else {
-            let _ = writeln!(
-                md,
-                "| metric | n | mean | sd | skew | ex.kurt | JB | p | normal? |"
-            );
-            let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|");
-            for row in &machine.metrics {
-                let verdict = if row.degenerate {
-                    "constant"
-                } else if row.non_normal {
-                    "no"
-                } else {
-                    "yes"
-                };
-                let _ = writeln!(
-                    md,
-                    "| {} | {} | {:.4} | {:.4} | {:+.3} | {:+.3} | {:.2} | {:.4} | {} |",
-                    row.name,
-                    row.n,
-                    row.mean,
-                    row.std_dev,
-                    row.skewness,
-                    row.excess_kurtosis,
-                    row.jarque_bera,
-                    row.jb_p_value,
-                    verdict,
-                );
-            }
-        }
+        let md = render_metric_distribution_markdown(&machine);
 
         let output = base_output(
             self.name(),

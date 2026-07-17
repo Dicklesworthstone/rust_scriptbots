@@ -30,10 +30,13 @@ use crate::stats::StatsError;
 /// Shape summary of a sample: its first four moments and a normality test.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DistributionSummary {
+    /// Number of observations included in the summary.
     pub n: usize,
+    /// Arithmetic mean of the observations.
     pub mean: f64,
     /// Population variance (divided by `n`), matching the moments the skewness/kurtosis use.
     pub variance: f64,
+    /// Population standard deviation, equal to the square root of `variance`.
     pub std_dev: f64,
     /// Fisher-Pearson skewness `g1 = m3 / m2^1.5`. Zero for a symmetric distribution, positive for
     /// a right tail.
@@ -49,8 +52,8 @@ pub struct DistributionSummary {
     /// `1.0` — there is no shape to reject.
     pub jb_p_value: f64,
     /// True for a constant sample, whose shape moments are undefined and are reported as zero
-    /// rather than `NaN`. A reader must not read "skewness 0, excess_kurtosis 0" as "looks normal"
-    /// when it actually means "there is nothing here".
+    /// rather than `NaN`. A reader must not interpret zero `skewness` and zero
+    /// `excess_kurtosis` as "looks normal" when it actually means "there is nothing here".
     pub degenerate: bool,
 }
 
@@ -95,8 +98,8 @@ pub fn summarize(sample: &[f64]) -> Result<DistributionSummary, StatsError> {
         let d = value - mean;
         let d2 = d * d;
         m2 += d2;
-        m3 += d2 * d;
-        m4 += d2 * d2;
+        m3 = d2.mul_add(d, m3);
+        m4 = d2.mul_add(d2, m4);
     }
     m2 /= n;
     m3 /= n;
