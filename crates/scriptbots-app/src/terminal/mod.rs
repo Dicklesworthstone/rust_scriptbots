@@ -27,8 +27,9 @@ use ratatui::{
 };
 use scriptbots_core::{
     AgentId, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
-    BrainInspectionRevision, ControlCommand, ControlDisposition, ControlSettings,
-    SimulationCommand, TerrainKind, TerrainLayer, TickSummary, WorldState, apply_control_command,
+    BrainInspectionRevision, ControlCommand, ControlDisposition, ControlSettings, NUM_EYES,
+    SENSOR_LAYOUT, SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer,
+    TickSummary, WorldState, apply_control_command,
 };
 #[cfg(test)]
 use scriptbots_storage::AnalyticsSnapshotProvider;
@@ -49,6 +50,11 @@ const UI_TICK_MILLIS: u64 = 100;
 const DEFAULT_HEADLESS_FRAMES: usize = 12;
 const MAX_HEADLESS_FRAMES: usize = 360;
 const EVENT_LOG_CAPACITY: usize = 16;
+/// Bounded contributor list requested from `WorldState::explain_sensors`
+/// (bd-16g.4.2); the panel is an on-demand probe, never a population scan.
+const PROBE_MAX_CONTRIBUTORS: usize = 12;
+/// Rows reserved below the map for the egocentric sense-probe panel.
+const PROBE_PANEL_HEIGHT: u16 = 18;
 const LEADERBOARD_LIMIT: usize = 6;
 const BRAINBOARD_LIMIT: usize = 4;
 const TERMINAL_BRAIN_INSPECTION_CLIENT_ID: BrainInspectionClientId =
@@ -343,6 +349,9 @@ struct TerminalApp<'a> {
     activation_layer_index: usize,
     activation_row_offset: usize,
     focus_lock: FocusLockMode,
+    /// When true, the focused agent's senses are probed each snapshot refresh
+    /// and rendered as the egocentric attribution panel (bd-16g.4.2).
+    probe_enabled: bool,
     brain_inspection_revision: BrainInspectionRevision,
     brain_inspection_cache: Option<TerminalBrainInspectionCache>,
 }
@@ -391,6 +400,7 @@ impl<'a> TerminalApp<'a> {
             activation_layer_index: 0,
             activation_row_offset: 0,
             focus_lock: FocusLockMode::Manual,
+            probe_enabled: false,
             brain_inspection_revision: BrainInspectionRevision::new(0),
             brain_inspection_cache: None,
         };
@@ -558,7 +568,16 @@ impl<'a> TerminalApp<'a> {
 
         // Draw the map while avoiding holding an external borrow across &mut self
         let world_size = self.snapshot.world_size;
-        self.draw_map(frame, body[0], world_size);
+        if self.probe_enabled {
+            let map_column = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(PROBE_PANEL_HEIGHT)])
+                .split(body[0]);
+            self.draw_map(frame, map_column[0], world_size);
+            self.draw_probe(frame, map_column[1], &self.snapshot);
+        } else {
+            self.draw_map(frame, body[0], world_size);
+        }
 
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
@@ -1378,6 +1397,134 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(paragraph, area);
     }
 
+    /// Egocentric sense-probe panel (bd-16g.4.2).
+    ///
+    /// Renders `SensorAttribution` verbatim: clamped values on the gauges, an
+    /// explicit `⚠raw` marker on saturated channels (contributions routinely
+    /// sum above 1.0 — normalising them would destroy the information), and a
+    /// per-channel source tag from `SENSOR_LAYOUT` so an empty contributor
+    /// list on a self-state channel reads as "self", never as "no neighbors
+    /// detected".
+    fn draw_probe(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(" Sense Probe ", self.palette.header_style()));
+        let Some(probe) = &snapshot.probe else {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from("no focused agent to probe"),
+                    Line::from("(population empty, or focus lost this frame)"),
+                ])
+                .block(block),
+                area,
+            );
+            return;
+        };
+        let att = &probe.attribution;
+        let mut lines: Vec<Line> = Vec::new();
+        let truncation = if att.truncated > 0 {
+            format!(" (+{} truncated)", att.truncated)
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("uid ", self.palette.header_style()),
+            Span::raw(format!(
+                "{}  t{}  {} contributors{truncation}",
+                probe.agent_uid,
+                att.tick.0,
+                att.contributions.len(),
+            )),
+        ]));
+
+        // Eye rows: indices come from SENSOR_LAYOUT, never hardcoded — the
+        // layout is deliberately non-contiguous (eye 3 sits at 21..=24).
+        for eye in 0..NUM_EYES {
+            let mut spans: Vec<Span> = vec![Span::styled(
+                format!("eye{eye} "),
+                self.palette.header_style(),
+            )];
+            for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye == Some(eye)) {
+                let idx = channel.index;
+                let letter = match channel.kind {
+                    SensorKind::EyeDensity => "d",
+                    SensorKind::EyeRed => "R",
+                    SensorKind::EyeGreen => "G",
+                    SensorKind::EyeBlue => "B",
+                    _ => "?",
+                };
+                let mut cell = format!("{letter}{:.2}", att.clamped[idx]);
+                if att.saturated[idx] {
+                    cell.push_str(&format!("⚠{:.1}", att.raw[idx]));
+                }
+                cell.push(' ');
+                spans.push(Span::raw(cell));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        let mut scalar_cells: Vec<String> = Vec::new();
+        for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye.is_none()) {
+            let idx = channel.index;
+            let mut cell = format!(
+                "{} {:.2}[{}]",
+                channel.name,
+                att.clamped[idx],
+                sensor_source_tag(channel.kind)
+            );
+            if att.saturated[idx] {
+                cell.push_str(&format!("⚠{:.1}", att.raw[idx]));
+            }
+            scalar_cells.push(cell);
+        }
+        // Three cells per row so no source tag is clipped on narrow panels.
+        for row in scalar_cells.chunks(3) {
+            lines.push(Line::from(row.join("  ")));
+        }
+
+        if att.contributions.is_empty() {
+            lines.push(Line::from(
+                "no neighbors within sense radius (self/grid channels above stay live)",
+            ));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "strongest contributors",
+                self.palette.header_style(),
+            )));
+            for contribution in &att.contributions {
+                let max_eye = contribution
+                    .eye_density
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+                    .map_or(0, |(eye, _)| eye);
+                let mut spans: Vec<Span> = Vec::new();
+                if self.palette.has_color() {
+                    let [r, g, b] = contribution.color;
+                    spans.push(Span::styled(
+                        "■ ",
+                        Style::default().fg(Color::Rgb(
+                            (r.clamp(0.0, 1.0) * 255.0) as u8,
+                            (g.clamp(0.0, 1.0) * 255.0) as u8,
+                            (b.clamp(0.0, 1.0) * 255.0) as u8,
+                        )),
+                    ));
+                }
+                spans.push(Span::raw(format!(
+                    "#{} {:+.0}° d{:.0} eye{} Σ{:.2}",
+                    contribution.source_uid.0,
+                    contribution.bearing.to_degrees(),
+                    contribution.distance,
+                    max_eye,
+                    contribution.total,
+                )));
+                lines.push(Line::from(spans));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
     fn draw_help(&self, frame: &mut Frame<'_>) {
         let size = frame.area();
         let help_width = (size.width as f32 * 0.6).round() as u16;
@@ -1401,6 +1548,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" ↑ / ↓    Page brain heatmap rows (console view)"),
             Line::raw(" ← / →    Change focused agent (console view)"),
             Line::raw(" m/t/o    Focus mode: Manual / TopPredator / Oldest"),
+            Line::raw(" i        Toggle sense probe (egocentric view of the focused agent)"),
             Line::raw(" ? / h    Toggle this help  (? is Shift+/ on most keyboards)"),
             Line::raw(""),
             Line::from(vec![Span::styled(
@@ -1575,6 +1723,22 @@ impl<'a> TerminalApp<'a> {
                         "Baseline set to current metrics",
                     );
                 }
+            }
+            (KeyCode::Char('i') | KeyCode::Char('I'), _) => {
+                self.probe_enabled = !self.probe_enabled;
+                if self.probe_enabled {
+                    // Capture immediately so the panel appears this frame.
+                    self.refresh_snapshot();
+                }
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    if self.probe_enabled {
+                        "Sense probe ON (focused agent)"
+                    } else {
+                        "Sense probe OFF"
+                    },
+                );
             }
             (KeyCode::Char('x') | KeyCode::Char('X'), _) => {
                 // User explicitly toggled; stop auto behavior and honor user's choice
@@ -1791,6 +1955,22 @@ impl<'a> TerminalApp<'a> {
                         next_inspection_cache = Some(cache);
                     }
                 }
+                // Egocentric sense probe (bd-16g.4.2): attribution is computed
+                // in core under this same lock; the panel renders it verbatim.
+                snap.probe = if self.probe_enabled {
+                    agent_id_opt.and_then(|agent_id| {
+                        world.agent_uid(agent_id).and_then(|agent_uid| {
+                            world
+                                .explain_sensors(agent_id, PROBE_MAX_CONTRIBUTORS)
+                                .map(|attribution| ProbeSnapshot {
+                                    agent_uid: agent_uid.get(),
+                                    attribution,
+                                })
+                        })
+                    })
+                } else {
+                    None
+                };
                 snap
             }
             Err(_) => return,
@@ -2065,6 +2245,27 @@ fn parse_terminal_analytics(
     })
 }
 
+/// Truthful per-channel provenance tag for the sense probe (bd-16g.4.2).
+///
+/// Attribution applies only to neighbour-derived channels; the panel says
+/// where every other channel comes from instead of implying "no neighbours
+/// detected" on a channel that never had contributors.
+const fn sensor_source_tag(kind: SensorKind) -> &'static str {
+    match kind {
+        SensorKind::EyeDensity
+        | SensorKind::EyeRed
+        | SensorKind::EyeGreen
+        | SensorKind::EyeBlue
+        | SensorKind::Sound
+        | SensorKind::Smell
+        | SensorKind::Hearing
+        | SensorKind::Blood => "nbr",
+        SensorKind::Food => "grid",
+        SensorKind::Health | SensorKind::Clock => "self",
+        SensorKind::Temperature => "pos",
+    }
+}
+
 fn diff_i(value: i64) -> String {
     if value > 0 {
         format!("(+{value})")
@@ -2111,6 +2312,18 @@ struct Snapshot {
     spike_hits: u32,
     brain_layers: Vec<BrainLayerView>,
     brain_inspection: Option<BrainInspectionViewMetadata>,
+    probe: Option<ProbeSnapshot>,
+}
+
+/// One agent's senses, explained (bd-16g.4.2).
+///
+/// A rendering-ready copy of the core attribution, captured under the same
+/// world lock as the rest of the snapshot. The panel renders this verbatim —
+/// attribution is computed in core and never re-derived here.
+#[derive(Clone, Debug)]
+struct ProbeSnapshot {
+    agent_uid: u64,
+    attribution: SensorAttribution,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2605,6 +2818,7 @@ impl Snapshot {
             spike_hits: summary.spike_hits,
             brain_layers: Vec::new(),
             brain_inspection: None,
+            probe: None,
         }
     }
 
@@ -3608,7 +3822,7 @@ impl<'a> Widget for MapWidget<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{AgentData, ScriptBotsConfig};
+    use scriptbots_core::{AgentData, Position, ScriptBotsConfig};
 
     #[test]
     fn brain_inspection_metadata_exposes_provenance_clipping_and_staleness() {
@@ -3803,6 +4017,139 @@ mod tests {
                 .expect("world mutex poisoned while executing test simulation step")
                 .step()
         })
+    }
+
+    #[derive(Debug)]
+    struct ProbePanelBrain;
+
+    impl scriptbots_core::BrainRunner for ProbePanelBrain {
+        fn kind(&self) -> &'static str {
+            "terminal.probe"
+        }
+
+        fn tick(
+            &mut self,
+            _inputs: &[f32; scriptbots_core::INPUT_SIZE],
+        ) -> [f32; scriptbots_core::OUTPUT_SIZE] {
+            [0.0; scriptbots_core::OUTPUT_SIZE]
+        }
+    }
+
+    /// bd-16g.4.2: the sense probe is opt-in, captures core attribution
+    /// verbatim under the snapshot lock, recaptures deterministically while
+    /// paused, and renders truthful per-channel source labels — a self-state
+    /// channel must read as `[self]`, never as a missing-neighbour condition.
+    #[test]
+    fn sense_probe_captures_attribution_verbatim_and_labels_channel_sources() {
+        let world = command_characterization_world();
+        {
+            let mut guard = world.lock().expect("probe world lock");
+            let family = guard
+                .brain_registry_mut()
+                .expect("probe registry mutation")
+                .register_with_state_digest("terminal.probe", 0x5455_495f_5052_4f42, |_rng| {
+                    Ok(Box::new(ProbePanelBrain))
+                });
+            // Two agents 12 world-units apart: comfortably inside the default
+            // sense radius so the focused agent has a real contributor.
+            for offset in [0.0_f32, 12.0] {
+                let agent_id = guard
+                    .try_spawn_agent(AgentData {
+                        position: Position {
+                            x: 100.0 + offset,
+                            y: 100.0,
+                        },
+                        ..AgentData::default()
+                    })
+                    .expect("spawn probe agent");
+                guard
+                    .bind_agent_brain(agent_id, family)
+                    .expect("bind probe brain");
+            }
+        }
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        app.paused = true;
+        assert!(
+            app.snapshot.probe.is_none(),
+            "the probe is opt-in; nothing may be captured before the toggle"
+        );
+
+        app.probe_enabled = true;
+        app.refresh_snapshot();
+        let first = app
+            .snapshot
+            .probe
+            .clone()
+            .expect("probe captured for the focused agent");
+        let attribution = &first.attribution;
+        assert!(
+            !attribution.contributions.is_empty(),
+            "the neighbour 12 units away must be attributed"
+        );
+        for index in 0..scriptbots_core::INPUT_SIZE {
+            assert!(
+                (0.0..=1.0).contains(&attribution.clamped[index]),
+                "clamped channel {index} must stay in [0, 1]"
+            );
+            if attribution.saturated[index] {
+                assert!(
+                    attribution.raw[index] > 1.0,
+                    "a saturated channel must expose its raw pre-clamp value"
+                );
+            }
+        }
+
+        app.refresh_snapshot();
+        let second = app
+            .snapshot
+            .probe
+            .clone()
+            .expect("recaptured probe while paused");
+        assert_eq!(
+            first.attribution, second.attribution,
+            "a paused world must recapture the identical attribution"
+        );
+        assert_eq!(first.agent_uid, second.agent_uid);
+
+        app.palette = Palette::test_backend_evidence();
+        let backend = ratatui::backend::TestBackend::new(140, 48);
+        let mut terminal = Terminal::new(backend).expect("probe test backend");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("probe frame renders");
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut text = String::new();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        for needle in ["Sense Probe", "[self]", "[grid]", "[pos]", "eye0", "eye3"] {
+            assert!(
+                text.contains(needle),
+                "probe panel must render {needle:?}; buffer was:\n{text}"
+            );
+        }
+
+        app.probe_enabled = false;
+        app.refresh_snapshot();
+        assert!(
+            app.snapshot.probe.is_none(),
+            "disabling the probe must stop capturing"
+        );
     }
 
     #[test]
