@@ -1733,6 +1733,7 @@ pub struct JournalBatch {
     applied: AppliedCommand,
     scientific: Option<Arc<ScientificBoundary>>,
     persistence: Option<Arc<PersistenceBatch>>,
+    retained_bytes: usize,
 }
 
 /// Complete engine-neutral payload produced by one scientific transition.
@@ -1863,10 +1864,161 @@ impl ScientificBoundary {
     }
 }
 
+const ARC_ALLOCATION_OVERHEAD_BYTES: usize = size_of::<usize>() * 2;
+
+fn retained_vec_bytes<T>(capacity: usize) -> usize {
+    capacity.saturating_mul(size_of::<T>())
+}
+
+fn retained_cow_bytes(value: &std::borrow::Cow<'static, str>) -> usize {
+    match value {
+        std::borrow::Cow::Borrowed(_) => 0,
+        std::borrow::Cow::Owned(value) => value.capacity(),
+    }
+}
+
+fn retained_birth_bytes(record: &BirthRecord) -> usize {
+    record
+        .brain_kind
+        .as_ref()
+        .map_or(0, std::string::String::capacity)
+}
+
+fn retained_death_bytes(record: &DeathRecord) -> usize {
+    record
+        .brain_kind
+        .as_ref()
+        .map_or(0, std::string::String::capacity)
+}
+
+fn retained_command_bytes(command: Option<&CommandEnvelope>) -> usize {
+    let Some(CommandEnvelope {
+        command: HostCommand::UpdateConfig(config),
+        ..
+    }) = command
+    else {
+        return 0;
+    };
+    size_of::<ScriptBotsConfig>().saturating_add(retained_vec_bytes::<usize>(
+        config.neuroflow.hidden_layers.capacity(),
+    ))
+}
+
+fn retained_scientific_bytes(scientific: Option<&ScientificBoundary>) -> usize {
+    let Some(scientific) = scientific else {
+        return 0;
+    };
+    let mut retained = ARC_ALLOCATION_OVERHEAD_BYTES
+        .saturating_add(size_of::<ScientificBoundary>())
+        .saturating_add(retained_vec_bytes::<BirthRecord>(
+            scientific.births.capacity(),
+        ))
+        .saturating_add(retained_vec_bytes::<DeathRecord>(
+            scientific.deaths.capacity(),
+        ));
+    for birth in &scientific.births {
+        retained = retained.saturating_add(retained_birth_bytes(birth));
+    }
+    for death in &scientific.deaths {
+        retained = retained.saturating_add(retained_death_bytes(death));
+    }
+    if let Some(resource_tick) = &scientific.resource_tick {
+        retained = retained.saturating_add(retained_vec_bytes::<scriptbots_core::ResourceFlow>(
+            resource_tick.flows.capacity(),
+        ));
+    }
+    if let Some(fault) = &scientific.fault {
+        retained = retained
+            .saturating_add(fault.code.capacity())
+            .saturating_add(fault.message.capacity());
+    }
+    retained
+}
+
+fn retained_agent_bytes(agent: &scriptbots_core::AgentState) -> usize {
+    let mut retained = retained_vec_bytes::<String>(agent.runtime.mutation_log.capacity());
+    for entry in &agent.runtime.mutation_log {
+        retained = retained.saturating_add(entry.capacity());
+    }
+    match &agent.runtime.brain {
+        scriptbots_core::BrainBinding::Unbound => {}
+        scriptbots_core::BrainBinding::Legacy { kind, .. } => {
+            retained = retained.saturating_add(kind.capacity());
+        }
+        scriptbots_core::BrainBinding::Protocol { kind, genome, .. } => {
+            retained = retained
+                .saturating_add(kind.capacity())
+                .saturating_add(genome.family_id().as_str().len())
+                .saturating_add(genome.payload().len());
+        }
+    }
+    retained
+}
+
+fn retained_persistence_bytes(persistence: Option<&PersistenceBatch>) -> usize {
+    let Some(persistence) = persistence else {
+        return 0;
+    };
+    let mut retained = ARC_ALLOCATION_OVERHEAD_BYTES
+        .saturating_add(size_of::<PersistenceBatch>())
+        .saturating_add(retained_vec_bytes::<scriptbots_core::MetricSample>(
+            persistence.metrics.capacity(),
+        ))
+        .saturating_add(retained_vec_bytes::<scriptbots_core::PersistenceEvent>(
+            persistence.events.capacity(),
+        ))
+        .saturating_add(retained_vec_bytes::<scriptbots_core::AgentState>(
+            persistence.agents.capacity(),
+        ))
+        .saturating_add(retained_vec_bytes::<BirthRecord>(
+            persistence.births.capacity(),
+        ))
+        .saturating_add(retained_vec_bytes::<DeathRecord>(
+            persistence.deaths.capacity(),
+        ))
+        .saturating_add(retained_vec_bytes::<scriptbots_core::ReplayEvent>(
+            persistence.replay_events.capacity(),
+        ));
+    for metric in &persistence.metrics {
+        retained = retained.saturating_add(retained_cow_bytes(&metric.name));
+    }
+    for event in &persistence.events {
+        if let scriptbots_core::PersistenceEventKind::Custom(kind) = &event.kind {
+            retained = retained.saturating_add(retained_cow_bytes(kind));
+        }
+    }
+    for agent in &persistence.agents {
+        retained = retained.saturating_add(retained_agent_bytes(agent));
+    }
+    for birth in &persistence.births {
+        retained = retained.saturating_add(retained_birth_bytes(birth));
+    }
+    for death in &persistence.deaths {
+        retained = retained.saturating_add(retained_death_bytes(death));
+    }
+    for event in &persistence.replay_events {
+        if let scriptbots_core::ReplayEventKind::BrainOutputs { outputs } = &event.kind {
+            retained = retained.saturating_add(retained_vec_bytes::<f32>(outputs.capacity()));
+        }
+    }
+    retained
+}
+
+fn journal_batch_retained_bytes(
+    command: Option<&CommandEnvelope>,
+    scientific: Option<&ScientificBoundary>,
+    persistence: Option<&PersistenceBatch>,
+) -> usize {
+    size_of::<JournalBatch>()
+        .saturating_add(retained_command_bytes(command))
+        .saturating_add(retained_scientific_bytes(scientific))
+        .saturating_add(retained_persistence_bytes(persistence))
+}
+
 impl JournalBatch {
     /// Construct one exact journal batch at an already-completed boundary.
     #[must_use]
-    pub(crate) const fn new(
+    pub(crate) fn new(
         id: JournalBatchId,
         scientific_event_sequence: Option<EventSequence>,
         command: Option<CommandEnvelope>,
@@ -1874,6 +2026,11 @@ impl JournalBatch {
         scientific: Option<Arc<ScientificBoundary>>,
         persistence: Option<Arc<PersistenceBatch>>,
     ) -> Self {
+        let retained_bytes = journal_batch_retained_bytes(
+            command.as_ref(),
+            scientific.as_deref(),
+            persistence.as_deref(),
+        );
         Self {
             id,
             scientific_event_sequence,
@@ -1881,6 +2038,7 @@ impl JournalBatch {
             applied,
             scientific,
             persistence,
+            retained_bytes,
         }
     }
 
@@ -1924,6 +2082,16 @@ impl JournalBatch {
     #[must_use]
     pub const fn persistence(&self) -> Option<&Arc<PersistenceBatch>> {
         self.persistence.as_ref()
+    }
+
+    /// Conservative bytes retained by this exact batch for bounded admission.
+    ///
+    /// The charge is computed once before the first admission attempt, uses saturating arithmetic,
+    /// and includes owned vector capacity and nested dynamic payloads without serializing or
+    /// allocating. Exact retries therefore reuse both this charge and the original batch allocation.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -4141,7 +4309,12 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{DynamicSnapshotSummary, DynamicSnapshotWorld};
+    use scriptbots_core::{
+        AgentData, AgentId, AgentIdentity, AgentRuntime, AgentState, BirthOrigin, BrainBinding,
+        BrainFamilyId, BrainGenomeEnvelope, BrainProvenance, CombatEventFlags, DeathCause,
+        DynamicSnapshotSummary, DynamicSnapshotWorld, MetricSample, PersistenceEvent,
+        PersistenceEventKind, Position, ReplayEvent, ReplayEventKind,
+    };
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::hint::black_box;
     use std::mem::size_of;
@@ -4748,6 +4921,196 @@ mod tests {
             0,
             None,
         ))
+    }
+
+    fn charged_journal_batch(
+        text_bytes: usize,
+        replay_outputs: usize,
+        genome_bytes: usize,
+        config_layers: usize,
+    ) -> Arc<JournalBatch> {
+        let dynamic_text = "x".repeat(text_bytes);
+        let birth = BirthRecord {
+            tick: Tick(1),
+            agent_uid: AgentUid(1),
+            spawn_ordinal: 1,
+            birth_ordinal: None,
+            origin: BirthOrigin::Seeded,
+            parent_a: None,
+            parent_b: None,
+            brain_kind: Some(dynamic_text.clone()),
+            brain_key: Some(7),
+            herbivore_tendency: 0.5,
+            generation: Generation(0),
+            position: Position::default(),
+            is_hybrid: false,
+        };
+        let death = DeathRecord {
+            tick: Tick(1),
+            agent_uid: AgentUid(2),
+            age: 1,
+            generation: Generation(0),
+            herbivore_tendency: 0.5,
+            brain_kind: Some(dynamic_text.clone()),
+            brain_key: Some(7),
+            energy: 0.0,
+            food_balance_total: 0.0,
+            cause: DeathCause::Unknown,
+            was_hybrid: false,
+            combat_flags: CombatEventFlags::default(),
+        };
+        let genome = BrainGenomeEnvelope::new(
+            BrainFamilyId::new("charge-fixture").expect("valid fixture family"),
+            1,
+            1,
+            vec![7; genome_bytes],
+            BrainProvenance::default(),
+        )
+        .expect("bounded fixture genome");
+        let mut runtime = AgentRuntime {
+            brain: BrainBinding::Protocol {
+                registry_key: 7,
+                kind: dynamic_text.clone(),
+                genome,
+                evaluator: None,
+            },
+            ..AgentRuntime::default()
+        };
+        runtime.mutation_log.push(dynamic_text.clone());
+        let agent = AgentState {
+            id: AgentId::default(),
+            identity: AgentIdentity {
+                uid: AgentUid(1),
+                spawn_ordinal: 1,
+                birth_ordinal: None,
+            },
+            data: AgentData::default(),
+            runtime,
+        };
+        let persistence = Arc::new(PersistenceBatch {
+            summary: projection_summary(1),
+            epoch: 0,
+            closed: false,
+            metrics: vec![MetricSample::new(dynamic_text.clone(), 1.0)],
+            events: vec![PersistenceEvent::new(
+                PersistenceEventKind::Custom(dynamic_text.clone().into()),
+                1,
+            )],
+            agents: vec![agent],
+            births: vec![birth.clone()],
+            deaths: vec![death.clone()],
+            replay_events: vec![ReplayEvent {
+                agent_uid: Some(AgentUid(1)),
+                kind: ReplayEventKind::BrainOutputs {
+                    outputs: vec![0.0; replay_outputs],
+                },
+            }],
+        });
+        let scientific = Arc::new(
+            ScientificBoundary::new(
+                TickEvents {
+                    tick: Tick(1),
+                    charts_flushed: false,
+                    epoch_rolled: false,
+                    food_respawned: None,
+                },
+                projection_summary(1),
+                vec![birth],
+                vec![death],
+                TickCombatSummary::default(),
+                0,
+                None,
+            )
+            .with_fault(ScientificBoundaryFault::new(
+                dynamic_text.clone(),
+                dynamic_text,
+            )),
+        );
+        let mut config = ScriptBotsConfig::default();
+        config.neuroflow.hidden_layers = vec![8; config_layers];
+        Arc::new(JournalBatch::new(
+            JournalBatchId::new(HostSessionId::new(70), 1),
+            Some(EventSequence::new(1)),
+            Some(CommandEnvelope::new(
+                CommandId::new(1),
+                HostCommand::UpdateConfig(Box::new(config)),
+            )),
+            AppliedCommand {
+                tick: Tick(1),
+                revisions: HostRevisions::default(),
+            },
+            Some(scientific),
+            Some(persistence),
+        ))
+    }
+
+    #[test]
+    fn journal_admission_charge_tracks_dynamic_strings_genomes_and_nested_outputs() {
+        let baseline = charged_journal_batch(4, 4, 4, 1).retained_bytes();
+        assert!(
+            charged_journal_batch(128, 4, 4, 1).retained_bytes() > baseline,
+            "longer owned strings must increase the precomputed charge"
+        );
+        assert!(
+            charged_journal_batch(4, 128, 4, 1).retained_bytes() > baseline,
+            "nested replay outputs must increase the precomputed charge"
+        );
+        assert!(
+            charged_journal_batch(4, 4, 256, 1).retained_bytes() > baseline,
+            "opaque genome bytes must increase the precomputed charge"
+        );
+        assert!(
+            charged_journal_batch(4, 4, 4, 32).retained_bytes() > baseline,
+            "UpdateConfig's boxed dynamic layers must increase the precomputed charge"
+        );
+    }
+
+    #[derive(Default)]
+    struct RejectOnceChargeJournal {
+        first: Option<(*const JournalBatch, usize)>,
+    }
+
+    impl JournalPort for RejectOnceChargeJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            let observed = (Arc::as_ptr(batch), batch.retained_bytes());
+            if let Some(first) = self.first {
+                assert_eq!(observed, first, "retry must reuse the exact charged allocation");
+                JournalAdmission::Accepted {
+                    batch_id: batch.id(),
+                }
+            } else {
+                self.first = Some(observed);
+                JournalAdmission::Full {
+                    batch_id: batch.id(),
+                    capacity: 1,
+                }
+            }
+        }
+
+        fn poll_receipts(&mut self, _limit: usize) -> Vec<JournalReceipt> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn retained_retry_preserves_the_precomputed_charge_and_exact_arc() {
+        let batch = charged_journal_batch(32, 16, 64, 3);
+        let retained = Arc::clone(&batch);
+        let charge = batch.retained_bytes();
+        let mut journal = RejectOnceChargeJournal::default();
+
+        assert!(matches!(
+            journal.try_admit(&batch),
+            JournalAdmission::Full { .. }
+        ));
+        assert!(Arc::ptr_eq(&batch, &retained));
+        assert_eq!(retained.retained_bytes(), charge);
+        drop(batch);
+        assert!(matches!(
+            journal.try_admit(&retained),
+            JournalAdmission::Accepted { .. }
+        ));
+        assert_eq!(retained.retained_bytes(), charge);
     }
 
     fn publish_durable_fixture_event(
