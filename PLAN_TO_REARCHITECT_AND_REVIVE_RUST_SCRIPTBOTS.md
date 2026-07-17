@@ -1885,6 +1885,14 @@ and links against User32; this is compile/link evidence only. Phase 0.4 stays in
 progress until an interactive Windows runner proves the visible station and
 current-version window launch/failure path.
 
+Native macOS matrix re-verified on the 2026-07-17 tree (VioletHawk, macOS 26.5
+arm64, `nightly-2026-07-09`): default-feature suites 197/197 and gui-feature
+suites 213/213 green; the eleven-run manual launch matrix (Auto/explicit modes,
+compiled/uncompiled gui, SSH remote-shell guard, force overrides, default
+REST/MCP ports, uncompiled `--dump-png` refusal, live GPUI session launch,
+offscreen PNG) passed end to end with exact typed errors and fail-closed exits.
+Full run log is appended to the `bd-2z0.1.5` notes.
+
 The macOS PTY frame also records deferred TUI product baseline, owned by the
 FrankenTUI frontend work rather than this startup bead: dense terrain emoji
 overwhelm agent legibility; charts lack axes and labels; the focus readout uses
