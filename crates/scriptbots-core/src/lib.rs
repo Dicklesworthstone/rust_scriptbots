@@ -37513,10 +37513,12 @@ mod tests {
                 "SB_WGPU_FXAA" => "on",
                 "SCRIPTBOTS_TERMINAL_PALETTE" => "tritanopia",
                 "SCRIPTBOTS_RENDER_QUALITY" => "ultra",
-                other => panic!("unmapped test name {other}"),
+                _ => "",
             };
-            let mapping = map_legacy_render_env(name, value)
-                .unwrap_or_else(|| panic!("{name} must map from {value}"));
+            assert!(!value.is_empty(), "unmapped test name {name}");
+            let mapping = map_legacy_render_env(name, value);
+            assert!(mapping.is_some(), "{name} must map from {value}");
+            let mapping = mapping.expect("advertised legacy mapping was asserted present");
             assert!(!mapping.assignments.is_empty());
             assert!(mapping.note.len() > 8);
         }
