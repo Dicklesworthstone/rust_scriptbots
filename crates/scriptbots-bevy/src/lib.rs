@@ -20,10 +20,10 @@ use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AgentId, ControlCommand, ControlDisposition, IndicatorState, NUM_EYES, OutputChannel,
-    OutputsExt, RenderSettings, RenderTonemapMode, SelectionMode, SelectionState, SelectionUpdate,
-    SimulationCommand, TerrainKind, TraitModifiers, WorldState, WorldStepDriver,
-    apply_control_command,
+    AgentId, ControlCommand, ControlDisposition, GpuClass, GpuInfo, IndicatorState, NUM_EYES,
+    OutputChannel, OutputsExt, RenderQuality, RenderSettings, RenderTonemapMode, SelectionMode,
+    SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TierFeatures, TraitModifiers,
+    WorldState, WorldStepDriver, apply_control_command, initial_tier_for, tier_features,
 };
 use slotmap::Key;
 use std::{
@@ -231,6 +231,108 @@ fn app_exit_result(exit: AppExit) -> Result<()> {
 }
 
 /// Entry point for the Bevy renderer; blocks until the window closes.
+/// Resolved render configuration for a Bevy launch (bd-2z0.14.3.3).
+///
+/// The operator's requested tier (`render.quality`, `Auto` by default) is
+/// resolved against the probed adapter into one concrete tier plus the
+/// canonical feature matrix row. Downstream systems read this resource
+/// instead of re-deriving capability decisions.
+#[derive(Resource, Debug, Clone)]
+pub struct EffectiveRenderSettings {
+    /// Concrete tier after Auto-resolution.
+    pub tier: RenderQuality,
+    /// Canonical per-tier feature matrix row.
+    pub features: TierFeatures,
+    /// Adapter probe (None when probing found no adapter).
+    pub gpu: Option<GpuInfo>,
+}
+
+/// Probe the default high-performance GPU adapter and classify it.
+///
+/// Returns `None` when no adapter is available (headless/software-only
+/// environments); callers must treat that as the software/Potato path, never
+/// as an error. VRAM is not reliably exposed by wgpu 27, so `vram_bytes`
+/// stays `None` until a backend-specific lane proves otherwise (documented
+/// in bd-2z0.14.3.3).
+#[must_use]
+pub fn probe_gpu_capability() -> Option<GpuInfo> {
+    use bevy::render::render_resource::wgpu;
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .ok()?;
+    let info = adapter.get_info();
+    let class = match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => GpuClass::Discrete,
+        wgpu::DeviceType::IntegratedGpu => GpuClass::Integrated,
+        wgpu::DeviceType::VirtualGpu => GpuClass::Virtual,
+        wgpu::DeviceType::Cpu => GpuClass::Software,
+        _ => GpuClass::Unknown,
+    };
+    let limits = adapter.limits();
+    let features = adapter.features();
+    Some(GpuInfo {
+        name: info.name,
+        backend: format!("{:?}", info.backend),
+        class,
+        vram_bytes: None,
+        max_texture_2d: Some(limits.max_texture_dimension_2d),
+        timestamp_queries: features.contains(wgpu::Features::TIMESTAMP_QUERY),
+    })
+}
+
+/// Resolve the effective render settings for a launch: probe the adapter,
+/// map `Auto` onto the canonical initial tier, and emit the structured
+/// capability report the C3 acceptance requires (one startup INFO block,
+/// never per-frame).
+#[must_use]
+pub fn resolve_effective_render_settings(settings: &RenderSettings) -> EffectiveRenderSettings {
+    let gpu = probe_gpu_capability();
+    let requested = settings.requested_quality();
+    let tier = match requested {
+        RenderQuality::Auto => gpu
+            .as_ref()
+            .map(|info| initial_tier_for(info.class, info.vram_bytes))
+            .unwrap_or(RenderQuality::Medium),
+        explicit => explicit,
+    };
+    let features = tier_features(tier);
+    match &gpu {
+        Some(info) => {
+            info!(
+                adapter = %info.name,
+                backend = %info.backend,
+                class = ?info.class,
+                max_texture_2d = ?info.max_texture_2d,
+                timestamp_queries = info.timestamp_queries,
+                "GPU capability report"
+            );
+        }
+        None => {
+            warn!("no GPU adapter detected; running the software/Potato visual path");
+        }
+    }
+    info!(
+        requested = ?requested,
+        effective = ?tier,
+        shadows = features.shadows,
+        shadow_cascades = features.shadow_cascades,
+        bloom = features.bloom,
+        ssao = features.ssao,
+        aa = ?features.anti_aliasing,
+        particles_max = features.particles_max,
+        "render quality tier resolved"
+    );
+    EffectiveRenderSettings {
+        tier,
+        features,
+        gpu,
+    }
+}
+
 pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     info!("Launching Bevy renderer (Phase 1: static world visuals)");
 
@@ -322,6 +424,10 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
 
     let mut app = App::new();
     let diagnostics_enabled = diagnostics_enabled();
+    // bd-2z0.14.3.3: probe the adapter and resolve the effective quality tier
+    // BEFORE the render app exists so the capability report is honest even
+    // when plugin init later fails.
+    let effective_render_settings = resolve_effective_render_settings(&initial_render_settings);
     app.insert_resource(AmbientLight {
         color: Color::srgb(0.45, 0.52, 0.65),
         brightness: 800.0,
@@ -346,6 +452,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_resource(TonemappingState::from_render_settings(
         &initial_render_settings,
     ))
+    .insert_resource(effective_render_settings)
     .add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "ScriptBots • Bevy Renderer".to_string(),
