@@ -1869,7 +1869,7 @@ loosens that threshold nor blesses the current output.
 
 **Exit:** every advertised test exercises its named path or is renamed to describe its true scope.
 
-#### 0.4 mode/startup contract [Currently In Progress — `bd-2z0.1.5`, CyanDove, 2026-07-12]
+#### 0.4 mode/startup contract [Completed — `bd-2z0.1.5`, closed 2026-07-17]
 
 - [Implemented] explicit `gui`, `bevy`, and `terminal` modes override auto-detection and never fall back after selection;
 - [Implemented] Auto considers only compiled graphical backends and selects one only in a real native graphical session; macOS uses native session availability rather than X11/Wayland variables;
@@ -1901,17 +1901,21 @@ and the inspected PNG frame has SHA-256
 An unavailable Bevy request likewise failed before its unique database, writer
 lock, or requested config file existed.
 
-Windows remains an honest external acceptance blocker. The repository has no
-self-hosted Windows runner and this machine has no Windows VM; GitHub-hosted
-`windows-2022` runners execute non-interactively and cannot prove a visible
-User32 window launch. The matrix now calls the production
-`GetProcessWindowStation`/`GetUserObjectInformationW(UOI_FLAGS)` path on that
-runner, prints flags/query/visibility/selection evidence, and checks that Auto
-uses the result. That is real Session-0/headless evidence, not a claim about a
-visible desktop. The Windows-target app unit-test binary also cross-compiles
-and links against User32; this is compile/link evidence only. Phase 0.4 stays in
-progress until an interactive Windows runner proves the visible station and
-current-version window launch/failure path.
+Windows acceptance is **complete** (2026-07-17, VioletHawk on `wlap`/surfacebookje,
+Windows 11 26220, pinned `nightly-2026-07-09`, gui build with `debug=0` at `2113569`).
+The production `GetProcessWindowStation`/`GetUserObjectInformationW(UOI_FLAGS)` path
+reported `flags=0x00000000 visible=false selected=terminal` in the non-interactive
+SSH session and `flags=0x00000001 visible=true selected=gui` inside jeffr's
+interactive console session 1 (launched via `schtasks /it`), where Auto selected
+GPUI and produced a real visible window (`Session=1 HWND=0x40378`, title
+`ScriptBots World`, stable 286s+). The full W1–W11 matrix passed: terminal/auto
+selection in both session classes, typed uncompiled gui/bevy/FORCE_GUI/dump-png
+errors with zero artifacts, REST 8088 (`/api/knobs` HTTP 200) and MCP 8090 at
+default ports, valid 800x600 offscreen PNG, and window-launch failure surfaced as
+a logged error plus immediate termination without renderer substitution. Residual
+platform findings are tracked as `bd-2z0.7.13` (GPUI `ExitProcess(0)` preempts the
+window-launch error's exit code on Windows; servers-disabled interactive launch
+behavior) and slow-host `shutdown_ack` evidence went to `bd-2z0.4.10`.
 
 Native macOS matrix re-verified on the 2026-07-17 tree (VioletHawk, macOS 26.5
 arm64, `nightly-2026-07-09`): default-feature suites 197/197 and gui-feature
@@ -1928,9 +1932,9 @@ agent `#0` while lists expose raw large handles; storage reads `committed
 pending / lag unknown`; brain metrics are unavailable; and recent events are
 sparse. None of those visual/product issues is changed by this startup proof.
 
-**Exit:** startup matrix passes for compiled/uncompiled GUI, terminal, headless, server, and launch failure.
+**Exit:** startup matrix passes for compiled/uncompiled GUI, terminal, headless, server, and launch failure. **MET 2026-07-17: Linux (162e260), native macOS (DSR profile `rust_scriptbots_bd_2z0_1_5_macos_matrix`, exit 0 at `050cc85`), and native Windows interactive (`wlap`, W1–W11).**
 
-Phase 0.4 therefore remains in progress. This slice hardens renderer selection, process startup, window lifetime, and control-server supervision. GPUI's HUD-only driver is interim containment, not the architectural double-driver fix: scientific time still belongs to a renderer, GPUI's inner command queue remains incorrect, and Bevy still owns a simulation worker. Permanent exactly-one-driver and command authority remain assigned to the `HostCore` migration.
+Phase 0.4 is therefore complete. This slice hardened renderer selection, process startup, window lifetime, and control-server supervision. GPUI's HUD-only driver is interim containment, not the architectural double-driver fix: scientific time still belongs to a renderer, GPUI's inner command queue remains incorrect, and Bevy still owns a simulation worker. Permanent exactly-one-driver and command authority remain assigned to the `HostCore` migration.
 
 #### 0.5 characterization manifest and digest v0 [Implemented: `bd-2z0.1.6`]
 
