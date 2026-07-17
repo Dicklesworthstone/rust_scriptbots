@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 asupersync = { workspace = true }
 axum = { version = "0.8.0", features = ["macros", "json"] }
 async-trait = "0.1"

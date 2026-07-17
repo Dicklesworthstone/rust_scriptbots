@@ -115,9 +115,11 @@ fn capture_shared_sense_run_summary(world: &SharedWorld) -> SenseRunSummary {
 fn persistence_step_driver(
     world: &SharedWorld,
     session: &SharedPersistenceAdmission,
+    latest_summary: &scriptbots_app::control::SharedLatestSummary,
 ) -> WorldStepDriver {
     let world = Arc::clone(world);
     let session = Arc::clone(session);
+    let latest_summary = Arc::clone(latest_summary);
     Arc::new(move || {
         let mut world = world
             .lock()
@@ -129,7 +131,14 @@ fn persistence_step_driver(
             .map_err(|error| PersistenceSessionError::Unavailable {
                 detail: format!("session mutex poisoned while stepping: {error}"),
             })?;
-        session.step(&mut world)
+        let outcome = session.step(&mut world)?;
+        // Publish the completed summary outside the mutex protocol (bd-134):
+        // control surfaces read this slot wait-free instead of contending on
+        // the world lock the next tick will hold.
+        if let Some(summary) = world.history().next_back() {
+            latest_summary.store(Some(std::sync::Arc::new(summary.clone())));
+        }
+        Ok(outcome)
     })
 }
 
@@ -357,7 +366,8 @@ fn main() -> Result<()> {
             config_overrides,
         },
     )?;
-    let simulation_step = persistence_step_driver(&world, &persistence);
+    let latest_summary = scriptbots_app::control::empty_latest_summary();
+    let simulation_step = persistence_step_driver(&world, &persistence, &latest_summary);
 
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
     // finalized and the worker is acknowledged before this function returns.
@@ -440,7 +450,7 @@ fn main() -> Result<()> {
             anyhow::anyhow!("control listeners were not reserved before runtime startup")
         })?;
         let (control_runtime, command_drain, command_submit) =
-            control_reservation.launch(world.clone())?;
+            control_reservation.launch(world.clone(), latest_summary.clone())?;
         info!(
             requested_mode = cli.mode.as_str(),
             active_mode = active_mode.as_str(),

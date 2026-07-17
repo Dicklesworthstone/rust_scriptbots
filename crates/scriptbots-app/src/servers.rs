@@ -44,7 +44,7 @@ use crate::command::{
 use crate::control::{
     AgentScoreEntry, ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry,
     EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
-    SelectionStateDto,
+    SelectionStateDto, SharedLatestSummary,
 };
 use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
 // keep image out of servers unless needed
@@ -317,8 +317,14 @@ impl ControlServerReservation {
     pub fn launch(
         self,
         world: SharedWorld,
+        latest_summary: SharedLatestSummary,
     ) -> Result<(ControlRuntime, CommandDrain, CommandSubmit)> {
-        ControlRuntime::launch_reserved_with_timeout(world, self, CONTROL_STARTUP_TIMEOUT)
+        ControlRuntime::launch_reserved_with_timeout(
+            world,
+            latest_summary,
+            self,
+            CONTROL_STARTUP_TIMEOUT,
+        )
     }
 
     /// Actual REST address, including the assigned port when configured with port zero.
@@ -381,13 +387,15 @@ impl ControlRuntime {
     /// Spawn the control runtime and return only after every enabled listener is bound.
     pub fn launch(
         world: SharedWorld,
+        latest_summary: SharedLatestSummary,
         config: ControlServerConfig,
     ) -> Result<(Self, CommandDrain, CommandSubmit)> {
-        ControlServerReservation::prepare(config)?.launch(world)
+        ControlServerReservation::prepare(config)?.launch(world, latest_summary)
     }
 
     fn launch_reserved_with_timeout(
         world: SharedWorld,
+        latest_summary: SharedLatestSummary,
         reservation: ControlServerReservation,
         startup_timeout: Duration,
     ) -> Result<(Self, CommandDrain, CommandSubmit)> {
@@ -399,7 +407,7 @@ impl ControlRuntime {
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Starting);
         let status_for_thread = status_tx.clone();
-        let handle = ControlHandle::new(world.clone(), command_tx.clone());
+        let handle = ControlHandle::new(world.clone(), command_tx.clone(), latest_summary);
 
         let thread = thread::Builder::new()
             .name("scriptbots-control".into())
@@ -1863,6 +1871,7 @@ fn map_control_error(err: ControlError) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::empty_latest_summary;
     use scriptbots_core::{ScriptBotsConfig, WorldState};
     use serial_test::serial;
     use std::{
@@ -1875,7 +1884,11 @@ mod tests {
     fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let (sender, receiver) = create_command_bus(2);
-        let handle = ControlHandle::new(Arc::new(std::sync::Mutex::new(world)), sender);
+        let handle = ControlHandle::new(
+            Arc::new(std::sync::Mutex::new(world)),
+            sender,
+            empty_latest_summary(),
+        );
         (handle, receiver)
     }
 
@@ -2015,7 +2028,7 @@ mod tests {
             ..ControlServerConfig::default()
         };
 
-        let error = ControlRuntime::launch(shared_world(), config)
+        let error = ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
             .err()
             .expect("occupied REST address must fail startup");
         let rendered = format!("{error:#}");
@@ -2038,7 +2051,7 @@ mod tests {
             ..ControlServerConfig::default()
         };
 
-        let error = ControlRuntime::launch(shared_world(), config)
+        let error = ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
             .err()
             .expect("occupied MCP address must fail startup");
         let rendered = format!("{error:#}");
@@ -2061,7 +2074,7 @@ mod tests {
             ..ControlServerConfig::default()
         };
 
-        let error = ControlRuntime::launch(shared_world(), config)
+        let error = ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
             .err()
             .expect("MCP must not share the prepared REST listener");
         assert!(
@@ -2085,7 +2098,7 @@ mod tests {
         };
 
         let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), config).expect("REST startup");
+            ControlRuntime::launch(shared_world(), empty_latest_summary(), config).expect("REST startup");
         let stream = TcpStream::connect(rest_address)
             .expect("readiness acknowledgement must follow a listening REST socket");
         drop(stream);
@@ -2172,7 +2185,7 @@ mod tests {
             ..ControlServerConfig::default()
         };
         let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), config).expect("MCP startup");
+            ControlRuntime::launch(shared_world(), empty_latest_summary(), config).expect("MCP startup");
 
         let response = http_post_json(
             mcp_address,
@@ -2318,7 +2331,7 @@ mod tests {
             ..ControlServerConfig::default()
         };
         let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), config).expect("disabled runtime startup");
+            ControlRuntime::launch(shared_world(), empty_latest_summary(), config).expect("disabled runtime startup");
         runtime.shutdown().expect("disabled runtime shutdown");
     }
 

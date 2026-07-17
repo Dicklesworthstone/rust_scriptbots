@@ -1,7 +1,8 @@
 use std::cmp::Reverse;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 // removed duplicate import
 
+use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -180,20 +181,39 @@ impl From<PoisonError<MutexGuard<'_, WorldState>>> for ControlError {
 
 type KnobsCache = std::sync::Arc<Mutex<Option<(u64, Vec<KnobEntry>)>>>;
 
+/// Latest completed tick summary, published by the simulation step drivers
+/// outside the world mutex (bd-134).
+///
+/// Reads are wait-free: control surfaces serve `latest_summary` from this slot
+/// even while the world mutex is held by a long tick — or poisoned outright.
+pub type SharedLatestSummary = Arc<ArcSwapOption<scriptbots_core::TickSummary>>;
+
+/// Fresh, empty published-summary slot.
+#[must_use]
+pub fn empty_latest_summary() -> SharedLatestSummary {
+    Arc::new(ArcSwapOption::empty())
+}
+
 /// Shared handle used by REST, CLI, and MCP surfaces to access the running world.
 #[derive(Clone)]
 pub struct ControlHandle {
     shared_world: SharedWorld,
     commands: CommandSender,
     knobs_cache: KnobsCache,
+    latest_summary: SharedLatestSummary,
 }
 
 impl ControlHandle {
-    pub fn new(shared_world: SharedWorld, commands: CommandSender) -> Self {
+    pub fn new(
+        shared_world: SharedWorld,
+        commands: CommandSender,
+        latest_summary: SharedLatestSummary,
+    ) -> Self {
         Self {
             shared_world,
             commands,
             knobs_cache: std::sync::Arc::new(Mutex::new(None)),
+            latest_summary,
         }
     }
 
@@ -233,6 +253,14 @@ impl ControlHandle {
 
     /// Retrieve the latest tick summary from the running world.
     pub fn latest_summary(&self) -> Result<scriptbots_core::TickSummary, ControlError> {
+        // Wait-free published read first (bd-134): the step drivers store each
+        // completed summary here, so a contended — or poisoned — world mutex
+        // cannot stall this endpoint or the SSE/NDJSON streams built on it.
+        if let Some(summary) = self.latest_summary.load_full() {
+            return Ok((*summary).clone());
+        }
+        // Nothing published yet (before the first completed tick, or a driver
+        // that does not publish): fall back to the world itself.
         let world = self.lock_world()?;
         if let Some(latest) = world.history().last() {
             Ok(latest.clone())
@@ -918,7 +946,7 @@ mod tests {
     fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let (sender, receiver) = crate::command::create_command_bus(4);
-        let handle = ControlHandle::new(Arc::new(Mutex::new(world)), sender);
+        let handle = ControlHandle::new(Arc::new(Mutex::new(world)), sender, empty_latest_summary());
         (handle, receiver)
     }
 
@@ -927,6 +955,51 @@ mod tests {
             let _ = scriptbots_core::apply_control_command(world, command)
                 .expect("drained test command applies");
         }
+    }
+
+    /// bd-134: a published summary is served wait-free — even a POISONED world
+    /// mutex must not take the latest-summary endpoint (and the SSE/NDJSON
+    /// streams built on it) down with it.
+    #[test]
+    fn latest_summary_reads_the_published_slot_without_the_world_mutex() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0xB134_5EED),
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        world.step().expect("persistence-disabled step");
+        let published = world
+            .history()
+            .next_back()
+            .expect("completed tick summary")
+            .clone();
+
+        let shared_world: SharedWorld = Arc::new(Mutex::new(world));
+        let (sender, _receiver) = crate::command::create_command_bus(4);
+        let slot = empty_latest_summary();
+        slot.store(Some(Arc::new(published.clone())));
+        let handle = ControlHandle::new(Arc::clone(&shared_world), sender, slot);
+
+        // Poison the world mutex on purpose.
+        let poisoner = Arc::clone(&shared_world);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("pre-poison lock");
+            panic!("deliberate poison for bd-134 latest-summary test");
+        })
+        .join();
+        assert!(
+            shared_world.lock().is_err(),
+            "the world mutex must actually be poisoned for this test to prove anything"
+        );
+
+        let served = handle
+            .latest_summary()
+            .expect("published summary served despite the poisoned mutex");
+        assert_eq!(served, published);
+
+        // Endpoints that genuinely need the world still fail typed.
+        assert!(matches!(handle.snapshot(), Err(ControlError::Lock)));
     }
 
     #[test]
