@@ -71,8 +71,8 @@ fn fixture(dir: &tempfile::TempDir) -> String {
         let ramp = f64::from(u32::try_from(tick).unwrap());
         let metrics = vec![
             MetricSample::new("gaussian", draws.normal()),
-            // A strongly right-skewed series: exponential growth clipped to keep it finite.
-            MetricSample::new("skewed", (ramp / 40.0).exp().min(1.0e6)),
+            // A strongly right-skewed but modest finite series: exp(0.01)..exp(8).
+            MetricSample::new("skewed", (ramp / 100.0).exp()),
             MetricSample::new("constant", 3.0),
         ];
         storage.persist(&batch(tick, metrics)).expect("persist");
