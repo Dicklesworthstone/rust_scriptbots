@@ -966,7 +966,7 @@ Empty-versus-empty is reported as `NoEvidence`, never “matched.”
 
 ### 7.5 bounded storage worker
 
-**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact descriptor-bound recovery identity and structural-schema proof is completed under `bd-2z0.8.9.4.2`; direct-write/root-cause unification is completed under `bd-2z0.8.9.4.4` at `60e06b3` with DSR format, UBS, focused-test, workspace-check, strict-Clippy, and workspace-test proof (TopazCastle, 2026-07-15); queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open]
+**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact descriptor-bound recovery identity and structural-schema proof is completed under `bd-2z0.8.9.4.2`; direct-write/root-cause unification is completed under `bd-2z0.8.9.4.4` at `60e06b3` with DSR format, UBS, focused-test, workspace-check, strict-Clippy, and workspace-test proof (TopazCastle, 2026-07-15); DuckDB closure, dead-edge cleanup, and active-contract updates are completed under `bd-2z0.8.9.9` (CalmMink, 2026-07-17); durability/retry/rollback/concurrent-read proofs are completed under `bd-2z0.8.9.7` and the mock-free terminal-to-replay E2E with production Action/WorldDigest instrumentation is completed under `bd-2z0.8.9.8` (CalmMink, 2026-07-17); queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open]
 
 The current unbounded storage channel carrying cloned full batches can exhaust memory. The new worker uses:
 
@@ -1344,7 +1344,7 @@ Every direct dependency receives one of:
 | Bevy | large default feature graph | update only with live renderer tests; minimize features |
 | WGPU/Naga | Bevy and custom renderer use different major lines | isolate renderer graphs; upgrade as a coupled family |
 | GPUI/WGPU bridge | depends on mutable GPUI and direct WGPU path | feasibility spike before more churn |
-| FrankenSQLite | exact-revision pre-1.0 API; synchronous facade; MVCC retry semantics | replace DuckDB immediately, pin a minimal feature set, then harden behind the bounded storage seam |
+| FrankenSQLite | exact-revision pre-1.0 API; synchronous facade; MVCC retry semantics | DuckDB closure removed in `9201aaa` (bd-2z0.8.9.9); pinned at `0.1.16` rev `1eec0d2`; continue hardening behind the bounded storage seam |
 | Axum/Tokio | currently functional transport boundary | patch updates first; runtime replacement later |
 | MCP SDK | pre-1.0 protocol surface | pin, conformance-test, upgrade separately |
 | Candle/Tract/Tch | old optional versions and placeholder implementation | disable from defaults; upgrade only with real backend tests |

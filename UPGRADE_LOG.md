@@ -23,6 +23,52 @@ incompatible, scientific output changes without an approved version boundary,
 licensing is unclear, or the migration crosses the review circuit breakers in
 the rearchitecture plan.
 
+## 2026-07-17 — DuckDB closure removal: contract verification and dead-edge cleanup (bd-2z0.8.9.9)
+
+- **Bead:** `bd-2z0.8.9.9`
+- **Change class:** removal closure and contract update for the already-landed
+  engine swap (`9201aaa`, 2026-07-11); one dead manifest edge removed in this
+  pass (`scriptbots-app` `num_cpus`, unused since the DuckDB worker topology
+  retired — the crate had only a stale doc comment). No source, feature, or
+  persistence-semantics change.
+- **Dependency graph evidence:** `cargo tree --prefix none` (unique) contains
+  no `duckdb`, `libduckdb-sys`, `arrow*`, or `parquet*`; 1,183 unique packages
+  total. The removed closure (from `9201aaa^..9201aaa` lock diff) is exactly 41
+  packages: `duckdb`, `libduckdb-sys`, `arrow`, `arrow-arith`, `arrow-array`,
+  `arrow-buffer`, `arrow-cast`, `arrow-data`, `arrow-ord`, `arrow-row`,
+  `arrow-schema`, `arrow-select`, `arrow-string`, `atoi`, `bitvec`,
+  `borsh-derive`, `bytecheck`, `bytecheck_derive`, `comfy-table`,
+  `const-random`, `const-random-macro`, `fallible-iterator`,
+  `fallible-streaming-iterator`, `funty`, `hashlink`, `lexical-core`,
+  `lexical-parse-float`, `lexical-parse-integer`, `lexical-util`,
+  `lexical-write-float`, `lexical-write-integer`, `ptr_meta`,
+  `ptr_meta_derive`, `radium`, `rend`, `rkyv`, `rkyv_derive`, `rust_decimal`,
+  `tap`, `tiny-keccak`, `wyz`. Lock package count moved 1,258 -> 1,289 at the
+  swap (the FrankenSQLite family is larger than the removed closure).
+- **Live-reference evidence:** repository search over `crates/`, `scripts/`,
+  `ci/`, `.github/`, and manifests finds no live DuckDB API, mode, extension,
+  setting, or documentation instruction. `README.md`, `AGENTS.md`, and
+  `docs/wasm/adrs/` are clean; the two `docs/wasm/research_log.md` mentions
+  remain as labeled decision history. CI workflows already use unique
+  `.sqlite` paths with no destructive cleanup.
+- **Build-size delta (release `scriptbots-app`, aarch64-apple-darwin, same
+  pinned nightly, default features):** 9201aaa^ (DuckDB) = 50,537,936 bytes
+  (binary carries 2,598 `duckdb` strings); HEAD (FrankenSQLite, pin e536d7f) =
+  28,079,136 bytes (0 `duckdb` strings) — a 22,458,800-byte (44.4%) smaller
+  binary. The 9201aaa^..HEAD range includes six days of feature work beside
+  the dependency swap, so the isolation build below bounds the swap itself.
+- **Isolation delta:** 77e7c1b (first buildable duckdb-free tree, three commits
+  after the swap; 9201aaa itself and 22b710c left crate-level
+  `duckdb = { workspace = true }` edges dangling and do not compile) release
+  binary = 25,870,992 bytes (0 `duckdb` strings) — vs 50,537,936 at 9201aaa^,
+  the swap region shrank the binary by 24,666,944 bytes (48.8%). HEAD's
+  28,079,136 bytes regrew 2,208,144 bytes of later feature work atop that
+  floor.
+- **Rollback:** not applicable to the removal itself (the retired backend is
+  gone from the graph); to restore the dead `num_cpus` edge, re-add
+  `num_cpus = { workspace = true }` to `crates/scriptbots-app/Cargo.toml` and
+  relock.
+
 ## 2026-07-17 — Advance the FrankenSQLite pin to e536d7f coupled with asupersync 0.3.9 (bd-2z0.8.9.11)
 
 - **Bead:** `bd-2z0.8.9.11`

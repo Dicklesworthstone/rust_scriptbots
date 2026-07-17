@@ -43,6 +43,7 @@ The recovery program replaced the former DuckDB stack with exact-revision Franke
 - Changed application targets to `--storage {file|memory}`, fresh run paths to `.sqlite`, and CI replay artifacts to unique runner-temporary paths without destructive cleanup.
 - Isolated every file-mode auto-tune/profile child on its own benchmark-only temporary database so probes cannot consume or corrupt the requested final run path.
 - Removed the DuckDB, bundled C++ database, and Arrow dependency closure from manifests and the lockfile.
+- Closed the removal program (bd-2z0.8.9.9): the dependency tree carries no `duckdb`/`libduckdb-sys`/`arrow*`/`parquet*` (41-package closure removed in `9201aaa`, enumerated in UPGRADE_LOG.md); no live DuckDB API, mode, setting, or doc instruction remains; the dead `scriptbots-app` `num_cpus` edge was dropped; release `scriptbots-app` on aarch64-apple-darwin shrank from 50,537,936 bytes (9201aaa^, DuckDB) to 25,870,992 bytes (77e7c1b, first buildable duckdb-free tree) — 24,666,944 bytes (−48.8%) from the swap region, with HEAD at 28,079,136 bytes after later feature work.
 
 ### Rendering, browser, and CI recovery
 

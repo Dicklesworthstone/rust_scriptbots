@@ -43,7 +43,6 @@ csv = { workspace = true }
 ron = "0.8"
 toml = "0.8"
 mimalloc = { version = "0.1", optional = true }
-num_cpus = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

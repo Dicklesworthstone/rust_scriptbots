@@ -10078,7 +10078,6 @@ dependencies = [
  "libc",
  "mcp-protocol-sdk",
  "mimalloc",
- "num_cpus",
  "owo-colors",
  "rand 0.9.5",
  "ratatui",
