@@ -121,7 +121,8 @@ pub fn summarize(sample: &[f64]) -> Result<DistributionSummary, StatsError> {
 
     let skewness = m3 / m2.powf(1.5);
     let excess_kurtosis = m4 / (m2 * m2) - 3.0;
-    let jarque_bera = (n / 6.0) * excess_kurtosis.mul_add(excess_kurtosis / 4.0, skewness * skewness);
+    let jarque_bera =
+        (n / 6.0) * excess_kurtosis.mul_add(excess_kurtosis / 4.0, skewness * skewness);
     // Chi-square(2) survival function: exact, closed form, no special function.
     let jb_p_value = (-jarque_bera / 2.0).exp();
 
@@ -174,8 +175,16 @@ mod tests {
         // 6.8. skewness = 0/2^1.5 = 0. excess_kurtosis = 6.8/4 - 3 = 1.7 - 3 = -1.3.
         let s = summarize(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         assert!((s.mean - 3.0).abs() < 1e-12);
-        assert!((s.variance - 2.0).abs() < 1e-12, "population variance is 2; got {}", s.variance);
-        assert!(s.skewness.abs() < 1e-12, "a symmetric sample has zero skewness; got {}", s.skewness);
+        assert!(
+            (s.variance - 2.0).abs() < 1e-12,
+            "population variance is 2; got {}",
+            s.variance
+        );
+        assert!(
+            s.skewness.abs() < 1e-12,
+            "a symmetric sample has zero skewness; got {}",
+            s.skewness
+        );
         assert!(
             (s.excess_kurtosis - (-1.3)).abs() < 1e-12,
             "excess kurtosis of 1..5 is -1.3; got {}",
@@ -188,13 +197,21 @@ mod tests {
     fn a_right_skewed_sample_has_positive_skewness() {
         // Doubling steps: a long right tail.
         let s = summarize(&[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]).unwrap();
-        assert!(s.skewness > 0.5, "a right-tailed sample must have positive skewness; got {}", s.skewness);
+        assert!(
+            s.skewness > 0.5,
+            "a right-tailed sample must have positive skewness; got {}",
+            s.skewness
+        );
     }
 
     #[test]
     fn a_left_skewed_sample_has_negative_skewness() {
         let s = summarize(&[-32.0, -16.0, -8.0, -4.0, -2.0, -1.0, 0.0]).unwrap();
-        assert!(s.skewness < -0.5, "a left-tailed sample must have negative skewness; got {}", s.skewness);
+        assert!(
+            s.skewness < -0.5,
+            "a left-tailed sample must have negative skewness; got {}",
+            s.skewness
+        );
     }
 
     #[test]
@@ -206,7 +223,10 @@ mod tests {
             (s.jb_p_value - (-s.jarque_bera / 2.0).exp()).abs() < 1e-12,
             "the p-value must equal exp(-JB/2)"
         );
-        assert!(s.jb_p_value > 0.0 && s.jb_p_value <= 1.0, "a p-value must be in (0, 1]");
+        assert!(
+            s.jb_p_value > 0.0 && s.jb_p_value <= 1.0,
+            "a p-value must be in (0, 1]"
+        );
     }
 
     #[test]
@@ -220,7 +240,11 @@ mod tests {
             "normal sample: skew={:.3} exkurt={:.3} JB={:.2} p={:.3}",
             s.skewness, s.excess_kurtosis, s.jarque_bera, s.jb_p_value
         );
-        assert!(s.skewness.abs() < 0.2, "a normal sample has near-zero skewness; got {}", s.skewness);
+        assert!(
+            s.skewness.abs() < 0.2,
+            "a normal sample has near-zero skewness; got {}",
+            s.skewness
+        );
         assert!(
             s.excess_kurtosis.abs() < 0.3,
             "a normal sample has near-zero excess kurtosis; got {}",
@@ -270,7 +294,10 @@ mod tests {
         assert!(s.degenerate, "a constant sample must be flagged degenerate");
         assert_eq!(s.variance, 0.0);
         assert_eq!(s.jb_p_value, 1.0);
-        assert!(!s.rejects_normality(0.05), "a constant sample has no shape to reject");
+        assert!(
+            !s.rejects_normality(0.05),
+            "a constant sample has no shape to reject"
+        );
     }
 
     #[test]

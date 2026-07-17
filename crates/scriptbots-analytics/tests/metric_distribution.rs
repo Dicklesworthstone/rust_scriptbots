@@ -96,7 +96,7 @@ fn metric<'a>(machine: &'a serde_json::Value, name: &str) -> &'a serde_json::Val
         .expect("metrics array")
         .iter()
         .find(|m| m["name"] == name)
-        .unwrap_or_else(|| panic!("metric `{name}` missing"))
+        .expect("requested metric missing from report")
 }
 
 #[test]
@@ -138,20 +138,30 @@ fn the_report_characterizes_each_metric_shape_correctly() {
 
     // constant: reported as degenerate, and never non-normal.
     let constant = metric(&machine, "constant");
-    assert_eq!(constant["degenerate"], true, "a constant metric must be flagged degenerate");
+    assert_eq!(
+        constant["degenerate"], true,
+        "a constant metric must be flagged degenerate"
+    );
     assert_eq!(
         constant["non_normal"], false,
         "a constant metric has no shape and must not be flagged non-normal"
     );
 
-    assert_eq!(machine["metrics_examined"], 3, "all three metrics have enough values");
+    assert_eq!(
+        machine["metrics_examined"], 3,
+        "all three metrics have enough values"
+    );
 }
 
 #[test]
 fn the_report_is_deterministic_and_registered() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = fixture(&dir);
-    assert_eq!(run_report(&path), run_report(&path), "the report must be deterministic");
+    assert_eq!(
+        run_report(&path),
+        run_report(&path),
+        "the report must be deterministic"
+    );
     assert!(
         Registry::builtin()
             .list()

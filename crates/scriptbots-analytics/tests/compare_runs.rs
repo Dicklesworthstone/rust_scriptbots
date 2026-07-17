@@ -58,8 +58,7 @@ fn run_db(dir: &tempfile::TempDir, file: &str, shifting_base: f64, salt: u64) ->
 
 fn compare(control: &str, treatment: &str) -> serde_json::Value {
     let cx = ReaderCtx::open(control).expect("open control");
-    let params =
-        ReportParams::from_pairs([format!("treatment_db={treatment}")]).expect("params");
+    let params = ReportParams::from_pairs([format!("treatment_db={treatment}")]).expect("params");
     let out = Registry::builtin()
         .run("compare-runs", &cx, &params)
         .expect("compare-runs runs");
@@ -84,7 +83,10 @@ fn a_treatment_effect_between_two_runs_is_certified() {
     let machine = compare(&control, &treatment);
 
     let shifting = metric(&machine, "shifting").expect("shifting must be compared");
-    assert_eq!(shifting["n_pairs"], 200, "all 200 ticks are shared and should pair");
+    assert_eq!(
+        shifting["n_pairs"], 200,
+        "all 200 ticks are shared and should pair"
+    );
     assert!(
         (shifting["mean_difference"].as_f64().unwrap() - 5.0).abs() < 1.0,
         "the treatment effect should be ~+5; got {}",
@@ -110,7 +112,10 @@ fn a_treatment_effect_between_two_runs_is_certified() {
         flat["p_value"]
     );
 
-    assert_eq!(machine["significant"], 1, "exactly one metric genuinely shifted");
+    assert_eq!(
+        machine["significant"], 1,
+        "exactly one metric genuinely shifted"
+    );
     assert_eq!(
         machine["treatment_db"].as_str(),
         Some(treatment.as_str()),
@@ -141,7 +146,10 @@ fn a_missing_treatment_db_param_is_a_typed_error_not_a_panic() {
     let cx = ReaderCtx::open(&control).expect("open control");
     let out = Registry::builtin().run("compare-runs", &cx, &ReportParams::default());
     assert!(
-        matches!(out, Err(scriptbots_analytics::AnalyticsError::BadParam { .. })),
+        matches!(
+            out,
+            Err(scriptbots_analytics::AnalyticsError::BadParam { .. })
+        ),
         "compare-runs without treatment_db must be a typed BadParam, got {out:?}"
     );
 }

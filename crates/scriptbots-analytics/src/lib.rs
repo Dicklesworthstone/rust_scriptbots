@@ -723,11 +723,15 @@ impl Report for RunComparison {
     }
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
-        let treatment_path = params.get("treatment_db").ok_or_else(|| AnalyticsError::BadParam {
-            name: "treatment_db".to_owned(),
-            reason: "compare-runs requires treatment_db=<path> (the treatment run database)"
-                .to_owned(),
-        })?;
+        let treatment_path =
+            params
+                .get("treatment_db")
+                .ok_or_else(|| AnalyticsError::BadParam {
+                    name: "treatment_db".to_owned(),
+                    reason:
+                        "compare-runs requires treatment_db=<path> (the treatment run database)"
+                            .to_owned(),
+                })?;
         let fdr = params
             .get("fdr")
             .map(str::parse::<f64>)
@@ -806,7 +810,8 @@ impl Report for RunComparison {
                 treatment: p.treatment.as_slice(),
             })
             .collect();
-        let study = compare::compare_metrics(&series, &compare_params).map_err(|e| metric_stats_error(&e))?;
+        let study = compare::compare_metrics(&series, &compare_params)
+            .map_err(|e| metric_stats_error(&e))?;
 
         let mut rows = Vec::with_capacity(study.metrics.len());
         let mut significant = 0usize;
@@ -852,9 +857,15 @@ impl Report for RunComparison {
             );
         }
         if machine.metrics.is_empty() {
-            let _ = writeln!(md, "_No metric was present in both runs with enough matched ticks._");
+            let _ = writeln!(
+                md,
+                "_No metric was present in both runs with enough matched ticks._"
+            );
         } else {
-            let _ = writeln!(md, "| metric | pairs | Δ (treat−ctrl) | 95% CI | p | d_z | +frac | real? |");
+            let _ = writeln!(
+                md,
+                "| metric | pairs | Δ (treat−ctrl) | 95% CI | p | d_z | +frac | real? |"
+            );
             let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
             for row in &machine.metrics {
                 let _ = writeln!(
@@ -1007,7 +1018,10 @@ impl Report for MetricDistribution {
         if machine.metrics.is_empty() {
             let _ = writeln!(md, "_No metric had at least four values to characterize._");
         } else {
-            let _ = writeln!(md, "| metric | n | mean | sd | skew | ex.kurt | JB | p | normal? |");
+            let _ = writeln!(
+                md,
+                "| metric | n | mean | sd | skew | ex.kurt | JB | p | normal? |"
+            );
             let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|");
             for row in &machine.metrics {
                 let verdict = if row.degenerate {
