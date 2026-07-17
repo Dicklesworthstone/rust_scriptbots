@@ -1362,8 +1362,7 @@ impl JournalPort for StorageJournalPort {
 mod tests {
     use super::*;
     use scriptbots_core::{
-        MetricSample, PersistenceBatch, ScriptBotsConfig, Tick, TickCombatSummary, TickEvents,
-        TickSummary,
+        MetricSample, PersistenceBatch, Tick, TickCombatSummary, TickEvents, TickSummary,
     };
     use scriptbots_runtime::{CommandId, HostRevisions};
 
