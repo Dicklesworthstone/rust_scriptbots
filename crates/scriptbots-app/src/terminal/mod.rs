@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod subcell;
+
 use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -43,6 +45,10 @@ use crate::{
     CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld, WorldStepDriver,
     renderer::{Renderer, RendererContext},
 };
+
+/// Sub-cell painter engine (bd-2z0.14.2.1.1): pure braille/half-block/quadrant
+/// compositing primitives consumed by the high-resolution canvas work.
+pub mod paint;
 
 const TARGET_SIM_HZ: f32 = 60.0;
 const MAX_STEPS_PER_FRAME: usize = 240;
