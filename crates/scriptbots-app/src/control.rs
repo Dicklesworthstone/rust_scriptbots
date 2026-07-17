@@ -19,7 +19,7 @@ use crate::command::{CommandSendError, CommandSender};
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::check_knob_ranges;
 #[cfg(feature = "gui")]
-use scriptbots_render::render_png_offscreen;
+use scriptbots_render::{OffscreenScene, render_offscreen_scene};
 use slotmap::Key; // offscreen PNG renderer
 use smallvec::SmallVec;
 
@@ -227,9 +227,14 @@ impl ControlHandle {
                     "requested image too large".into(),
                 ));
             }
-            let world = self.lock_world()?;
-            let bytes = render_png_offscreen(&world, width, height);
-            Ok(bytes)
+            // Capture the render-relevant state under a short lock, then
+            // rasterize with no lock held at all (bd-134): a slow PNG render
+            // must never stall the simulation or other control reads.
+            let scene = {
+                let world = self.lock_world()?;
+                OffscreenScene::capture(&world)
+            };
+            Ok(render_offscreen_scene(&scene, width, height))
         }
         #[cfg(not(feature = "gui"))]
         {
