@@ -1471,10 +1471,8 @@ mod tests {
         let applied = applied();
         let scientific = scientific();
         let step = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
-        let update = CommandEnvelope::new(
-            CommandId::new(2),
-            HostCommand::UpdateConfig(Box::default()),
-        );
+        let update =
+            CommandEnvelope::new(CommandId::new(2), HostCommand::UpdateConfig(Box::default()));
         let shutdown = CommandEnvelope::new(CommandId::new(3), HostCommand::Shutdown);
 
         assert!(

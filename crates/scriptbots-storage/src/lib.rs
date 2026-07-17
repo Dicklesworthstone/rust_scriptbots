@@ -7136,9 +7136,7 @@ impl Storage {
                             .to_owned(),
                     });
                 }
-                if archive.is_shutdown()
-                    && observed_shutdown.replace(journal_sequence).is_some()
-                {
+                if archive.is_shutdown() && observed_shutdown.replace(journal_sequence).is_some() {
                     return Err(StorageError::InvalidData {
                         context: "host_journal_progress.shutdown_sequence",
                         reason: "more than one archive encodes a shutdown command".to_owned(),
