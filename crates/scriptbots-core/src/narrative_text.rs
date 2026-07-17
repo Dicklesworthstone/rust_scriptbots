@@ -49,7 +49,7 @@ pub fn count(value: f64) -> String {
         out.push('-');
     }
     for (index, byte) in bytes.iter().enumerate() {
-        if index > 0 && (len - index) % 3 == 0 {
+        if index > 0 && (len - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(char::from(*byte));

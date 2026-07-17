@@ -5036,10 +5036,7 @@ mod tests {
                 0,
                 None,
             )
-            .with_fault(ScientificBoundaryFault::new(
-                dynamic_text,
-                dynamic_text,
-            )),
+            .with_fault(ScientificBoundaryFault::new(dynamic_text, dynamic_text)),
         )
     }
 
@@ -5060,13 +5057,8 @@ mod tests {
     ) -> Arc<JournalBatch> {
         let dynamic_text = "x".repeat(text_bytes);
         let (birth, death) = charged_lifecycle_records(&dynamic_text);
-        let persistence = charged_persistence(
-            &dynamic_text,
-            replay_outputs,
-            genome_bytes,
-            &birth,
-            &death,
-        );
+        let persistence =
+            charged_persistence(&dynamic_text, replay_outputs, genome_bytes, &birth, &death);
         let scientific = charged_scientific(&dynamic_text, birth, death);
         Arc::new(JournalBatch::new(
             JournalBatchId::new(HostSessionId::new(70), 1),

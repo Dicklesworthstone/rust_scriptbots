@@ -66,6 +66,7 @@ fn drive_until_journal_state(
     expected: &JournalState,
     next_nanos: &mut u64,
 ) -> CommandStatus {
+    let mut last_status = None;
     for _ in 0..WORKER_RETRY_LIMIT {
         frontend
             .drive_at(core, ManualInstant::from_nanos(*next_nanos))
@@ -81,10 +82,17 @@ fn drive_until_journal_state(
         if status.journal() == expected {
             return status;
         }
+        last_status = Some(status);
         thread::sleep(Duration::from_millis(1));
     }
 
-    panic!("command {command_id:?} did not reach journal state {expected:?}");
+    let status = last_status.expect("nonzero journal polling budget observes a command status");
+    assert_eq!(
+        status.journal(),
+        expected,
+        "command {command_id:?} did not reach journal state {expected:?}"
+    );
+    status
 }
 
 #[test]
@@ -125,28 +133,35 @@ fn memory_journal_accepts_zero_session_and_repairs_a_hot_ring_gap() {
     assert_eq!(second.journal(), &JournalState::CommittedVolatile);
     assert_eq!(core.world_tick(), Tick(2));
 
-    let gap = match frontend
+    let poll = frontend
         .read_events(usize::MAX)
-        .expect("read the one-entry hot ring")
-    {
-        EventPoll::Gap(gap) => gap,
-        EventPoll::Contiguous(page) => {
-            panic!("two events behind a one-entry hot ring must produce a gap, got {page:?}")
-        }
+        .expect("read the one-entry hot ring");
+    assert!(
+        matches!(&poll, EventPoll::Gap(_)),
+        "two events behind a one-entry hot ring must produce a gap, got {poll:?}"
+    );
+    let EventPoll::Gap(gap) = poll else {
+        return;
     };
-    let locator = match gap.catch_up {
-        EventCatchUpState::Available(locator) => locator,
-        EventCatchUpState::Unavailable(reason) => {
-            panic!("memory journal must advertise catch-up, got {reason:?}")
-        }
+    let catch_up = gap.catch_up;
+    assert!(
+        matches!(&catch_up, EventCatchUpState::Available(_)),
+        "memory journal must advertise catch-up, got {catch_up:?}"
+    );
+    let EventCatchUpState::Available(locator) = catch_up else {
+        return;
     };
     assert_eq!(locator.guarantee(), EventCatchUpGuarantee::LiveMemory);
 
-    let EventCatchUp::Contiguous(caught_up) = frontend
+    let catch_up = frontend
         .catch_up_events(locator, 1)
-        .expect("resolve the exact missing prefix")
-    else {
-        panic!("retained memory event must repair the hot-ring gap");
+        .expect("resolve the exact missing prefix");
+    assert!(
+        matches!(&catch_up, EventCatchUp::Contiguous(_)),
+        "retained memory event must repair the hot-ring gap, got {catch_up:?}"
+    );
+    let EventCatchUp::Contiguous(caught_up) = catch_up else {
+        return;
     };
     assert_eq!(caught_up.source, EventPageSource::LiveMemory);
     assert_eq!(caught_up.events.len(), 1);
@@ -156,11 +171,15 @@ fn memory_journal_accepts_zero_session_and_repairs_a_hot_ring_gap() {
         EventCommitment::CommittedVolatile
     );
 
-    let EventPoll::Contiguous(hot_suffix) = frontend
+    let hot_poll = frontend
         .read_events(1)
-        .expect("resume through the current hot suffix")
-    else {
-        panic!("successful catch-up must rejoin the hot ring");
+        .expect("resume through the current hot suffix");
+    assert!(
+        matches!(&hot_poll, EventPoll::Contiguous(_)),
+        "successful catch-up must rejoin the hot ring, got {hot_poll:?}"
+    );
+    let EventPoll::Contiguous(hot_suffix) = hot_poll else {
+        return;
     };
     assert_eq!(hot_suffix.events.len(), 1);
     assert_eq!(hot_suffix.events[0].event.sequence, EventSequence::new(2));
@@ -223,20 +242,23 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
         &mut next_nanos,
     );
 
-    let gap = match frontend
+    let poll = frontend
         .read_events(usize::MAX)
-        .expect("durable hot-ring gap")
-    {
-        EventPoll::Gap(gap) => gap,
-        EventPoll::Contiguous(page) => {
-            panic!("two durable events behind a one-entry hot ring must gap, got {page:?}")
-        }
+        .expect("durable hot-ring gap");
+    assert!(
+        matches!(&poll, EventPoll::Gap(_)),
+        "two durable events behind a one-entry hot ring must gap, got {poll:?}"
+    );
+    let EventPoll::Gap(gap) = poll else {
+        return;
     };
-    let locator = match gap.catch_up {
-        EventCatchUpState::Available(locator) => locator,
-        EventCatchUpState::Unavailable(reason) => {
-            panic!("durable journal must advertise catch-up, got {reason:?}")
-        }
+    let catch_up = gap.catch_up;
+    assert!(
+        matches!(&catch_up, EventCatchUpState::Available(_)),
+        "durable journal must advertise catch-up, got {catch_up:?}"
+    );
+    let EventCatchUpState::Available(locator) = catch_up else {
+        return;
     };
     assert_eq!(locator.guarantee(), EventCatchUpGuarantee::CrashDurable);
 
@@ -251,7 +273,10 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     assert_eq!(shutdown.journal(), &JournalState::Durable);
     assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
     assert_eq!(
-        pipeline.shutdown().expect("close durable storage").guarantee,
+        pipeline
+            .shutdown()
+            .expect("close durable storage")
+            .guarantee,
         PersistenceGuarantee::Durable
     );
 
@@ -269,16 +294,19 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
             last: EventSequence::new(2),
         })
     );
-    assert!(reader.contains_event_identity(
-        EventSequence::new(1),
-        JournalBatchId::new(session_id, 1)
-    ));
+    assert!(
+        reader.contains_event_identity(EventSequence::new(1), JournalBatchId::new(session_id, 1))
+    );
 
-    let EventCatchUp::Contiguous(page) = reader
+    let catch_up = reader
         .read(locator, 1)
-        .expect("read the original durable catch-up locator after reopen")
-    else {
-        panic!("reopened reader must retain the committed missing prefix");
+        .expect("read the original durable catch-up locator after reopen");
+    assert!(
+        matches!(&catch_up, EventCatchUp::Contiguous(_)),
+        "reopened reader must retain the committed missing prefix, got {catch_up:?}"
+    );
+    let EventCatchUp::Contiguous(page) = catch_up else {
+        return;
     };
     assert_eq!(page.source, EventPageSource::Durable);
     assert_eq!(page.events.len(), 1);
@@ -351,16 +379,25 @@ fn capacity_one_backpressure_retries_the_exact_retained_batch() {
         next_nanos = next_nanos
             .checked_add(1)
             .expect("test manual clock does not overflow");
-        match core
+        let admission = core
             .retry_retained_journal()
             .expect("retry the exact retained allocation")
-            .expect("batch remains retained until accepted")
-        {
+            .expect("batch remains retained until accepted");
+        assert!(
+            !matches!(admission, JournalAdmission::Closed { .. }),
+            "bounded journal closed while retrying {:?}",
+            admission.batch_id()
+        );
+        match admission {
             JournalAdmission::Accepted { .. } => {
                 accepted = true;
                 break;
             }
-            JournalAdmission::Full { capacity: 1, .. } => {
+            JournalAdmission::Full { capacity, .. } => {
+                assert_eq!(
+                    capacity, 1,
+                    "bounded journal reported unexpected capacity {capacity}"
+                );
                 assert!(Arc::ptr_eq(
                     &retained,
                     &core
@@ -369,15 +406,13 @@ fn capacity_one_backpressure_retries_the_exact_retained_batch() {
                 ));
                 thread::sleep(Duration::from_millis(1));
             }
-            JournalAdmission::Closed { batch_id } => {
-                panic!("bounded journal closed while retrying {batch_id:?}")
-            }
-            JournalAdmission::Full { capacity, .. } => {
-                panic!("bounded journal reported unexpected capacity {capacity}")
-            }
+            JournalAdmission::Closed { .. } => continue,
         }
     }
-    assert!(accepted, "capacity-one journal never accepted the retained retry");
+    assert!(
+        accepted,
+        "capacity-one journal never accepted the retained retry"
+    );
     assert!(core.pending_journal_batch().is_none());
 
     drive_until_journal_state(

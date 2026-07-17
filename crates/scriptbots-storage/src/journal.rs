@@ -3,18 +3,17 @@
 use super::{
     AdmissionState, DEFAULT_COMMAND_CAPACITY, ExistingStorageLease, InFlightPermit,
     MAX_STORAGE_QUERY_PAGE, Storage, StorageBuffer, StorageCommand, StorageError,
-    load_host_journal_index,
-    read_host_journal_events,
+    load_host_journal_index, read_host_journal_events,
 };
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use scriptbots_runtime::{
-    EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason,
-    EventCommitment, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot,
-    EventSequence, EventSequenceRange, HostAccessError, HostSessionId, JournalAdmission,
-    JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt, JournalReceiptState,
-    AppliedCommand, CommandEnvelope, HostCommand, JournaledScientificEvent, RunId,
-    ScientificBoundary, ScientificEvent, ShutdownCommitRequirement,
+    AppliedCommand, CommandEnvelope, EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator,
+    EventCatchUpUnavailableReason, EventCommitment, EventJournalReader, EventPage, EventPageSource,
+    EventRetentionSnapshot, EventSequence, EventSequenceRange, HostAccessError, HostCommand,
+    HostSessionId, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort,
+    JournalReceipt, JournalReceiptState, JournaledScientificEvent, RunId, ScientificBoundary,
+    ScientificEvent, ShutdownCommitRequirement,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -270,13 +269,14 @@ fn validate_scientific_archive_boundary(
         }
         _ => {}
     }
-    let shutdown = command
-        .is_some_and(|envelope| matches!(&envelope.command, HostCommand::Shutdown));
+    let shutdown =
+        command.is_some_and(|envelope| matches!(&envelope.command, HostCommand::Shutdown));
     if has_persistence && scientific.is_none() && !shutdown {
         return Err(StorageError::InvalidData {
             context: "host_journal_archive.persistence",
-            reason: "persistence without a scientific boundary is reserved for the final shutdown tail"
-                .to_owned(),
+            reason:
+                "persistence without a scientific boundary is reserved for the final shutdown tail"
+                    .to_owned(),
         });
     }
     if event_sequence.is_some() != scientific.is_some() {
@@ -285,9 +285,7 @@ fn validate_scientific_archive_boundary(
             reason: "scientific payload and event sequence must be present together".to_owned(),
         });
     }
-    if event_sequence.is_some_and(|event| {
-        event.get() == 0 || event.get() > journal_sequence
-    }) {
+    if event_sequence.is_some_and(|event| event.get() == 0 || event.get() > journal_sequence) {
         return Err(StorageError::InvalidData {
             context: "host_journal_archive.scientific_event_sequence",
             reason: "scientific event sequence must be nonzero and no later than its journal batch"
@@ -353,12 +351,11 @@ impl HostJournalArchive {
                 reason: format!("expected {payload_digest}, computed {actual_digest}"),
             });
         }
-        let archive: Self = serde_json::from_str(payload_json).map_err(|error| {
-            StorageError::InvalidData {
+        let archive: Self =
+            serde_json::from_str(payload_json).map_err(|error| StorageError::InvalidData {
                 context: "host_journal_archive.payload_json",
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
         let mut canonical = CanonicalJsonComparator::new(payload_json, maximum_bytes);
         serde_json::to_writer(&mut canonical, &archive).map_err(|error| {
             StorageError::InvalidData {
@@ -513,6 +510,20 @@ pub(super) struct PreparedHostJournalArchive {
     pub(super) persistence: Option<StorageBuffer>,
 }
 
+fn encode_host_journal_archive(
+    archive: &HostJournalArchiveRef<'_>,
+    maximum_bytes: usize,
+) -> Result<(String, String), StorageError> {
+    let mut writer = BoundedJsonWriter::new(maximum_bytes);
+    serde_json::to_writer(&mut writer, archive).map_err(|error| StorageError::InvalidData {
+        context: "host_journal_archive.payload_json",
+        reason: error.to_string(),
+    })?;
+    let payload_json = writer.finish()?;
+    let payload_digest = blake3::hash(payload_json.as_bytes()).to_hex().to_string();
+    Ok((payload_json, payload_digest))
+}
+
 pub(super) fn prepare_host_journal_archive(
     run_id: RunId,
     batch: &JournalBatch,
@@ -565,13 +576,7 @@ pub(super) fn prepare_host_journal_archive(
         scientific: batch.scientific().map(Arc::as_ref),
         persistence: persistence.as_ref(),
     };
-    let mut writer = BoundedJsonWriter::new(maximum_bytes);
-    serde_json::to_writer(&mut writer, &archive).map_err(|error| StorageError::InvalidData {
-        context: "host_journal_archive.payload_json",
-        reason: error.to_string(),
-    })?;
-    let payload_json = writer.finish()?;
-    let payload_digest = blake3::hash(payload_json.as_bytes()).to_hex().to_string();
+    let (payload_json, payload_digest) = encode_host_journal_archive(&archive, maximum_bytes)?;
     Ok(PreparedHostJournalArchive {
         payload_json,
         payload_digest,
@@ -665,10 +670,9 @@ fn journal_event_commitment(
         (EventCatchUpGuarantee::CrashDurable, JournalReceiptState::Durable) => {
             Ok(EventCommitment::Durable)
         }
-        (
-            EventCatchUpGuarantee::LiveMemory,
-            JournalReceiptState::CommittedVolatile,
-        ) => Ok(EventCommitment::CommittedVolatile),
+        (EventCatchUpGuarantee::LiveMemory, JournalReceiptState::CommittedVolatile) => {
+            Ok(EventCommitment::CommittedVolatile)
+        }
         (guarantee, invalid) => Err(StorageError::InvalidData {
             context: "host_journal_reader.commitment",
             reason: format!("reader guarantee {guarantee:?} cannot publish receipt {invalid:?}"),
@@ -803,12 +807,14 @@ impl JournalReaderPublisher {
                     .iter()
                     .map(|(event, _bytes)| (event.event.sequence, event.event.batch_id))
                     .collect();
-                next.available = next.memory_events.front().zip(next.memory_events.back()).map(
-                    |(first, last)| EventSequenceRange {
+                next.available = next
+                    .memory_events
+                    .front()
+                    .zip(next.memory_events.back())
+                    .map(|(first, last)| EventSequenceRange {
                         first: first.0.event.sequence,
                         last: last.0.event.sequence,
-                    },
-                );
+                    });
             }
         }
         self.inner.view.store(Arc::new(next));
@@ -834,10 +840,12 @@ impl StorageEventJournalReader {
         session_id: HostSessionId,
         options: StorageJournalOptions,
     ) -> Result<Self, StorageError> {
-        let options = options.validate().map_err(|reason| StorageError::InvalidData {
-            context: "storage.journal_options",
-            reason: reason.to_owned(),
-        })?;
+        let options = options
+            .validate()
+            .map_err(|reason| StorageError::InvalidData {
+                context: "storage.journal_options",
+                reason: reason.to_owned(),
+            })?;
         let lease = Arc::new(ExistingStorageLease::open(path)?);
         let (available, identities) = load_host_journal_index(
             path,
@@ -906,11 +914,7 @@ impl EventJournalReader for StorageEventJournalReader {
         }
     }
 
-    fn contains_event_identity(
-        &self,
-        sequence: EventSequence,
-        batch_id: JournalBatchId,
-    ) -> bool {
+    fn contains_event_identity(&self, sequence: EventSequence, batch_id: JournalBatchId) -> bool {
         self.inner
             .view
             .load()
@@ -1158,7 +1162,8 @@ impl StorageJournalPort {
     /// Exact bytes accepted but not yet observed through terminal receipts.
     #[must_use]
     pub fn inflight_bytes(&self) -> usize {
-        self.inflight_bytes.load(std::sync::atomic::Ordering::SeqCst)
+        self.inflight_bytes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn failed_receipt(batch_id: JournalBatchId, message: &str) -> JournalReceipt {
@@ -1280,8 +1285,11 @@ impl JournalPort for StorageJournalPort {
                     if matches!(receipt.state(), JournalReceiptState::Failed(_)) {
                         self.open = false;
                     }
-                    let terminal = matches!(receipt.state(), JournalReceiptState::Durable | JournalReceiptState::Failed(_))
-                        || self.shutdown_requirement == ShutdownCommitRequirement::CommittedVolatile;
+                    let terminal = matches!(
+                        receipt.state(),
+                        JournalReceiptState::Durable | JournalReceiptState::Failed(_)
+                    ) || self.shutdown_requirement
+                        == ShutdownCommitRequirement::CommittedVolatile;
                     if terminal {
                         self.shared.acknowledge(receipt.batch_id().sequence());
                         self.outstanding.remove(&receipt.batch_id());
@@ -1310,9 +1318,7 @@ impl JournalPort for StorageJournalPort {
                         .outstanding
                         .keys()
                         .copied()
-                        .take_while(|batch_id| {
-                            self.shared.resolution_ready(batch_id.sequence())
-                        })
+                        .take_while(|batch_id| self.shared.resolution_ready(batch_id.sequence()))
                         .take(remaining)
                         .collect::<Vec<_>>();
                     for batch_id in resolvable {
@@ -1357,7 +1363,8 @@ impl JournalPort for StorageJournalPort {
 mod tests {
     use super::*;
     use scriptbots_core::{
-        ScriptBotsConfig, Tick, TickCombatSummary, TickEvents, TickSummary,
+        MetricSample, PersistenceBatch, ScriptBotsConfig, Tick, TickCombatSummary, TickEvents,
+        TickSummary,
     };
     use scriptbots_runtime::{CommandId, HostRevisions};
 
@@ -1396,6 +1403,71 @@ mod tests {
     }
 
     #[test]
+    fn prepared_archive_preserves_exact_f64_during_canonical_decode() {
+        const EXACT_F64: f64 = 0.025_496_361_777_186_394;
+        let persistence = PersistenceBatch {
+            summary: TickSummary {
+                tick: Tick(1),
+                agent_count: 0,
+                births: 0,
+                deaths: 0,
+                total_energy: 0.0,
+                average_energy: 0.0,
+                average_health: 0.0,
+                max_age: 0,
+                spike_hits: 0,
+            },
+            epoch: 0,
+            closed: true,
+            metrics: vec![MetricSample::new("food.max", EXACT_F64)],
+            events: Vec::new(),
+            agents: Vec::new(),
+            births: Vec::new(),
+            deaths: Vec::new(),
+            replay_events: Vec::new(),
+        };
+        let persistence = Storage::prepare_batch(&persistence).expect("prepare exact f64 metric");
+        let run_id = RunId::new(1);
+        let session_id = HostSessionId::new(0x401);
+        let batch_id = JournalBatchId::new(session_id, 1);
+        let host_session_id = encode_journal_u64(session_id.get());
+        let journal_sequence = encode_journal_u64(batch_id.sequence());
+        let scientific_event_sequence = encode_journal_u64(1);
+        let command = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+        let scientific = scientific();
+        let archive = HostJournalArchiveRef {
+            version: HOST_JOURNAL_ARCHIVE_VERSION,
+            run_id,
+            host_session_id: &host_session_id,
+            journal_sequence: &journal_sequence,
+            scientific_event_sequence: Some(&scientific_event_sequence),
+            command: Some(&command),
+            applied: applied(),
+            scientific: Some(&scientific),
+            persistence: Some(&persistence),
+        };
+        let (payload_json, payload_digest) =
+            encode_host_journal_archive(&archive, MAX_JOURNAL_BYTES)
+                .expect("encode canonical archive");
+        assert!(payload_json.contains("\"value\":0.025496361777186394"));
+
+        let decoded = HostJournalArchive::decode(
+            &payload_json,
+            &payload_digest,
+            run_id,
+            batch_id,
+            MAX_JOURNAL_BYTES,
+        )
+        .expect("precisely parsed f64 remains canonical");
+        let decoded_value = decoded
+            .persistence
+            .expect("decoded persistence payload")
+            .metrics[0]
+            .value;
+        assert_eq!(decoded_value.to_bits(), EXACT_F64.to_bits());
+    }
+
+    #[test]
     fn archive_shape_matrix_accepts_only_runtime_producible_batches() {
         let applied = applied();
         let scientific = scientific();
@@ -1429,38 +1501,17 @@ mod tests {
             .is_ok()
         );
         assert!(
-            validate_scientific_archive_boundary(
-                1,
-                None,
-                applied,
-                None,
-                Some(&update),
-                false,
-            )
-            .is_ok()
+            validate_scientific_archive_boundary(1, None, applied, None, Some(&update), false,)
+                .is_ok()
         );
         assert!(
-            validate_scientific_archive_boundary(
-                1,
-                None,
-                applied,
-                None,
-                Some(&shutdown),
-                true,
-            )
-            .is_ok()
+            validate_scientific_archive_boundary(1, None, applied, None, Some(&shutdown), true,)
+                .is_ok()
         );
 
         assert!(
-            validate_scientific_archive_boundary(
-                1,
-                None,
-                applied,
-                None,
-                Some(&step),
-                false,
-            )
-            .is_err()
+            validate_scientific_archive_boundary(1, None, applied, None, Some(&step), false,)
+                .is_err()
         );
         assert!(
             validate_scientific_archive_boundary(
@@ -1485,15 +1536,8 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_scientific_archive_boundary(
-                1,
-                None,
-                applied,
-                None,
-                Some(&update),
-                true,
-            )
-            .is_err()
+            validate_scientific_archive_boundary(1, None, applied, None, Some(&update), true,)
+                .is_err()
         );
     }
 

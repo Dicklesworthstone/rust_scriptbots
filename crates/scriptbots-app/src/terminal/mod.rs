@@ -1960,12 +1960,12 @@ impl<'a> TerminalApp<'a> {
                 snap.probe = if self.probe_enabled {
                     agent_id_opt.and_then(|agent_id| {
                         world.agent_uid(agent_id).and_then(|agent_uid| {
-                            world
-                                .explain_sensors(agent_id, PROBE_MAX_CONTRIBUTORS)
-                                .map(|attribution| ProbeSnapshot {
+                            world.explain_sensors(agent_id, PROBE_MAX_CONTRIBUTORS).map(
+                                |attribution| ProbeSnapshot {
                                     agent_uid: agent_uid.get(),
                                     attribution,
-                                })
+                                },
+                            )
                         })
                     })
                 } else {
@@ -3917,10 +3917,13 @@ mod tests {
             || Ok(()),
             || Err(io::Error::other("injected alternate-screen failure")),
         );
-        let error = match result {
-            Ok(_) => panic!("alternate-screen failure unexpectedly succeeded"),
-            Err(error) => error,
-        };
+        assert!(
+            result.is_err(),
+            "alternate-screen failure unexpectedly succeeded"
+        );
+        let error = result
+            .err()
+            .expect("asserted alternate-screen failure must retain its error");
 
         assert_eq!(
             error.root_cause().to_string(),
