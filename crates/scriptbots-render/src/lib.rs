@@ -16,8 +16,9 @@ use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime, AgentUid,
     BrainActivations, BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision,
-    BrainInspectionUnavailable, ControlCommand, ControlDisposition, Generation, IndicatorState,
-    MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position, RenderTonemapMode, SENSOR_LAYOUT,
+    BrainInspectionUnavailable, ControlCommand, ControlDisposition, FoodGrid, Generation,
+    IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position,
+    RenderTonemapMode, SENSOR_LAYOUT,
     ScriptBotsConfig, SelectedBrainTelemetryOutcome, SelectionMode, SelectionState,
     SelectionUpdate, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
     TraitModifiers, Velocity, WorldState, WorldStepDriver, apply_control_command,
@@ -8453,26 +8454,92 @@ fn paint_brain_radar(
 }
 /// Render a simple PNG snapshot of the current world without a live window.
 /// This is a coarse, deterministic rasterization intended for REST exports.
+/// Render-relevant world state for the offscreen PNG snapshot (bd-134).
+///
+/// Captured from the world in one cheap pass so that rasterization — the
+/// expensive part — can run with **no world lock held at all**. Callers that
+/// serve a live, contended world must capture under a short lock and then
+/// rasterize the scene outside it; callers with exclusive worlds may use the
+/// [`render_png_offscreen`] convenience composition.
+pub struct OffscreenScene {
+    tonemap_mode: RenderTonemapMode,
+    exposure_factor: f32,
+    world_size: (f32, f32),
+    cell_size: f32,
+    bot_radius: f32,
+    terrain: TerrainLayer,
+    food: FoodGrid,
+    agents: Vec<OffscreenAgent>,
+}
+
+/// One agent's render-relevant sample inside an [`OffscreenScene`].
+struct OffscreenAgent {
+    x: f32,
+    y: f32,
+    energy: f32,
+    herbivore_tendency: f32,
+}
+
+impl OffscreenScene {
+    /// Copy everything the offscreen renderer reads, in one pass.
+    #[must_use]
+    pub fn capture(world: &WorldState) -> Self {
+        let config = world.config();
+        let tonemap_settings = &config.render;
+        let columns = world.agents().columns();
+        let positions = columns.positions();
+        let agents = world
+            .agents()
+            .iter_handles()
+            .enumerate()
+            .map(|(idx, handle)| {
+                let position = positions[idx];
+                let runtime = world.runtime().get(handle);
+                OffscreenAgent {
+                    x: position.x,
+                    y: position.y,
+                    energy: runtime.map(|rt| rt.energy).unwrap_or(0.5),
+                    herbivore_tendency: runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5),
+                }
+            })
+            .collect();
+        Self {
+            tonemap_mode: tonemap_settings
+                .tonemap_mode
+                .unwrap_or(RenderTonemapMode::Aces),
+            exposure_factor: tonemap_settings
+                .tonemap_exposure_bias
+                .map(|bias| 2f32.powf(bias))
+                .unwrap_or(1.0),
+            world_size: (config.world_width as f32, config.world_height as f32),
+            cell_size: config.food_cell_size as f32,
+            bot_radius: config.bot_radius,
+            terrain: world.terrain().clone(),
+            food: world.food().clone(),
+            agents,
+        }
+    }
+}
+
+/// Capture-and-render composition for callers with an uncontended world.
 pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<u8> {
+    render_offscreen_scene(&OffscreenScene::capture(world), width, height)
+}
+
+/// Rasterize a captured scene. Holds no world reference and takes no lock.
+pub fn render_offscreen_scene(scene: &OffscreenScene, width: u32, height: u32) -> Vec<u8> {
     let mut img: ImageBuffer<ImgRgba<u8>, Vec<u8>> = ImageBuffer::new(width, height);
 
-    let config = world.config();
-    let tonemap_settings = &config.render;
-    let tonemap_mode = tonemap_settings
-        .tonemap_mode
-        .unwrap_or(RenderTonemapMode::Aces);
-    let exposure_factor = tonemap_settings
-        .tonemap_exposure_bias
-        .map(|bias| 2f32.powf(bias))
-        .unwrap_or(1.0);
-    let world_size = (config.world_width as f32, config.world_height as f32);
-    let cell_size = config.food_cell_size as f32;
+    let tonemap_mode = scene.tonemap_mode;
+    let exposure_factor = scene.exposure_factor;
+    let world_size = scene.world_size;
+    let cell_size = scene.cell_size;
 
     let mut camera = Camera::default();
     let layout = camera.layout((0.0, 0.0), (width as f32, height as f32), world_size);
 
-    let terrain = world.terrain();
-    let food = world.food();
+    let terrain = &scene.terrain;
+    let food = &scene.food;
 
     let default_tile = TerrainTile {
         kind: TerrainKind::Grass,
@@ -8552,28 +8619,18 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
         }
     }
 
-    let cols = world.agents().columns();
-    for (idx, handle) in world.agents().iter_handles().enumerate() {
-        let pos = cols.positions()[idx];
-        let Some((screen_x, screen_y)) = camera.world_to_screen((pos.x, pos.y)) else {
+    for agent in &scene.agents {
+        let Some((screen_x, screen_y)) = camera.world_to_screen((agent.x, agent.y)) else {
             continue;
         };
         let fx = screen_x.round() as i32;
         let fy = screen_y.round() as i32;
-        let energy = world
-            .runtime()
-            .get(handle)
-            .map(|rt| rt.energy)
-            .unwrap_or(0.5);
-        let base_radius = config.bot_radius.max(1.0);
+        let energy = agent.energy;
+        let base_radius = scene.bot_radius.max(1.0);
         let scale = layout.scale.max(f32::EPSILON);
         let energy_boost = base_radius * (0.5 + energy.clamp(0.0, 1.0));
         let radius = (scale * energy_boost).round().max(2.0) as i32;
-        let tendency = world
-            .runtime()
-            .get(handle)
-            .map(|rt| rt.herbivore_tendency)
-            .unwrap_or(0.5);
+        let tendency = agent.herbivore_tendency;
         let color = if tendency <= 0.33 {
             ColorVec3 {
                 r: 120,
