@@ -2098,7 +2098,8 @@ mod tests {
         };
 
         let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), empty_latest_summary(), config).expect("REST startup");
+            ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
+                .expect("REST startup");
         let stream = TcpStream::connect(rest_address)
             .expect("readiness acknowledgement must follow a listening REST socket");
         drop(stream);
@@ -2185,7 +2186,8 @@ mod tests {
             ..ControlServerConfig::default()
         };
         let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), empty_latest_summary(), config).expect("MCP startup");
+            ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
+                .expect("MCP startup");
 
         let response = http_post_json(
             mcp_address,
@@ -2331,7 +2333,8 @@ mod tests {
             ..ControlServerConfig::default()
         };
         let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), empty_latest_summary(), config).expect("disabled runtime startup");
+            ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
+                .expect("disabled runtime startup");
         runtime.shutdown().expect("disabled runtime shutdown");
     }
 

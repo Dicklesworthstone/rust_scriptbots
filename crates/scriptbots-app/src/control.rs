@@ -946,7 +946,8 @@ mod tests {
     fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let (sender, receiver) = crate::command::create_command_bus(4);
-        let handle = ControlHandle::new(Arc::new(Mutex::new(world)), sender, empty_latest_summary());
+        let handle =
+            ControlHandle::new(Arc::new(Mutex::new(world)), sender, empty_latest_summary());
         (handle, receiver)
     }
 
