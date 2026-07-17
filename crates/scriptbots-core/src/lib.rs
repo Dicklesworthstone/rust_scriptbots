@@ -4,6 +4,7 @@ pub mod ancestry;
 pub mod channels;
 mod checkpoint;
 pub mod detect;
+pub mod economy;
 pub mod narrative_text;
 pub mod rng_domains;
 pub mod sense_fixed;
@@ -3627,6 +3628,19 @@ pub const KNOB_RANGES: &[KnobRange] = &[
     // Population.
     KnobRange::live("population_minimum", 0.0, 100_000.0),
     KnobRange::live("population_spawn_interval", 0.0, 1_000_000.0),
+    /// Render (presentation-only knobs; the typed RenderSettings::validate owns
+    /// the authoritative bounds, these give REST callers early batched feedback).
+    /// `render.tonemap_exposure_bias` deliberately has no entry: the documented
+    /// contract accepts every finite value, and the generic finite check covers it.
+    KnobRange::live("render.auto_exposure.speed_brighten", 0.0, 100.0),
+    KnobRange::live("render.auto_exposure.speed_darken", 0.0, 100.0),
+    KnobRange::live("render.post.bloom.threshold", 0.0, 16.0),
+    KnobRange::live("render.post.bloom.intensity", 0.0, 1.0),
+    KnobRange::live("render.post.vignette.intensity", 0.0, 1.0),
+    KnobRange::live("render.post.vignette.smoothness", 0.0, 1.0),
+    KnobRange::live("render.day_night.cycle_ticks", 0.0, 100_000_000.0),
+    KnobRange::live("render.day_night.start_phase", 0.0, 1.0),
+    KnobRange::live("render.day_night.night_ambient", 0.0, 1.0),
 ];
 
 /// One rejected knob assignment.
@@ -8292,6 +8306,19 @@ pub struct ControlSettings {
 }
 
 /// Render-specific configuration shared across front-ends.
+///
+/// This is the single typed source of truth for HOW things look, cleanly
+/// separated from WHAT the world is (the science fields). Every frontend
+/// (Bevy, FrankenTUI, GPUI while it lives, the wgpu capture lane, and the
+/// WASM projection) consumes this schema; renderer-specific materialization
+/// lives in the frontend crates. All fields are optional: `None` defers to
+/// the frontend's documented defaults and to the quality-tier feature
+/// matrix resolved via [`RenderSettings::effective_quality`].
+///
+/// Digest-neutrality contract: render settings are presentation state, so
+/// the world digest replaces this whole block with
+/// `RenderSettings::default()` before encoding. A regression test proves
+/// two worlds differing only here produce identical digests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RenderSettings {
     /// Preferred tonemapping curve for HDR output. None falls back to renderer defaults.
@@ -8303,6 +8330,35 @@ pub struct RenderSettings {
     /// Auto-exposure parameters; omitted values defer to renderer defaults.
     #[serde(default)]
     pub auto_exposure: Option<RenderAutoExposureSettings>,
+    /// Requested visual quality tier; `None` behaves as
+    /// [`RenderQuality::Auto`], letting the frontend pick from GPU
+    /// capability (see the capability bead, bd-2z0.14.3.3).
+    #[serde(default)]
+    pub quality: Option<RenderQuality>,
+    /// Post-processing stack configuration beyond tonemapping.
+    #[serde(default)]
+    pub post: Option<RenderPostSettings>,
+    /// Day/night cycle configuration; `None` keeps the historical static
+    /// lighting (equivalent to `cycle_ticks = 0`).
+    #[serde(default)]
+    pub day_night: Option<RenderDayNightSettings>,
+    /// Chrome theme for the terminal frontend (FrankenTUI `Ctrl+T` set).
+    /// Orthogonal to [`RenderSettings::palette`], which recolors semantic
+    /// data (agents/food/terrain) for accessibility.
+    #[serde(default)]
+    pub theme: Option<TuiThemeId>,
+    /// Accessibility palette applied to semantic data colors on every
+    /// surface (the preserved Natural/Deuteranopia/Protanopia/Tritanopia/
+    /// HighContrast set).
+    #[serde(default)]
+    pub palette: Option<AccessibilityPalette>,
+    /// Reduce non-essential motion (TUI animations, camera shake, ambient
+    /// sway). `None` leaves the frontend default (motion enabled).
+    #[serde(default)]
+    pub reduced_motion: Option<bool>,
+    /// Enable camera micro-shake from nearby combat events (Bevy frontend).
+    #[serde(default)]
+    pub camera_shake: Option<bool>,
 }
 
 /// Supported tonemapping curves for renderer configuration.
@@ -8313,6 +8369,179 @@ pub enum RenderTonemapMode {
     Aces,
     Agx,
     Tony,
+}
+
+/// Visual quality tier requested by the operator.
+///
+/// The per-tier feature matrix (shadow resolution, bloom, SSAO, AA mode,
+/// particle caps, terrain detail, water reflections, TUI sub-cell/animation
+/// enablement) is owned by each frontend against this enum; `Auto` asks the
+/// frontend to classify the GPU and pick, with a loud warning when only a
+/// software adapter is available.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderQuality {
+    /// Frontend classifies the adapter and chooses a tier at launch.
+    #[default]
+    Auto,
+    /// Bare minimum: no shadows, no post, no particles; software-adapter safe.
+    Potato,
+    /// Shadows off-to-basic, FXAA, reduced particles.
+    Low,
+    /// Balanced default for discrete-class GPUs.
+    Medium,
+    /// Full stack: cascaded shadows, bloom, SSAO, TAA, reflections.
+    High,
+    /// Everything High does, pushed further (higher shadow resolution,
+    /// denser particles, planar water reflections). Explicit choice only.
+    Ultra,
+}
+
+/// Post-processing stack configuration beyond tonemapping.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RenderPostSettings {
+    /// HDR bloom keyed off emissive surfaces.
+    #[serde(default)]
+    pub bloom: Option<RenderBloomSettings>,
+    /// Edge darkening for cinematic framing.
+    #[serde(default)]
+    pub vignette: Option<RenderVignetteSettings>,
+    /// Atmospheric fog (distance + height components are renderer-side).
+    #[serde(default)]
+    pub fog: Option<RenderFogSettings>,
+    /// Anti-aliasing mode; a single enum because modes are mutually exclusive.
+    #[serde(default)]
+    pub anti_aliasing: Option<RenderAntiAliasing>,
+}
+
+/// HDR bloom configuration.
+///
+/// `enabled` defaults to `true` so a partial block (e.g. a threshold-only
+/// override from a config file or `SB_WGPU_BLOOM_THRESH`) expresses intent
+/// without ceremony; explicit `enabled = false` still disables the pass.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenderBloomSettings {
+    /// Enable/disable the bloom passes.
+    #[serde(default = "default_post_effect_enabled")]
+    pub enabled: bool,
+    /// Luminance threshold above which texels contribute; None uses the
+    /// frontend default for the active quality tier.
+    #[serde(default)]
+    pub threshold: Option<f32>,
+    /// Bloom blend intensity in `[0, 1]`; None uses the tier default.
+    #[serde(default)]
+    pub intensity: Option<f32>,
+}
+
+/// Vignette configuration.
+///
+/// `enabled` defaults to `true` for the same partial-block reason as bloom.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenderVignetteSettings {
+    /// Enable/disable the vignette.
+    #[serde(default = "default_post_effect_enabled")]
+    pub enabled: bool,
+    /// Darkening strength in `[0, 1]`; None uses the tier default.
+    #[serde(default)]
+    pub intensity: Option<f32>,
+    /// Edge smoothness in `[0, 1]`; None uses the tier default.
+    #[serde(default)]
+    pub smoothness: Option<f32>,
+}
+
+/// Serde default helper: partially specified post-effect blocks default to
+/// enabled (see [`RenderBloomSettings`]).
+const fn default_post_effect_enabled() -> bool {
+    true
+}
+
+/// Fog density presets mirroring the historical `SB_WGPU_FOG` vocabulary.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderFogMode {
+    /// No fog.
+    #[default]
+    Off,
+    /// Subtle distance haze.
+    Low,
+    /// Noticeable distance + height fog.
+    Medium,
+    /// Heavy atmosphere.
+    High,
+}
+
+/// Fog configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RenderFogSettings {
+    /// Density preset; None defers to the quality tier.
+    #[serde(default)]
+    pub mode: Option<RenderFogMode>,
+    /// Optional fog color override as linear RGB in `[0, 1]`; None derives
+    /// the color from sky/time-of-day.
+    #[serde(default)]
+    pub color: Option<[f32; 3]>,
+}
+
+/// Anti-aliasing mode (mutually exclusive by construction).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderAntiAliasing {
+    /// No anti-aliasing.
+    Off,
+    /// Fast approximate AA (cheap, default at Low/Medium).
+    Fxaa,
+    /// Temporal AA (default at High/Ultra).
+    Taa,
+    /// Subpixel morphological AA (documented alternative).
+    Smaa,
+}
+
+/// Day/night cycle configuration.
+///
+/// `cycle_ticks = 0` is the historical static-noon behavior. Any nonzero
+/// value runs a full sun cycle over that many ticks; the daylight factor
+/// curve is shared with the renderer-neutral visual semantics (bd-2z0.14.3.2)
+/// so the Bevy sun and the TUI tint never disagree.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RenderDayNightSettings {
+    /// Ticks per full day/night cycle; 0 keeps static lighting.
+    #[serde(default)]
+    pub cycle_ticks: Option<u32>,
+    /// Starting phase in `[0, 1)` (0 = dawn, 0.25 = noon, 0.5 = dusk,
+    /// 0.75 = midnight); None starts at noon for continuity.
+    #[serde(default)]
+    pub start_phase: Option<f32>,
+    /// Night ambient light floor in `[0, 1]`; None uses the tier default.
+    #[serde(default)]
+    pub night_ambient: Option<f32>,
+    /// Render the night star field; None enables it at Medium and above.
+    #[serde(default)]
+    pub stars: Option<bool>,
+}
+
+/// Terminal-frontend chrome themes (the FrankenTUI `Ctrl+T` rotation set).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiThemeId {
+    CyberpunkAurora,
+    Darcula,
+    LumenLight,
+    NordicFrost,
+    HighContrast,
+}
+
+/// Accessibility palette for semantic data colors, preserved from the
+/// pre-overhaul renderers and shared by every surface.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessibilityPalette {
+    /// Untransformed semantic colors.
+    #[default]
+    Natural,
+    Deuteranopia,
+    Protanopia,
+    Tritanopia,
+    HighContrast,
 }
 
 /// Auto-exposure configuration applied by renderers that support HDR adaption.
@@ -8326,6 +8555,388 @@ pub struct RenderAutoExposureSettings {
     /// Bright-to-dark adaptation speed; None keeps renderer default.
     #[serde(default)]
     pub speed_darken: Option<f32>,
+}
+
+impl RenderSettings {
+    /// Validate every render-configuration invariant.
+    ///
+    /// Called from [`ScriptBotsConfig::validate`]; also safe to call alone
+    /// after a runtime patch. All failures are actionable static messages
+    /// naming the offending field.
+    pub fn validate(&self) -> Result<(), WorldStateError> {
+        if let Some(bias) = self.tonemap_exposure_bias {
+            // Documented contract: every FINITE bias is legal (auto-exposure can
+            // compensate); only non-finite values are rejected.
+            if !bias.is_finite() {
+                return Err(WorldStateError::InvalidConfig(
+                    "render.tonemap_exposure_bias must be finite",
+                ));
+            }
+        }
+        if let Some(ae) = &self.auto_exposure {
+            for (speed, name) in [
+                (ae.speed_brighten, "render.auto_exposure.speed_brighten"),
+                (ae.speed_darken, "render.auto_exposure.speed_darken"),
+            ] {
+                if let Some(value) = speed {
+                    if !value.is_finite() || value < 0.0 {
+                        return Err(WorldStateError::InvalidConfig(name));
+                    }
+                }
+            }
+        }
+        if let Some(post) = &self.post {
+            if let Some(bloom) = &post.bloom {
+                if let Some(threshold) = bloom.threshold {
+                    if !threshold.is_finite() || !(0.0..=16.0).contains(&threshold) {
+                        return Err(WorldStateError::InvalidConfig(
+                            "render.post.bloom.threshold must be finite and within [0, 16]",
+                        ));
+                    }
+                }
+                if let Some(intensity) = bloom.intensity {
+                    if !intensity.is_finite() || !(0.0..=1.0).contains(&intensity) {
+                        return Err(WorldStateError::InvalidConfig(
+                            "render.post.bloom.intensity must be finite and within [0, 1]",
+                        ));
+                    }
+                }
+            }
+            if let Some(vignette) = &post.vignette {
+                for (value, name) in [
+                    (vignette.intensity, "render.post.vignette.intensity"),
+                    (vignette.smoothness, "render.post.vignette.smoothness"),
+                ] {
+                    if let Some(v) = value {
+                        if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                            return Err(WorldStateError::InvalidConfig(name));
+                        }
+                    }
+                }
+            }
+            if let Some(fog) = &post.fog {
+                if let Some(color) = fog.color {
+                    if color.iter().any(|c| !c.is_finite() || !(0.0..=1.0).contains(c)) {
+                        return Err(WorldStateError::InvalidConfig(
+                            "render.post.fog.color components must be finite and within [0, 1]",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(day_night) = &self.day_night {
+            if let Some(phase) = day_night.start_phase {
+                if !phase.is_finite() || !(0.0..1.0).contains(&phase) {
+                    return Err(WorldStateError::InvalidConfig(
+                        "render.day_night.start_phase must be finite and within [0, 1)",
+                    ));
+                }
+            }
+            if let Some(ambient) = day_night.night_ambient {
+                if !ambient.is_finite() || !(0.0..=1.0).contains(&ambient) {
+                    return Err(WorldStateError::InvalidConfig(
+                        "render.day_night.night_ambient must be finite and within [0, 1]",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The requested quality tier, treating `None` as [`RenderQuality::Auto`].
+    #[must_use]
+    pub fn requested_quality(&self) -> RenderQuality {
+        self.quality.unwrap_or_default()
+    }
+
+    /// Whether the day/night cycle is active (nonzero cycle length).
+    #[must_use]
+    pub fn day_night_active(&self) -> bool {
+        self.day_night
+            .as_ref()
+            .and_then(|d| d.cycle_ticks)
+            .is_some_and(|ticks| ticks > 0)
+    }
+}
+
+/// One legacy environment variable translated onto the typed render schema.
+///
+/// Produced by [`map_legacy_render_env`]; the application applies the
+/// assignments into its environment configuration layer (typed
+/// `SCRIPTBOTS_*` variables and CLI flags still outrank them) and logs one
+/// INFO line per applied mapping so operators learn the canonical knob.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegacyRenderEnvMapping {
+    /// The legacy variable that was read (e.g. `SB_WGPU_BLOOM`).
+    pub env_name: &'static str,
+    /// Dotted configuration path assignments the value lands on, in order.
+    pub assignments: Vec<LegacyRenderEnvAssignment>,
+    /// Static explanation for the startup log line.
+    pub note: &'static str,
+}
+
+/// A single `config.path = value` assignment from a legacy mapping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegacyRenderEnvAssignment {
+    /// Dotted configuration path (e.g. `render.post.bloom.enabled`).
+    pub path: &'static str,
+    /// Parsed value ready for the environment configuration layer.
+    pub value: serde_json::Value,
+}
+
+/// Legacy variable names understood by [`map_legacy_render_env`], in the
+/// order the application should probe them.
+pub const LEGACY_RENDER_ENV_NAMES: [&str; 11] = [
+    "SB_WGPU_TONEMAP",
+    "SB_WGPU_EXPOSURE",
+    "SB_WGPU_BLOOM",
+    "SB_WGPU_BLOOM_THRESH",
+    "SB_WGPU_BLOOM_INTENSITY",
+    "SB_WGPU_VIGNETTE",
+    "SB_WGPU_FOG",
+    "SB_WGPU_FOG_COLOR",
+    "SB_WGPU_FXAA",
+    "SCRIPTBOTS_TERMINAL_PALETTE",
+    "SCRIPTBOTS_RENDER_QUALITY",
+];
+
+/// Translate one legacy render environment variable into typed-schema
+/// assignments. Returns `None` for unrecognized names or invalid values;
+/// the caller keeps the historical warn-and-skip behavior for invalid
+/// values, naming the variable in its own warning.
+///
+/// `SCRIPTBOTS_RENDER_QUALITY` is the canonical typed variable for
+/// `render.quality`; it is handled here so the application has exactly one
+/// mapping table for the whole render env surface.
+#[must_use]
+pub fn map_legacy_render_env(name: &str, value: &str) -> Option<LegacyRenderEnvMapping> {
+    let trimmed = value.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    let one = |path: &'static str, value: serde_json::Value| LegacyRenderEnvAssignment {
+        path,
+        value,
+    };
+    let mapping = |env_name: &'static str,
+                   assignments: Vec<LegacyRenderEnvAssignment>,
+                   note: &'static str| {
+        Some(LegacyRenderEnvMapping {
+            env_name,
+            assignments,
+            note,
+        })
+    };
+    match name {
+        "SB_WGPU_TONEMAP" => {
+            let mode = match lowered.as_str() {
+                "aces" => RenderTonemapMode::Aces,
+                "agx" => RenderTonemapMode::Agx,
+                "tony" | "tonymcmapface" => RenderTonemapMode::Tony,
+                _ => return None,
+            };
+            mapping(
+                "SB_WGPU_TONEMAP",
+                vec![one(
+                    "render.tonemap_mode",
+                    serde_json::to_value(mode).ok()?,
+                )],
+                "legacy wgpu tonemap knob; prefer SCRIPTBOTS_RENDER_* or --set render.tonemap_mode",
+            )
+        }
+        "SB_WGPU_EXPOSURE" => {
+            let bias: f32 = trimmed.parse().ok()?;
+            if !bias.is_finite() {
+                return None;
+            }
+            mapping(
+                "SB_WGPU_EXPOSURE",
+                vec![one(
+                    "render.tonemap_exposure_bias",
+                    serde_json::json!(f64::from(bias)),
+                )],
+                "legacy wgpu exposure knob; maps onto render.tonemap_exposure_bias",
+            )
+        }
+        "SB_WGPU_BLOOM" => {
+            let enabled = match lowered.as_str() {
+                "off" | "0" | "false" | "no" => false,
+                "on" | "1" | "true" | "yes" | "full" => true,
+                _ => return None,
+            };
+            mapping(
+                "SB_WGPU_BLOOM",
+                vec![one(
+                    "render.post.bloom.enabled",
+                    serde_json::Value::Bool(enabled),
+                )],
+                "legacy wgpu bloom toggle; 'full' collapses onto enabled",
+            )
+        }
+        "SB_WGPU_BLOOM_THRESH" => {
+            let threshold: f32 = trimmed.parse().ok()?;
+            if !threshold.is_finite() {
+                return None;
+            }
+            mapping(
+                "SB_WGPU_BLOOM_THRESH",
+                vec![one(
+                    "render.post.bloom.threshold",
+                    serde_json::json!(f64::from(threshold)),
+                )],
+                "legacy wgpu bloom threshold",
+            )
+        }
+        "SB_WGPU_BLOOM_INTENSITY" => {
+            let intensity: f32 = trimmed.parse().ok()?;
+            if !intensity.is_finite() {
+                return None;
+            }
+            mapping(
+                "SB_WGPU_BLOOM_INTENSITY",
+                vec![one(
+                    "render.post.bloom.intensity",
+                    serde_json::json!(f64::from(intensity)),
+                )],
+                "legacy wgpu bloom intensity",
+            )
+        }
+        "SB_WGPU_VIGNETTE" => {
+            let strength: f32 = trimmed.parse().ok()?;
+            if !strength.is_finite() || strength < 0.0 {
+                return None;
+            }
+            mapping(
+                "SB_WGPU_VIGNETTE",
+                vec![
+                    one(
+                        "render.post.vignette.enabled",
+                        serde_json::Value::Bool(strength > 0.0),
+                    ),
+                    one(
+                        "render.post.vignette.intensity",
+                        serde_json::json!(f64::from(strength.min(1.0))),
+                    ),
+                ],
+                "legacy wgpu vignette strength; zero disables, values above 1 clamp",
+            )
+        }
+        "SB_WGPU_FOG" => {
+            let mode = match lowered.as_str() {
+                "off" | "0" | "false" | "no" => RenderFogMode::Off,
+                "low" => RenderFogMode::Low,
+                "med" | "medium" => RenderFogMode::Medium,
+                "high" => RenderFogMode::High,
+                _ => return None,
+            };
+            mapping(
+                "SB_WGPU_FOG",
+                vec![one(
+                    "render.post.fog.mode",
+                    serde_json::to_value(mode).ok()?,
+                )],
+                "legacy wgpu fog preset",
+            )
+        }
+        "SB_WGPU_FOG_COLOR" => {
+            let rgb = parse_legacy_rgb(trimmed)?;
+            mapping(
+                "SB_WGPU_FOG_COLOR",
+                vec![one("render.post.fog.color", serde_json::json!(rgb))],
+                "legacy wgpu fog color (#rrggbb or r,g,b; 0-255 or 0-1 floats)",
+            )
+        }
+        "SB_WGPU_FXAA" => {
+            let aa = match lowered.as_str() {
+                "on" | "1" | "true" | "yes" => RenderAntiAliasing::Fxaa,
+                "off" | "0" | "false" | "no" => RenderAntiAliasing::Off,
+                _ => return None,
+            };
+            mapping(
+                "SB_WGPU_FXAA",
+                vec![one(
+                    "render.post.anti_aliasing",
+                    serde_json::to_value(aa).ok()?,
+                )],
+                "legacy wgpu FXAA toggle",
+            )
+        }
+        "SCRIPTBOTS_TERMINAL_PALETTE" => {
+            let palette = match lowered.as_str() {
+                "natural" => AccessibilityPalette::Natural,
+                "deuteranopia" => AccessibilityPalette::Deuteranopia,
+                "protanopia" => AccessibilityPalette::Protanopia,
+                "tritanopia" => AccessibilityPalette::Tritanopia,
+                "high_contrast" | "highcontrast" | "high-contrast" => {
+                    AccessibilityPalette::HighContrast
+                }
+                _ => return None,
+            };
+            mapping(
+                "SCRIPTBOTS_TERMINAL_PALETTE",
+                vec![one("render.palette", serde_json::to_value(palette).ok()?)],
+                "terminal palette now shared by every frontend via render.palette",
+            )
+        }
+        "SCRIPTBOTS_RENDER_QUALITY" => {
+            let quality = parse_render_quality(trimmed)?;
+            mapping(
+                "SCRIPTBOTS_RENDER_QUALITY",
+                vec![one("render.quality", serde_json::to_value(quality).ok()?)],
+                "canonical typed quality knob",
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Parse a quality tier from text (`auto|potato|low|medium|high|ultra`).
+#[must_use]
+pub fn parse_render_quality(raw: &str) -> Option<RenderQuality> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(RenderQuality::Auto),
+        "potato" => Some(RenderQuality::Potato),
+        "low" => Some(RenderQuality::Low),
+        "medium" | "med" => Some(RenderQuality::Medium),
+        "high" => Some(RenderQuality::High),
+        "ultra" => Some(RenderQuality::Ultra),
+        _ => None,
+    }
+}
+
+/// Parse the historical fog-color vocabularies into linear RGB `[0, 1]`.
+///
+/// Accepts `#rrggbb`, `rrggbb`, comma-separated `r,g,b` as either 0-255
+/// integers or 0-1 floats. Returns `None` on any malformed component.
+fn parse_legacy_rgb(raw: &str) -> Option<[f32; 3]> {
+    let hex = raw.strip_prefix('#').unwrap_or(raw);
+    if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let channel = |pair: &str| u8::from_str_radix(pair, 16).ok().map(|v| f32::from(v) / 255.0);
+        return Some([
+            channel(&hex[0..2])?,
+            channel(&hex[2..4])?,
+            channel(&hex[4..6])?,
+        ]);
+    }
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let mut rgb = [0.0_f32; 3];
+    for (slot, part) in rgb.iter_mut().zip(parts) {
+        if let Ok(int) = part.parse::<u32>() {
+            if int > 255 {
+                return None;
+            }
+            *slot = int as f32 / 255.0;
+        } else if let Ok(float) = part.parse::<f32>() {
+            if !float.is_finite() || !(0.0..=1.0).contains(&float) {
+                return None;
+            }
+            *slot = float;
+        } else {
+            return None;
+        }
+    }
+    Some(rgb)
 }
 
 /// Configuration change audit entry captured in-process.
@@ -9352,6 +9963,7 @@ impl ScriptBotsConfig {
             self.history_capacity != 0,
             "history_capacity must be at least 1"
         );
+        self.render.validate()?;
         Ok(())
     }
 
@@ -35426,57 +36038,59 @@ mod tests {
         // accumulator and poly-acos geometry. Re-pinned again in bd-2i1 after WorldDigest and the
         // trace advanced to V1.6 and default locomotion returned to the exact legacy two-rotation
         // model. Re-pinned in bd-hiv1 after sensing adopted the prior completed runtime wheel
-        // outputs instead of physical velocity. The DSR capture reviewed all six complete lane
-        // tuples, not only the final hash; transition, output-tail, and resource lanes remained
-        // unchanged while the stage-world and aggregate lanes advanced transitively.
+        // outputs instead of physical velocity. Re-pinned in bd-2z0.14.3.1 after RenderSettings
+        // v2 added presentation-only fields (quality tier, post stack, day/night, theme,
+        // palette) to the serialized config tree: as in bd-2i1, the transition, output-tail,
+        // and resource lanes are unchanged while the stage-world and aggregate lanes advanced
+        // transitively through the config-lane encoding; no science value moved.
         const EXPECTED: [(&str, &str, &str, &str, &str, &str); 6] = [
             (
                 "sense",
-                "0a0d121ea0f472f1",
+                "004a8ff34232c73a",
                 "79c9f653219e2e99",
                 "a5c3391527f7be0f",
                 "15b8ace5445abf68",
-                "3547a78fcb8d17ba",
+                "865000ef38f32868",
             ),
             (
                 "brains",
-                "36540a72ec2bb079",
+                "e47a9ca0b75f3bd2",
                 "0784675f322b8c77",
                 "e253563076bd2b5d",
                 "338ece8c58e3aa54",
-                "f4b85779233ab1fe",
+                "9f39057a48ff0d55",
             ),
             (
                 "actuation",
-                "6e06f10730262c8d",
+                "0b123cc4186c53d6",
                 "9372d014d2c797ef",
                 "d47fa5d7b8cf2959",
                 "f86a99d091268ea6",
-                "93789562882bac27",
+                "9c4573ee33022788",
             ),
             (
                 "food",
-                "53bee6a16454250d",
+                "f0ca325e4c9a4c56",
                 "c015084f9ab60410",
                 "fc08078be123d220",
                 "b02ed06b5635e312",
-                "695657518b13ef6f",
+                "0855fe48c69c007d",
             ),
             (
                 "death_cleanup",
-                "53bee6a16454250d",
+                "f0ca325e4c9a4c56",
                 "46581b2d02073daa",
                 "9b909fd41eae4aca",
                 "69b3e219fb68f4da",
-                "d5443a522bc98035",
+                "c28f4b1678fcf8d7",
             ),
             (
                 "population",
-                "3f5b0ac62a7eef37",
+                "b3afba363a569824",
                 "ff09abb6bd938d55",
                 "1aad4a0f35a0c69b",
                 "e94c6bb812e4088d",
-                "a3c9d6740ea1f0d2",
+                "7520bda32943fa12",
             ),
         ];
         if std::env::var("SCRIPTBOTS_WORLD_DIGEST_GOLDEN").as_deref() == Ok("1") {
@@ -35491,7 +36105,7 @@ mod tests {
             assert_eq!(build.pointer_width, 64);
             assert_eq!(
                 (observed.as_slice(), trace.overall.as_str()),
-                (&EXPECTED[..], "ca726f9062c140db")
+                (&EXPECTED[..], "0c0d9785026bc3f8")
             );
             println!(
                 "scriptbots.world-digest-golden.v1.6: six checkpoints and trace overall {} verified",
@@ -36714,5 +37328,266 @@ mod tests {
                 .iter()
                 .any(|agent| { agent.id == replacement_id.raw() && agent.uid == replacement_uid })
         );
+    }
+
+    fn reference_render_settings() -> RenderSettings {
+        RenderSettings {
+            tonemap_mode: Some(RenderTonemapMode::Agx),
+            tonemap_exposure_bias: Some(0.25),
+            auto_exposure: Some(RenderAutoExposureSettings {
+                enabled: true,
+                speed_brighten: Some(1.5),
+                speed_darken: Some(0.75),
+            }),
+            quality: Some(RenderQuality::High),
+            post: Some(RenderPostSettings {
+                bloom: Some(RenderBloomSettings {
+                    enabled: true,
+                    threshold: Some(1.1),
+                    intensity: Some(0.35),
+                }),
+                vignette: Some(RenderVignetteSettings {
+                    enabled: true,
+                    intensity: Some(0.2),
+                    smoothness: Some(0.6),
+                }),
+                fog: Some(RenderFogSettings {
+                    mode: Some(RenderFogMode::Medium),
+                    color: Some([0.6, 0.7, 0.9]),
+                }),
+                anti_aliasing: Some(RenderAntiAliasing::Taa),
+            }),
+            day_night: Some(RenderDayNightSettings {
+                cycle_ticks: Some(24_000),
+                start_phase: Some(0.25),
+                night_ambient: Some(0.05),
+                stars: Some(true),
+            }),
+            theme: Some(TuiThemeId::NordicFrost),
+            palette: Some(AccessibilityPalette::Deuteranopia),
+            reduced_motion: Some(false),
+            camera_shake: Some(true),
+        }
+    }
+
+    #[test]
+    fn render_settings_v2_serde_round_trip() {
+        let settings = reference_render_settings();
+        let json = serde_json::to_string(&settings).expect("serialize render settings");
+        let back: RenderSettings =
+            serde_json::from_str(&json).expect("deserialize render settings");
+        assert_eq!(settings, back);
+    }
+
+    #[test]
+    fn render_settings_v2_absent_fields_default_to_none() {
+        // The pre-v2 JSON shape (only tonemap fields) must keep parsing; new
+        // knobs stay unset and defer to frontend tier defaults.
+        let legacy_json = r#"{"tonemap_mode":"aces","tonemap_exposure_bias":0.5}"#;
+        let parsed: RenderSettings =
+            serde_json::from_str(legacy_json).expect("legacy render JSON parses");
+        assert_eq!(parsed.tonemap_mode, Some(RenderTonemapMode::Aces));
+        assert_eq!(parsed.quality, None);
+        assert_eq!(parsed.post, None);
+        assert_eq!(parsed.day_night, None);
+        assert_eq!(parsed.theme, None);
+        assert_eq!(parsed.palette, None);
+        assert!(!parsed.day_night_active());
+        assert_eq!(parsed.requested_quality(), RenderQuality::Auto);
+    }
+
+    #[test]
+    fn render_settings_validate_accepts_reference_instance() {
+        reference_render_settings()
+            .validate()
+            .expect("reference render settings are valid");
+        RenderSettings::default()
+            .validate()
+            .expect("default render settings are valid");
+    }
+
+    #[test]
+    fn render_settings_validate_rejects_each_bad_value() {
+        let cases: [RenderSettings; 7] = [
+            RenderSettings {
+                tonemap_exposure_bias: Some(f32::NAN),
+                ..RenderSettings::default()
+            },
+            RenderSettings {
+                auto_exposure: Some(RenderAutoExposureSettings {
+                    enabled: true,
+                    speed_brighten: Some(-1.0),
+                    speed_darken: None,
+                }),
+                ..RenderSettings::default()
+            },
+            RenderSettings {
+                post: Some(RenderPostSettings {
+                    bloom: Some(RenderBloomSettings {
+                        enabled: true,
+                        threshold: Some(99.0),
+                        intensity: None,
+                    }),
+                    ..RenderPostSettings::default()
+                }),
+                ..RenderSettings::default()
+            },
+            RenderSettings {
+                post: Some(RenderPostSettings {
+                    bloom: Some(RenderBloomSettings {
+                        enabled: true,
+                        threshold: None,
+                        intensity: Some(1.5),
+                    }),
+                    ..RenderPostSettings::default()
+                }),
+                ..RenderSettings::default()
+            },
+            RenderSettings {
+                post: Some(RenderPostSettings {
+                    vignette: Some(RenderVignetteSettings {
+                        enabled: true,
+                        intensity: Some(-0.1),
+                        smoothness: None,
+                    }),
+                    ..RenderPostSettings::default()
+                }),
+                ..RenderSettings::default()
+            },
+            RenderSettings {
+                post: Some(RenderPostSettings {
+                    fog: Some(RenderFogSettings {
+                        mode: None,
+                        color: Some([0.5, 1.2, 0.5]),
+                    }),
+                    ..RenderPostSettings::default()
+                }),
+                ..RenderSettings::default()
+            },
+            RenderSettings {
+                day_night: Some(RenderDayNightSettings {
+                    cycle_ticks: Some(1_000),
+                    start_phase: Some(1.5),
+                    night_ambient: None,
+                    stars: None,
+                }),
+                ..RenderSettings::default()
+            },
+        ];
+        for (index, settings) in cases.iter().enumerate() {
+            assert!(
+                settings.validate().is_err(),
+                "case {index} must reject invalid render settings"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_surfaces_render_errors() {
+        let config = ScriptBotsConfig {
+            render: RenderSettings {
+                tonemap_exposure_bias: Some(f32::INFINITY),
+                ..RenderSettings::default()
+            },
+            ..ScriptBotsConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "ScriptBotsConfig::validate must surface render validation failures"
+        );
+    }
+
+    #[test]
+    fn legacy_render_env_mapping_table() {
+        // Every advertised name maps; spot-check exact assignments.
+        for name in LEGACY_RENDER_ENV_NAMES {
+            let value = match name {
+                "SB_WGPU_TONEMAP" => "agx",
+                "SB_WGPU_EXPOSURE" => "0.5",
+                "SB_WGPU_BLOOM" => "off",
+                "SB_WGPU_BLOOM_THRESH" => "1.25",
+                "SB_WGPU_BLOOM_INTENSITY" => "0.4",
+                "SB_WGPU_VIGNETTE" => "0.3",
+                "SB_WGPU_FOG" => "med",
+                "SB_WGPU_FOG_COLOR" => "#ff8000",
+                "SB_WGPU_FXAA" => "on",
+                "SCRIPTBOTS_TERMINAL_PALETTE" => "tritanopia",
+                "SCRIPTBOTS_RENDER_QUALITY" => "ultra",
+                other => panic!("unmapped test name {other}"),
+            };
+            let mapping = map_legacy_render_env(name, value)
+                .unwrap_or_else(|| panic!("{name} must map from {value}"));
+            assert!(!mapping.assignments.is_empty());
+            assert!(mapping.note.len() > 8);
+        }
+
+        let fog = map_legacy_render_env("SB_WGPU_FOG", "med").expect("fog mapping");
+        assert_eq!(fog.assignments.len(), 1);
+        assert_eq!(fog.assignments[0].path, "render.post.fog.mode");
+        assert_eq!(fog.assignments[0].value, serde_json::json!("medium"));
+
+        let vignette_off =
+            map_legacy_render_env("SB_WGPU_VIGNETTE", "0").expect("vignette zero maps");
+        assert_eq!(
+            vignette_off.assignments[0].value,
+            serde_json::Value::Bool(false),
+            "zero vignette strength disables the effect"
+        );
+
+        let color = map_legacy_render_env("SB_WGPU_FOG_COLOR", "#ff8000").expect("hex color");
+        let rgb = color.assignments[0].value.as_array().expect("rgb array").clone();
+        assert_eq!(rgb.len(), 3);
+        assert!((rgb[0].as_f64().expect("r") - 1.0).abs() < 1e-6);
+        assert!((rgb[1].as_f64().expect("g") - 128.0 / 255.0).abs() < 1e-6);
+
+        let quality =
+            map_legacy_render_env("SCRIPTBOTS_RENDER_QUALITY", "Ultra").expect("quality maps");
+        assert_eq!(quality.assignments[0].value, serde_json::json!("ultra"));
+
+        let palette = map_legacy_render_env("SCRIPTBOTS_TERMINAL_PALETTE", "high_contrast")
+            .expect("palette maps");
+        assert_eq!(
+            palette.assignments[0].value,
+            serde_json::json!("high_contrast")
+        );
+    }
+
+    #[test]
+    fn legacy_render_env_rejects_invalid_values() {
+        assert!(map_legacy_render_env("SB_WGPU_TONEMAP", "sepia").is_none());
+        assert!(map_legacy_render_env("SB_WGPU_EXPOSURE", "bright").is_none());
+        assert!(map_legacy_render_env("SB_WGPU_BLOOM", "sometimes").is_none());
+        assert!(map_legacy_render_env("SB_WGPU_FOG", "soup").is_none());
+        assert!(map_legacy_render_env("SB_WGPU_FOG_COLOR", "#fff").is_none());
+        assert!(map_legacy_render_env("SB_WGPU_FOG_COLOR", "1,2").is_none());
+        assert!(map_legacy_render_env("SB_WGPU_FXAA", "maybe").is_none());
+        assert!(map_legacy_render_env("SCRIPTBOTS_RENDER_QUALITY", "ludicrous").is_none());
+        assert!(map_legacy_render_env("SB_WGPU_UNKNOWN", "1").is_none());
+    }
+
+    #[test]
+    fn render_settings_are_digest_neutral() {
+        // The world digest must encode science state only: two worlds differing
+        // solely in render configuration produce identical digests. The digest
+        // encoder replaces render settings with defaults; this guards that
+        // contract against regression.
+        let base = ScriptBotsConfig {
+            closed: true,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xC10),
+            ..ScriptBotsConfig::default()
+        };
+        let plain = WorldState::new(base.clone())
+            .expect("plain digest world")
+            .world_digest_v1()
+            .expect("plain digest");
+        let styled = WorldState::new(ScriptBotsConfig {
+            render: reference_render_settings(),
+            ..base
+        })
+        .expect("styled digest world")
+        .world_digest_v1()
+        .expect("styled digest");
+        assert_eq!(plain, styled);
     }
 }
