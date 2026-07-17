@@ -6,8 +6,8 @@ mod checkpoint;
 pub mod detect;
 pub mod economy;
 pub mod narrative_text;
-pub mod rng_domains;
 mod replay;
+pub mod rng_domains;
 pub mod sense_fixed;
 pub mod visual;
 
@@ -5924,7 +5924,9 @@ pub enum ReplayEventKind {
     /// Canonical `WorldDigestV1.overall` recorded once at a clean boundary by the driving
     /// application, so replay verification can prove the entire final science state — not
     /// just the event stream — reproduced exactly.
-    WorldDigest { overall: String },
+    WorldDigest {
+        overall: String,
+    },
 }
 
 /// Lightweight wrapper pairing an agent context with a replay event.
@@ -7453,7 +7455,7 @@ impl BrainFamilyRegistry {
 }
 
 /// High level simulation clock (ticks processed since boot).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Tick(pub u64);
 
 impl fmt::Display for Tick {
@@ -8581,13 +8583,16 @@ pub const fn tier_features(tier: RenderQuality) -> TierFeatures {
             tui_subcell: true,
             tui_animation: false,
         },
+        // Anti-aliasing rows stay Off across every tier until a renderer actually
+        // implements the mode (bd-2z0.7.11): no FXAA or TAA path exists in the wgpu
+        // post pipeline or the CPU rasterizer, so the matrix must not claim one.
         RenderQuality::Low => TierFeatures {
             shadows: true,
             shadow_resolution: 1024,
             shadow_cascades: 1,
             bloom: false,
             ssao: false,
-            anti_aliasing: RenderAntiAliasing::Fxaa,
+            anti_aliasing: RenderAntiAliasing::Off,
             fog: false,
             particles_max: 2_048,
             terrain_detail_divisor: 2,
@@ -8601,7 +8606,7 @@ pub const fn tier_features(tier: RenderQuality) -> TierFeatures {
             shadow_cascades: 2,
             bloom: true,
             ssao: false,
-            anti_aliasing: RenderAntiAliasing::Fxaa,
+            anti_aliasing: RenderAntiAliasing::Off,
             fog: true,
             particles_max: 8_192,
             terrain_detail_divisor: 1,
@@ -8615,7 +8620,7 @@ pub const fn tier_features(tier: RenderQuality) -> TierFeatures {
             shadow_cascades: 4,
             bloom: true,
             ssao: true,
-            anti_aliasing: RenderAntiAliasing::Taa,
+            anti_aliasing: RenderAntiAliasing::Off,
             fog: true,
             particles_max: 32_768,
             terrain_detail_divisor: 1,
@@ -8629,7 +8634,7 @@ pub const fn tier_features(tier: RenderQuality) -> TierFeatures {
             shadow_cascades: 4,
             bloom: true,
             ssao: true,
-            anti_aliasing: RenderAntiAliasing::Taa,
+            anti_aliasing: RenderAntiAliasing::Off,
             fog: true,
             particles_max: 65_536,
             terrain_detail_divisor: 1,
@@ -8693,10 +8698,7 @@ impl RenderGovernor {
     #[must_use]
     pub fn new(initial: RenderQuality, ceiling: RenderQuality, budget_ms: f32) -> Self {
         let ladder_index = |tier: RenderQuality| {
-            TIER_LADDER
-                .iter()
-                .position(|t| *t == tier)
-                .unwrap_or(2) // Medium when Auto/unknown sneaks in
+            TIER_LADDER.iter().position(|t| *t == tier).unwrap_or(2) // Medium when Auto/unknown sneaks in
         };
         Self {
             ceiling_ladder_index: ladder_index(ceiling),
@@ -13372,6 +13374,10 @@ pub struct WorldState {
     #[allow(dead_code)]
     replay_tick: u64,
     replay_events: Vec<ReplayEvent>,
+    /// Transient driver request to bind the canonical world digest into the next projected
+    /// batch's replay stream; consumed by `prepare_persistence`. Never serialized: it is a
+    /// driver instruction for the current boundary, not science state.
+    replay_world_digest_pending: bool,
     persistence_binding: Arc<PersistenceSessionToken>,
     persistence_boundary: PersistenceBoundaryStatus,
     brain_fault: Option<BrainSpawnError>,
@@ -13512,6 +13518,7 @@ impl WorldState {
             pending_lifecycle_death_metrics: Vec::new(),
             replay_tick: 0,
             replay_events: Vec::new(),
+            replay_world_digest_pending: false,
             persistence_binding: Arc::new(PersistenceSessionToken::default()),
             persistence_boundary: PersistenceBoundaryStatus::Open { tick: Tick::zero() },
             brain_fault: None,
@@ -18901,6 +18908,10 @@ impl WorldState {
             self.pending_lifecycle_birth_metrics.clear();
             self.pending_lifecycle_death_metrics.clear();
         }
+
+        // A driver-requested world digest rides this boundary's batch so the digest covers
+        // the completed post-tick state and the verifying driver sees the same shape.
+        self.append_requested_replay_world_digest();
 
         let batch = PersistenceBatch {
             summary: summary.clone(),
@@ -37942,9 +37953,18 @@ mod tests {
             initial_tier_for(GpuClass::Software, None),
             RenderQuality::Potato
         );
-        assert_eq!(initial_tier_for(GpuClass::Virtual, None), RenderQuality::Low);
-        assert_eq!(initial_tier_for(GpuClass::Unknown, None), RenderQuality::Medium);
-        assert_eq!(initial_tier_for(GpuClass::Discrete, None), RenderQuality::High);
+        assert_eq!(
+            initial_tier_for(GpuClass::Virtual, None),
+            RenderQuality::Low
+        );
+        assert_eq!(
+            initial_tier_for(GpuClass::Unknown, None),
+            RenderQuality::Medium
+        );
+        assert_eq!(
+            initial_tier_for(GpuClass::Discrete, None),
+            RenderQuality::High
+        );
         assert_eq!(
             initial_tier_for(GpuClass::Integrated, Some(2_u64 * 1024 * 1024 * 1024)),
             RenderQuality::Low
@@ -37978,7 +37998,12 @@ mod tests {
         assert!(!potato.shadows && potato.shadow_cascades == 0);
         assert!(low.shadows && low.shadow_cascades == 1);
         assert!(medium.bloom && !medium.ssao);
-        assert!(high.ssao && high.anti_aliasing == RenderAntiAliasing::Taa);
+        assert!(high.ssao);
+        // No renderer implements an anti-aliasing mode today, so every tier must report
+        // AA off rather than claim FXAA/TAA (bd-2z0.7.11).
+        for features in [potato, low, medium, high, ultra] {
+            assert_eq!(features.anti_aliasing, RenderAntiAliasing::Off);
+        }
         assert_eq!(ultra.water_reflections, 2);
         let ladder = [potato, low, medium, high, ultra];
         for pair in ladder.windows(2) {

@@ -10,7 +10,6 @@ name = "scriptbots_world_gfx"
 path = "src/lib.rs"
 
 [dependencies]
-wgpu = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
 bytemuck = { version = "1.16", features = ["derive"] }
 tracing = { workspace = true }
 pollster = "0.4"
@@ -21,15 +20,20 @@ default = []
 compute_binning = []
 perf_counters = []
 
+# Native backend per platform (bd-2z0.7.11): Metal on macOS, DX12 on Windows,
+# Vulkan on Linux. Portability layers (e.g. MoltenVK) must never enter the native
+# product by default; they remain explicit runtime diagnostics (WGPU_BACKEND).
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "27", default-features = false, features = ["metal", "wgsl"] }
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "27", default-features = false, features = ["dx12", "wgsl"] }
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06", "wayland", "x11"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-winit = { version = "0.30.12", default-features = false, features = ["rwh_06", "wayland", "x11"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }

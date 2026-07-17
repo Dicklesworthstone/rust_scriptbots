@@ -18,10 +18,10 @@ use scriptbots_core::{
     BrainActivations, BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision,
     BrainInspectionUnavailable, ControlCommand, ControlDisposition, FoodGrid, Generation,
     IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position,
-    RenderTonemapMode, SENSOR_LAYOUT, SensorAttribution, SensorKind, ScriptBotsConfig, SelectedBrainTelemetryOutcome,
-    SelectionMode, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TerrainLayer,
-    TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver,
-    apply_control_command,
+    RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig, SelectedBrainTelemetryOutcome,
+    SelectionMode, SelectionState, SelectionUpdate, SensorAttribution, SensorKind,
+    SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers,
+    Velocity, WorldState, WorldStepDriver, apply_control_command,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
@@ -539,15 +539,21 @@ pub mod world_compositor {
             let effective_scale = self.cam_scale * rs;
             let effective_offset = (self.cam_offset.0 * rs, self.cam_offset.1 * rs);
             r.set_camera(effective_scale, effective_offset);
-            let _ = r.resize(render_size);
+            if let Err(error) = r.resize(render_size) {
+                tracing::warn!(%error, "wgpu resize failed; keeping the previous frame");
+                return;
+            }
             let _frame = r.render(snapshot);
-            let _ = r.copy_to_readback(&_frame);
+            if let Err(error) = r.copy_to_readback(&_frame) {
+                tracing::warn!(%error, "wgpu readback copy failed; keeping the previous frame");
+                return;
+            }
             // Small bounded spin to ensure first mapped frame is ready; avoids blank-first-paint
-            let mut view_opt = r.mapped_rgba();
+            let mut view_opt = r.mapped_rgba().ok();
             if view_opt.is_none() {
                 for _ in 0..64 {
                     std::hint::spin_loop();
-                    view_opt = r.mapped_rgba();
+                    view_opt = r.mapped_rgba().ok();
                     if view_opt.is_some() {
                         break;
                     }
@@ -763,7 +769,14 @@ pub mod world_compositor {
 
     // Headless, one-shot offscreen render to PNG (bytes) using the same snapshot path as the GUI.
     // This allows verifying the wgpu pipeline without a display server.
-    pub fn render_wgpu_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<u8> {
+    pub fn render_wgpu_png_offscreen(
+        world: &WorldState,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, scriptbots_world_gfx::ReadbackError> {
+        if width == 0 || height == 0 {
+            return Err(scriptbots_world_gfx::ReadbackError::ZeroDimensions { width, height });
+        }
         // Build snapshot from world
         let frame = crate::RenderFrame::from_world(world, crate::ColorPaletteMode::Natural)
             .expect("render frame");
@@ -817,33 +830,43 @@ pub mod world_compositor {
         // Extract mapped frame. Geometry must come from the readback view:
         // render_snapshot may render at a reduced resolution (SB_WGPU_RES_SCALE),
         // so the actual view size can differ from the requested width/height.
-        let mut png: Vec<u8> = Vec::new();
-        if let Some(view) = comp.renderer.as_mut().and_then(|r| r.mapped_rgba()) {
-            let view_width = view.width;
-            let view_height = view.height;
-            let stride = view.bytes_per_row as usize;
-            let row_bytes = (view_width as usize) * 4;
-            let src = view.bytes();
-            let mut tight = vec![0u8; row_bytes * view_height as usize];
-            for y in 0..(view_height as usize) {
-                let s = y * stride;
-                let d = y * row_bytes;
-                let end = s + row_bytes;
-                if end <= src.len() {
-                    tight[d..d + row_bytes].copy_from_slice(&src[s..end]);
-                }
+        // An unmapped frame is a typed Empty failure, never an empty-vector success.
+        let view = comp
+            .renderer
+            .as_mut()
+            .ok_or(scriptbots_world_gfx::ReadbackError::AdapterUnavailable)?
+            .mapped_rgba()?;
+        let view_width = view.width;
+        let view_height = view.height;
+        let stride = view.bytes_per_row as usize;
+        let row_bytes = (view_width as usize) * 4;
+        let src = view.bytes();
+        let mut tight = vec![0u8; row_bytes * view_height as usize];
+        for y in 0..(view_height as usize) {
+            let s = y * stride;
+            let d = y * row_bytes;
+            let end = s + row_bytes;
+            if end <= src.len() {
+                tight[d..d + row_bytes].copy_from_slice(&src[s..end]);
             }
-            let mut cursor = std::io::Cursor::new(&mut png);
-            let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
-            let _ = image::ImageEncoder::write_image(
-                encoder,
-                &tight,
-                view_width,
-                view_height,
-                image::ExtendedColorType::Rgba8,
-            );
         }
-        png
+        if tight.iter().all(|byte| *byte == 0) {
+            return Err(scriptbots_world_gfx::ReadbackError::Blank);
+        }
+        let mut png: Vec<u8> = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png);
+        let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+        image::ImageEncoder::write_image(
+            encoder,
+            &tight,
+            view_width,
+            view_height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| {
+            scriptbots_world_gfx::ReadbackError::Device(format!("PNG encode failed: {error}"))
+        })?;
+        Ok(png)
     }
 }
 
@@ -8222,12 +8245,11 @@ fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
                 .h(px(16.0))
                 .bg(rgb(0x64748b)),
         );
-        panel = panel.child(strip).child(
-            div()
-                .text_xs()
-                .text_color(rgb(0x475569))
-                .child("-180°            eye cones at true angles · ticks = contributors            +180°"),
-        );
+        panel = panel
+            .child(strip)
+            .child(div().text_xs().text_color(rgb(0x475569)).child(
+                "-180°            eye cones at true angles · ticks = contributors            +180°",
+            ));
     }
 
     for eye in 0..NUM_EYES {

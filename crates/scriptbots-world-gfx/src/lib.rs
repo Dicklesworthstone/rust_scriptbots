@@ -85,13 +85,21 @@ pub struct RenderFrame {
 }
 
 impl WorldRenderer {
-    pub async fn new(adapter: &wgpu::Adapter, size: (u32, u32)) -> Result<Self, String> {
-        // Guard against zero-sized viewports (can happen during early window init on some platforms)
-        let size = (size.0.max(1), size.1.max(1));
+    pub async fn new(adapter: &wgpu::Adapter, size: (u32, u32)) -> Result<Self, ReadbackError> {
+        // Reject zero-sized viewports instead of clamping them (bd-2z0.7.11): early window
+        // init races must surface as typed errors, never as silently 1x1 renderers.
+        if size.0 == 0 || size.1 == 0 {
+            return Err(ReadbackError::ZeroDimensions {
+                width: size.0,
+                height: size.1,
+            });
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
-            .map_err(|e| format!("wgpu device request failed: {e}"))?;
+            .map_err(|error| {
+                ReadbackError::Device(format!("wgpu device request failed: {error}"))
+            })?;
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let (color, color_view) = create_color(&device, format, size);
@@ -124,9 +132,15 @@ impl WorldRenderer {
         })
     }
 
-    pub fn resize(&mut self, new_size: (u32, u32)) -> Result<(), String> {
-        if new_size == self.size || new_size.0 == 0 || new_size.1 == 0 {
+    pub fn resize(&mut self, new_size: (u32, u32)) -> Result<(), ReadbackError> {
+        if new_size == self.size {
             return Ok(());
+        }
+        if new_size.0 == 0 || new_size.1 == 0 {
+            return Err(ReadbackError::ZeroDimensions {
+                width: new_size.0,
+                height: new_size.1,
+            });
         }
         let (tex, view) = create_color(&self.device, self.format, new_size);
         self.color = tex;
@@ -252,7 +266,7 @@ impl WorldRenderer {
         RenderFrame { extent: self.size }
     }
 
-    pub fn copy_to_readback(&mut self, _frame: &RenderFrame) -> Result<(), String> {
+    pub fn copy_to_readback(&mut self, _frame: &RenderFrame) -> Result<(), ReadbackError> {
         #[cfg(feature = "perf_counters")]
         let t0 = Instant::now();
         let src_tex: &wgpu::Texture = match self.post.as_ref() {
@@ -269,7 +283,7 @@ impl WorldRenderer {
             })
     }
 
-    pub fn mapped_rgba(&mut self) -> Option<ReadbackView> {
+    pub fn mapped_rgba(&mut self) -> Result<ReadbackView, ReadbackError> {
         self.readback.mapped()
     }
 
@@ -382,10 +396,64 @@ pub struct ReadbackRing {
     extent: (u32, u32),
 }
 
+/// Typed failures for the adapter/device/readback/capture surface (bd-2z0.7.11).
+/// No failure on this surface may be reported as an empty vector or a silent success.
+#[derive(Debug)]
+pub enum ReadbackError {
+    /// No adapter satisfied the request.
+    AdapterUnavailable,
+    /// Device-level failure (poll, submit, lost device).
+    Device(String),
+    /// Resize/readback-buffer allocation failure.
+    Resize(String),
+    /// Buffer map request failed.
+    Map(String),
+    /// Mapping did not complete within the bounded wait.
+    Timeout,
+    /// Capture produced no frame content at all.
+    Empty,
+    /// Capture produced a frame with no nonzero pixels.
+    Blank,
+    /// Observed metadata disagrees with the required contract.
+    MetadataMismatch { expected: String, actual: String },
+    /// Zero-sized render or capture extent was rejected instead of clamped.
+    ZeroDimensions { width: u32, height: u32 },
+}
+
+impl std::fmt::Display for ReadbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AdapterUnavailable => write!(f, "no GPU adapter satisfied the request"),
+            Self::Device(detail) => write!(f, "GPU device failure: {detail}"),
+            Self::Resize(detail) => write!(f, "GPU resize failure: {detail}"),
+            Self::Map(detail) => write!(f, "GPU buffer map failure: {detail}"),
+            Self::Timeout => write!(f, "GPU readback did not map within the bounded wait"),
+            Self::Empty => write!(f, "capture produced no frame content"),
+            Self::Blank => write!(f, "capture produced a frame with no nonzero pixels"),
+            Self::MetadataMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "capture metadata mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::ZeroDimensions { width, height } => {
+                write!(
+                    f,
+                    "zero-sized render/capture extent {width}x{height} is rejected"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadbackError {}
+
 pub struct ReadbackSlot {
     buf: wgpu::Buffer,
     ready: bool,
     mapped: std::sync::Arc<AtomicBool>,
+    /// Last asynchronous map failure reported for this slot; surfaced by `mapped`.
+    map_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 pub struct ReadbackView {
@@ -406,14 +474,19 @@ impl ReadbackRing {
         device: &wgpu::Device,
         extent: (u32, u32),
         format: wgpu::TextureFormat,
-    ) -> Result<Self, String> {
-        assert_eq!(
-            format,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            "only RGBA8 sRGB supported for readback"
-        );
-        // Clamp extent to avoid zero-sized buffers which are invalid on some backends
-        let extent = (extent.0.max(1), extent.1.max(1));
+    ) -> Result<Self, ReadbackError> {
+        if format != wgpu::TextureFormat::Rgba8UnormSrgb {
+            return Err(ReadbackError::MetadataMismatch {
+                expected: "Rgba8UnormSrgb readback format".to_owned(),
+                actual: format!("{format:?}"),
+            });
+        }
+        if extent.0 == 0 || extent.1 == 0 {
+            return Err(ReadbackError::ZeroDimensions {
+                width: extent.0,
+                height: extent.1,
+            });
+        }
         let bytes_per_row = align_256(extent.0 * 4);
         let size_bytes = bytes_per_row as u64 * extent.1 as u64;
         let mk = || {
@@ -428,6 +501,7 @@ impl ReadbackRing {
             buf: mk(),
             ready: false,
             mapped: std::sync::Arc::new(AtomicBool::new(false)),
+            map_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         let slots = [mk_slot(), mk_slot(), mk_slot()];
         Ok(Self {
@@ -443,7 +517,7 @@ impl ReadbackRing {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         color: &wgpu::Texture,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReadbackError> {
         let slot = &mut self.slots[self.curr];
         slot.ready = false;
         if slot.mapped.load(Ordering::Relaxed) {
@@ -473,23 +547,38 @@ impl ReadbackRing {
         );
         queue.submit(Some(encoder.finish()));
 
-        // Map asynchronously; mark ready upon success via polling.
+        // Map asynchronously; record any failure so `mapped` can surface it instead of
+        // the caller spinning forever on a slot that will never become ready.
         let slice = slot.buf.slice(..);
         let mapped_flag = std::sync::Arc::clone(&slot.mapped);
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            if res.is_ok() {
-                mapped_flag.store(true, Ordering::Relaxed);
+        let map_error = std::sync::Arc::clone(&slot.map_error);
+        slice.map_async(wgpu::MapMode::Read, move |res| match res {
+            Ok(()) => mapped_flag.store(true, Ordering::Relaxed),
+            Err(error) => {
+                if let Ok(mut slot_error) = map_error.lock() {
+                    *slot_error = Some(error.to_string());
+                }
             }
         });
         // Ensure progress on mapping; non-blocking is sufficient for our readback ring
         // Non-blocking poll may be insufficient in tests; use indefinite wait
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| ReadbackError::Device(format!("readback poll failed: {error:?}")))?;
         // Advance ring pointer
         self.curr = (self.curr + 1) % self.slots.len();
         Ok(())
     }
 
-    pub fn mapped(&mut self) -> Option<ReadbackView> {
+    pub fn mapped(&mut self) -> Result<ReadbackView, ReadbackError> {
+        // Surface any recorded asynchronous map failure before scanning for readiness.
+        for slot in &self.slots {
+            if let Ok(mut slot_error) = slot.map_error.lock()
+                && let Some(error) = slot_error.take()
+            {
+                return Err(ReadbackError::Map(error));
+            }
+        }
         // Prefer the most recently mapped slot (scan last -> older)
         for i in 0..self.slots.len() {
             let idx = (self.curr + self.slots.len() - 1 - i) % self.slots.len();
@@ -500,14 +589,37 @@ impl ReadbackRing {
             let slice = slot.buf.slice(..);
             let guard = slice.get_mapped_range();
             slot.ready = true; // latch until consumer takes a view at least once
-            return Some(ReadbackView {
+            return Ok(ReadbackView {
                 guard,
                 bytes_per_row: self.bytes_per_row,
                 width: self.extent.0,
                 height: self.extent.1,
             });
         }
-        None
+        Err(ReadbackError::Empty)
+    }
+}
+
+/// Parse the `SB_WGPU_FXAA` toggle truthfully: FXAA is not implemented in the post
+/// pipeline, so any nonzero request logs a one-time warning and resolves to disabled
+/// rather than silently claiming the feature (bd-2z0.7.11).
+fn parse_fxaa_env(previous: u32) -> u32 {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    match std::env::var("SB_WGPU_FXAA")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        Some(0) => 0,
+        Some(_) => {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "SB_WGPU_FXAA requests FXAA, but FXAA is not implemented in the post \
+                     pipeline; the request is ignored"
+                );
+            }
+            0
+        }
+        None => previous,
     }
 }
 
@@ -2006,10 +2118,7 @@ impl PostFx {
                 // default is 1 = aces), matching `wants_post()`.
                 _ => self.env_tonemap,
             };
-            self.env_fxaa = std::env::var("SB_WGPU_FXAA")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(self.env_fxaa);
+            self.env_fxaa = parse_fxaa_env(self.env_fxaa);
             self.env_bloom_on = std::env::var("SB_WGPU_BLOOM")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -2207,11 +2316,7 @@ fn wants_post() -> bool {
     let mut guard = cache.lock().unwrap();
     let (last, val) = &mut *guard;
     if last.elapsed().as_millis() > 250 {
-        let fxaa = std::env::var("SB_WGPU_FXAA")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0)
-            != 0;
+        let fxaa = parse_fxaa_env(0) != 0;
         // Unset defaults to aces (matches the PostFx constructor default).
         let tonemap = !matches!(
             std::env::var("SB_WGPU_TONEMAP").ok().as_deref(),
@@ -2251,11 +2356,13 @@ struct Params {
 };
 @group(1) @binding(0) var<uniform> params: Params;
 
-fn aces_tonemap(c: vec3<f32>) -> vec3<f32> {
-  // Fitted ACES curve
-  let a = 2.51; let b = 0.03; let d = 0.59; let e = 0.14;
-  let numerator = c * (a * c + b);
-  let denom = c * ( (a - 1.0) * c + d ) + e;
+fn aces_tonemap(col: vec3<f32>) -> vec3<f32> {
+  // Fitted ACES curve. Coefficients MUST match the CPU aces_fitted in
+  // scriptbots-render (Stephen Hill fit); an earlier shader divided by (a-1.0)=1.51
+  // instead of the correct c=2.43 and crushed the shoulder relative to the CPU path.
+  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+  let numerator = col * (a * col + b);
+  let denom = col * (c * col + d) + e;
   return clamp(numerator / denom, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 

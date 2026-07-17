@@ -403,7 +403,10 @@ fn main() -> Result<()> {
                         std::env::var("SB_WGPU_DUMP").ok().as_deref(),
                         Some("1" | "true" | "yes" | "on")
                     ) {
-                        scriptbots_render::world_compositor::render_wgpu_png_offscreen(&guard, w, h)
+                        scriptbots_render::world_compositor::render_wgpu_png_offscreen(
+                            &guard, w, h,
+                        )
+                        .map_err(|error| anyhow::anyhow!("wgpu snapshot failed: {error}"))?
                     } else {
                         render_png_offscreen(&guard, w, h)
                     }
