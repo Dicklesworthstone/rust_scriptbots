@@ -39,7 +39,12 @@ pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 1;
 pub struct StorageJournalOptions {
     /// Most accepted batches that may await receipt polling.
     pub admission_capacity: usize,
-    /// Maximum monotonic time from accepting a batch to observing terminal receipt truth.
+    /// Monotonic age at which an unresolved batch becomes eligible for timeout resolution on the
+    /// next nonblocking receipt poll.
+    ///
+    /// This is not an autonomous timer: expiry is observed only when the host polls, and
+    /// contention on the authoritative terminal-truth cache may defer resolution until a later
+    /// uncontended poll.
     pub receipt_timeout: Duration,
     /// Largest exact [`JournalBatch`] allocation accepted by the adapter.
     pub max_batch_bytes: usize,
@@ -1671,6 +1676,326 @@ mod tests {
             volatile_event_history_capacity: 4,
             ..HostCoreOptions::default()
         }
+    }
+
+    fn admitted_journal_batch(command: StorageCommand) -> Option<Arc<JournalBatch>> {
+        match command {
+            StorageCommand::JournalAdmit { batch } => Some(batch),
+            _ => None,
+        }
+    }
+
+    fn measured_scientific_batch_bytes() -> (usize, usize) {
+        let session_id = HostSessionId::new(0x404);
+        let options = StorageJournalOptions::default();
+        let (worker_tx, worker_rx) = xchan::bounded(DEFAULT_COMMAND_CAPACITY);
+        let admission = Arc::new(Mutex::new(AdmissionState { open: true }));
+        let shared = Arc::new(JournalSessionShared::new(options.admission_capacity));
+        let (_receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
+        let publisher =
+            JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
+        let journal = StorageJournalPort::new(
+            worker_tx,
+            admission,
+            shared,
+            receipt_rx,
+            &publisher,
+            options,
+            ShutdownCommitRequirement::CommittedVolatile,
+        );
+        let mut core = HostCore::with_journal(
+            session_id,
+            timeout_test_world(),
+            timeout_host_options(),
+            Box::new(journal),
+        )
+        .expect("host used to measure its exact production journal allocation");
+        let mut frontend = NullFrontend::new(core.local_port(), 0x5004);
+
+        frontend.step().expect("first measurement step admission");
+        let first_applied = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(0))
+            .expect("first measurement step reaches the production journal port");
+        assert_eq!(first_applied.scientific_steps, 1);
+        let first_queued = worker_rx
+            .try_recv()
+            .expect("measurement worker lane receives the first accepted journal batch");
+        let first = admitted_journal_batch(first_queued)
+            .expect("measurement worker lane returns the first journal admission");
+
+        frontend.step().expect("second measurement step admission");
+        let second_applied = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(1))
+            .expect("second measurement step reaches the production journal port");
+        assert_eq!(second_applied.scientific_steps, 1);
+        let second_queued = worker_rx
+            .try_recv()
+            .expect("measurement worker lane receives the second accepted journal batch");
+        let second = admitted_journal_batch(second_queued)
+            .expect("measurement worker lane returns the second journal admission");
+        (first.retained_bytes(), second.retained_bytes())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one production-port test proves oversize refusal, exact Arc retention, zero charge, and fail-closed science together"
+    )]
+    fn oversize_journal_batch_closes_without_charge_and_blocks_later_science() {
+        let session_id = HostSessionId::new(0x405);
+        let options = StorageJournalOptions {
+            admission_capacity: 2,
+            max_batch_bytes: 1,
+            max_inflight_bytes: 1,
+            ..StorageJournalOptions::default()
+        };
+        assert_eq!(options.validate(), Ok(options));
+        let (worker_tx, worker_rx) = xchan::bounded(DEFAULT_COMMAND_CAPACITY);
+        let admission = Arc::new(Mutex::new(AdmissionState { open: true }));
+        let shared = Arc::new(JournalSessionShared::new(options.admission_capacity));
+        let (_receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
+        let publisher =
+            JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
+        let journal = StorageJournalPort::new(
+            worker_tx,
+            admission,
+            shared,
+            receipt_rx,
+            &publisher,
+            options,
+            ShutdownCommitRequirement::CommittedVolatile,
+        );
+        let inflight_bytes = Arc::clone(&journal.inflight_bytes);
+        let mut core = HostCore::with_journal(
+            session_id,
+            timeout_test_world(),
+            timeout_host_options(),
+            Box::new(journal),
+        )
+        .expect("host with a one-byte production journal batch ceiling");
+        let mut frontend = NullFrontend::new(core.local_port(), 0x5005);
+
+        let first = frontend.step().expect("oversize step enters host order");
+        let rejected = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(0))
+            .expect("oversize admission fails closed without waiting on storage");
+        assert_eq!(rejected.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(1));
+        assert!(matches!(
+            rejected.blocker,
+            Some(HostBlocker::JournalClosed { .. })
+        ));
+        let retained = core
+            .pending_journal_batch()
+            .expect("oversize result retains the exact completed batch");
+        assert_eq!(retained.id().session_id(), session_id);
+        assert_eq!(retained.id().sequence(), 1);
+        assert!(retained.retained_bytes() > options.max_batch_bytes);
+        assert_eq!(Arc::strong_count(&retained), 2);
+        let same_retained = core
+            .pending_journal_batch()
+            .expect("oversize batch remains retained for diagnostics");
+        assert!(Arc::ptr_eq(&retained, &same_retained));
+        drop(same_retained);
+        assert_eq!(Arc::strong_count(&retained), 2);
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(xchan::TryRecvError::Empty)
+        ));
+        let first_status = frontend
+            .command_status(first.command_id())
+            .expect("oversize command status query")
+            .expect("oversize command remains queryable");
+        assert!(matches!(
+            first_status.journal(),
+            JournalState::Failed(failure) if failure.code == "journal_closed"
+        ));
+
+        let later = frontend
+            .step()
+            .expect("later science command enters host order");
+        let blocked = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(1))
+            .expect("closed size gate blocks later science deterministically");
+        assert_eq!(blocked.scientific_steps, 0);
+        assert_eq!(blocked.blocker, Some(HostBlocker::ScientificFault));
+        assert_eq!(core.world_tick(), Tick(1));
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(xchan::TryRecvError::Empty)
+        ));
+        let later_status = frontend
+            .command_status(later.command_id())
+            .expect("later command status query")
+            .expect("later command remains queryable");
+        assert!(matches!(
+            later_status.application(),
+            ApplicationState::Failed(failure) if failure.code == "science_blocked"
+        ));
+        assert_eq!(later_status.journal(), &JournalState::NotRequired);
+
+        drop(core);
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&retained), 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one production-port test proves byte backpressure, exact retry identity, receipt release, and drop release together"
+    )]
+    fn inflight_byte_limit_retains_exact_batch_until_permit_release_and_retry() {
+        let (first_batch_bytes, second_batch_bytes) = measured_scientific_batch_bytes();
+        assert!(first_batch_bytes > 0);
+        assert!(second_batch_bytes > 0);
+        let byte_limit = first_batch_bytes.max(second_batch_bytes);
+        assert!(
+            first_batch_bytes.saturating_add(second_batch_bytes) > byte_limit,
+            "two nonempty exact charges must exceed the one-batch byte limit"
+        );
+        let defaults = StorageJournalOptions::default();
+        let options = StorageJournalOptions {
+            admission_capacity: 4,
+            max_batch_bytes: byte_limit,
+            max_inflight_bytes: byte_limit,
+            max_event_page_bytes: defaults.max_event_page_bytes.max(byte_limit),
+            ..defaults
+        };
+        assert_eq!(options.validate(), Ok(options));
+        let session_id = HostSessionId::new(0x406);
+        let (worker_tx, worker_rx) = xchan::bounded(DEFAULT_COMMAND_CAPACITY);
+        let admission = Arc::new(Mutex::new(AdmissionState { open: true }));
+        let shared = Arc::new(JournalSessionShared::new(options.admission_capacity));
+        let (receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
+        let publisher =
+            JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
+        let journal = StorageJournalPort::new(
+            worker_tx,
+            admission,
+            shared,
+            receipt_rx,
+            &publisher,
+            options,
+            ShutdownCommitRequirement::CommittedVolatile,
+        );
+        let inflight_bytes = Arc::clone(&journal.inflight_bytes);
+        let mut core = HostCore::with_journal(
+            session_id,
+            timeout_test_world(),
+            timeout_host_options(),
+            Box::new(journal),
+        )
+        .expect("host whose byte ceiling admits exactly one scientific batch");
+        let mut frontend = NullFrontend::new(core.local_port(), 0x5006);
+
+        frontend.step().expect("first byte-budgeted step admission");
+        let first_applied = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(0))
+            .expect("first byte-budgeted step reaches storage");
+        assert_eq!(first_applied.scientific_steps, 1);
+        let first_queued = worker_rx
+            .try_recv()
+            .expect("first exact batch reaches the live worker lane");
+        let first_worker_batch = admitted_journal_batch(first_queued)
+            .expect("first byte-budgeted command is a journal admission");
+        assert_eq!(first_worker_batch.retained_bytes(), first_batch_bytes);
+        assert_eq!(
+            inflight_bytes.load(Ordering::SeqCst),
+            first_batch_bytes
+        );
+
+        let second = frontend
+            .step()
+            .expect("second byte-budgeted step enters host order");
+        let full = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(1))
+            .expect("second batch reaches the nonblocking byte gate");
+        assert_eq!(full.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(2));
+        assert!(matches!(
+            full.blocker,
+            Some(HostBlocker::JournalFull { capacity: 4, .. })
+        ));
+        let retained = core
+            .pending_journal_batch()
+            .expect("aggregate byte pressure retains the exact second batch");
+        assert_eq!(retained.retained_bytes(), second_batch_bytes);
+        assert_eq!(Arc::strong_count(&retained), 2);
+        assert_eq!(
+            inflight_bytes.load(Ordering::SeqCst),
+            first_batch_bytes
+        );
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(xchan::TryRecvError::Empty)
+        ));
+        let second_status = frontend
+            .command_status(second.command_id())
+            .expect("second command status query under byte pressure")
+            .expect("second command remains queryable");
+        assert_eq!(second_status.journal(), &JournalState::Pending);
+
+        frontend
+            .step()
+            .expect("later science command enters host order while bytes are full");
+        let still_full = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(2))
+            .expect("retained second batch blocks all later science");
+        assert_eq!(still_full.scientific_steps, 0);
+        assert_eq!(core.world_tick(), Tick(2));
+        assert!(matches!(
+            still_full.blocker,
+            Some(HostBlocker::JournalFull { capacity: 4, .. })
+        ));
+        let same_retained = core
+            .pending_journal_batch()
+            .expect("later drive preserves the identical retained allocation");
+        assert!(Arc::ptr_eq(&retained, &same_retained));
+        drop(same_retained);
+        assert_eq!(Arc::strong_count(&retained), 2);
+
+        receipt_tx
+            .try_send(JournalReceipt::new(
+                first_worker_batch.id(),
+                JournalReceiptState::CommittedVolatile,
+            ))
+            .expect("first terminal receipt fits the bounded lane");
+        let released = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(3))
+            .expect("receipt polling releases the first exact byte permit");
+        assert_eq!(released.scientific_steps, 0);
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&first_worker_batch), 1);
+        assert!(matches!(
+            released.blocker,
+            Some(HostBlocker::JournalFull { capacity: 4, .. })
+        ));
+
+        let retried = core
+            .retry_retained_journal()
+            .expect("exact retained retry preserves host invariants")
+            .expect("second retained batch exists");
+        assert!(matches!(
+            retried,
+            JournalAdmission::Accepted { batch_id } if batch_id == retained.id()
+        ));
+        assert!(core.pending_journal_batch().is_none());
+        assert_eq!(
+            inflight_bytes.load(Ordering::SeqCst),
+            second_batch_bytes
+        );
+        let second_queued = worker_rx
+            .try_recv()
+            .expect("released bytes admit the exact retained second batch");
+        let second_worker_batch = admitted_journal_batch(second_queued)
+            .expect("retried byte-budgeted command is a journal admission");
+        assert!(Arc::ptr_eq(&retained, &second_worker_batch));
+        assert_eq!(second_worker_batch.retained_bytes(), second_batch_bytes);
+
+        drop(core);
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&retained), 2);
     }
 
     #[test]
