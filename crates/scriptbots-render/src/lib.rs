@@ -869,11 +869,10 @@ mod wgpu_capture_test {
     /// the content of the IMAGE. A PNG of a completely black frame is several
     /// hundred bytes and sails through that check, so the renderer could have
     /// drawn nothing at all and the test would still have gone green.
-    fn decode_capture(path: &std::path::Path) -> image::RgbaImage {
-        let decoded = image::open(path).unwrap_or_else(|err| {
-            panic!("captured frame at {} must decode: {err}", path.display())
-        });
-        decoded.to_rgba8()
+    fn decode_capture(path: &std::path::Path) -> Result<image::RgbaImage, String> {
+        image::open(path)
+            .map(|decoded| decoded.to_rgba8())
+            .map_err(|err| format!("captured frame at {} must decode: {err}", path.display()))
     }
 
     /// How many DISTINCT colours the frame contains.
@@ -1008,7 +1007,7 @@ mod wgpu_capture_test {
         );
 
         // The evidence, at last: decode the frame and look at it.
-        let frame = decode_capture(&expected_png);
+        let frame = decode_capture(&expected_png).expect("captured frame must decode");
         assert_eq!(
             frame.dimensions(),
             viewport,
@@ -1144,7 +1143,7 @@ mod wgpu_capture_test {
             comp.adapter_failure()
         );
 
-        let frame = decode_capture(&expected_png);
+        let frame = decode_capture(&expected_png).expect("captured frame must decode");
         assert!(
             distinct_colors(&frame) > 1,
             "nothing was drawn at all. Rasterized by: {}",
@@ -1187,7 +1186,8 @@ mod wgpu_capture_test {
             agents: &[] as &[AgentInstance],
         };
         comp.render_snapshot(&empty, viewport);
-        let without_agents = decode_capture(&second_png);
+        let without_agents =
+            decode_capture(&second_png).expect("captured comparison frame must decode");
         assert_eq!(
             without_agents.dimensions(),
             frame.dimensions(),
@@ -13675,7 +13675,7 @@ mod command_characterization_tests {
     #[test]
     #[cfg(panic = "unwind")]
     fn gui_health_probe_contains_panics_in_unwinding_profiles() {
-        let panicked: GuiHealthProbe = Arc::new(|| panic!("injected health panic"));
+        let panicked: GuiHealthProbe = Arc::new(|| std::panic::panic_any("injected health panic"));
         assert_eq!(
             gui_health_failure(&panicked).as_deref(),
             Some("health probe panicked: injected health panic")
