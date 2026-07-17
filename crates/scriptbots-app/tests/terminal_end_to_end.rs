@@ -4,6 +4,7 @@ use anyhow::Result;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use scriptbots_app::{
     ControlCommand, ControlRuntime, ControlServerConfig, McpTransportConfig, WorldStepDriver,
+    control::empty_latest_summary,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -268,8 +269,11 @@ fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
         ..ControlServerConfig::default()
     };
 
-    let (control_runtime, command_drain, command_submit) =
-        ControlRuntime::launch(Arc::clone(&shared_world), control_config)?;
+    let (control_runtime, command_drain, command_submit) = ControlRuntime::launch(
+        Arc::clone(&shared_world),
+        empty_latest_summary(),
+        control_config,
+    )?;
 
     let renderer = TerminalRenderer::default();
     {
@@ -514,8 +518,11 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
         ..ControlServerConfig::default()
     };
 
-    let (control_runtime, command_drain, command_submit) =
-        ControlRuntime::launch(Arc::clone(&shared_world), control_config)?;
+    let (control_runtime, command_drain, command_submit) = ControlRuntime::launch(
+        Arc::clone(&shared_world),
+        empty_latest_summary(),
+        control_config,
+    )?;
 
     let mut updated_config = config.clone();
     updated_config.food_growth_rate = 0.36;

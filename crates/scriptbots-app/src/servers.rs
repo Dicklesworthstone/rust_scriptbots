@@ -2131,7 +2131,9 @@ mod tests {
             "reservation must hold the MCP socket before world construction"
         );
 
-        let (runtime, _drain, _submit) = reservation.launch(shared_world()).expect("MCP startup");
+        let (runtime, _drain, _submit) = reservation
+            .launch(shared_world(), empty_latest_summary())
+            .expect("MCP startup");
         assert_eq!(runtime.status(), ControlRuntimeStatus::Running);
         let response = http_get(mcp_address, "/health");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -2164,7 +2166,7 @@ mod tests {
         assert!(TcpListener::bind(mcp_address).is_err());
 
         let (runtime, _drain, _submit) = reservation
-            .launch(shared_world())
+            .launch(shared_world(), empty_latest_summary())
             .expect("REST plus MCP startup");
         assert!(http_get(rest_address, "/api/knobs").starts_with("HTTP/1.1 200"));
         assert!(http_get(mcp_address, "/health").starts_with("HTTP/1.1 200"));
