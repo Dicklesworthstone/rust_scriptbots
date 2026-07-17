@@ -1866,7 +1866,7 @@ impl ScientificBoundary {
 
 const ARC_ALLOCATION_OVERHEAD_BYTES: usize = size_of::<usize>() * 2;
 
-fn retained_vec_bytes<T>(capacity: usize) -> usize {
+const fn retained_vec_bytes<T>(capacity: usize) -> usize {
     capacity.saturating_mul(size_of::<T>())
 }
 
@@ -4923,42 +4923,41 @@ mod tests {
         ))
     }
 
-    fn charged_journal_batch(
-        text_bytes: usize,
-        replay_outputs: usize,
-        genome_bytes: usize,
-        config_layers: usize,
-    ) -> Arc<JournalBatch> {
-        let dynamic_text = "x".repeat(text_bytes);
-        let birth = BirthRecord {
-            tick: Tick(1),
-            agent_uid: AgentUid(1),
-            spawn_ordinal: 1,
-            birth_ordinal: None,
-            origin: BirthOrigin::Seeded,
-            parent_a: None,
-            parent_b: None,
-            brain_kind: Some(dynamic_text.clone()),
-            brain_key: Some(7),
-            herbivore_tendency: 0.5,
-            generation: Generation(0),
-            position: Position::default(),
-            is_hybrid: false,
-        };
-        let death = DeathRecord {
-            tick: Tick(1),
-            agent_uid: AgentUid(2),
-            age: 1,
-            generation: Generation(0),
-            herbivore_tendency: 0.5,
-            brain_kind: Some(dynamic_text.clone()),
-            brain_key: Some(7),
-            energy: 0.0,
-            food_balance_total: 0.0,
-            cause: DeathCause::Unknown,
-            was_hybrid: false,
-            combat_flags: CombatEventFlags::default(),
-        };
+    fn charged_lifecycle_records(dynamic_text: &str) -> (BirthRecord, DeathRecord) {
+        (
+            BirthRecord {
+                tick: Tick(1),
+                agent_uid: AgentUid(1),
+                spawn_ordinal: 1,
+                birth_ordinal: None,
+                origin: BirthOrigin::Seeded,
+                parent_a: None,
+                parent_b: None,
+                brain_kind: Some(dynamic_text.to_owned()),
+                brain_key: Some(7),
+                herbivore_tendency: 0.5,
+                generation: Generation(0),
+                position: Position::default(),
+                is_hybrid: false,
+            },
+            DeathRecord {
+                tick: Tick(1),
+                agent_uid: AgentUid(2),
+                age: 1,
+                generation: Generation(0),
+                herbivore_tendency: 0.5,
+                brain_kind: Some(dynamic_text.to_owned()),
+                brain_key: Some(7),
+                energy: 0.0,
+                food_balance_total: 0.0,
+                cause: DeathCause::Unknown,
+                was_hybrid: false,
+                combat_flags: CombatEventFlags::default(),
+            },
+        )
+    }
+
+    fn charged_agent(dynamic_text: &str, genome_bytes: usize) -> AgentState {
         let genome = BrainGenomeEnvelope::new(
             BrainFamilyId::new("charge-fixture").expect("valid fixture family"),
             1,
@@ -4970,14 +4969,14 @@ mod tests {
         let mut runtime = AgentRuntime {
             brain: BrainBinding::Protocol {
                 registry_key: 7,
-                kind: dynamic_text.clone(),
+                kind: dynamic_text.to_owned(),
                 genome,
                 evaluator: None,
             },
             ..AgentRuntime::default()
         };
-        runtime.mutation_log.push(dynamic_text.clone());
-        let agent = AgentState {
+        runtime.mutation_log.push(dynamic_text.to_owned());
+        AgentState {
             id: AgentId::default(),
             identity: AgentIdentity {
                 uid: AgentUid(1),
@@ -4986,17 +4985,26 @@ mod tests {
             },
             data: AgentData::default(),
             runtime,
-        };
-        let persistence = Arc::new(PersistenceBatch {
+        }
+    }
+
+    fn charged_persistence(
+        dynamic_text: &str,
+        replay_outputs: usize,
+        genome_bytes: usize,
+        birth: &BirthRecord,
+        death: &DeathRecord,
+    ) -> Arc<PersistenceBatch> {
+        Arc::new(PersistenceBatch {
             summary: projection_summary(1),
             epoch: 0,
             closed: false,
-            metrics: vec![MetricSample::new(dynamic_text.clone(), 1.0)],
+            metrics: vec![MetricSample::new(dynamic_text.to_owned(), 1.0)],
             events: vec![PersistenceEvent::new(
-                PersistenceEventKind::Custom(dynamic_text.clone().into()),
+                PersistenceEventKind::Custom(dynamic_text.to_owned().into()),
                 1,
             )],
-            agents: vec![agent],
+            agents: vec![charged_agent(dynamic_text, genome_bytes)],
             births: vec![birth.clone()],
             deaths: vec![death.clone()],
             replay_events: vec![ReplayEvent {
@@ -5005,8 +5013,15 @@ mod tests {
                     outputs: vec![0.0; replay_outputs],
                 },
             }],
-        });
-        let scientific = Arc::new(
+        })
+    }
+
+    fn charged_scientific(
+        dynamic_text: &str,
+        birth: BirthRecord,
+        death: DeathRecord,
+    ) -> Arc<ScientificBoundary> {
+        Arc::new(
             ScientificBoundary::new(
                 TickEvents {
                     tick: Tick(1),
@@ -5022,19 +5037,41 @@ mod tests {
                 None,
             )
             .with_fault(ScientificBoundaryFault::new(
-                dynamic_text.clone(),
+                dynamic_text,
                 dynamic_text,
             )),
-        );
+        )
+    }
+
+    fn charged_config_command(config_layers: usize) -> CommandEnvelope {
         let mut config = ScriptBotsConfig::default();
         config.neuroflow.hidden_layers = vec![8; config_layers];
+        CommandEnvelope::new(
+            CommandId::new(1),
+            HostCommand::UpdateConfig(Box::new(config)),
+        )
+    }
+
+    fn charged_journal_batch(
+        text_bytes: usize,
+        replay_outputs: usize,
+        genome_bytes: usize,
+        config_layers: usize,
+    ) -> Arc<JournalBatch> {
+        let dynamic_text = "x".repeat(text_bytes);
+        let (birth, death) = charged_lifecycle_records(&dynamic_text);
+        let persistence = charged_persistence(
+            &dynamic_text,
+            replay_outputs,
+            genome_bytes,
+            &birth,
+            &death,
+        );
+        let scientific = charged_scientific(&dynamic_text, birth, death);
         Arc::new(JournalBatch::new(
             JournalBatchId::new(HostSessionId::new(70), 1),
             Some(EventSequence::new(1)),
-            Some(CommandEnvelope::new(
-                CommandId::new(1),
-                HostCommand::UpdateConfig(Box::new(config)),
-            )),
+            Some(charged_config_command(config_layers)),
             AppliedCommand {
                 tick: Tick(1),
                 revisions: HostRevisions::default(),
@@ -5072,14 +5109,21 @@ mod tests {
 
     impl JournalPort for RejectOnceChargeJournal {
         fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
-            let observed = (Arc::as_ptr(batch), batch.retained_bytes());
-            if let Some(first) = self.first {
-                assert_eq!(observed, first, "retry must reuse the exact charged allocation");
+            if let Some((first_ptr, first_charge)) = self.first {
+                assert!(
+                    std::ptr::eq(Arc::as_ptr(batch), first_ptr),
+                    "retry must reuse the exact batch allocation"
+                );
+                assert_eq!(
+                    batch.retained_bytes(),
+                    first_charge,
+                    "retry must reuse the precomputed charge"
+                );
                 JournalAdmission::Accepted {
                     batch_id: batch.id(),
                 }
             } else {
-                self.first = Some(observed);
+                self.first = Some((Arc::as_ptr(batch), batch.retained_bytes()));
                 JournalAdmission::Full {
                     batch_id: batch.id(),
                     capacity: 1,
