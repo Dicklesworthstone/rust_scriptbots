@@ -28,8 +28,8 @@ pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.3";
 /// requires a codec bump. A change to future-state coverage or field meaning requires a new
 /// checkpoint schema. Never rebless the representative V1 wire golden without reviewing both
 /// version identities.
-pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 4;
-const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v4";
+pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 5;
+const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v5";
 
 /// Maximum complete checkpoint wire accepted by the decoder.
 ///
@@ -2793,10 +2793,14 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_539,
-                "73376b3b7bcd7704f0e5b57312b3070f7becf63166a25b1e9e58a6f275da85ea",
+                8_546,
+                "45e76a6f71e1139f188d9906538d17fceedc96fa4190a69408cdcda59965cefb",
             ),
-            "the reviewed V1.3/codec-4 wire must remain byte-identical after bd-2i1 bound the locomotion model"
+            "the reviewed V1.3/codec-5 wire must remain byte-identical: re-pinned in \
+             bd-2i1 after the locomotion model was bound, then re-pinned in \
+             bd-2z0.14.3.1 after RenderSettings v2 added presentation-only fields \
+             (quality tier, post stack, day/night, theme, palette) to the serialized \
+             config tree (+7 bytes of Option discriminants); no science field changed"
         );
     }
 

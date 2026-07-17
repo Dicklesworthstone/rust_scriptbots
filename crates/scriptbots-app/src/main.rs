@@ -22,9 +22,10 @@ use scriptbots_brain::{
 #[cfg(feature = "brain-ft")]
 use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 use scriptbots_core::{
-    AgentData, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
-    PersistenceSessionError, RenderTonemapMode, ReplayEventKind, ScriptBotsConfig, TickSummary,
-    WorldDigestV1, WorldPersistence, WorldState,
+    AgentData, LEGACY_RENDER_ENV_NAMES, NeuroflowActivationKind, NullPersistence,
+    PersistenceAdmissionSession, PersistenceSessionError, RenderQuality, RenderTonemapMode,
+    ReplayEventKind, ScriptBotsConfig, TickSummary, WorldDigestV1, WorldPersistence, WorldState,
+    map_legacy_render_env, parse_render_quality,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
@@ -1538,6 +1539,34 @@ fn gather_env_statements(
     Ok(statements)
 }
 
+/// Insert `value` at a dotted path inside a JSON object, creating and
+/// merging intermediate objects. Leaf values overwrite; object values merge
+/// recursively so `render.post.bloom.enabled` and `render.tonemap_mode` can
+/// arrive from different sources without clobbering each other.
+fn insert_dotted_path(root: &mut serde_json::Map<String, JsonValue>, path: &str, value: JsonValue) {
+    let mut segments = path.split('.');
+    let Some(first) = segments.next() else {
+        return;
+    };
+    // Our render paths always start below the `render` root handled by the caller.
+    let mut current = root;
+    let mut last = first;
+    for segment in segments {
+        let entry = current
+            .entry(last.to_owned())
+            .or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
+        if !entry.is_object() {
+            *entry = JsonValue::Object(serde_json::Map::new());
+        }
+        let Some(next) = entry.as_object_mut() else {
+            return;
+        };
+        current = next;
+        last = segment;
+    }
+    current.insert(last.to_owned(), value);
+}
+
 /// The typed `SCRIPTBOTS_*` environment variables, decoded into the partial
 /// configuration they state.
 ///
@@ -1593,6 +1622,43 @@ fn typed_env_fields(auto_exposure_already_spoken: bool) -> Result<JsonValue> {
     }
 
     let mut render = serde_json::Map::new();
+    // Legacy `SB_WGPU_*` / `SCRIPTBOTS_TERMINAL_PALETTE` variables map onto the
+    // typed RenderSettings v2 schema FIRST, so the canonical typed
+    // `SCRIPTBOTS_RENDER_*` variables inserted below always outrank them.
+    // Each applied mapping is logged once so operators learn the new knob names.
+    for env_name in LEGACY_RENDER_ENV_NAMES {
+        let Ok(value) = env::var(env_name) else {
+            continue;
+        };
+        match map_legacy_render_env(env_name, &value) {
+            Some(mapping) => {
+                let paths: Vec<&str> = mapping
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.path)
+                    .collect();
+                for assignment in mapping.assignments {
+                    // Mapping paths are config-rooted (`render.post...`); the
+                    // env layer builds the `render` object itself, so insert
+                    // below it.
+                    let sub_path = assignment
+                        .path
+                        .strip_prefix("render.")
+                        .unwrap_or(assignment.path);
+                    insert_dotted_path(&mut render, sub_path, assignment.value);
+                }
+                info!(
+                    env_name = mapping.env_name,
+                    paths = ?paths,
+                    note = mapping.note,
+                    "Mapped legacy render environment variable onto typed render schema"
+                );
+            }
+            None => {
+                warn!(value = %value, "Invalid {env_name} value; ignoring legacy render override");
+            }
+        }
+    }
     if let Ok(value) = env::var("SCRIPTBOTS_RENDER_TONEMAP") {
         match parse_tonemap(&value) {
             Some(mode) => {
@@ -1809,6 +1875,13 @@ fn typed_cli_fields(cli: &AppCli) -> JsonValue {
     if !control.is_empty() {
         root.insert("control".to_owned(), JsonValue::Object(control));
     }
+    if let Some(quality) = cli.quality {
+        let mut render = serde_json::Map::new();
+        if let Ok(value) = serde_json::to_value(quality) {
+            render.insert("quality".to_owned(), value);
+        }
+        root.insert("render".to_owned(), JsonValue::Object(render));
+    }
     JsonValue::Object(root)
 }
 
@@ -1923,6 +1996,11 @@ struct AppCli {
     /// `--set neuroflow.enabled=true`). String values use TOML quoting.
     #[arg(long = "set", value_name = "PATH=VALUE", action = ArgAction::Append)]
     set_overrides: Vec<String>,
+    /// Visual quality tier shortcut (auto|potato|low|medium|high|ultra); equivalent to
+    /// `--set render.quality=TIER` but validated at parse time and recorded as its own
+    /// CLI configuration layer. (`SCRIPTBOTS_RENDER_QUALITY` is the env equivalent.)
+    #[arg(long = "quality", value_name = "TIER", value_parser = parse_quality_clap)]
+    quality: Option<RenderQuality>,
     /// Print the composed configuration in the selected format.
     #[arg(long = "print-config", action = ArgAction::SetTrue)]
     print_config: bool,
@@ -3611,6 +3689,14 @@ fn parse_tonemap(raw: &str) -> Option<RenderTonemapMode> {
     }
 }
 
+/// Clap value parser for `--quality`: fail closed at parse time with the
+/// valid tier vocabulary instead of accepting a typo into the run.
+fn parse_quality_clap(raw: &str) -> Result<RenderQuality, String> {
+    parse_render_quality(raw).ok_or_else(|| {
+        format!("invalid quality tier `{raw}`; expected auto|potato|low|medium|high|ultra")
+    })
+}
+
 #[cfg(any(feature = "gui", feature = "bevy_render"))]
 fn parse_png_size(raw: &str) -> Option<(u32, u32)> {
     let lower = raw.trim().to_ascii_lowercase();
@@ -5122,7 +5208,7 @@ activation = "Sigmoid"
     /// scenario. Tests that need deterministic provenance clear all of them: an ambient brain
     /// preset changes the population recipe, while an ambient configuration value adds a
     /// digest-recorded layer statement.
-    const CONFIG_ENV_VARS: [&str; 14] = [
+    const CONFIG_ENV_VARS: [&str; 25] = [
         "SCRIPTBOTS_BRAIN",
         "SCRIPTBOTS_CONFIG_OVERRIDES",
         "SCRIPTBOTS_NEUROFLOW_ENABLED",
@@ -5137,6 +5223,17 @@ activation = "Sigmoid"
         "SCRIPTBOTS_AUTO_PAUSE_BELOW",
         "SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE",
         "SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE",
+        "SB_WGPU_TONEMAP",
+        "SB_WGPU_EXPOSURE",
+        "SB_WGPU_BLOOM",
+        "SB_WGPU_BLOOM_THRESH",
+        "SB_WGPU_BLOOM_INTENSITY",
+        "SB_WGPU_VIGNETTE",
+        "SB_WGPU_FOG",
+        "SB_WGPU_FOG_COLOR",
+        "SB_WGPU_FXAA",
+        "SCRIPTBOTS_TERMINAL_PALETTE",
+        "SCRIPTBOTS_RENDER_QUALITY",
     ];
 
     fn with_clean_config_env<F: FnOnce()>(f: F) {
@@ -5153,6 +5250,134 @@ activation = "Sigmoid"
                 restore_env(var, previous);
             }
         });
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_render_env_maps_onto_typed_schema() {
+        with_clean_config_env(|| {
+            unsafe {
+                std::env::set_var("SB_WGPU_BLOOM", "off");
+                std::env::set_var("SB_WGPU_FOG", "med");
+                std::env::set_var("SB_WGPU_VIGNETTE", "0.5");
+                std::env::set_var("SB_WGPU_FXAA", "on");
+                std::env::set_var("SCRIPTBOTS_TERMINAL_PALETTE", "deuteranopia");
+            }
+            let config = compose_config(&default_cli()).expect("compose with legacy render env");
+            let post = config.render.post.expect("post settings materialized");
+            assert_eq!(
+                post.bloom.map(|bloom| bloom.enabled),
+                Some(false),
+                "SB_WGPU_BLOOM=off must map onto render.post.bloom.enabled=false"
+            );
+            assert_eq!(
+                post.fog.and_then(|fog| fog.mode),
+                Some(scriptbots_core::RenderFogMode::Medium),
+            );
+            let vignette = post.vignette.expect("vignette materialized");
+            assert!(vignette.enabled);
+            assert_eq!(vignette.intensity, Some(0.5));
+            assert_eq!(
+                post.anti_aliasing,
+                Some(scriptbots_core::RenderAntiAliasing::Fxaa),
+            );
+            assert_eq!(
+                config.render.palette,
+                Some(scriptbots_core::AccessibilityPalette::Deuteranopia),
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn typed_render_env_outranks_legacy() {
+        with_clean_config_env(|| {
+            unsafe {
+                std::env::set_var("SB_WGPU_TONEMAP", "agx");
+                std::env::set_var("SCRIPTBOTS_RENDER_TONEMAP", "aces");
+                std::env::set_var("SB_WGPU_BLOOM_THRESH", "1.5");
+            }
+            let config = compose_config(&default_cli()).expect("compose with competing env");
+            assert_eq!(
+                config.render.tonemap_mode,
+                Some(RenderTonemapMode::Aces),
+                "typed SCRIPTBOTS_RENDER_TONEMAP must outrank legacy SB_WGPU_TONEMAP"
+            );
+            let bloom = config
+                .render
+                .post
+                .and_then(|post| post.bloom)
+                .expect("legacy bloom threshold lands");
+            assert_eq!(bloom.threshold, Some(1.5));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn invalid_legacy_render_env_warns_and_skips() {
+        with_clean_config_env(|| {
+            unsafe {
+                std::env::set_var("SB_WGPU_FOG", "soup");
+                std::env::set_var("SB_WGPU_BLOOM", "sometimes");
+            }
+            let config = compose_config(&default_cli()).expect("compose tolerates bad legacy env");
+            assert!(
+                config.render.post.is_none(),
+                "invalid legacy values must be skipped, not merged: {:?}",
+                config.render.post
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn quality_flag_and_env_precedence() {
+        with_clean_config_env(|| {
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_RENDER_QUALITY", "low");
+            }
+            let env_only = compose_config(&default_cli()).expect("env quality composes");
+            assert_eq!(
+                env_only.render.quality,
+                Some(scriptbots_core::RenderQuality::Low),
+            );
+
+            let cli = AppCli::parse_from(["scriptbots-app", "--quality", "ultra"]);
+            let cli_config = compose_config(&cli).expect("cli quality composes");
+            assert_eq!(
+                cli_config.render.quality,
+                Some(scriptbots_core::RenderQuality::Ultra),
+                "--quality (CLI layer) must outrank SCRIPTBOTS_RENDER_QUALITY (env layer)"
+            );
+        });
+    }
+
+    #[test]
+    fn quality_flag_rejects_unknown_tier() {
+        let parsed = AppCli::try_parse_from(["scriptbots-app", "--quality", "ludicrous"]);
+        assert!(
+            parsed.is_err(),
+            "--quality must fail closed on unknown tiers"
+        );
+    }
+
+    #[test]
+    fn insert_dotted_path_merges_nested_objects() {
+        let mut map = serde_json::Map::new();
+        insert_dotted_path(&mut map, "post.bloom.enabled", JsonValue::Bool(false));
+        insert_dotted_path(&mut map, "post.bloom.threshold", serde_json::json!(1.5));
+        insert_dotted_path(&mut map, "tonemap_mode", serde_json::json!("aces"));
+        let post = map["post"].as_object().expect("post object");
+        let bloom = post["bloom"].as_object().expect("bloom object");
+        assert_eq!(bloom["enabled"], JsonValue::Bool(false));
+        assert_eq!(bloom["threshold"], serde_json::json!(1.5));
+        assert_eq!(map["tonemap_mode"], serde_json::json!("aces"));
+
+        // A later insert into the same nested object merges instead of replacing.
+        insert_dotted_path(&mut map, "post.fog.mode", serde_json::json!("high"));
+        let post = map["post"].as_object().expect("post object persists");
+        assert!(post.contains_key("bloom"), "sibling object must survive");
+        assert_eq!(post["fog"]["mode"], serde_json::json!("high"));
     }
 
     #[test]

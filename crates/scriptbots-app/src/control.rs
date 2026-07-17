@@ -1033,6 +1033,87 @@ mod tests {
     }
 
     #[test]
+    fn patch_render_quality_and_post_stack_round_trip() {
+        let (handle, receiver) = handle();
+        let snapshot = handle
+            .apply_patch(serde_json::json!({
+                "render": {
+                    "quality": "high",
+                    "theme": "nordic_frost",
+                    "palette": "tritanopia",
+                    "post": {
+                        "bloom": { "enabled": false, "threshold": 1.2 },
+                        "fog": { "mode": "low" }
+                    },
+                    "day_night": { "cycle_ticks": 24000, "stars": true }
+                }
+            }))
+            .expect("render patch applies");
+
+        let render = &snapshot.config["render"];
+        assert_eq!(render["quality"], serde_json::json!("high"));
+        assert_eq!(render["theme"], serde_json::json!("nordic_frost"));
+        assert_eq!(render["palette"], serde_json::json!("tritanopia"));
+        assert_eq!(render["post"]["bloom"]["enabled"], serde_json::json!(false));
+        assert!(
+            (render["post"]["bloom"]["threshold"]
+                .as_f64()
+                .expect("threshold")
+                - 1.2)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(render["post"]["fog"]["mode"], serde_json::json!("low"));
+        assert_eq!(render["day_night"]["cycle_ticks"], serde_json::json!(24000));
+
+        // The applied world config carries the same values after the command drains.
+        let mut world = handle.lock_world().expect("world lock");
+        drain_and_apply(&receiver, &mut world);
+        assert_eq!(
+            world.config().render.quality,
+            Some(scriptbots_core::RenderQuality::High)
+        );
+        assert_eq!(
+            world
+                .config()
+                .render
+                .post
+                .as_ref()
+                .and_then(|post| post.bloom.as_ref())
+                .map(|bloom| bloom.enabled),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn patch_render_rejects_invalid_enum_and_range() {
+        let (handle, _receiver) = handle();
+        let bad_enum = handle.apply_patch(serde_json::json!({
+            "render": { "quality": "ludicrous" }
+        }));
+        assert!(
+            matches!(bad_enum, Err(ControlError::InvalidPatch(_))),
+            "unknown quality tier must fail closed: {bad_enum:?}"
+        );
+
+        let out_of_range = handle.apply_patch(serde_json::json!({
+            "render": { "post": { "bloom": { "enabled": true, "intensity": 2.0 } } }
+        }));
+        assert!(
+            matches!(out_of_range, Err(ControlError::InvalidPatch(_))),
+            "bloom intensity 2.0 must be rejected by the knob range table: {out_of_range:?}"
+        );
+
+        let bad_nested = handle.apply_patch(serde_json::json!({
+            "render": { "day_night": { "start_phase": 1.5 } }
+        }));
+        assert!(
+            matches!(bad_nested, Err(ControlError::InvalidPatch(_))),
+            "start_phase 1.5 must be rejected: {bad_nested:?}"
+        );
+    }
+
+    #[test]
     #[should_panic(
         expected = "KNOWN DEFECT bd-2z0.4.1: config response projects unapplied future state"
     )]

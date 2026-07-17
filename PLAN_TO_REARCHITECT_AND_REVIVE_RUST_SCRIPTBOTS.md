@@ -2106,6 +2106,12 @@ claim that world integration early.
   differential experiments from sharing a digest or checkpoint contract. Completion evidence is
   `377e469`, `9ce716d`, `39fc2f0`, and DSR
   `0.1.0-bd2i1-perf-compare-quiet1.20260716T160817Z`;
+- [Completed — `bd-2z0.14.3.1`] Advance the checkpoint envelope to
+  `scriptbots.world-checkpoint.v1.3`/codec-5 with `postcard+blake3-v5` after RenderSettings v2
+  added presentation-only fields (quality tier, post stack, day/night, theme, palette) to the
+  serialized config tree. The digest and trace identities remain V1.6: no lane, counter, or
+  science semantic changed; the six-point and checkpoint goldens were re-pinned after review
+  showed only the config-lane encoding advancing transitively, matching the bd-2i1 pattern;
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical base V3 plus the then-current
   V3.1 bootstrap minor with the fixed six-domain continuation object; `bd-h547` advanced that
   bootstrap minor to V3.2 for adapter-attested V1.4 evidence. `bd-1kxd` now advances the canonical

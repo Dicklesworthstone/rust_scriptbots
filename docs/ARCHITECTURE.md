@@ -241,8 +241,8 @@ reconstruction envelope for the core science state whose equality those digests 
   never collide with one computed while seeing. V1.6 considers protocol construction semantics
   covered only when the family identity is present; legacy factories still use their explicit
   captured-state digest.
-- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1.3`/codec-4
-  `postcard+blake3-v4` envelope with an unkeyed BLAKE3 corruption checksum, only at an open,
+- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1.3`/codec-5
+  `postcard+blake3-v5` envelope with an unkeyed BLAKE3 corruption checksum, only at an open,
   persistence-disabled completed boundary with no deferred host output. It carries the complete
   configuration including the locomotion model, stable-UID agents, genome/evaluator state, exact
   declarative registry roster and allocation cursor, protocol adapter identities,

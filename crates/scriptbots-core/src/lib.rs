@@ -3628,10 +3628,10 @@ pub const KNOB_RANGES: &[KnobRange] = &[
     // Population.
     KnobRange::live("population_minimum", 0.0, 100_000.0),
     KnobRange::live("population_spawn_interval", 0.0, 1_000_000.0),
-    /// Render (presentation-only knobs; the typed RenderSettings::validate owns
-    /// the authoritative bounds, these give REST callers early batched feedback).
-    /// `render.tonemap_exposure_bias` deliberately has no entry: the documented
-    /// contract accepts every finite value, and the generic finite check covers it.
+    // Render (presentation-only knobs; the typed RenderSettings::validate owns
+    // the authoritative bounds, these give REST callers early batched feedback).
+    // `render.tonemap_exposure_bias` deliberately has no entry: the documented
+    // contract accepts every finite value, and the generic finite check covers it.
     KnobRange::live("render.auto_exposure.speed_brighten", 0.0, 100.0),
     KnobRange::live("render.auto_exposure.speed_darken", 0.0, 100.0),
     KnobRange::live("render.post.bloom.threshold", 0.0, 16.0),
@@ -8578,28 +8578,28 @@ impl RenderSettings {
                 (ae.speed_brighten, "render.auto_exposure.speed_brighten"),
                 (ae.speed_darken, "render.auto_exposure.speed_darken"),
             ] {
-                if let Some(value) = speed {
-                    if !value.is_finite() || value < 0.0 {
-                        return Err(WorldStateError::InvalidConfig(name));
-                    }
+                if let Some(value) = speed
+                    && (!value.is_finite() || value < 0.0)
+                {
+                    return Err(WorldStateError::InvalidConfig(name));
                 }
             }
         }
         if let Some(post) = &self.post {
             if let Some(bloom) = &post.bloom {
-                if let Some(threshold) = bloom.threshold {
-                    if !threshold.is_finite() || !(0.0..=16.0).contains(&threshold) {
-                        return Err(WorldStateError::InvalidConfig(
-                            "render.post.bloom.threshold must be finite and within [0, 16]",
-                        ));
-                    }
+                if let Some(threshold) = bloom.threshold
+                    && (!threshold.is_finite() || !(0.0..=16.0).contains(&threshold))
+                {
+                    return Err(WorldStateError::InvalidConfig(
+                        "render.post.bloom.threshold must be finite and within [0, 16]",
+                    ));
                 }
-                if let Some(intensity) = bloom.intensity {
-                    if !intensity.is_finite() || !(0.0..=1.0).contains(&intensity) {
-                        return Err(WorldStateError::InvalidConfig(
-                            "render.post.bloom.intensity must be finite and within [0, 1]",
-                        ));
-                    }
+                if let Some(intensity) = bloom.intensity
+                    && (!intensity.is_finite() || !(0.0..=1.0).contains(&intensity))
+                {
+                    return Err(WorldStateError::InvalidConfig(
+                        "render.post.bloom.intensity must be finite and within [0, 1]",
+                    ));
                 }
             }
             if let Some(vignette) = &post.vignette {
@@ -8607,37 +8607,38 @@ impl RenderSettings {
                     (vignette.intensity, "render.post.vignette.intensity"),
                     (vignette.smoothness, "render.post.vignette.smoothness"),
                 ] {
-                    if let Some(v) = value {
-                        if !v.is_finite() || !(0.0..=1.0).contains(&v) {
-                            return Err(WorldStateError::InvalidConfig(name));
-                        }
+                    if let Some(v) = value
+                        && (!v.is_finite() || !(0.0..=1.0).contains(&v))
+                    {
+                        return Err(WorldStateError::InvalidConfig(name));
                     }
                 }
             }
-            if let Some(fog) = &post.fog {
-                if let Some(color) = fog.color {
-                    if color.iter().any(|c| !c.is_finite() || !(0.0..=1.0).contains(c)) {
-                        return Err(WorldStateError::InvalidConfig(
-                            "render.post.fog.color components must be finite and within [0, 1]",
-                        ));
-                    }
-                }
+            if let Some(fog) = &post.fog
+                && let Some(color) = fog.color
+                && color
+                    .iter()
+                    .any(|c| !c.is_finite() || !(0.0..=1.0).contains(c))
+            {
+                return Err(WorldStateError::InvalidConfig(
+                    "render.post.fog.color components must be finite and within [0, 1]",
+                ));
             }
         }
         if let Some(day_night) = &self.day_night {
-            if let Some(phase) = day_night.start_phase {
-                if !phase.is_finite() || !(0.0..1.0).contains(&phase) {
-                    return Err(WorldStateError::InvalidConfig(
-                        "render.day_night.start_phase must be finite and within [0, 1)",
-                    ));
-                }
+            if let Some(phase) = day_night.start_phase
+                && (!phase.is_finite() || !(0.0..1.0).contains(&phase))
+            {
+                return Err(WorldStateError::InvalidConfig(
+                    "render.day_night.start_phase must be finite and within [0, 1)",
+                ));
             }
-            if let Some(ambient) = day_night.night_ambient {
-                if !ambient.is_finite() || !(0.0..=1.0).contains(&ambient) {
-                    return Err(WorldStateError::InvalidConfig(
-                        "render.day_night.night_ambient must be finite and within [0, 1]",
-                    ));
-                }
+            if let Some(ambient) = day_night.night_ambient
+                && (!ambient.is_finite() || !(0.0..=1.0).contains(&ambient))
+            {
+                return Err(WorldStateError::InvalidConfig(
+                    "render.day_night.night_ambient must be finite and within [0, 1]",
+                ));
             }
         }
         Ok(())
@@ -8712,10 +8713,8 @@ pub const LEGACY_RENDER_ENV_NAMES: [&str; 11] = [
 pub fn map_legacy_render_env(name: &str, value: &str) -> Option<LegacyRenderEnvMapping> {
     let trimmed = value.trim();
     let lowered = trimmed.to_ascii_lowercase();
-    let one = |path: &'static str, value: serde_json::Value| LegacyRenderEnvAssignment {
-        path,
-        value,
-    };
+    let one =
+        |path: &'static str, value: serde_json::Value| LegacyRenderEnvAssignment { path, value };
     let mapping = |env_name: &'static str,
                    assignments: Vec<LegacyRenderEnvAssignment>,
                    note: &'static str| {
@@ -8735,10 +8734,7 @@ pub fn map_legacy_render_env(name: &str, value: &str) -> Option<LegacyRenderEnvM
             };
             mapping(
                 "SB_WGPU_TONEMAP",
-                vec![one(
-                    "render.tonemap_mode",
-                    serde_json::to_value(mode).ok()?,
-                )],
+                vec![one("render.tonemap_mode", serde_json::to_value(mode).ok()?)],
                 "legacy wgpu tonemap knob; prefer SCRIPTBOTS_RENDER_* or --set render.tonemap_mode",
             )
         }
@@ -8909,7 +8905,11 @@ pub fn parse_render_quality(raw: &str) -> Option<RenderQuality> {
 fn parse_legacy_rgb(raw: &str) -> Option<[f32; 3]> {
     let hex = raw.strip_prefix('#').unwrap_or(raw);
     if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let channel = |pair: &str| u8::from_str_radix(pair, 16).ok().map(|v| f32::from(v) / 255.0);
+        let channel = |pair: &str| {
+            u8::from_str_radix(pair, 16)
+                .ok()
+                .map(|v| f32::from(v) / 255.0)
+        };
         return Some([
             channel(&hex[0..2])?,
             channel(&hex[2..4])?,
@@ -37535,7 +37535,11 @@ mod tests {
         );
 
         let color = map_legacy_render_env("SB_WGPU_FOG_COLOR", "#ff8000").expect("hex color");
-        let rgb = color.assignments[0].value.as_array().expect("rgb array").clone();
+        let rgb = color.assignments[0]
+            .value
+            .as_array()
+            .expect("rgb array")
+            .clone();
         assert_eq!(rgb.len(), 3);
         assert!((rgb[0].as_f64().expect("r") - 1.0).abs() < 1e-6);
         assert!((rgb[1].as_f64().expect("g") - 128.0 / 255.0).abs() < 1e-6);
