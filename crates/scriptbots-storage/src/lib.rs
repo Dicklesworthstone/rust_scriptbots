@@ -24,8 +24,8 @@ use scriptbots_core::{
 };
 use journal::{
     HOST_JOURNAL_ARCHIVE_VERSION, HostJournalArchive, JournalReaderBackend,
-    JournalReaderPublisher, PreparedHostJournalArchive, decode_journal_u64, encode_journal_u64,
-    prepare_host_journal_archive,
+    JournalReaderPublisher, JournalSessionShared, PreparedHostJournalArchive,
+    decode_journal_u64, encode_journal_u64, prepare_host_journal_archive,
 };
 use scriptbots_runtime::{
     EventCommitment, EventSequence, EventSequenceRange, HostCommand, HostSessionId, JournalBatch,
@@ -7847,30 +7847,6 @@ impl Storage {
             });
         }
 
-        let session_count = self.connection()?.query_row_with_params(
-            "SELECT COUNT(*) FROM host_journal_progress WHERE run_id = ?1",
-            &[sqlite_run_id(self.run_id)],
-        )?;
-        let session_count: i64 = decode(
-            &session_count,
-            0,
-            "host_journal_progress.session_count",
-        )?;
-        if session_count >= i64::try_from(DEFAULT_COMMAND_CAPACITY).map_err(|error| {
-            StorageError::InvalidData {
-                context: "host_journal_progress.session_count",
-                reason: error.to_string(),
-            }
-        })? {
-            return Err(StorageError::InvalidData {
-                context: "host_journal_progress.session_count",
-                reason: format!(
-                    "run {} already retains the bounded maximum of {DEFAULT_COMMAND_CAPACITY} host journal sessions",
-                    self.run_id
-                ),
-            });
-        }
-
         let zero = encode_journal_u64(0);
         let session = encode_journal_u64(session_id.get());
         execute_transaction_with_retry(self.connection()?, |transaction| {
@@ -9599,6 +9575,7 @@ enum StorageCommand {
         options: StorageJournalOptions,
         receipts: xchan::Sender<JournalReceipt>,
         publisher: JournalReaderPublisher,
+        shared: Arc<JournalSessionShared>,
         reply: xchan::Sender<Result<(), StorageError>>,
     },
     JournalAdmit {
@@ -9712,7 +9689,15 @@ struct WorkerState {
 struct WorkerJournalSession {
     receipts: Option<xchan::Sender<JournalReceipt>>,
     publisher: JournalReaderPublisher,
+    shared: Arc<JournalSessionShared>,
     maximum_archive_bytes: usize,
+    completed_sequence: u64,
+}
+
+impl Drop for WorkerJournalSession {
+    fn drop(&mut self) {
+        self.shared.mark_worker_closed();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -10789,6 +10774,7 @@ impl StoragePipeline {
             )
         };
         let publisher = JournalReaderPublisher::new(session_id, backend, options);
+        let shared = Arc::new(JournalSessionShared::new(options.admission_capacity));
         let (receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
         let (reply_tx, reply_rx) = xchan::bounded(1);
         let enqueue_deadline = Instant::now() + self.sink.deadlines.command_enqueue;
@@ -10813,6 +10799,7 @@ impl StoragePipeline {
             options,
             receipts: receipt_tx,
             publisher: publisher.clone(),
+            shared: Arc::clone(&shared),
             reply: reply_tx,
         };
         let send_result = self.sink.tx.send_deadline(command, enqueue_deadline);
@@ -10820,6 +10807,7 @@ impl StoragePipeline {
         match send_result {
             Ok(()) => {}
             Err(xchan::SendTimeoutError::Timeout(_)) => {
+                shared.cancel_after(0);
                 return Err(StorageError::Worker(StorageWorkerError::Timeout {
                     operation: StorageOperation::Admit,
                     phase: StorageWaitPhase::CommandEnqueue,
@@ -10830,6 +10818,7 @@ impl StoragePipeline {
                 }));
             }
             Err(xchan::SendTimeoutError::Disconnected(_)) => {
+                shared.cancel_after(0);
                 return Err(StorageError::Worker(StorageWorkerError::Channel {
                     operation: StorageOperation::Admit,
                     path: self.sink.path.to_string(),
@@ -10845,13 +10834,18 @@ impl StoragePipeline {
                 session_id,
                 self.sink.tx.clone(),
                 Arc::clone(&self.sink.admission),
+                Arc::clone(&shared),
                 receipt_rx,
                 &publisher,
                 options,
                 shutdown_requirement,
             )),
-            Ok(Err(error)) => Err(error),
+            Ok(Err(error)) => {
+                shared.cancel_after(0);
+                Err(error)
+            }
             Err(xchan::RecvTimeoutError::Timeout) => {
+                shared.cancel_after(0);
                 Err(StorageError::Worker(StorageWorkerError::Timeout {
                     operation: StorageOperation::Admit,
                     phase: StorageWaitPhase::Acknowledgement,
@@ -10862,6 +10856,7 @@ impl StoragePipeline {
                 }))
             }
             Err(xchan::RecvTimeoutError::Disconnected) => {
+                shared.cancel_after(0);
                 Err(StorageError::Worker(StorageWorkerError::Channel {
                     operation: StorageOperation::Admit,
                     path: self.sink.path.to_string(),
@@ -11239,6 +11234,15 @@ impl Drop for StoragePipeline {
     }
 }
 
+fn reap_cancelled_journal_sessions(state: &mut WorkerState) {
+    state.journal_sessions.retain(|_session_id, session| {
+        !session
+            .shared
+            .cancellation_boundary()
+            .is_some_and(|final_accepted| session.completed_sequence >= final_accepted)
+    });
+}
+
 fn storage_worker(
     target: StorageTarget,
     run_open: RunOpen,
@@ -11333,6 +11337,7 @@ fn storage_worker(
     }
 
     while let Ok(command) = rx.recv() {
+        reap_cancelled_journal_sessions(&mut state);
         match command {
             StorageCommand::Persist {
                 batch,
@@ -11406,6 +11411,7 @@ fn storage_worker(
                 options,
                 receipts,
                 publisher,
+                shared,
                 reply,
             } => {
                 let mut installed = false;
@@ -11434,7 +11440,9 @@ fn storage_worker(
                                 WorkerJournalSession {
                                     receipts: Some(receipts),
                                     publisher,
+                                    shared,
                                     maximum_archive_bytes: options.max_event_page_bytes,
+                                    completed_sequence: 0,
                                 },
                             );
                             installed = true;
@@ -11449,15 +11457,22 @@ fn storage_worker(
                 let session_id = batch_id.session_id();
                 let tick = Some(batch.applied().tick.0);
                 let Some(session) = state.journal_sessions.get(&session_id) else {
-                    warn!(
-                        path = %path,
-                        ?batch_id,
-                        "discarding a queued host-journal batch after its session was cancelled"
-                    );
-                    continue;
+                    let worker_error = StorageWorkerError::Channel {
+                        operation: StorageOperation::Persist,
+                        path: path.clone(),
+                        tick,
+                        commit_state: FailureCommitState::NotAdmitted,
+                        detail: format!(
+                            "host-journal batch {batch_id:?} arrived without its FIFO-preserved session"
+                        ),
+                    };
+                    analytics.publish_worker_error(&worker_error, true);
+                    storage.abandon_after_error();
+                    return Some(worker_error);
                 };
                 let receipts = session.receipts.clone();
                 let publisher = session.publisher.clone();
+                let shared = Arc::clone(&session.shared);
                 let maximum_archive_bytes = session.maximum_archive_bytes;
                 let pending_analytics = batch
                     .persistence()
@@ -11491,16 +11506,25 @@ fn storage_worker(
                                 "host_journal_reader.publication",
                             )?;
                             publisher.publish(&batch, &receipt_state)?;
-                            #[cfg(test)]
-                            fail_at_host_journal_fault(
-                                &path,
-                                HostJournalFaultPoint::AfterPublicationBeforeReceipt,
-                                "host_journal_receipt.publication",
-                            )?;
+                            shared.cache_terminal(batch_id, &receipt_state)?;
                             Ok::<(), StorageError>(())
                         })();
-                        let mut cancel_receipts = publication_result.is_err();
+                        if let Some(session) = state.journal_sessions.get_mut(&session_id) {
+                            session.completed_sequence = batch_id.sequence();
+                        }
+                        shared.mark_completed(batch_id.sequence());
+                        #[cfg(test)]
+                        let suppress_receipt = publication_result.is_ok()
+                            && take_host_journal_fault(
+                                &path,
+                                HostJournalFaultPoint::AfterPublicationBeforeReceipt,
+                            );
+                        #[cfg(not(test))]
+                        let suppress_receipt = false;
+                        let mut cancel_receipts =
+                            publication_result.is_err() || suppress_receipt;
                         if publication_result.is_ok()
+                            && !suppress_receipt
                             && let Some(receipts) = receipts.as_ref()
                         {
                             let receipt = JournalReceipt::new(batch_id, receipt_state);
@@ -11562,11 +11586,19 @@ fn storage_worker(
                                 "cancelled host-journal session after terminal storage commitment could not be published to its detached reader"
                             );
                         }
+                        if suppress_receipt {
+                            warn!(
+                                path = %path,
+                                ?batch_id,
+                                "suppressed the terminal host-journal receipt after publishing and caching it for recovery"
+                            );
+                        }
                         if cancel_receipts
                             && let Some(session) = state.journal_sessions.get_mut(&session_id)
                         {
                             session.receipts = None;
                         }
+                        reap_cancelled_journal_sessions(&mut state);
                     }
                     Err(error) => {
                         let worker_error = worker_error_from_storage(
@@ -11583,9 +11615,14 @@ fn storage_worker(
                                 message: worker_error.to_string(),
                             }),
                         );
+                        if let Some(session) = state.journal_sessions.get_mut(&session_id) {
+                            session.completed_sequence = batch_id.sequence();
+                        }
+                        shared.mark_completed(batch_id.sequence());
                         if let Some(receipts) = receipts {
                             let _ = receipts.try_send(failure);
                         }
+                        reap_cancelled_journal_sessions(&mut state);
                         analytics.publish_worker_error(&worker_error, true);
                         storage.abandon_after_error();
                         return Some(worker_error);
@@ -12227,7 +12264,7 @@ mod tests {
         path
     }
 
-    fn journal_fault_world() -> WorldState {
+    fn journal_fault_world_with_interval(persistence_interval: u32) -> WorldState {
         WorldState::new(ScriptBotsConfig {
             world_width: 64,
             world_height: 64,
@@ -12235,7 +12272,7 @@ mod tests {
             rng_seed: Some(0x51a7_0f5e),
             closed: true,
             history_capacity: 8,
-            persistence_interval: 1,
+            persistence_interval,
             ..ScriptBotsConfig::default()
         })
         .expect("compact journal fault world")
@@ -12355,6 +12392,18 @@ mod tests {
         HostCore,
         NullFrontend<LocalHostPort>,
     ) {
+        fault_test_host_with_interval(path, session_id, 1)
+    }
+
+    fn fault_test_host_with_interval(
+        path: &str,
+        session_id: HostSessionId,
+        persistence_interval: u32,
+    ) -> (
+        StoragePipeline,
+        HostCore,
+        NullFrontend<LocalHostPort>,
+    ) {
         let pipeline =
             StoragePipeline::create_unattributed_file(path).expect("fault test storage pipeline");
         let journal = pipeline
@@ -12362,7 +12411,7 @@ mod tests {
             .expect("fault test journal port");
         let core = HostCore::with_journal(
             session_id,
-            journal_fault_world(),
+            journal_fault_world_with_interval(persistence_interval),
             journal_fault_host_options(),
             Box::new(journal),
         )
@@ -12468,7 +12517,7 @@ mod tests {
             command.command_id(),
             &mut next_nanos,
         );
-        assert!(matches!(status.journal(), JournalState::Failed(_)));
+        assert_eq!(status.journal(), &JournalState::Durable);
         drop_fault_host(pipeline, core, frontend);
         let committed = journal_database_snapshot(&path);
         assert_eq!(committed.tick_count, 1);
@@ -12526,13 +12575,12 @@ mod tests {
     }
 
     #[test]
-    fn host_journal_flush_fault_keeps_shutdown_cancel_clean() {
-        let path = temp_db_path("host-journal-flush-shutdown");
+    fn host_journal_flush_fault_recovers_the_final_shutdown_persistence_tail() {
+        let path = temp_db_path("host-journal-final-tail-flush");
         let path = path.to_string_lossy().into_owned();
         let (pipeline, mut core, mut frontend) =
-            fault_test_host(&path, HostSessionId::new(0x204));
-        arm_host_journal_fault(&path, HostJournalFaultPoint::BeforePersistenceFlush);
-        let step = frontend.step().expect("flush-faulted step");
+            fault_test_host_with_interval(&path, HostSessionId::new(0x204), 4);
+        let step = frontend.step().expect("step below the persistence cadence");
         let mut next_nanos = 0;
         let step_status = drive_journal_command_to_terminal(
             &mut frontend,
@@ -12540,8 +12588,12 @@ mod tests {
             step.command_id(),
             &mut next_nanos,
         );
-        assert!(matches!(step_status.journal(), JournalState::Failed(_)));
-        let shutdown = frontend.shutdown().expect("shutdown after flush fault");
+        assert_eq!(step_status.journal(), &JournalState::Durable);
+
+        arm_host_journal_fault(&path, HostJournalFaultPoint::BeforePersistenceFlush);
+        let shutdown = frontend
+            .shutdown()
+            .expect("shutdown carrying the final persistence tail");
         let shutdown_status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -12553,13 +12605,57 @@ mod tests {
         drop_fault_host(pipeline, core, frontend);
         let failed = journal_database_snapshot(&path);
         assert_eq!(failed.tick_count, 0);
-        assert_eq!(failed.shutdown_sequence, None);
+        assert_eq!(failed.admitted_journal, 2);
+        assert_eq!(failed.durable_journal, 1);
+        assert_eq!(failed.shutdown_sequence, Some(2));
+        assert_eq!(failed.ledger_state.as_deref(), Some("admitted"));
 
         recover_fault_database(&path);
         let recovered = journal_database_snapshot(&path);
         assert_eq!(recovered.tick_count, 1);
-        assert_eq!(recovered.durable_journal, 1);
-        assert_eq!(recovered.shutdown_sequence, None);
+        assert_eq!(recovered.durable_journal, 2);
+        assert_eq!(recovered.shutdown_sequence, Some(2));
+        assert_eq!(recovered.ledger_state.as_deref(), Some("durable"));
+    }
+
+    #[test]
+    fn host_journal_terminal_cache_reclaims_an_acknowledged_prefix_at_capacity() {
+        let session_id = HostSessionId::new(0x205);
+        let shared = JournalSessionShared::new(2);
+        let first = JournalBatchId::new(session_id, 1);
+        let second = JournalBatchId::new(session_id, 2);
+        let third = JournalBatchId::new(session_id, 3);
+
+        shared
+            .cache_terminal(first, &JournalReceiptState::Durable)
+            .expect("cache first terminal receipt");
+        shared
+            .cache_terminal(second, &JournalReceiptState::Durable)
+            .expect("fill the bounded terminal cache");
+        shared.acknowledge(first.sequence());
+        shared
+            .cache_terminal(third, &JournalReceiptState::Durable)
+            .expect("acknowledged terminal prefix is reclaimed before the capacity check");
+    }
+
+    #[test]
+    fn dropped_host_journal_ports_are_reaped_before_the_active_session_cap() {
+        let mut pipeline =
+            StoragePipeline::unattributed_memory().expect("memory storage pipeline");
+        for offset in 0..=DEFAULT_COMMAND_CAPACITY {
+            let session_id = HostSessionId::new(
+                u64::try_from(offset).expect("bounded session offset") + 0x300,
+            );
+            let journal = pipeline
+                .journal_port(session_id, StorageJournalOptions::default())
+                .expect("a prior dropped journal session is reaped before registration");
+            drop(journal);
+        }
+
+        let receipt = pipeline
+            .shutdown()
+            .expect("shutdown reaps the final dropped journal session");
+        assert_eq!(receipt.guarantee, PersistenceGuarantee::CommittedVolatile);
     }
 
     fn unattributed_manifest_at(run_id: RunId, started_at_unix_ms: u64) -> RunManifestRecord {
