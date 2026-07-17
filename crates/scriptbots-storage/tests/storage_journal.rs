@@ -2,13 +2,16 @@
 
 use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
 use scriptbots_runtime::{
-    CommandId, CommandStatus, EventCatchUp, EventCatchUpGuarantee, EventCatchUpState,
-    EventCommitment, EventJournalReader, EventPageSource, EventPoll, EventSequence, HostBlocker,
-    HostCore, HostCoreOptions, HostLifecycle, HostSessionId, JournalAdmission, JournalBatchId,
-    JournalState, LocalHostPort, ManualInstant, NullFrontend, PlaybackSnapshot,
+    ApplicationState, CommandId, CommandStatus, EventCatchUp, EventCatchUpGuarantee,
+    EventCatchUpState, EventCommitment, EventJournalReader, EventPageSource, EventPoll,
+    EventSequence, HostBlocker, HostCommand, HostCore, HostCoreOptions, HostLifecycle,
+    HostSessionId, JournalAdmission, JournalBatchId, JournalState, LocalHostPort, ManualInstant,
+    NullFrontend, PlaybackSnapshot,
 };
 use scriptbots_storage::{
-    PersistenceGuarantee, StorageEventJournalReader, StorageJournalOptions, StoragePipeline,
+    HostJournalPrefixes, HostJournalRecordState, HostJournalSessionPage, PersistenceGuarantee,
+    StorageError, StorageEventJournalReader, StorageIntegrityCheckResult, StorageJournalOptions,
+    StoragePipeline, StorageReader,
 };
 use std::{
     sync::Arc,
@@ -225,22 +228,41 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     let mut frontend = NullFrontend::new(core.local_port(), 0x2002);
     let mut next_nanos = 0;
 
-    let first = frontend.step().expect("first durable step");
-    drive_until_journal_state(
+    let first_submission = frontend.step().expect("first durable step");
+    let first_command_id = first_submission.command_id();
+    let first_status = drive_until_journal_state(
         &mut frontend,
         &mut core,
-        first.command_id(),
+        first_command_id,
         &JournalState::Durable,
         &mut next_nanos,
     );
-    let second = frontend.step().expect("second durable step");
-    drive_until_journal_state(
+    assert!(
+        matches!(first_status.application(), ApplicationState::Applied(_)),
+        "first durable step must retain its exact applied boundary"
+    );
+    let ApplicationState::Applied(first_applied) = first_status.application() else {
+        return;
+    };
+    let first_applied = *first_applied;
+
+    let second_submission = frontend.step().expect("second durable step");
+    let second_command_id = second_submission.command_id();
+    let second_status = drive_until_journal_state(
         &mut frontend,
         &mut core,
-        second.command_id(),
+        second_command_id,
         &JournalState::Durable,
         &mut next_nanos,
     );
+    assert!(
+        matches!(second_status.application(), ApplicationState::Applied(_)),
+        "second durable step must retain its exact applied boundary"
+    );
+    let ApplicationState::Applied(second_applied) = second_status.application() else {
+        return;
+    };
+    let second_applied = *second_applied;
 
     let poll = frontend
         .read_events(usize::MAX)
@@ -261,16 +283,71 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
         return;
     };
     assert_eq!(locator.guarantee(), EventCatchUpGuarantee::CrashDurable);
+    assert_eq!(
+        locator.range(),
+        scriptbots_runtime::EventSequenceRange {
+            first: EventSequence::new(1),
+            last: EventSequence::new(1),
+        }
+    );
 
-    let shutdown = frontend.shutdown().expect("ordered durable shutdown");
-    let shutdown = drive_until_journal_state(
+    let live_catch_up = frontend
+        .catch_up_events(locator, 1)
+        .expect("read the first exact durable event before closing the writer");
+    assert!(
+        matches!(&live_catch_up, EventCatchUp::Contiguous(_)),
+        "live durable catch-up must be contiguous, got {live_catch_up:?}"
+    );
+    let EventCatchUp::Contiguous(live_catch_up) = live_catch_up else {
+        return;
+    };
+    assert_eq!(live_catch_up.source, EventPageSource::Durable);
+    assert_eq!(live_catch_up.events.len(), 1);
+    assert_eq!(
+        live_catch_up.events[0].commitment,
+        EventCommitment::Durable
+    );
+    let expected_first_event = live_catch_up.events[0].clone();
+
+    let live_hot_suffix = frontend
+        .read_events(1)
+        .expect("read the second exact event from the durable hot suffix");
+    assert!(
+        matches!(&live_hot_suffix, EventPoll::Contiguous(_)),
+        "live durable hot suffix must be contiguous, got {live_hot_suffix:?}"
+    );
+    let EventPoll::Contiguous(live_hot_suffix) = live_hot_suffix else {
+        return;
+    };
+    assert_eq!(live_hot_suffix.source, EventPageSource::Hot);
+    assert_eq!(live_hot_suffix.events.len(), 1);
+    assert_eq!(
+        live_hot_suffix.events[0].commitment,
+        EventCommitment::Durable
+    );
+    let expected_second_event = live_hot_suffix.events[0].clone();
+
+    let shutdown_submission = frontend.shutdown().expect("ordered durable shutdown");
+    let shutdown_command_id = shutdown_submission.command_id();
+    let shutdown_status = drive_until_journal_state(
         &mut frontend,
         &mut core,
-        shutdown.command_id(),
+        shutdown_command_id,
         &JournalState::Durable,
         &mut next_nanos,
     );
-    assert_eq!(shutdown.journal(), &JournalState::Durable);
+    assert_eq!(shutdown_status.journal(), &JournalState::Durable);
+    assert!(
+        matches!(
+            shutdown_status.application(),
+            ApplicationState::Applied(_)
+        ),
+        "durable shutdown must retain its exact applied boundary"
+    );
+    let ApplicationState::Applied(shutdown_applied) = shutdown_status.application() else {
+        return;
+    };
+    let shutdown_applied = *shutdown_applied;
     assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
     assert_eq!(
         pipeline
@@ -287,15 +364,25 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     let reader = StorageEventJournalReader::open_file(&path, run_id, session_id, options)
         .expect("reopen a detached durable reader after writer shutdown");
     assert_eq!(reader.guarantee(), EventCatchUpGuarantee::CrashDurable);
+    let complete_event_range = scriptbots_runtime::EventSequenceRange {
+        first: EventSequence::new(1),
+        last: EventSequence::new(2),
+    };
     assert_eq!(
         reader.available_range(),
-        Some(scriptbots_runtime::EventSequenceRange {
-            first: EventSequence::new(1),
-            last: EventSequence::new(2),
-        })
+        Some(complete_event_range)
     );
+    let retention = reader
+        .retention_snapshot()
+        .expect("reopened reader retains its complete durable event range");
+    assert_eq!(retention.session_id(), session_id);
+    assert_eq!(retention.guarantee(), EventCatchUpGuarantee::CrashDurable);
+    assert_eq!(retention.range(), complete_event_range);
     assert!(
         reader.contains_event_identity(EventSequence::new(1), JournalBatchId::new(session_id, 1))
+    );
+    assert!(
+        reader.contains_event_identity(EventSequence::new(2), JournalBatchId::new(session_id, 2))
     );
 
     let catch_up = reader
@@ -312,6 +399,242 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     assert_eq!(page.events.len(), 1);
     assert_eq!(page.events[0].event.sequence, EventSequence::new(1));
     assert_eq!(page.events[0].commitment, EventCommitment::Durable);
+    assert_eq!(page.events[0], expected_first_event);
+
+    let finished_reader = StorageReader::open_finished_for_run(&path, run_id)
+        .expect("open the immutable finished run for typed journal conformance");
+    let journal_page = finished_reader
+        .host_journal_session_conformance_page(
+            session_id,
+            None,
+            16,
+            options.max_event_page_bytes,
+        )
+        .expect("read one bounded canonical page covering the complete journal session");
+    assert_eq!(journal_page.run_id, run_id);
+    assert_eq!(journal_page.session_id, session_id);
+    assert_eq!(
+        journal_page.integrity_check,
+        StorageIntegrityCheckResult::Ok
+    );
+    assert_eq!(
+        journal_page.progress.journal,
+        HostJournalPrefixes {
+            admitted: 3,
+            applied: 3,
+            committed_volatile: 3,
+            durable: 3,
+        }
+    );
+    assert_eq!(
+        journal_page.progress.events,
+        HostJournalPrefixes {
+            admitted: 2,
+            applied: 2,
+            committed_volatile: 2,
+            durable: 2,
+        }
+    );
+    assert_eq!(
+        journal_page.progress.shutdown,
+        Some(JournalBatchId::new(session_id, 3))
+    );
+    assert_eq!(journal_page.next_after, None);
+    assert_eq!(journal_page.records.len(), 3);
+    let [first_record, second_record, shutdown_record] = journal_page.records.as_slice() else {
+        return;
+    };
+
+    assert_eq!(first_record.batch_id, JournalBatchId::new(session_id, 1));
+    assert_eq!(second_record.batch_id, JournalBatchId::new(session_id, 2));
+    assert_eq!(
+        shutdown_record.batch_id,
+        JournalBatchId::new(session_id, 3)
+    );
+    for record in [first_record, second_record, shutdown_record] {
+        assert_eq!(record.state, HostJournalRecordState::Durable);
+    }
+
+    assert!(
+        first_record.command.is_some(),
+        "first journal record must retain its exact command"
+    );
+    let Some(first_command) = first_record.command.as_ref() else {
+        return;
+    };
+    assert_eq!(first_command.command_id, first_command_id);
+    assert_eq!(first_command.expected_control_revision, None);
+    assert!(matches!(&first_command.command, HostCommand::Step));
+    assert_eq!(first_record.applied, first_applied);
+    assert_eq!(first_record.event.as_ref(), Some(&expected_first_event));
+
+    assert!(
+        second_record.command.is_some(),
+        "second journal record must retain its exact command"
+    );
+    let Some(second_command) = second_record.command.as_ref() else {
+        return;
+    };
+    assert_eq!(second_command.command_id, second_command_id);
+    assert_eq!(second_command.expected_control_revision, None);
+    assert!(matches!(&second_command.command, HostCommand::Step));
+    assert_eq!(second_record.applied, second_applied);
+    assert_eq!(second_record.event.as_ref(), Some(&expected_second_event));
+
+    assert!(
+        shutdown_record.command.is_some(),
+        "shutdown journal record must retain its exact command"
+    );
+    let Some(shutdown_command) = shutdown_record.command.as_ref() else {
+        return;
+    };
+    assert_eq!(shutdown_command.command_id, shutdown_command_id);
+    assert_eq!(shutdown_command.expected_control_revision, None);
+    assert!(matches!(&shutdown_command.command, HostCommand::Shutdown));
+    assert_eq!(shutdown_record.applied, shutdown_applied);
+    assert_eq!(shutdown_record.event, None);
+
+    let first_page = finished_reader
+        .host_journal_session_conformance_page(
+            session_id,
+            None,
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect("read the first single-record conformance page");
+    assert_eq!(first_page.records.len(), 1);
+    assert_eq!(
+        first_page.records[0].batch_id,
+        JournalBatchId::new(session_id, 1)
+    );
+    assert_eq!(
+        first_page.next_after,
+        Some(JournalBatchId::new(session_id, 1))
+    );
+
+    let second_page = finished_reader
+        .host_journal_session_conformance_page(
+            session_id,
+            first_page.next_after,
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect("read the second single-record conformance page");
+    assert_eq!(second_page.records.len(), 1);
+    assert_eq!(
+        second_page.records[0].batch_id,
+        JournalBatchId::new(session_id, 2)
+    );
+    assert_eq!(
+        second_page.next_after,
+        Some(JournalBatchId::new(session_id, 2))
+    );
+
+    let third_page = finished_reader
+        .host_journal_session_conformance_page(
+            session_id,
+            second_page.next_after,
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect("read the final single-record conformance page");
+    assert_eq!(third_page.records.len(), 1);
+    assert_eq!(
+        third_page.records[0].batch_id,
+        JournalBatchId::new(session_id, 3)
+    );
+    assert_eq!(third_page.next_after, None);
+
+    let empty_tip_page = finished_reader
+        .host_journal_session_conformance_page(
+            session_id,
+            Some(JournalBatchId::new(session_id, 3)),
+            1,
+            options.max_event_page_bytes,
+        )
+        .expect("a cursor at the durable tip returns an empty terminal page");
+    assert!(empty_tip_page.records.is_empty());
+    assert_eq!(empty_tip_page.next_after, None);
+
+    let assert_invalid_data_context =
+        |result: Result<HostJournalSessionPage, StorageError>, expected_context: &'static str| {
+            let error = result.expect_err("invalid conformance query must be rejected");
+            assert!(
+                matches!(
+                    &error,
+                    StorageError::InvalidData { context, .. }
+                        if *context == expected_context
+                ),
+                "expected InvalidData context {expected_context:?}, got {error:?}"
+            );
+        };
+
+    assert_invalid_data_context(
+        finished_reader.host_journal_session_conformance_page(
+            session_id,
+            None,
+            0,
+            options.max_event_page_bytes,
+        ),
+        "host_journal_conformance.record_limit",
+    );
+    assert_invalid_data_context(
+        finished_reader.host_journal_session_conformance_page(
+            session_id,
+            None,
+            4_097,
+            options.max_event_page_bytes,
+        ),
+        "host_journal_conformance.record_limit",
+    );
+    assert_invalid_data_context(
+        finished_reader.host_journal_session_conformance_page(session_id, None, 1, 0),
+        "host_journal_conformance.page_payload_byte_limit",
+    );
+    assert_invalid_data_context(
+        finished_reader.host_journal_session_conformance_page(
+            session_id,
+            None,
+            1,
+            (256_usize << 20) + 1,
+        ),
+        "host_journal_conformance.page_payload_byte_limit",
+    );
+    assert_invalid_data_context(
+        finished_reader.host_journal_session_conformance_page(session_id, None, 1, 1),
+        "host_journal_conformance.page_payload_byte_limit",
+    );
+    assert_invalid_data_context(
+        finished_reader.host_journal_session_conformance_page(
+            session_id,
+            Some(JournalBatchId::new(HostSessionId::new(0xdead), 1)),
+            1,
+            options.max_event_page_bytes,
+        ),
+        "host_journal_conformance.after",
+    );
+    assert_invalid_data_context(
+        finished_reader.host_journal_session_conformance_page(
+            session_id,
+            Some(JournalBatchId::new(session_id, 0)),
+            1,
+            options.max_event_page_bytes,
+        ),
+        "host_journal_conformance.after",
+    );
+    assert_invalid_data_context(
+        finished_reader.host_journal_session_conformance_page(
+            session_id,
+            Some(JournalBatchId::new(session_id, 4)),
+            1,
+            options.max_event_page_bytes,
+        ),
+        "host_journal_conformance.after",
+    );
+
+    finished_reader
+        .close()
+        .expect("close the immutable finished-run conformance reader");
 
     // The uniquely named database is intentionally retained; this test performs no file deletion.
 }

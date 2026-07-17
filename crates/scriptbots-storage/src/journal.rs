@@ -2,8 +2,8 @@
 
 use super::{
     AdmissionState, DEFAULT_COMMAND_CAPACITY, ExistingStorageLease, InFlightPermit,
-    MAX_STORAGE_QUERY_PAGE, Storage, StorageBuffer, StorageCommand, StorageError,
-    load_host_journal_index, read_host_journal_events,
+    MAX_STORAGE_QUERY_PAGE, MAX_STORAGE_WAIT_TIMEOUT, Storage, StorageBuffer, StorageCommand,
+    StorageError, load_host_journal_index, read_host_journal_events,
 };
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
@@ -16,15 +16,17 @@ use scriptbots_runtime::{
     ScientificEvent, ShutdownCommitRequirement,
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::Write,
     sync::{
         Arc, Mutex, TryLockError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 const DEFAULT_JOURNAL_CAPACITY: usize = DEFAULT_COMMAND_CAPACITY;
+const DEFAULT_JOURNAL_RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_JOURNAL_BATCH_BYTES: usize = 64 << 20;
 const DEFAULT_JOURNAL_INFLIGHT_BYTES: usize = 256 << 20;
 const DEFAULT_JOURNAL_IDENTITY_CAPACITY: usize = 512;
@@ -37,6 +39,8 @@ pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 1;
 pub struct StorageJournalOptions {
     /// Most accepted batches that may await receipt polling.
     pub admission_capacity: usize,
+    /// Maximum monotonic time from accepting a batch to observing terminal receipt truth.
+    pub receipt_timeout: Duration,
     /// Largest exact [`JournalBatch`] allocation accepted by the adapter.
     pub max_batch_bytes: usize,
     /// Largest total accepted allocation awaiting terminal receipts.
@@ -51,6 +55,7 @@ impl Default for StorageJournalOptions {
     fn default() -> Self {
         Self {
             admission_capacity: DEFAULT_JOURNAL_CAPACITY,
+            receipt_timeout: DEFAULT_JOURNAL_RECEIPT_TIMEOUT,
             max_batch_bytes: DEFAULT_JOURNAL_BATCH_BYTES,
             max_inflight_bytes: DEFAULT_JOURNAL_INFLIGHT_BYTES,
             event_cache_capacity: DEFAULT_JOURNAL_IDENTITY_CAPACITY,
@@ -66,6 +71,12 @@ impl StorageJournalOptions {
         }
         if self.admission_capacity > DEFAULT_COMMAND_CAPACITY {
             return Err("journal admission_capacity exceeds the storage command lane");
+        }
+        if self.receipt_timeout.is_zero() {
+            return Err("journal receipt_timeout must be nonzero");
+        }
+        if self.receipt_timeout > MAX_STORAGE_WAIT_TIMEOUT {
+            return Err("journal receipt_timeout exceeds the storage wait ceiling");
         }
         if self.max_batch_bytes == 0 {
             return Err("journal max_batch_bytes must be nonzero");
@@ -93,6 +104,92 @@ impl StorageJournalOptions {
         }
         Ok(self)
     }
+}
+
+/// Monotonic prefixes proven for either host-journal batches or scientific events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostJournalPrefixes {
+    /// Highest contiguously admitted sequence.
+    pub admitted: u64,
+    /// Highest contiguously applied sequence.
+    pub applied: u64,
+    /// Highest contiguous sequence committed to volatile storage.
+    pub committed_volatile: u64,
+    /// Highest crash-durable contiguous sequence.
+    pub durable: u64,
+}
+
+/// Immutable progress for one validated host-journal session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostJournalSessionProgress {
+    /// Admission, application, volatile-commit, and durability prefixes for journal batches.
+    pub journal: HostJournalPrefixes,
+    /// Admission, application, volatile-commit, and durability prefixes for scientific events.
+    pub events: HostJournalPrefixes,
+    /// Final ordered shutdown batch, when the session durably reached shutdown.
+    pub shutdown: Option<JournalBatchId>,
+}
+
+/// Persisted state of one canonical host-journal record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostJournalRecordState {
+    /// The exact archive and ledger identity were admitted atomically.
+    Admitted,
+    /// The archived boundary was applied to its durable scientific tables.
+    Applied,
+    /// Application committed, but file durability was not yet established.
+    CommittedVolatile,
+    /// The exact record and every preceding record are crash durable.
+    Durable,
+}
+
+impl HostJournalRecordState {
+    const fn event_commitment(self) -> EventCommitment {
+        match self {
+            Self::Admitted | Self::Applied => EventCommitment::Pending,
+            Self::CommittedVolatile => EventCommitment::CommittedVolatile,
+            Self::Durable => EventCommitment::Durable,
+        }
+    }
+}
+
+/// Typed public projection of one digest- and canonical-form-validated host-journal archive.
+#[derive(Debug, Clone)]
+pub struct HostJournalRecord {
+    /// Stable session-scoped archive identity and total journal order.
+    pub batch_id: JournalBatchId,
+    /// Exact command envelope carried by this record, when command-driven.
+    pub command: Option<CommandEnvelope>,
+    /// Exact tick and revision boundary at which the record applied.
+    pub applied: AppliedCommand,
+    /// Complete canonical scientific event, when this record advanced science.
+    pub event: Option<JournaledScientificEvent>,
+    /// Persisted ledger state cross-checked against the session prefixes.
+    pub state: HostJournalRecordState,
+}
+
+/// Successful result of the offline FrankenSQLite integrity conformance gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageIntegrityCheckResult {
+    /// `PRAGMA integrity_check` returned exactly `ok`.
+    Ok,
+}
+
+/// One bounded, immutable page from a validated finished host-journal session.
+#[derive(Debug, Clone)]
+pub struct HostJournalSessionPage {
+    /// Durable run selected by the finished storage reader.
+    pub run_id: RunId,
+    /// Host session whose records and progress this page describes.
+    pub session_id: HostSessionId,
+    /// Complete session prefixes and ordered shutdown marker.
+    pub progress: HostJournalSessionProgress,
+    /// Canonically decoded records in strictly increasing journal order.
+    pub records: Vec<HostJournalRecord>,
+    /// Cursor to pass as `after` for the next page, or `None` when this page reaches the tip.
+    pub next_after: Option<JournalBatchId>,
+    /// Typed evidence that the offline integrity conformance gate passed.
+    pub integrity_check: StorageIntegrityCheckResult,
 }
 
 pub(super) fn encode_journal_u64(value: u64) -> String {
@@ -500,6 +597,53 @@ impl HostJournalArchive {
             }),
             commitment,
         }))
+    }
+
+    pub(super) fn into_public_record(
+        self,
+        state: HostJournalRecordState,
+    ) -> Result<HostJournalRecord, StorageError> {
+        let event_sequence = self.event_sequence()?;
+        let batch_id = self.batch_id()?;
+        let Self {
+            command,
+            applied,
+            scientific,
+            ..
+        } = self;
+        let event = match (event_sequence, scientific) {
+            (Some(sequence), Some(boundary)) => Some(JournaledScientificEvent {
+                event: Arc::new(ScientificEvent {
+                    session_id: batch_id.session_id(),
+                    sequence,
+                    batch_id,
+                    tick: applied.tick,
+                    revisions: applied.revisions,
+                    boundary: Arc::new(boundary),
+                }),
+                commitment: state.event_commitment(),
+            }),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.scientific",
+                    reason: "scientific event sequence has no canonical payload".to_owned(),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.scientific_event_sequence",
+                    reason: "scientific payload has no canonical event sequence".to_owned(),
+                });
+            }
+        };
+        Ok(HostJournalRecord {
+            batch_id,
+            command,
+            applied,
+            event,
+            state,
+        })
     }
 }
 
@@ -1099,7 +1243,12 @@ pub struct StorageJournalPort {
     shared: Arc<JournalSessionShared>,
     receipts: xchan::Receiver<JournalReceipt>,
     outstanding: BTreeMap<JournalBatchId, OutstandingJournalBatch>,
+    // IDs resolved from the cache or a local timeout before their lane notification arrived.
+    // Tombstones count against `capacity` until a matching notification removes them; a timeout
+    // also seals admission.
+    suppressed_receipts: BTreeSet<JournalBatchId>,
     capacity: usize,
+    receipt_timeout: Duration,
     max_batch_bytes: usize,
     max_inflight_bytes: usize,
     inflight_bytes: Arc<AtomicUsize>,
@@ -1113,6 +1262,7 @@ pub struct StorageJournalPort {
 #[derive(Debug)]
 struct OutstandingJournalBatch {
     batch: Arc<JournalBatch>,
+    accepted_at: Instant,
     _permit: InFlightPermit,
 }
 
@@ -1122,7 +1272,9 @@ impl std::fmt::Debug for StorageJournalPort {
             .debug_struct("StorageJournalPort")
             .field("session_id", &self.session_id)
             .field("outstanding", &self.outstanding.len())
+            .field("suppressed_receipts", &self.suppressed_receipts.len())
             .field("capacity", &self.capacity)
+            .field("receipt_timeout", &self.receipt_timeout)
             .field("max_batch_bytes", &self.max_batch_bytes)
             .field("max_inflight_bytes", &self.max_inflight_bytes)
             .finish_non_exhaustive()
@@ -1146,7 +1298,9 @@ impl StorageJournalPort {
             shared,
             receipts,
             outstanding: BTreeMap::new(),
+            suppressed_receipts: BTreeSet::new(),
             capacity: options.admission_capacity,
+            receipt_timeout: options.receipt_timeout,
             max_batch_bytes: options.max_batch_bytes,
             max_inflight_bytes: options.max_inflight_bytes,
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
@@ -1173,6 +1327,87 @@ impl StorageJournalPort {
                 message: message.to_owned(),
             }),
         )
+    }
+
+    fn timed_out_receipt(&self, batch_id: JournalBatchId) -> JournalReceipt {
+        JournalReceipt::new(
+            batch_id,
+            JournalReceiptState::Failed(JournalFailure {
+                code: "storage_journal_receipt_timeout".to_owned(),
+                message: format!(
+                    "storage journal did not publish terminal receipt truth within {:?}",
+                    self.receipt_timeout
+                ),
+            }),
+        )
+    }
+
+    fn release_terminal(&mut self, batch_id: JournalBatchId) {
+        self.shared.acknowledge(batch_id.sequence());
+        self.outstanding.remove(&batch_id);
+        match self.shared.terminal_receipts.try_lock() {
+            Ok(mut cache) => {
+                cache.remove(&batch_id);
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().remove(&batch_id);
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+    }
+
+    fn append_expired_receipts(
+        &mut self,
+        now: Instant,
+        limit: usize,
+        receipts: &mut Vec<JournalReceipt>,
+    ) {
+        let remaining = limit.saturating_sub(receipts.len());
+        let expired = self
+            .outstanding
+            .iter()
+            .filter_map(|(batch_id, outstanding)| {
+                (now.saturating_duration_since(outstanding.accepted_at) >= self.receipt_timeout)
+                    .then_some(*batch_id)
+            })
+            .take(remaining)
+            .collect::<Vec<_>>();
+        if expired.is_empty() {
+            return;
+        }
+
+        // The worker caches terminal truth before it notifies the receipt lane. Reconcile that
+        // authoritative cache while selecting the timeout outcome so a preemption between those
+        // two publications cannot turn a real commitment into a synthetic failure. Contention is
+        // resolved by deferring this bounded poll; blocking here would violate JournalPort.
+        let reconciled = {
+            let mut cache = match self.shared.terminal_receipts.try_lock() {
+                Ok(cache) => cache,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => return,
+            };
+            expired
+                .into_iter()
+                .map(|batch_id| {
+                    let terminal = cache.remove(&batch_id);
+                    (batch_id, terminal)
+                })
+                .collect::<Vec<_>>()
+        };
+        if reconciled.iter().any(|(_batch_id, state)| state.is_none()) {
+            self.open = false;
+            self.shared.cancel_after(self.last_accepted_sequence);
+        }
+        for (batch_id, terminal) in reconciled {
+            // The worker may enqueue the matching notification immediately after the lane-first
+            // drain above. Keep one bounded tombstone so that duplicate cannot reach HostCore.
+            self.suppressed_receipts.insert(batch_id);
+            self.release_terminal(batch_id);
+            match terminal {
+                Some(state) => receipts.push(JournalReceipt::new(batch_id, state)),
+                None => receipts.push(self.timed_out_receipt(batch_id)),
+            }
+        }
     }
 }
 
@@ -1202,7 +1437,12 @@ impl JournalPort for StorageJournalPort {
             self.open = false;
             return JournalAdmission::Closed { batch_id };
         }
-        if self.outstanding.len() >= self.capacity {
+        if self
+            .outstanding
+            .len()
+            .saturating_add(self.suppressed_receipts.len())
+            >= self.capacity
+        {
             return JournalAdmission::Full {
                 batch_id,
                 capacity: self.capacity,
@@ -1241,6 +1481,7 @@ impl JournalPort for StorageJournalPort {
                     batch_id,
                     OutstandingJournalBatch {
                         batch: Arc::clone(batch),
+                        accepted_at: Instant::now(),
                         _permit: permit,
                     },
                 );
@@ -1277,10 +1518,19 @@ impl JournalPort for StorageJournalPort {
         if limit == 0 {
             return Vec::new();
         }
+        let now = Instant::now();
         let mut receipts = Vec::with_capacity(limit.min(self.capacity));
+        // Truth already present in the nonblocking receipt lane wins a deadline tie. Once the
+        // lane is drained, the authoritative terminal cache is reconciled before any expired
+        // remainder becomes one sticky local terminal failure.
         while receipts.len() < limit {
             match self.receipts.try_recv() {
                 Ok(receipt) => {
+                    let batch_id = receipt.batch_id();
+                    if self.suppressed_receipts.remove(&batch_id) {
+                        self.release_terminal(batch_id);
+                        continue;
+                    }
                     if matches!(receipt.state(), JournalReceiptState::Failed(_)) {
                         self.open = false;
                     }
@@ -1290,17 +1540,7 @@ impl JournalPort for StorageJournalPort {
                     ) || self.shutdown_requirement
                         == ShutdownCommitRequirement::CommittedVolatile;
                     if terminal {
-                        self.shared.acknowledge(receipt.batch_id().sequence());
-                        self.outstanding.remove(&receipt.batch_id());
-                        match self.shared.terminal_receipts.try_lock() {
-                            Ok(mut cache) => {
-                                cache.remove(&receipt.batch_id());
-                            }
-                            Err(TryLockError::Poisoned(poisoned)) => {
-                                poisoned.into_inner().remove(&receipt.batch_id());
-                            }
-                            Err(TryLockError::WouldBlock) => {}
-                        }
+                        self.release_terminal(batch_id);
                     }
                     receipts.push(receipt);
                 }
@@ -1335,6 +1575,9 @@ impl JournalPort for StorageJournalPort {
                 }
             }
         }
+
+        self.append_expired_receipts(now, limit, &mut receipts);
+
         match self.shared.terminal_receipts.try_lock() {
             Ok(mut cache) => {
                 cache.retain(|batch_id, _state| self.outstanding.contains_key(batch_id));
@@ -1362,9 +1605,13 @@ impl JournalPort for StorageJournalPort {
 mod tests {
     use super::*;
     use scriptbots_core::{
-        MetricSample, PersistenceBatch, Tick, TickCombatSummary, TickEvents, TickSummary,
+        MetricSample, PersistenceBatch, ScriptBotsConfig, Tick, TickCombatSummary, TickEvents,
+        TickSummary, WorldState,
     };
-    use scriptbots_runtime::{CommandId, HostRevisions};
+    use scriptbots_runtime::{
+        ApplicationState, CommandId, HostBlocker, HostCore, HostCoreOptions, HostFault, HostHealth,
+        HostRevisions, JournalState, ManualInstant, NullFrontend, PlaybackSnapshot,
+    };
 
     fn applied() -> AppliedCommand {
         AppliedCommand {
@@ -1398,6 +1645,328 @@ mod tests {
             0,
             None,
         )
+    }
+
+    fn timeout_test_world() -> WorldState {
+        WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(0x5eed),
+            closed: true,
+            history_capacity: 8,
+            persistence_interval: 1,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("compact deterministic timeout world")
+    }
+
+    fn timeout_host_options() -> HostCoreOptions {
+        HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            },
+            scientific_event_capacity: 2,
+            volatile_event_history_capacity: 4,
+            ..HostCoreOptions::default()
+        }
+    }
+
+    #[test]
+    fn journal_receipt_timeout_is_positive_and_storage_wait_bounded() {
+        let zero = StorageJournalOptions {
+            receipt_timeout: Duration::ZERO,
+            ..StorageJournalOptions::default()
+        };
+        assert_eq!(
+            zero.validate(),
+            Err("journal receipt_timeout must be nonzero")
+        );
+
+        let oversized = StorageJournalOptions {
+            receipt_timeout: MAX_STORAGE_WAIT_TIMEOUT.saturating_add(Duration::from_nanos(1)),
+            ..StorageJournalOptions::default()
+        };
+        assert_eq!(
+            oversized.validate(),
+            Err("journal receipt_timeout exceeds the storage wait ceiling")
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one race test proves cache-first truth, bounded duplicate suppression, exact retry, and healthy recovery together"
+    )]
+    fn cached_terminal_truth_wins_expired_deadline_without_channel_notification() {
+        let session_id = HostSessionId::new(0x403);
+        let options = StorageJournalOptions {
+            admission_capacity: 1,
+            receipt_timeout: Duration::from_millis(1),
+            ..StorageJournalOptions::default()
+        };
+        let (worker_tx, worker_rx) = xchan::bounded(DEFAULT_COMMAND_CAPACITY);
+        let admission = Arc::new(Mutex::new(AdmissionState { open: true }));
+        let shared = Arc::new(JournalSessionShared::new(options.admission_capacity));
+        let (receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
+        let publisher =
+            JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
+        let journal = StorageJournalPort::new(
+            worker_tx,
+            admission,
+            Arc::clone(&shared),
+            receipt_rx,
+            &publisher,
+            options,
+            ShutdownCommitRequirement::CommittedVolatile,
+        );
+        let inflight_bytes = Arc::clone(&journal.inflight_bytes);
+        let mut core = HostCore::with_journal(
+            session_id,
+            timeout_test_world(),
+            timeout_host_options(),
+            Box::new(journal),
+        )
+        .expect("host whose worker caches truth before notifying the receipt lane");
+        let mut frontend = NullFrontend::new(core.local_port(), 0x5003);
+
+        let first = frontend.step().expect("first step admission");
+        let applied = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(0))
+            .expect("first step completes before its asynchronous receipt");
+        assert_eq!(applied.scientific_steps, 1);
+        let queued = worker_rx
+            .try_recv()
+            .expect("live worker lane owns the accepted batch");
+        assert!(matches!(&queued, StorageCommand::JournalAdmit { .. }));
+        let StorageCommand::JournalAdmit {
+            batch: worker_batch,
+        } = queued
+        else {
+            return;
+        };
+        let batch_id = worker_batch.id();
+        assert_eq!(
+            inflight_bytes.load(Ordering::SeqCst),
+            worker_batch.retained_bytes()
+        );
+
+        std::thread::sleep(options.receipt_timeout.saturating_add(Duration::from_millis(1)));
+        shared
+            .cache_terminal(batch_id, &JournalReceiptState::CommittedVolatile)
+            .expect("worker publishes terminal truth before its channel notification");
+        let reconciled = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(1))
+            .expect("cached truth is reconciled without blocking on a channel notification");
+        assert_eq!(reconciled.scientific_steps, 0);
+        let first_status = frontend
+            .command_status(first.command_id())
+            .expect("status query after cached-truth reconciliation")
+            .expect("first command remains queryable");
+        assert_eq!(first_status.journal(), &JournalState::CommittedVolatile);
+        assert_eq!(core.health(), &HostHealth::Healthy);
+        assert_eq!(shared.cancellation_boundary(), None);
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&worker_batch), 1);
+        assert!(
+            shared
+                .terminal_receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+
+        let second = frontend.step().expect("second step enters host order");
+        let bounded = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(2))
+            .expect("suppression tombstone preserves bounded journal admission");
+        assert_eq!(bounded.scientific_steps, 1);
+        assert!(matches!(
+            bounded.blocker,
+            Some(HostBlocker::JournalFull { capacity: 1, .. })
+        ));
+        let retained = core
+            .pending_journal_batch()
+            .expect("second exact batch remains retained while the tombstone consumes capacity");
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(xchan::TryRecvError::Empty)
+        ));
+
+        receipt_tx
+            .try_send(JournalReceipt::new(
+                batch_id,
+                JournalReceiptState::CommittedVolatile,
+            ))
+            .expect("preempted worker eventually sends its matching channel notification");
+        frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(3))
+            .expect("locally reconciled receipt suppresses its later channel duplicate");
+        assert!(matches!(
+            core.health(),
+            HostHealth::Blocked(HostBlocker::JournalFull { capacity: 1, .. })
+        ));
+        let retried = core
+            .retry_retained_journal()
+            .expect("retry after duplicate suppression preserves host invariants")
+            .expect("second retained batch exists");
+        assert!(matches!(
+            retried,
+            JournalAdmission::Accepted { batch_id: accepted } if accepted == retained.id()
+        ));
+        let queued_second = worker_rx
+            .try_recv()
+            .expect("cleared tombstone admits the exact retained batch");
+        assert!(matches!(
+            &queued_second,
+            StorageCommand::JournalAdmit { batch } if Arc::ptr_eq(batch, &retained)
+        ));
+        assert!(core.pending_journal_batch().is_none());
+        assert_eq!(core.health(), &HostHealth::Healthy);
+        let unchanged_status = frontend
+            .command_status(first.command_id())
+            .expect("status query after duplicate suppression")
+            .expect("first command remains queryable");
+        assert_eq!(unchanged_status.journal(), &JournalState::CommittedVolatile);
+        let second_status = frontend
+            .command_status(second.command_id())
+            .expect("second status query after exact retry")
+            .expect("second command remains queryable");
+        assert_eq!(second_status.journal(), &JournalState::Pending);
+        assert_eq!(shared.cancellation_boundary(), None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle test proves timeout, accounting release, late-receipt suppression, and host fail-closed behavior together"
+    )]
+    fn stuck_live_worker_times_out_once_releases_batch_and_stops_later_science() {
+        let session_id = HostSessionId::new(0x402);
+        let options = StorageJournalOptions {
+            admission_capacity: 2,
+            receipt_timeout: Duration::from_millis(1),
+            ..StorageJournalOptions::default()
+        };
+        let (worker_tx, worker_rx) = xchan::bounded(DEFAULT_COMMAND_CAPACITY);
+        let admission = Arc::new(Mutex::new(AdmissionState { open: true }));
+        let shared = Arc::new(JournalSessionShared::new(options.admission_capacity));
+        let (receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
+        let publisher =
+            JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
+        let journal = StorageJournalPort::new(
+            worker_tx,
+            admission,
+            Arc::clone(&shared),
+            receipt_rx,
+            &publisher,
+            options,
+            ShutdownCommitRequirement::CommittedVolatile,
+        );
+        let inflight_bytes = Arc::clone(&journal.inflight_bytes);
+        let mut core = HostCore::with_journal(
+            session_id,
+            timeout_test_world(),
+            timeout_host_options(),
+            Box::new(journal),
+        )
+        .expect("host with a live but deliberately unserviced storage worker lane");
+        let mut frontend = NullFrontend::new(core.local_port(), 0x5002);
+
+        let first = frontend.step().expect("first step admission");
+        let applied = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(0))
+            .expect("first step completes before its asynchronous receipt");
+        assert_eq!(applied.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(1));
+
+        let queued = worker_rx
+            .try_recv()
+            .expect("live worker lane owns the accepted batch without servicing it");
+        assert!(matches!(&queued, StorageCommand::JournalAdmit { .. }));
+        let StorageCommand::JournalAdmit {
+            batch: worker_batch,
+        } = queued
+        else {
+            return;
+        };
+        let batch_id = worker_batch.id();
+        assert_eq!(
+            inflight_bytes.load(Ordering::SeqCst),
+            worker_batch.retained_bytes()
+        );
+
+        std::thread::sleep(options.receipt_timeout.saturating_add(Duration::from_millis(1)));
+        let timed_out = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(1))
+            .expect("deadline polling is nonblocking and returns terminal failure");
+        assert_eq!(timed_out.scientific_steps, 0);
+        assert_eq!(core.world_tick(), Tick(1));
+        let first_status = frontend
+            .command_status(first.command_id())
+            .expect("status query after timeout")
+            .expect("first command remains queryable");
+        assert!(matches!(
+            first_status.journal(),
+            JournalState::Failed(failure)
+                if failure.code == "storage_journal_receipt_timeout"
+        ));
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Journal { failure, .. })
+                if failure.code == "storage_journal_receipt_timeout"
+        ));
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&worker_batch), 1);
+        assert!(core.pending_journal_batch().is_none());
+        assert!(
+            core.retry_retained_journal()
+                .expect("accepted timed-out work has no retryable retained batch")
+                .is_none()
+        );
+
+        shared
+            .cache_terminal(batch_id, &JournalReceiptState::CommittedVolatile)
+            .expect("simulate terminal truth published after the local deadline");
+        receipt_tx
+            .try_send(JournalReceipt::new(
+                batch_id,
+                JournalReceiptState::CommittedVolatile,
+            ))
+            .expect("late receipt fits the still-live bounded lane");
+        frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(2))
+            .expect("late receipt is suppressed instead of becoming an unknown receipt");
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Journal { failure, .. })
+                if failure.code == "storage_journal_receipt_timeout"
+        ));
+        assert!(
+            shared
+                .terminal_receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+
+        let second = frontend.step().expect("later step enters host command order");
+        let blocked = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(3))
+            .expect("latched journal failure rejects later science deterministically");
+        assert_eq!(blocked.scientific_steps, 0);
+        assert_eq!(blocked.blocker, Some(HostBlocker::ScientificFault));
+        assert_eq!(core.world_tick(), Tick(1));
+        let second_status = frontend
+            .command_status(second.command_id())
+            .expect("later command status query")
+            .expect("later command remains queryable");
+        assert!(matches!(
+            second_status.application(),
+            ApplicationState::Failed(failure) if failure.code == "science_blocked"
+        ));
+        assert_eq!(second_status.journal(), &JournalState::NotRequired);
     }
 
     #[test]
