@@ -2793,14 +2793,17 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_546,
-                "45e76a6f71e1139f188d9906538d17fceedc96fa4190a69408cdcda59965cefb",
+                8_547,
+                "2a1483ddfdb2300cdcb5cdaf09179b1a2b0d1f0bfbc22934b057fd9d57c7fecf",
             ),
             "the reviewed V1.3/codec-5 wire must remain byte-identical: re-pinned in \
              bd-2i1 after the locomotion model was bound, then re-pinned in \
              bd-2z0.14.3.1 after RenderSettings v2 added presentation-only fields \
              (quality tier, post stack, day/night, theme, palette) to the serialized \
-             config tree (+7 bytes of Option discriminants); no science field changed"
+             config tree (+7 bytes of Option discriminants), and re-pinned in \
+             bd-2z0.8.9.8 after replay_event_tick_cap (a persistence-recording knob, \
+             default 0) joined the serialized config tree (+1 byte of usize varint); \
+             no science field changed"
         );
     }
 
