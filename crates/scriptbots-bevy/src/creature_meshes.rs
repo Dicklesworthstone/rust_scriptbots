@@ -64,8 +64,10 @@ impl CreaturePart {
             Self::WheelLeft => 1,
             Self::WheelRight => 2,
             Self::Spike => 3,
-            Self::EyeSclera(n) => 10 + u32::from(n),
-            Self::EyePupil(n) => 20 + u32::from(n),
+            // Widening `as` casts: `u32::from` is not const-stable on the
+            // pinned toolchain and `tag()` must stay `const`.
+            Self::EyeSclera(n) => 10 + n as u32,
+            Self::EyePupil(n) => 20 + n as u32,
             Self::Mouth => 30,
             Self::EarLeft => 31,
             Self::EarRight => 32,
@@ -81,8 +83,8 @@ pub enum CreatureLod {
     Lod0,
     /// Reduced detail (~800 triangles): mid distances.
     Lod1,
-    /// Impostor: two crossed quads textured from the baked LOD0 atlas
-    /// (bake itself is a later bead; this is the card geometry + UV layout).
+    /// Impostor: two crossed quads textured from the LOD0 bake produced by
+    /// [`bake_impostor_atlas`] (tile 0 = profile, tile 1 = front).
     Lod2,
 }
 
@@ -127,7 +129,8 @@ impl CreatureMeshData {
         ranges
     }
 
-    /// Convert into a real Bevy mesh with the creature-part custom attribute.
+    /// Convert into a real Bevy mesh with the creature-part custom attribute
+    /// and computed tangents (required for PBR normal mapping).
     #[must_use]
     pub fn to_bevy_mesh(&self) -> Mesh {
         let mut mesh = Mesh::new(
@@ -137,6 +140,7 @@ impl CreatureMeshData {
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, self.positions.clone());
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals.clone());
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, self.compute_tangents());
         mesh.insert_attribute(
             ATTRIBUTE_CREATURE_PART,
             bevy_mesh::VertexAttributeValues::Uint32(
@@ -145,6 +149,92 @@ impl CreatureMeshData {
         );
         mesh.insert_indices(Indices::U32(self.indices.clone()));
         mesh
+    }
+
+    /// Per-vertex tangents (`[tangent.xyz, handedness]`) derived from the UV
+    /// gradients (Lengyel's method), orthogonalized against the normals.
+    ///
+    /// Deterministic: fixed triangle order, plain f32 arithmetic, no hash
+    /// maps or threading. Vertices whose triangles all have degenerate UV
+    /// area receive an arbitrary-but-stable tangent orthogonal to their
+    /// normal (handedness +1).
+    #[must_use]
+    pub fn compute_tangents(&self) -> Vec<[f32; 4]> {
+        let vertex_count = self.positions.len();
+        let mut tan1 = vec![[0.0_f32; 3]; vertex_count];
+        let mut tan2 = vec![[0.0_f32; 3]; vertex_count];
+        for tri in self.indices.as_chunks::<3>().0 {
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            let (p0, p1, p2) = (self.positions[i0], self.positions[i1], self.positions[i2]);
+            let (uv0, uv1, uv2) = (self.uvs[i0], self.uvs[i1], self.uvs[i2]);
+            let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+            let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+            let duv1 = [uv1[0] - uv0[0], uv1[1] - uv0[1]];
+            let duv2 = [uv2[0] - uv0[0], uv2[1] - uv0[1]];
+            let det = duv1[0] * duv2[1] - duv2[0] * duv1[1];
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let r = 1.0 / det;
+            let t = [
+                (e1[0] * duv2[1] - e2[0] * duv1[1]) * r,
+                (e1[1] * duv2[1] - e2[1] * duv1[1]) * r,
+                (e1[2] * duv2[1] - e2[2] * duv1[1]) * r,
+            ];
+            let b = [
+                (e2[0] * duv1[0] - e1[0] * duv2[0]) * r,
+                (e2[1] * duv1[0] - e1[1] * duv2[0]) * r,
+                (e2[2] * duv1[0] - e1[2] * duv2[0]) * r,
+            ];
+            for &i in &[i0, i1, i2] {
+                for k in 0..3 {
+                    tan1[i][k] += t[k];
+                    tan2[i][k] += b[k];
+                }
+            }
+        }
+        let mut tangents = Vec::with_capacity(vertex_count);
+        for i in 0..vertex_count {
+            let n = self.normals[i];
+            let t = tan1[i];
+            let t_len2 = t[0].mul_add(t[0], t[1] * t[1]) + t[2] * t[2];
+            if t_len2 < 1e-12 {
+                // Degenerate UVs: any stable tangent orthogonal to n.
+                let axis = if n[0].abs() < 0.9 {
+                    [1.0, 0.0, 0.0]
+                } else {
+                    [0.0, 1.0, 0.0]
+                };
+                let fallback = normalize([
+                    n[1] * axis[2] - n[2] * axis[1],
+                    n[2] * axis[0] - n[0] * axis[2],
+                    n[0] * axis[1] - n[1] * axis[0],
+                ]);
+                tangents.push([fallback[0], fallback[1], fallback[2], 1.0]);
+                continue;
+            }
+            // Gram-Schmidt: t' = normalize(t - n * dot(n, t)).
+            let dot_nt = n[0].mul_add(t[0], n[1] * t[1]) + n[2] * t[2];
+            let ortho = normalize([
+                t[0] - n[0] * dot_nt,
+                t[1] - n[1] * dot_nt,
+                t[2] - n[2] * dot_nt,
+            ]);
+            // Handedness: sign of dot(cross(n, t), bitangent).
+            let cross = [
+                n[1] * t[2] - n[2] * t[1],
+                n[2] * t[0] - n[0] * t[2],
+                n[0] * t[1] - n[1] * t[0],
+            ];
+            let b = tan2[i];
+            let handedness = if cross[0].mul_add(b[0], cross[1] * b[1]) + cross[2] * b[2] < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            tangents.push([ortho[0], ortho[1], ortho[2], handedness]);
+        }
+        tangents
     }
 }
 
@@ -215,7 +305,11 @@ pub fn proportions_for_traits(
     spike_length: f32,
 ) -> CreatureProportions {
     let clamp01 = |v: f32| {
-        if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }
+        if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     };
     let smell = clamp01(trait_smell);
     let hearing = clamp01(trait_hearing);
@@ -253,7 +347,13 @@ struct MeshBuilder {
 }
 
 impl MeshBuilder {
-    fn vertex(&mut self, part: CreaturePart, position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> u32 {
+    fn vertex(
+        &mut self,
+        part: CreaturePart,
+        position: [f32; 3],
+        normal: [f32; 3],
+        uv: [f32; 2],
+    ) -> u32 {
         let index = self.positions.len() as u32;
         self.positions.push(position);
         self.normals.push(normalize(normal));
@@ -511,19 +611,27 @@ const EYE_RADIUS: f32 = 0.13;
 /// Pupil radius factor of the sclera.
 const PUPIL_FACTOR: f32 = 0.55;
 
+/// Half-extent of the impostor card in unit proportions. Must bound the
+/// whole creature: the spike tip reaches x = 0.45 + 0.175 + 0.7 = 1.325,
+/// wheels bottom near y = -0.83, ears top near y = 0.63, wheels z = ±0.68.
+/// 1.4 covers the spike with margin; shared by the LOD2 card geometry and
+/// the impostor bake projection.
+const IMPOSTOR_EXTENT: f32 = 1.4;
+
 /// Build the creature mesh for one LOD tier.
 ///
 /// LOD budgets (asserted in tests): Lod0 ≤ 6000 vertices, Lod1 ≤ 2000,
-/// Lod2 = exactly 8 vertices / 12 indices (two crossed quads).
+/// Lod2 = exactly 8 vertices / 24 indices (two double-sided crossed quads).
 #[must_use]
 pub fn build_creature_mesh(lod: CreatureLod) -> CreatureMeshData {
     let mut builder = MeshBuilder::default();
     match lod {
         CreatureLod::Lod2 => {
-            // Two crossed quads centered at the anchor origin, UVs spanning
-            // the full impostor tile; the impostor bake (later bead) paints
-            // the LOD0 creature into that tile.
-            let extent = 0.9;
+            // Two crossed quads centered at the anchor origin, sampling the
+            // two-tile impostor atlas from [`bake_impostor_atlas`]: the
+            // profile quad (X-Y plane) reads tile 0 (u in [0, 0.5]) and the
+            // front quad (Z-Y plane) reads tile 1 (u in [0.5, 1]).
+            let extent = IMPOSTOR_EXTENT;
             builder.quad(
                 CreaturePart::Body,
                 [
@@ -533,7 +641,7 @@ pub fn build_creature_mesh(lod: CreatureLod) -> CreatureMeshData {
                     [-extent, extent, 0.0],
                 ],
                 [0.0, 0.0, 1.0],
-                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]],
                 true,
             );
             builder.quad(
@@ -545,28 +653,40 @@ pub fn build_creature_mesh(lod: CreatureLod) -> CreatureMeshData {
                     [0.0, extent, -extent],
                 ],
                 [1.0, 0.0, 0.0],
-                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                [[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0]],
                 true,
             );
         }
         CreatureLod::Lod0 | CreatureLod::Lod1 => {
-            let (body_segments, body_rings, wheel_major_segs, wheel_minor_segs, cone_segs, eye_segs) =
-                match lod {
-                    CreatureLod::Lod0 => (16, 8, 14, 8, 10, 6),
-                    CreatureLod::Lod1 => (8, 4, 8, 4, 5, 4),
-                    CreatureLod::Lod2 => unreachable!(),
-                };
+            // Segment budgets target the bead's triangle bands
+            // (Lod0 ~2-4k tris, Lod1 ~800 tris); asserted in tests.
+            let (
+                body_segments,
+                body_rings,
+                wheel_major_segs,
+                wheel_minor_segs,
+                cone_segs,
+                eye_segs,
+            ) = match lod {
+                CreatureLod::Lod0 => (24, 12, 16, 10, 12, 8),
+                CreatureLod::Lod1 => (10, 6, 10, 6, 6, 5),
+                CreatureLod::Lod2 => unreachable!(),
+            };
 
             // Body: capsule along +X = cylinder + two hemispherical caps.
             let body_x0 = -BODY_HALF_LEN;
             let body_x1 = BODY_HALF_LEN;
+            // UV scale [1, 1]: the closing seam wraps cleanly under REPEAT
+            // sampling only when u spans exactly one period; a 2x scale
+            // leaves a fractional-period jump (and breaks the [0,1] UV
+            // invariant asserted for impostor-safe sampling).
             let (ring_a, ring_b) = builder.cylinder_x(
                 CreaturePart::Body,
                 body_x0,
                 body_x1,
                 BODY_RADIUS,
                 body_segments,
-                [2.0, 1.0],
+                [1.0, 1.0],
             );
             // Caps: hemispheres whose equators coincide with the cylinder
             // rings. Build them as half-ellipsoids sharing the ring positions
@@ -641,11 +761,7 @@ pub fn build_creature_mesh(lod: CreatureLod) -> CreatureMeshData {
                 );
                 builder.ellipsoid(
                     CreaturePart::EyePupil(eye as u8),
-                    [
-                        face_x + EYE_RADIUS * 0.7,
-                        eye_y,
-                        eye_z + t * 0.05,
-                    ],
+                    [face_x + EYE_RADIUS * 0.7, eye_y, eye_z + t * 0.05],
                     [EYE_RADIUS * PUPIL_FACTOR; 3],
                     eye_segs,
                     eye_segs,
@@ -670,7 +786,10 @@ pub fn build_creature_mesh(lod: CreatureLod) -> CreatureMeshData {
             );
 
             // Ears: two fins on the upper sides.
-            for (part, zsign) in [(CreaturePart::EarLeft, 1.0_f32), (CreaturePart::EarRight, -1.0_f32)] {
+            for (part, zsign) in [
+                (CreaturePart::EarLeft, 1.0_f32),
+                (CreaturePart::EarRight, -1.0_f32),
+            ] {
                 let base_z = zsign * BODY_RADIUS * 0.45;
                 builder.quad(
                     part,
@@ -746,12 +865,7 @@ fn cap_hemisphere(
             let pz = ring_radius * s;
             // Normal: outward from the sphere center.
             let normal = [direction * theta.sin(), theta.cos() * c, theta.cos() * s];
-            row.push(builder.vertex(
-                CreaturePart::Body,
-                [px, py, pz],
-                normal,
-                [u, t],
-            ));
+            row.push(builder.vertex(CreaturePart::Body, [px, py, pz], normal, [u, t]));
         }
         for seg in 0..segments as usize {
             let next = (seg + 1) % segments as usize;
@@ -776,6 +890,265 @@ fn cap_hemisphere(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Impostor bake: deterministic CPU rasterization of the LOD0 creature into
+// the two-tile atlas sampled by the LOD2 crossed quads. A CPU bake (not GPU)
+// because the atlas must be byte-identical across adapters/platforms — it is
+// a build-time artifact with a deterministic content hash, not a per-run
+// render target.
+// ---------------------------------------------------------------------------
+
+/// Baked impostor atlas for the LOD2 crossed quads.
+///
+/// Layout: two `tile_size x tile_size` tiles side by side (`width() =
+/// 2 * tile_size`, `height() = tile_size`). Tile 0 is the profile view
+/// (viewer at +Z, sees the X-Y silhouette with wheels), tile 1 is the front
+/// view (viewer at +X, sees face/spike). Buffers are row-major RGBA8 with
+/// row 0 = the top of the creature (v = 1), so a direct PNG dump is upright.
+/// Uncovered texels are `(0, 0, 0, 0)` in both maps.
+///
+/// The albedo map holds canonical per-part tints ([`part_albedo`]): neutral
+/// near-white body surfaces so the per-instance primary tint multiplies
+/// cleanly, dark pupils/wheels that stay dark under that tint. The normal
+/// map stores view-space normals per tile encoded as `n * 0.5 + 0.5`.
+#[derive(Debug, Clone)]
+pub struct ImpostorAtlas {
+    tile_size: u32,
+    albedo: Vec<u8>,
+    normals: Vec<u8>,
+}
+
+impl ImpostorAtlas {
+    /// Per-tile resolution; the atlas is two tiles wide.
+    #[must_use]
+    pub const fn tile_size(&self) -> u32 {
+        self.tile_size
+    }
+
+    /// Atlas width in pixels (two tiles).
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.tile_size * 2
+    }
+
+    /// Atlas height in pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.tile_size
+    }
+
+    /// Albedo + coverage alpha, RGBA8 row-major.
+    #[must_use]
+    pub fn albedo_rgba8(&self) -> &[u8] {
+        &self.albedo
+    }
+
+    /// View-space normal map (`n * 0.5 + 0.5`), RGBA8 row-major; alpha 255
+    /// marks covered texels.
+    #[must_use]
+    pub fn normals_rgba8(&self) -> &[u8] {
+        &self.normals
+    }
+
+    /// FNV-1a64 over both buffers: the provenance/regression fingerprint
+    /// used by the determinism test and capture manifests.
+    #[must_use]
+    pub fn content_hash(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for &byte in self.albedo.iter().chain(self.normals.iter()) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+}
+
+/// Canonical per-part albedo tints for the impostor bake.
+///
+/// Body-adjacent surfaces are near-white so the A1/A5 instance shader's
+/// per-instance tint multiplies without hue shift; intrinsically dark
+/// features (pupils, wheels) are baked dark so they survive the same
+/// multiplicative tint. Wheel gray comes from the shared visual semantics
+/// (bd-2z0.14.3.2) instead of a second convention.
+fn part_albedo(part: CreaturePart) -> [f32; 3] {
+    match part {
+        CreaturePart::Body => [0.90, 0.90, 0.93],
+        CreaturePart::WheelLeft | CreaturePart::WheelRight => {
+            scriptbots_core::visual::WHEEL_BASE_RGB
+        }
+        CreaturePart::Spike => [0.72, 0.75, 0.82],
+        CreaturePart::EyeSclera(_) => [0.98, 0.98, 0.98],
+        CreaturePart::EyePupil(_) => [0.04, 0.04, 0.06],
+        CreaturePart::Mouth => [0.80, 0.30, 0.26],
+        CreaturePart::EarLeft | CreaturePart::EarRight => [0.84, 0.84, 0.88],
+        CreaturePart::Nose => [0.60, 0.50, 0.46],
+    }
+}
+
+/// One orthographic impostor view: world axes mapping to (u, v, depth).
+struct ImpostorView {
+    u_axis: [f32; 3],
+    v_axis: [f32; 3],
+    depth_axis: [f32; 3],
+    /// Tile column in the atlas (0 = left/profile, 1 = right/front).
+    tile: u32,
+}
+
+/// Profile (viewer at +Z) and front (viewer at +X) views. `u` runs with
+/// world +X (profile) / +Z (front), `v` runs with world +Y (up), depth is
+/// nearest-to-viewer-wins along the view axis.
+const IMPOSTOR_VIEWS: [ImpostorView; 2] = [
+    ImpostorView {
+        u_axis: [1.0, 0.0, 0.0],
+        v_axis: [0.0, 1.0, 0.0],
+        depth_axis: [0.0, 0.0, 1.0],
+        tile: 0,
+    },
+    ImpostorView {
+        u_axis: [0.0, 0.0, 1.0],
+        v_axis: [0.0, 1.0, 0.0],
+        depth_axis: [1.0, 0.0, 0.0],
+        tile: 1,
+    },
+];
+
+/// Bake the two-tile impostor atlas by software-rasterizing the LOD0
+/// creature from the two [`IMPOSTOR_VIEWS`].
+///
+/// Deterministic: single-threaded, fixed triangle order, plain f32
+/// arithmetic, no hash maps. Two calls with the same `tile_size` produce
+/// byte-identical buffers (asserted in tests).
+///
+/// # Panics
+/// Panics if `tile_size` is outside `8..=1024` (programmer error; callers
+/// bake once at startup with a fixed size).
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub fn bake_impostor_atlas(tile_size: u32) -> ImpostorAtlas {
+    assert!(
+        (8..=1024).contains(&tile_size),
+        "impostor tile_size {tile_size} outside 8..=1024"
+    );
+    let mesh = build_creature_mesh(CreatureLod::Lod0);
+    let size = tile_size as usize;
+    let width = size * 2;
+    let mut albedo = vec![0_u8; width * size * 4];
+    let mut normals = vec![0_u8; width * size * 4];
+    let mut zbuf = vec![f32::NEG_INFINITY; size * size];
+
+    for view in &IMPOSTOR_VIEWS {
+        zbuf.fill(f32::NEG_INFINITY);
+        let tile_x = view.tile as usize * size;
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            let part = mesh.parts[i0];
+            let mut pu = [0.0_f32; 3];
+            let mut pv = [0.0_f32; 3];
+            let mut pd = [0.0_f32; 3];
+            for (corner, &idx) in [i0, i1, i2].iter().enumerate() {
+                let p = mesh.positions[idx];
+                pu[corner] =
+                    p[0].mul_add(view.u_axis[0], p[1] * view.u_axis[1]) + p[2] * view.u_axis[2];
+                pv[corner] =
+                    p[0].mul_add(view.v_axis[0], p[1] * view.v_axis[1]) + p[2] * view.v_axis[2];
+                pd[corner] = p[0].mul_add(view.depth_axis[0], p[1] * view.depth_axis[1])
+                    + p[2] * view.depth_axis[2];
+            }
+            // Map [-EXTENT, EXTENT] -> pixel space; row 0 = top (v = 1).
+            let to_px = |u: f32| (u / IMPOSTOR_EXTENT * 0.5 + 0.5) * tile_size as f32;
+            let mut sx = [0.0_f32; 3];
+            let mut sy = [0.0_f32; 3];
+            for corner in 0..3 {
+                sx[corner] = to_px(pu[corner]);
+                // Flip v so image row 0 is the top of the creature.
+                sy[corner] = (tile_size as f32) - to_px(pv[corner]);
+            }
+            let area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+            if area.abs() < 1e-12 {
+                continue;
+            }
+            let inv_area = 1.0 / area;
+            let min_x = sx
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min)
+                .floor()
+                .max(0.0) as usize;
+            let max_x = sx
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil()
+                .min(tile_size as f32) as usize;
+            let min_y = sy
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min)
+                .floor()
+                .max(0.0) as usize;
+            let max_y = sy
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil()
+                .min(tile_size as f32) as usize;
+            let color = part_albedo(part);
+            for py in min_y..max_y {
+                for px in min_x..max_x {
+                    let cx = px as f32 + 0.5;
+                    let cy = py as f32 + 0.5;
+                    let w0 = ((sx[1] - cx) * (sy[2] - cy) - (sx[2] - cx) * (sy[1] - cy)) * inv_area;
+                    let w1 = ((sx[2] - cx) * (sy[0] - cy) - (sx[0] - cx) * (sy[2] - cy)) * inv_area;
+                    let w2 = 1.0 - w0 - w1;
+                    // Accept either winding: `inv_area` carries the sign, so
+                    // positive barycentrics mean inside for both.
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        continue;
+                    }
+                    let depth = w0.mul_add(pd[0], w1 * pd[1]) + w2 * pd[2];
+                    let cell = py * size + px;
+                    if depth <= zbuf[cell] {
+                        continue;
+                    }
+                    zbuf[cell] = depth;
+                    let n_raw = [
+                        w0.mul_add(mesh.normals[i0][0], w1 * mesh.normals[i1][0])
+                            + w2 * mesh.normals[i2][0],
+                        w0.mul_add(mesh.normals[i0][1], w1 * mesh.normals[i1][1])
+                            + w2 * mesh.normals[i2][1],
+                        w0.mul_add(mesh.normals[i0][2], w1 * mesh.normals[i1][2])
+                            + w2 * mesh.normals[i2][2],
+                    ];
+                    let n = normalize(n_raw);
+                    let n_view = [
+                        n[0].mul_add(view.u_axis[0], n[1] * view.u_axis[1]) + n[2] * view.u_axis[2],
+                        n[0].mul_add(view.v_axis[0], n[1] * view.v_axis[1]) + n[2] * view.v_axis[2],
+                        n[0].mul_add(view.depth_axis[0], n[1] * view.depth_axis[1])
+                            + n[2] * view.depth_axis[2],
+                    ];
+                    let out = ((py * width) + tile_x + px) * 4;
+                    for k in 0..3 {
+                        albedo[out + k] = (color[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        normals[out + k] =
+                            ((n_view[k] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    }
+                    albedo[out + 3] = 255;
+                    normals[out + 3] = 255;
+                }
+            }
+        }
+    }
+    ImpostorAtlas {
+        tile_size,
+        albedo,
+        normals,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,8 +1159,7 @@ mod tests {
             for component in normal {
                 assert!(component.is_finite(), "normal {i} has non-finite component");
             }
-            let len = (normal[0].mul_add(normal[0], normal[1] * normal[1])
-                + normal[2] * normal[2])
+            let len = (normal[0].mul_add(normal[0], normal[1] * normal[1]) + normal[2] * normal[2])
                 .sqrt();
             assert!(
                 (len - 1.0).abs() < 0.01,
@@ -798,9 +1170,12 @@ mod tests {
 
     fn assert_indices_and_uvs_valid(mesh: &CreatureMeshData) {
         let vertex_count = mesh.vertex_count() as u32;
-        assert!(mesh.indices.len() % 3 == 0);
+        assert!(mesh.indices.len().is_multiple_of(3));
         for &index in &mesh.indices {
-            assert!(index < vertex_count, "index {index} out of bounds {vertex_count}");
+            assert!(
+                index < vertex_count,
+                "index {index} out of bounds {vertex_count}"
+            );
         }
         for uv in &mesh.uvs {
             assert!(uv[0].is_finite() && uv[1].is_finite());
@@ -823,13 +1198,17 @@ mod tests {
             .map(|(i, _)| i as u32)
             .collect();
         let mut edges: HashMap<(u32, u32), usize> = HashMap::new();
-        for tri in mesh.indices.chunks_exact(3) {
+        for tri in mesh.indices.as_chunks::<3>().0 {
             let in_part = tri.iter().filter(|v| part_vertices.contains(v)).count();
             if in_part < 3 {
                 continue;
             }
             for edge in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
-                let key = if edge.0 < edge.1 { edge } else { (edge.1, edge.0) };
+                let key = if edge.0 < edge.1 {
+                    edge
+                } else {
+                    (edge.1, edge.0)
+                };
                 *edges.entry(key).or_insert(0) += 1;
             }
         }
@@ -852,7 +1231,11 @@ mod tests {
             "Lod0 budget: {} vertices",
             mesh.vertex_count()
         );
-        assert!(mesh.triangle_count() >= 1500, "Lod0 detail: {}", mesh.triangle_count());
+        assert!(
+            mesh.triangle_count() >= 1500,
+            "Lod0 detail: {}",
+            mesh.triangle_count()
+        );
         // Every expected part is present.
         for part in [
             CreaturePart::Body,
@@ -890,8 +1273,21 @@ mod tests {
     fn lod2_impostor_is_two_crossed_quads() {
         let mesh = build_creature_mesh(CreatureLod::Lod2);
         assert_eq!(mesh.vertex_count(), 8, "two quads = 8 vertices");
-        assert_eq!(mesh.indices.len(), 12, "two quads x two sides x two tris");
+        assert_eq!(
+            mesh.indices.len(),
+            24,
+            "two quads x two sides x two tris x three indices"
+        );
         assert_indices_and_uvs_valid(&mesh);
+        // UV layout matches the two-tile impostor atlas: the profile quad
+        // (X-Y plane, first 4 vertices) samples tile 0 (u in [0, 0.5]) and
+        // the front quad (Z-Y plane, last 4) samples tile 1 (u in [0.5, 1]).
+        for uv in &mesh.uvs[..4] {
+            assert!(uv[0] <= 0.5, "profile quad uv in tile 0: {uv:?}");
+        }
+        for uv in &mesh.uvs[4..] {
+            assert!(uv[0] >= 0.5, "front quad uv in tile 1: {uv:?}");
+        }
     }
 
     #[test]
@@ -923,8 +1319,14 @@ mod tests {
         assert_eq!(covered, mesh.vertex_count(), "ranges cover every vertex");
         // Tags are unique per part variant.
         assert_eq!(CreaturePart::Body.tag(), 0);
-        assert_ne!(CreaturePart::EyeSclera(0).tag(), CreaturePart::EyePupil(0).tag());
-        assert_ne!(CreaturePart::EyeSclera(1).tag(), CreaturePart::EyeSclera(0).tag());
+        assert_ne!(
+            CreaturePart::EyeSclera(0).tag(),
+            CreaturePart::EyePupil(0).tag()
+        );
+        assert_ne!(
+            CreaturePart::EyeSclera(1).tag(),
+            CreaturePart::EyeSclera(0).tag()
+        );
     }
 
     #[test]
@@ -959,7 +1361,109 @@ mod tests {
         assert!(bevy_mesh.attribute(Mesh::ATTRIBUTE_POSITION.id).is_some());
         assert!(bevy_mesh.attribute(Mesh::ATTRIBUTE_NORMAL.id).is_some());
         assert!(bevy_mesh.attribute(Mesh::ATTRIBUTE_UV_0.id).is_some());
+        assert!(bevy_mesh.attribute(Mesh::ATTRIBUTE_TANGENT.id).is_some());
         assert!(bevy_mesh.attribute(ATTRIBUTE_CREATURE_PART.id).is_some());
         assert_eq!(bevy_mesh.count_vertices(), mesh.vertex_count());
+    }
+
+    #[test]
+    fn tangents_are_finite_orthonormal_for_all_lods() {
+        for lod in [CreatureLod::Lod0, CreatureLod::Lod1, CreatureLod::Lod2] {
+            let mesh = build_creature_mesh(lod);
+            let tangents = mesh.compute_tangents();
+            assert_eq!(tangents.len(), mesh.vertex_count());
+            for (i, tangent) in tangents.iter().enumerate() {
+                for component in tangent {
+                    assert!(component.is_finite(), "{lod:?} tangent {i} non-finite");
+                }
+                let len = (tangent[0].mul_add(tangent[0], tangent[1] * tangent[1])
+                    + tangent[2] * tangent[2])
+                    .sqrt();
+                assert!((len - 1.0).abs() < 0.01, "{lod:?} tangent {i} length {len}");
+                assert!(
+                    tangent[3].abs() == 1.0,
+                    "{lod:?} tangent {i} handedness {}",
+                    tangent[3]
+                );
+                let n = mesh.normals[i];
+                let dot = n[0].mul_add(tangent[0], n[1] * tangent[1]) + n[2] * tangent[2];
+                assert!(
+                    dot.abs() < 1e-3,
+                    "{lod:?} tangent {i} not orthogonal: {dot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn impostor_bake_is_deterministic_and_shaped() {
+        let a = bake_impostor_atlas(64);
+        let b = bake_impostor_atlas(64);
+        assert_eq!(a.albedo_rgba8(), b.albedo_rgba8(), "albedo byte-identical");
+        assert_eq!(
+            a.normals_rgba8(),
+            b.normals_rgba8(),
+            "normals byte-identical"
+        );
+        assert_eq!(a.content_hash(), b.content_hash());
+        assert_eq!(a.width(), 128);
+        assert_eq!(a.height(), 64);
+        assert_eq!(a.albedo_rgba8().len(), 128 * 64 * 4);
+        assert_eq!(a.normals_rgba8().len(), 128 * 64 * 4);
+        // Smaller bake differs from larger bake (resolution actually matters).
+        let small = bake_impostor_atlas(16);
+        assert_ne!(a.content_hash(), small.content_hash());
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn impostor_bake_renders_expected_features() {
+        let atlas = bake_impostor_atlas(64);
+        let size = atlas.tile_size() as usize;
+        let width = atlas.width() as usize;
+        let albedo = atlas.albedo_rgba8();
+        let tile_stats = |tile: usize| {
+            let mut covered = 0_usize;
+            let mut min_lum = u8::MAX;
+            let mut max_lum = u8::MIN;
+            for py in 0..size {
+                for px in 0..size {
+                    let out = ((py * width) + tile * size + px) * 4;
+                    if albedo[out + 3] == 0 {
+                        continue;
+                    }
+                    covered += 1;
+                    let lum = albedo[out].max(albedo[out + 1]).max(albedo[out + 2]);
+                    min_lum = min_lum.min(lum);
+                    max_lum = max_lum.max(lum);
+                }
+            }
+            (covered, min_lum, max_lum)
+        };
+        for (tile, label) in [(0_usize, "profile"), (1_usize, "front")] {
+            let (covered, min_lum, max_lum) = tile_stats(tile);
+            let fill = covered as f32 / (size * size) as f32;
+            assert!(
+                (0.05..=0.85).contains(&fill),
+                "{label} tile fill {fill} outside 5%..85% (creature neither absent nor square-filling)"
+            );
+            // Near-white body/sclera present.
+            assert!(max_lum >= 220, "{label} max luminance {max_lum}");
+            // Dark features (pupils, wheels) present.
+            assert!(min_lum <= 60, "{label} min luminance {min_lum}");
+        }
+        // Normal map: covered texels carry alpha and plausible normals.
+        let normals = atlas.normals_rgba8();
+        for py in 0..size {
+            for px in 0..width {
+                let out = (py * width + px) * 4;
+                let covered = albedo[out + 3] == 255;
+                assert_eq!(
+                    normals[out + 3] == 255,
+                    covered,
+                    "normal alpha disagrees with coverage at ({px},{py})"
+                );
+            }
+        }
     }
 }
