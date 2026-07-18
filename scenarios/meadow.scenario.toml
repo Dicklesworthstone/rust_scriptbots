@@ -6,6 +6,8 @@ hypothesis = "A balanced open meadow sustains grazing, reproduction, and occasio
 seeds = [42, 137, 20260717]
 
 [config]
+reproduction_cooldown = 60
+reproduction_attempt_chance = 0.2
 closed = false
 population_minimum = 24
 population_spawn_interval = 600

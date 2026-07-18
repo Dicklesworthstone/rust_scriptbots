@@ -6,6 +6,8 @@ hypothesis = "Population expands on rich food, crashes measurably when the droug
 seeds = [42, 137]
 
 [config]
+reproduction_cooldown = 60
+reproduction_attempt_chance = 0.2
 closed = false
 population_minimum = 24
 population_spawn_interval = 600
@@ -24,8 +26,8 @@ deaths_min = 5
 
 [[interventions]]
 tick = 120
-set = { food_max = 0.05, food_respawn_amount = 0.0, food_respawn_interval = 120 }
+set = { food_max = 0.02, food_respawn_amount = 0.0, food_respawn_interval = 10000, food_growth_rate = 0.0, metabolism_drain = 0.01 }
 
 [[interventions]]
 tick = 220
-set = { food_max = 0.6, food_respawn_amount = 0.5, food_respawn_interval = 20 }
+set = { food_max = 0.6, food_respawn_amount = 0.5, food_respawn_interval = 20, food_growth_rate = 0.02, metabolism_drain = 0.0002 }

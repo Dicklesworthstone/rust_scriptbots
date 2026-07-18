@@ -6,6 +6,8 @@ hypothesis = "Carnivore-leaning cohorts emerge and spike combat is measurable wh
 seeds = [42, 137]
 
 [config]
+reproduction_cooldown = 60
+reproduction_attempt_chance = 0.2
 closed = false
 population_minimum = 24
 population_spawn_interval = 600
