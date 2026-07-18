@@ -71,7 +71,7 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
     let persistence_for_storage = std::sync::Arc::clone(&persistence_shared);
     root.register(ServiceRegion::new(
         "storage-pipeline",
-        Budget::new().with_deadline_at_secs(30),
+        Budget::with_deadline_at_secs(30),
         move |_budget| {
             let finalize = (|| -> anyhow::Result<()> {
                 let mut world = world_for_storage
@@ -96,7 +96,7 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
     ));
     root.register(ServiceRegion::new(
         "control-server",
-        Budget::new().with_deadline_at_secs(15),
+        Budget::with_deadline_at_secs(15),
         move |_budget| match control_runtime.shutdown() {
             Ok(()) => Outcome::ok("control runtime shut down".to_owned()),
             Err(error) => Outcome::Err(format!("{error:#}")),

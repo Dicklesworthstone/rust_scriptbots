@@ -506,7 +506,7 @@ fn main() -> Result<()> {
         let persistence_for_storage = Arc::clone(&persistence);
         root.register(ServiceRegion::new(
             "storage-pipeline",
-            Budget::new().with_deadline_at_secs(30),
+            Budget::with_deadline_at_secs(30),
             move |_budget| match finalize_and_shutdown_storage(
                 &world_for_storage,
                 &persistence_for_storage,
@@ -518,7 +518,7 @@ fn main() -> Result<()> {
         ));
         root.register(ServiceRegion::new(
             "control-server",
-            Budget::new().with_deadline_at_secs(15),
+            Budget::with_deadline_at_secs(15),
             move |_budget| match control_runtime.shutdown() {
                 Ok(()) => Outcome::ok("control runtime shut down".to_owned()),
                 Err(error) => Outcome::Err(format!("{error:#}")),
