@@ -3,7 +3,15 @@
 use bytemuck::{Pod, Zeroable};
 use scriptbots_core::NUM_EYES;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "perf_counters")]
 use std::time::Instant;
+
+/// Animation time step per simulation tick, in seconds.
+///
+/// Shader animation derives from the world tick through this constant — never from a
+/// wall clock — so identical tick sequences produce identical frames and captures
+/// (bd-2z0.7.11). The value preserves the legacy ~60 ticks-per-second visual rate.
+pub const ANIM_SECONDS_PER_TICK: f32 = 1.0 / 60.0;
 
 /// Public snapshot format the renderer expects. Keep minimal; the app will adapt
 /// its internal world snapshot to this view before passing to the renderer.
@@ -12,6 +20,10 @@ pub struct WorldSnapshot<'a> {
     pub world_size: (f32, f32),
     pub terrain: TerrainView<'a>,
     pub agents: &'a [AgentInstance],
+    /// Animation clock for this frame, in seconds; callers derive it from the world
+    /// tick (`tick * ANIM_SECONDS_PER_TICK`) or a recorded sequence so captures are
+    /// deterministic.
+    pub anim_seconds: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -68,7 +80,9 @@ pub struct WorldRenderer {
     view: ViewUniforms,
     cam_scale: f32,
     cam_offset: (f32, f32),
-    start_time: Instant,
+    /// Last tick-derived animation time consumed by `render`; reused by `resize` so the
+    /// shader clock stays monotonic across viewport changes without a wall clock.
+    last_anim_seconds: f32,
     post: Option<PostFx>,
     /// Whether the post pass actually ran during the most recent `render()`.
     /// `post` staying `Some` only means the resources exist; env flags can
@@ -122,7 +136,7 @@ impl WorldRenderer {
             view,
             cam_scale: 1.0,
             cam_offset: (0.0, 0.0),
-            start_time: Instant::now(),
+            last_anim_seconds: 0.0,
             post: None,
             post_ran: false,
             #[cfg(feature = "perf_counters")]
@@ -147,12 +161,11 @@ impl WorldRenderer {
         self.color_view = view;
         self.size = new_size;
         self.readback = ReadbackRing::new(&self.device, new_size, self.format)?;
-        // keep time monotonic across resizes
-        let elapsed = self.start_time.elapsed().as_secs_f32();
+        // keep time monotonic across resizes: reuse the last tick-derived animation time
         self.view.update(
             &self.queue,
             new_size,
-            elapsed,
+            self.last_anim_seconds,
             self.cam_scale,
             self.cam_offset,
         );
@@ -175,12 +188,12 @@ impl WorldRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("world.render"),
             });
-        // Ensure view uniforms match current viewport, time, and camera
-        let elapsed = self.start_time.elapsed().as_secs_f32();
+        // Ensure view uniforms match current viewport, tick-derived time, and camera
+        self.last_anim_seconds = snapshot.anim_seconds;
         self.view.update(
             &self.queue,
             self.size,
-            elapsed,
+            snapshot.anim_seconds,
             self.cam_scale,
             self.cam_offset,
         );
@@ -338,6 +351,7 @@ mod capture_smoke_test {
                 elevation: None,
             },
             agents: &[],
+            anim_seconds: 0.0,
         };
         let frame = renderer.render(&snapshot);
         renderer

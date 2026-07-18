@@ -812,6 +812,7 @@ pub mod world_compositor {
                 elevation: Some(&elevation),
             },
             agents: &agents_gpu,
+            anim_seconds: frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
         };
 
         // Fit camera into the requested viewport
