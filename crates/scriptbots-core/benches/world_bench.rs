@@ -3346,8 +3346,7 @@ fn run_self_test() -> GateResult<()> {
 
     let mut stale_profile_schema =
         synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
-    stale_profile_schema.world_step_profile_schema =
-        "scriptbots.world-step-profile.v2".to_owned();
+    stale_profile_schema.world_step_profile_schema = "scriptbots.world-step-profile.v2".to_owned();
     assert_self_test_status(
         "stale v2 world-step profile schema is refused",
         &compare_artifacts(&baseline, &stale_profile_schema),
