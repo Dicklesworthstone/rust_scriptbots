@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::hint::black_box;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -1100,6 +1101,10 @@ const PERF_REPETITIONS: usize = 5;
 const PERF_TICKS: usize = 200;
 const PERF_WINDOW_TICKS: usize = 20;
 const PERF_SNAPSHOT_SAMPLES_PER_TICK: usize = 5;
+const PERF_MARKER_ENV: &str = "SCRIPTBOTS_PERF_MARKER_PATH";
+const PERF_MARKER_SCHEMA: &str = "scriptbots.perf-marker.v1";
+const PERF_MARKER_REPETITIONS: usize = 3;
+const _: () = assert!(PERF_MARKER_REPETITIONS > 0 && PERF_MARKER_REPETITIONS <= PERF_REPETITIONS);
 const MAX_CV_PCT: f64 = 5.0;
 const MAX_TPS_REGRESSION_PCT: f64 = 10.0;
 const MIN_TPS_1K: f64 = 60.0;
@@ -1107,6 +1112,150 @@ const MAX_SNAPSHOT_P95_NS_1K: u64 = 4_000_000;
 const MEMORY_CLASS_BUCKET_MIB: u64 = 256;
 
 type GateResult<T> = Result<T, String>;
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PerfMarkerEvent {
+    PureTpsStart,
+    PureTpsEnd,
+}
+
+#[derive(Serialize)]
+struct PerfMarkerRecord<'a> {
+    schema: &'static str,
+    run_nonce: &'a str,
+    scenario: &'a str,
+    agents: usize,
+    brain_family: &'a str,
+    measurement: usize,
+    sequence: u64,
+    pid: u32,
+    unix_ns: u64,
+    event: PerfMarkerEvent,
+}
+
+struct PerfMarkerWriter {
+    file: fs::File,
+    path: PathBuf,
+    run_nonce: String,
+    pid: u32,
+    sequence: u64,
+    expected_records: u64,
+}
+
+impl PerfMarkerWriter {
+    fn from_env(mode: GateMode) -> GateResult<Option<Self>> {
+        let Some(raw_path) = env::var_os(PERF_MARKER_ENV) else {
+            return Ok(None);
+        };
+        let path = PathBuf::from(raw_path);
+        if path.as_os_str().is_empty() {
+            return Err(format!("{PERF_MARKER_ENV} must not be empty"));
+        }
+        if !path.is_absolute() {
+            return Err(format!(
+                "{PERF_MARKER_ENV} must be an absolute path, got {}",
+                path.display()
+            ));
+        }
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "failed to create exclusive perf marker {}: {error}",
+                    path.display()
+                )
+            })?;
+        let expected_records = mode
+            .agent_counts()
+            .len()
+            .checked_mul(GateBrainFamily::ALL.len())
+            .and_then(|scenarios| scenarios.checked_mul(PERF_MARKER_REPETITIONS))
+            .and_then(|repetitions| repetitions.checked_mul(2))
+            .ok_or_else(|| "perf marker record count overflowed usize".to_owned())?;
+        let expected_records = u64::try_from(expected_records)
+            .map_err(|error| format!("perf marker record count did not fit u64: {error}"))?;
+        let pid = std::process::id();
+        let initialized_unix_ns = unix_time_ns()?;
+        Ok(Some(Self {
+            file,
+            path,
+            run_nonce: format!("{pid}-{initialized_unix_ns}"),
+            pid,
+            sequence: 0,
+            expected_records,
+        }))
+    }
+
+    fn emit(
+        &mut self,
+        scenario: &str,
+        agents: usize,
+        brain_family: GateBrainFamily,
+        measurement: usize,
+        event: PerfMarkerEvent,
+    ) -> GateResult<()> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| "perf marker sequence overflowed u64".to_owned())?;
+        let record = PerfMarkerRecord {
+            schema: PERF_MARKER_SCHEMA,
+            run_nonce: &self.run_nonce,
+            scenario,
+            agents,
+            brain_family: brain_family.label(),
+            measurement,
+            sequence,
+            pid: self.pid,
+            unix_ns: unix_time_ns()?,
+            event,
+        };
+        let mut encoded = serde_json::to_vec(&record)
+            .map_err(|error| format!("failed to encode perf marker record: {error}"))?;
+        encoded.push(b'\n');
+        self.file.write_all(&encoded).map_err(|error| {
+            format!(
+                "failed to append perf marker {}: {error}",
+                self.path.display()
+            )
+        })?;
+        self.file.flush().map_err(|error| {
+            format!(
+                "failed to flush perf marker {}: {error}",
+                self.path.display()
+            )
+        })?;
+        self.sequence = sequence;
+        Ok(())
+    }
+
+    fn finish(mut self) -> GateResult<()> {
+        self.file.flush().map_err(|error| {
+            format!(
+                "failed to finalize perf marker {}: {error}",
+                self.path.display()
+            )
+        })?;
+        if self.sequence != self.expected_records {
+            return Err(format!(
+                "perf marker {} contains {} records; expected {}",
+                self.path.display(),
+                self.sequence,
+                self.expected_records
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct RepetitionMarker<'a> {
+    writer: &'a mut PerfMarkerWriter,
+    scenario: &'a str,
+    measurement: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GateMode {
@@ -1583,9 +1732,19 @@ fn run_repetition(
     ticks: usize,
     index: usize,
     synthetic_sleep_us: u64,
+    mut marker: Option<RepetitionMarker<'_>>,
 ) -> GateResult<RepetitionResult> {
     let mut throughput_world = build_perf_world(agents, brain_family)?;
     let mut window_elapsed_ns = Vec::with_capacity(ticks / PERF_WINDOW_TICKS);
+    if let Some(marker) = marker.as_mut() {
+        marker.writer.emit(
+            marker.scenario,
+            agents,
+            brain_family,
+            marker.measurement,
+            PerfMarkerEvent::PureTpsStart,
+        )?;
+    }
     for _ in 0..ticks / PERF_WINDOW_TICKS {
         let started = Instant::now();
         for _ in 0..PERF_WINDOW_TICKS {
@@ -1597,6 +1756,15 @@ fn run_repetition(
             }
         }
         window_elapsed_ns.push(duration_ns(started.elapsed()));
+    }
+    if let Some(marker) = marker.as_mut() {
+        marker.writer.emit(
+            marker.scenario,
+            agents,
+            brain_family,
+            marker.measurement,
+            PerfMarkerEvent::PureTpsEnd,
+        )?;
     }
     let total_step_elapsed_ns = window_elapsed_ns
         .iter()
@@ -1712,7 +1880,10 @@ fn run_scenario(
     brain_family: GateBrainFamily,
     ticks: usize,
     synthetic_sleep_us: u64,
+    marker_writer: Option<&mut PerfMarkerWriter>,
 ) -> GateResult<ScenarioResult> {
+    let scenario = scenario_id(agents, brain_family, ticks);
+    let mut marker_writer = marker_writer;
     eprintln!(
         "perf-gate: agents={agents} brain={} warmups={PERF_WARMUPS} measurements={PERF_REPETITIONS} ticks={ticks}",
         brain_family.label()
@@ -1726,17 +1897,28 @@ fn run_scenario(
             ticks,
             index,
             synthetic_sleep_us,
+            None,
         )?);
     }
     let mut measurements = Vec::with_capacity(PERF_REPETITIONS);
     for index in 0..PERF_REPETITIONS {
         eprintln!("perf-gate: measurement {}/{}", index + 1, PERF_REPETITIONS);
+        let marker = if index < PERF_MARKER_REPETITIONS {
+            marker_writer.as_deref_mut().map(|writer| RepetitionMarker {
+                writer,
+                scenario: &scenario,
+                measurement: index + 1,
+            })
+        } else {
+            None
+        };
         measurements.push(run_repetition(
             agents,
             brain_family,
             ticks,
             index,
             synthetic_sleep_us,
+            marker,
         )?);
     }
 
@@ -1759,7 +1941,7 @@ fn run_scenario(
         );
     }
     Ok(ScenarioResult {
-        id: scenario_id(agents, brain_family, ticks),
+        id: scenario,
         agents,
         brain_family: brain_family.label().to_owned(),
         seed: PERF_SEED,
@@ -1784,6 +1966,14 @@ fn run_scenario(
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn unix_time_ns() -> GateResult<u64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?;
+    u64::try_from(elapsed.as_nanos())
+        .map_err(|error| format!("Unix timestamp did not fit u64 nanoseconds: {error}"))
 }
 
 fn median_f64(values: &[f64]) -> GateResult<f64> {
@@ -3024,6 +3214,7 @@ fn run_perf_gate(args: GateArgs) -> GateResult<i32> {
     if args.self_test {
         return run_self_test().map(|()| 0);
     }
+    let mut marker_writer = PerfMarkerWriter::from_env(args.mode)?;
     let fingerprint = capture_fingerprint()?;
     let mut scenarios = Vec::new();
     for agents in args.mode.agent_counts() {
@@ -3033,8 +3224,12 @@ fn run_perf_gate(args: GateArgs) -> GateResult<i32> {
                 brain_family,
                 args.ticks,
                 args.synthetic_sleep_us,
+                marker_writer.as_mut(),
             )?);
         }
+    }
+    if let Some(writer) = marker_writer {
+        writer.finish()?;
     }
     let artifact_kind = if args.record_baseline {
         "baseline"
