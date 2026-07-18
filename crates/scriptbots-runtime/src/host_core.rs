@@ -1865,7 +1865,10 @@ impl HostCore {
         )
         .map_err(status_violation)?;
         self.shared.borrow_mut().store_status(status)?;
-        if matches!(journal, JournalState::CommittedVolatile | JournalState::Durable) {
+        if matches!(
+            journal,
+            JournalState::CommittedVolatile | JournalState::Durable
+        ) {
             self.shared
                 .borrow_mut()
                 .archive_terminal_command(command_id)?;
@@ -4469,8 +4472,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_idempotency_stays_bounded_and_answers_exact_retries_after_durable_archival(
-    ) {
+    fn archived_idempotency_stays_bounded_and_answers_exact_retries_after_durable_archival() {
         let mut core = HostCore::new(HostSessionId::new(91), world(0), options(true))
             .expect("bounded-idempotency host");
         let mut port = core.local_port();
