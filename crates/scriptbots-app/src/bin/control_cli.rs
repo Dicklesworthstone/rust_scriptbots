@@ -325,7 +325,15 @@ fn export_metrics<W: Write>(
     writer: &mut Writer<W>,
     last: Option<usize>,
 ) -> Result<usize> {
-    let records = storage.recent_metrics(last.unwrap_or(4_096))?;
+    // The `--last N` boundary still selects the most recent N rows, but the CSV presents
+    // them in chronological (tick, name) order for offline analysis. Sorting here keeps
+    // the emitted order stable regardless of the storage engine's ORDER BY behavior.
+    let mut records = storage.recent_metrics(last.unwrap_or(4_096))?;
+    records.sort_by(|left, right| {
+        left.tick
+            .cmp(&right.tick)
+            .then_with(|| left.name.cmp(&right.name))
+    });
 
     writer
         .write_record(["tick", "name", "value"])
@@ -346,7 +354,9 @@ fn export_ticks<W: Write>(
     writer: &mut Writer<W>,
     last: Option<usize>,
 ) -> Result<usize> {
-    let records = storage.recent_ticks(last.unwrap_or(4_096))?;
+    let mut records = storage.recent_ticks(last.unwrap_or(4_096))?;
+    // Chronological presentation for the same reason as `export_metrics`.
+    records.sort_by_key(|record| record.tick);
 
     writer
         .write_record([
