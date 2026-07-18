@@ -84,6 +84,29 @@ fn test_path(tag: &str) -> PathBuf {
     ))
 }
 
+/// Probe once whether the temp directory can host a FrankenSQLite database. The pinned
+/// engine's VFS refuses exFAT-class volumes at open (the same reason production run
+/// databases must stay on POSIX filesystems), so DSR profiles that point TMPDIR at such a
+/// volume must skip these file-backed proofs rather than fail them.
+fn engine_capable_temp_dir() -> bool {
+    static CAPABLE: LazyLock<bool> = LazyLock::new(|| {
+        let probe = test_path("engine-capability");
+        let probe_string = probe.to_string_lossy().to_string();
+        let capable = Connection::open(&probe_string)
+            .and_then(Connection::close)
+            .is_ok();
+        let _ = fs::remove_file(&probe);
+        if !capable {
+            eprintln!(
+                "skipping: the temp filesystem cannot host a FrankenSQLite database \
+                 (exFAT-class volume)"
+            );
+        }
+        capable
+    });
+    *CAPABLE
+}
+
 fn cleanup(path: &PathBuf) {
     let path_string = path.to_string_lossy().to_string();
     let _ = fs::remove_file(path);
@@ -193,6 +216,9 @@ fn read_only_count(path: &str, sql: &str, params: &[SqliteValue]) -> i64 {
 
 #[test]
 fn concurrent_reader_observes_only_commit_boundaries() {
+    if !engine_capable_temp_dir() {
+        return;
+    }
     let path = test_path("mvcc-commit-boundary");
     let path_string = path.to_string_lossy().to_string();
 
@@ -318,6 +344,9 @@ fn commit_with_bounded_retry(
 
 #[test]
 fn induced_real_transient_conflict_retries_bounded_and_recovers() {
+    if !engine_capable_temp_dir() {
+        return;
+    }
     let path = test_path("transient-conflict");
     let path_string = path.to_string_lossy().to_string();
 
@@ -418,6 +447,9 @@ fn induced_real_transient_conflict_retries_bounded_and_recovers() {
 
 #[test]
 fn forced_constraint_failure_rolls_back_entire_batch_and_survives_reopen() {
+    if !engine_capable_temp_dir() {
+        return;
+    }
     let path = test_path("rollback-atomicity");
     let path_string = path.to_string_lossy().to_string();
 
@@ -510,6 +542,9 @@ fn forced_constraint_failure_rolls_back_entire_batch_and_survives_reopen() {
 
 #[test]
 fn storage_flush_under_real_contention_is_bounded_logged_and_recovers_exactly_once() {
+    if !engine_capable_temp_dir() {
+        return;
+    }
     let logs = log_buffer();
     let path = test_path("flush-contention");
     let path_string = path.to_string_lossy().to_string();
@@ -713,6 +748,9 @@ fn durability_child_clean_exit() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn acknowledged_batch_survives_child_process_exit_and_reopen()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !engine_capable_temp_dir() {
+        return Ok(());
+    }
     let path = test_path("child-durability");
     let path_string = path.to_string_lossy().to_string();
 
@@ -771,6 +809,9 @@ fn acknowledged_batch_survives_child_process_exit_and_reopen()
 
 #[test]
 fn corrupt_header_startup_refusal_leaves_database_bytes_untouched() {
+    if !engine_capable_temp_dir() {
+        return;
+    }
     let path = test_path("corrupt-header");
     let path_string = path.to_string_lossy().to_string();
 
