@@ -1255,6 +1255,11 @@ mod wgpu_capture_test {
 
 #[cfg(feature = "world_wgpu")]
 fn use_wgpu_renderer() -> bool {
+    // Presentation containment (bd-2z0.7.11): the DEFAULT presentation is the native
+    // GPUI canvas, which performs zero GPU readback. `SB_RENDERER=wgpu` is an explicit
+    // diagnostic product whose per-frame readback/upload is intentional; captures
+    // (--dump-png, frame saves) use the same one-shot readback path. Never widen this
+    // default without a surface/swapchain presentation that needs no readback.
     static CHOICE: OnceLock<bool> = OnceLock::new();
     *CHOICE.get_or_init(|| {
         let choice = match std::env::var("SB_RENDERER").ok().as_deref() {

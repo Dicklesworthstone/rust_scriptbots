@@ -586,11 +586,17 @@ impl ReadbackRing {
                 }
             }
         });
-        // Ensure progress on mapping; non-blocking is sufficient for our readback ring
-        // Non-blocking poll may be insufficient in tests; use indefinite wait
+        // Bounded wait for the map to land: an unbounded wait would let a wedged device
+        // stall a capture — or the opt-in diagnostic presentation — forever (bd-2z0.7.11).
         device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|error| ReadbackError::Device(format!("readback poll failed: {error:?}")))?;
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(2_000)),
+            })
+            .map_err(|error| match error {
+                wgpu::PollError::Timeout => ReadbackError::Timeout,
+                other => ReadbackError::Device(format!("readback poll failed: {other:?}")),
+            })?;
         // Advance ring pointer
         self.curr = (self.curr + 1) % self.slots.len();
         Ok(())
