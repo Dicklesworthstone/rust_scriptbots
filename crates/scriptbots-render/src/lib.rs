@@ -1019,6 +1019,7 @@ mod wgpu_capture_test {
                 elevation: None,
             },
             agents: &[] as &[AgentInstance],
+            anim_seconds: 0.0,
         };
         comp.set_camera_params(1.0, (0.0, 0.0));
         comp.render_snapshot(&snapshot, viewport);
@@ -1156,6 +1157,7 @@ mod wgpu_capture_test {
                 elevation: None,
             },
             agents: &agents,
+            anim_seconds: 0.0,
         };
 
         comp.render_snapshot(&snapshot, viewport);
