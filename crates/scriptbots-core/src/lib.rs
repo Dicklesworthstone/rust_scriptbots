@@ -3730,6 +3730,18 @@ pub enum Region {
         /// Radius.
         radius: f32,
     },
+    /// An axis-aligned rectangle; each axis wraps independently across the seam, so a
+    /// rect whose origin sits near an edge covers the wrap-around cells too.
+    Rect {
+        /// Left edge x.
+        x: f32,
+        /// Top edge y.
+        y: f32,
+        /// Width along the wrapped x axis.
+        w: f32,
+        /// Height along the wrapped y axis.
+        h: f32,
+    },
 }
 
 impl Region {
@@ -3743,10 +3755,17 @@ impl Region {
                 let dy = toroidal_delta(py, y, world_height);
                 dx.mul_add(dx, dy * dy) <= radius * radius
             }
+            Self::Rect { x, y, w, h } => {
+                // Each axis wraps independently from the origin: a point is inside when
+                // its forward wrapped distance from the origin is inside the extent.
+                let forward_x = (px - x).rem_euclid(world_width);
+                let forward_y = (py - y).rem_euclid(world_height);
+                forward_x < w && forward_y < h
+            }
         }
     }
 
-    fn validate(&self) -> Result<(), WorldStateError> {
+    fn validate_basic(&self) -> Result<(), WorldStateError> {
         match *self {
             Self::All => Ok(()),
             Self::Disc { x, y, radius } => {
@@ -3757,8 +3776,75 @@ impl Region {
                 }
                 Ok(())
             }
+            Self::Rect { x, y, w, h } => {
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || !w.is_finite()
+                    || !h.is_finite()
+                    || w <= 0.0
+                    || h <= 0.0
+                {
+                    return Err(WorldStateError::InvalidConfig(
+                        "rect region needs finite coordinates and positive extents",
+                    ));
+                }
+                Ok(())
+            }
         }
     }
+
+    /// Reject a region that cannot mean one experiment on this world's torus. Past the
+    /// injectivity radius a disc wraps onto itself and membership is ambiguous, and a
+    /// rect larger than its world axis is meaningless — clamping either would silently
+    /// run a different experiment than the one the caller asked for.
+    fn validate_for_world(
+        &self,
+        world_width: u32,
+        world_height: u32,
+    ) -> Result<(), WorldStateError> {
+        self.validate_basic()?;
+        let width_f = world_width as f32;
+        let height_f = world_height as f32;
+        match *self {
+            Self::All => Ok(()),
+            Self::Disc { radius, .. } => {
+                let max_radius = width_f.min(height_f) * 0.5;
+                if radius > max_radius {
+                    return Err(InterventionError::RegionTooLarge { radius, max_radius }.into());
+                }
+                Ok(())
+            }
+            Self::Rect { w, h, .. } => {
+                if w > width_f || h > height_f {
+                    return Err(InterventionError::RectTooLarge {
+                        w,
+                        h,
+                        world_width,
+                        world_height,
+                    }
+                    .into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A deliberate perturbation of the world was rejected as unhonourable.
+#[derive(Debug, Clone, Copy, PartialEq, Error)]
+pub enum InterventionError {
+    /// The disc radius exceeds the world's injectivity radius, so membership would be
+    /// ambiguous where the disc wraps onto itself.
+    #[error("disc radius {radius} exceeds the injectivity radius {max_radius}")]
+    RegionTooLarge { radius: f32, max_radius: f32 },
+    /// The rectangle exceeds a world axis outright.
+    #[error("rect {w}x{h} exceeds the {world_width}x{world_height} world extents")]
+    RectTooLarge {
+        w: f32,
+        h: f32,
+        world_width: u32,
+        world_height: u32,
+    },
 }
 
 /// A deliberate perturbation of the world.
@@ -3817,7 +3903,7 @@ impl Intervention {
                 growth_scale,
                 ..
             } => {
-                region.validate()?;
+                region.validate_basic()?;
                 if !(0.0..=1.0).contains(&growth_scale) {
                     return Err(WorldStateError::InvalidConfig(
                         "drought growth_scale must lie in [0, 1]",
@@ -3826,7 +3912,7 @@ impl Intervention {
                 Ok(())
             }
             Self::Bloom { region, amount } => {
-                region.validate()?;
+                region.validate_basic()?;
                 if !amount.is_finite() || amount < 0.0 {
                     return Err(WorldStateError::InvalidConfig(
                         "bloom amount must be finite and non-negative",
@@ -3839,7 +3925,7 @@ impl Intervention {
                 lethality,
                 scorch,
             } => {
-                region.validate()?;
+                region.validate_basic()?;
                 if !lethality.is_finite() || lethality < 0.0 {
                     return Err(WorldStateError::InvalidConfig(
                         "meteor lethality must be finite and non-negative",
@@ -3852,6 +3938,27 @@ impl Intervention {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Reject an intervention whose region is unhonourable on this exact world's torus:
+    /// a disc past the injectivity radius wraps onto itself, and a rect larger than its
+    /// world axis is meaningless. Basic magnitude/region checks still apply first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldStateError::Intervention`] for an unhonourable region, or
+    /// [`WorldStateError::InvalidConfig`] for a non-finite or negative magnitude.
+    pub fn validate_for_world(
+        &self,
+        world_width: u32,
+        world_height: u32,
+    ) -> Result<(), WorldStateError> {
+        self.validate()?;
+        match *self {
+            Self::Drought { region, .. }
+            | Self::Bloom { region, .. }
+            | Self::Meteor { region, .. } => region.validate_for_world(world_width, world_height),
         }
     }
 }
@@ -8300,6 +8407,9 @@ pub enum WorldStateError {
     /// A versioned brain-family registration or envelope operation failed.
     #[error(transparent)]
     BrainProtocol(#[from] BrainProtocolError),
+    /// A rejected intervention; carries the typed reason.
+    #[error(transparent)]
+    Intervention(#[from] InterventionError),
 }
 
 /// Control-related runtime behavior toggles.
@@ -15695,7 +15805,7 @@ impl WorldState {
         intervention: Intervention,
     ) -> Result<(), WorldStateError> {
         self.ensure_scientific_mutation_allowed("interventions")?;
-        intervention.validate()?;
+        intervention.validate_for_world(self.config.world_width, self.config.world_height)?;
         self.pending_interventions.push(intervention);
         Ok(())
     }
@@ -25082,6 +25192,277 @@ mod tests {
             "an agent 100 units away must be untouched, got {}",
             health_of(far)
         );
+    }
+
+    #[test]
+    fn a_meteor_selects_agents_across_the_y_seam() {
+        // Same seam discipline on the other axis: a fix that wraps only x dies here.
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            rng_seed: Some(6),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let near_top = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 5.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let near_bottom = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 195.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let far = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+
+        world
+            .enqueue_intervention(Intervention::Meteor {
+                region: Region::Disc {
+                    x: 100.0,
+                    y: 0.0,
+                    radius: 12.0,
+                },
+                lethality: 0.5,
+                scorch: 1.0,
+            })
+            .expect("valid meteor");
+        world.step().expect("step");
+
+        let health_of = |id| {
+            let idx = world.agents().index_of(id).expect("alive");
+            world.agents().columns().health()[idx]
+        };
+        assert!(
+            (health_of(near_top) - 1.5).abs() < 1e-5,
+            "agent just inside the y seam must take the damage, got {}",
+            health_of(near_top)
+        );
+        assert!(
+            (health_of(near_bottom) - 1.5).abs() < 1e-5,
+            "agent on the OTHER side of the y seam is 5 away, not 195, got {}",
+            health_of(near_bottom)
+        );
+        assert!(
+            (health_of(far) - 2.0).abs() < 1e-5,
+            "an agent 100 away must be untouched, got {}",
+            health_of(far)
+        );
+    }
+
+    #[test]
+    fn a_meteor_selects_agents_across_the_corner() {
+        // The corner is where a fix that wraps only ONE axis dies quietly: the agent at
+        // (195,195) sits 7.07 from the disc centre on the torus, 268 on a naive plane.
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            rng_seed: Some(7),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let inside_a = world.spawn_agent(AgentData {
+            position: Position::new(5.0, 5.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let inside_corner = world.spawn_agent(AgentData {
+            position: Position::new(195.0, 195.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let outside = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+
+        world
+            .enqueue_intervention(Intervention::Meteor {
+                region: Region::Disc {
+                    x: 0.0,
+                    y: 0.0,
+                    radius: 20.0,
+                },
+                lethality: 5.0,
+                scorch: 1.0,
+            })
+            .expect("valid meteor");
+        world.step().expect("step");
+
+        let health_or_dead = |id| {
+            world
+                .agents()
+                .index_of(id)
+                .map(|idx| world.agents().columns().health()[idx])
+        };
+        assert_eq!(
+            health_or_dead(inside_a).unwrap_or(0.0),
+            0.0,
+            "the agent at (5,5) must be dead or at zero health in the corner disc"
+        );
+        assert_eq!(
+            health_or_dead(inside_corner).unwrap_or(0.0),
+            0.0,
+            "the agent at (195,195) must be dead or at zero health — a one-axis wrap \
+             would spare it and call that correct"
+        );
+        let outside_idx = world
+            .agents()
+            .index_of(outside)
+            .expect("the centre agent must survive");
+        assert!(
+            (world.agents().columns().health()[outside_idx] - 2.0).abs() < 1e-5,
+            "the centre agent must be untouched"
+        );
+    }
+
+    #[test]
+    fn rect_regions_wrap_each_axis_independently() {
+        let width = 200.0_f32;
+        let height = 200.0_f32;
+
+        let x_wrap = Region::Rect {
+            x: 190.0,
+            y: 50.0,
+            w: 20.0,
+            h: 20.0,
+        };
+        assert!(
+            x_wrap.contains(195.0, 60.0, width, height),
+            "inside, left of seam"
+        );
+        assert!(
+            x_wrap.contains(5.0, 60.0, width, height),
+            "inside, right of seam"
+        );
+        assert!(
+            !x_wrap.contains(60.0, 60.0, width, height),
+            "60 is 70 forward from 190 on the torus, outside the 20-wide rect"
+        );
+        assert!(
+            !x_wrap.contains(195.0, 40.0, width, height),
+            "above the rect's y extent"
+        );
+
+        let y_wrap = Region::Rect {
+            x: 50.0,
+            y: 190.0,
+            w: 20.0,
+            h: 20.0,
+        };
+        assert!(
+            y_wrap.contains(60.0, 195.0, width, height),
+            "inside, above seam"
+        );
+        assert!(
+            y_wrap.contains(60.0, 5.0, width, height),
+            "inside, below seam"
+        );
+        assert!(
+            !y_wrap.contains(60.0, 60.0, width, height),
+            "60 is 70 forward from 190 on the torus"
+        );
+
+        let corner_wrap = Region::Rect {
+            x: 190.0,
+            y: 190.0,
+            w: 20.0,
+            h: 20.0,
+        };
+        assert!(corner_wrap.contains(195.0, 195.0, width, height));
+        assert!(corner_wrap.contains(5.0, 5.0, width, height));
+        assert!(!corner_wrap.contains(100.0, 100.0, width, height));
+
+        let full_width = Region::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 20.0,
+        };
+        assert!(full_width.contains(150.0, 10.0, width, height));
+        assert!(
+            !full_width.contains(150.0, 30.0, width, height),
+            "outside the 20-tall band"
+        );
+    }
+
+    #[test]
+    fn oversized_regions_are_rejected_not_clamped() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let disc_error = world
+            .enqueue_intervention(Intervention::Meteor {
+                region: Region::Disc {
+                    x: 0.0,
+                    y: 0.0,
+                    radius: 101.0,
+                },
+                lethality: 1.0,
+                scorch: 1.0,
+            })
+            .expect_err("a disc past the injectivity radius must be rejected");
+        assert!(
+            matches!(
+                disc_error,
+                WorldStateError::Intervention(InterventionError::RegionTooLarge {
+                    radius,
+                    max_radius
+                }) if radius == 101.0 && max_radius == 100.0
+            ),
+            "expected typed RegionTooLarge, got {disc_error}"
+        );
+
+        let rect_error = world
+            .enqueue_intervention(Intervention::Bloom {
+                region: Region::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 250.0,
+                    h: 20.0,
+                },
+                amount: 1.0,
+            })
+            .expect_err("a rect wider than the world must be rejected");
+        assert!(
+            matches!(
+                rect_error,
+                WorldStateError::Intervention(InterventionError::RectTooLarge { .. })
+            ),
+            "expected typed RectTooLarge, got {rect_error}"
+        );
+
+        // A rect exactly at the injectivity limit remains honourable.
+        world
+            .enqueue_intervention(Intervention::Bloom {
+                region: Region::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 200.0,
+                    h: 20.0,
+                },
+                amount: 1.0,
+            })
+            .expect("a full-width rect is valid");
     }
 
     #[test]
