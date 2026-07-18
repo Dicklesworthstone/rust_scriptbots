@@ -172,8 +172,7 @@ fn cancellation_storm_preserves_durability_invariants_at_every_point() {
             ..ScriptBotsConfig::default()
         };
         let (mut world, mut persistence) =
-            WorldState::with_persistence(config, Box::new(pipeline.sink()))
-                .expect("storm world");
+            WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("storm world");
         for _ in 0..ticks {
             persistence.step(&mut world).expect("storm science tick");
         }
