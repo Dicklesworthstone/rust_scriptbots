@@ -1034,7 +1034,7 @@ fn decode_lower_hex(context: &'static str, encoded: &str) -> Result<Vec<u8>, Sto
         }
     }
 
-    if encoded.is_empty() || encoded.len() % 2 != 0 {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
         return Err(StorageError::InvalidData {
             context,
             reason: "postcard hex must have a nonzero even length".to_owned(),
