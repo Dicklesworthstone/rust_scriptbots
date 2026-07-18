@@ -1041,7 +1041,7 @@ fn decode_lower_hex(context: &'static str, encoded: &str) -> Result<Vec<u8>, Sto
         });
     }
     let mut decoded = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
+    for pair in encoded.as_bytes().as_chunks::<2>().0 {
         let high = nibble(pair[0]).ok_or(StorageError::InvalidData {
             context,
             reason: "postcard hex must use lowercase hexadecimal characters".to_owned(),
