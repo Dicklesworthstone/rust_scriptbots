@@ -569,7 +569,9 @@ impl SharedHostState {
         };
         let terminal = matches!(
             authority.status.application(),
-            ApplicationState::Applied(_) | ApplicationState::Rejected(_) | ApplicationState::Failed(_)
+            ApplicationState::Applied(_)
+                | ApplicationState::Rejected(_)
+                | ApplicationState::Failed(_)
         );
         if !terminal
             || self.shutdown_command_id == Some(command_id)
@@ -1830,7 +1832,10 @@ impl HostCore {
                 ));
             };
             if archived.status.journal() == &journal
-                || matches!(archived.status.journal(), JournalState::Durable | JournalState::Failed(_))
+                || matches!(
+                    archived.status.journal(),
+                    JournalState::Durable | JournalState::Failed(_)
+                )
             {
                 return Ok(false);
             }
