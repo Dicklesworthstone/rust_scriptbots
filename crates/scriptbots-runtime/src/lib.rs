@@ -1933,22 +1933,20 @@ impl CommandLifecycleEvidence {
             }
         }
 
-        match self.admission_sequence {
-            None => {
-                if self.transitions.len() != 1
-                    || !matches!(
-                        &self.transitions[0].application,
-                        ApplicationState::Rejected(
-                            RejectionReason::Validation { .. }
-                                | RejectionReason::Overloaded { .. }
-                                | RejectionReason::HostStopping
-                        )
+        if self.admission_sequence.is_none() {
+            if self.transitions.len() != 1
+                || !matches!(
+                    &self.transitions[0].application,
+                    ApplicationState::Rejected(
+                        RejectionReason::Validation { .. }
+                            | RejectionReason::Overloaded { .. }
+                            | RejectionReason::HostStopping
                     )
-                {
-                    return Err(CommandLifecycleEvidenceError::InvalidPreAdmissionLifecycle);
-                }
+                )
+            {
+                return Err(CommandLifecycleEvidenceError::InvalidPreAdmissionLifecycle);
             }
-            Some(_) => {
+        } else {
                 if self.transitions.len() != 2
                     || self.transitions[0].application != ApplicationState::Admitted
                     || !matches!(
@@ -1978,7 +1976,6 @@ impl CommandLifecycleEvidence {
                 if terminal.revisions.config < admitted.revisions.config {
                     return Err(CommandLifecycleEvidenceError::TerminalConfigRevisionRegressed);
                 }
-            }
         }
         Ok(())
     }
@@ -2033,7 +2030,7 @@ impl CommandLifecycleEvidence {
     /// Every lifecycle evidence record offered by the runtime is audited,
     /// independently of whether the command also carries scientific persistence.
     #[must_use]
-    pub fn requires_runtime_journal(&self) -> bool {
+    pub const fn requires_runtime_journal(&self) -> bool {
         self.envelope.command.requires_journal() && !self.transitions.is_empty()
     }
 }
@@ -2068,10 +2065,18 @@ impl<'de> Deserialize<'de> for CommandLifecycleEvidence {
 pub enum CommandLifecycleEvidenceError {
     /// The payload declared an unsupported schema revision.
     #[error("unsupported command lifecycle schema version {found}")]
-    UnsupportedSchema { found: u16 },
+    UnsupportedSchema {
+        /// The schema revision the payload declared.
+        found: u16,
+    },
     /// The persisted source did not match the command id namespace.
     #[error("command source namespace {actual} does not match command id namespace {expected}")]
-    SourceMismatch { expected: u64, actual: u64 },
+    SourceMismatch {
+        /// The namespace the command id claims.
+        expected: u64,
+        /// The namespace the persisted evidence actually carried.
+        actual: u64,
+    },
     /// A terminal lifecycle must contain evidence.
     #[error("command lifecycle has no transitions")]
     EmptyTransitions,
@@ -2080,7 +2085,12 @@ pub enum CommandLifecycleEvidenceError {
     TransitionCountOverflow,
     /// Transition ordinals must be the exact zero-based vector order.
     #[error("command lifecycle transition ordinal {actual} does not follow {expected}")]
-    NoncontiguousOrdinal { expected: u32, actual: u32 },
+    NoncontiguousOrdinal {
+        /// The ordinal the evidence was required to carry.
+        expected: u32,
+        /// The ordinal the evidence actually carried.
+        actual: u32,
+    },
     /// An applied state's embedded boundary disagreed with its observed boundary.
     #[error("applied command transition does not match its observed host boundary")]
     AppliedBoundaryMismatch,
@@ -2292,7 +2302,7 @@ fn retained_command_bytes(command: Option<&CommandEnvelope>) -> usize {
     ))
 }
 
-fn retained_application_state_bytes(application: &ApplicationState) -> usize {
+const fn retained_application_state_bytes(application: &ApplicationState) -> usize {
     match application {
         ApplicationState::Rejected(RejectionReason::Validation { message }) => message.capacity(),
         ApplicationState::Failed(failure) => failure
@@ -2901,7 +2911,7 @@ impl CommandStatus {
     }
 }
 
-fn validate_status_combination(
+const fn validate_status_combination(
     admission_sequence: Option<AdmissionSequence>,
     application: &ApplicationState,
     journal: &JournalState,
@@ -7254,17 +7264,22 @@ mod tests {
                 );
             }
         }
-        let rejected = ApplicationState::Rejected(RejectionReason::HostStopping);
-        for journal in journals.clone() {
+        for journal in journals {
             assert!(
-                CommandStatus::try_new(CommandId::new(2), None, rejected.clone(), journal,).is_ok()
+                CommandStatus::try_new(
+                    CommandId::new(2),
+                    None,
+                    ApplicationState::Rejected(RejectionReason::HostStopping),
+                    journal,
+                )
+                .is_ok()
             );
         }
         assert_eq!(
             CommandStatus::try_new(
                 CommandId::new(2),
                 Some(AdmissionSequence::new(2)),
-                rejected.clone(),
+                ApplicationState::Rejected(RejectionReason::HostStopping),
                 JournalState::Pending,
             ),
             Err(StatusCombinationError::PreAdmissionRejectionWasAdmitted)

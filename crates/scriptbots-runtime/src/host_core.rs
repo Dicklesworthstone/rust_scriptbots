@@ -417,7 +417,7 @@ struct CommandAuthority {
 
 impl CommandAuthority {
     fn lifecycle_evidence(&self) -> Result<CommandLifecycleEvidence, HostAccessError> {
-        let envelope = self.envelope.as_ref().cloned().ok_or_else(|| {
+        let envelope = self.envelope.clone().ok_or_else(|| {
             protocol_violation("command lifecycle envelope was already compacted")
         })?;
         CommandLifecycleEvidence::from_terminal(
@@ -563,9 +563,9 @@ impl SharedHostState {
     /// Eviction guards: the command must be terminal (Applied/Rejected/Failed), must
     /// not be the pending shutdown command, and must not hold an outstanding audit
     /// order. Those stay live; every other durably archived record eventually moves.
-    fn archive_terminal_command(&mut self, command_id: CommandId) -> Result<(), HostAccessError> {
+    fn archive_terminal_command(&mut self, command_id: CommandId) {
         let Some(authority) = self.commands.get(&command_id) else {
-            return Ok(());
+            return;
         };
         let terminal = matches!(
             authority.status.application(),
@@ -577,7 +577,7 @@ impl SharedHostState {
             || self.shutdown_command_id == Some(command_id)
             || authority.pending_audit_order.is_some()
         {
-            return Ok(());
+            return;
         }
         let archived = ArchivedIdempotency {
             envelope_digest: authority.envelope_digest,
@@ -591,7 +591,6 @@ impl SharedHostState {
                 self.archived_idempotency.remove(&oldest);
             }
         }
-        Ok(())
     }
 
     fn reserve_pre_admission_audit(&mut self) -> Result<u64, HostAccessError> {
@@ -1263,6 +1262,7 @@ impl HostCore {
     }
 
     /// Construct a host with an injected runtime-neutral journal adapter.
+    #[allow(clippy::too_many_lines)]
     pub fn with_journal(
         session_id: HostSessionId,
         world: WorldState,
@@ -1871,7 +1871,7 @@ impl HostCore {
         ) {
             self.shared
                 .borrow_mut()
-                .archive_terminal_command(command_id)?;
+                .archive_terminal_command(command_id);
         }
         Ok(true)
     }
@@ -2206,7 +2206,7 @@ impl HostCore {
         self.revisions.config = ConfigRevision::new(self.world.config_revision());
         let applied = self.applied_boundary();
         self.complete_applied_with(envelope.command_id, admission, applied)?;
-        let blocked = self.offer_journal(envelope, applied, None, None)?;
+        let blocked = self.offer_journal(&envelope, applied, None, None)?;
         Ok(ApplyResult::completed(blocked))
     }
 
@@ -2280,7 +2280,7 @@ impl HostCore {
             revisions: self.revisions,
         };
         self.complete_applied_with(envelope.command_id, admission, applied)?;
-        let blocked = self.offer_journal(envelope, applied, Some(scientific), persistence)?;
+        let blocked = self.offer_journal(&envelope, applied, Some(scientific), persistence)?;
         if let Some(fault) = completed_fault {
             self.latch_completed_step_fault(tick, &fault)?;
         }
@@ -2331,7 +2331,7 @@ impl HostCore {
         self.revisions.control = next_control;
         let applied = self.applied_boundary();
         self.complete_applied_with(envelope.command_id, admission, applied)?;
-        let blocked = self.offer_journal(envelope, applied, None, persistence)?;
+        let blocked = self.offer_journal(&envelope, applied, None, persistence)?;
         self.synchronize_health()?;
         Ok(ApplyResult::completed(blocked))
     }
@@ -2390,7 +2390,7 @@ impl HostCore {
 
     fn offer_journal(
         &mut self,
-        envelope: CommandEnvelope,
+        envelope: &CommandEnvelope,
         applied: AppliedCommand,
         scientific: Option<Arc<ScientificBoundary>>,
         persistence: Option<Arc<scriptbots_core::PersistenceBatch>>,
@@ -2447,7 +2447,7 @@ impl HostCore {
     ) -> Result<bool, HostAccessError> {
         let applied = lifecycle
             .terminal()
-            .map(|transition| transition.boundary())
+            .map(CommandLifecycleTransition::boundary)
             .ok_or_else(|| protocol_violation("terminal command lifecycle is empty"))?;
         let batch_id = JournalBatchId::new(self.session_id, self.next_journal_sequence);
         self.next_journal_sequence = self
@@ -4485,7 +4485,7 @@ mod tests {
         // live map may retain once lifecycle evidence is durably archived.
         for ordinal in 1_u128..=40 {
             submit(&mut port, ordinal, HostCommand::Step);
-            let boundary = (ordinal * 2) as u64;
+            let boundary = u64::try_from(ordinal * 2).expect("test boundary within u64");
             core.drive(ManualInstant::from_nanos(boundary))
                 .expect("scientific boundary");
             core.drive(ManualInstant::from_nanos(boundary + 1))
@@ -4980,9 +4980,14 @@ mod tests {
         let mut port = core.local_port();
         let mut envelopes = Vec::new();
         for sequence in 1_u128..=8 {
-            let mut config = ScriptBotsConfig::default();
-            config.initial_food = f32::from_bits(0x7fc0_0001);
-            config.neuroflow.hidden_layers = vec![64; 64];
+            let config = ScriptBotsConfig {
+                initial_food: f32::from_bits(0x7fc0_0001),
+                neuroflow: scriptbots_core::NeuroflowSettings {
+                    hidden_layers: vec![64; 64],
+                    ..scriptbots_core::NeuroflowSettings::default()
+                },
+                ..ScriptBotsConfig::default()
+            };
             let envelope = CommandEnvelope::new(
                 CommandId::new(sequence),
                 HostCommand::UpdateConfig(Box::new(config)),
