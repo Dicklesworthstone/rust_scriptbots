@@ -813,6 +813,7 @@ pub mod world_compositor {
             },
             agents: &agents_gpu,
             anim_seconds: frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
+            tonemap_mode: frame.tonemap_mode,
         };
 
         // Fit camera into the requested viewport
@@ -1020,6 +1021,7 @@ mod wgpu_capture_test {
             },
             agents: &[] as &[AgentInstance],
             anim_seconds: 0.0,
+            tonemap_mode: None,
         };
         comp.set_camera_params(1.0, (0.0, 0.0));
         comp.render_snapshot(&snapshot, viewport);
@@ -1158,6 +1160,7 @@ mod wgpu_capture_test {
             },
             agents: &agents,
             anim_seconds: 0.0,
+            tonemap_mode: None,
         };
 
         comp.render_snapshot(&snapshot, viewport);
@@ -1211,6 +1214,7 @@ mod wgpu_capture_test {
             },
             agents: &[] as &[AgentInstance],
             anim_seconds: 0.0,
+            tonemap_mode: None,
         };
         comp.render_snapshot(&empty, viewport);
         let without_agents =
@@ -1435,6 +1439,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         terrain: terrain_view,
         agents: &agents_gpu,
         anim_seconds: state.frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
+        tonemap_mode: state.frame.tonemap_mode,
     };
 
     tracing::info!(
@@ -11112,6 +11117,7 @@ fn color_swatch(color: [f32; 3]) -> Div {
 #[derive(Clone)]
 struct RenderFrame {
     tick: u64,
+    tonemap_mode: Option<RenderTonemapMode>,
     world_size: (f32, f32),
     terrain: TerrainFrame,
     food_dimensions: (u32, u32),
@@ -11401,6 +11407,7 @@ impl RenderFrame {
 
         Some(Self {
             tick: world.tick().0,
+            tonemap_mode: config.render.tonemap_mode,
             world_size: (config.world_width as f32, config.world_height as f32),
             terrain,
             food_dimensions: (width, height),

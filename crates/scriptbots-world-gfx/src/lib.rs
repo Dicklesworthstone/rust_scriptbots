@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use bytemuck::{Pod, Zeroable};
-use scriptbots_core::NUM_EYES;
+use scriptbots_core::{NUM_EYES, RenderTonemapMode};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "perf_counters")]
 use std::time::Instant;
@@ -24,6 +24,10 @@ pub struct WorldSnapshot<'a> {
     /// tick (`tick * ANIM_SECONDS_PER_TICK`) or a recorded sequence so captures are
     /// deterministic.
     pub anim_seconds: f32,
+    /// The selected tonemap control from `RenderSettings`, when any. `None` defers to
+    /// the renderer's environment-driven default; `Some` makes the chosen curve drive
+    /// the shader every frame rather than sitting unconsumed (bd-2z0.7.11).
+    pub tonemap_mode: Option<RenderTonemapMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -262,12 +266,19 @@ impl WorldRenderer {
         if self.ensure_post()
             && let Some(p) = self.post.as_mut()
         {
+            // The selected RenderSettings tonemap control wins over the environment
+            // default so the chosen curve is actually consumed (bd-2z0.7.11).
+            let selected_tonemap = snapshot.tonemap_mode.map(|mode| match mode {
+                RenderTonemapMode::Aces | RenderTonemapMode::Tony => 1_u32,
+                RenderTonemapMode::Agx => 3_u32,
+            });
             p.run(
                 &self.device,
                 &self.queue,
                 &mut encoder,
                 &self.color_view,
                 self.size,
+                selected_tonemap,
             );
             self.post_ran = true;
         }
@@ -352,6 +363,7 @@ mod capture_smoke_test {
             },
             agents: &[],
             anim_seconds: 0.0,
+            tonemap_mode: None,
         };
         let frame = renderer.render(&snapshot);
         renderer
@@ -2109,6 +2121,7 @@ impl PostFx {
         encoder: &mut wgpu::CommandEncoder,
         src: &wgpu::TextureView,
         size: (u32, u32),
+        selected_tonemap: Option<u32>,
     ) {
         // Refresh env-driven parameters at most every 250ms to avoid per-frame parsing overhead
         let needs_refresh = self
@@ -2187,7 +2200,7 @@ impl PostFx {
         let params = PostParams {
             exposure: self.env_exposure,
             vignette: self.env_vignette,
-            tonemap: self.env_tonemap,
+            tonemap: selected_tonemap.unwrap_or(self.env_tonemap),
             fxaa: self.env_fxaa,
             bloom_thresh: self.env_bloom_thresh,
             bloom_intensity: self.env_bloom_intensity,
@@ -2397,6 +2410,10 @@ fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     rgb = aces_tonemap(rgb);
   } else if (params.tonemap == 2u) {
     rgb = reinhard_tonemap(rgb);
+  } else if (params.tonemap == 3u) {
+    // AgX parity with the CPU tonemap_rgb Agx path: pre-compress x/(x+0.3),
+    // then the same fitted-ACES curve.
+    rgb = aces_tonemap(rgb / (rgb + vec3<f32>(0.3)));
   } else {
     rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
   }

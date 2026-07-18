@@ -8847,9 +8847,11 @@ pub struct RenderFogSettings {
 pub enum RenderAntiAliasing {
     /// No anti-aliasing.
     Off,
-    /// Fast approximate AA (cheap, default at Low/Medium).
+    /// Fast approximate AA. Not implemented by any current renderer; accepted for
+    /// forward compatibility.
     Fxaa,
-    /// Temporal AA (default at High/Ultra).
+    /// Temporal AA. Not implemented by any current renderer; accepted for forward
+    /// compatibility.
     Taa,
     /// Subpixel morphological AA (documented alternative).
     Smaa,
@@ -8999,6 +9001,19 @@ impl RenderSettings {
                     "render.day_night.night_ambient must be finite and within [0, 1]",
                 ));
             }
+        }
+        if let Some(post) = &self.post
+            && let Some(mode) = post.anti_aliasing
+            && mode != RenderAntiAliasing::Off
+        {
+            // Truthful-controls rule (bd-2z0.7.11): the value is accepted so configs
+            // stay forward-compatible, but it must never be mistaken for a working
+            // feature while no renderer implements AA.
+            tracing::warn!(
+                mode = ?mode,
+                "render.post.anti_aliasing selects an anti-aliasing mode, but no renderer \
+                 implements one yet; the setting has no effect"
+            );
         }
         Ok(())
     }
