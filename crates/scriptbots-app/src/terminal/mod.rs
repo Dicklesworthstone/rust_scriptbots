@@ -577,12 +577,7 @@ impl<'a> TerminalApp<'a> {
     /// drained `UpdateConfig` command, so a rerun of the same scenario replays the
     /// same interventions at the same ticks.
     fn apply_due_interventions(&mut self) {
-        let due: Vec<crate::ScenarioInterventionV1> = self
-            .scenario
-            .interventions
-            .iter()
-            .cloned()
-            .collect();
+        let due: Vec<crate::ScenarioInterventionV1> = self.scenario.interventions.to_vec();
         if due.is_empty() {
             return;
         }

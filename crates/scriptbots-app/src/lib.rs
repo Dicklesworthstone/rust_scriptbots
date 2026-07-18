@@ -689,7 +689,7 @@ pub fn apply_scenario_interventions(
                     detail: format!("merged config does not deserialize: {error}"),
                 }
             })?;
-        scriptbots_core::apply_control_command(
+        let disposition = scriptbots_core::apply_control_command(
             world,
             scriptbots_core::ControlCommand::UpdateConfig(Box::new(merged_config.clone())),
         )
@@ -697,6 +697,13 @@ pub fn apply_scenario_interventions(
             tick,
             detail: error.to_string(),
         })?;
+        debug_assert!(
+            matches!(
+                disposition,
+                scriptbots_core::ControlDisposition::WorldApplied
+            ),
+            "a scenario config intervention must apply to the world, not become a playback command"
+        );
         *current_config_value = resolved.merged;
         applied += 1;
     }
