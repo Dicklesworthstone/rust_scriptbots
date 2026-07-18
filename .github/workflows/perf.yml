@@ -1,40 +1,9 @@
-name: Performance budgets
+name: Performance budgets (disabled; use DSR)
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/perf.yml"
-      - ".github/workflows/perf-report.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "rust-toolchain.toml"
-      - "ci/fixtures/perf_baseline.json"
-      - "crates/scriptbots-brain/**"
-      - "crates/scriptbots-brain-neuro/**"
-      - "crates/scriptbots-core/**"
-      - "crates/scriptbots-index/**"
-      - "crates/scriptbots-storage/**"
-      - "scripts/perf_gate.sh"
-  pull_request:
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/perf.yml"
-      - ".github/workflows/perf-report.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "rust-toolchain.toml"
-      - "ci/fixtures/perf_baseline.json"
-      - "crates/scriptbots-brain/**"
-      - "crates/scriptbots-brain-neuro/**"
-      - "crates/scriptbots-core/**"
-      - "crates/scriptbots-index/**"
-      - "crates/scriptbots-storage/**"
-      - "scripts/perf_gate.sh"
-  schedule:
-    - cron: "23 4 * * *"
+  # Performance evidence is deliberately DSR-only.  This manual, skipped
+  # workflow preserves the historical file and its audit trail without ever
+  # executing the benchmark on an inadmissible hosted machine class.
   workflow_dispatch:
     inputs:
       mode:
@@ -69,6 +38,7 @@ env:
 jobs:
   gate:
     name: Performance gate
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     outputs:
