@@ -1,17 +1,20 @@
 # Scene: mixed_population_1k
 # A dense mixed world: the workhorse capture for population-scale visuals.
-# Population floor keeps agents spawning; food abundance keeps them alive.
+# Population floor keeps agents spawning; abundant food drives the ecosystem
+# to natural births (probed: first birth ~tick 300 in a closed rich world,
+# so the scene runs the full 360-tick headless budget to cover it).
 name = "mixed_population_1k"
 seed = 2002
-ticks = 120
+ticks = 360
 frontend = "terminal_headless"
 quality = "medium"
 
 [config_overrides]
-population_minimum = 40
+closed = true
+population_minimum = 50
 population_spawn_interval = 4
-food_max = 0.9
-initial_food = 0.5
+food_max = 0.95
+initial_food = 0.7
 
 [[camera]]
 tick = 0
@@ -19,11 +22,11 @@ pos = [0.0, 1400.0, 0.0]
 pitch = -1.3
 
 [[captures]]
-tick = 60
+tick = 180
 name = "mid_population"
 
 [[captures]]
-tick = 120
+tick = 360
 name = "final_population"
 
 [[expect]]
@@ -34,4 +37,4 @@ max = 5000
 [[expect]]
 kind = "event_occurred"
 event = "birth"
-by_tick = 120
+by_tick = 360
