@@ -30,3 +30,12 @@ CC_X86_64_PC_WINDOWS_GNULLVM = "/data/projects/rust_scriptbots/toolchains/llvm-m
 CXX_X86_64_PC_WINDOWS_GNULLVM = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang++"
 AR_X86_64_PC_WINDOWS_GNULLVM = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/llvm-ar"
 CXXFLAGS_X86_64_PC_WINDOWS_GNULLVM = "-isystem /data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/x86_64-w64-mingw32/include/c++/v1"
+
+[net]
+# bd-1x69: frankensqlite pins submodule legacy_sqlite_code/sqlite at sqlite object
+# 450a9009, which is unreachable from any branch/tag ref on github.com/sqlite/sqlite.
+# libgit2 submodule updates fetch only default refspecs, so fresh clones fail with
+# "object not found" on some cargo/libgit2 builds. The git CLI retries the submodule
+# fetch by exact OID, and GitHub honors fetch-by-SHA, so routing all git fetching
+# through the CLI makes fresh clones work on every platform/toolchain.
+git-fetch-with-cli = true
