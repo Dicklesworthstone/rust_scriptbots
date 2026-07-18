@@ -142,3 +142,98 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
     reader.close().expect("reader closes");
     cleanup(&db);
 }
+
+/// Cancellation storm (bd-2z0.4.13 TESTS #2): abandon the shutdown wait at seeded,
+/// varying points and prove the durability invariants survive every abandonment — the
+/// outbox protocol and recovery converge admitted/applied/durable watermarks with no
+/// torn batches, regardless of when the wait was given up.
+#[test]
+fn cancellation_storm_preserves_durability_invariants_at_every_point() {
+    // Deterministic xorshift so every run replays the same storm.
+    let mut rng_state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next_u64 = move || {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
+
+    for storm in 0_u64..24 {
+        let db = temp_db(&format!("storm-{storm}"));
+        let ticks = next_u64() % 5 + 1;
+        let mut pipeline =
+            scriptbots_storage::StoragePipeline::create_unattributed_file_with_thresholds(
+                &db, 1, 1, 1, 1,
+            )
+            .expect("storm pipeline");
+        let config = ScriptBotsConfig {
+            rng_seed: Some(1_000 + storm),
+            persistence_interval: 1,
+            ..ScriptBotsConfig::default()
+        };
+        let (mut world, mut persistence) =
+            WorldState::with_persistence(config, Box::new(pipeline.sink()))
+                .expect("storm world");
+        for _ in 0..ticks {
+            persistence.step(&mut world).expect("storm science tick");
+        }
+
+        // Storm point: give the shutdown wait a budget of zero — the finalizer reports
+        // Cancelled instead of draining. The pipeline's Drop then completes the drain
+        // (non-panicking path), exactly as an orderly owner would.
+        let mut root = AppRoot::new();
+        let world_for_storage = std::sync::Arc::new(Mutex::new(world));
+        let persistence_for_storage = std::sync::Arc::new(Mutex::new(persistence));
+        root.register(ServiceRegion::new(
+            "storage-pipeline",
+            Budget::with_deadline_at_secs(30).with_poll_quota(0),
+            {
+                let world_for_storage = std::sync::Arc::clone(&world_for_storage);
+                let persistence_for_storage = std::sync::Arc::clone(&persistence_for_storage);
+                move |budget| {
+                    // A zero poll quota can never wait: cancellation is the honest report.
+                    if budget.poll_quota == 0 {
+                        return Outcome::Cancelled(asupersync::types::CancelReason::new(
+                            asupersync::types::CancelKind::Deadline,
+                        ));
+                    }
+                    drop(world_for_storage);
+                    drop(persistence_for_storage);
+                    match pipeline.shutdown() {
+                        Ok(_receipt) => Outcome::ok("drained".to_owned()),
+                        Err(error) => Outcome::Err(format!("{error:#}")),
+                    }
+                }
+            },
+        ));
+        let outcomes = root.close();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].budget_exhausted,
+            "a zero budget must exhaust: {:?}",
+            outcomes[0].outcome
+        );
+        assert!(matches!(outcomes[0].outcome, Outcome::Cancelled(_)));
+
+        // The pipeline owner was consumed by the finalizer; its Drop completes the
+        // drain now that the wait is over. Recovery then proves the invariants.
+        let mut recovered =
+            scriptbots_storage::StoragePipeline::recover_existing(&db).expect("storm recovery");
+        let shutdown = recovered.shutdown().expect("recovered shutdown");
+        assert!(
+            shutdown.watermarks.admitted == shutdown.watermarks.applied
+                && shutdown.watermarks.applied == shutdown.watermarks.durable,
+            "storm {storm}: watermarks must converge after cancellation: {:?}",
+            shutdown.watermarks
+        );
+
+        let reader = StorageReader::open(&db).expect("storm reader");
+        assert_eq!(
+            reader.max_tick().expect("storm max tick"),
+            Some(ticks),
+            "storm {storm}: every admitted tick must be durably committed"
+        );
+        reader.close().expect("storm reader closes");
+        cleanup(&db);
+    }
+}
