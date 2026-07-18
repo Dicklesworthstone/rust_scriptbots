@@ -993,10 +993,17 @@ impl TerrainPipeline {
         let idx = (tile_index as usize).min(5);
         let col = (idx % (self.grid_cols as usize)) as u32;
         let row = (idx / (self.grid_cols as usize)) as u32;
-        let u0 = (col as f32 * self.tile_w as f32) / self.atlas_w as f32;
-        let v0 = (row as f32 * self.tile_h as f32) / self.atlas_h as f32;
-        let u1 = ((col + 1) as f32 * self.tile_w as f32) / self.atlas_w as f32;
-        let v1 = ((row + 1) as f32 * self.tile_h as f32) / self.atlas_h as f32;
+        // Inset the tile rect by half a texel so LINEAR filtering never samples a
+        // neighboring tile at quad edges (atlas edge bleed, bd-2z0.7.11). With the
+        // 1x1 placeholder atlas the rect degenerates to the single texel centre.
+        let inset_u = 0.5 / self.atlas_w as f32;
+        let inset_v = 0.5 / self.atlas_h as f32;
+        let u0 = ((col as f32 * self.tile_w as f32) / self.atlas_w as f32 + inset_u).min(1.0);
+        let v0 = ((row as f32 * self.tile_h as f32) / self.atlas_h as f32 + inset_v).min(1.0);
+        let u1 = (((col + 1) as f32 * self.tile_w as f32) / self.atlas_w as f32 - inset_u)
+            .max(u0);
+        let v1 = (((row + 1) as f32 * self.tile_h as f32) / self.atlas_h as f32 - inset_v)
+            .max(v0);
         [u0, v0, u1, v1]
     }
 
@@ -1426,7 +1433,9 @@ fn circle_distance(p: vec2<f32>, radius: f32) -> f32 {
 
 fn smooth_mask(dist: f32) -> f32 {
   let aa = max(fwidth(dist), 1e-3);
-  return smoothstep(aa, -aa, dist);
+  // smoothstep(aa, -aa, x) has reversed edges — undefined behavior per the WGSL spec
+  // (edge0 must be < edge1). The spec-safe form is identical on every defined driver.
+  return 1.0 - smoothstep(-aa, aa, dist);
 }
 
 fn layer(base_rgb: ptr<function, vec3<f32>>, base_alpha: ptr<function, f32>, color: vec3<f32>, alpha: f32) {
@@ -1633,7 +1642,9 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let sel_hover = step(0.5, selection) * (1.0 - step(1.5, selection));
   let sel_selected = step(1.5, selection);
   let selection_glow = sel_hover * 0.25 + sel_selected * 0.45;
-  let rim = smoothstep(0.0, -max(fwidth(body_dist), 0.001) * 1.5, body_dist + body_radius * 0.15);
+  let rim_width = max(fwidth(body_dist), 0.001) * 1.5;
+  // Same reversed-edge fix as smooth_mask: 1 - smoothstep(-w, 0, x), never smoothstep(0, -w, x).
+  let rim = 1.0 - smoothstep(-rim_width, 0.0, body_dist + body_radius * 0.15);
   let rim_color = vec3<f32>(1.0, 1.0, 1.0) * (selection_glow + glow);
   layer(&accum_rgb, &accum_alpha, rim_color, rim);
 

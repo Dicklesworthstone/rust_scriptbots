@@ -8967,11 +8967,25 @@ struct ColorVec3 {
     b: u8,
 }
 
+/// sRGB-to-linear decode (the exact inverse of the encode in `linear_to_srgb_byte`).
+/// Ownership rule (bd-2z0.7.11): display bytes are ALWAYS sRGB; every tonemap/exposure
+/// operation happens in linear space, and encoding happens exactly once on the way out.
+fn srgb_to_linear(x: f32) -> f32 {
+    if x <= 0.040_45 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 fn tonemap_rgb(color: ColorVec3, exposure: f32, mode: RenderTonemapMode) -> ColorVec3 {
+    // `color` arrives as sRGB-encoded display bytes. Decode to linear BEFORE exposure
+    // and tonemap — the GPU path does this in hardware via sRGB texture views; the CPU
+    // path must do it explicitly or the mids are crushed (bd-2z0.7.11).
     let mut linear = [
-        (color.r as f32 / 255.0) * exposure,
-        (color.g as f32 / 255.0) * exposure,
-        (color.b as f32 / 255.0) * exposure,
+        srgb_to_linear(color.r as f32 / 255.0) * exposure,
+        srgb_to_linear(color.g as f32 / 255.0) * exposure,
+        srgb_to_linear(color.b as f32 / 255.0) * exposure,
     ];
 
     match mode {
@@ -9012,6 +9026,74 @@ fn linear_to_srgb_byte(x: f32) -> u8 {
         1.055 * x.powf(1.0 / 2.4) - 0.055
     };
     (srgb.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+#[cfg(test)]
+mod srgb_ownership_tests {
+    use super::*;
+
+    /// Hand-derived golden for the decode -> exposure -> fitted-ACES -> encode chain
+    /// (bd-2z0.7.11). Derivation for (120, 200, 120) at exposure 1.0:
+    ///   r: 120/255 = 0.470588 -> srgb_to_linear = 0.18782 -> aces_fitted = 0.27985
+    ///      -> encode = round(0.56564 * 255) = 144
+    ///   g: 200/255 = 0.784314 -> srgb_to_linear = 0.57748 -> aces_fitted = 0.66173
+    ///      -> encode = round(0.83332 * 255) = 212
+    ///   b equals r.
+    #[test]
+    fn cpu_tonemap_golden_matches_the_explicit_srgb_chain() {
+        let mapped = tonemap_rgb(
+            ColorVec3 {
+                r: 120,
+                g: 200,
+                b: 120,
+            },
+            1.0,
+            RenderTonemapMode::Aces,
+        );
+        assert!((mapped.r as i32 - 144).abs() <= 2, "r: got {}", mapped.r);
+        assert!((mapped.g as i32 - 212).abs() <= 2, "g: got {}", mapped.g);
+        assert_eq!(mapped.b, mapped.r);
+    }
+
+    #[test]
+    fn cpu_tonemap_preserves_order_and_black_point() {
+        let black = tonemap_rgb(
+            ColorVec3 { r: 0, g: 0, b: 0 },
+            1.0,
+            RenderTonemapMode::Aces,
+        );
+        assert_eq!((black.r, black.g, black.b), (0, 0, 0));
+
+        let mut previous = 0u8;
+        for value in [32u8, 64, 96, 128, 160, 192, 224, 255] {
+            let mapped = tonemap_rgb(
+                ColorVec3 {
+                    r: value,
+                    g: value,
+                    b: value,
+                },
+                1.0,
+                RenderTonemapMode::Aces,
+            );
+            assert!(
+                mapped.r >= previous,
+                "tonemap must be monotonic: {value} -> {} after {previous}",
+                mapped.r
+            );
+            assert_eq!(mapped.r, mapped.g, "grayscale channels must stay equal");
+            assert_eq!(mapped.g, mapped.b, "grayscale channels must stay equal");
+            previous = mapped.r;
+        }
+    }
+
+    #[test]
+    fn srgb_decode_is_the_exact_inverse_of_the_encode() {
+        for byte in 0u8..=255 {
+            let linear = srgb_to_linear(f32::from(byte) / 255.0);
+            let encoded = linear_to_srgb_byte(linear);
+            assert_eq!(encoded, byte, "round trip failed at {byte}");
+        }
+    }
 }
 
 impl Render for SimulationView {
