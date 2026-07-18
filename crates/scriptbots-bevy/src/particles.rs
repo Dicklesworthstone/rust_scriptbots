@@ -315,6 +315,164 @@ impl ParticlePool {
 }
 
 // ---------------------------------------------------------------------------
+// GPU instance projection + transparent-pass ordering.
+// ---------------------------------------------------------------------------
+
+/// GPU projection of one [`Particle`]; field-for-field the WGSL
+/// `ParticleInstance` layout (23 f32 = 92 bytes). `born_tick` and `duration`
+/// are carried as f32: exact for tick values below 2^24 (~77 hours at 60Hz),
+/// and the shader only needs the *difference*, which stays exact far longer
+/// for particles whose whole life fits in that window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParticleInstance {
+    /// Spawn position.
+    pub pos0: [f32; 3],
+    /// Initial velocity.
+    pub vel0: [f32; 3],
+    /// Gravity factor.
+    pub gravity: f32,
+    /// Velocity damping per tick.
+    pub drag: f32,
+    /// Born tick (see struct docs for the f32 precision bound).
+    pub born_tick: f32,
+    /// Lifetime in ticks.
+    pub duration: f32,
+    /// Quad size at birth.
+    pub size_start: f32,
+    /// Quad size at death.
+    pub size_end: f32,
+    /// Initial rotation.
+    pub rotation: f32,
+    /// Angular velocity.
+    pub spin: f32,
+    /// Base color.
+    pub color: [f32; 3],
+    /// Accent color.
+    pub accent: [f32; 3],
+    /// Emissive intensity.
+    pub intensity: f32,
+    /// Sprite atlas tile index.
+    pub sprite: f32,
+    /// Reserved (0); future bitfield (follow-anchor, blend class).
+    pub flags: f32,
+}
+
+impl ParticleInstance {
+    /// Project a live particle into the GPU layout. `tick` is unused today
+    /// (motion integrates shader-side from spawn attributes) and reserved
+    /// for future spawn-relative encodings.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn from_particle(particle: &Particle) -> Self {
+        Self {
+            pos0: particle.position,
+            vel0: particle.velocity,
+            gravity: particle.gravity,
+            drag: particle.drag,
+            born_tick: particle.born_tick as f32,
+            duration: particle.duration_ticks as f32,
+            size_start: particle.size_start,
+            size_end: particle.size_end,
+            rotation: particle.rotation,
+            spin: particle.spin,
+            color: particle.color,
+            accent: particle.accent,
+            intensity: particle.intensity,
+            sprite: particle.sprite.tile_index() as f32,
+            flags: 0.0,
+        }
+    }
+}
+
+impl ParticlePool {
+    /// Pack live particles into `out` in deterministic slot order.
+    ///
+    /// Write-combining friendly: gap-free sequential writes, and `out` is
+    /// reused across frames so steady-state frames perform zero allocation
+    /// after the first fill reaches capacity.
+    pub fn write_instance_buffer(&self, out: &mut Vec<ParticleInstance>) {
+        out.clear();
+        out.reserve(self.live_count);
+        for particle in self.slots.iter().flatten() {
+            out.push(ParticleInstance::from_particle(particle));
+        }
+    }
+}
+
+/// How the transparent particle pass orders billboards (C1 tier contract):
+/// Low draws unsorted and relies on the soft depth fade; Medium+ sorts
+/// back-to-front by view-space depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendOrderPolicy {
+    /// Draw in slot order (free); correctness comes from the depth fade.
+    Unsorted,
+    /// Bucket-sort back-to-front by view-space depth (Medium+ tiers).
+    #[default]
+    BucketSort,
+}
+
+/// Fill `order` with the draw order as indices into `view_depths`.
+///
+/// `view_depths` pairs each live particle's slot with its view-space depth
+/// (positive forward, larger = farther). Deterministic: a true bucket sort
+/// with 256 depth buckets, stable within a bucket by input (slot) order,
+/// back-to-front (farthest first). Non-finite depths land in the nearest
+/// bucket (drawn last, where the depth fade hides them). `order` and
+/// `scratch` are caller-reused so steady-state frames allocate nothing.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn blend_order_into(
+    view_depths: &[(u32, f32)],
+    policy: BlendOrderPolicy,
+    order: &mut Vec<u32>,
+    scratch: &mut Vec<u32>,
+) {
+    order.clear();
+    order.extend(0..view_depths.len() as u32);
+    if policy == BlendOrderPolicy::Unsorted || view_depths.len() < 2 {
+        return;
+    }
+    let mut min_d = f32::INFINITY;
+    let mut max_d = f32::NEG_INFINITY;
+    for &(_, depth) in view_depths {
+        if depth.is_finite() {
+            min_d = min_d.min(depth);
+            max_d = max_d.max(depth);
+        }
+    }
+    if !min_d.is_finite() || (max_d - min_d) < 1e-9 {
+        return; // empty or uniform depths: slot order is already correct.
+    }
+    const BUCKETS: usize = 256;
+    let span = max_d - min_d;
+    let bucket_of = |depth: f32| -> usize {
+        if !depth.is_finite() {
+            return 0; // non-finite => nearest bucket => drawn last.
+        }
+        (((depth - min_d) / span) * (BUCKETS - 1) as f32).clamp(0.0, (BUCKETS - 1) as f32) as usize
+    };
+    let mut counts = [0_usize; BUCKETS];
+    for &(_, depth) in view_depths {
+        counts[bucket_of(depth)] += 1;
+    }
+    // Prefix offsets with farthest bucket first (back-to-front).
+    let mut starts = [0_usize; BUCKETS];
+    let mut acc = 0_usize;
+    for bucket in (0..BUCKETS).rev() {
+        starts[bucket] = acc;
+        acc += counts[bucket];
+    }
+    scratch.clear();
+    scratch.resize(view_depths.len(), 0);
+    let mut cursor = starts;
+    for (index, &(_, depth)) in view_depths.iter().enumerate() {
+        let bucket = bucket_of(depth);
+        scratch[cursor[bucket]] = index as u32;
+        cursor[bucket] += 1;
+    }
+    order.copy_from_slice(scratch);
+}
+
+// ---------------------------------------------------------------------------
 // Deterministic cue scheduling.
 // ---------------------------------------------------------------------------
 
@@ -599,7 +757,18 @@ struct ParticleInstance {
 struct ParticleUniforms {
     tick: f32,
     atlas_cols: f32,
+    // Soft-particle fade: alpha scales with clamp((scene_depth -
+    // particle_depth) * soft_fade_scale, 0, 1). Large values approximate a
+    // hard depth cut; the Low tier uses this instead of sort order.
+    soft_fade_scale: f32,
+    _pad: f32,
     viewport: vec2<f32>,
+    // Camera basis in world space: billboards orient to the camera, never
+    // to a fixed world plane.
+    camera_right: vec3<f32>,
+    _pad2: f32,
+    camera_up: vec3<f32>,
+    _pad3: f32,
     view_proj: mat4x4<f32>,
 };
 
@@ -607,6 +776,7 @@ struct ParticleUniforms {
 @group(0) @binding(1) var<storage, read> instances: array<ParticleInstance>;
 @group(0) @binding(2) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(3) var atlas_sampler: sampler;
+@group(0) @binding(4) var scene_depth: texture_depth_2d;
 
 struct VertexOutput {
     @builtin(position) clip: vec4<f32>,
@@ -645,8 +815,12 @@ fn vs_particle(
         corner.x * s + corner.y * c,
     ) * size;
 
+    // Camera-facing billboard: rotate the corner offset into the camera's
+    // world-space basis so the quad always fronts the viewer.
+    let world = position + uniforms.camera_right * offset.x + uniforms.camera_up * offset.y;
+
     var out: VertexOutput;
-    out.clip = uniforms.view_proj * vec4<f32>(position + vec3<f32>(offset, 0.0), 1.0);
+    out.clip = uniforms.view_proj * vec4<f32>(world, 1.0);
     // Atlas UVs: tile column from sprite index, quad corner within the tile.
     let corner01 = corner * 0.5 + vec2<f32>(0.5, 0.5);
     out.uv = vec2<f32>((p.sprite + corner01.x) / uniforms.atlas_cols, corner01.y);
@@ -659,7 +833,14 @@ fn vs_particle(
 @fragment
 fn fs_particle(in: VertexOutput) -> @location(0) vec4<f32> {
     let sample = textureSample(atlas_tex, atlas_sampler, in.uv);
-    let alpha = sample.a * clamp(in.intensity, 0.0, 1.0);
+    var alpha = sample.a * clamp(in.intensity, 0.0, 1.0);
+    // Soft particles: fade the billboard where it approaches scene geometry.
+    // @builtin(position) in the fragment stage carries framebuffer pixel
+    // coordinates (xy) and the NDC depth (z) of this fragment.
+    let pixel = vec2<i32>(floor(in.clip.xy));
+    let scene = textureLoad(scene_depth, pixel, 0);
+    let fade = clamp((scene - in.clip.z) * uniforms.soft_fade_scale, 0.0, 1.0);
+    alpha *= fade;
     if (alpha < 0.01) {
         discard;
     }
@@ -915,6 +1096,11 @@ mod tests {
     fn wgsl_source_has_entry_points_and_balanced_braces() {
         assert!(PARTICLE_WGSL.contains("@vertex"));
         assert!(PARTICLE_WGSL.contains("@fragment"));
+        // Camera-facing billboards + soft depth fade (bd-2z0.14.1.7.1 contract).
+        assert!(PARTICLE_WGSL.contains("camera_right"));
+        assert!(PARTICLE_WGSL.contains("camera_up"));
+        assert!(PARTICLE_WGSL.contains("scene_depth"));
+        assert!(PARTICLE_WGSL.contains("soft_fade_scale"));
         let mut depth = 0i32;
         for ch in PARTICLE_WGSL.chars() {
             match ch {
@@ -925,6 +1111,111 @@ mod tests {
             assert!(depth >= 0, "unbalanced closing brace");
         }
         assert_eq!(depth, 0, "balanced braces");
-        // Full WGSL compilation lands with bd-2z0.14.1.7 (render-world wiring).
+    }
+
+    #[test]
+    fn wgsl_source_compiles_and_validates_with_naga() {
+        let module = naga::front::wgsl::parse_str(PARTICLE_WGSL)
+            .expect("PARTICLE_WGSL must parse as valid WGSL");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .expect("PARTICLE_WGSL must pass naga semantic validation");
+        // The instance layout consumed by the shader matches ParticleInstance.
+        assert_eq!(
+            core::mem::size_of::<ParticleInstance>(),
+            23 * 4,
+            "WGSL ParticleInstance layout drift from Rust projection"
+        );
+    }
+
+    #[test]
+    fn instance_buffer_fill_is_slot_ordered_and_grow_only() {
+        let mut pool = ParticlePool::with_capacity(4);
+        let a = pool.spawn(particle(ParticlePriority::Standard)).expect("a");
+        let b = pool.spawn(particle(ParticlePriority::Critical)).expect("b");
+        let _c = pool.spawn(particle(ParticlePriority::Ambient)).expect("c");
+        pool.kill(b);
+        let d = pool
+            .spawn(particle(ParticlePriority::Standard))
+            .expect("d reuses slot");
+        let mut out = Vec::new();
+        pool.write_instance_buffer(&mut out);
+        assert_eq!(out.len(), 3);
+        // Slot order: a (slot 0), d (slot 1, reused), c (slot 2).
+        let slots = [a.slot, d.slot, _c.slot];
+        assert!(slots.windows(2).all(|w| w[0] < w[1]), "slot-ordered fill");
+        assert_eq!(out[0].duration, 10.0);
+        assert_eq!(out[1].flags, 0.0);
+        let capacity_after_first_fill = out.capacity();
+        pool.write_instance_buffer(&mut out);
+        assert_eq!(
+            out.capacity(),
+            capacity_after_first_fill,
+            "grow-only buffer"
+        );
+    }
+
+    #[test]
+    fn blend_order_unsorted_is_identity_and_sorted_is_back_to_front() {
+        let depths = [(0, 10.0), (1, 30.0), (2, 20.0), (3, f32::NAN)];
+        let mut order = Vec::new();
+        let mut scratch = Vec::new();
+        blend_order_into(
+            &depths,
+            BlendOrderPolicy::Unsorted,
+            &mut order,
+            &mut scratch,
+        );
+        assert_eq!(order, vec![0, 1, 2, 3], "unsorted = slot order");
+        blend_order_into(
+            &depths,
+            BlendOrderPolicy::BucketSort,
+            &mut order,
+            &mut scratch,
+        );
+        assert_eq!(
+            order,
+            vec![1, 2, 0, 3],
+            "back-to-front; NaN lands in the nearest bucket (drawn last)"
+        );
+    }
+
+    #[test]
+    fn blend_order_is_stable_deterministic_and_handles_ties() {
+        let depths = [(0, 5.0), (1, 5.0), (2, 5.0), (3, 9.0), (4, 1.0)];
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let mut scratch = Vec::new();
+        blend_order_into(
+            &depths,
+            BlendOrderPolicy::BucketSort,
+            &mut first,
+            &mut scratch,
+        );
+        blend_order_into(
+            &depths,
+            BlendOrderPolicy::BucketSort,
+            &mut second,
+            &mut scratch,
+        );
+        assert_eq!(first, second, "deterministic across calls");
+        assert_eq!(
+            first,
+            vec![3, 0, 1, 2, 4],
+            "ties keep slot order within a bucket"
+        );
+        // Uniform depths: slot order (no reshuffle).
+        let uniform = [(0, 7.0), (1, 7.0), (2, 7.0)];
+        blend_order_into(
+            &uniform,
+            BlendOrderPolicy::BucketSort,
+            &mut first,
+            &mut scratch,
+        );
+        assert_eq!(first, vec![0, 1, 2]);
     }
 }

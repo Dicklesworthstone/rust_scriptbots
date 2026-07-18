@@ -15,3 +15,8 @@ slotmap = { workspace = true }
 # Direct adapter probing for the capability report; version-locked to bevy's own wgpu
 # line so the probe and the renderer share one wgpu universe (bevy 0.17 uses wgpu 26).
 wgpu = { version = "26", default-features = false, features = ["metal", "wgsl"] }
+
+[dev-dependencies]
+# Same naga 26 already in the lockfile as wgpu 26's dependency: WGSL source
+# validation in particle/creature tests without a second naga universe.
+naga = { version = "=26.0.0", default-features = false, features = ["wgsl-in"] }

@@ -10121,6 +10121,7 @@ dependencies = [
  "bevy_mesh",
  "bevy_post_process",
  "image",
+ "naga 26.0.0",
  "scriptbots-core",
  "slotmap",
  "tracing",
