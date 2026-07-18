@@ -2206,7 +2206,7 @@ impl HostCore {
         self.revisions.config = ConfigRevision::new(self.world.config_revision());
         let applied = self.applied_boundary();
         self.complete_applied_with(envelope.command_id, admission, applied)?;
-        let blocked = self.offer_journal(&envelope, applied, None, None)?;
+        let blocked = self.offer_journal(envelope, applied, None, None)?;
         Ok(ApplyResult::completed(blocked))
     }
 
@@ -2280,7 +2280,7 @@ impl HostCore {
             revisions: self.revisions,
         };
         self.complete_applied_with(envelope.command_id, admission, applied)?;
-        let blocked = self.offer_journal(&envelope, applied, Some(scientific), persistence)?;
+        let blocked = self.offer_journal(envelope, applied, Some(scientific), persistence)?;
         if let Some(fault) = completed_fault {
             self.latch_completed_step_fault(tick, &fault)?;
         }
@@ -2331,7 +2331,7 @@ impl HostCore {
         self.revisions.control = next_control;
         let applied = self.applied_boundary();
         self.complete_applied_with(envelope.command_id, admission, applied)?;
-        let blocked = self.offer_journal(&envelope, applied, None, persistence)?;
+        let blocked = self.offer_journal(envelope, applied, None, persistence)?;
         self.synchronize_health()?;
         Ok(ApplyResult::completed(blocked))
     }
