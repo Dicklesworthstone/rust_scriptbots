@@ -3870,6 +3870,13 @@ pub enum Intervention {
         /// Multiplier applied to the growth rate (0 = total).
         growth_scale: f32,
     },
+    /// Suppress food intake in a region for a while: agents inside cannot eat.
+    Embargo {
+        /// Where.
+        region: Region,
+        /// How long, in ticks.
+        ticks: u32,
+    },
     /// Add food to every cell in a region, right now.
     Bloom {
         /// Where.
@@ -3901,12 +3908,26 @@ impl Intervention {
             Self::Drought {
                 region,
                 growth_scale,
-                ..
+                ticks,
             } => {
                 region.validate_basic()?;
+                if ticks == 0 {
+                    return Err(WorldStateError::InvalidConfig(
+                        "drought ticks must be at least 1",
+                    ));
+                }
                 if !(0.0..=1.0).contains(&growth_scale) {
                     return Err(WorldStateError::InvalidConfig(
                         "drought growth_scale must lie in [0, 1]",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Embargo { region, ticks } => {
+                region.validate_basic()?;
+                if ticks == 0 {
+                    return Err(WorldStateError::InvalidConfig(
+                        "embargo ticks must be at least 1",
                     ));
                 }
                 Ok(())
@@ -3957,6 +3978,7 @@ impl Intervention {
         self.validate()?;
         match *self {
             Self::Drought { region, .. }
+            | Self::Embargo { region, .. }
             | Self::Bloom { region, .. }
             | Self::Meteor { region, .. } => region.validate_for_world(world_width, world_height),
         }
@@ -3970,8 +3992,18 @@ pub struct ActiveEffect {
     pub region: Region,
     /// Ticks left before it lapses.
     pub ticks_remaining: u32,
+    /// What it does while in force.
+    pub kind: ActiveEffectKind,
+}
+
+/// The effect an [`ActiveEffect`] has on the region while in force.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "effect", rename_all = "snake_case")]
+pub enum ActiveEffectKind {
     /// Growth multiplier applied inside the region.
-    pub growth_scale: f32,
+    GrowthScale(f32),
+    /// Intake suppressed entirely inside the region; agents cannot eat there.
+    Embargo,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -13886,11 +13918,31 @@ impl WorldState {
         let world_height = self.config.world_height as f32;
         let mut scale = 1.0f32;
         for effect in &self.active_effects {
-            if effect.region.contains(px, py, world_width, world_height) {
-                scale *= effect.growth_scale;
+            if let ActiveEffectKind::GrowthScale(growth_scale) = effect.kind
+                && effect.region.contains(px, py, world_width, world_height)
+            {
+                scale *= growth_scale;
             }
         }
         scale
+    }
+
+    /// Intake multiplier for an agent position: zero while any embargo covers it, one
+    /// otherwise. Expiry restores intake exactly, as the parent bead demands.
+    fn intake_scale_for_position(&self, x: f32, y: f32) -> f32 {
+        if self.active_effects.is_empty() {
+            return 1.0;
+        }
+        let world_width = self.config.world_width as f32;
+        let world_height = self.config.world_height as f32;
+        for effect in &self.active_effects {
+            if let ActiveEffectKind::Embargo = effect.kind
+                && effect.region.contains(x, y, world_width, world_height)
+            {
+                return 0.0;
+            }
+        }
+        1.0
     }
 
     fn apply_food_regrowth(&mut self) {
@@ -15839,13 +15891,18 @@ impl WorldState {
                     ticks,
                     growth_scale,
                 } => {
-                    if ticks > 0 {
-                        self.active_effects.push(ActiveEffect {
-                            region,
-                            ticks_remaining: ticks,
-                            growth_scale,
-                        });
-                    }
+                    self.active_effects.push(ActiveEffect {
+                        region,
+                        ticks_remaining: ticks,
+                        kind: ActiveEffectKind::GrowthScale(growth_scale),
+                    });
+                }
+                Intervention::Embargo { region, ticks } => {
+                    self.active_effects.push(ActiveEffect {
+                        region,
+                        ticks_remaining: ticks,
+                        kind: ActiveEffectKind::Embargo,
+                    });
                 }
                 Intervention::Bloom { region, amount } => {
                     let cap = self.config.food_max;
@@ -15981,15 +16038,16 @@ impl WorldState {
                             let base_intake = available.min(intake_rate);
                             let waste = available.min(waste_rate);
                             let herbivore = clamp01(runtime.herbivore_tendency);
+                            let embargo_scale = self.intake_scale_for_position(pos.x, pos.y);
                             let mut intake = 0.0;
-                            if herbivore > 0.0 && base_intake > 0.0 {
+                            if herbivore > 0.0 && base_intake > 0.0 && embargo_scale > 0.0 {
                                 let left =
                                     runtime.outputs.channel_clamped(OutputChannel::WheelLeft);
                                 let right =
                                     runtime.outputs.channel_clamped(OutputChannel::WheelRight);
                                 let average_speed = (left.abs() + right.abs()) * 0.5;
                                 let speed_scale = (1.0 - average_speed).clamp(0.0, 1.0) * 0.7 + 0.3;
-                                intake = base_intake * herbivore * speed_scale;
+                                intake = base_intake * herbivore * speed_scale * embargo_scale;
                             }
                             if waste > 0.0 {
                                 *cell = (available - waste).max(0.0);
@@ -19676,9 +19734,24 @@ impl WorldState {
                     effects_encoder.f32(y);
                     effects_encoder.f32(radius);
                 }
+                Region::Rect { x, y, w, h } => {
+                    effects_encoder.u8(2);
+                    effects_encoder.f32(x);
+                    effects_encoder.f32(y);
+                    effects_encoder.f32(w);
+                    effects_encoder.f32(h);
+                }
             }
             effects_encoder.u32(effect.ticks_remaining);
-            effects_encoder.f32(effect.growth_scale);
+            match effect.kind {
+                ActiveEffectKind::GrowthScale(growth_scale) => {
+                    effects_encoder.u8(0);
+                    effects_encoder.f32(growth_scale);
+                }
+                ActiveEffectKind::Embargo => {
+                    effects_encoder.u8(1);
+                }
+            }
         }
         let effects = effects_encoder.finish();
 
@@ -25398,6 +25471,101 @@ mod tests {
         assert!(
             !full_width.contains(150.0, 30.0, width, height),
             "outside the 20-tall band"
+        );
+    }
+
+    #[test]
+    fn an_embargo_suppresses_intake_and_restores_exactly_on_lapse() {
+        // An embargo that agents eat through is theatre; an embargo that never ends is a
+        // bug. The inside agent must gain nothing while the effect lives, then resume
+        // eating the tick after it lapses.
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 1.0,
+            food_max: 1.0,
+            food_intake_rate: 0.5,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_respawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            rng_seed: Some(13),
+            ..ScriptBotsConfig::default()
+        };
+
+        let energy_of = |world: &WorldState, id| {
+            world
+                .agent_runtime(id)
+                .expect("live agent has runtime")
+                .energy
+        };
+        let spawn = |world: &mut WorldState| {
+            let inside = world.spawn_agent(AgentData {
+                position: Position::new(50.0, 100.0),
+                ..AgentData::default()
+            });
+            let outside = world.spawn_agent(AgentData {
+                position: Position::new(150.0, 100.0),
+                ..AgentData::default()
+            });
+            for id in [inside, outside] {
+                world
+                    .try_update_agent_runtime(id, |runtime| {
+                        runtime.energy = 0.5;
+                        runtime.herbivore_tendency = 1.0;
+                    })
+                    .expect("customize runtime");
+            }
+            (inside, outside)
+        };
+
+        // Control: no embargo; both agents eat from tick one.
+        let mut control = WorldState::new(config.clone()).expect("control world");
+        let (control_inside, _) = spawn(&mut control);
+        control.step().expect("control step");
+        let control_gain = energy_of(&control, control_inside) - 0.5;
+        assert!(control_gain > 0.0, "control must eat: gain {control_gain}");
+
+        // Embargoed: a 2-tick embargo over the inside agent only.
+        let mut embargoed = WorldState::new(config).expect("embargo world");
+        let (inside, outside) = spawn(&mut embargoed);
+        embargoed
+            .enqueue_intervention(Intervention::Embargo {
+                region: Region::Disc {
+                    x: 50.0,
+                    y: 100.0,
+                    radius: 15.0,
+                },
+                ticks: 2,
+            })
+            .expect("valid embargo");
+
+        embargoed.step().expect("step one under embargo");
+        assert_eq!(
+            energy_of(&embargoed, inside),
+            0.5,
+            "an agent under embargo must gain nothing"
+        );
+        assert!(
+            energy_of(&embargoed, outside) > 0.5,
+            "the agent outside the embargo keeps eating"
+        );
+
+        embargoed.step().expect("step two under embargo");
+        assert_eq!(
+            energy_of(&embargoed, inside),
+            0.5,
+            "the second embargoed tick must also gain nothing"
+        );
+
+        // The effect lapses after exactly its 2 ticks; the third tick eats again.
+        embargoed.step().expect("step three after lapse");
+        assert!(
+            energy_of(&embargoed, inside) > 0.5,
+            "intake must restore exactly once the embargo lapses"
         );
     }
 
@@ -37867,7 +38035,7 @@ mod tests {
         world.active_effects.push(ActiveEffect {
             region: Region::All,
             ticks_remaining: 2,
-            growth_scale: 1.0,
+            kind: ActiveEffectKind::GrowthScale(1.0),
         });
         let after_effect = world.world_digest_v1().expect("effect-mutated V1");
         assert_eq!(before_effect.config, after_effect.config);

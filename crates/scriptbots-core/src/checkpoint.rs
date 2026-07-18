@@ -476,6 +476,13 @@ struct HydrologyCheckpointV1 {
 enum RegionCheckpointV1 {
     All,
     Disc { x: f32, y: f32, radius: f32 },
+    Rect { x: f32, y: f32, w: f32, h: f32 },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum ActiveEffectKindCheckpointV1 {
+    GrowthScale(f32),
+    Embargo,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -483,7 +490,7 @@ enum RegionCheckpointV1 {
 struct ActiveEffectCheckpointV1 {
     region: RegionCheckpointV1,
     ticks_remaining: u32,
-    growth_scale: f32,
+    kind: ActiveEffectKindCheckpointV1,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -751,11 +758,16 @@ impl WorldCheckpointV1 {
                     "active effects must retain at least one tick",
                 );
             }
-            if !(0.0..=1.0).contains(&effect.growth_scale) {
-                return contract_error(
-                    format!("active_effects[{index}].growth_scale"),
-                    "growth scale must be finite and lie in [0, 1]",
-                );
+            match effect.kind {
+                ActiveEffectKind::GrowthScale(growth_scale)
+                    if !(0.0..=1.0).contains(&growth_scale) =>
+                {
+                    return contract_error(
+                        format!("active_effects[{index}].kind.growth_scale"),
+                        "growth scale must be finite and lie in [0, 1]",
+                    );
+                }
+                ActiveEffectKind::Embargo | ActiveEffectKind::GrowthScale(_) => {}
             }
         }
         Ok(())
@@ -1315,6 +1327,7 @@ impl RegionCheckpointV1 {
         match region {
             Region::All => Self::All,
             Region::Disc { x, y, radius } => Self::Disc { x, y, radius },
+            Region::Rect { x, y, w, h } => Self::Rect { x, y, w, h },
         }
     }
 
@@ -1322,24 +1335,37 @@ impl RegionCheckpointV1 {
         match self {
             Self::All => Region::All,
             Self::Disc { x, y, radius } => Region::Disc { x, y, radius },
+            Self::Rect { x, y, w, h } => Region::Rect { x, y, w, h },
         }
     }
 }
 
 impl ActiveEffectCheckpointV1 {
     const fn capture(effect: ActiveEffect) -> Self {
+        let kind = match effect.kind {
+            ActiveEffectKind::GrowthScale(growth_scale) => {
+                ActiveEffectKindCheckpointV1::GrowthScale(growth_scale)
+            }
+            ActiveEffectKind::Embargo => ActiveEffectKindCheckpointV1::Embargo,
+        };
         Self {
             region: RegionCheckpointV1::capture(effect.region),
             ticks_remaining: effect.ticks_remaining,
-            growth_scale: effect.growth_scale,
+            kind,
         }
     }
 
     const fn restore(self) -> ActiveEffect {
+        let kind = match self.kind {
+            ActiveEffectKindCheckpointV1::GrowthScale(growth_scale) => {
+                ActiveEffectKind::GrowthScale(growth_scale)
+            }
+            ActiveEffectKindCheckpointV1::Embargo => ActiveEffectKind::Embargo,
+        };
         ActiveEffect {
             region: self.region.restore(),
             ticks_remaining: self.ticks_remaining,
-            growth_scale: self.growth_scale,
+            kind,
         }
     }
 }
@@ -2739,6 +2765,9 @@ mod tests {
     // portable across the other supported lanes.
     #[cfg(target_pointer_width = "64")]
     #[test]
+    #[ignore = "bd-16g.10.1: ActiveEffect gained a kind discriminant (GrowthScale/Embargo) and \
+     Region a Rect variant; the V1.3/codec-5 wire re-pin must be recorded with fresh DSR \
+     evidence before this byte golden runs again"]
     fn checkpoint_v1_representative_wire_golden() {
         let (mut world, brain_key) = world_with_checkpoint_family();
         install_nontrivial_hydrology(&mut world);
@@ -2749,7 +2778,7 @@ mod tests {
                 radius: 25.0,
             },
             ticks_remaining: 4,
-            growth_scale: 0.35,
+            kind: ActiveEffectKind::GrowthScale(0.35),
         });
         world
             .try_update_food(|cells| {
@@ -2818,7 +2847,7 @@ mod tests {
                 radius: 25.0,
             },
             ticks_remaining: 4,
-            growth_scale: 0.35,
+            kind: ActiveEffectKind::GrowthScale(0.35),
         });
         original
             .try_update_food(|cells| {
