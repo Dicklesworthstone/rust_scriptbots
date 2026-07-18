@@ -1,5 +1,8 @@
 //! Bevy renderer integration for ScriptBots.
 
+pub mod creature_meshes;
+pub mod particles;
+
 use anyhow::{Context, Result, anyhow};
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
