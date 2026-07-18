@@ -14300,6 +14300,22 @@ impl StoragePipeline {
 
 impl Drop for StoragePipeline {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            // bd-3bd: the orderly region finalizer owns the drain. Flushing during an
+            // unwind can double-panic and take the whole process down, so a Drop on
+            // the panic path never flushes — it hands the worker to the reaper.
+            if let Some(handle) = self.handle.take() {
+                handoff_storage_reap(StorageReapRequest::Pipeline {
+                    tx: self.sink.tx.clone(),
+                    admission: Arc::clone(&self.sink.admission),
+                    pending_shutdown: self.pending_shutdown.take(),
+                    handle,
+                    path: Arc::clone(&self.sink.path),
+                    analytics: self.sink.analytics.clone(),
+                });
+            }
+            return;
+        }
         if self.handle.is_some()
             && let Err(error) = self.shutdown()
         {

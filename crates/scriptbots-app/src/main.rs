@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use asupersync::types::{Budget, Outcome};
 use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
@@ -10,6 +11,7 @@ use scriptbots_app::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
     },
+    regions::{AppRoot, RegionOutcome, ServiceRegion},
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -495,19 +497,50 @@ fn main() -> Result<()> {
             scenario: Arc::clone(&launch_scenario_shared),
         };
         let render_result = renderer.run(context);
-        let control_result = control_runtime.shutdown();
-        match (render_result, control_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(render_error), Ok(())) => Err(render_error),
-            (Ok(()), Err(control_error)) => Err(control_error),
-            (Err(render_error), Err(control_error)) => Err(render_error).context(format!(
-                "control runtime shutdown also failed: {control_error:#}"
-            )),
-        }
+        // bd-2z0.4.13: the app entrypoint owns an AppRoot whose regions tear down in
+        // reverse dependency order with explicit budgets and per-region outcomes.
+        // Control closes first (stop accepting), storage drains last (every producer
+        // quiesced before the durable watermark advances).
+        let mut root = AppRoot::new();
+        let world_for_storage = Arc::clone(&world);
+        let persistence_for_storage = Arc::clone(&persistence);
+        root.register(ServiceRegion::new(
+            "storage-pipeline",
+            Budget::new().with_deadline_at_secs(30),
+            move |_budget| match finalize_and_shutdown_storage(
+                &world_for_storage,
+                &persistence_for_storage,
+                &mut storage_pipeline,
+            ) {
+                Ok(()) => Outcome::ok("storage drained to the durable watermark".to_owned()),
+                Err(error) => Outcome::Err(format!("{error:#}")),
+            },
+        ));
+        root.register(ServiceRegion::new(
+            "control-server",
+            Budget::new().with_deadline_at_secs(15),
+            move |_budget| match control_runtime.shutdown() {
+                Ok(()) => Outcome::ok("control runtime shut down".to_owned()),
+                Err(error) => Outcome::Err(format!("{error:#}")),
+            },
+        ));
+        let outcomes = root.close();
+        let control_result = region_result(&outcomes, "control-server");
+        let storage_result = region_result(&outcomes, "storage-pipeline");
+        prefer_storage_failure(
+            match (render_result, control_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(render_error), Ok(())) => Err(render_error),
+                (Ok(()), Err(control_error)) => Err(control_error),
+                (Err(render_error), Err(control_error)) => Err(render_error).context(format!(
+                    "control runtime shutdown also failed: {control_error:#}"
+                )),
+            },
+            storage_result,
+            "runtime",
+        )
     })();
-    let result = finish_with_storage(runtime_result, "runtime", || {
-        finalize_and_shutdown_storage(&world, &persistence, &mut storage_pipeline)
-    });
+    let result = runtime_result;
     emit_sense_run_end(capture_shared_sense_run_summary(&world), result.is_ok());
     result
 }
@@ -523,6 +556,24 @@ fn prefer_storage_failure<T>(
         (Ok(_), Err(storage_error)) => Err(storage_error),
         (Err(operation_error), Err(storage_error)) => {
             Err(storage_error).context(format!("{operation_name} also failed: {operation_error:#}"))
+        }
+    }
+}
+
+/// Map one region's recorded outcome back into the `Result` contract the caller
+/// already had, preserving the typed error in the message.
+fn region_result(outcomes: &[RegionOutcome], name: &str) -> Result<()> {
+    let Some(region) = outcomes.iter().find(|outcome| outcome.name == name) else {
+        return Err(anyhow!("region {name} reported no teardown outcome"));
+    };
+    match &region.outcome {
+        Outcome::Ok(_) => Ok(()),
+        Outcome::Err(error) => Err(anyhow!(error.clone())),
+        Outcome::Cancelled(reason) => {
+            Err(anyhow!("region {name} exhausted its teardown budget: {reason:?}"))
+        }
+        Outcome::Panicked(payload) => {
+            Err(anyhow!("region {name} finalizer panicked: {payload}"))
         }
     }
 }
