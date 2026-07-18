@@ -8,8 +8,8 @@ use scriptbots_core::{
     BrainInspectionError, BrainInspectionSnapshot, BrainProtocolError,
     DYNAMIC_WORLD_SNAPSHOT_SCHEMA, DynamicWorldSnapshot, Generation, INPUT_SIZE, MutationRates,
     OUTPUT_SIZE, OffspringStatePolicy, Position, RandomStream, RuleBasedMapGenerator,
-    ScriptBotsConfig, TerrainKind, TileSpec, TilesetSpec, Velocity, WORLD_STEP_PROFILE_SCHEMA,
-    WorldState, WorldStepProfiler, WorldStepStage,
+    ScriptBotsConfig, TerrainKind, TileSpec, TilesetSpec, Velocity,
+    WORLD_STEP_OUTCOME_PROFILE_SCHEMA, WorldState, WorldStepProfiler, WorldStepStage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -1630,6 +1630,12 @@ fn run_repetition(
         let profile = profiler
             .latest()
             .ok_or_else(|| "profiled step produced no timing report".to_owned())?;
+        if profile.schema != WORLD_STEP_OUTCOME_PROFILE_SCHEMA {
+            return Err(format!(
+                "profiled step schema mismatch: expected {WORLD_STEP_OUTCOME_PROFILE_SCHEMA}, got {}",
+                profile.schema
+            ));
+        }
         profiled_step_total_ns.push(profile.total_ns);
         for (sample_index, stage) in WorldStepStage::all().iter().copied().enumerate() {
             stage_samples[sample_index].push(profile.elapsed_ns(stage));
@@ -2494,7 +2500,7 @@ fn validate_artifact(artifact: &PerfArtifact, require_baseline: bool) -> GateRes
     if artifact.dynamic_snapshot_schema != DYNAMIC_WORLD_SNAPSHOT_SCHEMA {
         return Err("dynamic snapshot schema mismatch".to_owned());
     }
-    if artifact.world_step_profile_schema != WORLD_STEP_PROFILE_SCHEMA {
+    if artifact.world_step_profile_schema != WORLD_STEP_OUTCOME_PROFILE_SCHEMA {
         return Err("world-step profile schema mismatch".to_owned());
     }
     let class_bytes = serde_json::to_vec(&artifact.fingerprint.class)
@@ -3042,7 +3048,7 @@ fn run_perf_gate(args: GateArgs) -> GateResult<i32> {
         source_commit: fingerprint.git_commit.clone(),
         baseline_justification: args.justification.clone(),
         dynamic_snapshot_schema: DYNAMIC_WORLD_SNAPSHOT_SCHEMA.to_owned(),
-        world_step_profile_schema: WORLD_STEP_PROFILE_SCHEMA.to_owned(),
+        world_step_profile_schema: WORLD_STEP_OUTCOME_PROFILE_SCHEMA.to_owned(),
         synthetic_sleep_us: args.synthetic_sleep_us,
         fingerprint,
         policy: gate_policy(args.ticks),
@@ -3243,7 +3249,7 @@ fn synthetic_artifact(
         baseline_justification: (artifact_kind == "baseline")
             .then(|| "self-test baseline".to_owned()),
         dynamic_snapshot_schema: DYNAMIC_WORLD_SNAPSHOT_SCHEMA.to_owned(),
-        world_step_profile_schema: WORLD_STEP_PROFILE_SCHEMA.to_owned(),
+        world_step_profile_schema: WORLD_STEP_OUTCOME_PROFILE_SCHEMA.to_owned(),
         synthetic_sleep_us: 0,
         fingerprint: Fingerprint {
             machine_class_id,
@@ -3337,6 +3343,16 @@ fn run_self_test() -> GateResult<()> {
     println!("perf-gate self-test: stable memory capacity class: {linux_memory}");
 
     let baseline = synthetic_artifact("baseline", "same", [100.0; 5], [1_000_000; 5]);
+
+    let mut stale_profile_schema =
+        synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
+    stale_profile_schema.world_step_profile_schema =
+        "scriptbots.world-step-profile.v2".to_owned();
+    assert_self_test_status(
+        "stale v2 world-step profile schema is refused",
+        &compare_artifacts(&baseline, &stale_profile_schema),
+        VerdictStatus::Refused,
+    );
 
     let regression = synthetic_artifact("candidate", "same", [89.0; 5], [1_000_000; 5]);
     assert_self_test_status(
