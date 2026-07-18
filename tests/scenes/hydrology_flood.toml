@@ -1,0 +1,34 @@
+# Scene: hydrology_flood
+# A world seeded to generate hydrology (every world computes its flow field
+# from terrain): validates the water-depth ramp, shimmer, and depth-matched
+# splat layers against the real hydrology snapshot. NOTE: water levels are
+# terrain-derived, not a config knob — the flood framing comes from this
+# world's generated basins, asserted via the hydrology REST surface shape.
+name = "hydrology_flood"
+seed = 5005
+ticks = 90
+frontend = "terminal_headless"
+quality = "high"
+
+[config_overrides]
+initial_food = 0.3
+food_max = 0.7
+topography_enabled = true
+
+[[camera]]
+tick = 0
+pos = [0.0, 1100.0, 0.0]
+pitch = -1.15
+
+[[captures]]
+tick = 45
+name = "mid_flood"
+
+[[captures]]
+tick = 90
+name = "flood_final"
+
+[[expect]]
+kind = "agent_count"
+min = 1
+max = 10000

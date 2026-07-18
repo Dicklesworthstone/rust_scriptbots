@@ -1,0 +1,37 @@
+# Scene: combat_burst
+# Carnivore-heavy world engineered for spike combat: validates combat event
+# detection and the spark_cone cue mapping end to end.
+name = "combat_burst"
+seed = 3003
+ticks = 150
+frontend = "terminal_headless"
+quality = "high"
+
+[config_overrides]
+population_minimum = 24
+food_max = 0.4
+spike_damage = 0.35
+
+[[camera]]
+tick = 0
+pos = [0.0, 800.0, 0.0]
+pitch = -1.1
+
+[[captures]]
+tick = 150
+name = "combat_final"
+
+[[expect]]
+kind = "agent_count"
+min = 1
+max = 5000
+
+[[expect]]
+kind = "event_occurred"
+event = "spike_hit"
+by_tick = 150
+
+[[expect]]
+kind = "cue_present"
+cue = "spark_cone"
+at_tick = 150

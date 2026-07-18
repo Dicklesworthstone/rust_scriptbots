@@ -1,0 +1,37 @@
+# Scene: mixed_population_1k
+# A dense mixed world: the workhorse capture for population-scale visuals.
+# Population floor keeps agents spawning; food abundance keeps them alive.
+name = "mixed_population_1k"
+seed = 2002
+ticks = 120
+frontend = "terminal_headless"
+quality = "medium"
+
+[config_overrides]
+population_minimum = 40
+population_spawn_interval = 4
+food_max = 0.9
+initial_food = 0.5
+
+[[camera]]
+tick = 0
+pos = [0.0, 1400.0, 0.0]
+pitch = -1.3
+
+[[captures]]
+tick = 60
+name = "mid_population"
+
+[[captures]]
+tick = 120
+name = "final_population"
+
+[[expect]]
+kind = "agent_count"
+min = 10
+max = 5000
+
+[[expect]]
+kind = "event_occurred"
+event = "birth"
+by_tick = 120

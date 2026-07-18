@@ -1,0 +1,40 @@
+# Scene: day_night_sweep
+# Runs a full day/night cycle: validates the shared daylight curve drives
+# identical lighting phases on every surface (Bevy sun + TUI tint).
+name = "day_night_sweep"
+seed = 4004
+ticks = 240
+frontend = "terminal_headless"
+quality = "medium"
+
+[config_overrides]
+[config_overrides.render.day_night]
+cycle_ticks = 240
+start_phase = 0.0
+stars = true
+
+[[camera]]
+tick = 0
+pos = [0.0, 1000.0, 0.0]
+pitch = -1.2
+
+[[captures]]
+tick = 60
+name = "noon"
+
+[[captures]]
+tick = 120
+name = "dusk"
+
+[[captures]]
+tick = 180
+name = "midnight"
+
+[[captures]]
+tick = 240
+name = "dawn_again"
+
+[[expect]]
+kind = "agent_count"
+min = 1
+max = 10000

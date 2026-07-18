@@ -3007,6 +3007,7 @@ pub mod command;
 pub mod control;
 pub mod lab;
 pub mod precedence;
+pub mod scene;
 pub mod servers;
 pub mod terminal;
 
