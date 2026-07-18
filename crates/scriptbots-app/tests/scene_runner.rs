@@ -6,9 +6,7 @@
 
 use std::path::PathBuf;
 
-use scriptbots_app::scene::{
-    NullDriver, SceneManifest, TerminalHeadlessDriver, run_scene,
-};
+use scriptbots_app::scene::{NullDriver, SceneManifest, TerminalHeadlessDriver, run_scene};
 
 fn scenes_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/scenes")
@@ -21,9 +19,10 @@ fn load_all() -> Vec<SceneManifest> {
             let path = entry.ok()?.path();
             (path.extension().and_then(|ext| ext.to_str()) == Some("toml")).then_some(path)
         })
-        .map(|path| SceneManifest::load(&path).unwrap_or_else(|error| {
-            panic!("scene {} failed to load: {error}", path.display())
-        }))
+        .map(|path| {
+            SceneManifest::load(&path)
+                .unwrap_or_else(|error| panic!("scene {} failed to load: {error}", path.display()))
+        })
         .collect();
     manifests.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(manifests.len(), 5, "all five reference scenes load");

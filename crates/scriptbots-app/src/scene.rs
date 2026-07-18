@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState, parse_render_quality};
+use serde::{Deserialize, Serialize};
 
 /// One scene manifest (TOML). Unknown keys are rejected.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -168,7 +168,10 @@ impl SceneManifest {
             problems.push("name must be non-empty".to_string());
         }
         if self.ticks == 0 || self.ticks > MAX_SCENE_TICKS {
-            problems.push(format!("ticks {} must be in 1..={MAX_SCENE_TICKS}", self.ticks));
+            problems.push(format!(
+                "ticks {} must be in 1..={MAX_SCENE_TICKS}",
+                self.ticks
+            ));
         }
         if let Some(quality) = &self.quality
             && parse_render_quality(quality).is_none()
@@ -291,9 +294,10 @@ impl SceneManifest {
             })?;
             merge_json(&mut value, &overrides_json);
         }
-        let config: ScriptBotsConfig = serde_json::from_value(value).map_err(|error| SceneError {
-            problems: vec![format!("compose config: {error}")],
-        })?;
+        let config: ScriptBotsConfig =
+            serde_json::from_value(value).map_err(|error| SceneError {
+                problems: vec![format!("compose config: {error}")],
+            })?;
         config.validate().map_err(|error| SceneError {
             problems: vec![format!("composed config invalid: {error}")],
         })?;
@@ -384,7 +388,10 @@ pub struct CaptureRecord {
 
 /// Evaluate expectations against run facts.
 #[must_use]
-pub fn evaluate_expectations(manifest: &SceneManifest, facts: &SceneRunFacts) -> Vec<ExpectationResult> {
+pub fn evaluate_expectations(
+    manifest: &SceneManifest,
+    facts: &SceneRunFacts,
+) -> Vec<ExpectationResult> {
     manifest
         .expect
         .iter()
@@ -540,11 +547,9 @@ impl TerminalHeadlessDriver {
             agent.position.x = 60.0 + (index % cols) as f32 * 120.0;
             agent.position.y = 60.0 + (index / cols) as f32 * 120.0;
             agent.spike_length = 10.0;
-            world
-                .try_spawn_agent(agent)
-                .map_err(|error| SceneError {
-                    problems: vec![format!("seed agent {index}: {error}")],
-                })?;
+            world.try_spawn_agent(agent).map_err(|error| SceneError {
+                problems: vec![format!("seed agent {index}: {error}")],
+            })?;
         }
         Ok(())
     }
@@ -574,10 +579,14 @@ impl SceneDriver for TerminalHeadlessDriver {
             })?;
             facts.agent_counts.push(world.agent_count());
             if let Some(summary) = world.history().next_back() {
-                if summary.births > last_summary_births && !facts.events.iter().any(|(k, _)| k == "birth") {
+                if summary.births > last_summary_births
+                    && !facts.events.iter().any(|(k, _)| k == "birth")
+                {
                     facts.events.push(("birth".to_string(), tick));
                 }
-                if summary.deaths > last_summary_deaths && !facts.events.iter().any(|(k, _)| k == "death") {
+                if summary.deaths > last_summary_deaths
+                    && !facts.events.iter().any(|(k, _)| k == "death")
+                {
                     facts.events.push(("death".to_string(), tick));
                 }
                 if summary.spike_hits > last_spike_hits
@@ -605,11 +614,9 @@ impl SceneDriver for TerminalHeadlessDriver {
                 }
             }
             if manifest.captures.iter().any(|capture| capture.tick == tick) {
-                let digest = world
-                    .world_digest_v1()
-                    .map_err(|error| SceneError {
-                        problems: vec![format!("capture digest at tick {tick}: {error}")],
-                    })?;
+                let digest = world.world_digest_v1().map_err(|error| SceneError {
+                    problems: vec![format!("capture digest at tick {tick}: {error}")],
+                })?;
                 let hash = fnv1a64_hex(digest.overall.as_bytes());
                 for capture in manifest.captures.iter().filter(|c| c.tick == tick) {
                     facts.captures.push((
@@ -649,7 +656,10 @@ pub fn fnv1a64_hex(bytes: &[u8]) -> String {
 /// # Errors
 /// Returns a [`SceneError`] when the driver fails or the manifest is
 /// invalid; expectation failures are reported in the log, not as errors.
-pub fn run_scene(manifest: &SceneManifest, driver: &mut dyn SceneDriver) -> Result<SceneLog, SceneError> {
+pub fn run_scene(
+    manifest: &SceneManifest,
+    driver: &mut dyn SceneDriver,
+) -> Result<SceneLog, SceneError> {
     manifest.validate()?;
     let facts = driver.run(manifest)?;
     let expectations = evaluate_expectations(manifest, &facts);
@@ -691,7 +701,10 @@ mod tests {
                 tick: 10,
                 name: "mid".to_string(),
             }],
-            expect: vec![Expectation::AgentCount { min: 1, max: 10_000 }],
+            expect: vec![Expectation::AgentCount {
+                min: 1,
+                max: 10_000,
+            }],
         }
     }
 
@@ -755,8 +768,9 @@ surprise = true
     #[test]
     fn compose_config_applies_overrides_recursively() {
         let mut manifest = base_manifest();
-        manifest.config_overrides = Some(toml::from_str::<toml::Value>(
-            r#"
+        manifest.config_overrides = Some(
+            toml::from_str::<toml::Value>(
+                r#"
 world_width = 900
 world_height = 700
 [render]
@@ -765,7 +779,9 @@ quality = "high"
 cycle_ticks = 24000
 stars = true
 "#,
-        ).expect("override toml"));
+            )
+            .expect("override toml"),
+        );
         let config = manifest.compose_config().expect("compose");
         assert_eq!(config.world_width, 900);
         assert_eq!(config.world_height, 700);
@@ -863,19 +879,27 @@ stars = true
                 name: "final".to_string(),
             }],
             expect: vec![
-                Expectation::AgentCount { min: 1, max: 10_000 },
+                Expectation::AgentCount {
+                    min: 1,
+                    max: 10_000,
+                },
                 Expectation::CuePresent {
                     cue: "sparkle".to_string(),
                     at_tick: 12,
                 },
             ],
         };
-        let log = run_scene(&manifest, &mut TerminalHeadlessDriver::default()).expect("terminal run");
+        let log =
+            run_scene(&manifest, &mut TerminalHeadlessDriver::default()).expect("terminal run");
         assert_eq!(log.ticks_executed, 12);
         assert_eq!(log.captures.len(), 1);
         assert!(log.world_digest.is_some(), "terminal driver binds a digest");
         let count_result = &log.expectations[0];
-        assert!(count_result.pass, "agent count expectation: {}", count_result.detail);
+        assert!(
+            count_result.pass,
+            "agent count expectation: {}",
+            count_result.detail
+        );
     }
 
     #[test]
