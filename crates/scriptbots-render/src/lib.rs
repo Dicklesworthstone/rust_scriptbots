@@ -1431,6 +1431,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         world_size,
         terrain: terrain_view,
         agents: &agents_gpu,
+        anim_seconds: state.frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
     };
 
     tracing::info!(
