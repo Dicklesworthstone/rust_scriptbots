@@ -1210,6 +1210,7 @@ mod wgpu_capture_test {
                 elevation: None,
             },
             agents: &[] as &[AgentInstance],
+            anim_seconds: 0.0,
         };
         comp.render_snapshot(&empty, viewport);
         let without_agents =
