@@ -2949,9 +2949,10 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 mod tests {
     use super::*;
     use crate::{
-        BrainProjectionRequest, ProjectionBroker, ProjectionCamera, ProjectionClientId,
-        ProjectionDetail, ProjectionLimits, ProjectionRanking, ProjectionRequest,
-        ProjectionRequestRevision, ProjectionSelection, ProjectionViewport, project_snapshot,
+        BrainProjectionRequest, CommandLifecycleTransition, ProjectionBroker, ProjectionCamera,
+        ProjectionClientId, ProjectionDetail, ProjectionLimits, ProjectionRanking,
+        ProjectionRequest, ProjectionRequestRevision, ProjectionSelection, ProjectionViewport,
+        project_snapshot,
     };
     use scriptbots_core::{
         ActivationLayer, AgentData, AgentUid, BrainActivations, BrainInspection,
