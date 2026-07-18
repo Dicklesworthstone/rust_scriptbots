@@ -3,5 +3,5 @@
 # Paths are relative to this directory. Every entry must exist in Git.
 # Unavailable legacy-capture hashes remain historical evidence in
 # legacy_capture_checklist.md; they are deliberately excluded from this manifest.
-bc50c960b95db0bac2ff3aeb78cfb8bd465625071f0aae774a04ef2be3ea694a  golden/rust_default.png
+74f35e1b533241c481f961a3156b4841526929930cb3a191815f8f639e38bab9  golden/rust_default.png
 1f68f9474054c92515344df2bc7312dd83bae4fdfd4835c9199851128c429aef  golden/bevy_default.png
