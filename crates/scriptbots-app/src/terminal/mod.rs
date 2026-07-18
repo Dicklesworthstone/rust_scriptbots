@@ -42,7 +42,8 @@ use supports_color::{ColorLevel, Stream, on_cached};
 use tracing::{info, warn};
 
 use crate::{
-    CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld, WorldStepDriver,
+    CommandDrain, CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics, SharedWorld,
+    WorldStepDriver,
     renderer::{Renderer, RendererContext},
 };
 
@@ -279,7 +280,7 @@ impl TerminalRenderer {
         let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
         let mut app = TerminalApp::new(self, ctx);
         app.palette = Palette::test_backend_evidence();
-        let mut report = HeadlessReport::new(app.snapshot().clone());
+        let mut report = HeadlessReport::new(app.snapshot().clone(), app.scenario.as_ref());
 
         for _ in 0..frames {
             app.ensure_control_runtime_running()?;
@@ -341,6 +342,7 @@ struct TerminalApp<'a> {
     control: &'a ControlRuntime,
     command_drain: CommandDrain,
     command_submit: CommandSubmit,
+    scenario: Arc<ScenarioIdentityV0>,
     tick_interval: Duration,
     draw_interval: Duration,
     speed_multiplier: f32,
@@ -395,6 +397,7 @@ impl<'a> TerminalApp<'a> {
             control: ctx.control_runtime,
             command_drain: Arc::clone(&ctx.command_drain),
             command_submit: Arc::clone(&ctx.command_submit),
+            scenario: Arc::clone(&ctx.scenario),
             tick_interval: renderer.tick_interval,
             draw_interval: renderer.draw_interval,
             speed_multiplier: 1.0,
@@ -772,7 +775,10 @@ impl<'a> TerminalApp<'a> {
 
         let paragraph = Paragraph::new(line).block(
             Block::default()
-                .title(self.palette.title("ScriptBots Terminal HUD"))
+                .title(self.palette.title(format!(
+                    "ScriptBots Terminal HUD — {} · bootstrap {}",
+                    self.scenario.id, self.scenario.bootstrap_ticks
+                )))
                 .borders(Borders::ALL),
         );
         frame.render_widget(paragraph, area);
@@ -2851,14 +2857,34 @@ impl Snapshot {
 
 #[derive(Debug, Clone, Serialize)]
 struct HeadlessReport {
+    scenario: ScenarioSummary,
     initial: FrameStats,
     frames: Vec<FrameStats>,
     summary: ReportSummary,
 }
 
-impl HeadlessReport {
-    fn new(initial_snapshot: Snapshot) -> Self {
+/// Scenario identity carried by every headless report so CI evidence names the run.
+#[derive(Debug, Clone, Serialize)]
+struct ScenarioSummary {
+    id: String,
+    schema_version: u16,
+    bootstrap_ticks: u64,
+}
+
+impl From<&ScenarioIdentityV0> for ScenarioSummary {
+    fn from(scenario: &ScenarioIdentityV0) -> Self {
         Self {
+            id: scenario.id.clone(),
+            schema_version: scenario.schema_version,
+            bootstrap_ticks: scenario.bootstrap_ticks,
+        }
+    }
+}
+
+impl HeadlessReport {
+    fn new(initial_snapshot: Snapshot, scenario: &ScenarioIdentityV0) -> Self {
+        Self {
+            scenario: ScenarioSummary::from(scenario),
             initial: FrameStats::from_snapshot(&initial_snapshot, None),
             frames: Vec::new(),
             summary: ReportSummary::default(),
@@ -3846,6 +3872,11 @@ mod tests {
     use super::*;
     use scriptbots_core::{AgentData, Position, ScriptBotsConfig};
 
+    /// Shared scenario identity for renderer contexts built by tests.
+    fn test_scenario() -> Arc<ScenarioIdentityV0> {
+        Arc::new(ScenarioIdentityV0::caller_seeded("terminal-test-scenario"))
+    }
+
     #[test]
     fn brain_inspection_metadata_exposes_provenance_clipping_and_staleness() {
         let inspection = BrainInspectionViewMetadata {
@@ -3874,6 +3905,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
         app.snapshot.tick = 100;
@@ -4102,6 +4134,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
         app.paused = true;
@@ -4268,6 +4301,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
         app.paused = true;
@@ -4322,6 +4356,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
         let before = world.lock().expect("world lock").tick().0;
@@ -4352,6 +4387,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
 
         let report = renderer
@@ -4376,11 +4412,13 @@ mod tests {
                 evidence.forced_width_cells,
                 evidence.empty_symbol_cells,
             ),
-            (2429, 1743, 0, 0, 0),
+            (2424, 1782, 0, 0, 0),
             "fixed-seed Ratatui TestBackend cell counts changed; inspect the rendered buffer before intentionally updating this reviewed evidence: {evidence:?}"
         );
+        // Reviewed 2026-07-17 (bd-2z0.10.1): the header title now carries the scenario id
+        // and bootstrap policy, shifting the pinned counts and full-cell digest below.
         assert_eq!(
-            evidence.full_cell_fnv1a64, "c1b5c6b979cee722",
+            evidence.full_cell_fnv1a64, "265533efd3ec40aa",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
         assert_eq!(
@@ -4401,6 +4439,7 @@ mod tests {
             control_runtime: &repeat_runtime,
             command_drain: repeat_drain,
             command_submit: repeat_submit,
+            scenario: test_scenario(),
         };
         let repeat = renderer
             .run_headless_frames(repeat_ctx, 1)
@@ -4458,6 +4497,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: crate::command::make_command_drain(receiver),
             command_submit: crate::command::make_command_submit(sender),
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
         assert!(!app.paused);
@@ -4502,6 +4542,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let app = TerminalApp::new(&renderer, ctx);
 
@@ -4530,6 +4571,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
         let fault = Arc::<str>::from("deliberate brain construction failure");
@@ -4559,6 +4601,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
 
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -4585,6 +4628,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
         app.snapshot.max_age = 12;
@@ -4618,6 +4662,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
         app.refresh_snapshot();
@@ -4646,6 +4691,7 @@ mod tests {
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
+            scenario: test_scenario(),
         };
         let mut app = TerminalApp::new(&renderer, ctx);
 

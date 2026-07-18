@@ -38,6 +38,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::SharedWorld;
+use crate::ScenarioIdentityV0;
 use crate::command::{
     CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
 };
@@ -76,6 +77,9 @@ pub struct ControlServerConfig {
     pub swagger_path: String,
     pub rest_enabled: bool,
     pub mcp_transport: McpTransportConfig,
+    /// The run's scenario identity, surfaced read-only at `GET /api/scenario`.
+    /// `None` only for embedded/test servers with no manifest context.
+    pub scenario: Option<Arc<ScenarioIdentityV0>>,
     /// Environment parsing failures retained until the fallible launch boundary.
     #[doc(hidden)]
     pub environment_errors: Vec<String>,
@@ -90,6 +94,7 @@ impl Default for ControlServerConfig {
             mcp_transport: McpTransportConfig::Http {
                 bind_address: DEFAULT_CONTROL_MCP_HTTP_ADDRESS,
             },
+            scenario: None,
             environment_errors: Vec::new(),
         }
     }
@@ -811,6 +816,7 @@ async fn start_control_servers(
 #[derive(Clone)]
 struct ApiState {
     handle: ControlHandle,
+    scenario: Option<Arc<ScenarioIdentityV0>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -821,6 +827,33 @@ struct ErrorResponse {
 #[derive(Debug, Serialize, ToSchema)]
 struct PresetList {
     presets: Vec<&'static str>,
+}
+
+/// Read-only view of the run's scenario identity and bootstrap policy.
+#[derive(Debug, Serialize, ToSchema)]
+struct ScenarioView {
+    /// Stable scenario identifier (from `--scenario` or the derived default).
+    id: String,
+    /// Scenario schema version (`0` = derived, `1` = first-class document).
+    schema_version: u16,
+    /// Explicit pre-frontend warmup ticks (`0` = launch at tick zero).
+    bootstrap_ticks: u64,
+    /// How the founding population was seeded (app-derived recipe).
+    population_recipe: String,
+    /// Ordered, kind-tagged digests of every configuration layer that built this run.
+    ordered_config_layer_digests: Vec<String>,
+}
+
+impl From<&ScenarioIdentityV0> for ScenarioView {
+    fn from(scenario: &ScenarioIdentityV0) -> Self {
+        Self {
+            id: scenario.id.clone(),
+            schema_version: scenario.schema_version,
+            bootstrap_ticks: scenario.bootstrap_ticks,
+            population_recipe: scenario.population_recipe.clone(),
+            ordered_config_layer_digests: scenario.ordered_config_layer_digests.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -969,6 +1002,7 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
         get_scoreboard,
         get_agents_debug,
         get_config_audit,
+        get_scenario,
         list_presets,
         apply_preset,
         post_selection
@@ -981,6 +1015,7 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
             ConfigPatchRequest,
             KnobApplyRequest,
             ConfigAuditEntryView,
+            ScenarioView,
             PresetList,
             PresetApplyRequest,
             ErrorResponse,
@@ -1436,6 +1471,22 @@ async fn get_config_audit(
 
 #[utoipa::path(
     get,
+    path = "/api/scenario",
+    tag = "control",
+    responses(
+        (status = 200, body = ScenarioView),
+        (status = 404, body = ErrorResponse, description = "no scenario identity available")
+    )
+)]
+async fn get_scenario(State(state): State<ApiState>) -> Result<Json<ScenarioView>, AppError> {
+    let scenario = state.scenario.as_deref().ok_or_else(|| {
+        AppError::not_found("this server was launched without a scenario identity")
+    })?;
+    Ok(Json(ScenarioView::from(scenario)))
+}
+
+#[utoipa::path(
+    get,
     path = "/api/presets",
     tag = "control",
     responses((status = 200, body = PresetList))
@@ -1471,7 +1522,10 @@ fn prepare_rest_server(
     config: &ControlServerConfig,
     reserved: ReservedControlListener,
 ) -> Result<PreparedRestServer> {
-    let state = ApiState { handle };
+    let state = ApiState {
+        handle,
+        scenario: config.scenario.clone(),
+    };
     let mut openapi = ApiDoc::openapi();
     openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
 
@@ -1492,7 +1546,8 @@ fn prepare_rest_server(
         .route("/api/scoreboard", get(get_scoreboard))
         .route("/api/agents/debug", get(get_agents_debug))
         .route("/api/selection", post(post_selection))
-        // Presets and audit
+        // Scenario identity and presets
+        .route("/api/scenario", get(get_scenario))
         .route("/api/presets", get(list_presets))
         .route("/api/presets/apply", post(apply_preset))
         .route("/api/config/audit", get(get_config_audit))
@@ -2446,7 +2501,10 @@ mod tests {
     #[tokio::test]
     async fn rest_patch_rejects_non_finite_value_with_field_path_before_admission() {
         let (handle, receiver) = handle();
-        let state = ApiState { handle };
+        let state = ApiState {
+            handle,
+            scenario: None,
+        };
         let result = patch_config(
             State(state.clone()),
             Json(ConfigPatchRequest {
@@ -2492,5 +2550,38 @@ mod tests {
             receiver.try_recv(),
             Err(crate::command::CommandRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn scenario_endpoint_reports_the_runs_identity_or_404() {
+        // No scenario plumbed: the endpoint must say so honestly rather than invent one.
+        let (bare_handle, _bare_receiver) = handle();
+        let bare = ApiState {
+            handle: bare_handle,
+            scenario: None,
+        };
+        let missing = match get_scenario(State(bare)).await {
+            Ok(_) => panic!("a server without scenario context must 404"),
+            Err(error) => error,
+        };
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+        // With the run's scenario plumbed, the endpoint reports exactly it.
+        let mut identity = ScenarioIdentityV0::caller_seeded("fixture-equilibrium-study");
+        identity.schema_version = 1;
+        identity.bootstrap_ticks = 12;
+        let (state_handle, _state_receiver) = handle();
+        let state = ApiState {
+            handle: state_handle,
+            scenario: Some(Arc::new(identity)),
+        };
+        let Json(view) = match get_scenario(State(state)).await {
+            Ok(view) => view,
+            Err(error) => panic!("scenario view must resolve: {}", error.message),
+        };
+        let rendered = serde_json::to_value(&view).expect("view serializes");
+        assert_eq!(rendered["id"], "fixture-equilibrium-study");
+        assert_eq!(rendered["schema_version"], 1);
+        assert_eq!(rendered["bootstrap_ticks"], 12);
     }
 }

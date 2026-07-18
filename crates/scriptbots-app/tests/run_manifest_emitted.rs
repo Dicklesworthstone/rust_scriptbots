@@ -729,3 +729,153 @@ fn two_identical_runs_produce_the_same_provenance() {
     let _ = std::fs::remove_dir_all(&first);
     let _ = std::fs::remove_dir_all(&second);
 }
+
+const FIXTURE_SCENARIO: &str = r#"
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "fixture-equilibrium-study"
+description = "acceptance fixture for bd-2z0.10.1"
+
+[config]
+food_max = 0.123
+population_minimum = 24
+"#;
+
+fn write_scenario(dir: &Path, contents: &str) -> PathBuf {
+    let path = dir.join("fixture.scenario.toml");
+    std::fs::write(&path, contents).expect("write scenario document");
+    path
+}
+
+#[test]
+fn a_scenario_document_binds_identity_bootstrap_and_config_into_the_manifest() {
+    // The scenario document is the unit a researcher shares: the manifest must name
+    // its stable id and schema version, its config body must actually configure the
+    // world, and its bytes must appear in the ordered layer digests.
+    let dir = run_dir("scenario_binds");
+    let scenario_path = write_scenario(&dir, FIXTURE_SCENARIO);
+    let scenario_arg = scenario_path.to_str().expect("utf-8 scenario path");
+    let output = launch_with(&dir, &[], &["--scenario", scenario_arg]);
+    let manifest = manifest_of(&output, &dir);
+
+    assert_eq!(
+        manifest["scenario"]["id"], "fixture-equilibrium-study",
+        "the manifest does not name the scenario document's stable id"
+    );
+    assert_eq!(
+        manifest["scenario"]["schema_version"], 1,
+        "the manifest does not record the first-class scenario schema version"
+    );
+    // The launch helper passes --bootstrap-ticks 2 explicitly: the CLI must outrank
+    // the document (which declares no policy here), and the manifest must say so.
+    assert_eq!(manifest["scenario"]["bootstrap_ticks"], 2);
+    assert_eq!(
+        manifest["normalized_config"]["food_max"], 0.123,
+        "the scenario document's config body did not reach the world"
+    );
+    assert_eq!(manifest["normalized_config"]["population_minimum"], 24);
+    let digests = manifest["scenario"]["ordered_config_layer_digests"]
+        .as_array()
+        .expect("layer digests");
+    assert!(
+        digests
+            .iter()
+            .any(|entry| entry.as_str().is_some_and(|entry| entry.starts_with("file:"))),
+        "the scenario document's exact bytes are missing from the ordered layer digests: {digests:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_same_scenario_and_seed_produce_identical_placement_and_digests() {
+    // THE acceptance row: starting the same scenario/seed produces identical
+    // placement and trace. Two launches of one scenario document plus one seed must
+    // agree on config digest, root seed, and the tick-zero world digest (which binds
+    // every agent's placement); a third launch with a different seed must disagree.
+    let first = run_dir("scenario_same_a");
+    let second = run_dir("scenario_same_b");
+    let third = run_dir("scenario_different_seed");
+    let scenario_path = write_scenario(&first, FIXTURE_SCENARIO);
+    let scenario_arg = scenario_path.to_str().expect("utf-8 scenario path");
+
+    let out_a = launch_with(&first, &[], &["--scenario", scenario_arg]);
+    let out_b = launch_with(&second, &[], &["--scenario", scenario_arg]);
+    let out_c = launch_with(&third, &[("SCRIPTBOTS_RNG_SEED", "9999")], &["--scenario", scenario_arg]);
+    assert!(
+        out_a.status.success() && out_b.status.success() && out_c.status.success(),
+        "all three runs must complete\na: {}\nb: {}\nc: {}",
+        String::from_utf8_lossy(&out_a.stderr),
+        String::from_utf8_lossy(&out_b.stderr),
+        String::from_utf8_lossy(&out_c.stderr)
+    );
+
+    let read = |dir: &Path| -> serde_json::Value {
+        let bytes = std::fs::read(dir.join("run.manifest.json")).expect("manifest exists");
+        serde_json::from_slice(&bytes).expect("valid JSON")
+    };
+    let (a, b, c) = (read(&first), read(&second), read(&third));
+
+    assert_eq!(a["config_digest"], b["config_digest"]);
+    assert_eq!(a["root_seed"], b["root_seed"]);
+    assert_eq!(a["scenario"], b["scenario"]);
+    assert_ne!(
+        a["config_digest"], c["config_digest"],
+        "a different seed must not masquerade as the same scenario run"
+    );
+
+    // IDENTICAL PLACEMENT: the bootstrap sidecar's start digest binds every founder's
+    // position, body, and brain genome at tick zero. Two same-seed runs must match
+    // bit-for-bit; the different-seed run must not.
+    let start_digest = |manifest: &serde_json::Value| {
+        manifest["bootstrap_evidence"]["start"]["overall"]
+            .as_str()
+            .expect("bootstrap start digest")
+            .to_owned()
+    };
+    assert_eq!(
+        start_digest(&a),
+        start_digest(&b),
+        "same scenario + same seed produced different tick-zero world state"
+    );
+    assert_ne!(
+        start_digest(&a),
+        start_digest(&c),
+        "different seed produced identical tick-zero world state — seed is not driving placement"
+    );
+
+    let _ = std::fs::remove_dir_all(&first);
+    let _ = std::fs::remove_dir_all(&second);
+    let _ = std::fs::remove_dir_all(&third);
+}
+
+#[test]
+fn an_invalid_scenario_document_fails_before_any_run_artifacts_exist() {
+    // A malformed scenario must fail closed: no run database, no manifest, no
+    // storage sidecars — exactly the preflight discipline the config layers get.
+    let dir = run_dir("scenario_invalid");
+    let bad = FIXTURE_SCENARIO.replace("scriptbots.scenario.v1", "scriptbots.scenario.v0");
+    let scenario_path = write_scenario(&dir, &bad);
+    let scenario_arg = scenario_path.to_str().expect("utf-8 scenario path");
+    let output = launch_with(&dir, &[], &["--scenario", scenario_arg]);
+
+    assert!(
+        !output.status.success(),
+        "a wrong-schema scenario document must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("scenario schema must be"),
+        "the failure must name the schema contract, got:\n{stderr}"
+    );
+    assert!(
+        !dir.join("run.sqlite").exists(),
+        "an invalid scenario reserved a run database"
+    );
+    assert!(
+        !dir.join("run.manifest.json").exists(),
+        "an invalid scenario wrote a manifest"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::Result;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use scriptbots_app::{
-    ControlCommand, ControlRuntime, ControlServerConfig, McpTransportConfig, WorldStepDriver,
+    ControlCommand, ControlRuntime, ControlServerConfig, McpTransportConfig, ScenarioIdentityV0,
+    WorldStepDriver,
     control::empty_latest_summary,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
@@ -284,6 +285,7 @@ fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
             control_runtime: &control_runtime,
             command_drain,
             command_submit,
+            scenario: Arc::new(ScenarioIdentityV0::caller_seeded("e2e-scenario")),
         };
         renderer.run(context)?;
     }
@@ -551,6 +553,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
             control_runtime: &control_runtime,
             command_drain,
             command_submit,
+            scenario: Arc::new(ScenarioIdentityV0::caller_seeded("e2e-scenario")),
         };
         renderer.run(context)?;
     }

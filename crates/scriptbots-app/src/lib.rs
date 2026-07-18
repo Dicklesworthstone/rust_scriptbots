@@ -240,6 +240,192 @@ impl ScenarioIdentityV0 {
     }
 }
 
+/// Schema identifier for a versioned scenario document (`--scenario` files).
+pub const SCENARIO_V1_SCHEMA: &str = "scriptbots.scenario.v1";
+/// Current schema version accepted for scenario documents.
+pub const SCENARIO_V1_VERSION: u16 = 1;
+/// Maximum UTF-8 byte length for a scenario document's human description.
+pub const MAX_SCENARIO_DESCRIPTION_BYTES: usize = 4_096;
+
+/// Errors returned while loading or validating a versioned scenario document.
+#[derive(Debug, Error)]
+pub enum ScenarioError {
+    /// The TOML/RON top level was not a table.
+    #[error("scenario document must be a table at the top level")]
+    NotATable,
+    /// The schema tag did not match the only accepted v1 identifier.
+    #[error("scenario schema must be \"{SCENARIO_V1_SCHEMA}\"; got {actual:?}")]
+    WrongSchema {
+        /// The schema string actually found.
+        actual: String,
+    },
+    /// The schema version was not the one this binary understands.
+    #[error("scenario schema_version must be {SCENARIO_V1_VERSION}; got {actual}")]
+    WrongVersion {
+        /// The version actually found.
+        actual: u64,
+    },
+    /// The stable scenario identifier was empty or whitespace-only.
+    #[error("scenario identity must not be empty")]
+    EmptyId,
+    /// The stable scenario identifier exceeded the durable storage boundary.
+    #[error("scenario identity is {actual} bytes; maximum is {maximum}")]
+    IdTooLong {
+        /// Actual UTF-8 byte length.
+        actual: usize,
+        /// Maximum permitted UTF-8 byte length.
+        maximum: usize,
+    },
+    /// The stable scenario identifier contained a control character.
+    #[error("scenario identity must not contain control characters")]
+    IdControlCharacter,
+    /// The human description exceeded its bound.
+    #[error("scenario description is {actual} bytes; maximum is {maximum}")]
+    DescriptionTooLong {
+        /// Actual UTF-8 byte length.
+        actual: usize,
+        /// Maximum permitted UTF-8 byte length.
+        maximum: usize,
+    },
+    /// The configuration body was not an object.
+    #[error("scenario config must be an object of configuration fields; got {actual}")]
+    ConfigNotObject {
+        /// JSON type name of the offending value.
+        actual: &'static str,
+    },
+    /// The document bytes did not parse as the declared format.
+    #[error("failed to parse scenario document: {0}")]
+    Parse(String),
+}
+
+/// A first-class, versioned scenario: a stable identifier, an explicit bootstrap
+/// policy, and a configuration body, bound into the run manifest's
+/// [`ScenarioIdentityV0`] so a run names exactly what it is.
+///
+/// The configuration body is deliberately opaque to this type: it flows through
+/// the same layered resolution and finite/range validation as every other
+/// configuration layer, so a scenario can never smuggle a value a `--config`
+/// file could not carry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScenarioDocumentV1 {
+    /// Must equal [`SCENARIO_V1_SCHEMA`].
+    pub schema: String,
+    /// Must equal [`SCENARIO_V1_VERSION`].
+    pub schema_version: u16,
+    /// Stable scenario identifier, persisted in the run manifest and storage.
+    pub id: String,
+    /// Optional human description (bounded, free text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Explicit pre-frontend warmup ticks; `None` means the run default (`0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_ticks: Option<u64>,
+    /// Configuration fields, resolved exactly like one `--config` file layer.
+    #[serde(default = "empty_scenario_config")]
+    pub config: serde_json::Value,
+}
+
+/// Default scenario configuration body: an empty object (never `null`).
+fn empty_scenario_config() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+impl ScenarioDocumentV1 {
+    /// Parse and validate a TOML scenario document.
+    pub fn parse_toml(bytes: &[u8]) -> Result<Self, ScenarioError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| ScenarioError::Parse(format!("document is not valid UTF-8: {error}")))?;
+        let document: Self =
+            toml::from_str(text).map_err(|error| ScenarioError::Parse(error.to_string()))?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    /// Parse and validate a RON scenario document.
+    pub fn parse_ron(bytes: &[u8]) -> Result<Self, ScenarioError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| ScenarioError::Parse(format!("document is not valid UTF-8: {error}")))?;
+        let document: Self =
+            ron::from_str(text).map_err(|error| ScenarioError::Parse(error.to_string()))?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    /// Enforce the v1 contract: exact schema tag, exact version, identifier
+    /// rules identical to the run manifest's scenario identity, and an object
+    /// configuration body.
+    pub fn validate(&self) -> Result<(), ScenarioError> {
+        if self.schema != SCENARIO_V1_SCHEMA {
+            return Err(ScenarioError::WrongSchema {
+                actual: self.schema.clone(),
+            });
+        }
+        if self.schema_version != SCENARIO_V1_VERSION {
+            return Err(ScenarioError::WrongVersion {
+                actual: u64::from(self.schema_version),
+            });
+        }
+        validate_scenario_document_id(&self.id)?;
+        if let Some(description) = &self.description
+            && description.len() > MAX_SCENARIO_DESCRIPTION_BYTES
+        {
+            return Err(ScenarioError::DescriptionTooLong {
+                actual: description.len(),
+                maximum: MAX_SCENARIO_DESCRIPTION_BYTES,
+            });
+        }
+        if !self.config.is_object() {
+            return Err(ScenarioError::ConfigNotObject {
+                actual: json_type_name(&self.config),
+            });
+        }
+        Ok(())
+    }
+
+    /// Bind this document into the run's scenario identity. Configuration-layer
+    /// digests accumulate separately through
+    /// [`ScenarioIdentityV0::record_config_layer`]; the population recipe stays
+    /// app-derived so the manifest never claims a seeding the binary did not
+    /// perform.
+    #[must_use]
+    pub fn to_identity(&self) -> ScenarioIdentityV0 {
+        let mut identity = ScenarioIdentityV0::caller_seeded(self.id.clone());
+        identity.schema_version = self.schema_version;
+        identity.bootstrap_ticks = self.bootstrap_ticks.unwrap_or(0);
+        identity
+    }
+}
+
+/// Validate a scenario document identifier with exactly the run manifest's rules.
+fn validate_scenario_document_id(value: &str) -> Result<(), ScenarioError> {
+    if value.trim().is_empty() {
+        return Err(ScenarioError::EmptyId);
+    }
+    if value.len() > MAX_SCENARIO_ID_BYTES {
+        return Err(ScenarioError::IdTooLong {
+            actual: value.len(),
+            maximum: MAX_SCENARIO_ID_BYTES,
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ScenarioError::IdControlCharacter);
+    }
+    Ok(())
+}
+
+/// Name a JSON value's type for error reporting.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Human-readable registered brain family recorded in stable key order.
 ///
 /// This roster is a query/provenance projection, not an executable-semantics attestation. Current
@@ -2467,6 +2653,118 @@ mod characterization_tests {
     }
 }
 
+#[cfg(test)]
+mod scenario_tests {
+    use super::*;
+
+    const HAPPY_TOML: &str = r#"
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "arctic-baseline"
+description = "cold-start equilibrium study"
+bootstrap_ticks = 12
+
+[config]
+food_max = 0.6
+population_minimum = 40
+"#;
+
+    #[test]
+    fn scenario_document_parses_validates_and_binds_identity() {
+        let document = ScenarioDocumentV1::parse_toml(HAPPY_TOML.as_bytes()).expect("scenario");
+        assert_eq!(document.schema, SCENARIO_V1_SCHEMA);
+        assert_eq!(document.schema_version, SCENARIO_V1_VERSION);
+        assert_eq!(document.id, "arctic-baseline");
+        assert_eq!(document.bootstrap_ticks, Some(12));
+        assert_eq!(document.config["food_max"], serde_json::json!(0.6));
+
+        let identity = document.to_identity();
+        assert_eq!(identity.id, "arctic-baseline");
+        assert_eq!(identity.schema_version, 1);
+        assert_eq!(identity.bootstrap_ticks, 12);
+        assert!(identity.ordered_config_layer_digests.is_empty());
+        assert_eq!(identity.population_recipe, "caller_seeded_world_v0");
+    }
+
+    #[test]
+    fn scenario_document_round_trips_ron() {
+        let ron = br#"
+(
+    schema: "scriptbots.scenario.v1",
+    schema_version: 1,
+    id: "ron-scenario",
+    config: {"food_max": 0.4},
+)
+"#;
+        let document = ScenarioDocumentV1::parse_ron(ron).expect("ron scenario");
+        assert_eq!(document.id, "ron-scenario");
+        assert_eq!(document.bootstrap_ticks, None);
+        assert_eq!(document.to_identity().bootstrap_ticks, 0);
+    }
+
+    #[test]
+    fn scenario_document_rejects_wrong_schema_version_and_unknown_fields() {
+        let wrong_schema = HAPPY_TOML.replace("scriptbots.scenario.v1", "scriptbots.scenario.v0");
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(wrong_schema.as_bytes()),
+            Err(ScenarioError::WrongSchema { .. })
+        ));
+
+        let wrong_version = HAPPY_TOML.replace("schema_version = 1", "schema_version = 2");
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(wrong_version.as_bytes()),
+            Err(ScenarioError::WrongVersion { actual: 2 })
+        ));
+
+        let unknown_field = HAPPY_TOML.replace("bootstrap_ticks = 12", "bootstrap_ticks = 12\nsneaky = true");
+        assert!(
+            ScenarioDocumentV1::parse_toml(unknown_field.as_bytes()).is_err(),
+            "deny_unknown_fields must reject undeclared scenario keys"
+        );
+    }
+
+    #[test]
+    fn scenario_document_enforces_manifest_identity_rules() {
+        let empty_id = HAPPY_TOML.replace("arctic-baseline", "  ");
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(empty_id.as_bytes()),
+            Err(ScenarioError::EmptyId)
+        ));
+
+        let control_id = HAPPY_TOML.replace("arctic-baseline", "arctic\tbaseline");
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(control_id.as_bytes()),
+            Err(ScenarioError::IdControlCharacter)
+        ));
+
+        let long_id = format!(
+            "schema = \"scriptbots.scenario.v1\"\nschema_version = 1\nid = \"{}\"\n",
+            "x".repeat(MAX_SCENARIO_ID_BYTES + 1)
+        );
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(long_id.as_bytes()),
+            Err(ScenarioError::IdTooLong { actual, maximum })
+                if actual == MAX_SCENARIO_ID_BYTES + 1 && maximum == MAX_SCENARIO_ID_BYTES
+        ));
+    }
+
+    #[test]
+    fn scenario_document_requires_an_object_config_body() {
+        let array_config =
+            "schema = \"scriptbots.scenario.v1\"\nschema_version = 1\nid = \"x\"\nconfig = [1, 2]\n";
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(array_config.as_bytes()),
+            Err(ScenarioError::ConfigNotObject { actual: "array" })
+        ));
+
+        let missing_config =
+            "schema = \"scriptbots.scenario.v1\"\nschema_version = 1\nid = \"bare\"\n";
+        let document = ScenarioDocumentV1::parse_toml(missing_config.as_bytes())
+            .expect("a config-less scenario is a valid identity-only document");
+        assert_eq!(document.config, serde_json::json!({}));
+    }
+}
+
 pub mod command;
 pub mod control;
 pub mod lab;
@@ -2476,9 +2774,11 @@ pub mod terminal;
 
 pub mod renderer {
     use anyhow::Result;
+    use std::sync::Arc;
 
     use crate::{
-        CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld, WorldStepDriver,
+        CommandDrain, CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics,
+        SharedWorld, WorldStepDriver,
     };
 
     /// Shared context passed to renderer implementations.
@@ -2489,6 +2789,8 @@ pub mod renderer {
         pub control_runtime: &'a ControlRuntime,
         pub command_drain: CommandDrain,
         pub command_submit: CommandSubmit,
+        /// The run's scenario identity (id, schema version, bootstrap policy).
+        pub scenario: Arc<ScenarioIdentityV0>,
     }
 
     pub trait Renderer {
