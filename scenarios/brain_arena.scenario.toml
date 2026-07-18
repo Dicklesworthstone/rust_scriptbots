@@ -1,0 +1,21 @@
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "brain_arena"
+description = "Brain-family comparison: equal seeded cohorts of every registered family compete in one world."
+hypothesis = "Seeded mixed-brain cohorts survive comparably: the run records births and deaths with no single family's extinction dictated by construction rather than by behavior."
+seeds = [42, 137]
+
+[config]
+closed = false
+population_minimum = 24
+population_spawn_interval = 600
+population_spawn_count = 2
+population_crossover_chance = 0.2
+food_max = 0.5
+
+[envelope]
+ticks = 300
+population_min = 5
+population_max = 250
+births_min = 1
+deaths_min = 1

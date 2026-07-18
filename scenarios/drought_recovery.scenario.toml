@@ -1,0 +1,31 @@
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "drought_recovery"
+description = "Resource overshoot: a rich meadow suffers a scheduled drought, then recovers."
+hypothesis = "Population expands on rich food, crashes measurably when the drought intervention halves food capacity, and stabilizes again after recovery."
+seeds = [42, 137]
+
+[config]
+closed = false
+population_minimum = 24
+population_spawn_interval = 600
+population_spawn_count = 2
+food_max = 0.6
+food_growth_rate = 0.02
+food_respawn_interval = 20
+food_respawn_amount = 0.5
+
+[envelope]
+ticks = 300
+population_min = 5
+population_max = 300
+births_min = 10
+deaths_min = 5
+
+[[interventions]]
+tick = 120
+set = { food_max = 0.05, food_respawn_amount = 0.0, food_respawn_interval = 120 }
+
+[[interventions]]
+tick = 220
+set = { food_max = 0.6, food_respawn_amount = 0.5, food_respawn_interval = 20 }

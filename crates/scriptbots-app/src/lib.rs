@@ -210,6 +210,10 @@ pub struct ScenarioIdentityV0 {
     pub ordered_config_layer_digests: Vec<String>,
     pub population_recipe: String,
     pub bootstrap_ticks: u64,
+    /// Tick-scheduled interventions this run replays at exact boundaries
+    /// (empty for derived scenarios and plain config-layer runs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interventions: Vec<ScenarioInterventionV1>,
 }
 
 impl ScenarioIdentityV0 {
@@ -221,6 +225,7 @@ impl ScenarioIdentityV0 {
             ordered_config_layer_digests: Vec::new(),
             population_recipe: "caller_seeded_world_v0".to_owned(),
             bootstrap_ticks: 0,
+            interventions: Vec::new(),
         }
     }
 
@@ -293,6 +298,42 @@ pub enum ScenarioError {
         /// JSON type name of the offending value.
         actual: &'static str,
     },
+    /// The hypothesis text exceeded its bound.
+    #[error("scenario hypothesis is {actual} bytes; maximum is {maximum}")]
+    HypothesisTooLong {
+        /// Actual UTF-8 byte length.
+        actual: usize,
+        /// Maximum permitted UTF-8 byte length.
+        maximum: usize,
+    },
+    /// The validation envelope declared no horizon or a zero one.
+    #[error("scenario envelope ticks must be positive; got {actual}")]
+    EnvelopeZeroTicks {
+        /// The declared horizon.
+        actual: u64,
+    },
+    /// An intervention was scheduled beyond the envelope horizon.
+    #[error("intervention at tick {tick} is beyond the envelope horizon {horizon}")]
+    InterventionAfterHorizon {
+        /// The intervention's scheduled tick.
+        tick: u64,
+        /// The envelope horizon.
+        horizon: u64,
+    },
+    /// An intervention's `set` patch was not an object.
+    #[error("intervention at tick {tick} must set an object patch; got {actual}")]
+    InterventionNotObject {
+        /// The intervention's scheduled tick.
+        tick: u64,
+        /// JSON type name of the offending value.
+        actual: &'static str,
+    },
+    /// Two interventions share one tick with no defined order.
+    #[error("two interventions are scheduled at tick {tick}; at most one per tick is allowed")]
+    DuplicateInterventionTick {
+        /// The duplicated tick.
+        tick: u64,
+    },
     /// The document bytes did not parse as the declared format.
     #[error("failed to parse scenario document: {0}")]
     Parse(String),
@@ -324,7 +365,59 @@ pub struct ScenarioDocumentV1 {
     /// Configuration fields, resolved exactly like one `--config` file layer.
     #[serde(default = "empty_scenario_config")]
     pub config: serde_json::Value,
+    /// Cohort seed schedule: the seeds a validation harness runs to prove the story
+    /// is not one attractive seed. Empty means "use the run's normal seed machinery".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seeds: Vec<u64>,
+    /// The intended phenomenon, in words a lab notebook can quote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypothesis: Option<String>,
+    /// Measurable success/failure envelope for cohort validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<ScenarioEnvelopeV1>,
+    /// Tick-scheduled interventions (config patches applied at exact boundaries).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interventions: Vec<ScenarioInterventionV1>,
 }
+
+/// Measurable success/failure bounds for one scenario's cohort validation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScenarioEnvelopeV1 {
+    /// Validation horizon: the number of science ticks each cohort run executes.
+    pub ticks: u64,
+    /// Minimum final population (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_min: Option<u64>,
+    /// Maximum final population (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_max: Option<u64>,
+    /// Minimum total births across the run (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub births_min: Option<u64>,
+    /// Minimum total deaths across the run (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deaths_min: Option<u64>,
+    /// Minimum spike/combat events across the run (inclusive) — combat visibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spike_events_min: Option<u64>,
+}
+
+/// One tick-scheduled config patch: applied by the validation runner at the exact
+/// completed-tick boundary, validated by the same finite/range machinery as any
+/// configuration layer, and replayed identically on every rerun of the scenario.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScenarioInterventionV1 {
+    /// The completed-tick boundary at which the patch applies (0 = before tick 1).
+    pub tick: u64,
+    /// Config patch object (same semantics as a configuration layer body).
+    pub set: serde_json::Value,
+}
+
+// `serde_json::Value` equality is reflexive, so the marker is honest here and lets
+// scenario identities keep their `Eq` contract.
+impl Eq for ScenarioInterventionV1 {}
 
 /// Default scenario configuration body: an empty object (never `null`).
 fn empty_scenario_config() -> serde_json::Value {
@@ -382,6 +475,41 @@ impl ScenarioDocumentV1 {
                 actual: json_type_name(&self.config),
             });
         }
+        if let Some(hypothesis) = &self.hypothesis
+            && hypothesis.len() > MAX_SCENARIO_DESCRIPTION_BYTES
+        {
+            return Err(ScenarioError::HypothesisTooLong {
+                actual: hypothesis.len(),
+                maximum: MAX_SCENARIO_DESCRIPTION_BYTES,
+            });
+        }
+        if let Some(envelope) = &self.envelope
+            && envelope.ticks == 0
+        {
+            return Err(ScenarioError::EnvelopeZeroTicks { actual: 0 });
+        }
+        let mut seen_intervention_ticks = std::collections::HashSet::new();
+        for intervention in &self.interventions {
+            if let Some(envelope) = &self.envelope
+                && intervention.tick >= envelope.ticks
+            {
+                return Err(ScenarioError::InterventionAfterHorizon {
+                    tick: intervention.tick,
+                    horizon: envelope.ticks,
+                });
+            }
+            if !intervention.set.is_object() {
+                return Err(ScenarioError::InterventionNotObject {
+                    tick: intervention.tick,
+                    actual: json_type_name(&intervention.set),
+                });
+            }
+            if !seen_intervention_ticks.insert(intervention.tick) {
+                return Err(ScenarioError::DuplicateInterventionTick {
+                    tick: intervention.tick,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -395,6 +523,7 @@ impl ScenarioDocumentV1 {
         let mut identity = ScenarioIdentityV0::caller_seeded(self.id.clone());
         identity.schema_version = self.schema_version;
         identity.bootstrap_ticks = self.bootstrap_ticks.unwrap_or(0);
+        identity.interventions = self.interventions.clone();
         identity
     }
 }
@@ -467,6 +596,111 @@ impl Default for CharacterizationLimitationsV0 {
             superseded_by: "WorldDigestV1".to_owned(),
         }
     }
+}
+
+/// Errors returned while seeding the founder grid or applying scheduled interventions.
+#[derive(Debug, Error)]
+pub enum ScenarioRunError {
+    /// The founder grid cannot be seeded without at least one registered brain family.
+    #[error("cannot seed the scenario without at least one registered brain")]
+    EmptyBrainRoster,
+    /// A founder failed finite validation at spawn.
+    #[error("seeded founder must be finite: {0}")]
+    FounderNotFinite(String),
+    /// The registered-brain selection invariant broke mid-seed.
+    #[error("registered-brain selection invariant failed while seeding founder {0}")]
+    FounderSelectionInvariant(u64),
+    /// The registered brain family vanished between registration and binding.
+    #[error("registered brain {key} disappeared while binding a seeded founder; refusing an unbound fallback")]
+    FounderBrainVanished {
+        /// The registry key that vanished.
+        key: u64,
+    },
+    /// An intervention patch failed to merge or validate.
+    #[error("intervention at tick {tick} failed: {detail}")]
+    Intervention {
+        /// The intervention's scheduled tick.
+        tick: u64,
+        /// What failed.
+        detail: String,
+    },
+}
+
+/// Seed the fixed 4x4 registered-brain founder grid — the app's founding recipe
+/// (`fixed-4x4-registered-brain-grid-v1`). Shared by the binary startup path and
+/// the scenario cohort-validation harness so both run the same founders.
+pub fn seed_founding_population(
+    world: &mut WorldState,
+    brain_keys: &[u64],
+) -> Result<(), ScenarioRunError> {
+    if brain_keys.is_empty() {
+        return Err(ScenarioRunError::EmptyBrainRoster);
+    }
+    let mut agent = scriptbots_core::AgentData::default();
+    let spacing = 120.0;
+    for row in 0..4 {
+        for col in 0..4 {
+            agent.position.x = col as f32 * spacing + spacing * 0.5;
+            agent.position.y = row as f32 * spacing + spacing * 0.5;
+            agent.heading = 0.0;
+            agent.spike_length = 10.0;
+            let id = world
+                .try_spawn_agent(agent)
+                .map_err(|error| ScenarioRunError::FounderNotFinite(error.to_string()))?;
+            let index = row * 4 + col;
+            let Some(&key) = brain_keys.get(index % brain_keys.len()) else {
+                return Err(ScenarioRunError::FounderSelectionInvariant(index as u64));
+            };
+            let bound = world
+                .bind_agent_brain(id, key)
+                .map_err(|error| ScenarioRunError::FounderNotFinite(error.to_string()))?;
+            if !bound {
+                return Err(ScenarioRunError::FounderBrainVanished { key });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply every intervention scheduled at `tick` (the completed-tick boundary before
+/// the next science step). Returns how many patches were applied. The merge uses the
+/// same resolver as configuration layers, and the merged config is validated by the
+/// world's own update path — an invalid intervention fails loudly, never silently.
+pub fn apply_scenario_interventions(
+    world: &mut WorldState,
+    current_config_value: &mut serde_json::Value,
+    interventions: &[ScenarioInterventionV1],
+    tick: u64,
+) -> Result<usize, ScenarioRunError> {
+    let mut applied = 0;
+    for intervention in interventions.iter().filter(|item| item.tick == tick) {
+        let resolved = precedence::resolve_config_layers(
+            current_config_value,
+            &[precedence::ConfigLayerStatement {
+                kind: precedence::ConfigLayerKind::Cli,
+                label: format!("intervention:t{tick}"),
+                fields: intervention.set.clone(),
+            }],
+        );
+        let merged_config: ScriptBotsConfig =
+            serde_json::from_value(resolved.merged.clone()).map_err(|error| {
+                ScenarioRunError::Intervention {
+                    tick,
+                    detail: format!("merged config does not deserialize: {error}"),
+                }
+            })?;
+        scriptbots_core::apply_control_command(
+            world,
+            scriptbots_core::ControlCommand::UpdateConfig(Box::new(merged_config.clone())),
+        )
+        .map_err(|error| ScenarioRunError::Intervention {
+            tick,
+            detail: error.to_string(),
+        })?;
+        *current_config_value = resolved.merged;
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 /// The thread policy a run actually resolved to, and WHICH LAYER decided it.

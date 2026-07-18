@@ -1,0 +1,21 @@
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "islands_closed"
+description = "Closed ecosystem: no external population injection; founders' lineages persist or go extinct honestly."
+hypothesis = "In a closed world with no spawn injection, founder lineages either reach an equilibrium above zero or decline to an explained extinction — never silently restocked."
+seeds = [42, 137]
+
+[config]
+closed = true
+population_minimum = 0
+population_spawn_interval = 0
+population_spawn_count = 0
+population_crossover_chance = 0.0
+food_max = 0.6
+food_growth_rate = 0.015
+food_fertility_base = 0.5
+
+[envelope]
+ticks = 300
+population_min = 0
+population_max = 250

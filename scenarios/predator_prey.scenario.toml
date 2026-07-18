@@ -1,0 +1,25 @@
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "predator_prey"
+description = "Diet specialization under resource pressure: spikes and carnivory are visibly rewarded."
+hypothesis = "Carnivore-leaning cohorts emerge and spike combat is measurable while prey cohorts persist; neither diet class drives the other permanently extinct inside the horizon."
+seeds = [42, 137]
+
+[config]
+closed = false
+population_minimum = 24
+population_spawn_interval = 600
+population_spawn_count = 2
+food_max = 0.5
+reproduction_rate_carnivore = 0.4
+reproduction_rate_herbivore = 0.3
+spike_damage = 30.0
+spike_growth_rate = 0.05
+
+[envelope]
+ticks = 300
+population_min = 5
+population_max = 250
+births_min = 5
+deaths_min = 1
+spike_events_min = 1

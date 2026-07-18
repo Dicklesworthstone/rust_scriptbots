@@ -1,0 +1,23 @@
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "cooperation_kinship"
+description = "Altruistic food sharing and kinship: giving is cheap, sharing is frequent, partners are common."
+hypothesis = "Cheap sharing and high partner probability stabilize kin groups: population persists above the floor with sustained births while food is shared rather than hoarded."
+seeds = [42, 137]
+
+[config]
+closed = false
+population_minimum = 24
+population_spawn_interval = 600
+population_spawn_count = 2
+food_max = 0.5
+food_sharing_rate = 0.9
+food_transfer_rate = 0.5
+food_sharing_distance = 40.0
+reproduction_partner_chance = 0.8
+
+[envelope]
+ticks = 300
+population_min = 10
+population_max = 250
+births_min = 5

@@ -3827,34 +3827,8 @@ fn parse_png_size(raw: &str) -> Option<(u32, u32)> {
 }
 
 fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) -> Result<()> {
-    if brain_keys.is_empty() {
-        bail!("cannot seed the scenario without at least one registered brain");
-    }
-    let mut agent = AgentData::default();
-    let spacing = 120.0;
-    for row in 0..4 {
-        for col in 0..4 {
-            agent.position.x = col as f32 * spacing + spacing * 0.5;
-            agent.position.y = row as f32 * spacing + spacing * 0.5;
-            agent.heading = 0.0;
-            agent.spike_length = 10.0;
-            let id = world
-                .try_spawn_agent(agent)
-                .context("seeded agent must be finite")?;
-            let Some(&key) = brain_keys.get((row * 4 + col) % brain_keys.len()) else {
-                bail!("registered-brain selection invariant failed while seeding agent {id:?}");
-            };
-            let bound = world.bind_agent_brain(id, key).with_context(|| {
-                format!("failed to construct registered brain {key} for seeded agent {id:?}")
-            })?;
-            if !bound {
-                bail!(
-                    "registered brain {key} disappeared while binding seeded agent {id:?}; refusing an unbound fallback"
-                );
-            }
-        }
-    }
-    Ok(())
+    scriptbots_app::seed_founding_population(world, brain_keys)
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 #[cfg(test)]

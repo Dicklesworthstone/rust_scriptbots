@@ -551,6 +551,9 @@ impl<'a> TerminalApp<'a> {
 
         let mut step_error = None;
         for _ in 0..steps {
+            if !self.scenario.interventions.is_empty() {
+                self.apply_due_interventions();
+            }
             if let Err(error) = (self.simulation_step)() {
                 step_error = Some(Arc::<str>::from(error.to_string()));
                 break;
@@ -567,6 +570,44 @@ impl<'a> TerminalApp<'a> {
 
     fn step_once(&mut self) {
         self.advance_simulation(Instant::now(), true);
+    }
+
+    /// Apply any scheduled scenario interventions at the current completed-tick
+    /// boundary, before the next science step. Application is identical to a
+    /// drained `UpdateConfig` command, so a rerun of the same scenario replays the
+    /// same interventions at the same ticks.
+    fn apply_due_interventions(&mut self) {
+        let due: Vec<crate::ScenarioInterventionV1> = self
+            .scenario
+            .interventions
+            .iter()
+            .cloned()
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let mut world = self.world.lock().expect("terminal world mutex poisoned");
+        let current_tick = world.tick().0;
+        if !due.iter().any(|item| item.tick == current_tick) {
+            return;
+        }
+        let mut config_value = match serde_json::to_value(world.config()) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "scenario config did not serialize for intervention merge");
+                return;
+            }
+        };
+        match crate::apply_scenario_interventions(&mut world, &mut config_value, &due, current_tick)
+        {
+            Ok(applied) if applied > 0 => {
+                info!(tick = current_tick, applied, "applied scenario interventions");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, tick = current_tick, "scenario intervention failed")
+            }
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
@@ -2922,6 +2963,7 @@ struct FrameStats {
     agent_count: usize,
     births: usize,
     deaths: usize,
+    spike_hits: u32,
     avg_energy: f32,
     buffer: Option<HeadlessBufferEvidence>,
 }
@@ -2934,6 +2976,7 @@ impl FrameStats {
             agent_count: snapshot.agent_count,
             births: snapshot.births,
             deaths: snapshot.deaths,
+            spike_hits: snapshot.spike_hits,
             avg_energy: snapshot.avg_energy,
             buffer,
         }
@@ -3069,6 +3112,7 @@ struct ReportSummary {
     final_agent_count: usize,
     total_births: usize,
     total_deaths: usize,
+    total_spike_hits: u64,
     avg_energy_mean: f32,
     avg_energy_min: f32,
     avg_energy_max: f32,
@@ -3085,6 +3129,7 @@ impl ReportSummary {
                 final_agent_count: initial.agent_count,
                 total_births: 0,
                 total_deaths: 0,
+                total_spike_hits: 0,
                 avg_energy_mean: initial.avg_energy,
                 avg_energy_min: initial.avg_energy,
                 avg_energy_max: initial.avg_energy,
@@ -3097,6 +3142,7 @@ impl ReportSummary {
 
         let total_births = frames.iter().map(|frame| frame.births).sum();
         let total_deaths = frames.iter().map(|frame| frame.deaths).sum();
+        let total_spike_hits = frames.iter().map(|frame| u64::from(frame.spike_hits)).sum();
 
         let mut min_energy = f32::INFINITY;
         let mut max_energy = f32::NEG_INFINITY;
@@ -3126,6 +3172,7 @@ impl ReportSummary {
             final_agent_count: final_stats.agent_count,
             total_births,
             total_deaths,
+            total_spike_hits,
             avg_energy_mean,
             avg_energy_min: min_energy,
             avg_energy_max: max_energy,

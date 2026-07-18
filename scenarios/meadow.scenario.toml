@@ -1,0 +1,24 @@
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "meadow"
+description = "Balanced introductory ecosystem: open world, moderate food, mixed brains."
+hypothesis = "A balanced open meadow sustains grazing, reproduction, and occasional combat without population collapse or explosion."
+seeds = [42, 137, 20260717]
+
+[config]
+closed = false
+population_minimum = 24
+population_spawn_interval = 600
+population_spawn_count = 2
+population_crossover_chance = 0.3
+food_max = 0.5
+food_growth_rate = 0.01
+food_respawn_interval = 25
+food_respawn_amount = 0.5
+
+[envelope]
+ticks = 300
+population_min = 10
+population_max = 250
+births_min = 5
+deaths_min = 1
