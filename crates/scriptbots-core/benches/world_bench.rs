@@ -2865,9 +2865,10 @@ fn compare_artifacts(baseline: &PerfArtifact, candidate: &PerfArtifact) -> PerfV
     }
 }
 
-fn bootstrap_verdict(candidate: &PerfArtifact, reason: String) -> PerfVerdict {
+fn bootstrap_verdict(candidate: &PerfArtifact, reason: String) -> GateResult<PerfVerdict> {
+    validate_artifact(candidate, false)?;
     let status = VerdictStatus::BootstrapRequired;
-    PerfVerdict {
+    Ok(PerfVerdict {
         schema: PERF_VERDICT_SCHEMA.to_owned(),
         status,
         exit_code: status.exit_code(),
@@ -2875,7 +2876,7 @@ fn bootstrap_verdict(candidate: &PerfArtifact, reason: String) -> PerfVerdict {
         candidate_machine_class_id: candidate.fingerprint.machine_class_id.clone(),
         reasons: vec![reason],
         scenarios: Vec::new(),
-    }
+    })
 }
 
 fn baseline_candidate_verdict(candidate: &PerfArtifact) -> PerfVerdict {
@@ -3085,13 +3086,13 @@ fn run_perf_gate(args: GateArgs) -> GateResult<i32> {
                     "no checked-in exact baseline exists at {}; run the reviewed baseline-candidate workflow",
                     path.display()
                 ),
-            )
+            )?
         }
     } else {
         bootstrap_verdict(
             &artifact,
             "no baseline was supplied; raw results are informational only".to_owned(),
-        )
+        )?
     };
     write_json(&args.output_dir.join("perf_verdict.json"), &verdict)?;
     let summary = summary_markdown(&artifact, &verdict);
@@ -3526,6 +3527,22 @@ fn run_self_test() -> GateResult<()> {
         &compare_artifacts(&baseline, &empty),
         VerdictStatus::Refused,
     );
+    match bootstrap_verdict(
+        &empty,
+        "self-test intentionally omitted the baseline".to_owned(),
+    ) {
+        Ok(verdict) => {
+            return Err(format!(
+                "structurally invalid bootstrap candidate emitted a {:?} verdict",
+                verdict.status
+            ));
+        }
+        Err(error) => {
+            println!(
+                "perf-gate self-test: structurally invalid bootstrap candidate is refused before verdict: {error}"
+            );
+        }
+    }
     Ok(())
 }
 
