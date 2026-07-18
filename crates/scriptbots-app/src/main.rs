@@ -24,7 +24,7 @@ use scriptbots_brain::{
 #[cfg(feature = "brain-ft")]
 use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 use scriptbots_core::{
-    AgentData, LEGACY_RENDER_ENV_NAMES, NeuroflowActivationKind, NullPersistence,
+    LEGACY_RENDER_ENV_NAMES, NeuroflowActivationKind, NullPersistence,
     PersistenceAdmissionSession, PersistenceSessionError, RenderQuality, RenderTonemapMode,
     ReplayEventKind, ScriptBotsConfig, TickSummary, WorldDigestV1, WorldPersistence, WorldState,
     map_legacy_render_env, parse_render_quality,
@@ -3883,7 +3883,7 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::BirthOrigin;
+    use scriptbots_core::{AgentData, BirthOrigin};
     use scriptbots_storage::{StoragePipeline, StorageReader};
     use serial_test::serial;
     use std::fs;
