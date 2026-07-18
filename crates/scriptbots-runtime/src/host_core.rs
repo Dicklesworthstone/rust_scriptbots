@@ -3,7 +3,8 @@
 use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, BrainProjection,
     BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId,
-    CommandLifecycleEvidence, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt,
+    CommandLifecycleEvidence, CommandLifecycleTransition, CommandStatus, ConfigRevision,
+    ControlRevision, DriveReceipt,
     EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason,
     EventCommitment, EventHub, EventJournalReader, EventPage, EventPageSource,
     EventRetentionSnapshot, EventSequence, EventSequenceRange, FoodLayerSnapshot, HostAccessError,
