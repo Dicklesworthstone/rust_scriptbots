@@ -451,6 +451,15 @@ struct SharedHostState {
     shutdown_command_id: Option<CommandId>,
     queue: VecDeque<AdmittedEnvelope>,
     commands: HashMap<CommandId, CommandAuthority>,
+    /// Bounded post-archival idempotency index: digest + terminal status for commands
+    /// whose lifecycle is durably archived. This, not the unbounded live map, is the
+    /// long-window dedup authority (bd-2z0.5.2.1); the durable journal outranks it.
+    archived_idempotency: HashMap<CommandId, ArchivedIdempotency>,
+    /// Admission-ordered ids of archived commands, for oldest-first eviction.
+    archived_order: VecDeque<CommandId>,
+    /// Retention bound for the archived index; a field so tests can shrink it without
+    /// touching production defaults.
+    archived_retention: usize,
     next_audit_order: u64,
     pending_audit_count: usize,
     pending_audits: VecDeque<(u64, CommandId)>,
@@ -458,6 +467,19 @@ struct SharedHostState {
     events: VecDeque<HostEvent>,
     visible_boundary: AppliedCommand,
 }
+
+/// Retained proof that one terminal command already ran, kept after its full
+/// `CommandAuthority` is released at durable archival.
+#[derive(Debug, Clone)]
+struct ArchivedIdempotency {
+    envelope_digest: [u8; blake3::OUT_LEN],
+    status: CommandStatus,
+}
+
+/// Maximum archived terminal commands retained for idempotent retry answers. Beyond
+/// this bound the oldest archived records are evicted and the durable journal is the
+/// only authority (bd-2z0.5.2.1).
+const ARCHIVED_IDEMPOTENCY_RETENTION: usize = 4_096;
 
 impl SharedHostState {
     fn emit(&mut self, kind: HostEventKind) -> Result<(), HostAccessError> {
@@ -532,6 +554,42 @@ impl SharedHostState {
         }
         authority.status = status.clone();
         self.emit(HostEventKind::CommandStatusChanged(status))
+    }
+
+    /// Move one terminal, journal-committed command out of the live authority map into
+    /// the bounded archived-idempotency index, evicting the oldest archived records
+    /// beyond the retention bound (bd-2z0.5.2.1).
+    ///
+    /// Eviction guards: the command must be terminal (Applied/Rejected/Failed), must
+    /// not be the pending shutdown command, and must not hold an outstanding audit
+    /// order. Those stay live; every other durably archived record eventually moves.
+    fn archive_terminal_command(&mut self, command_id: CommandId) -> Result<(), HostAccessError> {
+        let Some(authority) = self.commands.get(&command_id) else {
+            return Ok(());
+        };
+        let terminal = matches!(
+            authority.status.application(),
+            ApplicationState::Applied(_) | ApplicationState::Rejected(_) | ApplicationState::Failed(_)
+        );
+        if !terminal
+            || self.shutdown_command_id == Some(command_id)
+            || authority.pending_audit_order.is_some()
+        {
+            return Ok(());
+        }
+        let archived = ArchivedIdempotency {
+            envelope_digest: authority.envelope_digest,
+            status: authority.status.clone(),
+        };
+        self.archived_idempotency.insert(command_id, archived);
+        self.archived_order.push_back(command_id);
+        self.commands.remove(&command_id);
+        while self.archived_order.len() > self.archived_retention {
+            if let Some(oldest) = self.archived_order.pop_front() {
+                self.archived_idempotency.remove(&oldest);
+            }
+        }
+        Ok(())
     }
 
     fn reserve_pre_admission_audit(&mut self) -> Result<u64, HostAccessError> {
@@ -650,6 +708,16 @@ impl SharedHostState {
                 command_id: envelope.command_id,
             });
         }
+        if let Some(archived) = self.archived_idempotency.get(&envelope.command_id) {
+            // The command is durably archived: an exact retry replays the archived
+            // terminal status, a changed payload collides (bd-2z0.5.2.1).
+            if archived.envelope_digest == envelope_digest {
+                return Ok(archived.status.clone());
+            }
+            return Err(HostAccessError::CommandIdCollision {
+                command_id: envelope.command_id,
+            });
+        }
 
         if self.audit_gate_closed || self.admission_lifecycle == HostLifecycle::Stopped {
             return Err(HostAccessError::CommandEvidenceClosed {
@@ -741,12 +809,17 @@ impl HostPort for LocalHostPort {
         &mut self,
         command_id: CommandId,
     ) -> Result<Option<CommandStatus>, HostAccessError> {
-        Ok(self
-            .shared
-            .borrow()
+        let shared = self.shared.borrow();
+        Ok(shared
             .commands
             .get(&command_id)
-            .map(|authority| authority.status.clone()))
+            .map(|authority| authority.status.clone())
+            .or_else(|| {
+                shared
+                    .archived_idempotency
+                    .get(&command_id)
+                    .map(|archived| archived.status.clone())
+            }))
     }
 
     fn snapshot_after(
@@ -1255,6 +1328,9 @@ impl HostCore {
             shutdown_command_id: None,
             queue: VecDeque::with_capacity(options.command_capacity),
             commands: HashMap::new(),
+            archived_idempotency: HashMap::new(),
+            archived_order: VecDeque::new(),
+            archived_retention: ARCHIVED_IDEMPOTENCY_RETENTION,
             next_audit_order: 1,
             pending_audit_count: 0,
             pending_audits: VecDeque::with_capacity(options.command_capacity),
@@ -1742,8 +1818,32 @@ impl HostCore {
             .borrow()
             .commands
             .get(&command_id)
-            .map(|authority| authority.status.clone())
-            .ok_or_else(|| protocol_violation("journal receipt command status is missing"))?;
+            .map(|authority| authority.status.clone());
+        let Some(current) = current else {
+            // The record already moved to the archived idempotency index at durable
+            // archival; a duplicate or later receipt upgrades it without resurrecting
+            // the live authority (bd-2z0.5.2.1).
+            let mut shared = self.shared.borrow_mut();
+            let Some(archived) = shared.archived_idempotency.get_mut(&command_id) else {
+                return Err(protocol_violation(
+                    "journal receipt command status is missing",
+                ));
+            };
+            if archived.status.journal() == &journal
+                || matches!(archived.status.journal(), JournalState::Durable | JournalState::Failed(_))
+            {
+                return Ok(false);
+            }
+            let upgraded = CommandStatus::try_new(
+                command_id,
+                archived.status.admission_sequence(),
+                archived.status.application().clone(),
+                journal,
+            )
+            .map_err(status_violation)?;
+            archived.status = upgraded;
+            return Ok(true);
+        };
         if current.journal() == &journal
             || matches!(
                 current.journal(),
@@ -1756,10 +1856,15 @@ impl HostCore {
             command_id,
             current.admission_sequence(),
             current.application().clone(),
-            journal,
+            journal.clone(),
         )
         .map_err(status_violation)?;
         self.shared.borrow_mut().store_status(status)?;
+        if matches!(journal, JournalState::CommittedVolatile | JournalState::Durable) {
+            self.shared
+                .borrow_mut()
+                .archive_terminal_command(command_id)?;
+        }
         Ok(true)
     }
 
@@ -4356,6 +4461,106 @@ mod tests {
             EventCommitment::CommittedVolatile
         );
         assert_eq!(slow.last_seen(), EventSequence::new(1));
+    }
+
+    #[test]
+    fn archived_idempotency_stays_bounded_and_answers_exact_retries_after_durable_archival(
+    ) {
+        let mut core = HostCore::new(HostSessionId::new(91), world(0), options(true))
+            .expect("bounded-idempotency host");
+        let mut port = core.local_port();
+        // Shrink the retention bound so the eviction proof runs in tens of commands
+        // rather than thousands.
+        core.shared.borrow_mut().archived_retention = 8;
+
+        // Drive 40 unique commands to terminal + durable archival: far more than the
+        // live map may retain once lifecycle evidence is durably archived.
+        for ordinal in 1_u128..=40 {
+            submit(&mut port, ordinal, HostCommand::Step);
+            let boundary = (ordinal * 2) as u64;
+            core.drive(ManualInstant::from_nanos(boundary))
+                .expect("scientific boundary");
+            core.drive(ManualInstant::from_nanos(boundary + 1))
+                .expect("volatile commitment");
+        }
+
+        {
+            let shared = core.shared.borrow();
+            assert_eq!(
+                shared.commands.len(),
+                0,
+                "durably-archived terminal commands must not stay in the live map"
+            );
+            assert_eq!(
+                shared.archived_idempotency.len(),
+                8,
+                "the archived index must be bounded at the retention limit"
+            );
+            assert_eq!(shared.archived_order.len(), 8);
+            // Oldest-first eviction: ids 33..=40 survive, ids 1..=32 are gone.
+            for evicted in 1_u128..=32 {
+                assert!(
+                    !shared
+                        .archived_idempotency
+                        .contains_key(&CommandId::new(evicted)),
+                    "id {evicted} should have been evicted beyond the bound"
+                );
+            }
+        }
+
+        // An exact retry of an archived command replays its archived terminal status.
+        let replayed = submit(&mut port, 40, HostCommand::Step);
+        assert!(
+            matches!(replayed.application(), ApplicationState::Applied(_)),
+            "exact archived retry must replay the applied terminal status, got {:?}",
+            replayed.application()
+        );
+        assert!(matches!(
+            replayed.journal(),
+            JournalState::CommittedVolatile
+        ));
+
+        // A changed payload on an archived id collides instead of silently re-executing.
+        let mut config = core.world.config().clone();
+        config.food_growth_rate = 0.5;
+        let collision = port.submit(envelope(40, HostCommand::UpdateConfig(Box::new(config))));
+        assert!(
+            matches!(collision, Err(HostAccessError::CommandIdCollision { command_id }) if command_id == CommandId::new(40)),
+            "changed payload on an archived id must collide, got {collision:?}"
+        );
+
+        // An evicted-beyond-the-bound id reads as a fresh command again: bounded
+        // idempotency is explicit, and the durable journal outranks it.
+        let fresh = submit(&mut port, 1, HostCommand::Step);
+        assert!(
+            matches!(fresh.application(), ApplicationState::Admitted),
+            "an id evicted beyond the retention bound is admitted as fresh"
+        );
+    }
+
+    #[test]
+    fn shutdown_command_is_never_evicted_from_the_live_map() {
+        let mut core = HostCore::new(HostSessionId::new(92), world(0), options(true))
+            .expect("shutdown-retention host");
+        let mut port = core.local_port();
+        core.shared.borrow_mut().archived_retention = 1;
+
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("scientific boundary");
+        core.drive(ManualInstant::from_nanos(3))
+            .expect("volatile commitment");
+        submit(&mut port, 2, HostCommand::Shutdown);
+        core.drive(ManualInstant::from_nanos(4))
+            .expect("shutdown boundary");
+        core.drive(ManualInstant::from_nanos(5))
+            .expect("shutdown commitment");
+
+        let shared = core.shared.borrow();
+        assert!(
+            shared.commands.contains_key(&CommandId::new(2)),
+            "the pending shutdown command must never be evicted"
+        );
     }
 
     #[test]
