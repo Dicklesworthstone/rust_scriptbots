@@ -9062,11 +9062,7 @@ mod srgb_ownership_tests {
 
     #[test]
     fn cpu_tonemap_preserves_order_and_black_point() {
-        let black = tonemap_rgb(
-            ColorVec3 { r: 0, g: 0, b: 0 },
-            1.0,
-            RenderTonemapMode::Aces,
-        );
+        let black = tonemap_rgb(ColorVec3 { r: 0, g: 0, b: 0 }, 1.0, RenderTonemapMode::Aces);
         assert_eq!((black.r, black.g, black.b), (0, 0, 0));
 
         let mut previous = 0u8;

@@ -1006,10 +1006,8 @@ impl TerrainPipeline {
         let inset_v = 0.5 / self.atlas_h as f32;
         let u0 = ((col as f32 * self.tile_w as f32) / self.atlas_w as f32 + inset_u).min(1.0);
         let v0 = ((row as f32 * self.tile_h as f32) / self.atlas_h as f32 + inset_v).min(1.0);
-        let u1 = (((col + 1) as f32 * self.tile_w as f32) / self.atlas_w as f32 - inset_u)
-            .max(u0);
-        let v1 = (((row + 1) as f32 * self.tile_h as f32) / self.atlas_h as f32 - inset_v)
-            .max(v0);
+        let u1 = (((col + 1) as f32 * self.tile_w as f32) / self.atlas_w as f32 - inset_u).max(u0);
+        let v1 = (((row + 1) as f32 * self.tile_h as f32) / self.atlas_h as f32 - inset_v).max(v0);
         [u0, v0, u1, v1]
     }
 
