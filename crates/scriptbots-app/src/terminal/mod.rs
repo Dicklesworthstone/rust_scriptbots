@@ -282,8 +282,16 @@ impl TerminalRenderer {
         app.palette = Palette::test_backend_evidence();
         let mut report = HeadlessReport::new(app.snapshot().clone(), app.scenario.as_ref());
 
-        for _ in 0..frames {
+        for frame_index in 0..frames {
             app.ensure_control_runtime_running()?;
+            // bd-2z0.8.9.8: ask the final tick's batch to carry the canonical world digest
+            // so replay verification can compare final science state.
+            if frame_index + 1 == frames {
+                app.world
+                    .lock()
+                    .expect("terminal world mutex poisoned")
+                    .request_replay_world_digest();
+            }
             app.step_once();
             terminal.draw(|frame| app.draw(frame))?;
             let buffer =
@@ -291,19 +299,16 @@ impl TerminalRenderer {
             report.record(app.snapshot(), buffer);
         }
 
-        // bd-2z0.8.9.8: bind the final canonical digest into the replay stream so replay
-        // verification can compare final science state, and surface it in headless logs.
+        // Surface the final digest in the headless evidence logs.
         {
-            let mut world = app.world.lock().expect("terminal world mutex poisoned");
+            let world = app.world.lock().expect("terminal world mutex poisoned");
             let digest = world
                 .world_digest_v1()
                 .context("failed to capture the final headless WorldDigestV1")?;
-            let overall = digest.overall.clone();
-            world.record_replay_world_digest(overall.clone());
             tracing::info!(
-                tick = app.snapshot().tick.0,
-                world_digest = %overall,
-                "recorded final world digest into the replay stream"
+                tick = app.snapshot().tick,
+                world_digest = %digest.overall,
+                "captured final world digest for the replay stream"
             );
         }
 
