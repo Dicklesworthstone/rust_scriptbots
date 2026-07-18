@@ -366,7 +366,7 @@ fn main() -> Result<()> {
             std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1");
         }
     }
-        let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
+    let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
         config,
         BootstrapRequest {
             brain_preset: cli.brain,
@@ -403,10 +403,8 @@ fn main() -> Result<()> {
                         std::env::var("SB_WGPU_DUMP").ok().as_deref(),
                         Some("1" | "true" | "yes" | "on")
                     ) {
-                        scriptbots_render::world_compositor::render_wgpu_png_offscreen(
-                            &guard, w, h,
-                        )
-                        .map_err(|error| anyhow::anyhow!("wgpu snapshot failed: {error}"))?
+                        scriptbots_render::world_compositor::render_wgpu_png_offscreen(&guard, w, h)
+                            .map_err(|error| anyhow::anyhow!("wgpu snapshot failed: {error}"))?
                     } else {
                         render_png_offscreen(&guard, w, h)
                     }
@@ -1425,9 +1423,8 @@ fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
 /// source bytes (those bytes ARE the provenance — digests must cover what was read,
 /// not a re-serialization).
 fn load_scenario_document(path: &std::path::Path) -> Result<(ScenarioDocumentV1, Vec<u8>)> {
-    let bytes = std::fs::read(path).with_context(|| {
-        format!("failed to read scenario document {}", path.display())
-    })?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read scenario document {}", path.display()))?;
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -1510,7 +1507,14 @@ fn compose_config_with_scenario(
         scenario.record_config_layer(ConfigLayerKind::File, source_bytes);
         statements.push(ConfigLayerStatement {
             kind: ConfigLayerKind::File,
-            label: format!("scenario:{} ({})", cli.scenario.as_ref().expect("scenario document implies --scenario").display(), document.id),
+            label: format!(
+                "scenario:{} ({})",
+                cli.scenario
+                    .as_ref()
+                    .expect("scenario document implies --scenario")
+                    .display(),
+                document.id
+            ),
             fields: document.config.clone(),
         });
     }

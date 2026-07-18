@@ -37,8 +37,8 @@ use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::SharedWorld;
 use crate::ScenarioIdentityV0;
+use crate::SharedWorld;
 use crate::command::{
     CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
 };

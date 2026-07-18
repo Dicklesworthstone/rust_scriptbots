@@ -781,9 +781,9 @@ fn a_scenario_document_binds_identity_bootstrap_and_config_into_the_manifest() {
         .as_array()
         .expect("layer digests");
     assert!(
-        digests
-            .iter()
-            .any(|entry| entry.as_str().is_some_and(|entry| entry.starts_with("file:"))),
+        digests.iter().any(|entry| entry
+            .as_str()
+            .is_some_and(|entry| entry.starts_with("file:"))),
         "the scenario document's exact bytes are missing from the ordered layer digests: {digests:?}"
     );
 
@@ -804,7 +804,11 @@ fn the_same_scenario_and_seed_produce_identical_placement_and_digests() {
 
     let out_a = launch_with(&first, &[], &["--scenario", scenario_arg]);
     let out_b = launch_with(&second, &[], &["--scenario", scenario_arg]);
-    let out_c = launch_with(&third, &[("SCRIPTBOTS_RNG_SEED", "9999")], &["--scenario", scenario_arg]);
+    let out_c = launch_with(
+        &third,
+        &[("SCRIPTBOTS_RNG_SEED", "9999")],
+        &["--scenario", scenario_arg],
+    );
     assert!(
         out_a.status.success() && out_b.status.success() && out_c.status.success(),
         "all three runs must complete\na: {}\nb: {}\nc: {}",

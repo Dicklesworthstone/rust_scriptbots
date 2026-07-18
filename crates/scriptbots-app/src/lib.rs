@@ -334,8 +334,9 @@ fn empty_scenario_config() -> serde_json::Value {
 impl ScenarioDocumentV1 {
     /// Parse and validate a TOML scenario document.
     pub fn parse_toml(bytes: &[u8]) -> Result<Self, ScenarioError> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|error| ScenarioError::Parse(format!("document is not valid UTF-8: {error}")))?;
+        let text = std::str::from_utf8(bytes).map_err(|error| {
+            ScenarioError::Parse(format!("document is not valid UTF-8: {error}"))
+        })?;
         let document: Self =
             toml::from_str(text).map_err(|error| ScenarioError::Parse(error.to_string()))?;
         document.validate()?;
@@ -344,8 +345,9 @@ impl ScenarioDocumentV1 {
 
     /// Parse and validate a RON scenario document.
     pub fn parse_ron(bytes: &[u8]) -> Result<Self, ScenarioError> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|error| ScenarioError::Parse(format!("document is not valid UTF-8: {error}")))?;
+        let text = std::str::from_utf8(bytes).map_err(|error| {
+            ScenarioError::Parse(format!("document is not valid UTF-8: {error}"))
+        })?;
         let document: Self =
             ron::from_str(text).map_err(|error| ScenarioError::Parse(error.to_string()))?;
         document.validate()?;
@@ -2716,7 +2718,10 @@ population_minimum = 40
             Err(ScenarioError::WrongVersion { actual: 2 })
         ));
 
-        let unknown_field = HAPPY_TOML.replace("bootstrap_ticks = 12", "bootstrap_ticks = 12\nsneaky = true");
+        let unknown_field = HAPPY_TOML.replace(
+            "bootstrap_ticks = 12",
+            "bootstrap_ticks = 12\nsneaky = true",
+        );
         assert!(
             ScenarioDocumentV1::parse_toml(unknown_field.as_bytes()).is_err(),
             "deny_unknown_fields must reject undeclared scenario keys"
@@ -2750,8 +2755,7 @@ population_minimum = 40
 
     #[test]
     fn scenario_document_requires_an_object_config_body() {
-        let array_config =
-            "schema = \"scriptbots.scenario.v1\"\nschema_version = 1\nid = \"x\"\nconfig = [1, 2]\n";
+        let array_config = "schema = \"scriptbots.scenario.v1\"\nschema_version = 1\nid = \"x\"\nconfig = [1, 2]\n";
         assert!(matches!(
             ScenarioDocumentV1::parse_toml(array_config.as_bytes()),
             Err(ScenarioError::ConfigNotObject { actual: "array" })
