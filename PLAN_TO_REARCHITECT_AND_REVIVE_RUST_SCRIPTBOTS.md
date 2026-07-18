@@ -2000,16 +2000,16 @@ Phase 0.4 is therefore complete. This slice hardened renderer selection, process
 
 Writer errors, queue bounds, flush, and cancellation belong to the runtime/storage worker phase; they do not mix with this core event-accounting fix.
 
-#### 1.4 scenario/startup construction [Currently In Progress — `bd-2z0.10.1`, VioletHawk, 2026-07-17]
+#### 1.4 scenario/startup construction [Completed — `bd-2z0.10.1`, closed 2026-07-18]
 
 - [Implemented] minimal versioned scenario schema (`scriptbots.scenario.v1`): strict TOML/RON document with exact schema/version checks, bounded identity, explicit bootstrap policy, and an object-only config body resolved through the normal layered machinery;
 - [Implemented] `--scenario FILE` CLI binding: the document's id/schema_version land in `RunManifestV3.scenario`, its bytes join the ordered config-layer digests, and its config body speaks first among file layers;
 - [Implemented] effective bootstrap policy resolved once (explicit CLI/env > document > zero default) and surfaced in the manifest, the read-only `GET /api/scenario` REST view, the terminal HUD title, and serialized headless reports;
 - [Implemented] deterministic seed/placement fixtures: two same-scenario/same-seed launches agree on config digest, root seed, and tick-zero world digest; a different seed diverges; invalid documents fail closed before any run artifact exists;
 - [Preserved] full-world seeding, current ecology parameters, and the explicit zero-default bootstrap (no hidden ticks) are unchanged;
-- [Pending] DSR batch proof (profile `rust_scriptbots_bd_2z0_10_1_scenario`); curated scenario catalog (`bd-2z0.10.3`) and scenario validation parity with it.
+- [DSR-proven] profile `rust_scriptbots_bd_2z0_10_1_scenario` (version `0.1.4-bd2z0101-scenario-scoped.20260718T051500Z`): isolated clone at `59900b5`, fmt clean, 225/225 tests green on darwin/arm64, control_cli bin suite explicitly excluded (peer-owned `bd-2z0.8.9.8` chronological-export red at that commit).
 
-**Exit:** startup is explicit and reproducible; no claim about a tuned ecosystem is made yet.
+**Exit:** startup is explicit and reproducible; no claim about a tuned ecosystem is made yet. **MET 2026-07-18.**
 
 #### 1.5 stable IDs and minimal random-stream protocol [Completed — `bd-2z0.3.1`]
 
