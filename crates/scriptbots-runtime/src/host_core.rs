@@ -2177,11 +2177,11 @@ impl HostCore {
                 Ok(ApplyResult::completed(blocked))
             }
             HostCommand::UpdateConfig(config) => {
-                self.apply_config_command(admission, retry_envelope, config, next_control)
+                self.apply_config_command(admission, &retry_envelope, config, next_control)
             }
-            HostCommand::Step => self.apply_step_command(admission, retry_envelope, next_control),
+            HostCommand::Step => self.apply_step_command(admission, &retry_envelope, next_control),
             HostCommand::Shutdown => {
-                self.apply_shutdown_command(admission, retry_envelope, next_control)
+                self.apply_shutdown_command(admission, &retry_envelope, next_control)
             }
         }
     }
@@ -2189,7 +2189,7 @@ impl HostCore {
     fn apply_config_command(
         &mut self,
         admission: AdmissionSequence,
-        envelope: CommandEnvelope,
+        envelope: &CommandEnvelope,
         config: Box<ScriptBotsConfig>,
         next_control: ControlRevision,
     ) -> Result<ApplyResult, HostAccessError> {
@@ -2213,7 +2213,7 @@ impl HostCore {
     fn apply_step_command(
         &mut self,
         admission: AdmissionSequence,
-        envelope: CommandEnvelope,
+        envelope: &CommandEnvelope,
         next_control: ControlRevision,
     ) -> Result<ApplyResult, HostAccessError> {
         let next_scientific = self
@@ -2290,7 +2290,7 @@ impl HostCore {
     fn apply_shutdown_command(
         &mut self,
         admission: AdmissionSequence,
-        envelope: CommandEnvelope,
+        envelope: &CommandEnvelope,
         next_control: ControlRevision,
     ) -> Result<ApplyResult, HostAccessError> {
         {
@@ -2404,7 +2404,7 @@ impl HostCore {
             .shared
             .borrow()
             .lifecycle_evidence(envelope.command_id)?;
-        if command_envelope_digest(lifecycle.envelope())? != command_envelope_digest(&envelope)? {
+        if command_envelope_digest(lifecycle.envelope())? != command_envelope_digest(envelope)? {
             return Err(protocol_violation(
                 "journal command differs from its retained lifecycle envelope",
             ));

@@ -2906,7 +2906,7 @@ impl CommandStatus {
     }
 
     /// Revalidate cross-axis invariants after transport deserialization.
-    pub fn validate(&self) -> Result<(), StatusCombinationError> {
+    pub const fn validate(&self) -> Result<(), StatusCombinationError> {
         validate_status_combination(self.admission_sequence, &self.application, &self.journal)
     }
 }
