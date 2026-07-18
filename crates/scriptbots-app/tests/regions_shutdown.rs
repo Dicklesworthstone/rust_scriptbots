@@ -127,9 +127,7 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
 
     // The durable watermark must equal the last admitted batch after teardown.
     let reader = StorageReader::open(&db).expect("open run database after teardown");
-    let watermarks = reader
-        .persistence_watermarks()
-        .expect("watermark query");
+    let watermarks = reader.persistence_watermarks().expect("watermark query");
     assert!(
         watermarks.admitted.is_some()
             && watermarks.admitted == watermarks.applied
