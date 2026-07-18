@@ -691,16 +691,22 @@ data-bearing robot command through the fail-closed integration instead:
 
 ```bash
 scripts/bv_authoritative.sh --robot-triage
-scripts/bv_authoritative.sh --robot-plan
+scripts/bv_authoritative.sh --robot-plan  # fails closed if BV and BR claim sets diverge
 scripts/bv_authoritative.sh --robot-insights | jq '.status'
 scripts/test_bv_authoritative.sh
 ```
 
 The wrapper creates a unique external read-only view, forces JSON robot mode,
-and emits a result only after BR all/ready state and BV issue, status, blocking
-edge, exact actionable issue IDs, and `data_hash` evidence agree. Every BV next
-result, plan item, and triage top pick is checked against `br ready`, which
-remains the sole actionability and claim authority. The wrapper refuses
+and emits a result only after BR's ID/status/dependency-count projection agrees with the
+tracked export, BV's issue/status/blocking-edge counts and `data_hash` agree,
+BV's native actionable count agrees with its complete plan, and that plan
+covers every BR-ready issue. Because BV 0.16.0 includes in-progress work and
+uses different hierarchy semantics, its native actionable set need not equal
+`br ready`. Every BV next result and triage top pick must be BR-ready; an
+unscoped plan must equal the BR-ready set and a scoped plan must be its subset.
+Unsafe claim-oriented output fails closed. Graph-ranked recommendations may be
+blocked and never authorize a claim; `br ready` remains the sole actionability
+and claim authority. The wrapper refuses
 caller-selected databases/workspaces, missing or empty exports, non-JSON graph
 output, every unrecognized or mutating BV option, and a source export that
 changes during analysis. Historical `--as-of` sources are refused. Neither

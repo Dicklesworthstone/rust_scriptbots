@@ -8,6 +8,51 @@ fail() {
   exit "${2:-65}"
 }
 
+normalize_br_json() {
+  local input="$1"
+  local output="$2"
+
+  jq -s -e '
+    def uint:
+      type == "number" and . >= 0 and floor == .;
+
+    (if length == 1 then
+      .[0]
+    else
+      error("BR output must contain exactly one top-level JSON value")
+    end)
+    | (if type == "array" then
+      .
+    elif type == "object"
+        and has("issues")
+        and has("total")
+        and has("limit")
+        and has("offset")
+        and has("has_more")
+        and (.issues | type == "array")
+        and (.total | uint)
+        and (.limit | uint)
+        and (.offset | uint)
+        and .limit == 0
+        and .offset == 0
+        and (.has_more | type == "boolean")
+        and .has_more == false
+        and .total == (.issues | length) then
+      .issues
+    else
+      error("unsupported, paginated, or incomplete BR JSON envelope")
+    end)
+    | if all(.[];
+        type == "object"
+        and (.id | type == "string" and length > 0)
+        and (.status | type == "string" and length > 0)) then
+        .
+      else
+        error("malformed BR issue entry")
+      end
+  ' "$input" >"$output"
+}
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/.." && pwd -P)"
 authoritative="$repo_root/.beads/issues.jsonl"
@@ -27,6 +72,7 @@ robot_plan_seen=0
 robot_triage_seen=0
 triage_grouping_seen=0
 label_seen=0
+recipe_seen=0
 attention_limit_seen=0
 graph_format_seen=0
 
@@ -60,6 +106,7 @@ while (( argument_index < ${#arguments[@]} )); do
       [[ "${arguments[argument_index]}" != --* ]] || fail "$argument requires a value" 64
       case "$argument" in
         --label) label_seen=1 ;;
+        --recipe) recipe_seen=1 ;;
         --attention-limit) attention_limit_seen=1 ;;
       esac
       ;;
@@ -67,6 +114,7 @@ while (( argument_index < ${#arguments[@]} )); do
       [[ -n "${argument#*=}" ]] || fail "option requires a value: $argument" 64
       case "$argument" in
         --label=*) label_seen=1 ;;
+        --recipe=*) recipe_seen=1 ;;
         --attention-limit=*) attention_limit_seen=1 ;;
       esac
       ;;
@@ -106,7 +154,9 @@ mkdir "$view_root/.beads"
 ln -s "$authoritative" "$view_root/.beads/beads.jsonl"
 
 source_stats="$view_root/source-stats.json"
+br_list_raw="$view_root/br-list-raw.json"
 br_list="$view_root/br-list.json"
+br_ready_raw="$view_root/br-ready-raw.json"
 br_ready="$view_root/br-ready.json"
 verifier="$view_root/bv-triage.json"
 planner="$view_root/bv-plan.json"
@@ -128,24 +178,50 @@ jq -e '.total > 0 and .total == .unique_ids' "$source_stats" >/dev/null ||
 if ! (
   cd "$repo_root"
   env -u BEADS_DB -u BEADS_DIR -u BEADS_JSONL \
-    BR_OUTPUT_FORMAT=json br list --json --no-db --all --limit 0 >"$br_list"
+    BR_OUTPUT_FORMAT=json br list --json --no-db --all --limit 0 >"$br_list_raw"
 ); then
   fail "br list could not read the authoritative JSONL export"
+fi
+
+if ! normalize_br_json "$br_list_raw" "$br_list"; then
+  fail "br list returned an unsupported or incomplete JSON envelope"
 fi
 
 if ! (
   cd "$repo_root"
   env -u BEADS_DB -u BEADS_DIR -u BEADS_JSONL \
-    BR_OUTPUT_FORMAT=json br ready --json --no-db --limit 0 >"$br_ready" 2>"$view_root/br-ready.log"
+    BR_OUTPUT_FORMAT=json br ready --json --no-db --limit 0 >"$br_ready_raw" 2>"$view_root/br-ready.log"
 ); then
   fail "br ready could not read the authoritative JSONL export"
 fi
 
-if ! jq -e --slurpfile expected "$source_stats" '
-  (length == $expected[0].total)
-  and ((group_by(.status) | map({key: .[0].status, value: length}) | from_entries) == $expected[0].by_status)
+if ! normalize_br_json "$br_ready_raw" "$br_ready"; then
+  fail "br ready returned an unsupported or incomplete JSON envelope"
+fi
+
+# BR is the sole claim authority.  Require its complete no-db projection to be
+# identical to the tracked export, including every issue's relationship count.
+if ! jq -e --slurpfile source "$authoritative" '
+  ($source
+    | map({
+        id,
+        status,
+        dependency_count: ((.dependencies // []) | length)
+      })
+    | sort_by(.id)) as $expected
+  | (map({id, status, dependency_count}) | sort_by(.id)) == $expected
 ' "$br_list" >/dev/null; then
-  fail "br list counts/statuses disagree with .beads/issues.jsonl"
+  fail "br list identities, statuses, or dependency counts disagree with .beads/issues.jsonl"
+fi
+
+if ! jq -e --slurpfile listed "$br_list" '
+  ([.[].id] | length) == ([.[].id] | unique | length)
+  and all(.[]; .status == "open")
+  and all(.[];
+    . as $ready
+    | any($listed[0][]; .id == $ready.id and .status == $ready.status))
+' "$br_ready" >/dev/null; then
+  fail "br ready returned duplicate, non-open, or non-authoritative issues"
 fi
 
 env -u BEADS_DB -u BEADS_DIR -u BEADS_JSONL \
@@ -155,18 +231,23 @@ env -u BEADS_DB -u BEADS_DIR -u BEADS_JSONL \
     fail "BV could not analyze the isolated authoritative view"
   }
 
-if ! jq -e --slurpfile expected "$source_stats" --slurpfile ready "$br_ready" '
+if ! jq -e --slurpfile expected "$source_stats" '
   (.data_hash | type == "string" and length > 0)
   and (.triage.project_health.counts.total == $expected[0].total)
   and (.triage.project_health.counts.by_status == $expected[0].by_status)
   and (.triage.project_health.graph.node_count == $expected[0].total)
   and (.triage.project_health.graph.edge_count == $expected[0].blocking_edges)
-  and (.triage.quick_ref.actionable_count == ($ready[0] | length))
+  and (.triage.project_health.counts.actionable | type == "number")
+  and (.triage.quick_ref.actionable_count == .triage.project_health.counts.actionable)
+  and (.triage.quick_ref.top_picks | type == "array")
+  and (.triage.recommendations | type == "array")
 ' "$verifier" >/dev/null; then
-  fail "BV issue/status/dependency/actionable counts disagree with br and .beads/issues.jsonl"
+  fail "BV issue, status, dependency, or internal actionable counts are inconsistent"
 fi
 
 expected_data_hash="$(jq -r '.data_hash' "$verifier")"
+bv_actionable_count="$(jq -r '.triage.quick_ref.actionable_count' "$verifier")"
+br_ready_count="$(jq 'length' "$br_ready")"
 
 env -u BEADS_DB -u BEADS_DIR -u BEADS_JSONL \
   BV_OUTPUT_FORMAT=json BV_NO_CACHE=1 \
@@ -175,15 +256,32 @@ env -u BEADS_DB -u BEADS_DIR -u BEADS_JSONL \
     fail "BV could not plan the isolated authoritative view"
   }
 
-if ! jq -e --arg expected_hash "$expected_data_hash" --slurpfile ready "$br_ready" '
+if ! jq -e \
+  --arg expected_hash "$expected_data_hash" \
+  --argjson expected_actionable "$bv_actionable_count" \
+  --slurpfile source "$authoritative" \
+  --slurpfile ready "$br_ready" '
   ([.plan.tracks[]?.items[]?.id] | sort) as $planned
+  | ($source | map(.id) | sort) as $source_ids
   | ($ready[0] | map(.id) | sort) as $ready_ids
   | .data_hash == $expected_hash
+    and (.plan.tracks | type == "array")
+    and all(.plan.tracks[];
+      (.items | type == "array")
+      and all(.items[];
+        (.id | type == "string" and length > 0)))
     and ($planned == ($planned | unique))
-    and ($planned == $ready_ids)
-    and (.plan.total_actionable == ($ready[0] | length))
+    and all($planned[]; . as $candidate | $source_ids | index($candidate) != null)
+    and all($ready_ids[]; . as $candidate | $planned | index($candidate) != null)
+    and (.plan.total_actionable == ($planned | length))
+    and (.plan.total_actionable == $expected_actionable)
 ' "$planner" >/dev/null; then
-  fail "BV actionable issue IDs disagree with br ready; BR remains the claim authority"
+  fail "BV plan integrity, actionable count, or BR-ready coverage check failed"
+fi
+
+if [[ "$bv_actionable_count" != "$br_ready_count" ]]; then
+  printf 'bv-authoritative: note: BV reports %s graph-actionable issues; BR authorizes %s ready claims. Treat BV recommendations as analysis only.\n' \
+    "$bv_actionable_count" "$br_ready_count" >&2
 fi
 
 set +e
@@ -214,17 +312,37 @@ if (( robot_next_seen == 1 )); then
 fi
 
 if (( robot_plan_seen == 1 )); then
-  jq -e --slurpfile ready "$br_ready" '
-    ([.plan.tracks[]?.items[]?.id] | unique) as $planned
-    | all($planned[]; . as $candidate | any($ready[0][]; .id == $candidate))
+  jq -e \
+    --argjson scoped "$((label_seen == 1 || recipe_seen == 1))" \
+    --slurpfile ready "$br_ready" '
+    (.plan | type == "object")
+    and (.plan.tracks | type == "array")
+    and all(.plan.tracks[];
+      (.items | type == "array")
+      and all(.items[];
+        (.id | type == "string" and length > 0)))
+    and (
+      ([.plan.tracks[].items[].id] | sort) as $planned_ids
+      | ($ready[0] | map(.id) | sort) as $ready_ids
+      | ($planned_ids == ($planned_ids | unique))
+        and (.plan.total_actionable == ($planned_ids | length))
+        and if $scoped == 1 then
+          all($planned_ids[];
+            . as $candidate | $ready_ids | index($candidate) != null)
+        else
+          $planned_ids == $ready_ids
+        end
+    )
   ' "$result" >/dev/null ||
-    fail "BV plan contains an issue that is not present in br ready"
+    fail "BV plan is not an exact BR-ready plan (or a BR-ready subset when scoped)"
 fi
 
 if (( robot_triage_seen == 1 )); then
   jq -e --slurpfile ready "$br_ready" '
-    [.triage.quick_ref.top_picks[]?.id] as $picks
-    | all($picks[]; . as $candidate | any($ready[0][]; .id == $candidate))
+    (.triage.quick_ref.top_picks | type == "array")
+    and all(.triage.quick_ref.top_picks[];
+      (.id | type == "string" and length > 0)
+      and (.id as $candidate | any($ready[0][]; .id == $candidate)))
   ' "$result" >/dev/null ||
     fail "BV triage top picks contain an issue that is not present in br ready"
 fi

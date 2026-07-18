@@ -36,14 +36,25 @@ chmod +x "$fixture/scripts/bv_authoritative.sh"
   [[ ! -e .beads/beads.jsonl ]] || fail "fixture unexpectedly created the stale alternate snapshot"
   jq -c 'select(.id == $id)' --arg id "$closed_id" .beads/issues.jsonl >.beads/beads.jsonl
 
+  if scripts/bv_authoritative.sh --robot-triage >/dev/null 2>&1; then
+    fail "authoritative wrapper emitted an in-progress BV top pick as a BR-ready claim"
+  fi
+  if scripts/bv_authoritative.sh --robot-plan >/dev/null 2>&1; then
+    fail "authoritative wrapper emitted BV's broader plan as BR-ready claim authority"
+  fi
+
+  br close "$in_progress_id" --reason "fixture transitions to aligned claim sets" --json >/dev/null
+  br sync --flush-only --json >/dev/null
+
   issues_hash_before="$(git hash-object .beads/issues.jsonl)"
   stale_hash_before="$(git hash-object .beads/beads.jsonl)"
 
-  br_all="$(br list --json --no-db --all --limit 0)"
+  br_all_raw="$(br list --json --no-db --all --limit 0)"
+  br_all="$(jq 'if type == "array" then . else .issues end' <<<"$br_all_raw")"
   br_ready="$(br ready --json --no-db --limit 0 2>/dev/null)"
   br_blocked="$(br show "$blocked_id" --json --no-db)"
   [[ "$(jq 'length' <<<"$br_all")" == 4 ]] || fail "br list did not return all four exported issues"
-  [[ "$(jq 'length' <<<"$br_ready")" == 2 ]] || fail "br ready did not return the ready and in-progress issues"
+  [[ "$(jq 'length' <<<"$br_ready")" == 1 ]] || fail "br ready did not return exactly the open, unblocked issue"
   [[ "$(jq -s '[.[] | .dependencies[]?] | length' .beads/issues.jsonl)" == 3 ]] ||
     fail "fixture did not retain blocking, hierarchy, and related relationship records"
   jq -e --arg id "$ready_id" '.[0].dependencies == [{id: $id, title: "Ready foundation", status: "open", priority: 0, dependency_type: "blocks"}]' \
@@ -56,10 +67,10 @@ chmod +x "$fixture/scripts/bv_authoritative.sh"
   authoritative_result="$(scripts/bv_authoritative.sh --robot-triage)"
   jq -e '
     .triage.project_health.counts.total == 4
-    and .triage.project_health.counts.by_status == {closed: 1, in_progress: 1, open: 2}
+    and .triage.project_health.counts.by_status == {closed: 2, open: 2}
     and .triage.project_health.graph.node_count == 4
     and .triage.project_health.graph.edge_count == 1
-    and .triage.quick_ref.actionable_count == 2
+    and .triage.quick_ref.actionable_count == 1
   ' <<<"$authoritative_result" >/dev/null || fail "authoritative wrapper returned incorrect tracker state"
 
   authoritative_plan="$(scripts/bv_authoritative.sh --robot-plan)"
@@ -67,7 +78,7 @@ chmod +x "$fixture/scripts/bv_authoritative.sh"
     ([.plan.tracks[]?.items[]?.id] | sort) == ($ready | map(.id) | sort)
     and .plan.total_actionable == ($ready | length)
   ' <<<"$authoritative_plan" >/dev/null ||
-    fail "authoritative wrapper did not preserve the exact br ready ID set"
+    fail "authoritative wrapper did not preserve the exact aligned BR-ready ID set"
 
   authoritative_next="$(scripts/bv_authoritative.sh --robot-next)"
   jq -e --argjson ready "$br_ready" '
@@ -104,6 +115,32 @@ chmod +x "$fixture/scripts/bv_authoritative.sh"
   if scripts/bv_authoritative.sh --robot-diff --diff-since HEAD >/dev/null 2>&1; then
     fail "wrapper accepted BV diff, whose historical loader does not honor the isolated source"
   fi
+
+  malformed_bin="$fixture/malformed-br-bin"
+  real_br="$(command -v br)"
+  mkdir "$malformed_bin"
+  # These variables must remain literal for the generated fake executable.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "$1" == list ]]; then' \
+    '  case "${FAKE_BR_MODE:-incomplete}" in' \
+    '    incomplete) printf '\''{"issues":[],"total":0}'\''\n ;;' \
+    '    concatenated) printf '\''[]\n[]\n'\'' ;;' \
+    '  esac' \
+    'else' \
+    '  exec "$REAL_BR" "$@"' \
+    'fi' >"$malformed_bin/br"
+  chmod +x "$malformed_bin/br"
+  if PATH="$malformed_bin:$PATH" REAL_BR="$real_br" \
+      scripts/bv_authoritative.sh --robot-triage >/dev/null 2>&1; then
+    fail "wrapper accepted a BR object envelope without pagination metadata"
+  fi
+  if PATH="$malformed_bin:$PATH" REAL_BR="$real_br" FAKE_BR_MODE=concatenated \
+      scripts/bv_authoritative.sh --robot-triage >/dev/null 2>&1; then
+    fail "wrapper accepted concatenated top-level BR JSON values"
+  fi
+
   [[ ! -e .bv ]] || fail "rejected BV mutation options created repository state"
   [[ "$(find . -maxdepth 3 -type f -iname '*feedback*' -print)" == "$feedback_before" ]] ||
     fail "rejected BV mutation options created a feedback file"
@@ -113,7 +150,7 @@ chmod +x "$fixture/scripts/bv_authoritative.sh"
   [[ "$(git hash-object .beads/beads.jsonl)" == "$stale_hash_before" ]] ||
     fail "wrapper modified the stale beads.jsonl snapshot"
 
-  printf 'authoritative fixture: total=4 statuses=2-open/1-in_progress/1-closed stored_relationships=3 blocking_edges=1 actionable_ids_exact=2 hash=%s stale_hash=%s\n' \
+  printf 'authoritative fixture: total=4 final_statuses=2-open/2-closed stored_relationships=3 blocking_edges=1 aligned_actionable=1 br_ready=1 unsafe_top_pick_refused unsafe_plan_refused hash=%s stale_hash=%s\n' \
     "$authoritative_hash" "$stale_hash"
   printf 'fixture retained for audit: %s\n' "$fixture"
 )
@@ -134,4 +171,4 @@ chmod +x "$empty_fixture/scripts/bv_authoritative.sh"
 if "$empty_fixture/scripts/bv_authoritative.sh" --robot-triage >/dev/null 2>&1; then
   fail "wrapper accepted an empty authoritative export"
 fi
-printf 'negative gates: source override, mutation flags, modifier-only, historical and mixed-source commands, missing export, and empty export all refused\n'
+printf 'negative gates: source override, mutation flags, modifier-only, historical and mixed-source commands, incomplete/concatenated BR envelopes, missing export, and empty export all refused\n'

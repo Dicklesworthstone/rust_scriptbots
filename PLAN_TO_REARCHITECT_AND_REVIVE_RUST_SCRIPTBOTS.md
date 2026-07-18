@@ -3075,8 +3075,9 @@ prerequisites; the remaining dependency records are hierarchy. `br dep cycles
 authoritative BV view reported `computed`.
 Because `bv 0.16.0` currently treats `parent-child` hierarchy as a blocker in
 `--robot-next`, execution uses `br ready --json` as the actionability authority
-and the authoritative BV wrapper for centrality, critical-path, parallel-track,
-and priority analysis.
+and the authoritative BV wrapper for centrality, critical-path, and priority
+analysis. Parallel-track output is usable only when its emitted set passes the
+wrapper's BR-ready equality or subset gate.
 Unfinished epics are not falsely closed merely to work around that viewer bug.
 
 ### 17.2 critical path
@@ -3142,7 +3143,8 @@ After creation:
 - `br dep cycles` must report none;
 - `br ready --json` must show sensible first work;
 - `scripts/bv_authoritative.sh --robot-triage` must identify P0 foundations rather than polish;
-- `scripts/bv_authoritative.sh --robot-plan` must expose parallel tracks;
+- `scripts/bv_authoritative.sh --robot-plan` must expose only BR-ready parallel
+  tracks or fail closed with the actionable-set mismatch;
 - `scripts/bv_authoritative.sh --robot-insights` status fields must be checked for computed versus timed-out metrics;
 - priority misalignments and missing dependencies are corrected;
 - tracker JSONL is flushed and reviewed.
@@ -3151,16 +3153,20 @@ The fail-closed `scripts/bv_authoritative.sh` integration now makes the tracked
 `.beads/issues.jsonl` export the only documented BV source. It uses a unique
 external symlink view, forces JSON robot mode, positively allows only supported
 read-only commands/modifiers, rejects source overrides and mutation flags, and
-cross-checks BR all/ready state against BV issue, status, blocking-edge, exact
-actionable issue-ID sets, and `data_hash` evidence before emitting a result.
-Every BV next result, plan item, and triage top pick is checked against BR's
-ready set; BR remains the sole claim authority. The implementation-time
+cross-checks the exact BR/source ID/status/dependency-count projection, BR readiness, BV issue,
+status, blocking-edge, internally consistent native actionability, complete
+BR-ready coverage, and `data_hash` evidence before emitting a result. Every BV
+next result and triage top pick must be BR-ready; unscoped plans must equal the
+BR-ready set and scoped plans must be its subset. Current BV 0.16.0 plans that
+include in-progress or hierarchy-divergent work therefore fail closed rather
+than masquerading as claim authority. BR remains the sole claim authority. The implementation-time
 239-issue snapshot proved 28 closed, 22 in progress, 189 open, 326 blocking
 edges, 58 actionable issues, and authoritative BV hash `5d1d45dfe541f203`.
 The automated mutation fixture also proves that a stale sibling snapshot gets a
 different hash, all three stored relationship types survive export, only the
-blocking relationship enters BV's dependency graph, and missing/empty/overridden
-sources fail closed without modifying either repository snapshot.
+blocking relationship enters BV's dependency graph, BR/BV claim-set divergence
+cannot escape as an unsafe plan, and missing/empty/overridden sources fail
+closed without modifying either repository snapshot.
 
 ---
 

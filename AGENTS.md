@@ -512,8 +512,8 @@ bv is a graph-aware triage engine for Beads projects. In this repository,
 `.beads/issues.jsonl` is the authoritative tracked export; the similarly named
 `.beads/beads.jsonl` is not an authority. Always invoke BV through
 `scripts/bv_authoritative.sh`, which builds an isolated read-only view and
-cross-checks BR/BV issue, status, dependency, actionable, and hash state before
-emitting JSON.
+cross-checks BR/BV issue, status, dependency, native actionability, BR readiness,
+and hash state before emitting JSON.
 
 **Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail.
 
@@ -522,7 +522,7 @@ emitting JSON.
 ### The Workflow: Start With Triage
 
 **`scripts/bv_authoritative.sh --robot-triage` is your single entry point.** It returns:
-- `quick_ref`: at-a-glance counts + top 3 picks
+- `quick_ref`: at-a-glance native BV counts and up to 3 claim-safe top picks
 - `recommendations`: graph-ranked issues with scores, reasons, unblock info (including blocked work)
 - `quick_wins`: low-effort high-impact items
 - `blockers_to_clear`: items that unblock the most downstream work
@@ -534,16 +534,22 @@ scripts/bv_authoritative.sh --robot-triage  # THE MEGA-COMMAND: start here
 br ready --json                             # The sole actionability and claim authority
 ```
 
-The wrapper compares BV's complete planned issue-ID set with `br ready`, and
-validates every `--robot-next`, plan item, and triage top pick against that BR
-set. A BV recommendation is graph analysis, not authorization to claim work.
+BV 0.16.0 and current BR deliberately disagree about actionability: BV includes
+in-progress work and treats hierarchy differently, while `br ready` returns
+open, unblocked, non-deferred claims. The wrapper proves BV's own actionable
+count and complete plan agree, proves every BR-ready issue is represented in
+that plan, and then refuses a claim-oriented result unless `--robot-next`, an
+unscoped plan, a scoped plan, or a triage top pick is respectively BR-ready,
+exactly BR-ready, a BR-ready subset, or BR-ready. An empty BV top-pick list is
+valid graph-analysis output, not evidence that the BR queue is empty. A BV
+recommendation is graph analysis, not authorization to claim work.
 
 ### Command Reference
 
 **Planning:**
 | Command | Returns |
 |---------|---------|
-| `--robot-plan` | Parallel execution tracks with `unblocks` lists |
+| `--robot-plan` | Parallel execution tracks only when the emitted set agrees with BR readiness; otherwise fails closed |
 | `--robot-priority` | Priority misalignment detection with confidence |
 
 **Graph Analysis:**
@@ -571,9 +577,9 @@ filename can therefore mix stale data with an authoritative report hash.
 ### Scoping & Filtering
 
 ```bash
-scripts/bv_authoritative.sh --robot-plan --label backend            # Scope to label's subgraph
+scripts/bv_authoritative.sh --robot-plan --label backend            # Scope; still refuses non-BR-ready items
 scripts/bv_authoritative.sh --robot-insights --label backend        # Inspect one label's subgraph
-scripts/bv_authoritative.sh --recipe actionable --robot-plan        # Pre-filter: ready to work
+scripts/bv_authoritative.sh --recipe actionable --robot-plan        # BV filter; BR-ready subset gate still applies
 scripts/bv_authoritative.sh --recipe high-impact --robot-triage     # Pre-filter: top PageRank
 scripts/bv_authoritative.sh --robot-triage --robot-triage-by-track  # Group by parallel work streams
 scripts/bv_authoritative.sh --robot-triage --robot-triage-by-label  # Group by domain
@@ -598,7 +604,7 @@ actual task.
 ```bash
 scripts/bv_authoritative.sh --robot-triage | jq '.triage.quick_ref'           # At-a-glance summary
 scripts/bv_authoritative.sh --robot-triage | jq '.triage.recommendations[0]'  # Top recommendation
-scripts/bv_authoritative.sh --robot-plan | jq '.plan.summary.highest_impact'  # Best unblock target
+scripts/bv_authoritative.sh --robot-plan | jq '.plan.summary.highest_impact'  # Best BR-aligned target, or fail closed
 scripts/bv_authoritative.sh --robot-insights | jq '.status'                   # Check metric readiness
 scripts/bv_authoritative.sh --robot-insights | jq '.Cycles'                   # Circular deps (must fix!)
 ```
