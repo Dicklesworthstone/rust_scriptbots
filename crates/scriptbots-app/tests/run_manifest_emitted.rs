@@ -737,7 +737,7 @@ id = "fixture-equilibrium-study"
 description = "acceptance fixture for bd-2z0.10.1"
 
 [config]
-food_max = 0.123
+food_max = 0.6
 population_minimum = 24
 "#;
 
@@ -770,7 +770,7 @@ fn a_scenario_document_binds_identity_bootstrap_and_config_into_the_manifest() {
     // the document (which declares no policy here), and the manifest must say so.
     assert_eq!(manifest["scenario"]["bootstrap_ticks"], 2);
     assert_eq!(
-        manifest["normalized_config"]["food_max"], 0.123,
+        manifest["normalized_config"]["food_max"], 0.6,
         "the scenario document's config body did not reach the world"
     );
     assert_eq!(manifest["normalized_config"]["population_minimum"], 24);
