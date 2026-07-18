@@ -267,11 +267,11 @@ impl PixelBuffer {
         let mut unlit_sum = [0.0_f32; 3];
         let mut unlit_count = 0_u32;
         let mut lit = [[false; 2]; 4];
-        for dy in 0..pixel_h {
-            for dx in 0..pixel_w {
+        for (dy, row) in lit.iter_mut().enumerate().take(pixel_h) {
+            for (dx, cell) in row.iter_mut().enumerate().take(pixel_w) {
                 let pixel = self.sub_pixel_or_empty(base_x + dx, base_y + dy);
                 if pixel.a >= COVERAGE_THRESHOLD {
-                    lit[dy][dx] = true;
+                    *cell = true;
                     lit_sum[0] += pixel.r;
                     lit_sum[1] += pixel.g;
                     lit_sum[2] += pixel.b;

@@ -13,13 +13,10 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use scriptbots_core::{
-    AgentData, ControlCommand, ScriptBotsConfig, WorldState, parse_render_quality,
-};
+use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState, parse_render_quality};
 
 /// One scene manifest (TOML). Unknown keys are rejected.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -173,12 +170,12 @@ impl SceneManifest {
         if self.ticks == 0 || self.ticks > MAX_SCENE_TICKS {
             problems.push(format!("ticks {} must be in 1..={MAX_SCENE_TICKS}", self.ticks));
         }
-        if let Some(quality) = &self.quality {
-            if parse_render_quality(quality).is_none() {
-                problems.push(format!(
-                    "quality `{quality}` is not auto|potato|low|medium|high|ultra"
-                ));
-            }
+        if let Some(quality) = &self.quality
+            && parse_render_quality(quality).is_none()
+        {
+            problems.push(format!(
+                "quality `{quality}` is not auto|potato|low|medium|high|ultra"
+            ));
         }
         for (index, key) in self.camera.iter().enumerate() {
             if key.tick > self.ticks {

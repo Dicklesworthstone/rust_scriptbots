@@ -18,6 +18,10 @@ use asupersync::types::{Budget, Outcome};
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+/// Finalizer contract for one owned background service: performs the drain-and-join
+/// work on the orderly teardown path, honoring the region's budget.
+type RegionFinalizer = Box<dyn FnOnce(&Budget) -> Outcome<String, String> + Send>;
+
 /// One background service owned by the application root.
 ///
 /// The finalizer performs the service's drain-and-join contract on the orderly
@@ -27,7 +31,7 @@ use tracing::{error, info, warn};
 pub struct ServiceRegion {
     name: &'static str,
     budget: Budget,
-    finalizer: Box<dyn FnOnce(&Budget) -> Outcome<String, String> + Send>,
+    finalizer: RegionFinalizer,
 }
 
 impl ServiceRegion {

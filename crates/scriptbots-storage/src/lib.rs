@@ -38,9 +38,9 @@ use scriptbots_core::{
     world_counters_digest_v1,
 };
 use scriptbots_runtime::{
-    ApplicationState, CommandId, EventCommitment, EventSequence, EventSequenceRange, HostCommand,
-    HostSessionId, JournalBatch, JournalBatchId, JournalFailure, JournalReceipt,
-    JournalReceiptState, JournaledScientificEvent, RunId, ShutdownCommitRequirement,
+    ApplicationState, CommandId, EventCommitment, EventSequence, EventSequenceRange, HostSessionId,
+    JournalBatch, JournalBatchId, JournalFailure, JournalReceipt, JournalReceiptState,
+    JournaledScientificEvent, RunId, ShutdownCommitRequirement,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
