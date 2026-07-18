@@ -569,12 +569,10 @@ fn region_result(outcomes: &[RegionOutcome], name: &str) -> Result<()> {
     match &region.outcome {
         Outcome::Ok(_) => Ok(()),
         Outcome::Err(error) => Err(anyhow!(error.clone())),
-        Outcome::Cancelled(reason) => {
-            Err(anyhow!("region {name} exhausted its teardown budget: {reason:?}"))
-        }
-        Outcome::Panicked(payload) => {
-            Err(anyhow!("region {name} finalizer panicked: {payload}"))
-        }
+        Outcome::Cancelled(reason) => Err(anyhow!(
+            "region {name} exhausted its teardown budget: {reason:?}"
+        )),
+        Outcome::Panicked(payload) => Err(anyhow!("region {name} finalizer panicked: {payload}")),
     }
 }
 
