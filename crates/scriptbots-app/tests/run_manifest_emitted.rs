@@ -769,9 +769,12 @@ fn a_scenario_document_binds_identity_bootstrap_and_config_into_the_manifest() {
     // The launch helper passes --bootstrap-ticks 2 explicitly: the CLI must outrank
     // the document (which declares no policy here), and the manifest must say so.
     assert_eq!(manifest["scenario"]["bootstrap_ticks"], 2);
-    assert_eq!(
-        manifest["normalized_config"]["food_max"], 0.6,
-        "the scenario document's config body did not reach the world"
+    let food_max = manifest["normalized_config"]["food_max"]
+        .as_f64()
+        .expect("food_max is numeric");
+    assert!(
+        (food_max - 0.6).abs() < 1e-6,
+        "the scenario document's config body did not reach the world: food_max={food_max}"
     );
     assert_eq!(manifest["normalized_config"]["population_minimum"], 24);
     let digests = manifest["scenario"]["ordered_config_layer_digests"]
