@@ -4441,6 +4441,7 @@ name = "fsqlite"
 version = "0.1.16"
 source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=e536d7f8ca102b3eb5236bef48514582379f9346#e536d7f8ca102b3eb5236bef48514582379f9346"
 dependencies = [
+ "asupersync",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-parser",
@@ -10241,9 +10242,11 @@ name = "scriptbots-storage"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "asupersync",
  "blake3",
  "crossbeam-channel",
  "fsqlite",
+ "fsqlite-types",
  "libc",
  "postcard",
  "scriptbots-core",

@@ -4,6 +4,8 @@
 
 mod journal;
 
+pub mod async_lane;
+
 pub use journal::{
     CommandJournalCursor, CommandJournalEvidence, CommandJournalPage, CommandJournalRecord,
     CommandStorageTransition, CommandStorageTransitionKind, DomainEventCursor, DomainEventEvidence,

@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 arc-swap = { workspace = true }
+asupersync = { workspace = true }
 blake3 = { workspace = true }
-fsqlite = { workspace = true }
+fsqlite = { workspace = true, features = ["async-api"] }
+fsqlite-types = { workspace = true }
 libc = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
