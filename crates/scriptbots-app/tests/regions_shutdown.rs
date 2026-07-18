@@ -61,12 +61,9 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
         },
         ..ControlServerConfig::default()
     };
-    let (control_runtime, _drain, _submit) = ControlRuntime::launch(
-        world_shared.clone(),
-        empty_latest_summary(),
-        control_config,
-    )
-    .expect("control runtime launches with every listener bound");
+    let (control_runtime, _drain, _submit) =
+        ControlRuntime::launch(world_shared.clone(), empty_latest_summary(), control_config)
+            .expect("control runtime launches with every listener bound");
 
     let persistence_shared = std::sync::Arc::new(Mutex::new(persistence));
     let mut root = AppRoot::new();
