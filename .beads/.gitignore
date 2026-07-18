@@ -23,3 +23,7 @@ daemon-*.log.gz
 
 # Local version tracking
 .local_version
+
+# br runtime locks (transient)
+.sync.lock
+.write.lock
