@@ -293,7 +293,13 @@ impl PixelBuffer {
             }
         };
         let fg = quantize(average(lit_sum, lit_count), cell_x, cell_y, depth, dither);
-        let bg = quantize(average(unlit_sum, unlit_count), cell_x, cell_y, depth, dither);
+        let bg = quantize(
+            average(unlit_sum, unlit_count),
+            cell_x,
+            cell_y,
+            depth,
+            dither,
+        );
         let ch = match mode {
             SubCellMode::Braille => braille_char([lit[0], lit[1], lit[2], lit[3]]),
             SubCellMode::Quadrant => quadrant_char(lit[0][0], lit[0][1], lit[1][0], lit[1][1]),
@@ -316,12 +322,7 @@ pub const COVERAGE_THRESHOLD: f32 = 0.5;
 /// reference vectors.
 #[must_use]
 pub fn braille_char(dots: [[bool; 2]; 4]) -> char {
-    const BITS: [[u32; 2]; 4] = [
-        [0x01, 0x08],
-        [0x02, 0x10],
-        [0x04, 0x20],
-        [0x40, 0x80],
-    ];
+    const BITS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
     let mut code = 0x2800_u32;
     for (row, bits) in dots.iter().zip(BITS.iter()) {
         for (lit, bit) in row.iter().zip(bits.iter()) {
@@ -338,7 +339,12 @@ pub fn braille_char(dots: [[bool; 2]; 4]) -> char {
 /// Index bit order: upper-left = 1, upper-right = 2, lower-left = 4,
 /// lower-right = 8.
 #[must_use]
-pub const fn quadrant_char(upper_left: bool, upper_right: bool, lower_left: bool, lower_right: bool) -> char {
+pub const fn quadrant_char(
+    upper_left: bool,
+    upper_right: bool,
+    lower_left: bool,
+    lower_right: bool,
+) -> char {
     const TABLE: [char; 16] = [
         ' ', '\u{2598}', '\u{259D}', '\u{2580}', // none, UL, UR, upper half
         '\u{2596}', '\u{258C}', '\u{259E}', '\u{259B}', // LL, left, anti-diag, no-LR
@@ -548,12 +554,7 @@ mod tests {
         // All sixteen combinations produce distinct glyphs.
         let mut seen = std::collections::BTreeSet::new();
         for bits in 0_u8..16 {
-            let glyph = quadrant_char(
-                bits & 1 != 0,
-                bits & 2 != 0,
-                bits & 4 != 0,
-                bits & 8 != 0,
-            );
+            let glyph = quadrant_char(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
             assert!(seen.insert(glyph), "duplicate quadrant glyph {glyph:?}");
         }
     }
@@ -625,10 +626,7 @@ mod tests {
         let mut buffer = PixelBuffer::new();
         buffer.ensure_size(80, 40);
         assert_eq!(buffer.grow_events(), 1);
-        buffer
-            .get_mut(3, 4)
-            .expect("in bounds")
-            .r = 1.0;
+        buffer.get_mut(3, 4).expect("in bounds").r = 1.0;
 
         // Same size and smaller sizes must not grow — and must clear.
         buffer.ensure_size(80, 40);
