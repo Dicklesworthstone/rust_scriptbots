@@ -3893,6 +3893,20 @@ pub enum Intervention {
         /// Fraction of each cell's food destroyed, in `[0, 1]`.
         scorch: f32,
     },
+    /// Paint terrain tiles in a region, optionally biasing the resulting food fertility.
+    PaintTerrain {
+        /// Where.
+        region: Region,
+        /// The terrain kind every covered tile becomes.
+        terrain: TerrainKind,
+        /// Additive fertility bias applied to the painted cells' recomputed profiles.
+        fertility_bias: Option<f32>,
+    },
+    /// Open or close the world to scheduled spawn arrivals from this boundary onward.
+    SetClosedWorld {
+        /// The closed-world flag the world must hold after this intervention lands.
+        closed: bool,
+    },
 }
 
 impl Intervention {
@@ -3959,6 +3973,22 @@ impl Intervention {
                 }
                 Ok(())
             }
+            Self::PaintTerrain {
+                region,
+                fertility_bias,
+                ..
+            } => {
+                region.validate_basic()?;
+                if let Some(bias) = fertility_bias
+                    && (!bias.is_finite() || !(-1.0..=1.0).contains(&bias))
+                {
+                    return Err(WorldStateError::InvalidConfig(
+                        "paint-terrain fertility_bias must be finite and lie in [-1, 1]",
+                    ));
+                }
+                Ok(())
+            }
+            Self::SetClosedWorld { .. } => Ok(()),
         }
     }
 
@@ -3980,7 +4010,11 @@ impl Intervention {
             Self::Drought { region, .. }
             | Self::Embargo { region, .. }
             | Self::Bloom { region, .. }
-            | Self::Meteor { region, .. } => region.validate_for_world(world_width, world_height),
+            | Self::Meteor { region, .. }
+            | Self::PaintTerrain { region, .. } => {
+                region.validate_for_world(world_width, world_height)
+            }
+            Self::SetClosedWorld { .. } => Ok(()),
         }
     }
 }
@@ -10767,6 +10801,16 @@ impl TerrainLayer {
         }
     }
 
+    /// Mutable access to one tile, for intervention-driven terrain painting.
+    pub fn tile_mut(&mut self, x: u32, y: u32) -> Option<&mut TerrainTile> {
+        if x < self.width && y < self.height {
+            let idx = (y as usize) * (self.width as usize) + (x as usize);
+            Some(&mut self.tiles[idx])
+        } else {
+            None
+        }
+    }
+
     fn tile_wrapped(&self, x: i32, y: i32) -> &TerrainTile {
         let w = self.width as i32;
         let h = self.height as i32;
@@ -15952,6 +15996,46 @@ impl WorldState {
                         }
                     }
                 }
+                Intervention::PaintTerrain {
+                    region,
+                    terrain,
+                    fertility_bias,
+                } => {
+                    let (width, height) = (self.terrain.width(), self.terrain.height());
+                    for ty in 0..height {
+                        for tx in 0..width {
+                            let (px, py) =
+                                ((tx as f32 + 0.5) * cell_size, (ty as f32 + 0.5) * cell_size);
+                            if region.contains(px, py, world_width, world_height)
+                                && let Some(tile) = self.terrain.tile_mut(tx, ty)
+                            {
+                                tile.kind = kind;
+                            }
+                        }
+                    }
+                    // Recompute derived food profiles from the painted terrain, then apply
+                    // the caller's fertility bias to exactly the painted cells.
+                    self.food_profiles = FoodCellProfile::compute(&self.config, &self.terrain);
+                    if let Some(bias) = fertility_bias {
+                        let (width, height) = (self.terrain.width(), self.terrain.height());
+                        for ty in 0..height {
+                            for tx in 0..width {
+                                let (px, py) =
+                                    ((tx as f32 + 0.5) * cell_size, (ty as f32 + 0.5) * cell_size);
+                                if region.contains(px, py, world_width, world_height) {
+                                    let index = (ty as usize) * (width as usize) + (tx as usize);
+                                    if let Some(profile) = self.food_profiles.get_mut(index) {
+                                        profile.fertility =
+                                            (profile.fertility + bias).clamp(0.0, 1.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Intervention::SetClosedWorld { closed } => {
+                    self.config.closed = closed;
+                }
             }
         }
 
@@ -16014,10 +16098,13 @@ impl WorldState {
         let fertility_bonus_scale = self.config.reproduction_fertility_bonus.max(0.0);
         let healths = self.agents.columns().health();
         for (idx, agent_id) in handles.iter().enumerate() {
+            let pos = positions[idx];
+            // Computed before the mutable runtime borrow: the embargo scale
+            // reads active effects (immutable) and must not alias the agent.
+            let embargo_scale = self.intake_scale_for_position(pos.x, pos.y);
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 // legacy C++ gate: a full agent neither eats nor wastes cell food
                 if (intake_rate > 0.0 || waste_rate > 0.0) && healths[idx] < 2.0 {
-                    let pos = positions[idx];
                     let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
                     let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
                     let profile_index = (cell_y as usize) * food_width + cell_x as usize;
@@ -16038,7 +16125,6 @@ impl WorldState {
                             let base_intake = available.min(intake_rate);
                             let waste = available.min(waste_rate);
                             let herbivore = clamp01(runtime.herbivore_tendency);
-                            let embargo_scale = self.intake_scale_for_position(pos.x, pos.y);
                             let mut intake = 0.0;
                             if herbivore > 0.0 && base_intake > 0.0 && embargo_scale > 0.0 {
                                 let left =
@@ -25567,6 +25653,81 @@ mod tests {
             energy_of(&embargoed, inside) > 0.5,
             "intake must restore exactly once the embargo lapses"
         );
+    }
+
+    #[test]
+    fn paint_terrain_recolors_only_the_region_and_biases_fertility() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(17),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let cell_kind = |world: &WorldState, x: u32, y: u32| {
+            world.terrain().tile(x, y).expect("tile in bounds").kind
+        };
+        let before_inside = cell_kind(&world, 5, 5);
+        let before_outside = cell_kind(&world, 9, 5);
+
+        world
+            .enqueue_intervention(Intervention::PaintTerrain {
+                region: Region::Disc {
+                    x: 100.0,
+                    y: 100.0,
+                    radius: 30.0,
+                },
+                kind: TerrainKind::Rock,
+                fertility_bias: Some(0.5),
+            })
+            .expect("valid paint");
+        world.step().expect("step");
+
+        assert_eq!(
+            cell_kind(&world, 5, 5),
+            TerrainKind::Rock,
+            "the tile at the disc centre must become Rock"
+        );
+        assert_eq!(
+            cell_kind(&world, 9, 5),
+            before_outside,
+            "a tile outside the disc must keep its kind"
+        );
+        let fertility_inside = world
+            .food_profile(5, 5)
+            .expect("profile in bounds")
+            .fertility;
+        assert!(
+            fertility_inside > 0.0,
+            "the fertility bias must lift the painted cell's profile, got {fertility_inside}"
+        );
+        let _ = before_inside;
+    }
+
+    #[test]
+    fn set_closed_world_flips_the_flag_at_the_intervention_boundary() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            closed: false,
+            rng_seed: Some(19),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        assert!(!world.config().closed, "starts open");
+
+        world
+            .enqueue_intervention(Intervention::SetClosedWorld { closed: true })
+            .expect("valid close");
+        world.step().expect("step");
+        assert!(world.config().closed, "closed after the boundary");
+
+        world
+            .enqueue_intervention(Intervention::SetClosedWorld { closed: false })
+            .expect("valid reopen");
+        world.step().expect("step");
+        assert!(!world.config().closed, "reopened after the next boundary");
     }
 
     #[test]
