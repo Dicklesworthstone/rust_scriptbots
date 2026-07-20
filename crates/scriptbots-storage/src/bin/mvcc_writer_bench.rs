@@ -106,7 +106,7 @@ fn parse_args() -> Result<Config, String> {
     })
 }
 
-fn create_schema(connection: &Connection, context: &str) {
+fn create_schema(connection: &Connection, _context: &str) {
     connection
         .execute_batch(
             "CREATE TABLE runs (run_id TEXT PRIMARY KEY, label TEXT NOT NULL);

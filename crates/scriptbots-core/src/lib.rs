@@ -1030,6 +1030,7 @@ fn configure_parallelism() {
 
         // SAFETY: `limit` is a finite positive integer converted to string; the standard library
         // marks `set_var` as unsafe on nightly, but providing well-formed Unicode strings is safe.
+        #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("RAYON_NUM_THREADS", limit.to_string());
         }

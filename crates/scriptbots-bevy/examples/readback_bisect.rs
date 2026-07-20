@@ -40,7 +40,11 @@ fn main() {
 
     // --- configure_session: wipe entities, create target, spawn rig via
     // run_system_once, warm up ---
-    let entities: Vec<Entity> = app.world_mut().iter_entities().map(|e| e.id()).collect();
+    let mut entity_query = app.world_mut().query::<bevy::ecs::entity::EntityRef>();
+    let entities: Vec<Entity> = entity_query
+        .iter(app.world())
+        .map(|entity_ref| entity_ref.id())
+        .collect();
     let wiped = entities.len();
     for entity in entities {
         let _ = app.world_mut().despawn(entity);
