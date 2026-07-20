@@ -42,6 +42,7 @@ use crate::{
     WorldDigestV1, WorldDigestV1ContractError, WorldState, WorldStateError,
     brain_registry_digest_v1, clamp01, validate_finite, world_counters_digest_v1,
 };
+use rand::RngCore;
 use scriptbots_index::UniformGridIndex;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -2574,6 +2575,7 @@ mod tests {
     use crate::tests::{
         boxed_fixture_brain_family, boxed_fixture_brain_family_with_behavior_probe,
     };
+    use rand::RngCore;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},

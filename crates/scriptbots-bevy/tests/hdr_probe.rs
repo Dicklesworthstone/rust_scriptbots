@@ -109,7 +109,7 @@ fn hdr_image_target_renders_content_upstream_canary() {
         let world = render_app.world_mut();
         let device = world.resource::<RenderDevice>().clone();
         let queue = world.resource::<RenderQueue>().clone();
-        let gpu_images = world.resource::<RenderAssets<GpuImage>>().clone();
+        let gpu_images = world.resource::<RenderAssets<GpuImage>>();
         let gpu_image = gpu_images.get(&target).expect("gpu image prepared");
         let bytes_per_row = RenderDevice::align_copy_bytes_per_row(128 * 4) as u32;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
