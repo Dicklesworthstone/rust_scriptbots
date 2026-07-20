@@ -1,6 +1,7 @@
 //! Core types shared across the `ScriptBots` workspace.
 
 pub mod ancestry;
+pub mod attribution;
 pub mod channels;
 mod checkpoint;
 pub mod detect;
