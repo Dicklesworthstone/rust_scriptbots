@@ -22,6 +22,17 @@
 //! updated — which is exactly the failure mode we want, instead of a silent
 //! mislabel that survives for months.
 
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::{INPUT_SIZE, NUM_EYES, OUTPUT_SIZE};
 
 /// One actuator slot in a brain's output vector.
@@ -242,9 +253,11 @@ const _: () = {
 /// Read a brain's actuator vector by channel name rather than by a magic index.
 pub trait OutputsExt {
     /// Raw value of one actuator channel.
+    #[must_use]
     fn channel(&self, channel: OutputChannel) -> f32;
 
     /// Value of one actuator channel, clamped to the unit interval.
+    #[must_use]
     fn channel_clamped(&self, channel: OutputChannel) -> f32 {
         self.channel(channel).clamp(0.0, 1.0)
     }
@@ -252,12 +265,14 @@ pub trait OutputsExt {
     /// Peak commanded wheel effort in normalized actuator space.
     ///
     /// This deliberately excludes physical displacement and boost-scaled wheel speed.
+    #[must_use]
     fn peak_wheel_output(&self) -> f32 {
         self.channel_clamped(OutputChannel::WheelLeft)
             .max(self.channel_clamped(OutputChannel::WheelRight))
     }
 
     /// Whether the brain is requesting boost.
+    #[must_use]
     fn boost_engaged(&self) -> bool {
         self.channel(OutputChannel::Boost) > BOOST_THRESHOLD
     }
@@ -272,9 +287,11 @@ impl OutputsExt for [f32; OUTPUT_SIZE] {
 /// Read a brain's sensor vector by channel rather than by a magic index.
 pub trait SensorsExt {
     /// Raw value of one sensor slot.
+    #[must_use]
     fn sensor(&self, channel: &SensorChannel) -> f32;
 
     /// Every sensor slot paired with its description, in wire order.
+    #[must_use]
     fn labelled(&self) -> [(&'static SensorChannel, f32); INPUT_SIZE];
 }
 

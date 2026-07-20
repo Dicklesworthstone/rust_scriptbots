@@ -25,6 +25,18 @@
 //! A detector that reports `NaN` magnitudes is worse than one that reports
 //! nothing, because it looks like it worked.
 
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(clippy::suboptimal_flops, clippy::imprecise_flops)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use thiserror::Error;
 
 /// One point of a metric series.
@@ -137,7 +149,7 @@ impl Default for CusumParams {
 }
 
 impl CusumParams {
-    fn validate(self) -> Result<(), DetectError> {
+    const fn validate(self) -> Result<(), DetectError> {
         if self.warmup < 2 {
             return Err(DetectError::InvalidParam {
                 name: "warmup",
@@ -173,6 +185,11 @@ impl CusumParams {
 /// and a change is reported when the accumulated evidence exceeds `h`. After a
 /// detection the baseline is re-estimated from the following samples, so a
 /// series may contain many changes.
+///
+/// # Panics
+///
+/// Never: the warmup slice is guarded by the `base + params.warmup < series.len()` loop
+/// condition, so every slice and index stays in bounds.
 ///
 /// # Errors
 ///
@@ -280,6 +297,11 @@ pub struct Crossing {
 /// Only *transitions* are reported: a series that sits below a level forever
 /// produces one crossing (when it first arrives), not one per sample. This is
 /// the difference between an event stream and a stuck alarm.
+///
+/// # Panics
+///
+/// Never: `windows(2)` yields slices of length exactly two, so `window[0]` and `window[1]` are
+/// always in bounds.
 ///
 /// # Errors
 ///
@@ -417,7 +439,7 @@ impl Default for RegimeParams {
 }
 
 impl RegimeParams {
-    fn validate(self) -> Result<(), DetectError> {
+    const fn validate(self) -> Result<(), DetectError> {
         if self.window < 4 {
             return Err(DetectError::InvalidParam {
                 name: "window",
@@ -440,6 +462,11 @@ impl RegimeParams {
 /// "this run collapsed" is far less useful than "this run grew, equilibrated,
 /// then collapsed at t=9,000".
 ///
+/// # Panics
+///
+/// Never: `chunks_exact` yields only full windows, so `chunk[0]` and `chunk[chunk.len() - 1]`
+/// are always in bounds.
+///
 /// # Errors
 ///
 /// Returns [`DetectError`] when the series is invalid or a parameter is outside
@@ -457,14 +484,18 @@ pub fn regimes(series: &[Sample], params: RegimeParams) -> Result<Vec<RegimeWind
         // Least-squares slope against the sample index (ticks are strictly
         // increasing but may be unevenly spaced; index keeps this scale-free).
         let mean_x = (n - 1.0) / 2.0;
-        let mut sxy = 0.0f64;
-        let mut sxx = 0.0f64;
+        let mut sum_dx_dy = 0.0f64;
+        let mut sum_dx_sq = 0.0f64;
         for (i, sample) in chunk.iter().enumerate() {
             let dx = i as f64 - mean_x;
-            sxy += dx * (sample.value - mean);
-            sxx += dx * dx;
+            sum_dx_dy += dx * (sample.value - mean);
+            sum_dx_sq += dx * dx;
         }
-        let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+        let slope = if sum_dx_sq > 0.0 {
+            sum_dx_dy / sum_dx_sq
+        } else {
+            0.0
+        };
 
         // Detrended residuals: spread and zero-crossing rate.
         let mut residuals = Vec::with_capacity(chunk.len());
@@ -596,6 +627,11 @@ impl Default for BimodalityParams {
 /// Uses an exhaustive Otsu split over the sorted values: deterministic, no
 /// iteration, no seeded initialization, and therefore no chance of two runs
 /// disagreeing about whether a population had split.
+///
+/// # Panics
+///
+/// Never: the split search only selects indices in `1..values.len()`, so every slice and index
+/// into the sorted values stays in bounds.
 ///
 /// # Errors
 ///
@@ -919,13 +955,13 @@ mod tests {
 
     #[test]
     fn detectors_reject_non_finite_and_unordered_input() {
-        let bad = vec![Sample::new(0, 1.0), Sample::new(1, f64::NAN)];
+        let bad = [Sample::new(0, 1.0), Sample::new(1, f64::NAN)];
         assert_eq!(
             change_points_cusum(&bad, CusumParams::default()),
             Err(DetectError::NonFinite { index: 1 })
         );
 
-        let unordered = vec![Sample::new(5, 1.0), Sample::new(5, 2.0)];
+        let unordered = [Sample::new(5, 1.0), Sample::new(5, 2.0)];
         assert_eq!(
             change_points_cusum(&unordered, CusumParams::default()),
             Err(DetectError::UnorderedTicks { index: 1 })
@@ -1020,7 +1056,7 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].regime, Regime::Growth);
 
-        let flat = vec![100.0; 64];
+        let flat = [100.0; 64];
         let windows = regimes(&series_from(&flat), RegimeParams::default()).expect("valid");
         assert_eq!(windows[0].regime, Regime::Equilibrium);
 

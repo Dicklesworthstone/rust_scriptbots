@@ -41,3 +41,6 @@ scriptbots-brain-neuro = { path = "../scriptbots-brain-neuro", default-features 
 [[bench]]
 name = "world_bench"
 harness = false
+
+[lints]
+workspace = true

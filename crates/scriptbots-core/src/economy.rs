@@ -21,6 +21,18 @@
 //! never map iteration, never wall-clock. Identical input sequences produce
 //! bit-identical [`EpochFlows`] on every platform and thread count.
 
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+#![allow(clippy::float_cmp, clippy::while_float)]
+
 use crate::{RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -72,7 +84,7 @@ impl EconomyStock {
 ///
 /// A non-finite value must become a typed error, never a NaN quietly poisoning
 /// the residual into `0 != 0 is false, so we're fine`.
-#[derive(Debug, Clone, PartialEq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EconomyAggregationError {
     /// A flow or reconciliation lane carried NaN or an infinity.
     #[error(

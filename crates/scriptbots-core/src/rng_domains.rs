@@ -32,6 +32,18 @@
 //! the root seed and a schema tag, so the streams are separated by construction and the property
 //! is testable rather than hoped for.
 
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+#![allow(clippy::too_many_lines)]
+
 use crate::{AgentUid, RandomStream, RandomStreamRestoreError, RandomStreamState, SmallRngStream};
 use serde::{Deserialize, Serialize};
 
@@ -77,13 +89,13 @@ pub enum RngDomain {
 impl RngDomain {
     /// Every domain, in the stable derivation and digest order. It must never be reordered: the
     /// order is part of the science wire and matches the fixed checkpoint object's field order.
-    pub const ALL: [RngDomain; 6] = [
-        RngDomain::Environment,
-        RngDomain::Food,
-        RngDomain::Population,
-        RngDomain::Lineage,
-        RngDomain::Mutation,
-        RngDomain::Crossover,
+    pub const ALL: [Self; 6] = [
+        Self::Environment,
+        Self::Food,
+        Self::Population,
+        Self::Lineage,
+        Self::Mutation,
+        Self::Crossover,
     ];
 
     /// The STABLE STRING that participates in seed derivation.
@@ -95,23 +107,23 @@ impl RngDomain {
     #[must_use]
     pub const fn tag(self) -> &'static str {
         match self {
-            RngDomain::Environment => "environment",
-            RngDomain::Food => "food",
-            RngDomain::Population => "population",
-            RngDomain::Lineage => "lineage",
-            RngDomain::Mutation => "mutation",
-            RngDomain::Crossover => "crossover",
+            Self::Environment => "environment",
+            Self::Food => "food",
+            Self::Population => "population",
+            Self::Lineage => "lineage",
+            Self::Mutation => "mutation",
+            Self::Crossover => "crossover",
         }
     }
 
     const fn index(self) -> usize {
         match self {
-            RngDomain::Environment => 0,
-            RngDomain::Food => 1,
-            RngDomain::Population => 2,
-            RngDomain::Lineage => 3,
-            RngDomain::Mutation => 4,
-            RngDomain::Crossover => 5,
+            Self::Environment => 0,
+            Self::Food => 1,
+            Self::Population => 2,
+            Self::Lineage => 3,
+            Self::Mutation => 4,
+            Self::Crossover => 5,
         }
     }
 }
@@ -413,7 +425,11 @@ impl AgentRngCountersV1 {
 pub enum AgentRngCounterError {
     /// The next ordinal would wrap and reuse an earlier random identity.
     #[error("agent random counter `{counter}` is exhausted")]
-    Exhausted { counter: &'static str },
+    Exhausted {
+        /// Stable name of the exhausted counter (`reproduction-attempt`, `birth`, or
+        /// `brain-initialization`).
+        counter: &'static str,
+    },
 }
 
 /// Versioned metadata binding an agent-keyed protocol to its root and concrete RNG lane.
@@ -516,29 +532,48 @@ impl AgentSubstreamProtocolV1 {
 pub enum AgentSubstreamProtocolError {
     /// The protocol envelope version is unsupported.
     #[error("agent random-substream protocol version {found} does not match {expected}")]
-    Version { found: u16, expected: u16 },
+    Version {
+        /// Envelope version decoded from the persisted metadata.
+        found: u16,
+        /// Envelope version this build supports.
+        expected: u16,
+    },
 
     /// The persisted keyed derivation algorithm is unsupported.
     #[error("agent random-substream algorithm `{found}` does not match `{expected}`")]
     Algorithm {
+        /// Keyed-substream derivation identity decoded from the persisted metadata.
         found: String,
+        /// Derivation identity this build implements.
         expected: &'static str,
     },
 
     /// The persisted counter/identity codec is unsupported.
     #[error("agent random-substream codec version {found} does not match {expected}")]
-    CodecVersion { found: u16, expected: u16 },
+    CodecVersion {
+        /// Counter/identity codec version decoded from the persisted metadata.
+        found: u16,
+        /// Codec version this build supports.
+        expected: u16,
+    },
 
     /// The concrete generator lane does not match this compilation target.
     #[error("agent random-substream generator `{found}` does not match `{expected}`")]
     StreamAlgorithm {
+        /// Concrete generator algorithm recorded in the persisted metadata.
         found: String,
+        /// Generator algorithm selected by this compilation target.
         expected: &'static str,
     },
 
     /// The envelope belongs to a different world root seed.
     #[error("agent random-substream root seed {found} does not match {expected}")]
-    RootSeed { found: u64, expected: u64 },
+    RootSeed {
+        /// Root seed recorded in the persisted metadata.
+        found: u64,
+        /// Root seed of the world being validated against.
+        expected: u64,
+    },
 }
 
 /// Derive one existing agent's operation-local stream seed.
@@ -630,10 +665,16 @@ pub struct DomainStreams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DomainStreamsCheckpoint {
+    /// Envelope format version; must equal [`DOMAIN_STREAMS_CHECKPOINT_VERSION`] on restore.
     pub version: u16,
+    /// Domain-separation derivation identity; must equal [`RNG_DOMAIN_DERIVATION_V1`].
     pub algorithm: String,
+    /// Codec version of the fixed domain-state wire object; must equal
+    /// [`DOMAIN_STREAMS_CHECKPOINT_CODEC_VERSION`].
     pub codec_version: u16,
+    /// World root seed every domain stream in this checkpoint was derived from.
     pub root_seed: u64,
+    /// Per-domain generator continuation states, one named field per [`RngDomain`].
     pub streams: DomainStreamStates,
 }
 
@@ -704,11 +745,21 @@ impl DomainStreams {
     /// deliberately no `Option` here — a caller forced to handle "this domain has no stream"
     /// would have nothing sensible to do but fall back to some other domain's stream, which is
     /// precisely the coupling this module exists to prevent.
+    ///
+    /// # Panics
+    ///
+    /// Never: `RngDomain::index` yields a lane index below `streams.len()` for every variant, so
+    /// the indexing cannot go out of bounds.
     pub fn stream(&mut self, domain: RngDomain) -> &mut SmallRngStream {
         &mut self.streams[domain.index()]
     }
 
     /// Capture a restorable checkpoint of every domain.
+    ///
+    /// # Panics
+    ///
+    /// Never: every lane is reached through `RngDomain::index`, which is in bounds by
+    /// construction.
     #[must_use]
     pub fn checkpoint(&self) -> DomainStreamsCheckpoint {
         let checkpoint = |domain: RngDomain| self.streams[domain.index()].checkpoint();
@@ -796,12 +847,19 @@ impl DomainStreams {
 pub enum DomainStreamRestoreError {
     /// The checkpoint envelope version is unsupported.
     #[error("random-domain checkpoint version {found} does not match supported version {expected}")]
-    Version { found: u16, expected: u16 },
+    Version {
+        /// Envelope version found in the decoded checkpoint.
+        found: u16,
+        /// Envelope version this build supports.
+        expected: u16,
+    },
 
     /// The checkpoint was derived under a different domain-separation contract.
     #[error("random-domain checkpoint algorithm `{found}` does not match `{expected}`")]
     Algorithm {
+        /// Domain derivation identity recorded in the checkpoint.
         found: String,
+        /// Domain derivation identity this build implements.
         expected: &'static str,
     },
 
@@ -809,20 +867,30 @@ pub enum DomainStreamRestoreError {
     #[error(
         "random-domain checkpoint codec version {found} does not match supported version {expected}"
     )]
-    CodecVersion { found: u16, expected: u16 },
+    CodecVersion {
+        /// State-object codec version recorded in the checkpoint.
+        found: u16,
+        /// State-object codec version this build supports.
+        expected: u16,
+    },
 
     /// A stream state claims it belongs to a different root/domain derivation.
     #[error("the `{domain}` domain's embedded seed {found} does not match derived seed {expected}")]
     DerivedSeedMismatch {
+        /// Stable tag of the domain whose stream failed seed validation.
         domain: &'static str,
+        /// Seed embedded in the persisted stream state.
         found: u64,
+        /// Seed re-derived from the checkpoint's root seed for this domain.
         expected: u64,
     },
 
     /// The domain's state was present but could not be restored.
     #[error("the `{domain}` domain's random stream could not be restored: {source}")]
     Stream {
+        /// Stable tag of the domain whose state could not be restored.
         domain: &'static str,
+        /// Underlying generator-level restore failure.
         #[source]
         source: RandomStreamRestoreError,
     },

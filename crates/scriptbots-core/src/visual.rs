@@ -1,7 +1,7 @@
 //! Renderer-neutral visual semantics (bd-2z0.14.3.2).
 //!
 //! One implementation of every "what should this look like" decision, consumed
-//! identically by the Bevy 3D frontend, the FrankenTUI terminal canvas, the
+//! identically by the Bevy 3D frontend, the `FrankenTUI` terminal canvas, the
 //! GPUI frontend while it lives, and the wgpu capture lane. Frontends may
 //! RENDER differently (PBR lighting vs braille cells); they must not DECIDE
 //! differently. Before this module, GPUI, Bevy, and the terminal each
@@ -19,6 +19,20 @@
 //! Semantic functions return colors in the *natural* palette. Frontends apply
 //! [`apply_accessibility_palette`] as the FINAL stage before display so every
 //! surface (3D PBR, terminal truecolor, ASCII fallback) transforms identically.
+
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(clippy::suboptimal_flops, clippy::imprecise_flops)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+#![allow(clippy::float_cmp, clippy::while_float)]
+#![allow(clippy::too_many_lines)]
 
 use crate::{AccessibilityPalette, BirthOrigin, DeathCause, TerrainKind};
 
@@ -56,7 +70,7 @@ const fn transform_palette(rgb: [f32; 3], matrix: &[[f32; 3]; 3]) -> [f32; 3] {
 /// midpoint. Input components are clamped into `[0, 1]` first so out-of-range
 /// science-side colors cannot smear.
 #[must_use]
-pub fn apply_accessibility_palette(rgb: [f32; 3], palette: AccessibilityPalette) -> [f32; 3] {
+pub const fn apply_accessibility_palette(rgb: [f32; 3], palette: AccessibilityPalette) -> [f32; 3] {
     let clamped = [
         rgb[0].clamp(0.0, 1.0),
         rgb[1].clamp(0.0, 1.0),
@@ -105,9 +119,12 @@ pub const WHEEL_BASE_RGB: [f32; 3] = [0.14, 0.16, 0.22];
 /// Selection/hover state shared by every frontend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VisualSelection {
+    /// Neither hovered nor selected: the baseline emissive level (0.12).
     #[default]
     None,
+    /// Pointer is over the agent: mid-level emissive highlight (0.28).
     Hovered,
+    /// Agent is the active selection: strongest emissive highlight (0.48).
     Selected,
 }
 
@@ -144,6 +161,8 @@ pub struct AgentVisualInput {
     pub temperature_preference: f32,
     /// Requested left/right wheel efforts (sign = direction).
     pub wheel_left: f32,
+    /// Requested right wheel effort; same sign/magnitude convention as
+    /// `wheel_left`.
     pub wheel_right: f32,
     /// Whether the spike is currently extended.
     pub spike_extended: bool,
@@ -216,7 +235,7 @@ const fn clamp01(v: f32) -> f32 {
 /// then an 18% blend toward the temperature accent so climate preference
 /// reads as a warm/cool tint on the same stripe.
 #[must_use]
-pub fn diet_stripe_color(herbivore_tendency: f32, temperature_preference: f32) -> [f32; 3] {
+pub const fn diet_stripe_color(herbivore_tendency: f32, temperature_preference: f32) -> [f32; 3] {
     let herbivore = clamp01(herbivore_tendency);
     let temp_pref = clamp01(temperature_preference);
     let mut stripe = mix_vec3(CARNIVORE_RGB, HERBIVORE_RGB, herbivore);
@@ -232,7 +251,7 @@ pub fn diet_stripe_color(herbivore_tendency: f32, temperature_preference: f32) -
 /// against 100 — that bug class is impossible here because this is the only
 /// implementation).
 #[must_use]
-pub fn health_factor(health: f32) -> f32 {
+pub const fn health_factor(health: f32) -> f32 {
     if health.is_finite() {
         (health / 2.0).clamp(0.45, 1.0)
     } else {
@@ -248,7 +267,7 @@ pub fn health_factor(health: f32) -> f32 {
 /// floor (frontends pass the observed maximum or a scenario constant); age
 /// beyond it simply stays at the floor. Pure and deterministic.
 #[must_use]
-pub fn age_factor(age_ticks: u64, reference_age: u64) -> f32 {
+pub const fn age_factor(age_ticks: u64, reference_age: u64) -> f32 {
     if reference_age == 0 {
         return 1.0;
     }
@@ -259,7 +278,7 @@ pub fn age_factor(age_ticks: u64, reference_age: u64) -> f32 {
 /// Apply a saturation factor (e.g. [`age_factor`]) to a color, preserving hue
 /// and luminance bias toward the rec.709 grey point.
 #[must_use]
-pub fn apply_saturation(rgb: [f32; 3], factor: f32) -> [f32; 3] {
+pub const fn apply_saturation(rgb: [f32; 3], factor: f32) -> [f32; 3] {
     let f = clamp01(factor);
     let lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
     [
@@ -356,7 +375,7 @@ pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
 // itself inherited the GPUI canvas hues; brightness factors made explicit).
 // ---------------------------------------------------------------------------
 
-/// Base color per terrain kind (natural palette, sRGB bytes as floats).
+/// Base color per terrain kind (natural palette, `sRGB` bytes as floats).
 pub const TERRAIN_BASE_COLORS: [[f32; 3]; 6] = [
     [0.117_647, 0.247_059, 0.400_000], // Deep water
     [0.184_314, 0.450_980, 0.701_961], // Shallow water
@@ -368,7 +387,7 @@ pub const TERRAIN_BASE_COLORS: [[f32; 3]; 6] = [
 
 /// Base color for a terrain kind.
 #[must_use]
-pub fn terrain_kind_base_color(kind: TerrainKind) -> [f32; 3] {
+pub const fn terrain_kind_base_color(kind: TerrainKind) -> [f32; 3] {
     let index = match kind {
         TerrainKind::DeepWater => 0,
         TerrainKind::ShallowWater => 1,
@@ -430,7 +449,7 @@ pub struct TerrainShadeInput {
 /// `elevation`, `slope`, `accent`, and `daylight` are clamped defensively;
 /// `moisture` likewise.
 #[must_use]
-pub fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
+pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
     let moisture = clamp01(input.moisture);
     let elevation = clamp01(input.elevation);
     let slope = clamp01(input.slope);
@@ -489,7 +508,7 @@ pub const FOOD_DENSE_RGB: [f32; 3] = [0.95, 0.85, 0.30];
 /// canonical food color answer; previously each frontend picked its own
 /// greens (or encoded food only as brightness modifiers).
 #[must_use]
-pub fn food_density_color(density: f32) -> [f32; 3] {
+pub const fn food_density_color(density: f32) -> [f32; 3] {
     let d = clamp01(density);
     if d < 0.5 {
         mix_vec3(FOOD_SPARSE_RGB, FOOD_MID_RGB, d * 2.0)
@@ -855,12 +874,12 @@ pub fn value_noise_2d(seed: u64, x: f32, y: f32) -> f32 {
         let iy = y.floor() as i64;
         let fx = smooth(x - x.floor());
         let fy = smooth(y - y.floor());
-        let a = lattice(seed, ix, iy);
-        let b = lattice(seed, ix + 1, iy);
-        let c = lattice(seed, ix, iy + 1);
-        let d = lattice(seed, ix + 1, iy + 1);
-        let top = a + (b - a) * fx;
-        let bottom = c + (d - c) * fx;
+        let top_left = lattice(seed, ix, iy);
+        let top_right = lattice(seed, ix + 1, iy);
+        let bottom_left = lattice(seed, ix, iy + 1);
+        let bottom_right = lattice(seed, ix + 1, iy + 1);
+        let top = top_left + (top_right - top_left) * fx;
+        let bottom = bottom_left + (bottom_right - bottom_left) * fx;
         top + (bottom - top) * fy
     }
     let base = octave(seed, x, y);

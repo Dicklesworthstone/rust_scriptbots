@@ -48,6 +48,17 @@
 //! dependency and must not acquire one). The graph returns typed reports; the
 //! layer above it does the logging.
 
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::{AgentUid, BirthOrigin, BirthRecord, DeathCause, DeathRecord, Generation, Tick};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -56,7 +67,7 @@ use std::collections::BTreeMap;
 pub const APPROX_BYTES_PER_NODE: usize = 80;
 
 /// One agent's place in the tree.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AncestryNode {
     /// Logical identity. Never reused, unlike a slot handle.
     pub uid: AgentUid,
@@ -189,7 +200,7 @@ pub struct PruneReport {
 }
 
 /// The graph.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AncestryGraph {
     nodes: BTreeMap<AgentUid, AncestryNode>,
 }
