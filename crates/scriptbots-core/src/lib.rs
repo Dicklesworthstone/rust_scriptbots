@@ -3830,6 +3830,37 @@ impl Region {
     }
 }
 
+/// Maximum cohort size a single injection command may carry. The arena grows
+/// dynamically, so this is the documented command-level headroom that keeps one
+/// pathological command from inserting an unbounded population at one boundary — not a
+/// slot limit.
+pub const MAX_COHORT_INJECTION: u32 = 1_024;
+
+/// Where an injected cohort's brains come from.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum CohortSource {
+    /// Bind every cohort member to the brain family registered under this registry key.
+    RegisteredBrain { key: u64 },
+}
+
+/// How cohort positions are sampled without consuming world RNG.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "placement", rename_all = "snake_case")]
+pub enum Placement {
+    /// Uniform sampling inside the region, driven by the carried seed. The seed IS the
+    /// domain: no world RNG stream is consumed, so replay reproduces the cohort exactly.
+    Seeded { region: Region, seed: u64 },
+}
+
+impl Placement {
+    fn region(&self) -> Region {
+        match *self {
+            Self::Seeded { region, .. } => region,
+        }
+    }
+}
+
 /// A deliberate perturbation of the world was rejected as unhonourable.
 #[derive(Debug, Clone, Copy, PartialEq, Error)]
 pub enum InterventionError {
@@ -3845,6 +3876,12 @@ pub enum InterventionError {
         world_width: u32,
         world_height: u32,
     },
+    /// The requested cohort exceeds the documented command-level headroom.
+    #[error("cohort injection of {requested} exceeds the command headroom {headroom}")]
+    PopulationCapExceeded { requested: u32, headroom: u32 },
+    /// No brain family is registered under the requested registry key.
+    #[error("no brain family is registered under key {key}")]
+    UnknownBrainKey { key: u64 },
 }
 
 /// A deliberate perturbation of the world.
@@ -3897,10 +3934,23 @@ pub enum Intervention {
     PaintTerrain {
         /// Where.
         region: Region,
-        /// The terrain kind every covered tile becomes.
+        /// The terrain kind every covered tile becomes. Named `terrain` rather
+        /// than `kind` because the enum's internal serde tag is also `kind`;
+        /// a field with the tag's name is a hard serde conflict (see the
+        /// note on [`Intervention`]'s derive).
         terrain: TerrainKind,
         /// Additive fertility bias applied to the painted cells' recomputed profiles.
         fertility_bias: Option<f32>,
+    },
+    /// Inject a cohort of new agents with a shared brain binding and seed-driven
+    /// placement that consumes no world RNG.
+    InjectCohort {
+        /// How many agents to spawn; validated nonzero and bounded.
+        count: u16,
+        /// Where their brains come from.
+        genome: CohortSource,
+        /// How their positions are sampled.
+        placement: Placement,
     },
     /// Open or close the world to scheduled spawn arrivals from this boundary onward.
     SetClosedWorld {
@@ -3988,6 +4038,24 @@ impl Intervention {
                 }
                 Ok(())
             }
+            Self::InjectCohort {
+                count, placement, ..
+            } => {
+                placement.region().validate_basic()?;
+                if count == 0 {
+                    return Err(WorldStateError::InvalidConfig(
+                        "cohort injection count must be at least 1",
+                    ));
+                }
+                if u32::from(count) > MAX_COHORT_INJECTION {
+                    return Err(InterventionError::PopulationCapExceeded {
+                        requested: u32::from(count),
+                        headroom: MAX_COHORT_INJECTION,
+                    }
+                    .into());
+                }
+                Ok(())
+            }
             Self::SetClosedWorld { .. } => Ok(()),
         }
     }
@@ -4014,6 +4082,9 @@ impl Intervention {
             | Self::PaintTerrain { region, .. } => {
                 region.validate_for_world(world_width, world_height)
             }
+            Self::InjectCohort { placement, .. } => placement
+                .region()
+                .validate_for_world(world_width, world_height),
             Self::SetClosedWorld { .. } => Ok(()),
         }
     }
@@ -4031,8 +4102,13 @@ pub struct ActiveEffect {
 }
 
 /// The effect an [`ActiveEffect`] has on the region while in force.
+///
+/// Serialized externally tagged (no `#[serde(tag)]`): internal tagging cannot
+/// encode the `GrowthScale` newtype variant — postcard fails at runtime with
+/// a custom serde error, which is exactly what broke the digest/checkpoint
+/// effects lanes. Variant names stay snake_case for readable JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "effect", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ActiveEffectKind {
     /// Growth multiplier applied inside the region.
     GrowthScale(f32),
@@ -15881,6 +15957,34 @@ impl WorldState {
         summary
     }
 
+    /// Sample one position uniformly inside a region on the torus. Discs sample uniform
+    /// by area (sqrt of the radial draw); rects sample each wrapped axis independently.
+    fn sample_position_in_region(
+        region: Region,
+        rng: &mut SmallRng,
+        world_width: f32,
+        world_height: f32,
+    ) -> Position {
+        match region {
+            Region::All => Position::new(
+                rng.random::<f32>() * world_width,
+                rng.random::<f32>() * world_height,
+            ),
+            Region::Disc { x, y, radius } => {
+                let angle = rng.random::<f32>() * std::f32::consts::TAU;
+                let distance = radius * rng.random::<f32>().sqrt();
+                Position::new(
+                    (x + distance * angle.cos()).rem_euclid(world_width),
+                    (y + distance * angle.sin()).rem_euclid(world_height),
+                )
+            }
+            Region::Rect { x, y, w, h } => Position::new(
+                (x + rng.random::<f32>() * w).rem_euclid(world_width),
+                (y + rng.random::<f32>() * h).rem_euclid(world_height),
+            ),
+        }
+    }
+
     /// Queue a deliberate perturbation of the world.
     ///
     /// The intervention is applied at the top of the next tick, inside the
@@ -15902,6 +16006,14 @@ impl WorldState {
     ) -> Result<(), WorldStateError> {
         self.ensure_scientific_mutation_allowed("interventions")?;
         intervention.validate_for_world(self.config.world_width, self.config.world_height)?;
+        if let Intervention::InjectCohort {
+            genome: CohortSource::RegisteredBrain { key },
+            ..
+        } = intervention
+            && self.brain_registry.family(key).is_none()
+        {
+            return Err(InterventionError::UnknownBrainKey { key }.into());
+        }
         self.pending_interventions.push(intervention);
         Ok(())
     }
@@ -15928,6 +16040,13 @@ impl WorldState {
         let world_height = self.config.world_height as f32;
         let cell_size = self.config.food_cell_size as f32;
 
+        // Age only effects that existed BEFORE this tick's queue landed, so
+        // an effect that arrives with N ticks to live is consumed on exactly
+        // N ticks: ageing a freshly-queued effect in its arrival tick would
+        // burn its first tick of life before any stage consumed it (the
+        // 2-tick embargo that suppressed intake for exactly one tick).
+        // Ageing before queue application would instead grant N+1 ticks.
+        let pre_existing_effects = self.active_effects.len();
         for intervention in queued {
             match intervention {
                 Intervention::Drought {
@@ -16036,15 +16155,54 @@ impl WorldState {
                 Intervention::SetClosedWorld { closed } => {
                     self.config.closed = closed;
                 }
+                Intervention::InjectCohort {
+                    count,
+                    genome,
+                    placement,
+                } => {
+                    let CohortSource::RegisteredBrain { key } = genome;
+                    let Placement::Seeded { region, seed } = placement;
+                    let mut rng = SmallRng::seed_from_u64(seed);
+                    let mut spawned: Vec<AgentId> = Vec::with_capacity(usize::from(count));
+                    let mut breach_count = 0_u32;
+                    for _ in 0..count {
+                        let position = Self::sample_position_in_region(
+                            region,
+                            &mut rng,
+                            world_width,
+                            world_height,
+                        );
+                        // Validated at enqueue, so these cannot fail for any validation
+                        // reason; an internal invariant breach is counted, never panicked
+                        // over, and leaves the already-spawned members intact rather than
+                        // fabricating a rollback through a test-only removal path.
+                        match self.try_spawn_agent(AgentData {
+                            position,
+                            ..AgentData::default()
+                        }) {
+                            Ok(id) => spawned.push(id),
+                            Err(_) => {
+                                breach_count += 1;
+                            }
+                        }
+                    }
+                    for id in spawned {
+                        if self.bind_agent_brain(id, key).is_err() {
+                            breach_count += 1;
+                        }
+                    }
+                    if breach_count > 0 {
+                        tracing::warn!(
+                            breach_count,
+                            key,
+                            "cohort injection hit an internal breach after enqueue validation"
+                        );
+                    }
+                }
             }
         }
 
-        // Age timed effects AFTER applying this tick's queue, so an effect that
-        // lands with N ticks to live is in force for exactly N ticks. Ageing
-        // first would give a freshly-queued N-tick drought N+1 ticks of life —
-        // an off-by-one that a caller could never see, and that would quietly
-        // corrupt every duration in every study.
-        for effect in &mut self.active_effects {
+        for effect in self.active_effects[..pre_existing_effects].iter_mut() {
             effect.ticks_remaining = effect.ticks_remaining.saturating_sub(1);
         }
         self.active_effects
@@ -25728,6 +25886,187 @@ mod tests {
             .expect("valid reopen");
         world.step().expect("step");
         assert!(!world.config().closed, "reopened after the next boundary");
+    }
+
+    #[test]
+    fn an_injected_cohort_lands_seeded_positions_with_the_bound_brain() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(23),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let key = world
+            .register_brain_family(
+                "cohort-fixture".to_owned(),
+                Box::new(FixtureBrainFamily::new("cohort-fixture")),
+            )
+            .expect("register cohort fixture family");
+
+        let region = Region::Disc {
+            x: 100.0,
+            y: 100.0,
+            radius: 20.0,
+        };
+        world
+            .enqueue_intervention(Intervention::InjectCohort {
+                count: 5,
+                genome: CohortSource::RegisteredBrain { key },
+                placement: Placement::Seeded {
+                    region,
+                    seed: 0xC0FFEE,
+                },
+            })
+            .expect("valid cohort injection");
+        let before = world.agent_count();
+        world.step().expect("step");
+
+        assert_eq!(
+            world.agent_count(),
+            before + 5,
+            "exactly the cohort lands at the boundary"
+        );
+        let world_width = 200.0_f32;
+        let world_height = 200.0_f32;
+        let mut bound = 0_usize;
+        for id in world.agents().iter_handles() {
+            let idx = world.agents().index_of(id).expect("alive");
+            let position = world.agents().columns().positions()[idx];
+            assert!(
+                region.contains(position.x, position.y, world_width, world_height),
+                "cohort member at ({}, {}) must land inside the placement region",
+                position.x,
+                position.y
+            );
+            let bound_key = match &world.agent_runtime(id).expect("runtime").brain {
+                BrainBinding::Protocol { registry_key, .. } => Some(*registry_key),
+                BrainBinding::Legacy { registry_key, .. } => *registry_key,
+                BrainBinding::Unbound => None,
+            };
+            if bound_key == Some(key) {
+                bound += 1;
+            }
+        }
+        assert_eq!(bound, 5, "every cohort member carries the bound brain key");
+    }
+
+    #[test]
+    fn an_injected_cohort_reproduces_positions_from_the_carried_seed() {
+        let spawn_positions = || {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                food_cell_size: 20,
+                rng_seed: Some(29),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("world");
+            let key = world
+                .register_brain_family(
+                    "cohort-fixture".to_owned(),
+                    Box::new(FixtureBrainFamily::new("cohort-fixture")),
+                )
+                .expect("register cohort fixture family");
+            world
+                .enqueue_intervention(Intervention::InjectCohort {
+                    count: 4,
+                    genome: CohortSource::RegisteredBrain { key },
+                    placement: Placement::Seeded {
+                        region: Region::Rect {
+                            x: 190.0,
+                            y: 190.0,
+                            w: 20.0,
+                            h: 20.0,
+                        },
+                        seed: 0xBEEF,
+                    },
+                })
+                .expect("valid cohort injection");
+            world.step().expect("step");
+            let mut positions: Vec<(f32, f32)> = world
+                .agents()
+                .iter_handles()
+                .map(|id| {
+                    let idx = world.agents().index_of(id).expect("alive");
+                    let position = world.agents().columns().positions()[idx];
+                    (position.x, position.y)
+                })
+                .collect();
+            positions.sort_by(|a, b| a.partial_cmp(b).expect("finite positions"));
+            positions
+        };
+        assert_eq!(
+            spawn_positions(),
+            spawn_positions(),
+            "the carried seed must reproduce the exact cohort positions across worlds"
+        );
+    }
+
+    #[test]
+    fn cohort_injection_validates_count_and_brain_key() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let zero = world
+            .enqueue_intervention(Intervention::InjectCohort {
+                count: 0,
+                genome: CohortSource::RegisteredBrain { key: 0 },
+                placement: Placement::Seeded {
+                    region: Region::All,
+                    seed: 1,
+                },
+            })
+            .expect_err("a zero cohort must be rejected");
+        assert!(
+            matches!(zero, WorldStateError::InvalidConfig(_)),
+            "expected InvalidConfig for a zero cohort, got {zero}"
+        );
+
+        let oversized = world
+            .enqueue_intervention(Intervention::InjectCohort {
+                count: u16::MAX,
+                genome: CohortSource::RegisteredBrain { key: 0 },
+                placement: Placement::Seeded {
+                    region: Region::All,
+                    seed: 1,
+                },
+            })
+            .expect_err("an over-headroom cohort must be rejected");
+        assert!(
+            matches!(
+                oversized,
+                WorldStateError::Intervention(InterventionError::PopulationCapExceeded {
+                    requested,
+                    headroom
+                }) if requested == u32::from(u16::MAX) && headroom == MAX_COHORT_INJECTION
+            ),
+            "expected typed PopulationCapExceeded, got {oversized}"
+        );
+
+        let unknown = world
+            .enqueue_intervention(Intervention::InjectCohort {
+                count: 2,
+                genome: CohortSource::RegisteredBrain { key: 9_999 },
+                placement: Placement::Seeded {
+                    region: Region::All,
+                    seed: 1,
+                },
+            })
+            .expect_err("an unregistered brain key must be rejected");
+        assert!(
+            matches!(
+                unknown,
+                WorldStateError::Intervention(InterventionError::UnknownBrainKey { key })
+                    if key == 9_999
+            ),
+            "expected typed UnknownBrainKey, got {unknown}"
+        );
     }
 
     #[test]
