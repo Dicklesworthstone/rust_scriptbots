@@ -10,8 +10,8 @@ use scriptbots_app::tournament::{
 use scriptbots_brain::BrainKind;
 use scriptbots_core::ScriptBotsConfig;
 
-const MLP_A: BrainKind = BrainKind::new("mlp.a");
-const MLP_B: BrainKind = BrainKind::new("mlp.b");
+const MLP_A: BrainKind = BrainKind::new("mlp-a");
+const MLP_B: BrainKind = BrainKind::new("mlp-b");
 const DWRAON: BrainKind = BrainKind::new("dwraon.baseline");
 
 fn small_world() -> ScriptBotsConfig {

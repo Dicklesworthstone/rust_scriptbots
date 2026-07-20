@@ -495,7 +495,7 @@ mod tests {
 pub mod execution {
     use super::{FamilyOutcome, MatchOutcome, MatchPlan, TournamentError};
     use scriptbots_brain::BrainKind;
-    use scriptbots_core::{AgentData, BrainBinding, ScriptBotsConfig, WorldState};
+    use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
     use std::collections::BTreeMap;
 
     /// A completed match: the outcome plus the config digest it ran under, so every arm
@@ -506,196 +506,88 @@ pub mod execution {
         pub config_digest: String,
     }
 
-    /// A brain-family adapter wrapper that re-registers an identical executable under a
-    /// second family identity. The null tournament's bias probe depends on it: the
-    /// registry refuses duplicate `family_id`s by design, so entering one adapter under
-    /// two names ("mlp.a", "mlp.b") requires each registration to carry its own identity
-    /// while the executable bytes, genome codecs, and offspring policy stay exactly the
-    /// adapter's.
-    struct RenamedFamilyAdapter {
-        inner: Box<dyn scriptbots_core::BrainFamilyAdapter>,
-        family_id: scriptbots_core::BrainFamilyId,
-    }
-
-    impl scriptbots_core::BrainFamilyCodec for RenamedFamilyAdapter {
-        fn family_id(&self) -> &scriptbots_core::BrainFamilyId {
-            &self.family_id
-        }
-
-        fn adapter_identity(&self) -> scriptbots_core::BrainAdapterIdentityV1 {
-            // The executable identity stays the inner adapter's: both arms ARE the same
-            // brain, and the attestation must be able to prove that.
-            self.inner.adapter_identity()
-        }
-
-        fn validate_genome(
-            &self,
-            genome: &scriptbots_core::BrainGenomeEnvelope,
-        ) -> Result<(), scriptbots_core::BrainProtocolError> {
-            self.inner.validate_genome(genome)
-        }
-
-        fn offspring_state_policy(&self) -> scriptbots_core::OffspringStatePolicy {
-            self.inner.offspring_state_policy()
-        }
-
-        fn random_genome_material(
-            &self,
-            rng: &mut dyn scriptbots_core::RandomStream,
-        ) -> Result<scriptbots_core::BrainGenomeMaterial, scriptbots_core::BrainProtocolError>
-        {
-            self.inner.random_genome_material(rng)
-        }
-
-        fn validate_evaluator_state(
-            &self,
-            state: &scriptbots_core::BrainEvaluatorStateEnvelope,
-        ) -> Result<(), scriptbots_core::BrainProtocolError> {
-            self.inner.validate_evaluator_state(state)
-        }
-
-        fn mutate_genome_material(
-            &self,
-            genome: &scriptbots_core::BrainGenomeEnvelope,
-            rates: scriptbots_core::MutationRates,
-            rng: &mut dyn scriptbots_core::RandomStream,
-        ) -> Result<scriptbots_core::BrainGenomeMaterial, scriptbots_core::BrainProtocolError>
-        {
-            self.inner.mutate_genome_material(genome, rates, rng)
-        }
-
-        fn crossover_genomes_material(
-            &self,
-            left: &scriptbots_core::BrainGenomeEnvelope,
-            right: &scriptbots_core::BrainGenomeEnvelope,
-            rng: &mut dyn scriptbots_core::RandomStream,
-        ) -> Result<scriptbots_core::BrainGenomeMaterial, scriptbots_core::BrainProtocolError>
-        {
-            self.inner.crossover_genomes_material(left, right, rng)
-        }
-
-        fn initial_state(
-            &self,
-            genome: &scriptbots_core::BrainGenomeEnvelope,
-            rng: &mut dyn scriptbots_core::RandomStream,
-        ) -> Result<scriptbots_core::BrainEvaluatorStateEnvelope, scriptbots_core::BrainProtocolError>
-        {
-            self.inner.initial_state(genome, rng)
-        }
-
-        fn offspring_state(
-            &self,
-            child: &scriptbots_core::BrainGenomeEnvelope,
-            parents: &[&scriptbots_core::BrainEvaluatorStateEnvelope],
-            rng: &mut dyn scriptbots_core::RandomStream,
-        ) -> Result<scriptbots_core::BrainEvaluatorStateEnvelope, scriptbots_core::BrainProtocolError>
-        {
-            self.inner.offspring_state(child, parents, rng)
-        }
-
-        fn evaluator(
-            &self,
-            genome: &scriptbots_core::BrainGenomeEnvelope,
-            state: &scriptbots_core::BrainEvaluatorStateEnvelope,
-        ) -> Result<Box<dyn scriptbots_core::BrainEvaluator>, scriptbots_core::BrainProtocolError>
-        {
-            self.inner.evaluator(genome, state)
-        }
-    }
-
-    // NOTE: no explicit `impl BrainFamilyAdapter` — scriptbots-core's
-    // blanket `impl<T: BrainFamilyCodec + ?Sized> BrainFamilyAdapter for T`
-    // covers the adapter half; an empty manual impl now conflicts (E0119).
-
-    /// Wrap an adapter under a custom family identity, or return it directly when the
-    /// name already matches the adapter's canonical one.
-    fn adapter_for(
-        canonical_kind: &'static str,
-        name: &str,
-        make: impl FnOnce() -> Result<Box<dyn scriptbots_core::BrainFamilyAdapter>, TournamentError>,
-    ) -> Result<Box<dyn scriptbots_core::BrainFamilyAdapter>, TournamentError> {
-        if name == canonical_kind {
-            return make();
-        }
-        let family_id = scriptbots_core::BrainFamilyId::new(name).map_err(|error| {
-            TournamentError::UnbalancedOrders {
-                reason: format!("family name {name:?} is not a valid family id: {error}"),
-            }
-        })?;
-        Ok(Box::new(RenamedFamilyAdapter {
-            inner: make()?,
-            family_id,
-        }))
-    }
-
-    /// Register exactly the families the spec entered. Unknown family names are a typed
-    /// error, never a silent substitution.
+    /// Register exactly the canonical adapters the spec's families need, deduplicated:
+    /// two arm names resolving to one adapter produce ONE registry entry, because the
+    /// registry refuses duplicate adapter identities by design. Arm attribution for the
+    /// null tournament flows through founder slots and lineage, never through a second
+    /// registration that would collide with that rule.
     fn register_entered_families(
         world: &mut WorldState,
         families: &[BrainKind],
     ) -> Result<BTreeMap<BrainKind, u64>, TournamentError> {
         let mut keys = BTreeMap::new();
+        let mut registered: BTreeMap<String, u64> = BTreeMap::new();
         for family in families {
             let name = family.as_str();
-            // Exact built-in names, or any name with the family's dotted prefix — the
-            // null-tournament bias probe needs one adapter under two names ("mlp.a",
-            // "mlp.b") to prove the harness itself adds no signal.
-            let resolves = |prefix: &str| name == prefix || name.starts_with(&format!("{prefix}."));
-            let key = if resolves("mlp") {
-                world.register_brain_family(
-                    name,
-                    adapter_for(
-                        scriptbots_brain::mlp::MlpBrain::KIND.as_str(),
-                        name,
-                        || {
-                            Ok(Box::new(scriptbots_brain::mlp::MlpBrainFamily::new())
-                                as Box<dyn scriptbots_core::BrainFamilyAdapter>)
-                        },
-                    )?,
-                )
-            } else if resolves("dwraon") {
-                world.register_brain_family(
-                    name,
-                    adapter_for(
-                        scriptbots_brain::dwraon::DwraonBrain::KIND.as_str(),
-                        name,
-                        || {
-                            Ok(Box::new(scriptbots_brain::dwraon::DwraonFamilyAdapter::default())
-                                as Box<dyn scriptbots_core::BrainFamilyAdapter>)
-                        },
-                    )?,
-                )
-            } else if resolves("assembly") {
-                world.register_brain_family(
-                    name,
-                    adapter_for(
-                        scriptbots_brain::assembly::AssemblyBrain::KIND.as_str(),
-                        name,
-                        || {
-                            Ok(
-                                Box::new(
-                                    scriptbots_brain::assembly::AssemblyFamilyAdapter::new()
-                                        .map_err(|error| TournamentError::UnbalancedOrders {
-                                            reason: format!("assembly adapter construction: {error}"),
-                                        })?,
-                                ) as Box<dyn scriptbots_core::BrainFamilyAdapter>,
-                            )
-                        },
-                    )?,
-                )
-            } else {
-                return Err(TournamentError::UnbalancedOrders {
-                    reason: format!(
-                        "no built-in adapter for entered family {name:?}; enter one of mlp.baseline, dwraon.baseline, assembly.experimental"
-                    ),
-                });
-            }
-            .map_err(|error| TournamentError::UnbalancedOrders {
-                reason: format!("registering family {name:?} failed: {error}"),
-            })?;
+            let canonical = canonical_kind_of(name);
+            let key = match registered.get(canonical.as_str()) {
+                Some(key) => *key,
+                None => {
+                    let adapter = adapter_for(name)?;
+                    let key = world
+                        .register_brain_family(canonical.clone(), adapter)
+                        .map_err(|error| TournamentError::UnbalancedOrders {
+                            reason: format!(
+                                "registering adapter {canonical} for {name:?} failed: {error}"
+                            ),
+                        })?;
+                    registered.insert(canonical.clone(), key);
+                    key
+                }
+            };
             keys.insert(*family, key);
         }
         Ok(keys)
+    }
+
+    /// Resolve an entered family name to its canonical adapter constructor. Exact
+    /// built-in names, or any name with the family's dotted/dashed prefix ("mlp-a",
+    /// "mlp.baseline", ...) resolve to the same adapter.
+    fn adapter_for(
+        name: &str,
+    ) -> Result<Box<dyn scriptbots_core::BrainFamilyAdapter>, TournamentError> {
+        if name == "mlp" || name.starts_with("mlp.") || name.starts_with("mlp-") {
+            return Ok(Box::new(scriptbots_brain::mlp::MlpBrainFamily::new()));
+        }
+        if name == "dwraon" || name.starts_with("dwraon.") || name.starts_with("dwraon-") {
+            return Ok(Box::new(
+                scriptbots_brain::dwraon::DwraonFamilyAdapter::default(),
+            ));
+        }
+        if name == "assembly" || name.starts_with("assembly.") || name.starts_with("assembly-") {
+            let adapter =
+                scriptbots_brain::assembly::AssemblyFamilyAdapter::new().map_err(|error| {
+                    TournamentError::UnbalancedOrders {
+                        reason: format!("assembly adapter construction: {error}"),
+                    }
+                })?;
+            return Ok(Box::new(adapter));
+        }
+        Err(TournamentError::UnbalancedOrders {
+            reason: format!(
+                "no built-in adapter for entered family {name:?}; enter one of mlp.baseline, dwraon.baseline, assembly.experimental"
+            ),
+        })
+    }
+
+    /// The canonical registry kind an entered family name resolves to.
+    fn canonical_kind_of(name: &str) -> String {
+        if name == "mlp" || name.starts_with("mlp.") || name.starts_with("mlp-") {
+            scriptbots_brain::mlp::MlpBrain::KIND.as_str().to_owned()
+        } else if name == "dwraon" || name.starts_with("dwraon.") || name.starts_with("dwraon-") {
+            scriptbots_brain::dwraon::DwraonBrain::KIND
+                .as_str()
+                .to_owned()
+        } else if name == "assembly"
+            || name.starts_with("assembly.")
+            || name.starts_with("assembly-")
+        {
+            scriptbots_brain::assembly::AssemblyBrain::KIND
+                .as_str()
+                .to_owned()
+        } else {
+            name.to_owned()
+        }
     }
 
     /// Deterministic cohort placement: spawn-order slot index drives the grid, so the
@@ -721,21 +613,43 @@ pub mod execution {
             .collect()
     }
 
-    fn live_family_counts(
+    /// Inherit arms into newly arrived agents while their parents are still alive. The
+    /// reproduction stage runs after death cleanup, so a newborn's parent is always
+    /// alive at step end: every child is registered while its parent's arm is known,
+    /// which keeps the map complete even after founders die.
+    fn register_offspring_arms(
         world: &WorldState,
-        family_keys: &BTreeMap<u64, BrainKind>,
-    ) -> BTreeMap<BrainKind, usize> {
-        let mut counts = BTreeMap::new();
+        arm_by_uid: &mut std::collections::HashMap<scriptbots_core::AgentUid, BrainKind>,
+    ) {
         for id in world.agents().iter_handles() {
+            let Some(uid) = world.agent_uid(id) else {
+                continue;
+            };
+            if arm_by_uid.contains_key(&uid) {
+                continue;
+            }
             let Some(runtime) = world.agent_runtime(id) else {
                 continue;
             };
-            let key = match &runtime.brain {
-                BrainBinding::Protocol { registry_key, .. } => Some(*registry_key),
-                BrainBinding::Legacy { registry_key, .. } => *registry_key,
-                BrainBinding::Unbound => None,
+            let parent_uid = runtime.lineage[0].or(runtime.lineage[1]);
+            let Some(arm) = parent_uid.and_then(|parent| arm_by_uid.get(&parent)) else {
+                continue;
             };
-            if let Some(family) = key.and_then(|key| family_keys.get(&key)) {
+            arm_by_uid.insert(uid, *arm);
+        }
+    }
+
+    /// Live agents per arm from the founder/lineage map.
+    fn arm_counts(
+        world: &WorldState,
+        arm_by_uid: &std::collections::HashMap<scriptbots_core::AgentUid, BrainKind>,
+    ) -> BTreeMap<BrainKind, usize> {
+        let mut counts = BTreeMap::new();
+        for id in world.agents().iter_handles() {
+            let Some(uid) = world.agent_uid(id) else {
+                continue;
+            };
+            if let Some(family) = arm_by_uid.get(&uid) {
                 *counts.entry(*family).or_insert(0) += 1;
             }
         }
@@ -774,19 +688,12 @@ pub mod execution {
                 reason: format!("match world construction failed: {error}"),
             })?;
 
-        let mut family_keys: BTreeMap<BrainKind, u64> = BTreeMap::new();
-        for family in plan.spawn_order.iter() {
-            family_keys.extend(register_entered_families(
-                &mut world,
-                std::slice::from_ref(family),
-            )?);
-        }
-        let key_to_family: BTreeMap<u64, BrainKind> = family_keys
-            .iter()
-            .map(|(family, key)| (*key, *family))
-            .collect();
+        let mut family_keys = register_entered_families(&mut world, &plan.spawn_order)?;
 
-        // Spawn the cohort in spawn order on a deterministic grid.
+        // Spawn the cohort in spawn order on a deterministic grid, recording each
+        // founder's arm by stable uid; every later agent inherits its arm through its
+        // primary parent's lineage link, so arm attribution never depends on brain
+        // bindings (which the null tournament deliberately shares).
         let cohort_total: usize = plan.cohort.values().sum();
         let positions = cohort_grid_positions(
             cohort_total,
@@ -794,6 +701,8 @@ pub mod execution {
             world.config().world_height as f32,
         );
         let mut slot = 0_usize;
+        let mut arm_by_uid: std::collections::HashMap<scriptbots_core::AgentUid, BrainKind> =
+            std::collections::HashMap::new();
         for family in &plan.spawn_order {
             let key = family_keys[family];
             let members = plan.cohort[family];
@@ -817,6 +726,10 @@ pub mod execution {
                         reason: format!("brain bind returned false for family {}", family.as_str()),
                     });
                 }
+                let uid = world
+                    .agent_uid(id)
+                    .expect("a just-spawned agent has a stable uid");
+                arm_by_uid.insert(uid, *family);
             }
         }
 
@@ -829,7 +742,8 @@ pub mod execution {
                     reason: format!("match step {tick} failed: {error}"),
                 })?;
             ticks_run = tick;
-            let counts = live_family_counts(&world, &key_to_family);
+            register_offspring_arms(&world, &mut arm_by_uid);
+            let counts = arm_counts(&world, &arm_by_uid);
             for family in &plan.spawn_order {
                 if counts.get(family).copied().unwrap_or(0) == 0 {
                     extinct_at.entry(*family).or_insert(tick);
@@ -852,12 +766,10 @@ pub mod execution {
             let Some(runtime) = world.agent_runtime(id) else {
                 continue;
             };
-            let key = match &runtime.brain {
-                BrainBinding::Protocol { registry_key, .. } => Some(*registry_key),
-                BrainBinding::Legacy { registry_key, .. } => *registry_key,
-                BrainBinding::Unbound => None,
+            let Some(uid) = world.agent_uid(id) else {
+                continue;
             };
-            let Some(family) = key.and_then(|key| key_to_family.get(&key)) else {
+            let Some(family) = arm_by_uid.get(&uid) else {
                 continue;
             };
             total_live += 1;
