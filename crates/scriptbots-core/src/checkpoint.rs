@@ -34,7 +34,8 @@ use crate::{
     BrainGenomeEnvelope, BrainProtocolError, BrainRegistry, BrainRegistryDigestEntryV1,
     BrainRunner, CharacterizationError, CombatEventFlags, FoodCellProfile, FoodGrid, Generation,
     HydrologyField, HydrologyFlowDirection, HydrologyState, HydrologyTile, HydrologyTileLayer,
-    INPUT_SIZE, IndicatorState, MapArtifactMetadata, MapGeneratorKind, MutationRates, NUM_EYES,
+    INPUT_SIZE, IndicatorState, Intervention, MAX_NEUROFLOW_HIDDEN_LAYERS,
+    MAX_NEUROFLOW_LAYER_NEURONS, MapArtifactMetadata, MapGeneratorKind, MutationRates, NUM_EYES,
     OUTPUT_SIZE, PersistenceBoundaryStatus, Position, Region, RngDomainDigestV1,
     RngDomainDigestsV1, ScientificStateError, ScriptBotsConfig, SelectionState, TerrainLayer,
     TerrainTile, Tick, TickCadence, TraitModifiers, WorldDigestV1, WorldDigestV1ContractError,
@@ -2575,6 +2576,9 @@ mod tests {
         boxed_fixture_brain_family, boxed_fixture_brain_family_with_behavior_probe,
     };
     use crate::{BrainGenomeDerivation, LocomotionModel};
+    use crate::{
+        Intervention, MAX_NEUROFLOW_HIDDEN_LAYERS, MAX_NEUROFLOW_LAYER_NEURONS, RenderSettings,
+    };
     use rand::RngCore;
     use std::sync::{
         Arc,
