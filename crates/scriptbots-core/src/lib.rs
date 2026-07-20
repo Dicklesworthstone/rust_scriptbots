@@ -26346,11 +26346,15 @@ mod tests {
         let agent = world.spawn_agent(sample_agent(0));
         {
             let runtime = world.agent_runtime_mut(agent).expect("legacy runtime");
+            // Cloning a Legacy binding intentionally DROPS the runner (the manual
+            // Clone impl is the missing-runner fixture mechanism) — this clone is
+            // semantic, not redundant; do not remove it.
             runtime.brain = BrainBinding::Legacy {
                 runner: Some(Box::new(StubBrain)),
                 registry_key: Some(41),
                 kind: "stub".to_owned(),
-            };
+            }
+            .clone();
             runtime.energy = 1.0;
             runtime.reproduction_counter = 1.0;
             runtime.outputs = [0.75; OUTPUT_SIZE];
@@ -31915,7 +31919,9 @@ mod tests {
         world
             .agent_runtime_mut(missing_legacy)
             .expect("missing legacy runtime")
-            .brain = BrainBinding::with_runner(Box::new(StubBrain));
+            // Cloning a Legacy binding intentionally DROPS the runner (the manual
+            // Clone impl is the missing-runner fixture mechanism) — semantic, not redundant.
+            .brain = BrainBinding::with_runner(Box::new(StubBrain)).clone();
 
         let error = world
             .stage_brains()
