@@ -4795,6 +4795,50 @@ impl ResourceFlowKind {
             Self::CapacityRejection => 16,
         }
     }
+
+    /// The accounting class of this flow (bd-16g.11.1). The labels are
+    /// LOAD-BEARING: an external input (sunlight regrowth, manufactured carcass
+    /// rewards, spawn endowment, interventions) explains stock growth with no
+    /// matching debit; mislabeling one as an internal transfer is what lets a
+    /// real leak hide inside it. This table is the single place the
+    /// classification lives, and the pin test makes every reclassification
+    /// show up in a diff.
+    #[must_use]
+    pub const fn flow_class(self) -> FlowClass {
+        match self {
+            Self::ScenarioIntervention
+            | Self::FoodDynamics
+            | Self::CarcassReward
+            | Self::PopulationInjection => FlowClass::ExternalInput,
+            Self::GroundFoodConversion | Self::EnergySharing | Self::ReproductionAllocation => {
+                FlowClass::InternalTransfer
+            }
+            Self::Aging
+            | Self::BasalMetabolism
+            | Self::Movement
+            | Self::MetabolismRamp
+            | Self::Boost
+            | Self::Topography
+            | Self::TemperatureStress
+            | Self::Combat
+            | Self::DeathRemoval
+            | Self::CapacityRejection => FlowClass::Sink,
+        }
+    }
+}
+
+/// The accounting class of a [`ResourceFlowKind`] (bd-16g.11.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowClass {
+    /// Value entering the books from outside: sunlight regrowth, food respawn,
+    /// manufactured carcass rewards, spawn endowment, deliberate interventions.
+    ExternalInput,
+    /// Value moved between books inside the world: grazing conversion, the
+    /// strictly conserved give/receive, parent-to-child allocation.
+    InternalTransfer,
+    /// Value leaving the books: drains, combat, death residue, cap rejection.
+    Sink,
 }
 
 const RESOURCE_FLOW_KINDS: [ResourceFlowKind; 17] = [
@@ -4992,6 +5036,31 @@ impl ResourceLedgerState {
             flows: working.flows,
             reconciliation,
         });
+        // bd-16g.11.1 logging contract: an economy regression must announce
+        // itself, name the book it broke, and name its prime suspect — in
+        // release builds too, where the StockGuard below is compiled out.
+        if !reconciliation.reconciled {
+            let unexplained = reconciliation.unexplained_delta;
+            let (worst_stock, worst_value) = [
+                ("grid_food", unexplained.food),
+                ("agent_energy", unexplained.energy),
+                ("agent_health", unexplained.health),
+            ]
+            .into_iter()
+            .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+            .expect("three stocks");
+            tracing::warn!(
+                target: "scriptbots::economy",
+                tick = working.tick.0,
+                stock = worst_stock,
+                residual = worst_value,
+                tolerance = reconciliation.tolerance,
+                unexplained_food = unexplained.food,
+                unexplained_energy = unexplained.energy,
+                unexplained_health = unexplained.health,
+                "resource books failed to reconcile"
+            );
+        }
         // bd-16g.11.1 StockGuard: the books are recomputed directly from the
         // world at every tick boundary, so a mutation site with no posting is
         // IMPOSSIBLE to add silently in a debug build — the guard fails on the
@@ -10702,6 +10771,10 @@ pub struct ScriptBotsConfig {
     /// Maximum number of narrative events retained in-memory.
     #[serde(default = "default_narrative_capacity")]
     pub narrative_capacity: usize,
+    /// Emit the per-tick resource-ledger residual row at debug level
+    /// (bd-16g.11.1). Off by default: at 10k agents it is one line per tick.
+    #[serde(default)]
+    pub economy_debug_per_tick: bool,
     /// Interval (ticks) between persistence flushes. 0 disables persistence.
     pub persistence_interval: u32,
     /// Maximum replay events recorded per tick; `0` disables production replay emission.
@@ -10817,6 +10890,7 @@ impl Default for ScriptBotsConfig {
             history_capacity: 256,
             narrative_interval: default_narrative_interval(),
             narrative_capacity: default_narrative_capacity(),
+            economy_debug_per_tick: false,
             persistence_interval: 0,
             replay_event_tick_cap: 0,
             analytics_stride: AnalyticsStride::default(),
@@ -21145,6 +21219,19 @@ impl WorldState {
             if self.resource_ledger.enabled {
                 let closing = self.resource_amounts();
                 self.resource_ledger.finish_tick(closing);
+                if self.config.economy_debug_per_tick
+                    && let Some(latest) = &self.resource_ledger.report.latest
+                {
+                    tracing::debug!(
+                        target: "scriptbots::economy",
+                        tick = latest.tick.0,
+                        residual_food = latest.reconciliation.unexplained_delta.food,
+                        residual_energy = latest.reconciliation.unexplained_delta.energy,
+                        residual_health = latest.reconciliation.unexplained_delta.health,
+                        tolerance = latest.reconciliation.tolerance,
+                        "per-tick residual row"
+                    );
+                }
             }
             self.advance_tick();
             events.tick = self.tick;
@@ -38414,6 +38501,219 @@ mod tests {
 
         fn state_digest(&self) -> Option<u64> {
             Some(0x4c45_4447_4552_5f49)
+        }
+    }
+
+    #[test]
+    fn flow_class_labels_are_pinned_and_load_bearing() {
+        // bd-16g.11.1 NEGATIVE 2 (adapted to the landed type system): the
+        // external/internal/sink labels are what stops sunlight regrowth from
+        // looking like a conservation violation — or a real leak hiding inside
+        // it. The reconciliation math is label-agnostic, so the label's teeth
+        // are this table: every reclassification shows up here in a diff.
+        use ResourceFlowKind as K;
+        let expected = [
+            (K::ScenarioIntervention, FlowClass::ExternalInput),
+            (K::FoodDynamics, FlowClass::ExternalInput),
+            (K::Aging, FlowClass::Sink),
+            (K::BasalMetabolism, FlowClass::Sink),
+            (K::Movement, FlowClass::Sink),
+            (K::MetabolismRamp, FlowClass::Sink),
+            (K::Boost, FlowClass::Sink),
+            (K::Topography, FlowClass::Sink),
+            (K::TemperatureStress, FlowClass::Sink),
+            (K::GroundFoodConversion, FlowClass::InternalTransfer),
+            (K::EnergySharing, FlowClass::InternalTransfer),
+            (K::Combat, FlowClass::Sink),
+            (K::CarcassReward, FlowClass::ExternalInput),
+            (K::DeathRemoval, FlowClass::Sink),
+            (K::ReproductionAllocation, FlowClass::InternalTransfer),
+            (K::PopulationInjection, FlowClass::ExternalInput),
+            (K::CapacityRejection, FlowClass::Sink),
+        ];
+        assert_eq!(expected.len(), RESOURCE_FLOW_KINDS.len());
+        for (index, kind) in RESOURCE_FLOW_KINDS.into_iter().enumerate() {
+            assert_eq!(kind, expected[index].0, "kind table order changed");
+            assert_eq!(
+                kind.flow_class(),
+                expected[index].1,
+                "{kind:?} reclassified — the external/internal/sink labels are load-bearing"
+            );
+        }
+        // The specific mislabel the bead calls out: sunlight regrowth must read
+        // as an EXTERNAL input, never an internal transfer.
+        assert_eq!(K::FoodDynamics.flow_class(), FlowClass::ExternalInput);
+    }
+
+    #[test]
+    fn a_cap_spill_tick_posts_the_spill_as_capacity_rejection_activity() {
+        // bd-16g.11.1 fixture (b): an agent at energy 1.99 eating a 0.5 gain is
+        // credited exactly 0.01; the 0.49 the cap destroys is measured as
+        // CapacityRejection ACTIVITY (the delta stays reconciliation-clean —
+        // the clamp already shaped the credited stock), and the books balance.
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.9,
+            food_max: 1.0,
+            food_intake_rate: 1.0,
+            food_waste_rate: 0.0,
+            food_transfer_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            reproduction_energy_threshold: 0.0,
+            rng_seed: Some(0xCA9_5A11),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let agent = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(100.0, 100.0),
+                ..AgentData::default()
+            })
+            .expect("spawn eater");
+        world
+            .try_update_agent_runtime(agent, |runtime| {
+                runtime.energy = 1.99;
+                runtime.herbivore_tendency = 1.0;
+            })
+            .expect("near-full energy");
+        world.set_resource_ledger_enabled(true);
+        world.step().expect("cap-spill tick");
+
+        let latest = world
+            .resource_ledger()
+            .latest
+            .clone()
+            .expect("ledger recorded the tick");
+        assert!(
+            latest.reconciliation.reconciled,
+            "cap-spill ticks must reconcile: {:?}",
+            latest.reconciliation
+        );
+        let rejection = &latest.flows[ResourceFlowKind::CapacityRejection.index()];
+        assert!(
+            rejection.activity.energy > 0.4,
+            "the destroyed 0.49 must be measured, not swallowed: {:?}",
+            rejection.activity
+        );
+        // The credited stock changed by the clamped 0.01, not the requested 0.5.
+        let energy_after = world.agent_runtime(agent).expect("runtime").energy;
+        assert!(
+            (energy_after - 2.0).abs() < 1e-6,
+            "energy clamps at the cap: {energy_after}"
+        );
+    }
+
+    #[test]
+    fn seeded_runs_satisfy_the_class_signed_conservation_identity() {
+        // bd-16g.11.1 property test: over seeded runs the books must close per
+        // stock — the sum of every category's cumulative delta equals the
+        // observed stock change within the derived tolerance. With the
+        // flow_class table this decomposes as external_in - sinks +
+        // internal_net == delta(stock), which is the identity that makes "do
+        // the joules add up?" a number instead of a rumour.
+        let configs = [
+            ("baseline", ScriptBotsConfig::default(), 500_u64),
+            (
+                "tiny world, long run",
+                ScriptBotsConfig {
+                    world_width: 100,
+                    world_height: 100,
+                    food_cell_size: 20,
+                    persistence_interval: 0,
+                    chart_flush_interval: 0,
+                    rng_seed: Some(0x1D38_7712),
+                    ..ScriptBotsConfig::default()
+                },
+                5_000_u64,
+            ),
+            (
+                "harsh metabolism",
+                ScriptBotsConfig {
+                    world_width: 120,
+                    world_height: 120,
+                    food_cell_size: 20,
+                    metabolism_drain: 0.01,
+                    movement_drain: 0.004,
+                    persistence_interval: 0,
+                    chart_flush_interval: 0,
+                    rng_seed: Some(0x2E49_8A21),
+                    ..ScriptBotsConfig::default()
+                },
+                500_u64,
+            ),
+            (
+                "generous regrowth",
+                ScriptBotsConfig {
+                    world_width: 120,
+                    world_height: 120,
+                    food_cell_size: 20,
+                    food_growth_rate: 0.06,
+                    food_respawn_interval: 5,
+                    persistence_interval: 0,
+                    chart_flush_interval: 0,
+                    rng_seed: Some(0x3F5A_9B32),
+                    ..ScriptBotsConfig::default()
+                },
+                500_u64,
+            ),
+        ];
+        for (label, config, ticks) in configs {
+            let mut world = WorldState::new(config).expect("property world");
+            for _ in 0..4 {
+                world
+                    .try_spawn_agent(AgentData::default())
+                    .expect("property spawn");
+            }
+            let opening = world.resource_amounts();
+            world.set_resource_ledger_enabled(true);
+            for _ in 0..ticks {
+                world.step().expect("property step");
+            }
+            let closing = world.resource_amounts();
+            let observed = closing.delta_from(opening);
+            let report = world.resource_ledger().clone();
+            assert_eq!(report.completed_ticks, ticks, "{label}: every tick posted");
+            let mut attributed = ResourceAmounts::default();
+            for flow in &report.cumulative {
+                attributed.add_assign(flow.delta);
+            }
+            let unexplained = observed.subtract(attributed);
+            let gross = attributed.scale().max(observed.scale()).max(1.0);
+            let tolerance = 1.0e-6 * gross;
+            assert!(
+                unexplained.within(tolerance),
+                "{label}: {ticks} ticks must close the books: unexplained \
+                 {unexplained:?} exceeds derived tolerance {tolerance} (gross {gross})"
+            );
+            // The class decomposition is the same sum regrouped — and it must
+            // land on the OBSERVED stock change, which is what makes
+            // "external_in - sinks + internal_net == delta(stock)" a property
+            // of the run rather than a tautology about the report.
+            let signed_total =
+                |amounts: ResourceAmounts| amounts.food + amounts.energy + amounts.health;
+            let mut by_class = [0.0_f64; 3];
+            for flow in &report.cumulative {
+                let lane = match RESOURCE_FLOW_KINDS[flow.kind.index()].flow_class() {
+                    FlowClass::ExternalInput => 0,
+                    FlowClass::Sink => 1,
+                    FlowClass::InternalTransfer => 2,
+                };
+                by_class[lane] += signed_total(flow.delta);
+            }
+            let recomposed = by_class[0] + by_class[1] + by_class[2];
+            let observed_scalar = signed_total(observed);
+            assert!(
+                (recomposed - observed_scalar).abs() <= tolerance,
+                "{label}: external_in({}) - sinks({}) + internal_net({}) must equal \
+                 delta(stocks) ({observed_scalar}) within {tolerance}",
+                by_class[0],
+                by_class[1],
+                by_class[2]
+            );
         }
     }
 

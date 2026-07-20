@@ -399,6 +399,32 @@ impl EpochAggregator {
         self.argmax_tick = [None; STOCK_COUNT];
         self.gross_flow = [NeumaierSum::default(); STOCK_COUNT];
 
+        // bd-16g.11.1 logging contract: one line from which a reader who has
+        // never seen the source can answer "where did the joules go this
+        // epoch?". `finish` is a consuming seal, not a pure function — the pure
+        // `observe` path never logs.
+        let category_totals: Vec<String> = flows
+            .per_category
+            .iter()
+            .filter(|flow| flow.delta.scale() != 0.0)
+            .map(|flow| format!("{:?}={:.6}", flow.kind, flow.delta.scale()))
+            .collect();
+        tracing::info!(
+            target: "scriptbots::economy",
+            epoch = flows.epoch,
+            first_tick = flows.first_tick,
+            last_tick = flows.last_tick,
+            tick_count = flows.tick_count,
+            categories = %category_totals.join(" "),
+            residual_food = flows.residual[0].residual_sum,
+            residual_energy = flows.residual[1].residual_sum,
+            residual_health = flows.residual[2].residual_sum,
+            gross_food = flows.residual[0].gross_flow,
+            gross_energy = flows.residual[1].gross_flow,
+            gross_health = flows.residual[2].gross_flow,
+            "epoch resource books sealed"
+        );
+
         flows
     }
 }
