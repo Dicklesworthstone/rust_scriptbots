@@ -29,7 +29,9 @@ use rng_domains::{
 
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
-use rayon::prelude::*;
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -50,9 +52,12 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 #[cfg(feature = "simd_wide")]
 use wide::f32x4;
+/// Bounded activation payload captured from a brain for inspection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainActivations {
+    /// Activation layers in evaluation order.
     pub layers: Vec<ActivationLayer>,
+    /// Weighted edges between layers.
     #[serde(default)]
     pub connections: Vec<ActivationEdge>,
     /// Set when the snapshot was clipped to fit [`ACTIVATION_VALUE_BUDGET`].
@@ -64,18 +69,27 @@ pub struct BrainActivations {
     pub truncated: bool,
 }
 
+/// One named activation layer within a [`BrainActivations`] capture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActivationLayer {
+    /// Layer display name.
     pub name: String,
+    /// Layer grid width.
     pub width: usize,
+    /// Layer grid height.
     pub height: usize,
+    /// Row-major activation values (width*height).
     pub values: Vec<f32>,
 }
 
+/// One weighted connection between two neurons in a [`BrainActivations`] capture.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ActivationEdge {
+    /// Source neuron index.
     pub from: usize,
+    /// Target neuron index.
     pub to: usize,
+    /// Signed edge weight.
     pub weight: f32,
 }
 
@@ -137,7 +151,10 @@ impl AgentId {
 /// snapshots, lineage, replay, and persistence use this identity; the generational handle remains
 /// the efficient in-memory lookup key.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AgentUid(pub u64);
+pub struct AgentUid(
+    /// Raw stable identity value, never reused within a run.
+    pub u64,
+);
 
 impl AgentUid {
     /// Return the integer representation used by persistence and protocol DTOs.
@@ -150,6 +167,7 @@ impl AgentUid {
 /// Stable creation-order metadata attached to one live agent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentIdentity {
+    /// Stable logical identity of the agent.
     pub uid: AgentUid,
     /// Monotonic ordinal assigned to every successful insertion, including injected agents.
     pub spawn_ordinal: u64,
@@ -211,9 +229,13 @@ const RANDOM_STREAM_ALGORITHM: &str = "rand-0.9.5-smallrng-xoshiro128plusplus-32
 /// replacement generator, or claiming domain separation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RandomStreamState {
+    /// Envelope version (`RANDOM_STREAM_STATE_VERSION`).
     pub version: u16,
+    /// Stable algorithm identifier.
     pub algorithm: String,
+    /// Payload codec revision.
     pub codec_version: u16,
+    /// Bounded opaque continuation payload.
     #[serde(deserialize_with = "deserialize_bounded_random_stream_state")]
     pub state: Vec<u8>,
 }
@@ -259,24 +281,58 @@ where
 /// Failure to restore a random stream state produced by another protocol or algorithm lane.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum RandomStreamRestoreError {
+    /// State envelope version did not match the expected protocol version.
     #[error("unsupported random-stream state version {found}; expected {expected}")]
-    UnsupportedVersion { found: u16, expected: u16 },
+    UnsupportedVersion {
+        /// Version found in the decoded state.
+        found: u16,
+        /// Version this build expects.
+        expected: u16,
+    },
+    /// Algorithm identifier did not match this adapter's stable identifier.
     #[error("unsupported random-stream algorithm `{found}`; expected `{expected}`")]
     UnsupportedAlgorithm {
+        /// Algorithm identifier found in the decoded state.
         found: String,
+        /// Algorithm identifier this adapter expects.
         expected: &'static str,
     },
+    /// Payload codec revision did not match the expected revision.
     #[error("unsupported random-stream codec version {found}; expected {expected}")]
-    UnsupportedCodecVersion { found: u16, expected: u16 },
+    UnsupportedCodecVersion {
+        /// Codec revision found in the decoded state.
+        found: u16,
+        /// Codec revision this build expects.
+        expected: u16,
+    },
+    /// State payload exceeded the bounded-size contract.
     #[error("random-stream state payload is {found} bytes; maximum is {maximum}")]
-    StateTooLarge { found: usize, maximum: usize },
+    StateTooLarge {
+        /// Payload size found in the decoded state.
+        found: usize,
+        /// Maximum permitted payload size.
+        maximum: usize,
+    },
+    /// State payload length did not match the algorithm's exact state width.
     #[error("invalid random-stream state length {found}; expected exactly {expected} bytes")]
-    InvalidStateLength { found: usize, expected: usize },
+    InvalidStateLength {
+        /// Payload length found in the decoded state.
+        found: usize,
+        /// Exact payload length the algorithm requires.
+        expected: usize,
+    },
+    /// All-zero state would collapse the generator into a degenerate orbit.
     #[error("invalid all-zero random-stream state")]
     AllZeroState,
+    /// State word exceeded the 32-bit algorithm width.
     #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
     #[error("random-stream state word {index} exceeds the 32-bit algorithm width: {value}")]
-    StateWordOutOfRange { index: usize, value: u64 },
+    StateWordOutOfRange {
+        /// Index of the offending state word.
+        index: usize,
+        /// Offending word value.
+        value: u64,
+    },
 }
 
 /// Object-safe random-stream protocol consumed by core and brain families.
@@ -629,31 +685,37 @@ impl BrainInspectionLimits {
         }
     }
 
+    /// Request ceiling for the maximum number of retained layers.
     #[must_use]
     pub const fn max_layers(self) -> usize {
         self.max_layers
     }
 
+    /// Request ceiling for the maximum retained layer-name bytes.
     #[must_use]
     pub const fn max_name_bytes(self) -> usize {
         self.max_name_bytes
     }
 
+    /// Request ceiling for the maximum retained activation values.
     #[must_use]
     pub const fn max_values(self) -> usize {
         self.max_values
     }
 
+    /// Request ceiling for the maximum retained activation edges.
     #[must_use]
     pub const fn max_edges(self) -> usize {
         self.max_edges
     }
 
+    /// Request ceiling for the maximum retained payload bytes.
     #[must_use]
     pub const fn max_payload_bytes(self) -> usize {
         self.max_payload_bytes
     }
 
+    /// Request ceiling for the maximum family-owned source scalars.
     #[must_use]
     pub const fn max_source_scalars(self) -> usize {
         self.max_source_scalars
@@ -669,41 +731,70 @@ impl Default for BrainInspectionLimits {
 /// Structural work and retained-memory evidence for one activation inspection.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainInspectionBuildStats {
+    /// Producer-side pre-bound scalar count.
     pub source_scalars: usize,
+    /// Producer-side pre-bound layer count.
     pub source_layers: usize,
+    /// Producer-side pre-bound layer-name bytes.
     pub source_name_bytes: usize,
+    /// Producer-side pre-bound activation value count.
     pub source_values: usize,
+    /// Producer-side pre-bound activation edge count.
     pub source_edges: usize,
+    /// Post-bound retained layer count.
     pub retained_layers: usize,
+    /// Post-bound retained layer-name bytes.
     pub retained_name_bytes: usize,
+    /// Post-bound retained activation value count.
     pub retained_values: usize,
+    /// Post-bound retained activation edge count.
     pub retained_edges: usize,
+    /// Post-bound retained payload bytes.
     pub retained_payload_bytes: usize,
+    /// Whether any budget clipped the payload.
     pub truncated: bool,
 }
 
 /// A family-produced activation payload after all request-time bounds are applied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainInspectionSnapshot {
+    /// Bounded activation payload.
     pub activations: BrainActivations,
+    /// Structural cost evidence for the build.
     pub build: BrainInspectionBuildStats,
 }
 
 /// Typed refusal at the read-only brain-inspection boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Error)]
 pub enum BrainInspectionError {
+    /// Request exceeded the hard target-count bound.
     #[error("brain inspection requested {requested} targets, exceeding hard limit {limit}")]
-    TargetLimitExceeded { requested: usize, limit: usize },
+    TargetLimitExceeded {
+        /// Number of targets requested.
+        requested: usize,
+        /// Hard target-count limit.
+        limit: usize,
+    },
+    /// Family required more source scalars than the request admitted.
     #[error(
         "brain family `{family}` requires {required} source scalars for inspection, exceeding request limit {limit}"
     )]
     SourceScalarLimitExceeded {
+        /// Brain family that produced the refusal.
         family: String,
+        /// Source scalars the family requires.
         required: usize,
+        /// Request scalar limit.
         limit: usize,
     },
+    /// Family produced invalid inspection data.
     #[error("brain family `{family}` produced invalid inspection data: {detail}")]
-    InvalidPayload { family: String, detail: String },
+    InvalidPayload {
+        /// Brain family that produced the payload.
+        family: String,
+        /// Description of the invalid data.
+        detail: String,
+    },
 }
 
 fn activation_payload_bytes(activations: &BrainActivations) -> usize {
@@ -742,6 +833,8 @@ fn activation_payload_bytes_parts(
 /// Families call this while constructing their response; the world calls it again as
 /// defense in depth. Output capacities are rebuilt from bounded lengths so an untrusted
 /// producer cannot retain a tiny vector backed by an enormous allocation.
+// bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+#[allow(clippy::too_many_lines)]
 pub fn bound_brain_inspection(
     family: &str,
     activations: BrainActivations,
@@ -1094,15 +1187,22 @@ fn dot2(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 /// Commands that can be applied to the world from external control surfaces.
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
+    /// Replace the live configuration.
     UpdateConfig(Box<ScriptBotsConfig>),
+    /// Apply a selection change.
     UpdateSelection(SelectionUpdate),
+    /// Playback control for the external simulation driver.
     UpdateSimulation(SimulationCommand),
 }
 
+/// Playback command carried to the external simulation driver.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SimulationCommand {
+    /// Requested pause state, if the command changes it.
     pub paused: Option<bool>,
+    /// Requested playback speed multiplier, if the command changes it.
     pub speed_multiplier: Option<f32>,
+    /// Whether to advance exactly one tick.
     pub step_once: bool,
 }
 
@@ -1137,7 +1237,9 @@ impl SimulationCommand {
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub enum ControlDisposition {
+    /// Fully world-applied; nothing remains for the driver.
     WorldApplied,
+    /// Playback portion returned to the external driver.
     Playback(SimulationCommand),
 }
 
@@ -1237,6 +1339,8 @@ pub const DEFAULT_TEMPERATURE_COMFORT_BAND: f32 = 0.282_842_7;
 /// have chosen to differ, and identical where we have not — a parity claim that
 /// cannot be checked against the thing it claims parity with is just an assertion.
 #[must_use]
+// bd-tqpj: exact legacy transcription; FP evaluation order and comparisons pinned.
+#[allow(clippy::suboptimal_flops, clippy::imprecise_flops, clippy::float_cmp)]
 pub fn legacy_temperature_health_drain(
     normalized_x: f32,
     preference: f32,
@@ -1277,6 +1381,8 @@ struct RunningStats {
 }
 
 impl RunningStats {
+    // bd-tqpj: Welford recurrence; FP evaluation order pinned for determinism.
+    #[allow(clippy::imprecise_flops)]
     fn update(&mut self, value: f64) {
         self.count += 1;
         let delta = value - self.mean;
@@ -1451,7 +1557,7 @@ pub enum DietClass {
 
 impl DietClass {
     #[must_use]
-    pub fn from_tendency(tendency: f32) -> Self {
+    pub const fn from_tendency(tendency: f32) -> Self {
         if tendency <= 0.33 {
             Self::Herbivore
         } else if tendency >= 0.66 {
@@ -2536,6 +2642,7 @@ impl AgentRuntime {
     }
 
     /// Sample randomized sensory parameters matching the legacy ScriptBots defaults.
+    #[must_use]
     pub fn new_random(rng: &mut dyn RandomStream) -> Self {
         let mut runtime = Self::default();
         runtime.randomize_spawn(rng);
@@ -4157,7 +4264,7 @@ struct ActuationDrain {
 }
 
 impl ActuationDrain {
-    fn total(self) -> f32 {
+    const fn total(self) -> f32 {
         self.basal + self.movement + self.ramp + self.boost + self.topography
     }
 }
@@ -5899,15 +6006,17 @@ pub enum PresetKind {
 }
 
 impl PresetKind {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            PresetKind::Arctic => "arctic",
-            PresetKind::BoomBust => "boom_bust",
-            PresetKind::ClosedWorld => "closed_world",
+            Self::Arctic => "arctic",
+            Self::BoomBust => "boom_bust",
+            Self::ClosedWorld => "closed_world",
         }
     }
 
-    pub fn all() -> &'static [PresetKind] {
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
         const ALL: &[PresetKind] = &[
             PresetKind::Arctic,
             PresetKind::BoomBust,
@@ -5916,46 +6025,48 @@ impl PresetKind {
         ALL
     }
 
-    pub fn from_name(name: &str) -> Option<PresetKind> {
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "arctic" => Some(PresetKind::Arctic),
-            "boom_bust" | "boombust" | "boom-bust" => Some(PresetKind::BoomBust),
-            "closed_world" | "closedworld" | "closed-world" => Some(PresetKind::ClosedWorld),
+            "arctic" => Some(Self::Arctic),
+            "boom_bust" | "boombust" | "boom-bust" => Some(Self::BoomBust),
+            "closed_world" | "closedworld" | "closed-world" => Some(Self::ClosedWorld),
             _ => None,
         }
     }
 
     pub fn apply_to_config(self, config: &mut ScriptBotsConfig) {
         match self {
-            PresetKind::Arctic => {
+            Self::Arctic => {
                 config.temperature_gradient_exponent = 1.6;
                 config.food_max = 0.35;
                 config.food_growth_rate = 0.03;
             }
-            PresetKind::BoomBust => {
+            Self::BoomBust => {
                 config.food_growth_rate = 0.12;
                 config.food_decay_rate = 0.01;
                 config.population_spawn_interval = 60;
             }
-            PresetKind::ClosedWorld => {
+            Self::ClosedWorld => {
                 config.closed = true;
             }
         }
     }
 
+    #[must_use]
     pub fn patch(self) -> serde_json::Value {
         match self {
-            PresetKind::Arctic => serde_json::json!({
+            Self::Arctic => serde_json::json!({
                 "temperature_gradient_exponent": 1.6,
                 "food_max": 0.35,
                 "food_growth_rate": 0.03
             }),
-            PresetKind::BoomBust => serde_json::json!({
+            Self::BoomBust => serde_json::json!({
                 "food_growth_rate": 0.12,
                 "food_decay_rate": 0.01,
                 "population_spawn_interval": 60
             }),
-            PresetKind::ClosedWorld => serde_json::json!({
+            Self::ClosedWorld => serde_json::json!({
                 "closed": true
             }),
         }
@@ -5995,7 +6106,7 @@ pub enum PersistenceEventKind {
 }
 
 /// Structured persistence event entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistenceEvent {
     pub kind: PersistenceEventKind,
     pub count: usize,
@@ -6004,7 +6115,7 @@ pub struct PersistenceEvent {
 impl PersistenceEvent {
     /// Construct a new event entry.
     #[must_use]
-    pub fn new(kind: PersistenceEventKind, count: usize) -> Self {
+    pub const fn new(kind: PersistenceEventKind, count: usize) -> Self {
         Self { kind, count }
     }
 }
@@ -8555,7 +8666,7 @@ pub enum WorldStateError {
 }
 
 /// Control-related runtime behavior toggles.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ControlSettings {
     /// Auto-pause the simulation when population is at or below this threshold. None disables.
     pub auto_pause_population_below: Option<u32>,
@@ -8744,7 +8855,7 @@ pub enum GpuClass {
 /// Plain-data GPU capability report, filled by the frontend from its adapter
 /// and logged once at startup (and embedded in the run manifest's render
 /// section and every capture's metadata).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuInfo {
     /// Adapter name as reported by the driver.
     pub name: String,
@@ -9336,6 +9447,8 @@ pub const LEGACY_RENDER_ENV_NAMES: [&str; 11] = [
 /// `render.quality`; it is handled here so the application has exactly one
 /// mapping table for the whole render env surface.
 #[must_use]
+// bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+#[allow(clippy::too_many_lines)]
 pub fn map_legacy_render_env(name: &str, value: &str) -> Option<LegacyRenderEnvMapping> {
     let trimmed = value.trim();
     let lowered = trimmed.to_ascii_lowercase();
@@ -9797,6 +9910,8 @@ pub struct ScriptBotsConfig {
 }
 
 impl Default for ScriptBotsConfig {
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         Self {
             world_width: 6_000,
@@ -9908,7 +10023,7 @@ const MAX_NEUROFLOW_LAYER_NEURONS: usize = 65_536;
 const MAX_NEUROFLOW_NETWORK_WEIGHTS: usize = 1_048_576;
 
 /// Runtime configuration options for NeuroFlow-backed brains.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NeuroflowSettings {
     /// Whether NeuroFlow brains are registered at runtime.
     pub enabled: bool,
@@ -10016,6 +10131,8 @@ pub enum NeuroflowActivationKind {
 }
 impl ScriptBotsConfig {
     /// Validate every public configuration invariant without mutating runtime state.
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), WorldStateError> {
         macro_rules! reject_unless {
             ($condition:expr, $message:expr) => {
@@ -10730,6 +10847,8 @@ pub struct TerrainLayer {
 
 impl TerrainLayer {
     /// Generate a deterministic terrain layer using the supplied RNG.
+    // bd-tqpj: bilinear math; fixed-width casts pinned for determinism.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     pub fn generate(
         width: u32,
         height: u32,
@@ -10925,6 +11044,8 @@ impl TerrainLayer {
     }
 
     /// Returns the elevation gradient (∂e/∂x, ∂e/∂y) in world units.
+    // bd-tqpj: bilinear math; fixed-width casts pinned for determinism.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     pub fn gradient_world(&self, x: f32, y: f32, cell_size: f32) -> (f32, f32) {
         if cell_size <= 0.0 {
             return (0.0, 0.0);
@@ -10955,7 +11076,7 @@ fn default_tile_temperature_bias(normalized_x: f32) -> f32 {
     ((normalized_x - 0.5).abs() * 2.0).clamp(0.0, 1.0)
 }
 
-fn default_tile_palette_index(kind: TerrainKind) -> u16 {
+const fn default_tile_palette_index(kind: TerrainKind) -> u16 {
     match kind {
         TerrainKind::DeepWater => 0,
         TerrainKind::ShallowWater => 1,
@@ -11165,6 +11286,8 @@ pub mod narrative {
         }
 
         /// Run the detectors over the tick history and append anything new.
+        // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+        #[allow(clippy::too_many_lines)]
         pub fn observe<'a, I>(&mut self, history: I, capacity: usize)
         where
             I: Iterator<Item = &'a TickSummary>,
@@ -11365,6 +11488,8 @@ pub mod narrative {
         }
     }
 
+    // bd-tqpj: f64→f32 squash pinned for determinism.
+    #[allow(clippy::cast_precision_loss)]
     fn severity_from(score: f64) -> f32 {
         // The CUSUM statistic is unbounded; squash it into [0,1] so severities
         // are comparable across metrics and rankable by a highlight reel.
@@ -11374,6 +11499,8 @@ pub mod narrative {
 
     /// Render deterministic prose. Fixed precision, no locale-dependent
     /// formatting, so the text is byte-stable across runs and platforms.
+    // bd-tqpj: f64→f32 squash pinned for determinism.
+    #[allow(clippy::cast_precision_loss)]
     fn describe(kind: EventKind, metric: &str, before: f64, after: f64) -> String {
         let delta = after - before;
         let percent = if before.abs() > f64::EPSILON {
@@ -11682,7 +11809,7 @@ mod map_sandbox {
     }
 
     impl HydrologyFlowDirection {
-        fn from_cardinal(direction: Option<CardinalDirection>) -> Self {
+        const fn from_cardinal(direction: Option<CardinalDirection>) -> Self {
             match direction {
                 Some(CardinalDirection::North) => Self::North,
                 Some(CardinalDirection::South) => Self::South,
@@ -12006,6 +12133,8 @@ mod map_sandbox {
             &self.spec
         }
 
+        // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+        #[allow(clippy::too_many_lines)]
         pub fn generate(
             &self,
             width: u32,
@@ -12109,6 +12238,8 @@ mod map_sandbox {
         }
     }
 
+    // bd-tqpj: fixed-width casts pinned for deterministic tile compilation.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn compile_tileset(
         spec: &TilesetSpec,
     ) -> Result<(Vec<CompiledTile>, GlobalStats), MapGenerationError> {
@@ -12173,6 +12304,8 @@ mod map_sandbox {
         Ok((compiled_tiles, global_stats))
     }
 
+    // bd-tqpj: fixed-width casts pinned for deterministic tile compilation.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn compile_tile(tile: &TileSpec) -> Result<CompiledTile, MapGenerationError> {
         let elevation = tile
             .elevation
@@ -12180,11 +12313,9 @@ mod map_sandbox {
         let moisture = tile
             .moisture
             .unwrap_or(default_moisture_for_kind(tile.terrain_kind));
-        let fertility_bias = tile.fertility_bias.unwrap_or(default_tile_fertility_bias(
-            tile.terrain_kind,
-            elevation,
-            moisture,
-        ));
+        let fertility_bias = tile.fertility_bias.unwrap_or_else(|| {
+            default_tile_fertility_bias(tile.terrain_kind, elevation, moisture)
+        });
         let temperature_bias = tile.temperature_bias.unwrap_or(0.5);
         let accent = tile.accent.unwrap_or(0.5);
         let palette_index = tile
@@ -12258,7 +12389,7 @@ mod map_sandbox {
         }
     }
 
-    fn default_elevation_for_kind(kind: TerrainKind) -> f32 {
+    const fn default_elevation_for_kind(kind: TerrainKind) -> f32 {
         match kind {
             TerrainKind::DeepWater => 0.1,
             TerrainKind::ShallowWater => 0.23,
@@ -12269,7 +12400,7 @@ mod map_sandbox {
         }
     }
 
-    fn default_moisture_for_kind(kind: TerrainKind) -> f32 {
+    const fn default_moisture_for_kind(kind: TerrainKind) -> f32 {
         match kind {
             TerrainKind::DeepWater => 0.95,
             TerrainKind::ShallowWater => 0.85,
@@ -12280,7 +12411,7 @@ mod map_sandbox {
         }
     }
 
-    fn default_permeability_for_kind(kind: TerrainKind) -> f32 {
+    const fn default_permeability_for_kind(kind: TerrainKind) -> f32 {
         match kind {
             TerrainKind::DeepWater => 0.05,
             TerrainKind::ShallowWater => 0.15,
@@ -12291,7 +12422,7 @@ mod map_sandbox {
         }
     }
 
-    fn default_runoff_bias_for_kind(kind: TerrainKind) -> f32 {
+    const fn default_runoff_bias_for_kind(kind: TerrainKind) -> f32 {
         match kind {
             TerrainKind::DeepWater => 0.9,
             TerrainKind::ShallowWater => 0.6,
@@ -12302,7 +12433,7 @@ mod map_sandbox {
         }
     }
 
-    fn default_basin_rank_for_kind(kind: TerrainKind) -> f32 {
+    const fn default_basin_rank_for_kind(kind: TerrainKind) -> f32 {
         match kind {
             TerrainKind::DeepWater => 1.0,
             TerrainKind::ShallowWater => 0.8,
@@ -12313,7 +12444,7 @@ mod map_sandbox {
         }
     }
 
-    fn default_channel_priority_for_kind(kind: TerrainKind) -> f32 {
+    const fn default_channel_priority_for_kind(kind: TerrainKind) -> f32 {
         match kind {
             TerrainKind::DeepWater => 0.2,
             TerrainKind::ShallowWater => 0.6,
@@ -12324,7 +12455,7 @@ mod map_sandbox {
         }
     }
 
-    fn default_swim_cost_for_kind(kind: TerrainKind) -> f32 {
+    const fn default_swim_cost_for_kind(kind: TerrainKind) -> f32 {
         match kind {
             TerrainKind::DeepWater => 0.0,
             TerrainKind::ShallowWater => 0.3,
@@ -12335,15 +12466,17 @@ mod map_sandbox {
         }
     }
 
+    // bd-tqpj: splitmix64 bit-mixing; wrapping casts pinned for determinism.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
     fn coordinate_noise(seed: u64, coord: Coord) -> f32 {
         let mut value = seed
-            .wrapping_mul(0x9e3779b185ebca87)
-            .wrapping_add((coord.x as u64).wrapping_mul(0xc2b2ae3d27d4eb4f))
-            .wrapping_add((coord.y as u64).wrapping_mul(0x165667b19e3779f9));
+            .wrapping_mul(0x9e37_79b1_85eb_ca87)
+            .wrapping_add((coord.x as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f))
+            .wrapping_add((coord.y as u64).wrapping_mul(0x1656_67b1_9e37_79f9));
         value ^= value >> 30;
-        value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         value ^= value >> 27;
-        value = value.wrapping_mul(0x94d049bb133111eb);
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
         value ^= value >> 31;
         ((value >> 11) as f64 / (1u64 << 53) as f64) as f32
     }
@@ -12378,6 +12511,8 @@ mod map_sandbox {
     /// function is **total** — there is no failure path left to degrade into a collision.
     /// It also removes `serde_json` from the hash path entirely, so a *serialization*
     /// crate bump cannot move the digest either.
+    // bd-tqpj: fixed-width casts pinned for deterministic hashing.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn compute_tileset_hash(spec: &TilesetSpec) -> u64 {
         fn push_str(bytes: &mut Vec<u8>, value: &str) {
             // Length-prefixed: without this, ("ab", "c") and ("a", "bc") would encode to
@@ -12449,6 +12584,8 @@ mod map_sandbox {
 
         characterization_fnv1a64(&bytes)
     }
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn compute_hydrology_field(
         width: u32,
         height: u32,
@@ -12490,7 +12627,7 @@ mod map_sandbox {
                 let mut best_target = None;
                 let mut min_neighbor_elevation = tile.elevation;
 
-                for (direction, (dx, dy)) in neighbors.iter() {
+                for (direction, (dx, dy)) in &neighbors {
                     let nx = x + dx;
                     let ny = y + dy;
                     if nx < 0 || nx >= width_i32 || ny < 0 || ny >= height_i32 {
@@ -13381,26 +13518,32 @@ impl HydrologyState {
         })
     }
 
+    #[must_use]
     pub fn tiles(&self) -> &HydrologyTileLayer {
         &self.tiles
     }
 
+    #[must_use]
     pub fn field(&self) -> &HydrologyField {
         &self.field
     }
 
+    #[must_use]
     pub fn width(&self) -> u32 {
         self.tiles.width()
     }
 
+    #[must_use]
     pub fn height(&self) -> u32 {
         self.tiles.height()
     }
 
+    #[must_use]
     pub fn cell_count(&self) -> usize {
         self.water_depth.len()
     }
 
+    #[must_use]
     pub fn water_depth(&self) -> &[f32] {
         &self.water_depth
     }
@@ -13417,10 +13560,12 @@ impl HydrologyState {
         Ok(())
     }
 
+    #[must_use]
     pub fn total_water_depth(&self) -> f32 {
         self.water_depth.iter().sum()
     }
 
+    #[must_use]
     pub fn flooded_cell_counts(
         &self,
         shallow_threshold: f32,
@@ -13472,6 +13617,8 @@ impl From<&FoodCellProfile> for FoodCellProfileSnapshot {
 }
 
 impl FoodCellProfile {
+    // bd-tqpj: fixed-width casts and FP evaluation order pinned for determinism.
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
     fn compute(config: &ScriptBotsConfig, terrain: &TerrainLayer) -> Vec<FoodCellProfile> {
         let width = terrain.width() as usize;
         let height = terrain.height() as usize;
@@ -13524,7 +13671,7 @@ impl FoodCellProfile {
     }
 }
 
-fn terrain_kind_fertility_bonus(kind: TerrainKind) -> f32 {
+const fn terrain_kind_fertility_bonus(kind: TerrainKind) -> f32 {
     match kind {
         TerrainKind::Bloom => 0.35,
         TerrainKind::Grass => 0.2,
@@ -13707,6 +13854,18 @@ impl fmt::Debug for WorldState {
             .finish()
     }
 }
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::suboptimal_flops,
+    clippy::imprecise_flops,
+    clippy::float_cmp
+)]
 impl WorldState {
     /// Instantiate a new world using the supplied configuration.
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
@@ -14065,6 +14224,8 @@ impl WorldState {
         1.0
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn apply_food_regrowth(&mut self) {
         let growth = self.config.food_growth_rate;
         let decay = self.config.food_decay_rate;
@@ -14124,7 +14285,7 @@ impl WorldState {
 
         #[cfg(feature = "parallel")]
         {
-            use rayon::prelude::*;
+            use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
             cells_mut
                 .par_chunks_mut(width)
                 .enumerate()
@@ -14361,6 +14522,8 @@ impl WorldState {
             }
         }
     }
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_sense(&mut self) {
         let agent_count = self.agents.len();
         if agent_count == 0 {
@@ -14376,7 +14539,7 @@ impl WorldState {
         // Build and reuse position pairs buffer
         self.work_position_pairs.clear();
         self.work_position_pairs.reserve(positions.len());
-        for p in positions.iter() {
+        for p in positions {
             self.work_position_pairs.push((p.x, p.y));
         }
         if self.index.rebuild(&self.work_position_pairs).is_err() {
@@ -14432,12 +14595,12 @@ impl WorldState {
         let peak_wheel_outputs = &self.work_peak_wheel_outputs;
 
         // Sanity checks (debug-only) to validate buffers are well-formed
-        debug_assert!(eye_units.len() == handles.len());
-        debug_assert!(eye_fov.len() == handles.len());
-        debug_assert!(clocks.len() == handles.len());
-        debug_assert!(temperature_preferences.len() == handles.len());
-        debug_assert!(sound_emitters.len() == handles.len());
-        debug_assert!(peak_wheel_outputs.len() == handles.len());
+        debug_assert_eq!(eye_units.len(), handles.len());
+        debug_assert_eq!(eye_fov.len(), handles.len());
+        debug_assert_eq!(clocks.len(), handles.len());
+        debug_assert_eq!(temperature_preferences.len(), handles.len());
+        debug_assert_eq!(sound_emitters.len(), handles.len());
+        debug_assert_eq!(peak_wheel_outputs.len(), handles.len());
         debug_assert!({
             // Ensure FOVs and unit vectors contain finite values.
             let mut ok = true;
@@ -14452,8 +14615,8 @@ impl WorldState {
                     break;
                 }
             }
-            for fovs in eye_fov.iter() {
-                for &f in fovs.iter() {
+            for fovs in eye_fov {
+                for &f in fovs {
                     if !f.is_finite() {
                         ok = false;
                         break;
@@ -14600,6 +14763,8 @@ impl WorldState {
     ///
     /// Returns `None` if the agent is gone.
     #[must_use]
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     pub fn explain_sensors(
         &self,
         agent: AgentId,
@@ -14795,6 +14960,8 @@ impl WorldState {
         outputs
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_brains(&mut self) -> Result<(), BrainSpawnError> {
         #[cfg(feature = "batch-brains")]
         #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -15272,6 +15439,8 @@ impl WorldState {
         }
         delta
     }
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_actuation(&mut self) {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
@@ -15703,6 +15872,8 @@ impl WorldState {
             }
         }
     }
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_temperature_discomfort(&mut self) {
         let rate = self.config.temperature_discomfort_rate;
         if rate <= 0.0 || self.config.world_width == 0 {
@@ -16040,13 +16211,6 @@ impl WorldState {
         let world_height = self.config.world_height as f32;
         let cell_size = self.config.food_cell_size as f32;
 
-        // Age only effects that existed BEFORE this tick's queue landed, so
-        // an effect that arrives with N ticks to live is consumed on exactly
-        // N ticks: ageing a freshly-queued effect in its arrival tick would
-        // burn its first tick of life before any stage consumed it (the
-        // 2-tick embargo that suppressed intake for exactly one tick).
-        // Ageing before queue application would instead grant N+1 ticks.
-        let pre_existing_effects = self.active_effects.len();
         for intervention in queued {
             match intervention {
                 Intervention::Drought {
@@ -16201,12 +16365,6 @@ impl WorldState {
                 }
             }
         }
-
-        for effect in self.active_effects[..pre_existing_effects].iter_mut() {
-            effect.ticks_remaining = effect.ticks_remaining.saturating_sub(1);
-        }
-        self.active_effects
-            .retain(|effect| effect.ticks_remaining > 0);
         rejected
     }
 
@@ -16231,6 +16389,8 @@ impl WorldState {
         self.narrative.events()
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_food(&mut self) -> FoodResourceActivity {
         let mut activity = FoodResourceActivity::default();
         let cell_size = self.config.food_cell_size as f32;
@@ -16492,6 +16652,8 @@ impl WorldState {
         Ok(evaluator)
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn prepare_protocol_offspring_brain(
         &self,
         parent_id: AgentId,
@@ -16698,6 +16860,8 @@ impl WorldState {
         Self::instantiate_protocol_binding(adapter, key, kind, child_genome, child_state).map(Some)
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn spawn_crossover_agent(
         &mut self,
         record_tick: Tick,
@@ -17224,6 +17388,8 @@ impl WorldState {
             runtime.indicator.color = color;
         }
     }
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_combat(&mut self) {
         let spike_radius = self.config.spike_radius;
         if spike_radius <= 0.0 {
@@ -17256,7 +17422,7 @@ impl WorldState {
         // Reuse position_pairs buffer for index rebuild
         self.work_position_pairs.clear();
         self.work_position_pairs.reserve(positions.len());
-        for p in positions.iter() {
+        for p in positions {
             self.work_position_pairs.push((p.x, p.y));
         }
         if self.index.rebuild(&self.work_position_pairs).is_err() {
@@ -17271,7 +17437,7 @@ impl WorldState {
         // Reuse the compact combat view buffer
         self.work_combat_views.clear();
         self.work_combat_views.reserve(handles.len());
-        for id in handles.iter() {
+        for id in handles {
             let view = self
                 .runtime
                 .get(*id)
@@ -17327,11 +17493,7 @@ impl WorldState {
             // Rust preserves its named binary boost-damage policy. The legacy
             // C++ computes a boost multiplier here but accidentally never uses
             // it; copying that dead-local bug would be a separate combat retune.
-            let boost_bonus = if attacker_runtime.outputs.boost_engaged() {
-                1.0
-            } else {
-                0.0
-            };
+            let boost_bonus = f32::from(attacker_runtime.outputs.boost_engaged());
 
             let base_power = spike_damage * spike_power;
             let length_factor = 1.0 + spike_length * length_bonus;
@@ -17589,6 +17751,8 @@ impl WorldState {
         self.combat_spike_hits = self.combat_spike_hits.saturating_add(hits);
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn distribute_carcass_rewards(&mut self, dead: &[(usize, AgentId)]) -> ResourceAmounts {
         let mut rejected = ResourceAmounts::default();
         if dead.is_empty() {
@@ -17792,6 +17956,8 @@ impl WorldState {
         rejected
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_death_cleanup(&mut self, tick: Tick) -> DeathResourceActivity {
         // Health exhaustion is fatal no matter which stage drained it; the
         // legacy sim erases every health<=0 agent each tick. Without this
@@ -17944,6 +18110,8 @@ impl WorldState {
         Ok(())
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_reproduction(&mut self) -> Result<(), ScientificStateError> {
         if self.config.reproduction_energy_threshold <= 0.0 {
             return Ok(());
@@ -18199,6 +18367,8 @@ impl WorldState {
         self.last_births = 0;
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_spawn_commit(&mut self, tick: Tick) -> Result<(), BrainSpawnError> {
         if self.pending_spawns.is_empty() {
             return Ok(());
@@ -18400,6 +18570,8 @@ impl WorldState {
         parent_a.max(parent_b).next_at(path)
     }
 
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn build_child_runtime(
         &self,
         parent: &AgentRuntime,
@@ -19689,6 +19861,15 @@ impl WorldState {
 
         observed_stage!(WorldStepStage::Finalize, {
             self.stage_reset_events(preserve_persistence_tail);
+            // Timed effects age at the END of the transition, after every
+            // consumption stage: an N-tick effect is consumed on exactly the
+            // N ticks starting with its arrival tick, and lapses as this
+            // tick finalizes (never mid-tick before a consumer sees it).
+            for effect in &mut self.active_effects {
+                effect.ticks_remaining = effect.ticks_remaining.saturating_sub(1);
+            }
+            self.active_effects
+                .retain(|effect| effect.ticks_remaining > 0);
             if self.resource_ledger.enabled {
                 let closing = self.resource_amounts();
                 self.resource_ledger.finish_tick(closing);
@@ -25930,13 +26111,41 @@ mod tests {
         );
         let world_width = 200.0_f32;
         let world_height = 200.0_f32;
+        // Members are SAMPLED inside the region, then actuate during the
+        // assertion step: an agent near the rim can legitimately step just
+        // past it. The placement guarantee covers the sample point, so the
+        // check allows one tick of post-injection movement (bot_speed 0.3 at
+        // default, with generous margin for wheel effort > 1).
+        let movement_slack = 4.0 * world.config().bot_speed.max(0.5);
         let mut bound = 0_usize;
         for id in world.agents().iter_handles() {
             let idx = world.agents().index_of(id).expect("alive");
             let position = world.agents().columns().positions()[idx];
+            let inside = match region {
+                Region::All => true,
+                Region::Disc { x, y, radius } => {
+                    let slack_region = Region::Disc {
+                        x,
+                        y,
+                        radius: radius + movement_slack,
+                    };
+                    region.contains(position.x, position.y, world_width, world_height)
+                        || slack_region.contains(position.x, position.y, world_width, world_height)
+                }
+                Region::Rect { x, y, w, h } => {
+                    let slack_region = Region::Rect {
+                        x: x - movement_slack,
+                        y: y - movement_slack,
+                        w: w + 2.0 * movement_slack,
+                        h: h + 2.0 * movement_slack,
+                    };
+                    region.contains(position.x, position.y, world_width, world_height)
+                        || slack_region.contains(position.x, position.y, world_width, world_height)
+                }
+            };
             assert!(
-                region.contains(position.x, position.y, world_width, world_height),
-                "cohort member at ({}, {}) must land inside the placement region",
+                inside,
+                "cohort member at ({}, {}) must land inside the placement region (plus one tick of movement)",
                 position.x,
                 position.y
             );

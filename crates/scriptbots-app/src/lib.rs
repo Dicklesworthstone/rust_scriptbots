@@ -3018,6 +3018,7 @@ pub mod regions;
 pub mod scene;
 pub mod servers;
 pub mod terminal;
+pub mod tournament;
 
 pub mod renderer {
     use anyhow::Result;

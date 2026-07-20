@@ -23,7 +23,7 @@ pub mod assembly;
 pub use assembly::AssemblyBrain;
 
 /// Small newtype wrapper identifying brain families.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BrainKind(&'static str);
 
 impl BrainKind {
