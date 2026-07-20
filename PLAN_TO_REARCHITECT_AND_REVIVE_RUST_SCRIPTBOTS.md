@@ -80,22 +80,20 @@ The default `meadow` scenario should:
 - make births, deaths, predation, and behavioral variation observable within a few minutes;
 - expose the run seed, config hash, code revision, and deterministic status in the UI.
 
-### 2.3 Curated scenario catalog
+### 2.3 Curated scenario catalog [Completed — `bd-2z0.10.3`, closed 2026-07-20]
 
-The initial catalog should contain:
+The shipped catalog lives in `scenarios/` as first-class `scriptbots.scenario.v1` documents:
 
-| Scenario | Scientific story | Required visible behavior |
+| Scenario | Scientific story | Validated behavior (cohort-proven) |
 |---|---|---|
-| `meadow` | Balanced introductory ecosystem | exploration, grazing, reproduction, occasional combat |
-| `predator_prey` | Diet specialization under resource pressure | recognizable predator/prey population cycles |
-| `islands` | Spatial isolation and divergence | separate lineages adapt on disconnected fertile regions |
-| `boom_bust` | Resource overshoot | population expansion followed by measurable scarcity |
-| `cold_front` | Temperature preference and migration | movement and selection along a temperature gradient |
-| `brain_arena` | Brain-family comparison | equal seeded cohorts and comparable survival metrics |
-| `closed_ecosystem` | No external population injection | extinction or equilibrium is allowed and explained |
-| `hydrology` | Terrain, moisture, and food coupling | water/terrain changes visibly affect resources and paths |
+| `meadow` | Balanced introductory ecosystem | grazing, reproduction, and population inside the envelope on every cohort seed |
+| `drought_recovery` | Resource overshoot | boom births, famine deaths via exact-tick interventions (t120 drought, t220 recovery), bit-identical replay |
+| `predator_prey` | Diet specialization under pressure | measurable spike combat inside the horizon on every cohort seed |
+| `islands_closed` | Closed ecosystem | zero external injection; honest persistence or extinction, no silent restock |
+| `cooperation_kinship` | Altruistic sharing and kinship | cheap sharing sustains population above the floor with sustained births |
+| `brain_arena` | Brain-family comparison | equal seeded cohorts run with comparable survival metrics recorded |
 
-Every scenario is data, not a partial mutation of defaults hidden in code. Each scenario includes a schema version, seed policy, full config, initial population recipe, terrain recipe, brain roster, expected invariants, and human description.
+Every scenario is data, not a partial mutation of defaults hidden in code. Each carries a schema version, cohort seed schedule, full documented config body, hypothesis, and measurable success/failure envelope; the terminal driver replays scheduled interventions at exact tick boundaries. The cohort harness (`crates/scriptbots-app/tests/scenario_catalog.rs`) runs every declared seed through the real binary and requires the envelope on every seed plus bit-identical world digests on rerun. The plan's two additional stories (`cold_front`, `hydrology`) remain available for a future catalog revision alongside the bead-anchored six.
 
 ---
 
