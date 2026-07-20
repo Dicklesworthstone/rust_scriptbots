@@ -580,8 +580,7 @@ impl BrainFamilyCodec for SabotagedMutationFamily {
     fn genome_loci(
         &self,
         genome: &BrainGenomeEnvelope,
-    ) -> Result<Vec<(scriptbots_core::genome_diff::Locus, LocusValue)>, BrainProtocolError>
-    {
+    ) -> Result<Vec<(scriptbots_core::genome_diff::Locus, LocusValue)>, BrainProtocolError> {
         self.inner.genome_loci(genome)
     }
     fn validate_evaluator_state(
@@ -633,7 +632,6 @@ impl BrainFamilyCodec for SabotagedMutationFamily {
         self.inner.evaluator(genome, state)
     }
 }
-
 
 #[test]
 fn the_proof_detects_the_restored_e2d9aaa_bug() {
