@@ -1,10 +1,11 @@
-//! Core types shared across the ScriptBots workspace.
+//! Core types shared across the `ScriptBots` workspace.
 
 pub mod ancestry;
 pub mod channels;
 mod checkpoint;
 pub mod detect;
 pub mod economy;
+pub mod genome_diff;
 pub mod narrative_text;
 pub mod permalink;
 mod replay;
@@ -148,7 +149,7 @@ impl AgentId {
 
 /// Stable logical identity for an agent within one simulation run.
 ///
-/// Unlike [`AgentId`], this value is never recycled when a SlotMap entry is removed. Scientific
+/// Unlike [`AgentId`], this value is never recycled when a `SlotMap` entry is removed. Scientific
 /// snapshots, lineage, replay, and persistence use this identity; the generational handle remains
 /// the efficient in-memory lookup key.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -464,14 +465,14 @@ impl SmallRngStream {
 }
 
 #[inline]
-fn decode_le_u64(bytes: &[u8]) -> u64 {
+const fn decode_le_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
 }
 
 #[inline]
-fn splitmix64(state: &mut u64) -> u64 {
+const fn splitmix64(state: &mut u64) -> u64 {
     const PHI: u64 = 0x9e37_79b9_7f4a_7c15;
     *state = state.wrapping_add(PHI);
     let mut value = *state;
@@ -611,10 +612,13 @@ pub const ACTIVATION_PAYLOAD_BYTE_BUDGET: usize = 64 * 1_024;
 
 /// Maximum family-owned scalar work admitted before an activation payload is built.
 ///
-/// NeuroFlow uses this preflight before serializing its private network representation.
+/// `NeuroFlow` uses this preflight before serializing its private network representation.
 pub const ACTIVATION_SOURCE_SCALAR_BUDGET: usize = 65_536;
 
 /// Producer-side limits carried by every explicit brain-inspection request.
+// bd-tqpj: shared `max_` prefix mirrors the wire-format budget family; renaming
+// fields would churn the serialization layout, so the field-names lint is waived.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct BrainInspectionLimits {
     max_layers: usize,
@@ -625,6 +629,9 @@ pub struct BrainInspectionLimits {
     max_source_scalars: usize,
 }
 
+// bd-tqpj: wire mirror of `BrainInspectionLimits`; the shared `max_` prefix is the
+// serialization contract, so the field-names lint is waived.
+#[allow(clippy::struct_field_names)]
 #[derive(Deserialize)]
 struct BrainInspectionLimitsWire {
     max_layers: usize,
@@ -4153,7 +4160,7 @@ impl Region {
 pub const MAX_COHORT_INJECTION: u32 = 1_024;
 
 /// Where an injected cohort's brains come from.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum CohortSource {
     /// Bind every cohort member to the brain family registered under this registry key.
@@ -8136,6 +8143,24 @@ pub trait BrainFamilyCodec: Send + Sync {
     /// Validate generic versions and family-owned genome bytes.
     fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError>;
 
+    /// Decode a genome into its canonical typed locus list for structural diffing
+    /// (bd-16g.13.1). Loci are emitted in canonical index order — the same genome
+    /// always decodes to the same ordered list on any platform. Families that cannot
+    /// expose typed loci inherit the default, which refuses honestly rather than
+    /// letting the diff compare opaque bytes.
+    fn genome_loci(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<Vec<(crate::genome_diff::Locus, crate::genome_diff::LocusValue)>, BrainProtocolError>
+    {
+        let _ = genome;
+        Err(BrainProtocolError::InvalidPayload {
+            kind: BrainEnvelopeKind::Genome,
+            family_id: self.family_id().clone(),
+            detail: "family does not expose typed genome loci for structural diffing".to_owned(),
+        })
+    }
+
     /// Validate generic versions and family-owned future-affecting state bytes.
     fn validate_evaluator_state(
         &self,
@@ -8617,13 +8642,13 @@ impl AgentColumns {
 
     /// Number of active rows in the columns.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.positions.len()
     }
 
     /// Returns true if there are no active rows.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -8885,13 +8910,13 @@ impl AgentArena {
 
     /// Number of active agents.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.columns.len()
     }
 
     /// Returns true when no agents are stored.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
 
@@ -8993,9 +9018,14 @@ impl AgentArena {
 
     /// Rebuild the dense rows in the exact handle order supplied by the world owner.
     ///
-    /// Agent handles remain stable; only their dense SoA locations change. The normal simulation
+    /// Agent handles remain stable; only their dense `SoA` locations change. The normal simulation
     /// path is already append-ordered, so this allocation is paid only when a restored or
     /// deliberately perturbed world arrives with a noncanonical dense layout.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ordered_handles` is not exactly the live-handle set; the caller
+    /// (checkpoint restore / deterministic reorder) must supply the canonical order.
     fn reorder(&mut self, ordered_handles: &[AgentId]) {
         debug_assert_eq!(ordered_handles.len(), self.len());
         if self.handles.as_slice() == ordered_handles {
@@ -9326,7 +9356,7 @@ pub struct ControlSettings {
 ///
 /// This is the single typed source of truth for HOW things look, cleanly
 /// separated from WHAT the world is (the science fields). Every frontend
-/// (Bevy, FrankenTUI, GPUI while it lives, the wgpu capture lane, and the
+/// (Bevy, `FrankenTUI`, GPUI while it lives, the wgpu capture lane, and the
 /// WASM projection) consumes this schema; renderer-specific materialization
 /// lives in the frontend crates. All fields are optional: `None` defers to
 /// the frontend's documented defaults and to the quality-tier feature
@@ -9359,14 +9389,14 @@ pub struct RenderSettings {
     /// lighting (equivalent to `cycle_ticks = 0`).
     #[serde(default)]
     pub day_night: Option<RenderDayNightSettings>,
-    /// Chrome theme for the terminal frontend (FrankenTUI `Ctrl+T` set).
+    /// Chrome theme for the terminal frontend (`FrankenTUI` `Ctrl+T` set).
     /// Orthogonal to [`RenderSettings::palette`], which recolors semantic
     /// data (agents/food/terrain) for accessibility.
     #[serde(default)]
     pub theme: Option<TuiThemeId>,
     /// Accessibility palette applied to semantic data colors on every
     /// surface (the preserved Natural/Deuteranopia/Protanopia/Tritanopia/
-    /// HighContrast set).
+    /// `HighContrast` set).
     #[serde(default)]
     pub palette: Option<AccessibilityPalette>,
     /// Reduce non-essential motion (TUI animations, camera shake, ambient
@@ -9385,9 +9415,9 @@ pub enum RenderTonemapMode {
     /// ACES tonemapping curve.
     #[default]
     Aces,
-    /// AgX tonemapping curve.
+    /// `AgX` tonemapping curve.
     Agx,
-    /// Tony McMapFace tonemapping curve.
+    /// Tony `McMapFace` tonemapping curve.
     Tony,
 }
 
@@ -9546,7 +9576,10 @@ pub const fn initial_tier_for(class: GpuClass, vram_bytes: Option<u64>) -> Rende
 /// `Medium` means the same thing in the 3D renderer, the terminal canvas, and
 /// the capture harness. Fields are deliberately coarse; frontends document
 /// how each maps onto their pipelines (e.g. shadow resolution tiers).
-#[derive(Debug, Clone, Copy, PartialEq)]
+// bd-tqpj: the tier feature matrix is a flat bag of capability flags; the bool
+// count mirrors the render-tier contract, so the excessive-bools lint is waived.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TierFeatures {
     /// Enable shadow mapping at all.
     pub shadows: bool,
@@ -9677,8 +9710,9 @@ pub enum GovernorAction {
     StepUp,
 }
 
-/// Adaptive frame-time governor: a deterministic closed loop that steps the
-/// quality tier down when the frame budget is blown and back up after
+/// Adaptive frame-time governor: a deterministic closed loop over the quality tier.
+///
+/// The loop steps the tier down when the frame budget is blown and back up after
 /// sustained headroom, with hysteresis and minimum dwell so it cannot flap.
 ///
 /// Determinism contract: transitions are driven ONLY by the injected frame
@@ -9726,7 +9760,7 @@ impl RenderGovernor {
 
     /// The tier the governor currently runs at.
     #[must_use]
-    pub fn current_tier(&self) -> RenderQuality {
+    pub const fn current_tier(&self) -> RenderQuality {
         TIER_LADDER[self.current_ladder_index]
     }
 
@@ -9892,7 +9926,7 @@ pub struct RenderDayNightSettings {
     pub stars: Option<bool>,
 }
 
-/// Terminal-frontend chrome themes (the FrankenTUI `Ctrl+T` rotation set).
+/// Terminal-frontend chrome themes (the `FrankenTUI` `Ctrl+T` rotation set).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiThemeId {
@@ -9929,7 +9963,7 @@ pub enum AccessibilityPalette {
 /// Auto-exposure configuration applied by renderers that support HDR adaption.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RenderAutoExposureSettings {
-    /// Enable/disable the AutoExposure component.
+    /// Enable/disable the `AutoExposure` component.
     pub enabled: bool,
     /// Dark-to-bright adaptation speed; None keeps renderer default.
     #[serde(default)]
@@ -10061,7 +10095,7 @@ impl RenderSettings {
 /// assignments into its environment configuration layer (typed
 /// `SCRIPTBOTS_*` variables and CLI flags still outrank them) and logs one
 /// INFO line per applied mapping so operators learn the canonical knob.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyRenderEnvMapping {
     /// The legacy variable that was read (e.g. `SB_WGPU_BLOOM`).
     pub env_name: &'static str,
@@ -10072,7 +10106,7 @@ pub struct LegacyRenderEnvMapping {
 }
 
 /// A single `config.path = value` assignment from a legacy mapping.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyRenderEnvAssignment {
     /// Dotted configuration path (e.g. `render.post.bloom.enabled`).
     pub path: &'static str,
@@ -10096,10 +10130,11 @@ pub const LEGACY_RENDER_ENV_NAMES: [&str; 11] = [
     "SCRIPTBOTS_RENDER_QUALITY",
 ];
 
-/// Translate one legacy render environment variable into typed-schema
-/// assignments. Returns `None` for unrecognized names or invalid values;
-/// the caller keeps the historical warn-and-skip behavior for invalid
-/// values, naming the variable in its own warning.
+/// Translate one legacy render environment variable into typed-schema assignments.
+///
+/// Returns `None` for unrecognized names or invalid values; the caller keeps the
+/// historical warn-and-skip behavior for invalid values, naming the variable in
+/// its own warning.
 ///
 /// `SCRIPTBOTS_RENDER_QUALITY` is the canonical typed variable for
 /// `render.quality`; it is handled here so the application has exactly one
@@ -10299,6 +10334,9 @@ pub fn parse_render_quality(raw: &str) -> Option<RenderQuality> {
 ///
 /// Accepts `#rrggbb`, `rrggbb`, comma-separated `r,g,b` as either 0-255
 /// integers or 0-1 floats. Returns `None` on any malformed component.
+// bd-tqpj: u32→f32 channel squash is the historical parse contract; the
+// precision-losing cast is pinned (a double-rounding via f64 would drift).
+#[allow(clippy::cast_precision_loss)]
 fn parse_legacy_rgb(raw: &str) -> Option<[f32; 3]> {
     let hex = raw.strip_prefix('#').unwrap_or(raw);
     if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -10337,7 +10375,7 @@ fn parse_legacy_rgb(raw: &str) -> Option<[f32; 3]> {
 }
 
 /// Configuration change audit entry captured in-process.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigAuditEntry {
     /// Tick at which the change was applied.
     pub tick: u64,
@@ -10682,12 +10720,12 @@ const MAX_NEUROFLOW_HIDDEN_LAYERS: usize = 64;
 const MAX_NEUROFLOW_LAYER_NEURONS: usize = 65_536;
 const MAX_NEUROFLOW_NETWORK_WEIGHTS: usize = 1_048_576;
 
-/// Runtime configuration options for NeuroFlow-backed brains.
+/// Runtime configuration options for `NeuroFlow`-backed brains.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NeuroflowSettings {
-    /// Whether NeuroFlow brains are registered at runtime.
+    /// Whether `NeuroFlow` brains are registered at runtime.
     pub enabled: bool,
-    /// Hidden layer sizes supplied to the NeuroFlow network.
+    /// Hidden layer sizes supplied to the `NeuroFlow` network.
     #[serde(deserialize_with = "deserialize_neuroflow_hidden_layers")]
     pub hidden_layers: Vec<usize>,
     /// Activation function applied to the hidden/output layers.
@@ -10781,7 +10819,7 @@ where
     deserializer.deserialize_seq(HiddenLayersVisitor)
 }
 
-/// Supported activation functions for NeuroFlow networks.
+/// Supported activation functions for `NeuroFlow` networks.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum NeuroflowActivationKind {
     /// Hyperbolic tangent activation.
@@ -11471,11 +11509,12 @@ impl FoodGrid {
 
     /// Returns the flat index for `(x, y)` without bounds checks.
     #[inline]
-    fn offset(&self, x: u32, y: u32) -> usize {
+    const fn offset(&self, x: u32, y: u32) -> usize {
         (y as usize) * (self.width as usize) + (x as usize)
     }
 
     /// Immutable access to a specific cell.
+    #[must_use]
     pub fn get(&self, x: u32, y: u32) -> Option<f32> {
         if x < self.width && y < self.height {
             Some(self.cells[self.offset(x, y)])
@@ -11514,7 +11553,12 @@ pub struct TerrainLayer {
 impl TerrainLayer {
     /// Generate a deterministic terrain layer using the supplied RNG.
     // bd-tqpj: bilinear math; fixed-width casts pinned for determinism.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::suboptimal_flops,
+        clippy::imprecise_flops
+    )]
     pub fn generate(
         width: u32,
         height: u32,
@@ -11678,6 +11722,8 @@ impl TerrainLayer {
         }
     }
 
+    // bd-tqpj: toroidal wrap math; fixed-width casts pinned for determinism.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     fn tile_wrapped(&self, x: i32, y: i32) -> &TerrainTile {
         let w = self.width as i32;
         let h = self.height as i32;
@@ -11687,6 +11733,13 @@ impl TerrainLayer {
         &self.tiles[idx]
     }
 
+    // bd-tqpj: bilinear math; fixed-width casts and FP evaluation order pinned
+    // for determinism.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::suboptimal_flops
+    )]
     fn sample_elevation(&self, fx: f32, fy: f32) -> f32 {
         let width = self.width as f32;
         let height = self.height as f32;
@@ -11718,19 +11771,20 @@ impl TerrainLayer {
     /// Returns the elevation gradient (∂e/∂x, ∂e/∂y) in world units.
     // bd-tqpj: bilinear math; fixed-width casts pinned for determinism.
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[must_use]
     pub fn gradient_world(&self, x: f32, y: f32, cell_size: f32) -> (f32, f32) {
         if cell_size <= 0.0 {
             return (0.0, 0.0);
         }
         let fx = x / cell_size;
         let fy = y / cell_size;
-        let e_px = self.sample_elevation(fx + 1.0, fy);
-        let e_mx = self.sample_elevation(fx - 1.0, fy);
-        let e_py = self.sample_elevation(fx, fy + 1.0);
-        let e_my = self.sample_elevation(fx, fy - 1.0);
+        let elev_east = self.sample_elevation(fx + 1.0, fy);
+        let elev_west = self.sample_elevation(fx - 1.0, fy);
+        let elev_north = self.sample_elevation(fx, fy + 1.0);
+        let elev_south = self.sample_elevation(fx, fy - 1.0);
 
-        let grad_x = (e_px - e_mx) * 0.5 / cell_size;
-        let grad_y = (e_py - e_my) * 0.5 / cell_size;
+        let grad_x = (elev_east - elev_west) * 0.5 / cell_size;
+        let grad_y = (elev_north - elev_south) * 0.5 / cell_size;
         (grad_x, grad_y)
     }
 }
@@ -11971,8 +12025,9 @@ pub mod narrative {
         }
 
         /// Run the detectors over the tick history and append anything new.
-        // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
-        #[allow(clippy::too_many_lines)]
+        // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit. The
+        // usize→f64 metric cast is pinned for deterministic series encoding.
+        #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
         pub fn observe<'a, I>(&mut self, history: I, capacity: usize)
         where
             I: Iterator<Item = &'a TickSummary>,
@@ -12018,14 +12073,10 @@ pub mod narrative {
                     EventKind::EnergyRecovery
                 }
             });
-            self.emit_changes(&combat, &params, "spike_hits", capacity, |cp| {
-                if cp.direction == Direction::Up {
-                    EventKind::CombatSurge
-                } else {
-                    // A lull in combat is not a story worth telling; only the
-                    // surge is. Reuse the surge kind and let the dedupe drop it.
-                    EventKind::CombatSurge
-                }
+            self.emit_changes(&combat, &params, "spike_hits", capacity, |_cp| {
+                // A lull in combat is not a story worth telling; only the
+                // surge is. Reuse the surge kind and let the dedupe drop it.
+                EventKind::CombatSurge
             });
 
             let extinction = Threshold {
@@ -12174,7 +12225,7 @@ pub mod narrative {
     }
 
     // bd-tqpj: f64→f32 squash pinned for determinism.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn severity_from(score: f64) -> f32 {
         // The CUSUM statistic is unbounded; squash it into [0,1] so severities
         // are comparable across metrics and rankable by a highlight reel.
@@ -12195,16 +12246,12 @@ pub mod narrative {
         };
         match kind {
             EventKind::PopulationCrash => format!(
-                "population fell {:.0}% ({:.0} -> {:.0})",
+                "population fell {:.0}% ({before:.0} -> {after:.0})",
                 percent.abs(),
-                before,
-                after
             ),
             EventKind::PopulationBoom => format!(
-                "population rose {:.0}% ({:.0} -> {:.0})",
+                "population rose {:.0}% ({before:.0} -> {after:.0})",
                 percent.abs(),
-                before,
-                after
             ),
             EventKind::EnergyCollapse => {
                 format!("mean energy collapsed ({before:.2} -> {after:.2})")
@@ -12212,10 +12259,9 @@ pub mod narrative {
             EventKind::EnergyRecovery => {
                 format!("mean energy recovered ({before:.2} -> {after:.2})")
             }
-            EventKind::CombatSurge => format!(
-                "combat surged ({:.0} -> {:.0} spike hits per tick)",
-                before, after
-            ),
+            EventKind::CombatSurge => {
+                format!("combat surged ({before:.0} -> {after:.0} spike hits per tick)")
+            }
             EventKind::Extinction => "population reached zero".to_owned(),
             EventKind::RegimeChange => format!("{metric} dynamics changed"),
         }
@@ -12441,16 +12487,19 @@ mod map_sandbox {
         }
 
         /// Field width in cells.
-        pub fn width(&self) -> u32 {
+        #[must_use]
+        pub const fn width(&self) -> u32 {
             self.width
         }
 
         /// Field height in cells.
-        pub fn height(&self) -> u32 {
+        #[must_use]
+        pub const fn height(&self) -> u32 {
             self.height
         }
 
         /// Row-major cell values, exactly `width * height` long.
+        #[must_use]
         pub fn values(&self) -> &[f32] {
             &self.values
         }
@@ -12531,16 +12580,19 @@ mod map_sandbox {
         }
 
         /// Layer width in cells.
-        pub fn width(&self) -> u32 {
+        #[must_use]
+        pub const fn width(&self) -> u32 {
             self.width
         }
 
         /// Layer height in cells.
-        pub fn height(&self) -> u32 {
+        #[must_use]
+        pub const fn height(&self) -> u32 {
             self.height
         }
 
         /// Row-major per-cell hydrology parameters, exactly `width * height` long.
+        #[must_use]
         pub fn tiles(&self) -> &[HydrologyTile] {
             &self.tiles
         }
@@ -12633,36 +12685,43 @@ mod map_sandbox {
         }
 
         /// Field width in cells.
-        pub fn width(&self) -> u32 {
+        #[must_use]
+        pub const fn width(&self) -> u32 {
             self.width
         }
 
         /// Field height in cells.
-        pub fn height(&self) -> u32 {
+        #[must_use]
+        pub const fn height(&self) -> u32 {
             self.height
         }
 
         /// Row-major outflow direction per cell.
+        #[must_use]
         pub fn flow_directions(&self) -> &[HydrologyFlowDirection] {
             &self.flow_directions
         }
 
         /// Row-major flow accumulation (upstream contributing area) per cell.
+        #[must_use]
         pub fn accumulation(&self) -> &[f32] {
             &self.accumulation
         }
 
         /// Row-major elevation at which a cell spills into its outflow neighbor.
+        #[must_use]
         pub fn spill_elevation(&self) -> &[f32] {
             &self.spill_elevation
         }
 
         /// Row-major drainage-basin identifier per cell.
+        #[must_use]
         pub fn basin_ids(&self) -> &[u32] {
             &self.basin_ids
         }
 
         /// Row-major starting water depth per cell.
+        #[must_use]
         pub fn initial_water_depth(&self) -> &[f32] {
             &self.initial_water_depth
         }
@@ -12741,32 +12800,38 @@ mod map_sandbox {
         }
 
         /// The generated terrain layer.
-        pub fn terrain(&self) -> &TerrainLayer {
+        #[must_use]
+        pub const fn terrain(&self) -> &TerrainLayer {
             &self.terrain
         }
 
         /// Optional per-cell fertility field.
-        pub fn fertility(&self) -> Option<&ScalarField> {
+        #[must_use]
+        pub const fn fertility(&self) -> Option<&ScalarField> {
             self.fertility.as_ref()
         }
 
         /// Optional per-cell temperature field.
-        pub fn temperature(&self) -> Option<&ScalarField> {
+        #[must_use]
+        pub const fn temperature(&self) -> Option<&ScalarField> {
             self.temperature.as_ref()
         }
 
         /// Optional per-cell hydrology parameters; present iff [`MapArtifact::hydrology_field`] is.
-        pub fn hydrology_tiles(&self) -> Option<&HydrologyTileLayer> {
+        #[must_use]
+        pub const fn hydrology_tiles(&self) -> Option<&HydrologyTileLayer> {
             self.hydrology_tiles.as_ref()
         }
 
         /// Optional hydrology solution; present iff [`MapArtifact::hydrology_tiles`] is.
-        pub fn hydrology_field(&self) -> Option<&HydrologyField> {
+        #[must_use]
+        pub const fn hydrology_field(&self) -> Option<&HydrologyField> {
             self.hydrology_field.as_ref()
         }
 
         /// Provenance record for the generation run.
-        pub fn metadata(&self) -> &MapArtifactMetadata {
+        #[must_use]
+        pub const fn metadata(&self) -> &MapArtifactMetadata {
             &self.metadata
         }
 
@@ -12930,13 +12995,15 @@ mod map_sandbox {
 
         /// Override how many collapse attempts [`RuleBasedMapGenerator::generate`]
         /// makes before reporting [`MapGenerationError::Contradiction`].
-        pub fn with_retry_budget(mut self, retries: usize) -> Self {
+        #[must_use]
+        pub const fn with_retry_budget(mut self, retries: usize) -> Self {
             self.retry_budget = retries;
             self
         }
 
         /// The tileset specification this generator was built from.
-        pub fn spec(&self) -> &TilesetSpec {
+        #[must_use]
+        pub const fn spec(&self) -> &TilesetSpec {
             &self.spec
         }
 
@@ -12946,6 +13013,8 @@ mod map_sandbox {
         /// internally on contradiction up to the configured retry budget.
         // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
         #[allow(clippy::too_many_lines)]
+        // bd-tqpj: pinned FP evaluation order; fma fusion would alter generated-map bytes.
+        #[allow(clippy::suboptimal_flops)]
         pub fn generate(
             &self,
             width: u32,
@@ -13120,10 +13189,10 @@ mod map_sandbox {
     fn compile_tile(tile: &TileSpec) -> Result<CompiledTile, MapGenerationError> {
         let elevation = tile
             .elevation
-            .unwrap_or(default_elevation_for_kind(tile.terrain_kind));
+            .unwrap_or_else(|| default_elevation_for_kind(tile.terrain_kind));
         let moisture = tile
             .moisture
-            .unwrap_or(default_moisture_for_kind(tile.terrain_kind));
+            .unwrap_or_else(|| default_moisture_for_kind(tile.terrain_kind));
         let fertility_bias = tile
             .fertility_bias
             .unwrap_or_else(|| default_tile_fertility_bias(tile.terrain_kind, elevation, moisture));
@@ -13131,22 +13200,22 @@ mod map_sandbox {
         let accent = tile.accent.unwrap_or(0.5);
         let palette_index = tile
             .palette_index
-            .unwrap_or(default_tile_palette_index(tile.terrain_kind));
+            .unwrap_or_else(|| default_tile_palette_index(tile.terrain_kind));
         let permeability = tile
             .permeability
-            .unwrap_or(default_permeability_for_kind(tile.terrain_kind));
+            .unwrap_or_else(|| default_permeability_for_kind(tile.terrain_kind));
         let runoff_bias = tile
             .runoff_bias
-            .unwrap_or(default_runoff_bias_for_kind(tile.terrain_kind));
+            .unwrap_or_else(|| default_runoff_bias_for_kind(tile.terrain_kind));
         let basin_rank = tile
             .basin_rank
-            .unwrap_or(default_basin_rank_for_kind(tile.terrain_kind));
+            .unwrap_or_else(|| default_basin_rank_for_kind(tile.terrain_kind));
         let channel_priority = tile
             .channel_priority
-            .unwrap_or(default_channel_priority_for_kind(tile.terrain_kind));
+            .unwrap_or_else(|| default_channel_priority_for_kind(tile.terrain_kind));
         let swim_cost = tile
             .swim_cost
-            .unwrap_or(default_swim_cost_for_kind(tile.terrain_kind));
+            .unwrap_or_else(|| default_swim_cost_for_kind(tile.terrain_kind));
 
         for (field, value) in [
             ("fertility_bias", fertility_bias),
@@ -13278,7 +13347,12 @@ mod map_sandbox {
     }
 
     // bd-tqpj: splitmix64 bit-mixing; wrapping casts pinned for determinism.
-    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
     fn coordinate_noise(seed: u64, coord: Coord) -> f32 {
         let mut value = seed
             .wrapping_mul(0x9e37_79b1_85eb_ca87)
@@ -13395,8 +13469,14 @@ mod map_sandbox {
 
         characterization_fnv1a64(&bytes)
     }
-    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
-    #[allow(clippy::too_many_lines)]
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit. Fixed-width
+    // grid casts and FP evaluation order pinned for deterministic hydrology.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::suboptimal_flops
+    )]
     fn compute_hydrology_field(
         width: u32,
         height: u32,
@@ -13601,8 +13681,7 @@ mod map_sandbox {
     fn current_epoch_ms() -> u128 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|dur| dur.as_millis())
-            .unwrap_or(0)
+            .map_or(0, |dur| dur.as_millis())
     }
 
     #[cfg(test)]
@@ -14334,31 +14413,31 @@ impl HydrologyState {
 
     /// Borrow the imported hydrology tile layer.
     #[must_use]
-    pub fn tiles(&self) -> &HydrologyTileLayer {
+    pub const fn tiles(&self) -> &HydrologyTileLayer {
         &self.tiles
     }
 
     /// Borrow the imported hydrology flow field.
     #[must_use]
-    pub fn field(&self) -> &HydrologyField {
+    pub const fn field(&self) -> &HydrologyField {
         &self.field
     }
 
     /// Grid width in cells.
     #[must_use]
-    pub fn width(&self) -> u32 {
+    pub const fn width(&self) -> u32 {
         self.tiles.width()
     }
 
     /// Grid height in cells.
     #[must_use]
-    pub fn height(&self) -> u32 {
+    pub const fn height(&self) -> u32 {
         self.tiles.height()
     }
 
     /// Total number of hydrology cells.
     #[must_use]
-    pub fn cell_count(&self) -> usize {
+    pub const fn cell_count(&self) -> usize {
         self.water_depth.len()
     }
 
@@ -14446,8 +14525,13 @@ impl From<&FoodCellProfile> for FoodCellProfileSnapshot {
 
 impl FoodCellProfile {
     // bd-tqpj: fixed-width casts and FP evaluation order pinned for determinism.
-    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
-    fn compute(config: &ScriptBotsConfig, terrain: &TerrainLayer) -> Vec<FoodCellProfile> {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::suboptimal_flops,
+        clippy::imprecise_flops
+    )]
+    fn compute(config: &ScriptBotsConfig, terrain: &TerrainLayer) -> Vec<Self> {
         let width = terrain.width() as usize;
         let height = terrain.height() as usize;
         if width == 0 || height == 0 {
@@ -14485,7 +14569,7 @@ impl FoodCellProfile {
                 let decay_multiplier = (1.0 + (1.0 - fertility) * decay_scale).max(0.0);
                 let nutrient_density = (0.3 + fertility * 0.7).clamp(0.0, 1.0);
 
-                profiles.push(FoodCellProfile {
+                profiles.push(Self {
                     capacity: config.food_max * capacity_factor,
                     growth_multiplier,
                     decay_multiplier,
@@ -14528,19 +14612,19 @@ impl TickCadence {
         }
     }
 
-    fn should_age(&self, tick: Tick) -> bool {
+    const fn should_age(&self, tick: Tick) -> bool {
         self.aging_interval > 0 && tick.0.is_multiple_of(self.aging_interval as u64)
     }
 
-    fn should_emit_chart_event(&self, tick: Tick) -> bool {
+    const fn should_emit_chart_event(&self, tick: Tick) -> bool {
         self.chart_interval > 0 && tick.0.is_multiple_of(self.chart_interval as u64)
     }
 
-    fn reproduction_window(&self, tick: Tick) -> bool {
+    const fn reproduction_window(&self, tick: Tick) -> bool {
         self.reproduction_interval == 0 || tick.0.is_multiple_of(self.reproduction_interval as u64)
     }
 
-    fn reproduction_chance(&self) -> f32 {
+    const fn reproduction_chance(&self) -> f32 {
         self.reproduction_chance
     }
 }
@@ -14556,7 +14640,7 @@ struct PersistenceRuntimeTail {
 }
 
 impl PersistenceRuntimeTail {
-    fn capture(agent_uid: AgentUid, runtime: &AgentRuntime) -> Self {
+    const fn capture(agent_uid: AgentUid, runtime: &AgentRuntime) -> Self {
         Self {
             agent_uid,
             food_delta: runtime.food_delta,
@@ -14567,7 +14651,7 @@ impl PersistenceRuntimeTail {
         }
     }
 
-    fn restore_into(self, runtime: &mut AgentRuntime) {
+    const fn restore_into(self, runtime: &mut AgentRuntime) {
         runtime.food_delta = self.food_delta;
         runtime.spiked = self.spiked;
         runtime.sound_output = self.sound_output;
@@ -14659,6 +14743,9 @@ pub struct WorldState {
     resource_ledger: ResourceLedgerState,
 }
 
+// bd-tqpj: intentional curated summary — a full-field Debug would dump entire world
+// buffers into logs; the omitted fields are deliberate, so the lint is waived.
+#[allow(clippy::missing_fields_in_debug)]
 impl fmt::Debug for WorldState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorldState")
@@ -14858,7 +14945,7 @@ impl WorldState {
         }
     }
 
-    /// Make the dense SoA layout match stable logical identity before any tick work begins.
+    /// Make the dense `SoA` layout match stable logical identity before any tick work begins.
     ///
     /// Normal monotonic insertion and stable removal keep this invariant, so the hot path pays
     /// only one branch. A checkpoint restore or test that materializes the same scientific world
@@ -14968,7 +15055,7 @@ impl WorldState {
         if interval == 0 {
             return None;
         }
-        if !next_tick.0.is_multiple_of(interval as u64) {
+        if !next_tick.0.is_multiple_of(u64::from(interval)) {
             return None;
         }
         let width = self.food.width();
@@ -15043,7 +15130,7 @@ impl WorldState {
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
         for effect in &self.active_effects {
-            if let ActiveEffectKind::Embargo = effect.kind
+            if effect.kind == ActiveEffectKind::Embargo
                 && effect.region.contains(x, y, world_width, world_height)
             {
                 return 0.0;
@@ -15525,7 +15612,7 @@ impl WorldState {
                 let eye_b = channels.blue;
                 let smell = channels.smell;
                 let sound = channels.sound;
-                let hearing = channels.hearing;
+                let hearing_channel = channels.hearing;
                 let blood = channels.blood;
 
                 let cell_x =
@@ -15553,7 +15640,7 @@ impl WorldState {
                 sensors[15] = clamp01(eye_b[2]);
                 sensors[16] = (tick_value / clocks[idx][0].max(1.0)).sin().abs();
                 sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
-                sensors[18] = clamp01(hearing);
+                sensors[18] = clamp01(hearing_channel);
                 sensors[19] = clamp01(blood);
                 let env_temperature = sample_temperature(&self.config, position.x);
                 let discomfort =
@@ -15708,7 +15795,7 @@ impl WorldState {
         let eye_b = accumulator.blue.map(sense_fixed::from_fixed);
         let smell = sense_fixed::from_fixed(accumulator.smell) * traits.smell;
         let sound = sense_fixed::from_fixed(accumulator.sound) * traits.sound;
-        let hearing = sense_fixed::from_fixed(accumulator.hearing) * traits.hearing;
+        let hearing_channel = sense_fixed::from_fixed(accumulator.hearing) * traits.hearing;
         let blood = sense_fixed::from_fixed(accumulator.blood) * traits.blood;
 
         let cell_size = self.config.food_cell_size as f32;
@@ -15745,7 +15832,7 @@ impl WorldState {
         raw[15] = eye_b[2];
         raw[16] = (tick_value / clocks[0].max(1.0)).sin().abs();
         raw[17] = (tick_value / clocks[1].max(1.0)).sin().abs();
-        raw[18] = hearing;
+        raw[18] = hearing_channel;
         raw[19] = blood;
         raw[20] = discomfort;
         raw[21] = density[3];
@@ -16134,6 +16221,9 @@ impl WorldState {
         next_heading
     }
 
+    // bd-tqpj: manual midpoint form is pinned to the legacy wheel-effort contract;
+    // `f32::midpoint` reassociates and would alter digests.
+    #[allow(clippy::manual_midpoint)]
     fn legacy_locomotion_step(
         position: Position,
         heading: f32,
@@ -16175,6 +16265,9 @@ impl WorldState {
         }
     }
 
+    // bd-tqpj: manual midpoint forms are pinned to the legacy locomotion contract;
+    // `f32::midpoint` reassociates and would alter digests.
+    #[allow(clippy::manual_midpoint)]
     fn actuation_locomotion(
         position: Position,
         heading: f32,
@@ -16270,19 +16363,6 @@ impl WorldState {
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
     fn stage_actuation(&mut self) {
-        let width = self.config.world_width as f32;
-        let height = self.config.world_height as f32;
-        let bot_speed = self.config.bot_speed.max(0.0);
-        let bot_radius = self.config.bot_radius;
-        let locomotion_model = self.config.locomotion_model;
-        let boost_multiplier = self.config.boost_multiplier.max(1.0);
-        let spike_growth = self.config.spike_growth_rate.max(0.0);
-        let movement_drain = self.config.movement_drain;
-        let metabolism_drain = self.config.metabolism_drain;
-        let ramp_floor = self.config.metabolism_ramp_floor;
-        let ramp_rate = self.config.metabolism_ramp_rate;
-        let boost_penalty = self.config.metabolism_boost_penalty.max(0.0);
-
         #[derive(Copy, Clone)]
         struct DecodedOutputs {
             left: f32,
@@ -16312,6 +16392,19 @@ impl WorldState {
                 give_intent: outputs.channel_clamped(OutputChannel::GiveIntent),
             }
         }
+
+        let width = self.config.world_width as f32;
+        let height = self.config.world_height as f32;
+        let bot_speed = self.config.bot_speed.max(0.0);
+        let bot_radius = self.config.bot_radius;
+        let locomotion_model = self.config.locomotion_model;
+        let boost_multiplier = self.config.boost_multiplier.max(1.0);
+        let spike_growth = self.config.spike_growth_rate.max(0.0);
+        let movement_drain = self.config.movement_drain;
+        let metabolism_drain = self.config.metabolism_drain;
+        let ramp_floor = self.config.metabolism_ramp_floor;
+        let ramp_rate = self.config.metabolism_ramp_rate;
+        let boost_penalty = self.config.metabolism_boost_penalty.max(0.0);
 
         // Reuse handles buffer
         self.work_handles.clear();
@@ -16746,23 +16839,19 @@ impl WorldState {
                 let p0 = self
                     .runtime
                     .get(idxs[0])
-                    .map(|r| r.temperature_preference)
-                    .unwrap_or(0.5);
+                    .map_or(0.5, |r| r.temperature_preference);
                 let p1 = self
                     .runtime
                     .get(idxs[1])
-                    .map(|r| r.temperature_preference)
-                    .unwrap_or(0.5);
+                    .map_or(0.5, |r| r.temperature_preference);
                 let p2 = self
                     .runtime
                     .get(idxs[2])
-                    .map(|r| r.temperature_preference)
-                    .unwrap_or(0.5);
+                    .map_or(0.5, |r| r.temperature_preference);
                 let p3 = self
                     .runtime
                     .get(idxs[3])
-                    .map(|r| r.temperature_preference)
-                    .unwrap_or(0.5);
+                    .map_or(0.5, |r| r.temperature_preference);
 
                 let t_v = f32x4::new([t0, t1, t2, t3]);
                 let p_v = f32x4::new([p0, p1, p2, p3]);
@@ -16861,7 +16950,7 @@ impl WorldState {
         }
     }
 
-    fn stage_accumulate_tick_events(&mut self) {
+    const fn stage_accumulate_tick_events(&mut self) {
         self.pending_birth_events = self.pending_birth_events.saturating_add(self.last_births);
         self.pending_death_events = self.pending_death_events.saturating_add(self.last_deaths);
         self.pending_spike_attempt_events = self
@@ -16877,7 +16966,7 @@ impl WorldState {
         // already owe. This preserves a non-cadence-aligned final tick without allocating and
         // copying a second full agent map on every simulation tick.
         self.pending_persistence_runtime_tail.clear();
-        for (agent_id, runtime) in self.runtime.iter_mut() {
+        for (agent_id, runtime) in &mut self.runtime {
             if preserve_persistence_tail {
                 let agent_uid = self
                     .identities
@@ -17206,7 +17295,7 @@ impl WorldState {
     /// run (proved by `narrative_layer_does_not_perturb_the_simulation`).
     fn stage_narrative(&mut self, next_tick: Tick) {
         let interval = self.config.narrative_interval;
-        if interval == 0 || !next_tick.0.is_multiple_of(interval as u64) {
+        if interval == 0 || !next_tick.0.is_multiple_of(u64::from(interval)) {
             return;
         }
         self.narrative
@@ -17215,12 +17304,13 @@ impl WorldState {
 
     /// Recently detected narrative events, oldest first.
     #[must_use]
-    pub fn narrative_events(&self) -> &VecDeque<narrative::EventRecord> {
+    pub const fn narrative_events(&self) -> &VecDeque<narrative::EventRecord> {
         self.narrative.events()
     }
 
-    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
-    #[allow(clippy::too_many_lines)]
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit. The manual
+    // midpoint form is pinned: `f32::midpoint` reassociates and would alter digests.
+    #[allow(clippy::too_many_lines, clippy::manual_midpoint)]
     fn stage_food(&mut self) -> FoodResourceActivity {
         let mut activity = FoodResourceActivity::default();
         let cell_size = self.config.food_cell_size as f32;
@@ -17273,16 +17363,19 @@ impl WorldState {
                             let base_intake = available.min(intake_rate);
                             let waste = available.min(waste_rate);
                             let herbivore = clamp01(runtime.herbivore_tendency);
-                            let mut intake = 0.0;
-                            if herbivore > 0.0 && base_intake > 0.0 && embargo_scale > 0.0 {
-                                let left =
-                                    runtime.outputs.channel_clamped(OutputChannel::WheelLeft);
-                                let right =
-                                    runtime.outputs.channel_clamped(OutputChannel::WheelRight);
-                                let average_speed = (left.abs() + right.abs()) * 0.5;
-                                let speed_scale = (1.0 - average_speed).clamp(0.0, 1.0) * 0.7 + 0.3;
-                                intake = base_intake * herbivore * speed_scale * embargo_scale;
-                            }
+                            let intake =
+                                if herbivore > 0.0 && base_intake > 0.0 && embargo_scale > 0.0 {
+                                    let left =
+                                        runtime.outputs.channel_clamped(OutputChannel::WheelLeft);
+                                    let right =
+                                        runtime.outputs.channel_clamped(OutputChannel::WheelRight);
+                                    let average_speed = (left.abs() + right.abs()) * 0.5;
+                                    let speed_scale =
+                                        (1.0 - average_speed).clamp(0.0, 1.0) * 0.7 + 0.3;
+                                    base_intake * herbivore * speed_scale * embargo_scale
+                                } else {
+                                    0.0
+                                };
                             if waste > 0.0 {
                                 *cell = (available - waste).max(0.0);
                             }
@@ -17450,7 +17543,7 @@ impl WorldState {
         let state = adapter
             .initial_state(&genome, rng)
             .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
-        Self::instantiate_protocol_binding(adapter, key, kind, genome, state).map(Some)
+        Self::instantiate_protocol_binding(adapter, key, kind, genome, &state).map(Some)
     }
 
     fn instantiate_protocol_binding(
@@ -17458,9 +17551,9 @@ impl WorldState {
         key: u64,
         kind: String,
         genome: BrainGenomeEnvelope,
-        state: BrainEvaluatorStateEnvelope,
+        state: &BrainEvaluatorStateEnvelope,
     ) -> Result<BrainBinding, BrainSpawnError> {
-        let evaluator = Self::reconstruct_protocol_evaluator(adapter, &genome, &state)
+        let evaluator = Self::reconstruct_protocol_evaluator(adapter, &genome, state)
             .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
         Ok(BrainBinding::protocol(key, kind, genome, evaluator))
     }
@@ -17520,7 +17613,7 @@ impl WorldState {
                 },
             ));
         }
-        let parent_uid = self
+        let parent_agent_uid = self
             .agent_uid(parent_id)
             .expect("live brain parent must have stable identity");
         let parent_state = parent_runtime
@@ -17567,7 +17660,10 @@ impl WorldState {
             None
         };
 
-        let parents = [Some(parent_uid), partner.as_ref().map(|(_, _, uid)| *uid)];
+        let parents = [
+            Some(parent_agent_uid),
+            partner.as_ref().map(|(_, _, uid)| *uid),
+        ];
         let parent_genome_hashes = [
             Some(parent_genome.material_hash()),
             partner
@@ -17657,16 +17753,17 @@ impl WorldState {
                     ));
                 }
             }
-            OffspringStatePolicy::Blend if parent_states.is_empty() => {
-                return Err(BrainSpawnError::new(
-                    kind,
-                    BrainProtocolError::ParentStateUnavailable {
-                        index: 0,
-                        available: 0,
-                    },
-                ));
+            OffspringStatePolicy::Blend => {
+                if parent_states.is_empty() {
+                    return Err(BrainSpawnError::new(
+                        kind,
+                        BrainProtocolError::ParentStateUnavailable {
+                            index: 0,
+                            available: 0,
+                        },
+                    ));
+                }
             }
-            OffspringStatePolicy::Blend => {}
         }
         let state_parents = match state_policy {
             OffspringStatePolicy::Reset => &[][..],
@@ -17687,7 +17784,7 @@ impl WorldState {
         let child_state = adapter
             .offspring_state(&child_genome, state_parents, &mut state_rng)
             .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
-        Self::instantiate_protocol_binding(adapter, key, kind, child_genome, child_state).map(Some)
+        Self::instantiate_protocol_binding(adapter, key, kind, child_genome, &child_state).map(Some)
     }
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
@@ -17773,9 +17870,8 @@ impl WorldState {
         let columns = self.agents.columns();
         let parent_data = columns.snapshot(parent_index);
         let partner_data = columns.snapshot(partner_index);
-        let parent_runtime = match self.runtime.get(parent_id).cloned() {
-            Some(rt) => rt,
-            None => return Ok(None),
+        let Some(parent_runtime) = self.runtime.get(parent_id).cloned() else {
+            return Ok(None);
         };
         let partner_runtime = self.runtime.get(partner_id).cloned();
 
@@ -17800,10 +17896,10 @@ impl WorldState {
 
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
-        let parent_uid = self
+        let parent_agent_uid = self
             .agent_uid(parent_id)
             .expect("live crossover parent must have stable identity");
-        let partner_uid = self
+        let partner_agent_uid = self
             .agent_uid(partner_id)
             .expect("live crossover partner must have stable identity");
         let counters_before = self
@@ -17811,7 +17907,7 @@ impl WorldState {
             .get(parent_id)
             .copied()
             .ok_or_else(|| ScientificStateError::MissingAgentRngCounters {
-                path: format!("agents[uid={}].rng_counters", parent_uid.get()),
+                path: format!("agents[uid={}].rng_counters", parent_agent_uid.get()),
             })?;
         if !agent_counter_rollbacks
             .iter()
@@ -17824,9 +17920,9 @@ impl WorldState {
             .get_mut(parent_id)
             .expect("counter presence was checked above")
             .take_birth()
-            .map_err(|error| Self::agent_rng_counter_error(parent_uid, error))?;
+            .map_err(|error| Self::agent_rng_counter_error(parent_agent_uid, error))?;
         let offspring_rng_identity =
-            OffspringRngIdentityV1::new(parent_uid, Some(partner_uid), birth_ordinal);
+            OffspringRngIdentityV1::new(parent_agent_uid, Some(partner_agent_uid), birth_ordinal);
         let mut population_rng = offspring_substream(
             self.rng.root_seed(),
             offspring_rng_identity,
@@ -17842,7 +17938,7 @@ impl WorldState {
             offspring_rng_identity,
             OffspringRngOperationV1::RuntimeMutation,
         );
-        let child_data = self.build_child_data(
+        let child_data = Self::build_child_data(
             &parent_data,
             Some(&partner_data),
             self.config.reproduction_spawn_jitter,
@@ -17939,9 +18035,7 @@ impl WorldState {
                 key,
             )?
             else {
-                return Err(
-                    BrainSpawnError::new(parent_kind.clone(), MissingBrainFactory { key }).into(),
-                );
+                return Err(BrainSpawnError::new(parent_kind, MissingBrainFactory { key }).into());
             };
             child_runtime.brain = binding;
         } else if parent_was_bound {
@@ -17992,7 +18086,7 @@ impl WorldState {
         let minimum = self.config.population_minimum;
         let interval = self.config.population_spawn_interval;
         let minimum_requires_spawn = minimum > 0 && self.agents.len() < minimum;
-        let scheduled_spawn = interval != 0 && next_tick.0.is_multiple_of(interval as u64);
+        let scheduled_spawn = interval != 0 && next_tick.0.is_multiple_of(u64::from(interval));
         if !minimum_requires_spawn && !scheduled_spawn {
             return Ok(None);
         }
@@ -18341,26 +18435,26 @@ impl WorldState {
                         let a1 = chunk[1];
                         let a2 = chunk[2];
                         let a3 = chunk[3];
-                        let dx_arr = [
+                        let x_delta_arr = [
                             Self::wrap_delta(origin.x, positions[a0].x, world_w),
                             Self::wrap_delta(origin.x, positions[a1].x, world_w),
                             Self::wrap_delta(origin.x, positions[a2].x, world_w),
                             Self::wrap_delta(origin.x, positions[a3].x, world_w),
                         ];
-                        let dy_arr = [
+                        let y_delta_arr = [
                             Self::wrap_delta(origin.y, positions[a0].y, world_h),
                             Self::wrap_delta(origin.y, positions[a1].y, world_h),
                             Self::wrap_delta(origin.y, positions[a2].y, world_h),
                             Self::wrap_delta(origin.y, positions[a3].y, world_h),
                         ];
-                        let dx_v = f32x4::new(dx_arr);
-                        let dy_v = f32x4::new(dy_arr);
-                        let dist_sq_v = dx_v * dx_v + dy_v * dy_v;
+                        let x_delta_v = f32x4::new(x_delta_arr);
+                        let y_delta_v = f32x4::new(y_delta_arr);
+                        let dist_sq_v = x_delta_v * x_delta_v + y_delta_v * y_delta_v;
                         let dist_v = dist_sq_v.sqrt();
-                        let dir_x_v = dx_v / dist_v;
-                        let dir_y_v = dy_v / dist_v;
+                        let x_dir_v = x_delta_v / dist_v;
+                        let y_dir_v = y_delta_v / dist_v;
                         let align_v =
-                            dir_x_v * f32x4::splat(facing.0) + dir_y_v * f32x4::splat(facing.1);
+                            x_dir_v * f32x4::splat(facing.0) + y_dir_v * f32x4::splat(facing.1);
                         // Build lane mask for (not self) && (dist within reach) && (alignment >= threshold)
                         let dist_sq_arr = dist_sq_v.to_array();
                         let align_arr = align_v.to_array();
@@ -18651,16 +18745,16 @@ impl WorldState {
                 for (chunk_i, chunk) in handle_chunks.iter().enumerate() {
                     let base = chunk_i * 4;
                     let ids = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    let mut dx_arr = [0.0_f32; 4];
-                    let mut dy_arr = [0.0_f32; 4];
+                    let mut x_delta_arr = [0.0_f32; 4];
+                    let mut y_delta_arr = [0.0_f32; 4];
                     for lane in 0..4 {
                         let idx = base + lane;
-                        dx_arr[lane] = toroidal_delta(positions[idx].x, victim_pos.x, width);
-                        dy_arr[lane] = toroidal_delta(positions[idx].y, victim_pos.y, height);
+                        x_delta_arr[lane] = toroidal_delta(positions[idx].x, victim_pos.x, width);
+                        y_delta_arr[lane] = toroidal_delta(positions[idx].y, victim_pos.y, height);
                     }
-                    let dx_v = f32x4::new(dx_arr);
-                    let dy_v = f32x4::new(dy_arr);
-                    let dist2_v = dx_v * dx_v + dy_v * dy_v;
+                    let x_delta_v = f32x4::new(x_delta_arr);
+                    let y_delta_v = f32x4::new(y_delta_arr);
+                    let dist2_v = x_delta_v * x_delta_v + y_delta_v * y_delta_v;
                     let dist2 = dist2_v.to_array();
                     for lane in 0..4 {
                         let idx = base + lane;
@@ -18931,7 +19025,7 @@ impl WorldState {
             && self.config.population_spawn_interval != 0
             && next_tick
                 .0
-                .is_multiple_of(self.config.population_spawn_interval as u64)
+                .is_multiple_of(u64::from(self.config.population_spawn_interval))
             && self.config.population_crossover_chance > 0.0
             && self.agents.len() >= 2;
         if natural_crossover_or_birth || scheduled_crossover {
@@ -18977,9 +19071,8 @@ impl WorldState {
         let ages: Vec<u32> = columns.ages().to_vec();
         for (idx, agent_id) in handles.iter().enumerate() {
             {
-                let runtime = match self.runtime.get_mut(*agent_id) {
-                    Some(rt) => rt,
-                    None => continue,
+                let Some(runtime) = self.runtime.get_mut(*agent_id) else {
+                    continue;
                 };
                 let herb = runtime.herbivore_tendency.clamp(0.0, 1.0);
                 let reproduction_rate = rate_carnivore + (rate_herbivore - rate_carnivore) * herb;
@@ -19062,13 +19155,10 @@ impl WorldState {
             };
             let offspring_rng_identity =
                 OffspringRngIdentityV1::new(parent_uid, partner_uid, birth_ordinal);
-            let parent_runtime_snapshot = match self.runtime.get(*agent_id).cloned() {
-                Some(runtime) => runtime,
-                None => {
-                    self.agent_rng_counters
-                        .insert(*agent_id, parent_rng_counters_before_attempt);
-                    continue;
-                }
+            let Some(parent_runtime_snapshot) = self.runtime.get(*agent_id).cloned() else {
+                self.agent_rng_counters
+                    .insert(*agent_id, parent_rng_counters_before_attempt);
+                continue;
             };
             let parent_energy_before_debit = parent_runtime_snapshot.energy;
             let parent_reproduction_counter_before_reset =
@@ -19089,7 +19179,7 @@ impl WorldState {
                 OffspringRngOperationV1::RuntimeMutation,
             );
             let child = (|| {
-                let data = self.build_child_data(
+                let data = Self::build_child_data(
                     &parent_snapshots[idx],
                     partner_data.as_ref(),
                     jitter,
@@ -19335,7 +19425,6 @@ impl WorldState {
     }
     #[allow(clippy::too_many_arguments)]
     fn build_child_data(
-        &self,
         parent: &AgentData,
         partner: Option<&AgentData>,
         jitter: f32,
@@ -19355,20 +19444,20 @@ impl WorldState {
         };
         let mut child = *parent;
         let heading = parent.heading;
-        let base_dx = -heading.cos() * back_offset;
-        let base_dy = -heading.sin() * back_offset;
-        let jitter_dx = if jitter > 0.0 {
+        let backstep_x = -heading.cos() * back_offset;
+        let backstep_y = -heading.sin() * back_offset;
+        let jitter_x = if jitter > 0.0 {
             population_rng.random_range(-jitter..jitter)
         } else {
             0.0
         };
-        let jitter_dy = if jitter > 0.0 {
+        let jitter_y = if jitter > 0.0 {
             population_rng.random_range(-jitter..jitter)
         } else {
             0.0
         };
-        child.position.x = Self::wrap_position(parent.position.x + base_dx + jitter_dx, width);
-        child.position.y = Self::wrap_position(parent.position.y + base_dy + jitter_dy, height);
+        child.position.x = Self::wrap_position(parent.position.x + backstep_x + jitter_x, width);
+        child.position.y = Self::wrap_position(parent.position.y + backstep_y + jitter_y, height);
         child.velocity = Velocity::default();
         child.heading = wrap_signed_angle(parent.heading + population_rng.random_range(-0.2..0.2));
         child.health = 1.0;
@@ -19563,10 +19652,7 @@ impl WorldState {
                 runtime.temperature_preference,
             );
 
-            runtime.push_gene_log(
-                gene_log_capacity,
-                format!("hybrid crossover ({:.2})", blend),
-            );
+            runtime.push_gene_log(gene_log_capacity, format!("hybrid crossover ({blend:.2})"));
         } else {
             runtime.hybrid = false;
             runtime.lineage[1] = None;
@@ -19711,7 +19797,7 @@ impl WorldState {
                     4.5,
                 );
                 runtime.eye_fov[i] = after;
-                runtime.log_change(gene_log_capacity, &format!("eye_fov{}", i), before, after);
+                runtime.log_change(gene_log_capacity, &format!("eye_fov{i}"), before, after);
             }
             for i in 0..runtime.eye_direction.len() {
                 let before = runtime.eye_direction[i];
@@ -19727,7 +19813,7 @@ impl WorldState {
                 if (after - before).abs() > 1e-4 {
                     runtime.push_gene_log(
                         gene_log_capacity,
-                        format!("eye_dir{}: {:.3}->{:.3}", i, before, after),
+                        format!("eye_dir{i}: {before:.3}->{after:.3}"),
                     );
                 }
             }
@@ -19801,7 +19887,7 @@ impl WorldState {
         if !force_partial_batch
             && !next_tick
                 .0
-                .is_multiple_of(self.config.persistence_interval as u64)
+                .is_multiple_of(u64::from(self.config.persistence_interval))
         {
             if analytics.lifecycle_events == 0 {
                 self.pending_lifecycle_birth_metrics.clear();
@@ -19811,17 +19897,20 @@ impl WorldState {
         }
 
         let macro_enabled = analytics.macro_metrics != 0
-            && (force_partial_batch || next_tick.0.is_multiple_of(analytics.macro_metrics as u64));
+            && (force_partial_batch
+                || next_tick
+                    .0
+                    .is_multiple_of(u64::from(analytics.macro_metrics)));
         let behavior_enabled = analytics.behavior_metrics != 0
             && (force_partial_batch
                 || next_tick
                     .0
-                    .is_multiple_of(analytics.behavior_metrics as u64));
+                    .is_multiple_of(u64::from(analytics.behavior_metrics)));
         let lifecycle_enabled = analytics.lifecycle_events != 0
             && (force_partial_batch
                 || next_tick
                     .0
-                    .is_multiple_of(analytics.lifecycle_events as u64));
+                    .is_multiple_of(u64::from(analytics.lifecycle_events)));
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         let agent_count = handles.len();
@@ -19878,7 +19967,7 @@ impl WorldState {
         for (idx, agent_id) in handles.iter().enumerate() {
             total_health += healths.get(idx).copied().unwrap_or(0.0);
             if let Some(age) = ages.get(idx).copied() {
-                age_sum += age as f64;
+                age_sum += f64::from(age);
                 if age > age_max {
                     age_max = age;
                 }
@@ -19893,7 +19982,7 @@ impl WorldState {
                 temperature_pref_stats.update(f64::from(runtime.temperature_preference));
                 if let Some(generation) = generations.get(idx) {
                     let value = generation.0;
-                    generation_sum += value as f64;
+                    generation_sum += f64::from(value);
                     if value > generation_max {
                         generation_max = value;
                     }
@@ -19933,8 +20022,7 @@ impl WorldState {
                     let label = runtime
                         .brain
                         .kind()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| "unbound".to_string());
+                        .map_or_else(|| "unbound".to_string(), str::to_string);
                     let entry = brain_map.entry(label).or_insert((0, 0.0));
                     entry.0 += 1;
                     entry.1 += f64::from(runtime.energy);
@@ -20087,7 +20175,7 @@ impl WorldState {
                     "population.age.mean",
                     age_sum / agent_count as f64,
                 ));
-                metrics.push(MetricSample::new("population.age.max", age_max as f64));
+                metrics.push(MetricSample::new("population.age.max", f64::from(age_max)));
                 metrics.push(MetricSample::new(
                     "behavior.boost.count",
                     boost_count as f64,
@@ -20118,7 +20206,7 @@ impl WorldState {
                 ));
                 metrics.push(MetricSample::new(
                     "population.generation.max",
-                    generation_max as f64,
+                    f64::from(generation_max),
                 ));
                 metrics.push(MetricSample::new(
                     "temperature.discomfort.mean",
@@ -20345,7 +20433,7 @@ impl WorldState {
         self.append_requested_replay_world_digest();
 
         let batch = PersistenceBatch {
-            summary: summary.clone(),
+            summary,
             epoch: self.epoch,
             closed: self.config.closed,
             metrics,
@@ -20421,8 +20509,8 @@ impl WorldState {
     /// Execute one simulation tick while capturing six deterministic first-divergence points.
     ///
     /// Unlike [`Self::step_profiled`], this observer never reads a clock. It captures Sense,
-    /// Brains, Actuation, Food, DeathCleanup, and Population rather than all fifteen performance
-    /// stages. DeathCleanup and Population retain the ordered queue digest from immediately before
+    /// Brains, Actuation, Food, `DeathCleanup`, and Population rather than all fifteen performance
+    /// stages. `DeathCleanup` and `Population` retain the ordered queue digest from immediately before
     /// those stages consume it. Each point records a typed complete/error capture; a successful
     /// step does not imply every diagnostic capture succeeded, so consumers must inspect the
     /// captures and call [`WorldStepTrace::validate_contract`] after decoding an artifact.
@@ -20449,7 +20537,7 @@ impl WorldState {
         self.step_outcome_observed(tracer)
     }
 
-    fn require_external_session_if_enabled(&self) -> Result<(), PersistenceSessionError> {
+    const fn require_external_session_if_enabled(&self) -> Result<(), PersistenceSessionError> {
         if self.config.persistence_interval == 0 {
             Ok(())
         } else {
@@ -20681,7 +20769,7 @@ impl WorldState {
         let preserve_persistence_tail = self.config.persistence_interval != 0
             && !next_tick
                 .0
-                .is_multiple_of(self.config.persistence_interval as u64);
+                .is_multiple_of(u64::from(self.config.persistence_interval));
         let persistence = observed_stage!(WorldStepStage::Persistence, {
             self.prepare_persistence(next_tick, false)
         });
@@ -20785,7 +20873,7 @@ impl WorldState {
 
     /// Returns an immutable reference to configuration.
     #[must_use]
-    pub fn config(&self) -> &ScriptBotsConfig {
+    pub const fn config(&self) -> &ScriptBotsConfig {
         &self.config
     }
 
@@ -21112,11 +21200,11 @@ impl WorldState {
             .agents
             .iter_handles()
             .map(|id| {
-                let uid = self
-                    .agent_uid(id)
-                    .ok_or(CharacterizationError::MissingAgentData {
-                        agent_id: id.data().as_ffi(),
-                    })?;
+                let uid =
+                    self.agent_uid(id)
+                        .ok_or_else(|| CharacterizationError::MissingAgentData {
+                            agent_id: id.data().as_ffi(),
+                        })?;
                 Ok((uid, id))
             })
             .collect::<Result<_, CharacterizationError>>()?;
@@ -21155,24 +21243,21 @@ impl WorldState {
             // something moved.
             brains_encoder.u64(uid.0);
             brains_encoder.option_string(runtime.brain.kind());
-            match runtime.brain.state_digest() {
-                Some(digest) => {
-                    brains_encoder.bool(true);
-                    brains_encoder.u64(digest);
-                }
-                None => {
-                    brains_encoder.bool(false);
-                    // An UNBOUND agent has no brain to cover, and that is not a gap. A BOUND
-                    // agent whose family cannot expose its state IS a gap, and it is named.
-                    if runtime.brain.is_bound() {
-                        uncovered.insert(
-                            runtime
-                                .brain
-                                .kind()
-                                .unwrap_or("<unnamed family>")
-                                .to_owned(),
-                        );
-                    }
+            if let Some(digest) = runtime.brain.state_digest() {
+                brains_encoder.bool(true);
+                brains_encoder.u64(digest);
+            } else {
+                brains_encoder.bool(false);
+                // An UNBOUND agent has no brain to cover, and that is not a gap. A BOUND
+                // agent whose family cannot expose its state IS a gap, and it is named.
+                if runtime.brain.is_bound() {
+                    uncovered.insert(
+                        runtime
+                            .brain
+                            .kind()
+                            .unwrap_or("<unnamed family>")
+                            .to_owned(),
+                    );
                 }
             }
         }
@@ -21212,11 +21297,11 @@ impl WorldState {
         let counter_states = ordered
             .iter()
             .map(|(uid, id)| {
-                let counters = self.agent_rng_counters.get(*id).copied().ok_or(
+                let counters = self.agent_rng_counters.get(*id).copied().ok_or_else(|| {
                     CharacterizationError::MissingAgentRngCounters {
                         agent_id: id.data().as_ffi(),
-                    },
-                )?;
+                    }
+                })?;
                 Ok(AgentRngCounterStateV1::new(*uid, counters))
             })
             .collect::<Result<Vec<_>, CharacterizationError>>()?;
@@ -21394,7 +21479,7 @@ impl WorldState {
 
     fn required_agent_uid_for_trace(&self, id: AgentId) -> Result<AgentUid, CharacterizationError> {
         self.agent_uid(id)
-            .ok_or(CharacterizationError::MissingAgentData {
+            .ok_or_else(|| CharacterizationError::MissingAgentData {
                 agent_id: id.data().as_ffi(),
             })
     }
@@ -21686,19 +21771,19 @@ impl WorldState {
 
         {
             let cells = self.food.cells_mut();
-            if !food_profiles.is_empty() {
+            if food_profiles.is_empty() {
+                for cell in cells.iter_mut() {
+                    if *cell > new_config.food_max {
+                        *cell = new_config.food_max;
+                    }
+                }
+            } else {
                 for (idx, cell) in cells.iter_mut().enumerate() {
                     if let Some(profile) = food_profiles.get(idx) {
                         if *cell > profile.capacity {
                             *cell = profile.capacity;
                         }
                     } else if *cell > new_config.food_max {
-                        *cell = new_config.food_max;
-                    }
-                }
-            } else {
-                for cell in cells.iter_mut() {
-                    if *cell > new_config.food_max {
                         *cell = new_config.food_max;
                     }
                 }
@@ -21990,12 +22075,13 @@ impl WorldState {
     }
 
     /// Iterate over retained tick summaries.
+    #[must_use]
     pub fn history(&self) -> impl DoubleEndedIterator<Item = &TickSummary> {
         self.history.iter()
     }
 
     /// Advances the world tick counter, rolling epochs when needed.
-    fn advance_tick(&mut self) {
+    const fn advance_tick(&mut self) {
         self.tick = self.tick.next();
         if self.tick.0.is_multiple_of(10_000) {
             self.epoch += 1;
@@ -22052,7 +22138,7 @@ impl WorldState {
 
     /// Read-only access to the agent arena.
     #[must_use]
-    pub fn agents(&self) -> &AgentArena {
+    pub const fn agents(&self) -> &AgentArena {
         &self.agents
     }
 
@@ -22065,17 +22151,17 @@ impl WorldState {
 
     /// Number of live agents.
     #[must_use]
-    pub fn agent_count(&self) -> usize {
+    pub const fn agent_count(&self) -> usize {
         self.agents.len()
     }
 
-    /// Return the stable logical identity metadata for a live SlotMap handle.
+    /// Return the stable logical identity metadata for a live `SlotMap` handle.
     #[must_use]
     pub fn agent_identity(&self, id: AgentId) -> Option<AgentIdentity> {
         self.identities.get(id).copied()
     }
 
-    /// Return the stable logical UID for a live SlotMap handle.
+    /// Return the stable logical UID for a live `SlotMap` handle.
     #[must_use]
     pub fn agent_uid(&self, id: AgentId) -> Option<AgentUid> {
         self.agent_identity(id).map(|identity| identity.uid)
@@ -22134,13 +22220,13 @@ impl WorldState {
 
     /// Spike hits recorded during the most recent tick.
     #[must_use]
-    pub fn last_spike_hits(&self) -> u32 {
+    pub const fn last_spike_hits(&self) -> u32 {
         self.last_spike_hits
     }
 
     /// Maximum agent age observed during the most recent tick.
     #[must_use]
-    pub fn last_max_age(&self) -> u32 {
+    pub const fn last_max_age(&self) -> u32 {
         self.last_max_age
     }
 
@@ -22201,10 +22287,10 @@ impl WorldState {
         if parent_a == parent_b {
             return Ok(None);
         }
-        let Some(parent_a_state) = self.snapshot_agent(parent_a) else {
+        let Some(first_parent_state) = self.snapshot_agent(parent_a) else {
             return Ok(None);
         };
-        let Some(parent_b_state) = self.snapshot_agent(parent_b) else {
+        let Some(second_parent_state) = self.snapshot_agent(parent_b) else {
             return Ok(None);
         };
         // Parent origins must precede their child in the append-only ancestry log. A parent
@@ -22217,13 +22303,13 @@ impl WorldState {
         }
 
         let generation = Self::crossover_child_generation(
-            parent_a_state.data.generation,
-            parent_b_state.data.generation,
+            first_parent_state.data.generation,
+            second_parent_state.data.generation,
             "agent.generation",
         )?;
         let lineage = [
-            Some(parent_a_state.identity.uid),
-            Some(parent_b_state.identity.uid),
+            Some(first_parent_state.identity.uid),
+            Some(second_parent_state.identity.uid),
         ];
         let rng_before = self.rng.clone();
         let mut runtime = AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
@@ -22342,7 +22428,7 @@ impl WorldState {
 
     /// Immutable access to the food grid.
     #[must_use]
-    pub fn food(&self) -> &FoodGrid {
+    pub const fn food(&self) -> &FoodGrid {
         &self.food
     }
 
@@ -22373,7 +22459,7 @@ impl WorldState {
     }
     /// Immutable access to the terrain tile layer.
     #[must_use]
-    pub fn terrain(&self) -> &TerrainLayer {
+    pub const fn terrain(&self) -> &TerrainLayer {
         &self.terrain
     }
     /// Replace the current terrain and food fields using a pre-generated map artifact.
@@ -22423,18 +22509,20 @@ impl WorldState {
     }
 
     /// Metadata describing the last applied procedural map, when available.
-    pub fn map_metadata(&self) -> Option<&MapArtifactMetadata> {
+    #[must_use]
+    pub const fn map_metadata(&self) -> Option<&MapArtifactMetadata> {
         self.map_metadata.as_ref()
     }
 
     /// Immutable access to hydrology state when available.
-    pub fn hydrology(&self) -> Option<&HydrologyState> {
+    #[must_use]
+    pub const fn hydrology(&self) -> Option<&HydrologyState> {
         self.hydrology.as_ref()
     }
 
     /// Immutable access to the brain registry.
     #[must_use]
-    pub fn brain_registry(&self) -> &BrainRegistry {
+    pub const fn brain_registry(&self) -> &BrainRegistry {
         &self.brain_registry
     }
 
@@ -22459,6 +22547,11 @@ impl WorldState {
     /// A pending Seeded/Injected origin row at the agent's insertion boundary is refreshed with
     /// the binding. Once that boundary is admitted, the binding affects only live simulation
     /// state; persisted origin metadata is immutable and is neither recreated nor rewritten.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a live agent lacks a stable identity or RNG-counter entry; both are world
+    /// invariants verified immediately before each `expect` in this body.
     pub fn bind_agent_brain(&mut self, id: AgentId, key: u64) -> Result<bool, WorldStateError> {
         self.ensure_scientific_mutation_allowed(&format!(
             "agents[{}].runtime.brain",
@@ -22509,7 +22602,7 @@ impl WorldState {
 
     /// Immutable access to per-agent runtime metadata.
     #[must_use]
-    pub fn runtime(&self) -> &AgentMap<AgentRuntime> {
+    pub const fn runtime(&self) -> &AgentMap<AgentRuntime> {
         &self.runtime
     }
 
@@ -22694,6 +22787,11 @@ impl WorldState {
         let herbivore_tendency = clamp01(runtime.herbivore_tendency);
         let is_hybrid = runtime.hybrid;
 
+        // bd-tqpj: clippy::suspicious_operation_groupings false positive — the predicate
+        // intentionally matches `record.agent_uid` (BirthRecord field) against
+        // `identity.uid` (AgentIdentity field); both are AgentUid, and clippy's
+        // suggested `identity.agent_uid` does not exist.
+        #[allow(clippy::suspicious_operation_groupings)]
         let Some(record) = self.pending_birth_records.iter_mut().rev().find(|record| {
             record.agent_uid == identity.uid
                 && record.tick == self.tick
@@ -22780,7 +22878,7 @@ impl WorldState {
                 let actual = runtime
                     .brain
                     .kind()
-                    .map(|kind| kind.to_lowercase())
+                    .map(str::to_lowercase)
                     .unwrap_or_default();
                 if !actual.contains(filter) {
                     continue;
