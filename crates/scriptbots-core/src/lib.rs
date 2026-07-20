@@ -5,6 +5,7 @@ pub mod channels;
 mod checkpoint;
 pub mod detect;
 pub mod economy;
+pub mod genome_diff;
 pub mod narrative_text;
 pub mod permalink;
 mod replay;
@@ -17144,6 +17145,16 @@ impl WorldState {
         &self.active_effects
     }
 
+    /// Read an agent's heritable genome through the versioned protocol — the only
+    /// sanctioned cross-crate genome read path (bd-16g.13.1). Protocol types only:
+    /// genome envelopes cross the crate boundary; brain structs never do. Returns
+    /// `None` for an unbound or legacy (non-protocol) brain, or a dead handle.
+    #[must_use]
+    pub fn agent_genome(&self, id: AgentId) -> Option<BrainGenomeEnvelope> {
+        let runtime = self.runtime.get(id)?;
+        runtime.brain.genome().cloned()
+    }
+
     /// Apply queued interventions and age the timed ones.
     ///
     /// Runs at the TOP of the tick, before food dynamics and sensing, so a
@@ -19168,7 +19179,7 @@ impl WorldState {
             // for the one partner of an actual birth, not the whole population.
             let partner_runtime = partner_index.and_then(|j| self.runtime.get(handles[j]).cloned());
             let partner_id = partner_index.map(|j| handles[j]);
-            let partner_uid = partner_id.map(|id| {
+            let partner_agent_uid = partner_id.map(|id| {
                 self.agent_uid(id)
                     .expect("live birth partner must have stable identity")
             });
@@ -19186,7 +19197,7 @@ impl WorldState {
                 }
             };
             let offspring_rng_identity =
-                OffspringRngIdentityV1::new(parent_uid, partner_uid, birth_ordinal);
+                OffspringRngIdentityV1::new(parent_uid, partner_agent_uid, birth_ordinal);
             let Some(parent_runtime_snapshot) = self.runtime.get(*agent_id).cloned() else {
                 self.agent_rng_counters
                     .insert(*agent_id, parent_rng_counters_before_attempt);
