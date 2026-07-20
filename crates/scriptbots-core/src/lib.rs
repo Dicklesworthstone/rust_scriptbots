@@ -11980,6 +11980,37 @@ pub mod narrative {
                 Self::RegimeChange => "regime_change",
             }
         }
+
+        /// The single rail glyph for this kind (bd-16g.2.4). This table is the ONLY
+        /// kind-to-presentation mapping: the TUI rail and the GPU lab rail both read
+        /// it, so the two surfaces can never drift into showing different stories.
+        #[must_use]
+        pub const fn rail_glyph(self) -> char {
+            match self {
+                Self::PopulationCrash => '\u{25BC}', // v
+                Self::PopulationBoom => '\u{25B2}',  // ^
+                Self::Extinction => '\u{2716}',      // x
+                Self::EnergyCollapse => '\u{25C6}',  // diamond
+                Self::EnergyRecovery => '\u{25C7}',  // open diamond
+                Self::CombatSurge => '\u{271A}',     // cross
+                Self::RegimeChange => '\u{25CF}',    // circle
+            }
+        }
+
+        /// The single rail colour for this kind as an RGB triple (bd-16g.2.4). Each
+        /// surface converts the triple to its native colour type.
+        #[must_use]
+        pub const fn rail_rgb(self) -> [u8; 3] {
+            match self {
+                Self::PopulationCrash => [0xE5, 0x39, 0x35],
+                Self::PopulationBoom => [0x43, 0xA0, 0x47],
+                Self::Extinction => [0xFF, 0xFF, 0xFF],
+                Self::EnergyCollapse => [0xFB, 0x8C, 0x00],
+                Self::EnergyRecovery => [0xFF, 0xEB, 0x3B],
+                Self::CombatSurge => [0xAB, 0x47, 0xBC],
+                Self::RegimeChange => [0x42, 0xA5, 0xF5],
+            }
+        }
     }
 
     /// One thing that happened, with the evidence that says so.
@@ -12047,6 +12078,11 @@ pub mod narrative {
     #[derive(Debug, Default)]
     pub struct RunNarrative {
         events: VecDeque<EventRecord>,
+        /// Events discarded when the bounded ring wrapped. A rail that cannot say
+        /// how much history it dropped presents a tail as if it were the whole
+        /// story (bd-16g.2.4). Instrumentation only: it affects no future
+        /// transition and is deliberately not part of the characterization digest.
+        dropped: u64,
         /// Last tick emitted per event kind. This serves two purposes: a
         /// sliding window re-detects the same change on every pass (dedupe),
         /// and a genuinely churning metric would otherwise emit a new event
@@ -12060,6 +12096,12 @@ pub mod narrative {
         #[must_use]
         pub const fn events(&self) -> &VecDeque<EventRecord> {
             &self.events
+        }
+
+        /// Total events discarded by ring truncation since the run began.
+        #[must_use]
+        pub const fn dropped_events(&self) -> u64 {
+            self.dropped
         }
 
         pub(super) fn encode_world_step_trace(
@@ -12262,6 +12304,7 @@ pub mod narrative {
 
             if self.events.len() >= capacity {
                 self.events.pop_front();
+                self.dropped = self.dropped.saturating_add(1);
             }
             self.events.push_back(record);
         }
@@ -17349,6 +17392,12 @@ impl WorldState {
     #[must_use]
     pub const fn narrative_events(&self) -> &VecDeque<narrative::EventRecord> {
         self.narrative.events()
+    }
+
+    /// Total narrative events discarded by ring truncation since the run began.
+    #[must_use]
+    pub const fn narrative_dropped_events(&self) -> u64 {
+        self.narrative.dropped_events()
     }
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit. The manual
@@ -26349,6 +26398,7 @@ mod tests {
             // Cloning a Legacy binding intentionally DROPS the runner (the manual
             // Clone impl is the missing-runner fixture mechanism) — this clone is
             // semantic, not redundant; do not remove it.
+            #[allow(clippy::redundant_clone)]
             runtime.brain = BrainBinding::Legacy {
                 runner: Some(Box::new(StubBrain)),
                 registry_key: Some(41),
@@ -31916,11 +31966,12 @@ mod tests {
             .expect("missing protocol runtime")
             .brain = stripped_protocol;
         let missing_legacy = world.spawn_agent(sample_agent(4));
+        // Cloning a Legacy binding intentionally DROPS the runner (the manual
+        // Clone impl is the missing-runner fixture mechanism) — semantic, not redundant.
+        #[allow(clippy::redundant_clone)]
         world
             .agent_runtime_mut(missing_legacy)
             .expect("missing legacy runtime")
-            // Cloning a Legacy binding intentionally DROPS the runner (the manual
-            // Clone impl is the missing-runner fixture mechanism) — semantic, not redundant.
             .brain = BrainBinding::with_runner(Box::new(StubBrain)).clone();
 
         let error = world
