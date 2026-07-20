@@ -23,15 +23,32 @@
 #![allow(clippy::float_cmp, clippy::while_float)]
 #![allow(clippy::too_many_lines)]
 
-use super::*;
 use crate::rng_domains::{
     AgentRngCountersV1, AgentSubstreamProtocolError, AgentSubstreamProtocolV1,
-    DomainStreamRestoreError,
+    DomainStreamRestoreError, DomainStreams, DomainStreamsCheckpoint, RngDomain,
 };
+use crate::{
+    ActiveEffect, ActiveEffectKind, AgentArena, AgentData, AgentId, AgentIdentity, AgentMap,
+    AgentRngCounterStateV1, AgentRuntime, AgentUid, BirthOrigin, BirthRecord,
+    BrainAdapterIdentityV1, BrainBinding, BrainEvaluatorStateEnvelope, BrainFamilyId,
+    BrainGenomeDerivation, BrainGenomeEnvelope, BrainProtocolError, BrainRegistry,
+    BrainRegistryDigestEntryV1, BrainRunner, CharacterizationError, CombatEventFlags,
+    FoodCellProfile, FoodGrid, Generation, HydrologyField, HydrologyFlowDirection, HydrologyState,
+    HydrologyTile, HydrologyTileLayer, INPUT_SIZE, IndicatorState, Intervention, LocomotionModel,
+    MAX_NEUROFLOW_HIDDEN_LAYERS, MAX_NEUROFLOW_LAYER_NEURONS, MapArtifactMetadata,
+    MapGeneratorKind, MutationRates, NUM_EYES, OUTPUT_SIZE, PersistenceBoundaryStatus, Position,
+    Region, RenderSettings, RngDomainDigestV1, RngDomainDigestsV1, ScientificStateError,
+    ScriptBotsConfig, SelectionState, TerrainLayer, TerrainTile, Tick, TickCadence, TraitModifiers,
+    WorldDigestV1, WorldDigestV1ContractError, WorldState, WorldStateError,
+    brain_registry_digest_v1, clamp01, validate_finite, world_counters_digest_v1,
+};
+use scriptbots_index::UniformGridIndex;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::marker::PhantomData;
+use thiserror::Error;
 
 /// Strict schema carried by the first world checkpoint envelope.
 pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.3";
@@ -703,7 +720,7 @@ impl WorldCheckpointV1 {
 
     /// Number of live stable agents carried by this checkpoint.
     #[must_use]
-    pub fn agent_count(&self) -> usize {
+    pub const fn agent_count(&self) -> usize {
         self.state.agents.len()
     }
 
@@ -1219,7 +1236,7 @@ impl BrainRegistry {
 }
 
 impl AgentRuntimeCheckpointV1 {
-    fn capture(runtime: &AgentRuntime) -> Self {
+    const fn capture(runtime: &AgentRuntime) -> Self {
         Self {
             energy: runtime.energy,
             reproduction_counter: runtime.reproduction_counter,

@@ -70,6 +70,9 @@ pub struct MatchPlan {
     /// Family spawn order; position `spawn_order_index` is recorded on the outcome so an
     /// order effect can be measured rather than hidden.
     pub spawn_order: Vec<BrainKind>,
+    /// Which assignment within the order set this match is, so the rating layer can test
+    /// for an order effect instead of assuming it away.
+    pub spawn_order_index: u32,
     /// Equal cohort composition per family.
     pub cohort: BTreeMap<BrainKind, usize>,
     pub world_seed: u64,
@@ -103,6 +106,9 @@ pub struct FamilyOutcome {
 pub struct MatchOutcome {
     pub match_id: MatchId,
     pub ticks_run: u64,
+    /// Which assignment within the order set produced this outcome — the order effect is
+    /// a measurement, not a nuisance to be hidden from the rating layer.
+    pub spawn_order_index: u32,
     pub per_family: BTreeMap<String, FamilyOutcome>,
     /// Qualifiers the leaderboard must never lose (open-world respawn, early stop).
     pub warnings: Vec<String>,
@@ -316,6 +322,20 @@ pub fn plan(spec: &TournamentSpec) -> Result<Vec<MatchPlan>, TournamentError> {
         }
     }
 
+    // The plan is pure; the log is the audit trail: every pairing decision is visible
+    // without re-running anything.
+    tracing::info!(
+        target: "scriptbots::tournament",
+        families = spec.families.len(),
+        seeds = spec.seeds.len(),
+        ticks = spec.ticks,
+        cohort_size = spec.cohort_size,
+        matches = total_matches,
+        order_policy = ?spec.order_policy,
+        closed = spec.closed,
+        "tournament plan accepted"
+    );
+
     let per_family = spec.cohort_size / family_count;
     let mut plans = Vec::with_capacity(total_matches);
     for (seed_ordinal, root_seed) in spec.seeds.iter().enumerate() {
@@ -325,6 +345,7 @@ pub fn plan(spec: &TournamentSpec) -> Result<Vec<MatchPlan>, TournamentError> {
                 match_id: match_id(*root_seed, match_index),
                 seed: *root_seed,
                 spawn_order: spawn_order.clone(),
+                spawn_order_index: order_ordinal as u32,
                 cohort: spec
                     .families
                     .iter()
@@ -798,6 +819,7 @@ pub mod execution {
         let mut outcome = MatchOutcome {
             match_id: plan.match_id,
             ticks_run,
+            spawn_order_index: plan.spawn_order_index,
             per_family: BTreeMap::new(),
             warnings: Vec::new(),
         };
@@ -853,6 +875,33 @@ pub mod execution {
         // Species barrier re-proven at the end of every match: no child anywhere has
         // parents of two different arms.
         assert_no_cross_kind_mating(&world, &arm_by_uid)?;
+
+        for family in &plan.spawn_order {
+            let family_outcome = outcome.family(*family).expect("family recorded");
+            tracing::info!(
+                target: "scriptbots::tournament",
+                match_id = plan.match_id.0,
+                seed = plan.seed,
+                family = family.as_str(),
+                spawn_order_index = plan.spawn_order_index,
+                survival_share = family_outcome.survival_share,
+                biomass_share = family_outcome.biomass_share,
+                mean_lineage_depth = family_outcome.mean_lineage_depth,
+                extinct_at = ?family_outcome.extinct_at,
+                "match family outcome"
+            );
+            if let Some(tick) = family_outcome.extinct_at
+                && tick <= ticks / 10
+            {
+                tracing::warn!(
+                    target: "scriptbots::tournament",
+                    match_id = plan.match_id.0,
+                    family = family.as_str(),
+                    extinct_at = tick,
+                    "family extinct before 10% of the tick budget (likely a spawn bug, not a finding)"
+                );
+            }
+        }
 
         Ok(MatchRunReport {
             outcome,
