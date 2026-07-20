@@ -4992,6 +4992,25 @@ impl ResourceLedgerState {
             flows: working.flows,
             reconciliation,
         });
+        // bd-16g.11.1 StockGuard: the books are recomputed directly from the
+        // world at every tick boundary, so a mutation site with no posting is
+        // IMPOSSIBLE to add silently in a debug build — the guard fails on the
+        // very tick it happens (the missing `stage_actuation` posting on
+        // `food_delta` is exactly the shape of bug this makes unrepresentable).
+        // It fires AFTER the report update so the failing tick's books remain
+        // inspectable in the report.
+        #[cfg(debug_assertions)]
+        {
+            let unexplained = reconciliation.unexplained_delta;
+            let tick = working.tick;
+            let limit = reconciliation.tolerance;
+            debug_assert!(
+                reconciliation.reconciled,
+                "StockGuard: tick {} books do not balance: unexplained \
+                 (food={}, energy={}, health={}) exceeds derived tolerance {limit}",
+                tick.0, unexplained.food, unexplained.energy, unexplained.health,
+            );
+        }
     }
 }
 
@@ -16833,20 +16852,27 @@ impl WorldState {
 
         if self.resource_ledger.enabled {
             let mut deltas = [ResourceAmounts::default(); 5];
+            let mut capacity_rejection = ResourceAmounts::default();
             let healths = self.agents.columns().health();
             for (idx, agent_id) in handles.iter().enumerate() {
                 let Some(runtime) = self.runtime.get(*agent_id) else {
                     continue;
                 };
                 let total = results[idx].drain.total();
-                if total <= f32::EPSILON {
-                    continue;
-                }
                 let energy_loss = (runtime.energy - results[idx].energy).max(0.0);
                 let health_after = (healths[idx]
                     + results[idx].delta.as_ref().map_or(0.0, |d| d.health_delta))
                 .clamp(0.0, 2.0);
                 let health_loss = (healths[idx] - health_after).max(0.0);
+                if total <= f32::EPSILON {
+                    // Zero-drain agents can still lose value to the caps: that
+                    // destruction is capacity rejection, not metabolism — and
+                    // skipping it leaves the tick's books unbalanced
+                    // (bd-16g.11.1's first StockGuard catch).
+                    capacity_rejection.energy -= f64::from(energy_loss);
+                    capacity_rejection.health -= f64::from(health_loss);
+                    continue;
+                }
                 let components = [
                     results[idx].drain.basal,
                     results[idx].drain.movement,
@@ -16859,6 +16885,13 @@ impl WorldState {
                     flow.energy -= f64::from(energy_loss) * share;
                     flow.health -= f64::from(health_loss) * share;
                 }
+            }
+            if capacity_rejection.energy != 0.0 || capacity_rejection.health != 0.0 {
+                self.resource_ledger.record(
+                    ResourceFlowKind::CapacityRejection,
+                    capacity_rejection,
+                    ResourceAmounts::default(),
+                );
             }
             for (kind, delta) in [
                 ResourceFlowKind::BasalMetabolism,
@@ -17289,19 +17322,20 @@ impl WorldState {
         if self.applied_interventions.len() >= APPLIED_INTERVENTION_CAPACITY {
             self.applied_interventions.pop_front();
         }
-        self.applied_interventions.push_back(AppliedInterventionRecord {
-            seq,
-            // Both the application stage (top of tick) and the expiry aging (at
-            // finalize, before advance) stamp the tick being PRODUCED, matching
-            // the birth/death record convention.
-            tick: self.tick.next(),
-            kind,
-            region,
-            agents_affected,
-            cells_affected,
-            expires_at,
-            expired,
-        });
+        self.applied_interventions
+            .push_back(AppliedInterventionRecord {
+                seq,
+                // Both the application stage (top of tick) and the expiry aging (at
+                // finalize, before advance) stamp the tick being PRODUCED, matching
+                // the birth/death record convention.
+                tick: self.tick.next(),
+                kind,
+                region,
+                agents_affected,
+                cells_affected,
+                expires_at,
+                expired,
+            });
         if expired {
             tracing::info!(
                 target: "scriptbots::intervention",
@@ -17339,7 +17373,10 @@ impl WorldState {
     }
 
     fn count_agents_in_region(&self, region: Region) -> usize {
-        let (width, height) = (self.config.world_width as f32, self.config.world_height as f32);
+        let (width, height) = (
+            self.config.world_width as f32,
+            self.config.world_height as f32,
+        );
         self.agents
             .columns()
             .positions()
@@ -17349,8 +17386,10 @@ impl WorldState {
     }
 
     fn count_food_cells_in_region(&self, region: Region) -> usize {
-        let (world_width, world_height) =
-            (self.config.world_width as f32, self.config.world_height as f32);
+        let (world_width, world_height) = (
+            self.config.world_width as f32,
+            self.config.world_height as f32,
+        );
         let cell_size = self.config.food_cell_size as f32;
         let (width, height) = (self.food.width(), self.food.height());
         let mut count = 0_usize;
@@ -17518,14 +17557,7 @@ impl WorldState {
                 }
                 Intervention::SetClosedWorld { closed } => {
                     self.config.closed = closed;
-                    self.record_intervention(
-                        "set_closed_world",
-                        Region::All,
-                        0,
-                        0,
-                        None,
-                        false,
-                    );
+                    self.record_intervention("set_closed_world", Region::All, 0, 0, None, false);
                 }
                 Intervention::InjectCohort {
                     count,
@@ -27018,7 +27050,10 @@ mod tests {
             .find(|record| record.kind == "meteor")
             .expect("meteor recorded");
         assert!(!meteor.expired);
-        assert_eq!(meteor.agents_affected, 1, "only the near agent is in the disc");
+        assert_eq!(
+            meteor.agents_affected, 1,
+            "only the near agent is in the disc"
+        );
         assert!(meteor.cells_affected > 0);
         assert_eq!(meteor.tick, Tick(1), "applied at the top of the first tick");
         assert_eq!(meteor.seq, 1);
@@ -38380,6 +38415,41 @@ mod tests {
         fn state_digest(&self) -> Option<u64> {
             Some(0x4c45_4447_4552_5f49)
         }
+    }
+
+    #[test]
+    fn stock_guard_fails_the_tick_a_mutation_has_no_posting() {
+        // bd-16g.11.1 NEGATIVE (fault injection, proving the guard is not
+        // decorative): mutate the food stock directly with NO matching posting —
+        // the exact shape of the historical missing-`stage_actuation` bug — and
+        // the debug StockGuard must fail on that very tick.
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(0x570C_6661),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        world.set_resource_ledger_enabled(true);
+        let opening = world.resource_amounts();
+        world.resource_ledger.begin_tick(Tick(1), opening);
+        // THE FAULT: food changes with no posting at all.
+        world
+            .try_update_food(|cells| {
+                if let Some(cell) = cells.first_mut() {
+                    *cell += 0.5;
+                }
+            })
+            .expect("direct food mutation");
+        let closing = world.resource_amounts();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.resource_ledger.finish_tick(closing);
+        }));
+        assert!(
+            outcome.is_err(),
+            "StockGuard must fail the tick a mutation has no posting"
+        );
     }
 
     #[test]
