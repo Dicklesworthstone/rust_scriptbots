@@ -3428,7 +3428,7 @@ impl SimulationView {
         }
 
         if let Ok(mut world) = self.world.lock() {
-            world.apply_selection_update(SelectionUpdate {
+            let _ = world.apply_selection_update(SelectionUpdate {
                 mode: SelectionMode::Add,
                 agent_ids: vec![agent_id.raw()],
                 state: SelectionState::Selected,
@@ -11760,6 +11760,12 @@ fn palette_color(color: Rgba, palette: ColorPaletteMode, palette_is_natural: boo
     }
 }
 
+/// Smallest on-screen avatar size (in px) that paints the full detail kit.
+/// Below this, ears/eyes/mouth resolve to sub-pixel mush — the silhouette
+/// branch carries the same information for a fraction of the instance-buffer
+/// cost (bd-2z0.7.12).
+const DETAIL_MIN_PX: f32 = 18.0;
+
 #[allow(clippy::too_many_arguments)]
 fn paint_agent_avatar(
     window: &mut Window,
@@ -11830,7 +11836,12 @@ fn paint_agent_avatar(
         window.paint_path(path, wheel_color);
     }
 
-    if very_low_fps {
+    if very_low_fps || size_px < DETAIL_MIN_PX {
+        // LOD: below DETAIL_MIN_PX the avatar's ears/eyes/mouth resolve to sub-pixel
+        // mush; the silhouette (body capsule + spike) carries the same visual
+        // information for a fraction of the instance-buffer cost. This is the
+        // primary lever keeping typical zoomed-out scenes inside GPUI's default
+        // 2 MiB instance buffer (bd-2z0.7.12).
         let mut body_shape = PathBuilder::fill();
         append_capsule_polygon(
             &mut body_shape,
