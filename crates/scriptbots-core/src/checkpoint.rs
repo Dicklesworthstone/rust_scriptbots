@@ -10,6 +10,14 @@
 //! Keeping that boundary explicit prevents a core round trip from being advertised as a storage
 //! or application recovery feature.
 
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(clippy::float_cmp, clippy::while_float)]
+#![allow(clippy::too_many_lines)]
+
 use super::*;
 use crate::rng_domains::{
     AgentRngCountersV1, AgentSubstreamProtocolError, AgentSubstreamProtocolV1,

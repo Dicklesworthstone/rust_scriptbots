@@ -6,6 +6,7 @@ mod checkpoint;
 pub mod detect;
 pub mod economy;
 pub mod narrative_text;
+pub mod permalink;
 mod replay;
 pub mod rng_domains;
 pub mod sense_fixed;
@@ -14251,9 +14252,8 @@ struct FoodCellProfile {
     nutrient_density: f32,
 }
 
-/// Public snapshot of derived food cell parameters.
-///
-/// Public projection of the per-cell food ecology profile.
+/// Public snapshot of derived food cell parameters: a read-only projection of the
+/// per-cell food ecology profile exposed to consumers outside the core simulation.
 #[derive(Debug, Clone, Copy)]
 pub struct FoodCellProfileSnapshot {
     /// Maximum food energy the cell can hold.
@@ -20291,6 +20291,8 @@ impl WorldState {
         }
     }
 
+    // bd-tqpj: ~280-line sequential 15-stage tick pipeline; reviewed as a unit per lint policy.
+    #[allow(clippy::too_many_lines)]
     fn step_outcome_observed<O: WorldStepObserver>(
         &mut self,
         observer: &mut O,
@@ -20659,6 +20661,8 @@ impl WorldState {
         self.characterization_digest_v0_inner(true)
     }
 
+    // bd-tqpj: ~240-line digest encoder; reviewed as a unit per lint policy.
+    #[allow(clippy::too_many_lines)]
     fn characterization_digest_v0_inner(
         &self,
         require_quiescent: bool,
@@ -20909,6 +20913,8 @@ impl WorldState {
         self.world_digest_v1_inner(true)
     }
 
+    // bd-tqpj: ~260-line digest encoder; reviewed as a unit per lint policy.
+    #[allow(clippy::too_many_lines)]
     fn world_digest_v1_inner(
         &self,
         require_quiescent: bool,
@@ -21443,6 +21449,9 @@ impl WorldState {
     }
 
     /// Apply a new configuration, refreshing derived caches while preserving runtime state.
+    // bd-tqpj: exact f32 != dimension guards are intentional identity checks; u32→f32 grid
+    // casts are pinned by the science contract; long fn reviewed as a unit.
+    #[allow(clippy::float_cmp, clippy::cast_precision_loss, clippy::too_many_lines)]
     pub fn apply_config_update(
         &mut self,
         new_config: ScriptBotsConfig,
@@ -21558,6 +21567,8 @@ impl WorldState {
     /// The response is synchronous, so paused worlds have no pending state and a caller never
     /// receives an untagged value from an earlier focus. Stable UIDs prevent a removed agent's
     /// request from aliasing a later occupant of the same generational slot.
+    // bd-tqpj: ~138-line inspection dispatch; reviewed as a unit per lint policy.
+    #[allow(clippy::too_many_lines)]
     pub fn inspect_brains(
         &self,
         request: &BrainInspectionRequest,
@@ -21788,6 +21799,8 @@ impl WorldState {
         self.config.closed
     }
 
+    /// Chronological audit trail of validated configuration patches applied to this world.
+    #[must_use]
     pub fn config_audit(&self) -> &[ConfigAuditEntry] {
         &self.config_audit
     }
@@ -21952,11 +21965,13 @@ impl WorldState {
     }
 
     /// Spike hits recorded during the most recent tick.
+    #[must_use]
     pub fn last_spike_hits(&self) -> u32 {
         self.last_spike_hits
     }
 
     /// Maximum agent age observed during the most recent tick.
+    #[must_use]
     pub fn last_max_age(&self) -> u32 {
         self.last_max_age
     }
@@ -22194,6 +22209,8 @@ impl WorldState {
         &self.terrain
     }
     /// Replace the current terrain and food fields using a pre-generated map artifact.
+    // bd-tqpj: exact f32 != cell-size guard is an intentional identity check.
+    #[allow(clippy::float_cmp)]
     pub fn apply_map_artifact(&mut self, artifact: &MapArtifact) -> Result<(), WorldStateError> {
         self.ensure_scientific_mutation_allowed("map")?;
         artifact.validate()?;
@@ -22546,6 +22563,7 @@ impl WorldState {
     }
 
     /// Produce a filtered, sorted listing of agents for debug consumers.
+    #[must_use]
     pub fn agent_debug_view(&self, query: AgentDebugQuery) -> Vec<AgentDebugInfo> {
         let AgentDebugQuery {
             ids,
@@ -22639,6 +22657,7 @@ impl WorldState {
     }
 
     /// Apply a selection update to highlight agents.
+    #[must_use]
     pub fn apply_selection_update(&mut self, update: SelectionUpdate) -> SelectionResult {
         let mut cleared = 0usize;
         let mut applied = 0usize;
@@ -23008,6 +23027,18 @@ impl PersistenceAdmissionSession {
 
 #[cfg(test)]
 mod tests {
+    // Tests assert bit-exact FP equality, cast seeds/coords/counts pervasively,
+    // and include long table-driven fixtures; scoped to this module per lint policy.
+    #![allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::float_cmp,
+        clippy::too_many_lines,
+        clippy::suboptimal_flops,
+        clippy::imprecise_flops
+    )]
     use super::*;
     use std::cell::Cell;
     use std::sync::{
@@ -29880,11 +29911,11 @@ mod tests {
         }
     }
 
-    pub(crate) fn boxed_fixture_brain_family(id: &str) -> Box<dyn BrainFamilyAdapter> {
+    fn boxed_fixture_brain_family(id: &str) -> Box<dyn BrainFamilyAdapter> {
         Box::new(FixtureBrainFamily::new(id))
     }
 
-    pub(crate) fn boxed_fixture_brain_family_with_behavior_probe(
+    fn boxed_fixture_brain_family_with_behavior_probe(
         id: &str,
         evaluation_offset: i16,
         evaluator_constructions: Arc<AtomicUsize>,
