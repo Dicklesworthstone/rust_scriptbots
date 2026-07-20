@@ -1059,7 +1059,7 @@ fn configure_parallelism() {
 }
 
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-fn default_thread_budget(cpu_count: usize) -> usize {
+const fn default_thread_budget(cpu_count: usize) -> usize {
     match cpu_count {
         0..=2 => 1,
         3..=4 => 2,
@@ -1071,7 +1071,7 @@ fn default_thread_budget(cpu_count: usize) -> usize {
 #[cfg(not(feature = "parallel"))]
 fn configure_parallelism() {}
 
-fn clamp01(value: f32) -> f32 {
+const fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
@@ -1966,7 +1966,7 @@ impl BrainBinding {
 
     /// Exact protocol genome when this is an admitted evolutionary family.
     #[must_use]
-    pub fn genome(&self) -> Option<&BrainGenomeEnvelope> {
+    pub const fn genome(&self) -> Option<&BrainGenomeEnvelope> {
         match self {
             Self::Protocol { genome, .. } => Some(genome),
             Self::Unbound | Self::Legacy { .. } => None,
@@ -2011,13 +2011,7 @@ impl BrainBinding {
     #[must_use]
     pub fn describe(&self) -> Cow<'_, str> {
         self.registry_key().map_or_else(
-            || {
-                if let Some(kind) = self.kind() {
-                    Cow::Borrowed(kind)
-                } else {
-                    Cow::Borrowed("unbound")
-                }
-            },
+            || self.kind().map_or(Cow::Borrowed("unbound"), Cow::Borrowed),
             |key| Cow::Owned(format!("registry:{key}")),
         )
     }
@@ -4495,9 +4489,9 @@ pub struct ActiveEffect {
 /// The effect an [`ActiveEffect`] has on the region while in force.
 ///
 /// Serialized externally tagged (no `#[serde(tag)]`): internal tagging cannot
-/// encode the `GrowthScale` newtype variant — postcard fails at runtime with
+/// encode the `GrowthScale` newtype variant — `postcard` fails at runtime with
 /// a custom serde error, which is exactly what broke the digest/checkpoint
-/// effects lanes. Variant names stay snake_case for readable JSON.
+/// effects lanes. Variant names stay `snake_case` for readable JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActiveEffectKind {
@@ -4678,7 +4672,7 @@ impl ResourceAmounts {
         }
     }
 
-    fn scale(self) -> f64 {
+    const fn scale(self) -> f64 {
         self.food
             .abs()
             .max(self.energy.abs())
@@ -8985,13 +8979,13 @@ impl AgentArena {
 
     /// Borrow the underlying column storage.
     #[must_use]
-    pub fn columns(&self) -> &AgentColumns {
+    pub const fn columns(&self) -> &AgentColumns {
         &self.columns
     }
 
     /// Mutably borrow trusted column storage inside the simulation crate.
     #[must_use]
-    fn columns_mut(&mut self) -> &mut AgentColumns {
+    const fn columns_mut(&mut self) -> &mut AgentColumns {
         &mut self.columns
     }
 
@@ -9105,6 +9099,11 @@ impl AgentArena {
     }
 
     /// Remove `id` returning its scalar data if it was present, preserving dense iteration order.
+    ///
+    /// # Panics
+    ///
+    /// Never when the arena coherence invariant holds: the dense index comes from the
+    /// slot map immediately before any indexing, so every index is in bounds.
     pub fn remove(&mut self, id: AgentId) -> Option<AgentData> {
         let index = self.slots.remove(id)?;
         let removed = self.columns.snapshot(index);
@@ -10649,7 +10648,7 @@ pub struct ScriptBotsConfig {
     pub replay_event_tick_cap: usize,
     /// Sampling cadence for analytics families.
     pub analytics_stride: AnalyticsStride,
-    /// NeuroFlow runtime configuration.
+    /// `NeuroFlow` runtime configuration.
     pub neuroflow: NeuroflowSettings,
     /// Control-related runtime behavior toggles.
     pub control: ControlSettings,
@@ -15569,30 +15568,15 @@ impl WorldState {
         debug_assert_eq!(peak_wheel_outputs.len(), handles.len());
         debug_assert!({
             // Ensure FOVs and unit vectors contain finite values.
-            let mut ok = true;
-            for units in eye_units {
-                for unit in units {
-                    if !unit[0].is_finite() || !unit[1].is_finite() {
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    break;
-                }
-            }
-            for fovs in eye_fov {
-                for &f in fovs {
-                    if !f.is_finite() {
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    break;
-                }
-            }
-            ok
+            let units_finite = eye_units.iter().all(|units| {
+                units
+                    .iter()
+                    .all(|unit| unit[0].is_finite() && unit[1].is_finite())
+            });
+            let fovs_finite = eye_fov
+                .iter()
+                .all(|fovs| fovs.iter().all(|f| f.is_finite()));
+            units_finite && fovs_finite
         });
 
         let world_width = self.config.world_width as f32;

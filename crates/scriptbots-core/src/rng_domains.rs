@@ -391,17 +391,17 @@ impl AgentRngCountersV1 {
     }
 
     /// Claim the next reproduction-attempt ordinal.
-    pub fn take_reproduction_attempt(&mut self) -> Result<u64, AgentRngCounterError> {
+    pub const fn take_reproduction_attempt(&mut self) -> Result<u64, AgentRngCounterError> {
         Self::take_counter(&mut self.reproduction_attempt, "reproduction-attempt")
     }
 
     /// Claim the next successful-birth ordinal.
-    pub fn take_birth(&mut self) -> Result<u64, AgentRngCounterError> {
+    pub const fn take_birth(&mut self) -> Result<u64, AgentRngCounterError> {
         Self::take_counter(&mut self.birth, "birth")
     }
 
     /// Claim the next brain-initialization ordinal.
-    pub fn take_brain_initialization(&mut self) -> Result<u64, AgentRngCounterError> {
+    pub const fn take_brain_initialization(&mut self) -> Result<u64, AgentRngCounterError> {
         Self::take_counter(&mut self.brain_initialization, "brain-initialization")
     }
 

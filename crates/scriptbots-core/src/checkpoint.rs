@@ -1024,7 +1024,7 @@ impl WorldState {
                         *registry_key,
                         kind.clone(),
                         genome.clone(),
-                        &evaluator_state,
+                        evaluator_state,
                     )
                     .map_err(|error| WorldCheckpointError::Brain {
                         agent_uid: saved.identity.uid.0,

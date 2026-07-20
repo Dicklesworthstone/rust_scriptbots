@@ -34,23 +34,36 @@ mod tests {
 }
 
 /// One addressable genome locus, in canonical order (index order, never a hash walk).
+///
 /// Two genomes of the same family and schema produce loci in the same order, so the diff
 /// is a single aligned pass and its bytes are reproducible on any platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Locus {
+    /// Bias of the node with the given index.
     NodeBias(u32),
+    /// Damping factor of the node with the given index.
     NodeDamping(u32),
+    /// Gain of the node with the given index.
     NodeGain(u32),
+    /// Weight of connection `conn` feeding node `node`.
     NodeWeight {
+        /// Index of the node that owns the connection.
         node: u32,
+        /// Incoming connection slot within the node.
         conn: u8,
     },
+    /// Function kind of connection `conn` feeding node `node`.
     NodeKind {
+        /// Index of the node that owns the connection.
         node: u32,
+        /// Incoming connection slot within the node.
         conn: u8,
     },
+    /// Target node of connection `conn` leaving node `node`.
     NodeTarget {
+        /// Index of the node that owns the connection.
         node: u32,
+        /// Outgoing connection slot within the node.
         conn: u8,
     },
     /// A family-level hyperparameter locus (reserved; families name their own).
@@ -78,27 +91,42 @@ impl Locus {
 /// corruption it exists to find.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LocusValue {
+    /// A continuous scalar parameter; compared bitwise via `f32::to_bits`.
     Scalar(f32),
+    /// A connection target: the index of the node a connection points at.
     Target(u32),
+    /// A connection function-kind tag.
     Kind(u8),
 }
 
 /// One typed change between two aligned genomes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GenomeDelta {
+    /// A scalar parameter whose bits changed.
     Scalar {
+        /// The locus that changed.
         locus: Locus,
+        /// Parent value.
         before: f32,
+        /// Child value.
         after: f32,
     },
+    /// A connection whose target node changed.
     Retarget {
+        /// The locus that changed.
         locus: Locus,
+        /// Parent target node index.
         before: u32,
+        /// Child target node index.
         after: u32,
     },
+    /// A connection whose function kind changed.
     KindFlip {
+        /// The locus that changed.
         locus: Locus,
+        /// Parent kind tag.
         before: u8,
+        /// Child kind tag.
         after: u8,
     },
 }
@@ -106,50 +134,82 @@ pub enum GenomeDelta {
 /// The kind of a delta, for the by-kind summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeltaKind {
+    /// Scalar value change.
     Scalar,
+    /// Connection retarget.
     Retarget,
+    /// Function-kind change.
     KindFlip,
 }
 
 /// Aggregate diff statistics, computed in one pass over the canonical delta list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffSummary {
+    /// Number of loci that differ (equal to the delta count).
     pub changed_loci: usize,
+    /// Total loci compared (genome length).
     pub total_loci: usize,
     /// Sum of |after - before| over scalar deltas.
     pub l1: f64,
     /// Max |after - before| over scalar deltas.
     pub linf: f64,
+    /// Delta count per kind.
     pub by_kind: BTreeMap<DeltaKind, usize>,
 }
 
 /// The complete structural diff between two genomes of one family and schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenomeDiff {
+    /// Brain family both genomes belong to.
     pub family: BrainFamilyId,
+    /// Genome schema version both envelopes share.
     pub schema_version: u32,
+    /// Typed deltas in canonical locus order.
     pub deltas: Vec<GenomeDelta>,
+    /// Aggregate statistics over `deltas`.
     pub summary: DiffSummary,
 }
 
 /// Degenerate inputs are typed, never a panic and never a silent empty diff.
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenomeDiffError {
+    /// The two genomes belong to different brain families.
     #[error("cannot diff across brain families: {a} vs {b}")]
-    FamilyMismatch { a: BrainFamilyId, b: BrainFamilyId },
+    FamilyMismatch {
+        /// Family of the parent genome.
+        a: BrainFamilyId,
+        /// Family of the child genome.
+        b: BrainFamilyId,
+    },
+    /// The two genomes use different schema versions.
     #[error("cannot diff across genome schemas: {a} vs {b}")]
-    SchemaMismatch { a: u32, b: u32 },
+    SchemaMismatch {
+        /// Schema version of the parent genome.
+        a: u32,
+        /// Schema version of the child genome.
+        b: u32,
+    },
+    /// The decoded locus lists differ in length or type alignment.
     #[error("genome shape mismatch: {a_loci} loci vs {b_loci} loci")]
-    ShapeMismatch { a_loci: usize, b_loci: usize },
+    ShapeMismatch {
+        /// Locus count of the parent genome.
+        a_loci: usize,
+        /// Locus count of the child genome.
+        b_loci: usize,
+    },
+    /// The family codec could not expose typed loci.
     #[error("family {family} cannot expose typed loci: {reason}")]
     Unsupported {
+        /// Family that failed to decode.
         family: BrainFamilyId,
+        /// Codec-reported failure detail.
         reason: String,
     },
 }
 
-/// Compute the typed structural diff between two genomes of the same family and schema,
-/// decoded through the family codec's locus view. Deltas are emitted in canonical locus
+/// Compute the typed structural diff between two genomes of the same family and schema.
+///
+/// Decoded through the family codec's locus view. Deltas are emitted in canonical locus
 /// order, so two invocations produce identical bytes on any platform at any thread count.
 /// An empty delta list means "no mutations" — and nothing else.
 pub fn diff_genomes(

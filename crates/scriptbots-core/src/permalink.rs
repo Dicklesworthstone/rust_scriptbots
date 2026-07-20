@@ -493,7 +493,7 @@ impl Permalink {
     /// Canonicality check: `encode(decode(s)) == s` for every accepted payload.
     #[must_use]
     pub fn is_canonical(bytes: &[u8]) -> bool {
-        Self::decode(bytes).map_or(false, |link| link.encode() == bytes)
+        Self::decode(bytes).is_ok_and(|link| link.encode() == bytes)
     }
 
     /// Validate the scenario id with the manifest's identity rules.
