@@ -29911,11 +29911,11 @@ mod tests {
         }
     }
 
-    fn boxed_fixture_brain_family(id: &str) -> Box<dyn BrainFamilyAdapter> {
+    pub fn boxed_fixture_brain_family(id: &str) -> Box<dyn BrainFamilyAdapter> {
         Box::new(FixtureBrainFamily::new(id))
     }
 
-    fn boxed_fixture_brain_family_with_behavior_probe(
+    pub fn boxed_fixture_brain_family_with_behavior_probe(
         id: &str,
         evaluation_offset: i16,
         evaluator_constructions: Arc<AtomicUsize>,
