@@ -16009,7 +16009,7 @@ impl WorldState {
                             if region.contains(px, py, world_width, world_height)
                                 && let Some(tile) = self.terrain.tile_mut(tx, ty)
                             {
-                                tile.kind = kind;
+                                tile.kind = terrain;
                             }
                         }
                     }
@@ -25678,7 +25678,7 @@ mod tests {
                     y: 100.0,
                     radius: 30.0,
                 },
-                kind: TerrainKind::Rock,
+                terrain: TerrainKind::Rock,
                 fertility_bias: Some(0.5),
             })
             .expect("valid paint");

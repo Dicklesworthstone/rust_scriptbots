@@ -744,14 +744,12 @@ impl WorldCheckpointV1 {
         validate_agent_rng_checkpoint(state)?;
         validate_origin_checkpoint(state)?;
         for (index, effect) in state.active_effects.iter().enumerate() {
-            effect
-                .region
-                .restore()
-                .validate()
-                .map_err(|error| WorldCheckpointError::Contract {
+            effect.region.restore().validate_basic().map_err(|error| {
+                WorldCheckpointError::Contract {
                     path: format!("active_effects[{index}].region"),
                     detail: error.to_string(),
-                })?;
+                }
+            })?;
             if effect.ticks_remaining == 0 {
                 return contract_error(
                     format!("active_effects[{index}].ticks_remaining"),
@@ -759,7 +757,7 @@ impl WorldCheckpointV1 {
                 );
             }
             match effect.kind {
-                ActiveEffectKind::GrowthScale(growth_scale)
+                ActiveEffectKindCheckpointV1::GrowthScale(growth_scale)
                     if !(0.0..=1.0).contains(&growth_scale) =>
                 {
                     return contract_error(
@@ -767,7 +765,8 @@ impl WorldCheckpointV1 {
                         "growth scale must be finite and lie in [0, 1]",
                     );
                 }
-                ActiveEffectKind::Embargo | ActiveEffectKind::GrowthScale(_) => {}
+                ActiveEffectKindCheckpointV1::Embargo
+                | ActiveEffectKindCheckpointV1::GrowthScale(_) => {}
             }
         }
         Ok(())
