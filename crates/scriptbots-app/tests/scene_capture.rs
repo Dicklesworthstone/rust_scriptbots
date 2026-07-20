@@ -12,9 +12,7 @@ use scriptbots_app::scene::{
     BevyOffscreenDriver, CapturePoint, Expectation, FrontendKind, GoldenOutcome, SceneDriver,
     SceneManifest, process_golden,
 };
-use scriptbots_bevy::capture::{
-    CapturedFrame, CompareThresholds, compare_frames, encode_png,
-};
+use scriptbots_bevy::capture::{CapturedFrame, CompareThresholds, compare_frames, encode_png};
 use serial_test::serial;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
@@ -76,10 +74,9 @@ fn render_tiny(
     let dir = artifacts_dir?;
     let png = std::fs::read(dir.join("mid.png")).ok()?;
     let (width, height, rgba8) = scriptbots_bevy::capture::decode_png(&png).ok()?;
-    let provenance = serde_json::from_str(
-        &std::fs::read_to_string(dir.join("mid.provenance.json")).ok()?,
-    )
-    .ok()?;
+    let provenance =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("mid.provenance.json")).ok()?)
+            .ok()?;
     Some((
         hash,
         CapturedFrame {
@@ -95,7 +92,7 @@ fn render_tiny(
 #[test]
 #[serial]
 fn offscreen_capture_is_deterministic_on_the_same_adapter() {
-    let _guard = GPU_GUARD.lock().expect("gpu guard");
+    let _guard = GPU_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let first = render_tiny("det_a", Some(temp.path()));
     let second = render_tiny("det_b", Some(temp.path()));
@@ -108,7 +105,10 @@ fn offscreen_capture_is_deterministic_on_the_same_adapter() {
     );
     assert_eq!(frame_a.rgba8, frame_b.rgba8, "pixel bytes identical");
     // Provenance contract: real adapter identity, never blank.
-    assert_eq!(frame_a.provenance.schema, "scriptbots.capture-provenance.v1");
+    assert_eq!(
+        frame_a.provenance.schema,
+        "scriptbots.capture-provenance.v1"
+    );
     assert_ne!(frame_a.provenance.adapter_name, "unknown");
     assert_eq!(frame_a.provenance.viewport, [256, 256]);
     assert_eq!(frame_a.provenance.colorspace, "rgba8-srgb");
@@ -124,7 +124,7 @@ fn offscreen_capture_is_deterministic_on_the_same_adapter() {
 #[test]
 #[serial]
 fn corrupted_pipeline_fails_the_harness() {
-    let _guard = GPU_GUARD.lock().expect("gpu guard");
+    let _guard = GPU_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let Some((_, honest, _)) = render_tiny("alarm_honest", Some(temp.path())) else {
         return;
@@ -142,7 +142,10 @@ fn corrupted_pipeline_fails_the_harness() {
     let Some((_, corrupted, _)) = corrupted else {
         return;
     };
-    assert!(corrupted.provenance.corrupt, "corruption is labeled in provenance");
+    assert!(
+        corrupted.provenance.corrupt,
+        "corruption is labeled in provenance"
+    );
     let stats = compare_frames(
         &honest.rgba8,
         &corrupted.rgba8,
@@ -164,7 +167,7 @@ fn corrupted_pipeline_fails_the_harness() {
 #[test]
 #[serial]
 fn golden_workflow_pass_regen_missing() {
-    let _guard = GPU_GUARD.lock().expect("gpu guard");
+    let _guard = GPU_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let Some((_, frame, _)) = render_tiny("golden_flow", Some(temp.path())) else {
         return;
@@ -174,22 +177,36 @@ fn golden_workflow_pass_regen_missing() {
     // 1. Missing golden: explicit failure with regeneration instructions,
     //    candidate written for review — never an auto-bless.
     let outcome = process_golden(&frame, &golden, false).expect("missing golden workflow");
-    let GoldenOutcome::MissingGolden { candidate, instructions } = outcome else {
+    let GoldenOutcome::MissingGolden {
+        candidate,
+        instructions,
+    } = outcome
+    else {
         panic!("missing golden must produce MissingGolden, got {outcome:?}");
     };
     assert!(candidate.exists(), "candidate written for review");
-    assert!(instructions.contains("RUST_REGEN_GOLDEN"), "instructions name the regen path");
+    assert!(
+        instructions.contains("RUST_REGEN_GOLDEN"),
+        "instructions name the regen path"
+    );
     assert!(!golden.exists(), "no auto-bless");
 
     // 2. Regen: blesses byte-for-byte and writes provenance.
     let outcome = process_golden(&frame, &golden, true).expect("regen workflow");
     assert!(matches!(outcome, GoldenOutcome::Regenerated { .. }));
     assert!(golden.exists());
-    assert!(temp.path().join("goldens/golden_flow/mid.provenance.json").exists());
+    assert!(
+        temp.path()
+            .join("goldens/golden_flow/mid.provenance.json")
+            .exists()
+    );
 
     // 3. Compare against the just-blessed golden: pass.
     let outcome = process_golden(&frame, &golden, false).expect("pass workflow");
-    let GoldenOutcome::Pass { differing_ratio, .. } = outcome else {
+    let GoldenOutcome::Pass {
+        differing_ratio, ..
+    } = outcome
+    else {
         panic!("same-adapter compare must pass, got {outcome:?}");
     };
     assert_eq!(differing_ratio, 0.0);
@@ -200,7 +217,12 @@ fn golden_workflow_pass_regen_missing() {
         px[0] = px[0].wrapping_add(64);
     }
     let outcome = process_golden(&tampered, &golden, false).expect("mismatch workflow");
-    let GoldenOutcome::Mismatch { heatmap, max_channel_diff, .. } = outcome else {
+    let GoldenOutcome::Mismatch {
+        heatmap,
+        max_channel_diff,
+        ..
+    } = outcome
+    else {
         panic!("tampered candidate must mismatch, got {outcome:?}");
     };
     assert!(heatmap.exists(), "diff heatmap written");
@@ -222,14 +244,20 @@ fn checked_in_scene_manifests_all_validate() {
         });
         count += 1;
     }
-    assert!(count >= 5, "expected the five reference scenes, found {count}");
+    assert!(
+        count >= 5,
+        "expected the five reference scenes, found {count}"
+    );
 }
 
 #[test]
 fn missing_scene_manifest_fails_closed() {
     let missing = Path::new("definitely/not/a/scene.toml");
     let error = SceneManifest::load(missing).expect_err("missing file must fail");
-    assert!(error.to_string().contains("read"), "fail-closed read error: {error}");
+    assert!(
+        error.to_string().contains("read"),
+        "fail-closed read error: {error}"
+    );
 }
 
 #[test]

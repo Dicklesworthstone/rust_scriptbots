@@ -595,11 +595,13 @@ fn collect_tick_facts(
 /// Resolve a stable agent UID to its world position (camera follow targets).
 #[cfg(feature = "bevy_render")]
 fn agent_world_position(world: &WorldState, uid: u64) -> Option<[f32; 2]> {
-    world
-        .agents()
-        .iter()
-        .find(|(id, _)| world.agent_uid(id).is_some_and(|u| u.get() == uid))
-        .map(|(_, agent)| [agent.position.x, agent.position.y])
+    let arena = world.agents();
+    let id = arena
+        .iter_handles()
+        .find(|id| world.agent_uid(*id).is_some_and(|u| u.get() == uid))?;
+    let index = arena.index_of(id)?;
+    let position = arena.columns().positions().get(index)?;
+    Some([position.x, position.y])
 }
 
 /// The camera pose for one tick: the latest keyframe at or before `tick`,
@@ -607,7 +609,11 @@ fn agent_world_position(world: &WorldState, uid: u64) -> Option<[f32; 2]> {
 /// ground plane, +Y up); the look target is the followed agent (converted
 /// into Bevy space) or a yaw/pitch ray from `pos`.
 #[cfg(feature = "bevy_render")]
-fn camera_pose_at(manifest: &SceneManifest, tick: u64, world: &WorldState) -> ([f32; 3], [f32; 3], f32) {
+fn camera_pose_at(
+    manifest: &SceneManifest,
+    tick: u64,
+    world: &WorldState,
+) -> ([f32; 3], [f32; 3], f32) {
     let Some(key) = manifest.camera.iter().rev().find(|key| key.tick <= tick) else {
         return ([0.0, 1800.0, 1400.0], [0.0, 0.0, 0.0], 55.0);
     };
@@ -746,86 +752,98 @@ impl SceneDriver for BevyOffscreenDriver {
         }
         let corrupt = std::env::var(CAPTURE_CORRUPT_ENV)
             .ok()
-            .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
         let mut world = WorldState::new(config.clone()).map_err(|error| SceneError {
             problems: vec![format!("construct world: {error}")],
         })?;
         seed_grid(&mut world, self.seed_agents)?;
 
-        let mut capture = OffscreenCapture::new(&OffscreenCaptureConfig {
-            viewport: self.viewport,
-            render_settings: config.render.clone(),
-            corrupt,
-        })
-        .map_err(|error| SceneError {
-            problems: vec![format!("offscreen capture init: {error:#}")],
-        })?;
-
         let mut facts = SceneRunFacts::default();
         facts.agent_counts.push(world.agent_count());
         let mut tracker = TickFactTracker::default();
 
-        let mut do_captures =
-            |world: &WorldState, tick: u64, facts: &mut SceneRunFacts| -> Result<(), SceneError> {
-                let due: Vec<&CapturePoint> = manifest
-                    .captures
-                    .iter()
-                    .filter(|capture| capture.tick == tick)
-                    .collect();
-                if due.is_empty() {
-                    return Ok(());
-                }
-                let (pos, look_at, fov) = camera_pose_at(manifest, tick, world);
-                capture.set_camera_pose(pos, look_at, fov);
-                let frame = capture
-                    .render(world, &manifest.name, manifest.seed, tick)
-                    .map_err(|error| SceneError {
-                        problems: vec![format!("offscreen render at tick {tick}: {error:#}")],
-                    })?;
-                let hash = fnv1a64_hex(&frame.rgba8);
-                for point in due {
-                    facts
+        OffscreenCapture::run(
+            &OffscreenCaptureConfig {
+                viewport: self.viewport,
+                render_settings: config.render.clone(),
+                corrupt,
+            },
+            |capture| {
+                let mut do_captures = |world: &WorldState,
+                                       tick: u64,
+                                       facts: &mut SceneRunFacts|
+                 -> Result<(), SceneError> {
+                    let due: Vec<&CapturePoint> = manifest
                         .captures
-                        .push((point.name.clone(), tick, hash.clone(), frame.rgba8.len()));
-                    if let Some(dir) = &self.artifacts_dir {
-                        std::fs::create_dir_all(dir).map_err(|error| SceneError {
-                            problems: vec![format!("create {}: {error}", dir.display())],
-                        })?;
-                        let png = encode_png(frame.width, frame.height, &frame.rgba8).map_err(
-                            |error| SceneError {
-                                problems: vec![format!("encode png {}: {error:#}", point.name)],
-                            },
-                        )?;
-                        std::fs::write(dir.join(format!("{}.png", point.name)), png).map_err(
-                            |error| SceneError {
-                                problems: vec![format!("write {}.png: {error}", point.name)],
-                            },
-                        )?;
-                        let provenance = serde_json::to_string_pretty(&frame.provenance).map_err(
-                            |error| SceneError {
-                                problems: vec![format!("encode provenance: {error}")],
-                            },
-                        )?;
-                        std::fs::write(
-                            dir.join(format!("{}.provenance.json", point.name)),
-                            provenance,
-                        )
-                        .map_err(|error| SceneError {
-                            problems: vec![format!("write {}.provenance.json: {error}", point.name)],
-                        })?;
+                        .iter()
+                        .filter(|capture| capture.tick == tick)
+                        .collect();
+                    if due.is_empty() {
+                        return Ok(());
                     }
+                    let (pos, look_at, fov) = camera_pose_at(manifest, tick, world);
+                    capture.set_camera_pose(pos, look_at, fov);
+                    let frame = capture
+                        .render(world, &manifest.name, manifest.seed, tick)
+                        .map_err(|error| SceneError {
+                            problems: vec![format!("offscreen render at tick {tick}: {error:#}")],
+                        })?;
+                    let hash = fnv1a64_hex(&frame.rgba8);
+                    for point in due {
+                        facts
+                            .captures
+                            .push((point.name.clone(), tick, hash.clone(), frame.rgba8.len()));
+                        if let Some(dir) = &self.artifacts_dir {
+                            std::fs::create_dir_all(dir).map_err(|error| SceneError {
+                                problems: vec![format!("create {}: {error}", dir.display())],
+                            })?;
+                            let png = encode_png(frame.width, frame.height, &frame.rgba8)
+                                .map_err(|error| SceneError {
+                                    problems: vec![format!("encode png {}: {error:#}", point.name)],
+                                })?;
+                            std::fs::write(dir.join(format!("{}.png", point.name)), png).map_err(
+                                |error| SceneError {
+                                    problems: vec![format!("write {}.png: {error}", point.name)],
+                                },
+                            )?;
+                            let provenance = serde_json::to_string_pretty(&frame.provenance)
+                                .map_err(|error| SceneError {
+                                    problems: vec![format!("encode provenance: {error}")],
+                                })?;
+                            std::fs::write(
+                                dir.join(format!("{}.provenance.json", point.name)),
+                                provenance,
+                            )
+                            .map_err(|error| SceneError {
+                                problems: vec![format!(
+                                    "write {}.provenance.json: {error}",
+                                    point.name
+                                )],
+                            })?;
+                        }
+                    }
+                    Ok(())
+                };
+
+                do_captures(&world, 0, &mut facts).map_err(|e| anyhow::anyhow!("{e}"))?;
+                for tick in 1..=manifest.ticks {
+                    world.step().map_err(|error| {
+                        anyhow::anyhow!("world step {tick}: {error}")
+                    })?;
+                    collect_tick_facts(&world, tick, &mut facts, &mut tracker);
+                    do_captures(&world, tick, &mut facts).map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
                 Ok(())
-            };
-
-        do_captures(&world, 0, &mut facts)?;
-        for tick in 1..=manifest.ticks {
-            world.step().map_err(|error| SceneError {
-                problems: vec![format!("world step {tick}: {error}")],
-            })?;
-            collect_tick_facts(&world, tick, &mut facts, &mut tracker);
-            do_captures(&world, tick, &mut facts)?;
-        }
+            },
+        )
+        .map_err(|error| SceneError {
+            problems: vec![format!("offscreen capture: {error:#}")],
+        })?;
         if let Ok(digest) = world.world_digest_v1() {
             facts.world_digest = Some(digest.overall);
         }
@@ -972,7 +990,10 @@ pub fn process_golden(
     }
     let golden_bytes = std::fs::read(golden_path).map_err(|e| io("read golden", e))?;
     let (gw, gh, golden_rgba) = decode_png(&golden_bytes).map_err(|error| SceneError {
-        problems: vec![format!("decode golden {}: {error:#}", golden_path.display())],
+        problems: vec![format!(
+            "decode golden {}: {error:#}",
+            golden_path.display()
+        )],
     })?;
     let stats = if (gw, gh) == (frame.width, frame.height) {
         compare_frames(
