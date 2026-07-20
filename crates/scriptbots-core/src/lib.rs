@@ -4195,6 +4195,8 @@ impl Region {
 /// keeps one pathological command from inserting an unbounded population at one
 /// boundary — not a slot limit.
 pub const MAX_COHORT_INJECTION: u32 = 1_024;
+/// Capacity of the world's bounded applied-intervention audit ring (bd-16g.10.1).
+pub const APPLIED_INTERVENTION_CAPACITY: usize = 64;
 
 /// Where an injected cohort's brains come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4345,6 +4347,20 @@ pub enum Intervention {
 }
 
 impl Intervention {
+    /// Stable snake-case label for logs and audit records.
+    #[must_use]
+    pub const fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Drought { .. } => "drought",
+            Self::Embargo { .. } => "embargo",
+            Self::Bloom { .. } => "bloom",
+            Self::Meteor { .. } => "meteor",
+            Self::PaintTerrain { .. } => "paint_terrain",
+            Self::SetClosedWorld { .. } => "set_closed_world",
+            Self::InjectCohort { .. } => "inject_cohort",
+        }
+    }
+
     /// Reject an intervention that cannot be honoured, rather than clamping it
     /// into a different experiment than the one that was asked for.
     ///
@@ -4486,6 +4502,32 @@ pub struct ActiveEffect {
     pub kind: ActiveEffectKind,
 }
 
+/// Applied-intervention audit record (bd-16g.10.1 logging contract).
+///
+/// Core keeps a bounded ring of exactly what it applied and what lapsed;
+/// surfaces (TUI, REST, MCP) read the ring and emit the
+/// `scriptbots::intervention` logs. Observational history like the narrative
+/// ring: never part of the characterization digest or checkpoints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedInterventionRecord {
+    /// Monotonic sequence within the run, starting at 1; surfaces watermark on it.
+    pub seq: u64,
+    /// Tick the command applied (or the effect lapsed).
+    pub tick: Tick,
+    /// Stable snake-case label: `drought`, `embargo`, `bloom`, `meteor`,
+    /// `paint_terrain`, `set_closed_world`, `inject_cohort`, or `expiry:<kind>`.
+    pub kind: &'static str,
+    /// Region the command targeted.
+    pub region: Region,
+    /// Live agents inside the region at application time (0 for expiry records).
+    pub agents_affected: usize,
+    /// Food cells inside the region at application time (0 for expiry records).
+    pub cells_affected: usize,
+    /// For timed effects, the tick at which the effect lapses.
+    pub expires_at: Option<Tick>,
+    /// True for effect-expiry records, false for command applications.
+    pub expired: bool,
+}
 /// The effect an [`ActiveEffect`] has on the region while in force.
 ///
 /// Serialized externally tagged (no `#[serde(tag)]`): internal tagging cannot
@@ -14832,6 +14874,12 @@ pub struct WorldState {
     narrative: narrative::RunNarrative,
     pending_interventions: Vec<Intervention>,
     active_effects: Vec<ActiveEffect>,
+    /// Bounded audit ring of applied/lapsed interventions (bd-16g.10.1). Surfaces
+    /// read this to emit the `scriptbots::intervention` logs; never in digests
+    /// or checkpoints.
+    applied_interventions: VecDeque<AppliedInterventionRecord>,
+    /// Monotonic sequence source for `AppliedInterventionRecord::seq`.
+    next_intervention_seq: u64,
     #[allow(dead_code)]
     carcass_health_distributed: f32,
     #[allow(dead_code)]
@@ -14987,6 +15035,8 @@ impl WorldState {
             history: VecDeque::with_capacity(history_capacity),
             narrative: narrative::RunNarrative::default(),
             pending_interventions: Vec::new(),
+            applied_interventions: VecDeque::with_capacity(APPLIED_INTERVENTION_CAPACITY),
+            next_intervention_seq: 1,
             active_effects: Vec::new(),
             carcass_health_distributed: 0.0,
             carcass_reproduction_bonus: 0.0,
@@ -17179,14 +17229,33 @@ impl WorldState {
         intervention: Intervention,
     ) -> Result<(), WorldStateError> {
         self.ensure_scientific_mutation_allowed("interventions")?;
-        intervention.validate_for_world(self.config.world_width, self.config.world_height)?;
+        if let Err(error) =
+            intervention.validate_for_world(self.config.world_width, self.config.world_height)
+        {
+            tracing::error!(
+                target: "scriptbots::intervention",
+                tick = self.tick.0,
+                kind = intervention.kind_label(),
+                %error,
+                "intervention rejected"
+            );
+            return Err(error);
+        }
         if let Intervention::InjectCohort {
             genome: CohortSource::RegisteredBrain { key },
             ..
         } = intervention
             && self.brain_registry.family(key).is_none()
         {
-            return Err(InterventionError::UnknownBrainKey { key }.into());
+            let error = InterventionError::UnknownBrainKey { key };
+            tracing::error!(
+                target: "scriptbots::intervention",
+                tick = self.tick.0,
+                kind = intervention.kind_label(),
+                %error,
+                "intervention rejected"
+            );
+            return Err(error.into());
         }
         self.pending_interventions.push(intervention);
         Ok(())
@@ -17196,6 +17265,103 @@ impl WorldState {
     #[must_use]
     pub fn active_effects(&self) -> &[ActiveEffect] {
         &self.active_effects
+    }
+
+    /// Bounded audit ring of applied and lapsed interventions, oldest first
+    /// (bd-16g.10.1). Surfaces read this to emit `scriptbots::intervention` logs.
+    #[must_use]
+    pub const fn applied_interventions(&self) -> &VecDeque<AppliedInterventionRecord> {
+        &self.applied_interventions
+    }
+
+    fn record_intervention(
+        &mut self,
+        kind: &'static str,
+        region: Region,
+        agents_affected: usize,
+        cells_affected: usize,
+        expires_at: Option<Tick>,
+        expired: bool,
+    ) {
+        let seq = self.next_intervention_seq;
+        self.next_intervention_seq = self.next_intervention_seq.saturating_add(1);
+        if self.applied_interventions.len() >= APPLIED_INTERVENTION_CAPACITY {
+            self.applied_interventions.pop_front();
+        }
+        self.applied_interventions.push_back(AppliedInterventionRecord {
+            seq,
+            // Both the application stage (top of tick) and the expiry aging (at
+            // finalize, before advance) stamp the tick being PRODUCED, matching
+            // the birth/death record convention.
+            tick: self.tick.next(),
+            kind,
+            region,
+            agents_affected,
+            cells_affected,
+            expires_at,
+            expired,
+        });
+        if expired {
+            tracing::info!(
+                target: "scriptbots::intervention",
+                tick = self.tick.next().0,
+                seq,
+                kind,
+                "intervention effect lapsed"
+            );
+        } else {
+            tracing::info!(
+                target: "scriptbots::intervention",
+                tick = self.tick.next().0,
+                seq,
+                kind,
+                ?region,
+                agents_affected,
+                cells_affected,
+                expires_at = expires_at.map(|tick| tick.0),
+                "intervention applied"
+            );
+            if agents_affected == 0 && cells_affected == 0 && kind != "set_closed_world" {
+                // A mis-parameterized meteor that hits nothing is visually
+                // indistinguishable from one that worked; the log is the only
+                // place that difference can show up.
+                tracing::warn!(
+                    target: "scriptbots::intervention",
+                    tick = self.tick.next().0,
+                    seq,
+                    kind,
+                    ?region,
+                    "intervention matched zero agents and zero cells"
+                );
+            }
+        }
+    }
+
+    fn count_agents_in_region(&self, region: Region) -> usize {
+        let (width, height) = (self.config.world_width as f32, self.config.world_height as f32);
+        self.agents
+            .columns()
+            .positions()
+            .iter()
+            .filter(|position| region.contains(position.x, position.y, width, height))
+            .count()
+    }
+
+    fn count_food_cells_in_region(&self, region: Region) -> usize {
+        let (world_width, world_height) =
+            (self.config.world_width as f32, self.config.world_height as f32);
+        let cell_size = self.config.food_cell_size as f32;
+        let (width, height) = (self.food.width(), self.food.height());
+        let mut count = 0_usize;
+        for cy in 0..height {
+            for cx in 0..width {
+                let (px, py) = ((cx as f32 + 0.5) * cell_size, (cy as f32 + 0.5) * cell_size);
+                if region.contains(px, py, world_width, world_height) {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     /// Apply queued interventions and age the timed ones.
@@ -17223,21 +17389,42 @@ impl WorldState {
                     ticks,
                     growth_scale,
                 } => {
+                    let agents = self.count_agents_in_region(region);
+                    let cells = self.count_food_cells_in_region(region);
                     self.active_effects.push(ActiveEffect {
                         region,
                         ticks_remaining: ticks,
                         kind: ActiveEffectKind::GrowthScale(growth_scale),
                     });
+                    self.record_intervention(
+                        "drought",
+                        region,
+                        agents,
+                        cells,
+                        Some(Tick(self.tick.next().0 + u64::from(ticks))),
+                        false,
+                    );
                 }
                 Intervention::Embargo { region, ticks } => {
+                    let agents = self.count_agents_in_region(region);
+                    let cells = self.count_food_cells_in_region(region);
                     self.active_effects.push(ActiveEffect {
                         region,
                         ticks_remaining: ticks,
                         kind: ActiveEffectKind::Embargo,
                     });
+                    self.record_intervention(
+                        "embargo",
+                        region,
+                        agents,
+                        cells,
+                        Some(Tick(self.tick.next().0 + u64::from(ticks))),
+                        false,
+                    );
                 }
                 Intervention::Bloom { region, amount } => {
                     let cap = self.config.food_max;
+                    let cells = self.count_food_cells_in_region(region);
                     let (width, height) = (self.food.width(), self.food.height());
                     for cy in 0..height {
                         for cx in 0..width {
@@ -17252,12 +17439,15 @@ impl WorldState {
                             }
                         }
                     }
+                    self.record_intervention("bloom", region, 0, cells, None, false);
                 }
                 Intervention::Meteor {
                     region,
                     lethality,
                     scorch,
                 } => {
+                    let cells = self.count_food_cells_in_region(region);
+                    let agents = self.count_agents_in_region(region);
                     let (width, height) = (self.food.width(), self.food.height());
                     for cy in 0..height {
                         for cx in 0..width {
@@ -17283,6 +17473,7 @@ impl WorldState {
                             }
                         }
                     }
+                    self.record_intervention("meteor", region, agents, cells, None, false);
                 }
                 Intervention::PaintTerrain {
                     region,
@@ -17290,6 +17481,7 @@ impl WorldState {
                     fertility_bias,
                 } => {
                     let (width, height) = (self.terrain.width(), self.terrain.height());
+                    let mut tiles = 0_usize;
                     for ty in 0..height {
                         for tx in 0..width {
                             let (px, py) =
@@ -17298,6 +17490,7 @@ impl WorldState {
                                 && let Some(tile) = self.terrain.tile_mut(tx, ty)
                             {
                                 tile.kind = terrain;
+                                tiles += 1;
                             }
                         }
                     }
@@ -17320,9 +17513,18 @@ impl WorldState {
                             }
                         }
                     }
+                    self.record_intervention("paint_terrain", region, 0, tiles, None, false);
                 }
                 Intervention::SetClosedWorld { closed } => {
                     self.config.closed = closed;
+                    self.record_intervention(
+                        "set_closed_world",
+                        Region::All,
+                        0,
+                        0,
+                        None,
+                        false,
+                    );
                 }
                 Intervention::InjectCohort {
                     count,
@@ -17331,6 +17533,7 @@ impl WorldState {
                 } => {
                     let CohortSource::RegisteredBrain { key } = genome;
                     let Placement::Seeded { region, seed } = placement;
+                    let placement_region = region;
                     let mut rng = SmallRng::seed_from_u64(seed);
                     let mut spawned: Vec<AgentId> = Vec::with_capacity(usize::from(count));
                     let mut breach_count = 0_u32;
@@ -17355,6 +17558,7 @@ impl WorldState {
                             }
                         }
                     }
+                    let spawned_count = spawned.len();
                     for id in spawned {
                         if self.bind_agent_brain(id, key).is_err() {
                             breach_count += 1;
@@ -17367,6 +17571,14 @@ impl WorldState {
                             "cohort injection hit an internal breach after enqueue validation"
                         );
                     }
+                    self.record_intervention(
+                        "inject_cohort",
+                        placement_region,
+                        spawned_count,
+                        0,
+                        None,
+                        false,
+                    );
                 }
             }
         }
@@ -20881,6 +21093,19 @@ impl WorldState {
             // tick finalizes (never mid-tick before a consumer sees it).
             for effect in &mut self.active_effects {
                 effect.ticks_remaining = effect.ticks_remaining.saturating_sub(1);
+            }
+            let lapsed: Vec<ActiveEffect> = self
+                .active_effects
+                .iter()
+                .filter(|effect| effect.ticks_remaining == 0)
+                .copied()
+                .collect();
+            for effect in lapsed {
+                let kind_label = match effect.kind {
+                    ActiveEffectKind::GrowthScale(_) => "expiry:drought",
+                    ActiveEffectKind::Embargo => "expiry:embargo",
+                };
+                self.record_intervention(kind_label, effect.region, 0, 0, None, true);
             }
             self.active_effects
                 .retain(|effect| effect.ticks_remaining > 0);
@@ -26735,13 +26960,122 @@ mod tests {
         assert_eq!(run(), run(), "same seed must yield the same story");
     }
 
-    /// The attribution must reproduce core's own sensing, or the inspector is
-    /// confidently lying to the user — the worst possible outcome for a panel
-    /// whose entire job is to explain.
-    ///
-    /// The proof: explain what the agent perceives now, then step the world once
-    /// (`stage_sense` runs before anything moves, so it senses exactly the world we
-    /// just explained) and require core's sensors to match what we predicted.
+    #[test]
+    fn applied_intervention_audit_ring_records_application_and_expiry() {
+        // bd-16g.10.1 logging contract: the world keeps a bounded audit ring of
+        // exactly what it applied and what lapsed; surfaces read the ring to emit
+        // the scriptbots::intervention logs.
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            rng_seed: Some(5),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let near = world.spawn_agent(AgentData {
+            position: Position::new(5.0, 100.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let far = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let _ = (near, far);
+
+        world
+            .enqueue_intervention(Intervention::Meteor {
+                region: Region::Disc {
+                    x: 0.0,
+                    y: 100.0,
+                    radius: 20.0,
+                },
+                lethality: 1.0,
+                scorch: 0.5,
+            })
+            .expect("meteor validates");
+        world
+            .enqueue_intervention(Intervention::Drought {
+                region: Region::All,
+                ticks: 2,
+                growth_scale: 0.0,
+            })
+            .expect("drought validates");
+        assert!(world.applied_interventions().is_empty());
+
+        for _ in 0..3 {
+            world.step().expect("intervention step");
+        }
+        let records = world.applied_interventions();
+        let meteor = records
+            .iter()
+            .find(|record| record.kind == "meteor")
+            .expect("meteor recorded");
+        assert!(!meteor.expired);
+        assert_eq!(meteor.agents_affected, 1, "only the near agent is in the disc");
+        assert!(meteor.cells_affected > 0);
+        assert_eq!(meteor.tick, Tick(1), "applied at the top of the first tick");
+        assert_eq!(meteor.seq, 1);
+
+        let drought = records
+            .iter()
+            .find(|record| record.kind == "drought")
+            .expect("drought recorded");
+        assert_eq!(drought.expires_at, Some(Tick(3)));
+        assert_eq!(drought.seq, 2);
+
+        let expiry = records
+            .iter()
+            .find(|record| record.kind == "expiry:drought")
+            .expect("expiry recorded");
+        assert!(expiry.expired);
+        assert!(expiry.seq > drought.seq, "expiry follows application");
+        // Sequences are strictly monotonic across the ring.
+        let seqs: Vec<u64> = records.iter().map(|record| record.seq).collect();
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "audit seq must be monotonic: {seqs:?}"
+        );
+    }
+
+    #[test]
+    fn applied_intervention_audit_ring_is_bounded() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            rng_seed: Some(7),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        for index in 0..(APPLIED_INTERVENTION_CAPACITY + 8) {
+            world
+                .enqueue_intervention(Intervention::SetClosedWorld {
+                    closed: index % 2 == 0,
+                })
+                .expect("closed-world toggle validates");
+            world.step().expect("bounded ring step");
+        }
+        assert_eq!(
+            world.applied_interventions().len(),
+            APPLIED_INTERVENTION_CAPACITY,
+            "the audit ring must be bounded"
+        );
+        // The oldest retained record is not seq 1 — the ring wrapped, and the
+        // retained tail is still strictly ordered.
+        let seqs: Vec<u64> = world
+            .applied_interventions()
+            .iter()
+            .map(|record| record.seq)
+            .collect();
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(seqs[0] > 1, "wrapped ring drops the oldest records");
+    }
+
     #[test]
     fn a_meteor_selects_agents_across_the_toroidal_seam() {
         // The world is a TORUS. A region that measured distance naively would
@@ -27742,6 +28076,13 @@ mod tests {
         );
     }
 
+    /// The attribution must reproduce core's own sensing, or the inspector is
+    /// confidently lying to the user — the worst possible outcome for a panel
+    /// whose entire job is to explain.
+    ///
+    /// The proof: explain what the agent perceives now, then step the world once
+    /// (`stage_sense` runs before anything moves, so it senses exactly the world we
+    /// just explained) and require core's sensors to match what we predicted.
     #[test]
     fn explain_sensors_reproduces_the_sensors_core_itself_computes() {
         // Freeze the food economy so sensor[4] cannot drift between the
