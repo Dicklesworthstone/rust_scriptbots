@@ -17163,16 +17163,6 @@ impl WorldState {
         &self.active_effects
     }
 
-    /// Read an agent's heritable genome through the versioned protocol — the only
-    /// sanctioned cross-crate genome read path (bd-16g.13.1). Protocol types only:
-    /// genome envelopes cross the crate boundary; brain structs never do. Returns
-    /// `None` for an unbound or legacy (non-protocol) brain, or a dead handle.
-    #[must_use]
-    pub fn agent_genome(&self, id: AgentId) -> Option<BrainGenomeEnvelope> {
-        let runtime = self.runtime.get(id)?;
-        runtime.brain.genome().cloned()
-    }
-
     /// Apply queued interventions and age the timed ones.
     ///
     /// Runs at the TOP of the tick, before food dynamics and sensing, so a

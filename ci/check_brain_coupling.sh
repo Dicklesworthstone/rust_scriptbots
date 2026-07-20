@@ -11,7 +11,7 @@
 #      Concrete brain access belongs to scriptbots-brain and the protocol
 #      adapters only.
 #   3. scriptbots-core must expose exactly one sanctioned genome read path:
-#      a public WorldState::agent_genome method (protocol envelope types
+#      a public WorldState::agent_brain_genome method (protocol envelope types
 #      only, no brain struct crossing the boundary).
 #
 # A CI grep can only prove the boundary exists; it cannot prove nobody will
@@ -65,10 +65,10 @@ check_no_downcast() { # $1 = repo root
 }
 
 check_read_path() { # $1 = core lib
-  if grep -q 'pub fn agent_genome(' "$1"; then
-    note "ok: WorldState::agent_genome read path exists"
+  if grep -q 'pub fn agent_brain_genome(' "$1"; then
+    note "ok: WorldState::agent_brain_genome read path exists"
   else
-    fail "WorldState::agent_genome read path missing (the only sanctioned genome read)"
+    fail "WorldState::agent_brain_genome read path missing (the only sanctioned genome read)"
   fi
 }
 
@@ -100,7 +100,7 @@ scriptbots-core = { path = "../scriptbots-core" }
 [dev-dependencies]
 scriptbots-brain = { path = "../scriptbots-brain" }
 EOF
-  printf 'pub fn agent_genome() {}\n' > "$tmp/crates/scriptbots-core/src/lib.rs"
+  printf 'pub fn agent_brain_genome() {}\n' > "$tmp/crates/scriptbots-core/src/lib.rs"
   if REPO_ROOT="$tmp" rc >/dev/null 2>&1; then
     note "self-test 1 ok: compliant fixture passes"
   else
