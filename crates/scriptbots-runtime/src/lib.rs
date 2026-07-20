@@ -1947,35 +1947,35 @@ impl CommandLifecycleEvidence {
                 return Err(CommandLifecycleEvidenceError::InvalidPreAdmissionLifecycle);
             }
         } else {
-                if self.transitions.len() != 2
-                    || self.transitions[0].application != ApplicationState::Admitted
-                    || !matches!(
-                        &self.transitions[1].application,
-                        ApplicationState::Applied(_)
-                            | ApplicationState::Failed(_)
-                            | ApplicationState::Rejected(
-                                RejectionReason::ControlRevisionConflict { .. }
-                                    | RejectionReason::ScientificRevisionConflict { .. }
-                                    | RejectionReason::ConfigRevisionConflict { .. }
-                            )
-                    )
-                {
-                    return Err(CommandLifecycleEvidenceError::InvalidAdmittedLifecycle);
-                }
-                let admitted = self.transitions[0].boundary;
-                let terminal = self.transitions[1].boundary;
-                if terminal.tick < admitted.tick {
-                    return Err(CommandLifecycleEvidenceError::TerminalTickRegressed);
-                }
-                if terminal.revisions.control < admitted.revisions.control {
-                    return Err(CommandLifecycleEvidenceError::TerminalControlRevisionRegressed);
-                }
-                if terminal.revisions.scientific < admitted.revisions.scientific {
-                    return Err(CommandLifecycleEvidenceError::TerminalScientificRevisionRegressed);
-                }
-                if terminal.revisions.config < admitted.revisions.config {
-                    return Err(CommandLifecycleEvidenceError::TerminalConfigRevisionRegressed);
-                }
+            if self.transitions.len() != 2
+                || self.transitions[0].application != ApplicationState::Admitted
+                || !matches!(
+                    &self.transitions[1].application,
+                    ApplicationState::Applied(_)
+                        | ApplicationState::Failed(_)
+                        | ApplicationState::Rejected(
+                            RejectionReason::ControlRevisionConflict { .. }
+                                | RejectionReason::ScientificRevisionConflict { .. }
+                                | RejectionReason::ConfigRevisionConflict { .. }
+                        )
+                )
+            {
+                return Err(CommandLifecycleEvidenceError::InvalidAdmittedLifecycle);
+            }
+            let admitted = self.transitions[0].boundary;
+            let terminal = self.transitions[1].boundary;
+            if terminal.tick < admitted.tick {
+                return Err(CommandLifecycleEvidenceError::TerminalTickRegressed);
+            }
+            if terminal.revisions.control < admitted.revisions.control {
+                return Err(CommandLifecycleEvidenceError::TerminalControlRevisionRegressed);
+            }
+            if terminal.revisions.scientific < admitted.revisions.scientific {
+                return Err(CommandLifecycleEvidenceError::TerminalScientificRevisionRegressed);
+            }
+            if terminal.revisions.config < admitted.revisions.config {
+                return Err(CommandLifecycleEvidenceError::TerminalConfigRevisionRegressed);
+            }
         }
         Ok(())
     }

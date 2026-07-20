@@ -82,9 +82,18 @@ pub struct Permalink {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermalinkError {
     /// Fewer bytes than the fixed header needs.
-    TruncatedHeader { offset: usize, needed: usize, available: usize },
+    TruncatedHeader {
+        offset: usize,
+        needed: usize,
+        available: usize,
+    },
     /// A declared field length overran the payload.
-    TruncatedField { field: &'static str, offset: usize, declared: usize, remaining: usize },
+    TruncatedField {
+        field: &'static str,
+        offset: usize,
+        declared: usize,
+        remaining: usize,
+    },
     /// Payload exceeds the documented cap before parsing starts.
     OversizedPayload { actual: usize, maximum: usize },
     /// Magic prefix mismatch.
@@ -106,7 +115,12 @@ pub enum PermalinkError {
     /// Too many knob entries.
     TooManyKnobs { found: usize, maximum: usize },
     /// A knob assignment violates its declared range.
-    OutOfRange { path: String, value: f64, min: f64, max: f64 },
+    OutOfRange {
+        path: String,
+        value: f64,
+        min: f64,
+        max: f64,
+    },
     /// The embedded digest does not match the config reconstructed from
     /// (scenario + knob diff). The link and the scenario disagree — the digest
     /// is the gate that keeps a tampered scenario from passing.
@@ -118,33 +132,62 @@ pub enum PermalinkError {
 impl fmt::Display for PermalinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TruncatedHeader { offset, needed, available } => write!(
+            Self::TruncatedHeader {
+                offset,
+                needed,
+                available,
+            } => write!(
                 f,
                 "permalink header truncated at byte {offset}: need {needed} bytes, have {available}"
             ),
-            Self::TruncatedField { field, offset, declared, remaining } => write!(
+            Self::TruncatedField {
+                field,
+                offset,
+                declared,
+                remaining,
+            } => write!(
                 f,
                 "permalink field {field} at byte {offset} declares {declared} bytes but only {remaining} remain"
             ),
             Self::OversizedPayload { actual, maximum } => {
-                write!(f, "permalink payload is {actual} bytes; maximum is {maximum}")
+                write!(
+                    f,
+                    "permalink payload is {actual} bytes; maximum is {maximum}"
+                )
             }
             Self::BadMagic { first_16_bytes_hex } => {
-                write!(f, "permalink magic mismatch (first bytes: {first_16_bytes_hex})")
+                write!(
+                    f,
+                    "permalink magic mismatch (first bytes: {first_16_bytes_hex})"
+                )
             }
             Self::UnsupportedVersion { found, supported } => {
-                write!(f, "permalink version {found} is not supported (expected {supported})")
+                write!(
+                    f,
+                    "permalink version {found} is not supported (expected {supported})"
+                )
             }
             Self::NonzeroFlags { found } => {
-                write!(f, "permalink reserved flags must be zero; got 0x{found:02x}")
+                write!(
+                    f,
+                    "permalink reserved flags must be zero; got 0x{found:02x}"
+                )
             }
             Self::CrcMismatch { expected, actual } => {
-                write!(f, "permalink CRC32 mismatch: computed {actual:#010x}, declared {expected:#010x}")
+                write!(
+                    f,
+                    "permalink CRC32 mismatch: computed {actual:#010x}, declared {expected:#010x}"
+                )
             }
             Self::InvalidUtf8 { field, offset } => {
-                write!(f, "permalink field {field} at byte {offset} is not valid UTF-8")
+                write!(
+                    f,
+                    "permalink field {field} at byte {offset} is not valid UTF-8"
+                )
             }
-            Self::InvalidScenarioId { reason } => write!(f, "permalink scenario id invalid: {reason}"),
+            Self::InvalidScenarioId { reason } => {
+                write!(f, "permalink scenario id invalid: {reason}")
+            }
             Self::InvalidKnobPath { path, reason } => {
                 write!(f, "permalink knob path {path:?} invalid: {reason}")
             }
@@ -154,10 +197,21 @@ impl fmt::Display for PermalinkError {
             Self::TooManyKnobs { found, maximum } => {
                 write!(f, "permalink carries {found} knobs; maximum is {maximum}")
             }
-            Self::OutOfRange { path, value, min, max } => {
-                write!(f, "permalink knob {path} = {value} is outside [{min}, {max}]")
+            Self::OutOfRange {
+                path,
+                value,
+                min,
+                max,
+            } => {
+                write!(
+                    f,
+                    "permalink knob {path} = {value} is outside [{min}, {max}]"
+                )
             }
-            Self::DigestMismatch { embedded, reconstructed } => write!(
+            Self::DigestMismatch {
+                embedded,
+                reconstructed,
+            } => write!(
                 f,
                 "permalink config digest mismatch: embedded {embedded:#018x}, reconstructed {reconstructed:#018x}"
             ),
@@ -205,7 +259,8 @@ impl Permalink {
     /// Encode as the shareable URL-safe string (`sbw1.` + base64url, no padding).
     #[must_use]
     pub fn to_url_string(&self) -> String {
-        let mut encoded = String::with_capacity(PERMALINK_PREFIX.len() + self.encode().len() * 4 / 3 + 4);
+        let mut encoded =
+            String::with_capacity(PERMALINK_PREFIX.len() + self.encode().len() * 4 / 3 + 4);
         encoded.push_str(PERMALINK_PREFIX);
         base64url_encode(&self.encode(), &mut encoded);
         encoded
@@ -245,7 +300,8 @@ impl Permalink {
             return Err(PermalinkError::NonzeroFlags { found: flags });
         }
         let crc_slice = take_slice(bytes, bytes.len() - 4, 4, "crc")?;
-        let declared_crc = u32::from_le_bytes([crc_slice[0], crc_slice[1], crc_slice[2], crc_slice[3]]);
+        let declared_crc =
+            u32::from_le_bytes([crc_slice[0], crc_slice[1], crc_slice[2], crc_slice[3]]);
         let payload = &bytes[..bytes.len() - 4];
         let actual_crc = crc32(payload);
         if actual_crc != declared_crc {
@@ -261,7 +317,10 @@ impl Permalink {
         let scenario_len = take_u16(payload, &mut cursor, "scenario_id")? as usize;
         let scenario_bytes = take_slice(payload, cursor, scenario_len, "scenario_id")?;
         let scenario_id = std::str::from_utf8(scenario_bytes)
-            .map_err(|_| PermalinkError::InvalidUtf8 { field: "scenario_id", offset: cursor })?
+            .map_err(|_| PermalinkError::InvalidUtf8 {
+                field: "scenario_id",
+                offset: cursor,
+            })?
             .to_owned();
         cursor += scenario_len;
         let config_digest = u64::from_le_bytes(take(payload, cursor, 8, "config_digest")?);
@@ -285,7 +344,10 @@ impl Permalink {
             }
             let path_bytes = take_slice(payload, cursor, path_len, "knob_path")?;
             let path = std::str::from_utf8(path_bytes)
-                .map_err(|_| PermalinkError::InvalidUtf8 { field: "knob_path", offset: cursor })?
+                .map_err(|_| PermalinkError::InvalidUtf8 {
+                    field: "knob_path",
+                    offset: cursor,
+                })?
                 .to_owned();
             cursor += path_len;
             if path.is_empty() {
@@ -349,11 +411,11 @@ impl Permalink {
 
     /// Parse the URL-safe string form.
     pub fn from_url_string(text: &str) -> Result<Self, PermalinkError> {
-        let body = text.strip_prefix(PERMALINK_PREFIX).ok_or_else(|| {
-            PermalinkError::BadMagic {
+        let body = text
+            .strip_prefix(PERMALINK_PREFIX)
+            .ok_or_else(|| PermalinkError::BadMagic {
                 first_16_bytes_hex: hex_prefix(text.as_bytes(), 16),
-            }
-        })?;
+            })?;
         let bytes = base64url_decode(body)?;
         Self::decode(&bytes)
     }
@@ -441,7 +503,10 @@ impl Permalink {
 /// ascending path order — so two runs with the same reconstruction always
 /// agree and any tampering always disagrees.
 #[must_use]
-pub fn config_digest_with_diff(scenario_config: &serde_json::Value, knob_diff: &[(String, f64)]) -> u64 {
+pub fn config_digest_with_diff(
+    scenario_config: &serde_json::Value,
+    knob_diff: &[(String, f64)],
+) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -733,8 +798,9 @@ mod tests {
         // Version 255.
         let mut bad_version = good.clone();
         bad_version[3] = 255;
-        let crc = crc32(&bad_version[..bad_version.len() - 4]);
-        bad_version[bad_version.len() - 4..].copy_from_slice(&crc.to_le_bytes());
+        let bad_version_len = bad_version.len();
+        let crc = crc32(&bad_version[..bad_version_len - 4]);
+        bad_version[bad_version_len - 4..].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             Permalink::decode(&bad_version),
             Err(PermalinkError::UnsupportedVersion { found: 255, .. })
@@ -757,12 +823,15 @@ mod tests {
         lying.extend_from_slice(&42u64.to_le_bytes());
         lying.extend_from_slice(&u16::MAX.to_le_bytes());
         lying.extend_from_slice(&[0u8; 4]);
-        let crc = crc32(&lying[..lying.len() - 4]);
-        lying[lying.len() - 4..].copy_from_slice(&crc.to_le_bytes());
+        let lying_len = lying.len();
+        let crc = crc32(&lying[..lying_len - 4]);
+        lying[lying_len - 4..].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             Permalink::decode(&lying),
-            Err(PermalinkError::TruncatedField { field: "scenario_id", .. })
-                | Err(PermalinkError::CrcMismatch { .. })
+            Err(PermalinkError::TruncatedField {
+                field: "scenario_id",
+                ..
+            }) | Err(PermalinkError::CrcMismatch { .. })
                 | Err(PermalinkError::TrailingBytes { .. })
         ));
 
@@ -790,10 +859,14 @@ mod tests {
         big_scenario.extend_from_slice(&u16::MAX.to_le_bytes());
         big_scenario.extend_from_slice(&vec![b'x'; U16_MAX_AS_USIZE]);
         big_scenario.extend_from_slice(&[0u8; 40]);
-        let crc = crc32(&big_scenario[..big_scenario.len() - 4]);
-        big_scenario[big_scenario.len() - 4..].copy_from_slice(&crc.to_le_bytes());
+        let big_scenario_len = big_scenario.len();
+        let crc = crc32(&big_scenario[..big_scenario_len - 4]);
+        big_scenario[big_scenario_len - 4..].copy_from_slice(&crc.to_le_bytes());
         let outcome = std::panic::catch_unwind(|| Permalink::decode(&big_scenario));
-        assert!(outcome.is_ok(), "64 KB scenario id must never panic the decode");
+        assert!(
+            outcome.is_ok(),
+            "64 KB scenario id must never panic the decode"
+        );
     }
 
     #[test]
@@ -830,7 +903,9 @@ mod tests {
         ));
 
         link.knob_diff = vec![("food_max".to_owned(), 999_999.0)];
-        let error = link.validate_knobs().expect_err("out-of-range must be rejected");
+        let error = link
+            .validate_knobs()
+            .expect_err("out-of-range must be rejected");
         assert!(matches!(
             error,
             PermalinkError::OutOfRange { ref path, .. } if path == "food_max"
@@ -865,10 +940,7 @@ mod tests {
     #[test]
     fn duplicate_and_unordered_knobs_are_rejected() {
         let mut link = sample_link();
-        link.knob_diff = vec![
-            ("food_max".to_owned(), 0.6),
-            ("food_max".to_owned(), 0.7),
-        ];
+        link.knob_diff = vec![("food_max".to_owned(), 0.6), ("food_max".to_owned(), 0.7)];
         let bytes = link.encode();
         // encode() sorts; hand-build a duplicate-in-order payload to decode.
         let mut manual = Vec::new();

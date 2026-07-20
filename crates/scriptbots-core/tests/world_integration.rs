@@ -3,7 +3,12 @@
 // reassociation, or width changes alter world digests. Function lengths mirror
 // the legacy C++ parity layout and are reviewed as units.
 #![allow(clippy::suboptimal_flops, clippy::imprecise_flops)]
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 #![allow(clippy::float_cmp, clippy::while_float)]
 #![allow(clippy::too_many_lines)]
 
