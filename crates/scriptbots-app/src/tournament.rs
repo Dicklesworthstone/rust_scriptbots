@@ -15,7 +15,7 @@ use scriptbots_brain::BrainKind;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
-pub use execution::{MatchRunReport, run_match};
+pub use execution::{MatchRunReport, enforce_no_config_drift, run_match, run_tournament};
 
 /// Largest match count one spec may emit (orders × seeds). Guards the factorial policy
 /// from scheduling an untestable tournament by accident.
@@ -143,6 +143,14 @@ pub enum TournamentError {
         "cohort size {cohort_size} is not divisible by {families} families; unequal cohorts change the reproduction operator each family experiences"
     )]
     UnequalCohorts { cohort_size: usize, families: usize },
+    #[error("config digest drift across arms: expected {expected}, found {found}")]
+    ConfigDrift { expected: String, found: String },
+    #[error("cross-kind mating: child {child} has parents of kinds {parent_a} and {parent_b}")]
+    CrossKindMating {
+        child: u64,
+        parent_a: String,
+        parent_b: String,
+    },
     #[error("{reason}")]
     UnbalancedOrders { reason: String },
 }
@@ -672,10 +680,14 @@ pub mod execution {
         // The open-world lifeline is deliberately NOT touched: a tournament that sets
         // closed=false must experience the respawner and carry the qualifier, or the
         // warning would certify a respawn-inflated result as clean.
-        // The config digest arms the cross-arm drift guard: every arm must run the same
-        // effective configuration, and a mismatch anywhere must look like the bug it is.
+        // The config digest arms the cross-arm drift guard: it covers the SHARED
+        // configuration (seed-neutralized — each match's world_seed is per-match by
+        // design, not drift), so any mutated knob anywhere looks like the bug it is.
+        let mut digest_config = base_config.clone();
+        digest_config.rng_seed = None;
+        digest_config.closed = closed;
         let config_digest = blake3::hash(
-            serde_json::to_string(&config)
+            serde_json::to_string(&digest_config)
                 .map_err(|error| TournamentError::UnbalancedOrders {
                     reason: format!("config serialization for the digest failed: {error}"),
                 })?
@@ -838,9 +850,79 @@ pub mod execution {
             }
         }
 
+        // Species barrier re-proven at the end of every match: no child anywhere has
+        // parents of two different arms.
+        assert_no_cross_kind_mating(&world, &arm_by_uid)?;
+
         Ok(MatchRunReport {
             outcome,
             config_digest,
         })
+    }
+
+    /// Assert the species barrier held: no child anywhere has parents of two different
+    /// arms. A mixed cohort is the only place the codebase routinely mixes families, so
+    /// the barrier is re-proven at the end of every match rather than assumed.
+    fn assert_no_cross_kind_mating(
+        world: &WorldState,
+        arm_by_uid: &std::collections::HashMap<scriptbots_core::AgentUid, BrainKind>,
+    ) -> Result<(), TournamentError> {
+        for id in world.agents().iter_handles() {
+            let Some(uid) = world.agent_uid(id) else {
+                continue;
+            };
+            let Some(runtime) = world.agent_runtime(id) else {
+                continue;
+            };
+            let (Some(parent_a), Some(parent_b)) = (runtime.lineage[0], runtime.lineage[1]) else {
+                continue;
+            };
+            let (Some(arm_a), Some(arm_b)) = (arm_by_uid.get(&parent_a), arm_by_uid.get(&parent_b))
+            else {
+                continue;
+            };
+            if arm_a != arm_b {
+                return Err(TournamentError::CrossKindMating {
+                    child: uid.get(),
+                    parent_a: arm_a.as_str().to_owned(),
+                    parent_b: arm_b.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Plan and execute the full tournament serially. Matches are independent worlds by
+    /// construction, so serial execution is byte-identical to any parallel schedule —
+    /// the `--jobs N` invariant is proven per match rather than claimed for a pool.
+    pub fn run_tournament(
+        spec: &super::TournamentSpec,
+        base_config: &ScriptBotsConfig,
+    ) -> Result<Vec<MatchRunReport>, TournamentError> {
+        let plans = super::plan(spec)?;
+        let mut reports = Vec::with_capacity(plans.len());
+        for match_plan in &plans {
+            reports.push(run_match(match_plan, spec.ticks, spec.closed, base_config)?);
+        }
+        enforce_no_config_drift(&reports)?;
+        Ok(reports)
+    }
+
+    /// Cross-arm drift guard: every match in a tournament must have run the same
+    /// effective config, so a mutated knob anywhere surfaces as `ConfigDrift`, never as
+    /// a publishable finding.
+    pub fn enforce_no_config_drift(reports: &[MatchRunReport]) -> Result<(), TournamentError> {
+        let Some(expected) = reports.first().map(|report| report.config_digest.clone()) else {
+            return Ok(());
+        };
+        for report in reports {
+            if report.config_digest != expected {
+                return Err(TournamentError::ConfigDrift {
+                    expected: expected.clone(),
+                    found: report.config_digest.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 }

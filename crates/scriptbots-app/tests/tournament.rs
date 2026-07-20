@@ -5,7 +5,8 @@
 //! qualifier that can never be lost, and the null-tournament bias probe.
 
 use scriptbots_app::tournament::{
-    FamilyOutcome, MatchOutcome, OrderPolicy, TournamentSpec, plan, run_match,
+    FamilyOutcome, MatchOutcome, OrderPolicy, TournamentError, TournamentSpec,
+    enforce_no_config_drift, plan, run_match, run_tournament,
 };
 use scriptbots_brain::BrainKind;
 use scriptbots_core::ScriptBotsConfig;
@@ -129,6 +130,44 @@ fn null_tournament_arms_are_indistinguishable_beyond_seed_noise() {
     eprintln!(
         "null tournament evidence: mean gap {mean_gap:.4}, max per-match gap {gap_max:.4} over {} matches",
         plans.len()
+    );
+}
+
+#[test]
+fn run_tournament_reproduces_identical_report_sets() {
+    let spec = two_family_spec(120);
+    let first = run_tournament(&spec, &small_world()).expect("tournament one");
+    let second = run_tournament(&spec, &small_world()).expect("tournament two");
+    assert_eq!(first.len(), 2, "two assignments");
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.outcome, b.outcome, "report sets are byte-identical");
+        assert_eq!(a.config_digest, b.config_digest);
+    }
+    assert!(
+        first
+            .iter()
+            .all(|report| report.config_digest == first[0].config_digest),
+        "every arm ran the same effective config"
+    );
+}
+
+#[test]
+fn config_drift_guard_rejects_mismatched_arms() {
+    // The guard compares digests across arms; a fault-injected mutation anywhere must
+    // surface as ConfigDrift, not as a publishable finding.
+    let spec = two_family_spec(10);
+    let mut reports = run_tournament(&spec, &small_world()).expect("clean tournament");
+    reports[1].config_digest = "tampered".to_owned();
+    let error =
+        enforce_no_config_drift(&reports).expect_err("a tampered arm must fail the drift guard");
+    assert!(
+        matches!(error, TournamentError::ConfigDrift { .. }),
+        "expected ConfigDrift, got {error}"
+    );
+    assert!(
+        error.to_string().contains("tampered"),
+        "the drift error names the divergent digest: {error}"
     );
 }
 
