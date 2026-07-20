@@ -1486,7 +1486,9 @@ fn summarize_food_grid(cells: &[f32]) -> Option<(f64, f64, f64, f32)> {
 /// Per-agent mutation rate configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutationRates {
+    /// Primary per-gene mutation probability.
     pub primary: f32,
+    /// Secondary large-effect mutation probability.
     pub secondary: f32,
 }
 
@@ -1502,10 +1504,15 @@ impl Default for MutationRates {
 /// Trait modifiers affecting sense organs and physiology.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct TraitModifiers {
+    /// Sensitivity multiplier for the smell channel.
     pub smell: f32,
+    /// Sensitivity multiplier for emitted sound.
     pub sound: f32,
+    /// Sensitivity multiplier for the hearing channel.
     pub hearing: f32,
+    /// Sensitivity multiplier for the eye channel.
     pub eye: f32,
+    /// Sensitivity multiplier for the blood physiology channel.
     pub blood: f32,
 }
 
@@ -1524,7 +1531,9 @@ impl Default for TraitModifiers {
 /// Highlight shown around an agent in the UI.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct IndicatorState {
+    /// Current indicator pulse intensity.
     pub intensity: f32,
+    /// RGB pulse color.
     pub color: [f32; 3],
 }
 
@@ -1540,22 +1549,29 @@ impl Default for IndicatorState {
 /// Selection state applied by user interaction.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SelectionState {
+    /// Not selected.
     #[default]
     None,
+    /// Hovered.
     Hovered,
+    /// Selected.
     Selected,
 }
 
 /// Coarse dietary classification used for debug surfacing.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum DietClass {
+    /// Predominantly plant-eating.
     #[default]
     Herbivore,
+    /// Mixed diet.
     Omnivore,
+    /// Predominantly meat-eating.
     Carnivore,
 }
 
 impl DietClass {
+    /// Classify an herbivore tendency into a coarse diet class.
     #[must_use]
     pub const fn from_tendency(tendency: f32) -> Self {
         if tendency <= 0.33 {
@@ -1571,17 +1587,23 @@ impl DietClass {
 /// Strategies for applying selection updates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SelectionMode {
+    /// Replace the current selection.
     Replace,
+    /// Add to the current selection.
     Add,
+    /// Clear the current selection.
     Clear,
 }
 
 /// External selection update request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectionUpdate {
+    /// How the update merges with the existing selection.
     pub mode: SelectionMode,
+    /// Raw agent handles to select.
     #[serde(default)]
     pub agent_ids: Vec<u64>,
+    /// Selection state to apply.
     #[serde(default = "SelectionUpdate::default_state")]
     pub state: SelectionState,
 }
@@ -1595,32 +1617,43 @@ impl SelectionUpdate {
 /// Resulting counts from applying a selection update.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct SelectionResult {
+    /// Count of agents updated.
     pub applied: usize,
+    /// Count of agents cleared.
     pub cleared: usize,
+    /// Count of agents still selected.
     pub remaining_selected: usize,
 }
 
 /// Sort options for agent debug listings.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum AgentDebugSort {
+    /// Sort by energy, descending.
     #[default]
     EnergyDesc,
+    /// Sort by age, descending.
     AgeDesc,
 }
 
 /// Query parameters for a debug view of agents.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentDebugQuery {
+    /// Optional raw-handle filter.
     #[serde(default)]
     pub ids: Option<Vec<u64>>,
+    /// Optional diet-class filter.
     #[serde(default)]
     pub diet: Option<DietClass>,
+    /// Optional selection-state filter.
     #[serde(default)]
     pub selection: Option<SelectionState>,
+    /// Optional brain-kind filter.
     #[serde(default)]
     pub brain_kind: Option<String>,
+    /// Optional result cap.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Sort order for the listing.
     #[serde(default)]
     pub sort: AgentDebugSort,
 }
@@ -1632,29 +1665,48 @@ pub struct AgentDebugInfo {
     pub agent_id: u64,
     /// Stable logical identity used by scientific records and lineage.
     pub agent_uid: AgentUid,
+    /// Projected selection state.
     pub selection: SelectionState,
+    /// Projected live position.
     pub position: Position,
+    /// Projected live energy reserve.
     pub energy: f32,
+    /// Projected live health.
     pub health: f32,
+    /// Projected live age in ticks.
     pub age: u32,
+    /// Projected generation number.
     pub generation: u32,
+    /// Projected herbivore tendency (0=carnivore..1=herbivore).
     pub herbivore_tendency: f32,
+    /// Projected coarse diet classification.
     pub diet: DietClass,
+    /// Projected brain family kind, if a brain is attached.
     pub brain_kind: Option<String>,
+    /// Projected brain registry key, if a brain is attached.
     pub brain_key: Option<u64>,
+    /// Projected primary mutation rate.
     pub mutation_primary: f32,
+    /// Projected secondary mutation rate.
     pub mutation_secondary: f32,
+    /// Projected UI highlight pulse state.
     pub indicator: IndicatorState,
 }
 
 /// Per-tick combat markers used by UI, analytics, and audio layers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CombatEventFlags {
+    /// Set when the agent attacked with its spike this tick.
     pub spike_attacker: bool,
+    /// Set when the agent was a spike victim this tick.
     pub spike_victim: bool,
+    /// Set when the agent hit a carnivore this tick.
     pub hit_carnivore: bool,
+    /// Set when the agent hit a herbivore this tick.
     pub hit_herbivore: bool,
+    /// Set when the agent was spiked by a carnivore this tick.
     pub was_spiked_by_carnivore: bool,
+    /// Set when the agent was spiked by a herbivore this tick.
     pub was_spiked_by_herbivore: bool,
 }
 
@@ -1666,18 +1718,28 @@ pub struct CombatEventFlags {
 /// an unrelated legacy runner or silently falling back to fresh random construction.
 #[derive(Serialize, Deserialize)]
 pub enum BrainBinding {
+    /// No brain attached.
     Unbound,
+    /// Admitted evolutionary family binding.
     Protocol {
+        /// Registry key of the bound brain family.
         registry_key: u64,
+        /// Brain family kind identifier.
         kind: String,
+        /// Heritable genome envelope.
         genome: BrainGenomeEnvelope,
+        /// Live evaluator state (never serialized).
         #[serde(skip)]
         evaluator: Option<Box<dyn BrainEvaluator>>,
     },
+    /// Non-admitted legacy runner binding.
     Legacy {
+        /// Live legacy runner (never serialized).
         #[serde(skip)]
         runner: Option<Box<dyn BrainRunner>>,
+        /// Legacy registry key, if registered.
         registry_key: Option<u64>,
+        /// Legacy brain kind identifier.
         kind: String,
     },
 }
@@ -2161,6 +2223,7 @@ impl std::fmt::Debug for BrainRegistry {
 }
 
 impl BrainRegistry {
+    /// Construct an empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -2352,29 +2415,53 @@ impl BrainRegistry {
 /// Runtime data associated with an agent beyond the dense SoA columns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRuntime {
+    /// Current energy reserve.
     pub energy: f32,
+    /// Progress toward the reproduction threshold.
     pub reproduction_counter: f32,
+    /// Disposition on the 0=carnivore..1=herbivore axis.
     pub herbivore_tendency: f32,
+    /// Per-agent mutation rate configuration.
     pub mutation_rates: MutationRates,
+    /// Sense/physiology multipliers.
     pub trait_modifiers: TraitModifiers,
+    /// Legacy dual clock outputs.
     pub clocks: [f32; 2],
+    /// Per-eye field-of-view angle.
     pub eye_fov: [f32; NUM_EYES],
+    /// Per-eye relative bearing.
     pub eye_direction: [f32; NUM_EYES],
+    /// Emitted-sound scale.
     pub sound_multiplier: f32,
+    /// Altruistic sharing intent output.
     pub give_intent: f32,
+    /// Latest input vector fed to the brain.
     pub sensors: [f32; INPUT_SIZE],
+    /// Latest brain output vector.
     pub outputs: [f32; OUTPUT_SIZE],
+    /// UI highlight pulse state.
     pub indicator: IndicatorState,
+    /// UI selection state.
     pub selection: SelectionState,
+    /// Per-tick combat role flags.
     pub combat: CombatEventFlags,
+    /// Net food intake this tick.
     pub food_delta: f32,
+    /// Whether the spike is extended.
     pub spiked: bool,
+    /// Whether the agent has two parents.
     pub hybrid: bool,
+    /// Current emitted sound level.
     pub sound_output: f32,
+    /// Preferred normalized temperature.
     pub temperature_preference: f32,
+    /// Brain attachment (protocol/legacy/unbound).
     pub brain: BrainBinding,
+    /// Up-to-two parent UIDs.
     pub lineage: [Option<AgentUid>; 2],
+    /// Bounded gene-change log.
     pub mutation_log: Vec<String>,
+    /// Lifetime cumulative food intake.
     pub food_balance_total: f32,
 }
 
@@ -2417,11 +2504,13 @@ impl Default for AgentRuntime {
 pub struct BrainInspectionClientId(u64);
 
 impl BrainInspectionClientId {
+    /// Construct from the raw `u64`.
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Return the raw `u64`.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
@@ -2436,11 +2525,13 @@ impl BrainInspectionClientId {
 pub struct BrainInspectionRevision(u64);
 
 impl BrainInspectionRevision {
+    /// Construct from the raw `u64`.
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Return the raw `u64`.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
@@ -2450,10 +2541,14 @@ impl BrainInspectionRevision {
 /// One synchronous, bounded, client-isolated brain-detail request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainInspectionRequest {
+    /// Owning client identity.
     pub client_id: BrainInspectionClientId,
+    /// Client-owned request revision.
     pub revision: BrainInspectionRevision,
+    /// Bounded target UIDs.
     #[serde(deserialize_with = "deserialize_brain_inspection_targets")]
     pub targets: Vec<AgentUid>,
+    /// Producer-side budgets.
     pub limits: BrainInspectionLimits,
 }
 
@@ -2502,6 +2597,7 @@ where
 }
 
 impl BrainInspectionRequest {
+    /// Build a single-target request.
     #[must_use]
     pub fn single(
         client_id: BrainInspectionClientId,
@@ -2521,19 +2617,28 @@ impl BrainInspectionRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BrainInspectionUnavailable {
+    /// Target agent is absent from the world.
     MissingAgent,
+    /// Target agent has no brain bound.
     UnboundBrain,
+    /// The bound brain family cannot inspect.
     Unsupported,
 }
 
 /// Current selected-agent detail captured without mutating the evaluator or world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SelectedBrainTelemetry {
+    /// Live generational handle.
     pub agent_id: AgentId,
+    /// Stable logical identity.
     pub agent_uid: AgentUid,
+    /// Latest sensor vector fed to the brain.
     pub sensors: [f32; INPUT_SIZE],
+    /// Latest brain output vector.
     pub outputs: [f32; OUTPUT_SIZE],
+    /// Up-to-two parent UIDs.
     pub lineage: [Option<AgentUid>; 2],
+    /// Bounded activation payload.
     pub inspection: BrainInspectionSnapshot,
 }
 
@@ -2541,11 +2646,16 @@ pub struct SelectedBrainTelemetry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SelectedBrainTelemetryOutcome {
+    /// Payload available for this target.
     Ready {
+        /// Captured telemetry payload.
         telemetry: Box<SelectedBrainTelemetry>,
     },
+    /// Typed refusal for this target.
     Unavailable {
+        /// Stable identity that was refused.
         agent_uid: AgentUid,
+        /// Why the payload is unavailable.
         reason: BrainInspectionUnavailable,
     },
 }
@@ -2553,26 +2663,39 @@ pub enum SelectedBrainTelemetryOutcome {
 /// Structural cost evidence for one complete batch request.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainInspectionBatchStats {
+    /// Targets requested by the client.
     pub requested_targets: usize,
+    /// Targets remaining after deduplication.
     pub unique_targets: usize,
+    /// Duplicate targets dropped.
     pub duplicate_targets: usize,
+    /// Live agents examined.
     pub agents_examined: usize,
+    /// Brain runner inspections performed.
     pub runner_inspections: usize,
+    /// Producer-side source scalars consumed.
     pub source_scalars: usize,
+    /// Post-bound retained payload bytes.
     pub retained_payload_bytes: usize,
 }
 
 /// Immutable response tagged to the exact client request and completed world tick.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainInspectionResponse {
+    /// Echoed client identity.
     pub client_id: BrainInspectionClientId,
+    /// Echoed client request revision.
     pub request_revision: BrainInspectionRevision,
+    /// Completed world tick the telemetry was captured at.
     pub source_tick: Tick,
+    /// Per-target outcomes in request order.
     pub telemetry: Vec<SelectedBrainTelemetryOutcome>,
+    /// Structural cost evidence for the batch.
     pub build: BrainInspectionBatchStats,
 }
 
 impl BrainInspectionResponse {
+    /// Borrow the ready telemetry for one target, if present.
     #[must_use]
     pub fn ready_for(&self, target: AgentUid) -> Option<&SelectedBrainTelemetry> {
         self.telemetry.iter().find_map(|outcome| match outcome {
@@ -2696,9 +2819,13 @@ impl AgentRuntime {
 /// Combined snapshot of dense columns and runtime metadata for a single agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentState {
+    /// Live generational handle.
     pub id: AgentId,
+    /// Stable creation-order identity.
     pub identity: AgentIdentity,
+    /// Dense scalar payload.
     pub data: AgentData,
+    /// Sparse runtime payload.
     pub runtime: AgentRuntime,
 }
 
@@ -2881,15 +3008,25 @@ pub const CHARACTERIZATION_DIGEST_V0_SCHEMA: &str = "scriptbots.world.characteri
 /// contract. A future full-state digest must use a new schema version.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CharacterizationDigestV0 {
+    /// Wire schema identifier.
     pub schema: String,
+    /// Hash algorithm identifier.
     pub algorithm: String,
+    /// Boundary tick the digest was captured at.
     pub tick: Tick,
+    /// Aggregate FNV-1a64 hash over all lanes.
     pub overall: String,
+    /// Agent-lane FNV-1a64 hash.
     pub agents: String,
+    /// Food-lane FNV-1a64 hash.
     pub food: String,
+    /// Terrain-lane FNV-1a64 hash.
     pub terrain: String,
+    /// Hydrology-lane FNV-1a64 hash, when hydrology is imported.
     pub hydrology: Option<String>,
+    /// Non-mutating RNG probe hash.
     pub rng_probe: String,
+    /// Brain-registry lane FNV-1a64 hash.
     pub brain_registry: String,
 }
 
@@ -3022,9 +3159,13 @@ impl RngDomainDigestV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldDigestV1 {
+    /// Wire schema identifier.
     pub schema: String,
+    /// Payload codec revision.
     pub codec_version: u16,
+    /// Hash algorithm identifier.
     pub algorithm: String,
+    /// Boundary tick the digest was captured at.
     pub tick: Tick,
     /// Hash over every lane below, including the coverage flags.
     pub overall: String,
@@ -3033,13 +3174,17 @@ pub struct WorldDigestV1 {
     /// Agent BRAINS — genome and evaluator state — kept in their own lane so that "the brains
     /// changed" is distinguishable from "the bodies changed".
     pub brains: String,
+    /// Food-lane hash.
     pub food: String,
+    /// Terrain-lane hash.
     pub terrain: String,
+    /// Hydrology-lane hash, when hydrology is imported.
     pub hydrology: Option<String>,
     /// All six RNG-domain checkpoints, with per-domain diagnostics and one aggregate.
     pub rng: RngDomainDigestV1,
     /// Future-affecting allocation counters.
     pub counters: String,
+    /// Brain-registry lane hash.
     pub brain_registry: String,
     /// Canonical scientific projection of the validated world configuration.
     pub config: String,
@@ -3068,33 +3213,66 @@ pub struct WorldDigestV1 {
 /// A decoded V1.6 boundary digest violated its pinned semantic contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorldDigestV1ContractError {
+    /// Decoded schema tag did not match the pinned wire schema.
     #[error("world-digest schema `{found}` does not match `{expected}`")]
     Schema {
+        /// Schema tag found in the decoded digest.
         found: String,
+        /// Pinned wire schema this build expects.
         expected: &'static str,
     },
+    /// Decoded codec version did not match the pinned wire revision.
     #[error("world-digest codec version {found} does not match {expected}")]
-    CodecVersion { found: u16, expected: u16 },
+    CodecVersion {
+        /// Codec version found in the decoded digest.
+        found: u16,
+        /// Pinned codec version this build expects.
+        expected: u16,
+    },
+    /// Decoded algorithm identifier did not match the pinned algorithm.
     #[error("world-digest algorithm `{found}` does not match `{expected}`")]
     Algorithm {
+        /// Algorithm identifier found in the decoded digest.
         found: String,
+        /// Pinned algorithm identifier this build expects.
         expected: &'static str,
     },
+    /// Decoded agent-identity tag did not match the pinned identity lane.
     #[error("world-digest agent identity `{found}` does not match `{expected}`")]
     AgentIdentity {
+        /// Identity tag found in the decoded digest.
         found: String,
+        /// Pinned identity tag this build expects.
         expected: &'static str,
     },
+    /// A coverage flag disagreed with its uncovered-family list.
     #[error("world-digest {coverage} coverage flag disagrees with its uncovered-family list")]
-    Coverage { coverage: &'static str },
+    Coverage {
+        /// Which coverage lane is inconsistent.
+        coverage: &'static str,
+    },
+    /// An uncovered-family list was not sorted and unique.
     #[error("world-digest {coverage} uncovered-family names are not sorted and unique")]
-    CoverageOrder { coverage: &'static str },
+    CoverageOrder {
+        /// Which coverage lane is misordered.
+        coverage: &'static str,
+    },
+    /// A digest field was not a lowercase 16-digit hash.
     #[error("world-digest field `{field}` is not a lowercase 16-digit digest")]
-    DigestFormat { field: &'static str },
+    DigestFormat {
+        /// Which field failed the format check.
+        field: &'static str,
+    },
+    /// An RNG-domain hash was not a lowercase 16-digit digest.
     #[error("world-digest RNG domain `{domain}` is not a lowercase 16-digit digest")]
-    RngDomainDigestFormat { domain: String },
+    RngDomainDigestFormat {
+        /// Which RNG domain failed the format check.
+        domain: String,
+    },
+    /// The RNG aggregate did not match its ordered domain hashes.
     #[error("world-digest RNG aggregate does not match its ordered domain hashes")]
     RngOverall,
+    /// The overall hash did not match its metadata, tick, lanes, and coverage.
     #[error("world-digest overall does not match its metadata, tick, lanes, and coverage")]
     Overall,
 }
@@ -3234,17 +3412,26 @@ fn validate_world_digest_coverage(
 /// Compile-lane identity needed to interpret a characterization digest honestly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreBuildIdentityV0 {
+    /// Whether the `parallel` feature compiled in.
     pub parallel: bool,
+    /// Whether the `simd_wide` feature compiled in.
     pub simd_wide: bool,
+    /// Rayon global pool thread count.
     pub rayon_threads: usize,
+    /// Target CPU architecture.
     pub target_arch: String,
+    /// Target operating system.
     pub target_os: String,
+    /// Target platform family.
     pub target_family: String,
+    /// Target byte endianness.
     pub target_endian: String,
+    /// Target pointer width in bits.
     pub pointer_width: u8,
 }
 
 impl CoreBuildIdentityV0 {
+    /// Capture this build's compile-lane identity.
     #[must_use]
     pub fn current() -> Self {
         #[cfg(feature = "parallel")]
@@ -3273,8 +3460,11 @@ impl CoreBuildIdentityV0 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldContinuationBlocker {
+    /// A latched brain fault.
     BrainFault,
+    /// A latched persistence fault.
     PersistenceFault,
+    /// An unacknowledged persistence batch is retained.
     RetainedPersistenceBatch,
 }
 
@@ -3299,26 +3489,43 @@ pub enum CharacterizationError {
         "world is not at a quiescent boundary (pending deaths: {pending_deaths}, pending spawns: {pending_spawns}, legacy queued boundary work: {simulation_commands})"
     )]
     NonQuiescent {
+        /// Deaths queued but not yet cleaned up.
         pending_deaths: usize,
+        /// Spawns queued but not yet committed.
         pending_spawns: usize,
+        /// Pending interventions still making the boundary non-quiescent.
         simulation_commands: usize,
     },
     /// A completed boundary is latched and cannot continue until its typed blocker is resolved.
     #[error("world cannot continue because it has a latched {blocker}")]
-    NonContinuable { blocker: WorldContinuationBlocker },
+    NonContinuable {
+        /// The latched continuation blocker.
+        blocker: WorldContinuationBlocker,
+    },
     /// An arena handle did not resolve to its dense scalar state.
     #[error("agent {agent_id} is missing dense scalar state")]
-    MissingAgentData { agent_id: u64 },
+    MissingAgentData {
+        /// Raw handle of the agent missing data.
+        agent_id: u64,
+    },
     /// An arena handle did not have matching runtime state.
     #[error("agent {agent_id} is missing runtime state")]
-    MissingAgentRuntime { agent_id: u64 },
+    MissingAgentRuntime {
+        /// Raw handle of the agent missing runtime state.
+        agent_id: u64,
+    },
     /// An arena handle did not have its persisted agent-keyed RNG continuation.
     #[error("agent {agent_id} is missing agent-keyed random continuation counters")]
-    MissingAgentRngCounters { agent_id: u64 },
+    MissingAgentRngCounters {
+        /// Raw handle of the agent missing RNG counters.
+        agent_id: u64,
+    },
     /// A deterministic diagnostic payload could not be encoded.
     #[error("could not encode {context} for deterministic characterization: {detail}")]
     Encoding {
+        /// Which payload lane failed to encode.
         context: &'static str,
+        /// Codec failure detail.
         detail: String,
     },
 }
@@ -4792,16 +4999,24 @@ impl WorldStepStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldStepTracePoint {
+    /// Sensory input capture point.
     Sense,
+    /// Brain evaluation capture point.
     Brains,
+    /// Actuation capture point.
     Actuation,
+    /// Food consumption capture point.
     Food,
+    /// Death cleanup capture point.
     DeathCleanup,
+    /// Population/reproduction capture point.
     Population,
 }
 
 impl WorldStepTracePoint {
+    /// Number of stable trace points.
     pub const COUNT: usize = 6;
+    /// Trace points in the stable schema order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Sense,
         Self::Brains,
@@ -5001,28 +5216,51 @@ impl WorldStepProfiler {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldStepStageWorldDigest {
+    /// Wire schema identifier.
     pub schema: String,
+    /// Payload codec revision.
     pub codec_version: u16,
+    /// Hash algorithm identifier.
     pub algorithm: String,
+    /// Last finalized boundary tick.
     pub completed_tick: Tick,
+    /// Tick currently executing.
     pub transition_tick: Tick,
+    /// Aggregate hash over all lanes below.
     pub overall: String,
+    /// Agent-body lane hash.
     pub agents: String,
+    /// Agent-brain (genome + evaluator state) lane hash.
     pub brains: String,
+    /// Food-lane hash.
     pub food: String,
+    /// Terrain-lane hash.
     pub terrain: String,
+    /// Hydrology-lane hash, when hydrology is imported.
     pub hydrology: Option<String>,
+    /// RNG-domain checkpoint hashes.
     pub rng: RngDomainDigestV1,
+    /// Future-affecting allocation counter hash.
     pub counters: String,
+    /// Brain-registry lane hash.
     pub brain_registry: String,
+    /// Canonical scientific projection of the validated configuration.
     pub config: String,
+    /// Ordered active intervention effects hash.
     pub effects: String,
+    /// Derived cadence/ecology cache hash.
     pub derived_transition: String,
+    /// Open ancestry-origin rows hash.
     pub origins: String,
+    /// Whether every bound brain exposed its evaluator state.
     pub evaluator_state_covered: bool,
+    /// Families whose evaluator state is not covered, named.
     pub uncovered_families: Vec<String>,
+    /// Whether every registered factory declared its captured state.
     pub factory_state_covered: bool,
+    /// Families whose factory closures remain opaque, named.
     pub uncovered_factory_families: Vec<String>,
+    /// Identity the agent lane is keyed on.
     pub agent_identity: String,
 }
 
@@ -5101,10 +5339,15 @@ impl WorldStepStageWorldDigest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldStepStageStateDigest {
+    /// Stage world lanes.
     pub world: WorldStepStageWorldDigest,
+    /// Ordered deferred work hash.
     pub transition: String,
+    /// Pending observational output hash.
     pub output_tail: String,
+    /// Resource-ledger hash.
     pub resource: String,
+    /// Aggregate hash over the lanes above.
     pub overall: String,
 }
 
@@ -5139,18 +5382,31 @@ impl WorldStepStageStateDigest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldStepTraceEncodingContext {
+    /// Validated scientific configuration lane.
     ScientificConfig,
+    /// Active intervention effects lane.
     ActiveEffects,
+    /// Pending birth records lane.
     PendingBirthRecords,
+    /// Pending interventions lane.
     PendingInterventions,
+    /// Simulation commands lane.
     SimulationCommands,
+    /// Pending death records lane.
     PendingDeathRecords,
+    /// Pending lifecycle birth metrics lane.
     PendingLifecycleBirthMetrics,
+    /// Pending lifecycle death metrics lane.
     PendingLifecycleDeathMetrics,
+    /// Pending replay events lane.
     PendingReplayEvents,
+    /// Tick history lane.
     TickHistory,
+    /// Narrative events lane.
     NarrativeEvents,
+    /// Narrative emission watermarks lane.
     NarrativeEmissionWatermarks,
+    /// Payload whose encoding label is not one of the named lanes.
     Unclassified,
 }
 
@@ -5196,27 +5452,43 @@ impl WorldStepTraceEncodingContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorldStepTraceError {
+    /// World was not at a quiescent boundary when capture ran.
     NonQuiescent {
+        /// Deaths queued but not yet cleaned up.
         pending_deaths: usize,
+        /// Spawns queued but not yet committed.
         pending_spawns: usize,
+        /// Pending interventions still making the boundary non-quiescent.
         simulation_commands: usize,
     },
+    /// A latched continuation blocker prevented capture.
     NonContinuable {
+        /// The latched continuation blocker.
         blocker: WorldContinuationBlocker,
     },
+    /// An arena handle did not resolve to its dense scalar state.
     MissingAgentData {
+        /// Raw handle of the agent missing data.
         agent_id: u64,
     },
+    /// An arena handle did not have matching runtime state.
     MissingAgentRuntime {
+        /// Raw handle of the agent missing runtime state.
         agent_id: u64,
     },
+    /// A deterministic payload lane could not be encoded.
     Encoding {
+        /// Which payload lane failed to encode.
         context: WorldStepTraceEncodingContext,
     },
+    /// The per-point transition input required for capture was missing.
     MissingTransitionInput {
+        /// Trace point missing its transition input.
         point: WorldStepTracePoint,
     },
+    /// An arena handle did not have its persisted agent-keyed RNG continuation.
     MissingAgentRngCounters {
+        /// Raw handle of the agent missing RNG counters.
         agent_id: u64,
     },
 }
@@ -5254,10 +5526,14 @@ impl From<CharacterizationError> for WorldStepTraceError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorldStepTraceCapture {
+    /// All lanes captured.
     Complete {
+        /// Captured stage state digest.
         state: Box<WorldStepStageStateDigest>,
     },
+    /// Typed capture failure.
     Error {
+        /// The capture failure.
         error: WorldStepTraceError,
     },
 }
@@ -5293,7 +5569,9 @@ impl WorldStepTraceCapture {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldStepStageDigest {
+    /// Canonical trace point.
     pub point: WorldStepTracePoint,
+    /// Its pinned capture result.
     pub capture: WorldStepTraceCapture,
 }
 
@@ -5301,9 +5579,13 @@ pub struct WorldStepStageDigest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldStepTrace {
+    /// Wire schema identifier.
     pub schema: String,
+    /// Payload codec revision.
     pub codec_version: u16,
+    /// Completed tick described by this trace.
     pub tick: Tick,
+    /// Six ordered stage captures.
     pub stages: Vec<WorldStepStageDigest>,
     /// Hash of the trace metadata and all six ordered success/error captures.
     pub overall: String,
@@ -5312,84 +5594,154 @@ pub struct WorldStepTrace {
 /// A deserialized trace violated the pinned six-point wire contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorldStepTraceContractError {
+    /// Trace schema tag did not match the pinned wire schema.
     #[error("trace schema `{found}` does not match `{expected}`")]
     Schema {
+        /// Schema tag found in the decoded trace.
         found: String,
+        /// Pinned wire schema this build expects.
         expected: &'static str,
     },
+    /// Trace codec version did not match the pinned wire revision.
     #[error("trace codec version {found} does not match {expected}")]
-    CodecVersion { found: u16, expected: u16 },
-    #[error("trace has {found} stage captures; expected exactly {expected}")]
-    StageCount { found: usize, expected: usize },
-    #[error("trace stage {index} is {found:?}; expected {expected:?}")]
-    StageOrder {
-        index: usize,
-        found: WorldStepTracePoint,
-        expected: WorldStepTracePoint,
-    },
-    #[error("{point:?} capture reports a missing transition for {found:?}")]
-    CaptureErrorPoint {
-        point: WorldStepTracePoint,
-        found: WorldStepTracePoint,
-    },
-    #[error("{point:?} cannot report a missing pre-consumption transition input")]
-    CaptureErrorNotAllowed { point: WorldStepTracePoint },
-    #[error("{point:?} cannot report a quiescent-boundary-only characterization error")]
-    BoundaryErrorNotAllowed { point: WorldStepTracePoint },
-    #[error("{point:?} stage-world schema `{found}` does not match `{expected}`")]
-    StageWorldSchema {
-        point: WorldStepTracePoint,
-        found: String,
-        expected: &'static str,
-    },
-    #[error("{point:?} stage-world codec version {found} does not match {expected}")]
-    StageWorldCodecVersion {
-        point: WorldStepTracePoint,
+    CodecVersion {
+        /// Codec version found in the decoded trace.
         found: u16,
+        /// Pinned codec version this build expects.
         expected: u16,
     },
+    /// Trace did not carry exactly the six pinned stage captures.
+    #[error("trace has {found} stage captures; expected exactly {expected}")]
+    StageCount {
+        /// Number of stage captures found.
+        found: usize,
+        /// Number of stage captures the contract pins.
+        expected: usize,
+    },
+    /// A stage capture appeared out of the pinned order.
+    #[error("trace stage {index} is {found:?}; expected {expected:?}")]
+    StageOrder {
+        /// Index of the misordered stage.
+        index: usize,
+        /// Trace point found at that index.
+        found: WorldStepTracePoint,
+        /// Trace point the contract pins at that index.
+        expected: WorldStepTracePoint,
+    },
+    /// A capture reported a missing transition for the wrong point.
+    #[error("{point:?} capture reports a missing transition for {found:?}")]
+    CaptureErrorPoint {
+        /// Stage whose capture is inconsistent.
+        point: WorldStepTracePoint,
+        /// Point named inside the capture error.
+        found: WorldStepTracePoint,
+    },
+    /// A pre-consumption point cannot report a missing transition input.
+    #[error("{point:?} cannot report a missing pre-consumption transition input")]
+    CaptureErrorNotAllowed {
+        /// Stage whose capture error is disallowed.
+        point: WorldStepTracePoint,
+    },
+    /// A mid-transition point cannot report a boundary-only characterization error.
+    #[error("{point:?} cannot report a quiescent-boundary-only characterization error")]
+    BoundaryErrorNotAllowed {
+        /// Stage whose boundary error is disallowed.
+        point: WorldStepTracePoint,
+    },
+    /// A stage-world schema tag did not match the pinned schema.
+    #[error("{point:?} stage-world schema `{found}` does not match `{expected}`")]
+    StageWorldSchema {
+        /// Stage whose schema mismatched.
+        point: WorldStepTracePoint,
+        /// Schema tag found.
+        found: String,
+        /// Pinned schema this build expects.
+        expected: &'static str,
+    },
+    /// A stage-world codec version did not match the pinned revision.
+    #[error("{point:?} stage-world codec version {found} does not match {expected}")]
+    StageWorldCodecVersion {
+        /// Stage whose codec version mismatched.
+        point: WorldStepTracePoint,
+        /// Codec version found.
+        found: u16,
+        /// Pinned codec version this build expects.
+        expected: u16,
+    },
+    /// A stage-world algorithm identifier did not match the pinned algorithm.
     #[error("{point:?} stage-world algorithm `{found}` does not match `{expected}`")]
     StageWorldAlgorithm {
+        /// Stage whose algorithm mismatched.
         point: WorldStepTracePoint,
+        /// Algorithm identifier found.
         found: String,
+        /// Pinned algorithm identifier this build expects.
         expected: &'static str,
     },
+    /// A stage-world identity tag did not match the pinned identity lane.
     #[error("{point:?} stage-world identity `{found}` does not match `{expected}`")]
     StageWorldIdentity {
+        /// Stage whose identity mismatched.
         point: WorldStepTracePoint,
+        /// Identity tag found.
         found: String,
+        /// Pinned identity tag this build expects.
         expected: &'static str,
     },
+    /// A stage-world's ticks do not describe the trace tick.
     #[error(
         "{point:?} stage-world ticks ({completed_tick}, {transition_tick}) do not describe trace tick {trace_tick}"
     )]
     StageWorldTicks {
+        /// Stage whose ticks mismatched.
         point: WorldStepTracePoint,
+        /// Completed tick found in the stage world.
         completed_tick: u64,
+        /// Transition tick found in the stage world.
         transition_tick: u64,
+        /// Tick of the enclosing trace.
         trace_tick: u64,
     },
+    /// A coverage flag disagreed with its uncovered-family list.
     #[error("{point:?} {coverage} coverage flag disagrees with its uncovered-family list")]
     Coverage {
+        /// Stage whose coverage is inconsistent.
         point: WorldStepTracePoint,
+        /// Which coverage lane is inconsistent.
         coverage: &'static str,
     },
+    /// An uncovered-family list was not sorted and unique.
     #[error("{point:?} {coverage} uncovered-family names are not sorted and unique")]
     CoverageOrder {
+        /// Stage whose coverage list is misordered.
         point: WorldStepTracePoint,
+        /// Which coverage lane is misordered.
         coverage: &'static str,
     },
+    /// A digest field was not a lowercase 16-digit hash.
     #[error("{point:?} field `{field}` is not a lowercase 16-digit digest")]
     DigestFormat {
+        /// Stage whose field failed the format check.
         point: WorldStepTracePoint,
+        /// Which field failed the format check.
         field: &'static str,
     },
+    /// A stage-world overall digest did not match its lanes.
     #[error("{point:?} stage-world overall digest does not match its lanes")]
-    StageWorldOverall { point: WorldStepTracePoint },
+    StageWorldOverall {
+        /// Stage whose world digest mismatched.
+        point: WorldStepTracePoint,
+    },
+    /// A stage overall digest did not match its capture.
     #[error("{point:?} stage overall digest does not match its capture")]
-    StageOverall { point: WorldStepTracePoint },
+    StageOverall {
+        /// Stage whose overall digest mismatched.
+        point: WorldStepTracePoint,
+    },
+    /// The trace overall field was not a lowercase 16-digit digest.
     #[error("trace overall field is not a lowercase 16-digit digest")]
     TraceOverallFormat,
+    /// The trace overall digest did not match its ordered captures.
     #[error("trace overall digest does not match its ordered captures")]
     TraceOverall,
 }
@@ -5397,12 +5749,20 @@ pub enum WorldStepTraceContractError {
 /// Two traces cannot be compared as canonical first-divergence evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorldStepTraceComparisonError {
+    /// Left trace failed its own contract.
     #[error("left trace is invalid: {0}")]
     InvalidLeft(WorldStepTraceContractError),
+    /// Right trace failed its own contract.
     #[error("right trace is invalid: {0}")]
     InvalidRight(WorldStepTraceContractError),
+    /// The traces describe different ticks.
     #[error("trace ticks differ: left is {left}, right is {right}")]
-    TickMismatch { left: u64, right: u64 },
+    TickMismatch {
+        /// Tick of the left trace.
+        left: u64,
+        /// Tick of the right trace.
+        right: u64,
+    },
 }
 
 impl WorldStepTrace {
@@ -5919,9 +6279,13 @@ fn duration_ns(duration: Duration) -> u64 {
 /// Events emitted after processing a world tick.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TickEvents {
+    /// Completed tick.
     pub tick: Tick,
+    /// Whether charts were flushed this tick.
     pub charts_flushed: bool,
+    /// Whether the evolution epoch rolled over this tick.
     pub epoch_rolled: bool,
+    /// Respawned food cell coordinates, if a respawn occurred.
     pub food_respawned: Option<(u32, u32)>,
 }
 
@@ -5933,19 +6297,27 @@ pub struct TickEvents {
 /// [`PersistenceBatch::births`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TickSummary {
+    /// Completed tick.
     pub tick: Tick,
+    /// Agent population at the boundary.
     pub agent_count: usize,
     /// Number of [`BirthOrigin::Born`] offspring produced by reproduction.
     ///
     /// This excludes [`BirthOrigin::Seeded`] and [`BirthOrigin::Injected`]
-    /// arrivals. Use [`PersistenceBatch::births`] for the complete origin stream.
+    /// [`PersistenceBatch::births`] for the complete origin stream.
     pub births: usize,
+    /// Deaths during the completed tick.
     pub deaths: usize,
+    /// Sum of current agent energy.
     pub total_energy: f32,
+    /// Mean current agent energy.
     pub average_energy: f32,
+    /// Mean current agent health.
     pub average_health: f32,
+    /// Oldest live agent age in ticks.
     #[serde(default)]
     pub max_age: u32,
+    /// Spike hits recorded during the tick.
     #[serde(default)]
     pub spike_hits: u32,
 }
@@ -5953,15 +6325,23 @@ pub struct TickSummary {
 /// Serializable representation of [`TickSummary`] for API surfaces.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TickSummaryDto {
+    /// Completed tick (`u64` encoding).
     pub tick: u64,
+    /// Agent population at the boundary.
     pub agent_count: usize,
     /// Born-only demographic count; Seeded and Injected arrivals are excluded.
     pub births: usize,
+    /// Deaths during the completed tick.
     pub deaths: usize,
+    /// Sum of current agent energy.
     pub total_energy: f32,
+    /// Mean current agent energy.
     pub average_energy: f32,
+    /// Mean current agent health.
     pub average_health: f32,
+    /// Oldest live agent age in ticks.
     pub max_age: u32,
+    /// Spike hits recorded during the tick.
     pub spike_hits: u32,
 }
 
@@ -5998,16 +6378,21 @@ impl From<TickSummaryDto> for TickSummary {
 }
 
 // --- Centralized preset definitions and helpers ---
+/// Named configuration preset bundled with the application.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum PresetKind {
+    /// Cold-climate preset.
     Arctic,
+    /// Oscillating food dynamics preset.
     BoomBust,
+    /// No external population flow preset.
     ClosedWorld,
 }
 
 impl PresetKind {
+    /// Stable lowercase identifier for CLI and persistence surfaces.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Arctic => "arctic",
             Self::BoomBust => "boom_bust",
@@ -6015,6 +6400,7 @@ impl PresetKind {
         }
     }
 
+    /// Every preset, in stable declaration order.
     #[must_use]
     pub const fn all() -> &'static [Self] {
         const ALL: &[PresetKind] = &[
@@ -6025,6 +6411,7 @@ impl PresetKind {
         ALL
     }
 
+    /// Resolve a preset from a user-supplied name, case-insensitively.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
@@ -6035,6 +6422,7 @@ impl PresetKind {
         }
     }
 
+    /// Apply the preset's field overrides onto a live configuration.
     pub fn apply_to_config(self, config: &mut ScriptBotsConfig) {
         match self {
             Self::Arctic => {
@@ -6053,6 +6441,7 @@ impl PresetKind {
         }
     }
 
+    /// The preset's field overrides as a JSON patch object.
     #[must_use]
     pub fn patch(self) -> serde_json::Value {
         match self {
@@ -6076,7 +6465,9 @@ impl PresetKind {
 /// Scalar metric sampled during persistence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricSample {
+    /// Metric identifier.
     pub name: Cow<'static, str>,
+    /// Sampled value.
     pub value: f64,
 }
 
@@ -6100,15 +6491,20 @@ impl MetricSample {
 /// Event type recorded for persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PersistenceEventKind {
+    /// Arrival count.
     Births,
+    /// Removal count.
     Deaths,
+    /// Family-defined event.
     Custom(Cow<'static, str>),
 }
 
 /// Structured persistence event entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistenceEvent {
+    /// Event category.
     pub kind: PersistenceEventKind,
+    /// Occurrences this batch.
     pub count: usize,
 }
 
@@ -6123,10 +6519,15 @@ impl PersistenceEvent {
 /// Reason recorded for an agent death.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum DeathCause {
+    /// Killed by a carnivore spike.
     CombatCarnivore,
+    /// Killed by a herbivore spike.
     CombatHerbivore,
+    /// Energy exhaustion.
     Starvation,
+    /// Age decay.
     Aging,
+    /// Undetermined.
     Unknown,
 }
 
@@ -6226,37 +6627,59 @@ pub struct BirthRecord {
 /// Lifecycle summary recorded when an agent is removed from the world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeathRecord {
+    /// Simulation tick whose removal boundary contains this record.
     pub tick: Tick,
+    /// Stable logical identity of the removed agent.
     pub agent_uid: AgentUid,
+    /// Age in ticks at removal.
     pub age: u32,
+    /// Lineage generation at removal.
     pub generation: Generation,
+    /// Herbivore tendency at removal.
     pub herbivore_tendency: f32,
+    /// Brain-family label observed at removal, when bound.
     pub brain_kind: Option<String>,
+    /// Stable registry key of the bound brain, when present.
     pub brain_key: Option<u64>,
+    /// Energy reserve at removal.
     pub energy: f32,
+    /// Lifetime cumulative food intake.
     pub food_balance_total: f32,
+    /// Typed reason for the removal.
     pub cause: DeathCause,
+    /// Whether the agent combined two parental lineages.
     pub was_hybrid: bool,
+    /// Per-tick combat role flags at removal.
     pub combat_flags: CombatEventFlags,
 }
 
 /// Agent pipeline stages used to categorize replay RNG scopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplayAgentPhase {
+    /// RNG drawn during the movement pipeline phase.
     Movement,
+    /// RNG drawn during the reproduction pipeline phase.
     Reproduction,
+    /// RNG drawn during the mutation pipeline phase.
     Mutation,
+    /// RNG drawn during the spawn pipeline phase.
     Spawn,
+    /// RNG drawn during the selection pipeline phase.
     Selection,
+    /// RNG drawn outside the named pipeline phases.
     Misc,
 }
 
 /// Identifies where in the simulation a random sample originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplayRngScope {
+    /// World-domain draw.
     World,
+    /// Agent-keyed draw.
     Agent {
+        /// Stable identity of the drawing agent.
         agent_uid: AgentUid,
+        /// Pipeline phase the draw occurred in.
         phase: ReplayAgentPhase,
     },
 }
@@ -6264,27 +6687,42 @@ pub enum ReplayRngScope {
 /// Detailed event recordings emitted for deterministic replays.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReplayEventKind {
+    /// Recorded brain output vector.
     BrainOutputs {
+        /// Output values produced by the brain.
         outputs: Vec<f32>,
     },
+    /// Recorded actuation decision.
     Action {
+        /// Left wheel drive output.
         left_wheel: f32,
+        /// Right wheel drive output.
         right_wheel: f32,
+        /// Whether movement boost was engaged.
         boost: bool,
+        /// Spike target, when an attack was committed.
         spike_target: Option<AgentUid>,
+        /// Emitted sound level.
         sound_level: f32,
+        /// Altruistic sharing intent output.
         give_intent: f32,
     },
+    /// Recorded RNG sample with provenance.
     RngSample {
+        /// Where in the simulation the sample originated.
         scope: ReplayRngScope,
+        /// Lower bound of the sampling range.
         range_min: f32,
+        /// Upper bound of the sampling range.
         range_max: f32,
+        /// Sampled value.
         value: f32,
     },
     /// Canonical `WorldDigestV1.overall` recorded once at a clean boundary by the driving
     /// application, so replay verification can prove the entire final science state — not
     /// just the event stream — reproduced exactly.
     WorldDigest {
+        /// Canonical overall digest at the boundary.
         overall: String,
     },
 }
@@ -6292,18 +6730,26 @@ pub enum ReplayEventKind {
 /// Lightweight wrapper pairing an agent context with a replay event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayEvent {
+    /// Originating agent, if any.
     pub agent_uid: Option<AgentUid>,
+    /// Event payload.
     pub kind: ReplayEventKind,
 }
 
 /// Aggregate payload forwarded to persistence sinks.
 #[derive(Debug, Clone)]
 pub struct PersistenceBatch {
+    /// Tick summary for the completed boundary.
     pub summary: TickSummary,
+    /// Evolution epoch.
     pub epoch: u64,
+    /// Whether the epoch closed at this boundary.
     pub closed: bool,
+    /// Sampled metrics.
     pub metrics: Vec<MetricSample>,
+    /// Structured events.
     pub events: Vec<PersistenceEvent>,
+    /// Per-agent states at the boundary.
     pub agents: Vec<AgentState>,
     /// Complete one-record-per-arrival stream for this boundary.
     ///
@@ -6312,7 +6758,9 @@ pub struct PersistenceBatch {
     /// needing the demographic count must filter this stream to `Born` rather
     /// than treating its length as the summary's birth count.
     pub births: Vec<BirthRecord>,
+    /// Death stream for the boundary.
     pub deaths: Vec<DeathRecord>,
+    /// Replay event stream for the boundary.
     pub replay_events: Vec<ReplayEvent>,
 }
 
@@ -6331,6 +6779,7 @@ pub enum PersistenceProjectionStatus {
     Ready,
 }
 
+/// Result of evaluating persistence policy at a completed boundary.
 #[derive(Debug)]
 #[must_use = "a ready persistence projection owns drained scientific records"]
 pub struct PersistenceProjection {
@@ -6529,21 +6978,32 @@ pub enum PersistenceSessionError {
     WrongWorld,
     /// Persistence-enabled stepping requires the world's bound external session.
     #[error("persistence-enabled tick {tick} requires the bound admission session")]
-    SessionRequired { tick: u64 },
+    SessionRequired {
+        /// Tick that required the session.
+        tick: u64,
+    },
     /// The session and payload-free world marker disagreed before sink I/O.
     #[error(
         "persistence session expected pending tick {pending_tick}, but world boundary was {boundary:?}"
     )]
     BoundaryMismatch {
+        /// Tick the session still holds a pending batch for.
         pending_tick: Tick,
+        /// Boundary status the world reported.
         boundary: PersistenceBoundaryStatus,
     },
     /// The world is pending but this session no longer owns its exact payload.
     #[error("persistence batch for pending tick {tick} is unavailable")]
-    MissingPendingBatch { tick: Tick },
+    MissingPendingBatch {
+        /// Tick whose batch is unavailable.
+        tick: Tick,
+    },
     /// The host could not acquire the external session that owns admission state.
     #[error("persistence admission session is unavailable: {detail}")]
-    Unavailable { detail: String },
+    Unavailable {
+        /// Host-side diagnostic detail.
+        detail: String,
+    },
     /// A scientific-state guard rejected finalization or session-driven stepping.
     #[error(transparent)]
     ScientificState(#[from] ScientificStateError),
@@ -6630,7 +7090,9 @@ pub enum WorldStepError {
         "brain construction failed while the completed tick was also rejected by persistence: {brain}; {persistence}"
     )]
     BrainAndPersistence {
+        /// The brain construction/evaluation failure.
         brain: BrainSpawnError,
+        /// The persistence admission failure.
         persistence: PersistenceAdmissionError,
     },
     /// Scientific-state validation and persistence admission both failed at one boundary.
@@ -6638,7 +7100,9 @@ pub enum WorldStepError {
         "scientific state was rejected while the completed tick was also rejected by persistence: {scientific_state}; {persistence}"
     )]
     ScientificStateAndPersistence {
+        /// The scientific-state validation failure.
         scientific_state: ScientificStateError,
+        /// The persistence admission failure.
         persistence: PersistenceAdmissionError,
     },
 }
@@ -7317,7 +7781,9 @@ where
 /// Which protocol envelope produced a validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrainEnvelopeKind {
+    /// Heritable genome envelope.
     Genome,
+    /// Live evaluator-state envelope.
     EvaluatorState,
 }
 
@@ -7333,72 +7799,136 @@ impl fmt::Display for BrainEnvelopeKind {
 /// Explicit protocol and adapter failures. Version mismatches never fall back or coerce bytes.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum BrainProtocolError {
+    /// A brain-family identifier failed validation.
     #[error("invalid brain-family identifier `{value}`: {reason}")]
-    InvalidFamilyId { value: String, reason: &'static str },
+    InvalidFamilyId {
+        /// The rejected identifier.
+        value: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+    /// An envelope's protocol version did not match exactly.
     #[error("unsupported {kind} envelope version {found}; expected exactly {expected}")]
     EnvelopeVersionMismatch {
+        /// Which envelope lane mismatched.
         kind: BrainEnvelopeKind,
+        /// Version found in the envelope.
         found: u16,
+        /// Version this build expects.
         expected: u16,
     },
+    /// An envelope was presented to a different family than it was encoded for.
     #[error("brain-family mismatch: found `{found}`, expected `{expected}`")]
     FamilyMismatch {
+        /// Family recorded in the envelope.
         found: BrainFamilyId,
+        /// Family the envelope was presented to.
         expected: BrainFamilyId,
     },
+    /// An envelope's schema version did not match.
     #[error("{kind} schema version {found} does not match expected version {expected}")]
     SchemaVersionMismatch {
+        /// Which envelope lane mismatched.
         kind: BrainEnvelopeKind,
+        /// Schema version found in the envelope.
         found: u32,
+        /// Schema version this build expects.
         expected: u32,
     },
+    /// An envelope's codec version did not match.
     #[error("{kind} codec version {found} does not match expected version {expected}")]
     CodecVersionMismatch {
+        /// Which envelope lane mismatched.
         kind: BrainEnvelopeKind,
+        /// Codec version found in the envelope.
         found: u16,
+        /// Codec version this build expects.
         expected: u16,
     },
+    /// An envelope payload exceeded its bounded size contract.
     #[error("{kind} payload is {found} bytes; maximum is {maximum}")]
     PayloadTooLarge {
+        /// Which envelope lane overflowed.
         kind: BrainEnvelopeKind,
+        /// Payload size found.
         found: usize,
+        /// Maximum permitted payload size.
         maximum: usize,
     },
+    /// Genome material hash did not match the envelope's recorded hash.
     #[error(
         "brain-genome material hash mismatch: envelope records {recorded}, computed {computed}"
     )]
     GenomeHashMismatch {
+        /// Hash recorded in the envelope.
         recorded: BrainGenomeHash,
+        /// Hash recomputed from the material.
         computed: BrainGenomeHash,
     },
+    /// A family evaluator did not round-trip its supplied future-affecting state.
     #[error(
         "brain family `{family_id}` evaluator did not preserve the supplied future-affecting state"
     )]
-    EvaluatorStateRoundTripMismatch { family_id: BrainFamilyId },
-    #[error("invalid brain-genome provenance: {detail}")]
-    InvalidProvenance { detail: String },
-    #[error("invalid {kind} payload for brain family `{family_id}`: {detail}")]
-    InvalidPayload {
-        kind: BrainEnvelopeKind,
+    EvaluatorStateRoundTripMismatch {
+        /// Family whose evaluator failed the round trip.
         family_id: BrainFamilyId,
+    },
+    /// Genome provenance metadata failed validation.
+    #[error("invalid brain-genome provenance: {detail}")]
+    InvalidProvenance {
+        /// Validation failure detail.
         detail: String,
     },
+    /// An envelope payload failed family-level validation.
+    #[error("invalid {kind} payload for brain family `{family_id}`: {detail}")]
+    InvalidPayload {
+        /// Which envelope lane failed validation.
+        kind: BrainEnvelopeKind,
+        /// Family the payload was presented to.
+        family_id: BrainFamilyId,
+        /// Validation failure detail.
+        detail: String,
+    },
+    /// The family is already registered.
     #[error("brain family `{family_id}` is already registered")]
-    DuplicateFamily { family_id: BrainFamilyId },
+    DuplicateFamily {
+        /// The duplicate family.
+        family_id: BrainFamilyId,
+    },
+    /// The family is not registered.
     #[error("brain family `{family_id}` is not registered")]
-    UnknownFamily { family_id: BrainFamilyId },
+    UnknownFamily {
+        /// The unknown family.
+        family_id: BrainFamilyId,
+    },
+    /// Offspring state policy referenced a parent state that does not exist.
     #[error("offspring state policy requested parent {index}, but only {available} states exist")]
-    ParentStateUnavailable { index: usize, available: usize },
+    ParentStateUnavailable {
+        /// Requested parent index.
+        index: usize,
+        /// Number of parent states available.
+        available: usize,
+    },
+    /// Batch evaluator inputs/outputs disagreed with evaluator cardinality.
     #[error(
         "batch cardinality mismatch: {evaluators} evaluators, {inputs} inputs, {outputs} outputs"
     )]
     BatchCardinalityMismatch {
+        /// Number of evaluators.
         evaluators: usize,
+        /// Number of input vectors.
         inputs: usize,
+        /// Number of output vectors.
         outputs: usize,
     },
+    /// A batch architecture key exceeded its bounded size contract.
     #[error("brain batch architecture key is {found} bytes; maximum is {maximum}")]
-    BatchArchitectureKeyTooLarge { found: usize, maximum: usize },
+    BatchArchitectureKeyTooLarge {
+        /// Key size found.
+        found: usize,
+        /// Maximum permitted key size.
+        maximum: usize,
+    },
 }
 
 fn ensure_payload_bound(
@@ -7493,6 +8023,7 @@ pub enum OffspringStatePolicy {
 /// Bounded request for optional brain inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrainInspection {
+    /// Request a bounded activation-layer capture.
     Activations(BrainInspectionLimits),
 }
 
