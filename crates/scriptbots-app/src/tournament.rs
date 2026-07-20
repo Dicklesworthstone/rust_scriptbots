@@ -184,9 +184,7 @@ fn order_assignments(
         OrderPolicy::BothAssignments => {
             if count != 2 {
                 return Err(TournamentError::UnbalancedOrders {
-                    reason: format!(
-                        "BothAssignments requires exactly 2 families, got {count}"
-                    ),
+                    reason: format!("BothAssignments requires exactly 2 families, got {count}"),
                 });
             }
             Ok(vec![families.to_vec(), {
@@ -371,7 +369,8 @@ mod tests {
                         .filter(|plan| plan.spawn_order[position] == *family)
                         .count();
                     assert_eq!(
-                        count, 1,
+                        count,
+                        1,
                         "family {} must occupy position {position} exactly once per seed",
                         family.as_str()
                     );
@@ -379,9 +378,7 @@ mod tests {
             }
             for plan in &planned {
                 assert!(
-                    plan.cohort
-                        .values()
-                        .all(|count| *count == 10),
+                    plan.cohort.values().all(|count| *count == 10),
                     "cohorts are equal"
                 );
             }
@@ -390,11 +387,7 @@ mod tests {
 
     #[test]
     fn plan_is_pure_and_byte_identical_across_calls() {
-        let input = spec(
-            vec![MLP, DWRAON, ASSEMBLY],
-            vec![7, 11, 13],
-            30,
-        );
+        let input = spec(vec![MLP, DWRAON, ASSEMBLY], vec![7, 11, 13], 30);
         let first = plan(&input).expect("plan one");
         let second = plan(&input).expect("plan two");
         assert_eq!(first, second, "plan() is pure");
@@ -431,10 +424,7 @@ mod tests {
         input.families.push(ASSEMBLY);
         input.cohort_size = 30;
         assert!(
-            matches!(
-                plan(&input),
-                Err(TournamentError::UnbalancedOrders { .. })
-            ),
+            matches!(plan(&input), Err(TournamentError::UnbalancedOrders { .. })),
             "three families cannot use BothAssignments"
         );
     }
@@ -477,10 +467,7 @@ mod tests {
         ));
         let mut input = spec(vec![MLP], vec![1], 10);
         input.ticks = 0;
-        assert!(matches!(
-            plan(&input),
-            Err(TournamentError::ZeroTicks)
-        ));
+        assert!(matches!(plan(&input), Err(TournamentError::ZeroTicks)));
     }
 
     #[test]
@@ -506,13 +493,9 @@ mod tests {
 
 /// Match execution and outcome computation.
 pub mod execution {
-    use super::{
-        FamilyOutcome, MatchOutcome, MatchPlan, TournamentError,
-    };
+    use super::{FamilyOutcome, MatchOutcome, MatchPlan, TournamentError};
     use scriptbots_brain::BrainKind;
-    use scriptbots_core::{
-        AgentData, BrainBinding, ScriptBotsConfig, WorldState,
-    };
+    use scriptbots_core::{AgentData, BrainBinding, ScriptBotsConfig, WorldState};
     use std::collections::BTreeMap;
 
     /// A completed match: the outcome plus the config digest it ran under, so every arm
@@ -521,6 +504,128 @@ pub mod execution {
     pub struct MatchRunReport {
         pub outcome: MatchOutcome,
         pub config_digest: String,
+    }
+
+    /// A brain-family adapter wrapper that re-registers an identical executable under a
+    /// second family identity. The null tournament's bias probe depends on it: the
+    /// registry refuses duplicate `family_id`s by design, so entering one adapter under
+    /// two names ("mlp.a", "mlp.b") requires each registration to carry its own identity
+    /// while the executable bytes, genome codecs, and offspring policy stay exactly the
+    /// adapter's.
+    struct RenamedFamilyAdapter {
+        inner: Box<dyn scriptbots_core::BrainFamilyAdapter>,
+        family_id: scriptbots_core::BrainFamilyId,
+    }
+
+    impl scriptbots_core::BrainFamilyCodec for RenamedFamilyAdapter {
+        fn family_id(&self) -> &scriptbots_core::BrainFamilyId {
+            &self.family_id
+        }
+
+        fn adapter_identity(&self) -> scriptbots_core::BrainAdapterIdentityV1 {
+            // The executable identity stays the inner adapter's: both arms ARE the same
+            // brain, and the attestation must be able to prove that.
+            self.inner.adapter_identity()
+        }
+
+        fn validate_genome(
+            &self,
+            genome: &scriptbots_core::BrainGenomeEnvelope,
+        ) -> Result<(), scriptbots_core::BrainProtocolError> {
+            self.inner.validate_genome(genome)
+        }
+
+        fn offspring_state_policy(&self) -> scriptbots_core::OffspringStatePolicy {
+            self.inner.offspring_state_policy()
+        }
+
+        fn random_genome_material(
+            &self,
+            rng: &mut dyn scriptbots_core::RandomStream,
+        ) -> Result<scriptbots_core::BrainGenomeMaterial, scriptbots_core::BrainProtocolError>
+        {
+            self.inner.random_genome_material(rng)
+        }
+
+        fn validate_evaluator_state(
+            &self,
+            state: &scriptbots_core::BrainEvaluatorStateEnvelope,
+        ) -> Result<(), scriptbots_core::BrainProtocolError> {
+            self.inner.validate_evaluator_state(state)
+        }
+
+        fn mutate_genome_material(
+            &self,
+            genome: &scriptbots_core::BrainGenomeEnvelope,
+            rates: scriptbots_core::MutationRates,
+            rng: &mut dyn scriptbots_core::RandomStream,
+        ) -> Result<scriptbots_core::BrainGenomeMaterial, scriptbots_core::BrainProtocolError>
+        {
+            self.inner.mutate_genome_material(genome, rates, rng)
+        }
+
+        fn crossover_genomes_material(
+            &self,
+            left: &scriptbots_core::BrainGenomeEnvelope,
+            right: &scriptbots_core::BrainGenomeEnvelope,
+            rng: &mut dyn scriptbots_core::RandomStream,
+        ) -> Result<scriptbots_core::BrainGenomeMaterial, scriptbots_core::BrainProtocolError>
+        {
+            self.inner.crossover_genomes_material(left, right, rng)
+        }
+
+        fn initial_state(
+            &self,
+            genome: &scriptbots_core::BrainGenomeEnvelope,
+            rng: &mut dyn scriptbots_core::RandomStream,
+        ) -> Result<scriptbots_core::BrainEvaluatorStateEnvelope, scriptbots_core::BrainProtocolError>
+        {
+            self.inner.initial_state(genome, rng)
+        }
+
+        fn offspring_state(
+            &self,
+            child: &scriptbots_core::BrainGenomeEnvelope,
+            parents: &[&scriptbots_core::BrainEvaluatorStateEnvelope],
+            rng: &mut dyn scriptbots_core::RandomStream,
+        ) -> Result<scriptbots_core::BrainEvaluatorStateEnvelope, scriptbots_core::BrainProtocolError>
+        {
+            self.inner.offspring_state(child, parents, rng)
+        }
+
+        fn evaluator(
+            &self,
+            genome: &scriptbots_core::BrainGenomeEnvelope,
+            state: &scriptbots_core::BrainEvaluatorStateEnvelope,
+        ) -> Result<Box<dyn scriptbots_core::BrainEvaluator>, scriptbots_core::BrainProtocolError>
+        {
+            self.inner.evaluator(genome, state)
+        }
+    }
+
+    // NOTE: no explicit `impl BrainFamilyAdapter` — scriptbots-core's
+    // blanket `impl<T: BrainFamilyCodec + ?Sized> BrainFamilyAdapter for T`
+    // covers the adapter half; an empty manual impl now conflicts (E0119).
+
+    /// Wrap an adapter under a custom family identity, or return it directly when the
+    /// name already matches the adapter's canonical one.
+    fn adapter_for(
+        canonical_kind: &'static str,
+        name: &str,
+        make: impl FnOnce() -> Result<Box<dyn scriptbots_core::BrainFamilyAdapter>, TournamentError>,
+    ) -> Result<Box<dyn scriptbots_core::BrainFamilyAdapter>, TournamentError> {
+        if name == canonical_kind {
+            return make();
+        }
+        let family_id = scriptbots_core::BrainFamilyId::new(name).map_err(|error| {
+            TournamentError::UnbalancedOrders {
+                reason: format!("family name {name:?} is not a valid family id: {error}"),
+            }
+        })?;
+        Ok(Box::new(RenamedFamilyAdapter {
+            inner: make()?,
+            family_id,
+        }))
     }
 
     /// Register exactly the families the spec entered. Unknown family names are a typed
@@ -539,22 +644,44 @@ pub mod execution {
             let key = if resolves("mlp") {
                 world.register_brain_family(
                     name,
-                    Box::new(scriptbots_brain::mlp::MlpBrainFamily::new()),
+                    adapter_for(
+                        scriptbots_brain::mlp::MlpBrain::KIND.as_str(),
+                        name,
+                        || {
+                            Ok(Box::new(scriptbots_brain::mlp::MlpBrainFamily::new())
+                                as Box<dyn scriptbots_core::BrainFamilyAdapter>)
+                        },
+                    )?,
                 )
             } else if resolves("dwraon") {
                 world.register_brain_family(
                     name,
-                    Box::new(scriptbots_brain::dwraon::DwraonFamilyAdapter::default()),
+                    adapter_for(
+                        scriptbots_brain::dwraon::DwraonBrain::KIND.as_str(),
+                        name,
+                        || {
+                            Ok(Box::new(scriptbots_brain::dwraon::DwraonFamilyAdapter::default())
+                                as Box<dyn scriptbots_core::BrainFamilyAdapter>)
+                        },
+                    )?,
                 )
             } else if resolves("assembly") {
                 world.register_brain_family(
                     name,
-                    Box::new(
-                        scriptbots_brain::assembly::AssemblyFamilyAdapter::new()
-                            .map_err(|error| TournamentError::UnbalancedOrders {
-                                reason: format!("assembly adapter construction: {error}"),
-                            })?,
-                    ),
+                    adapter_for(
+                        scriptbots_brain::assembly::AssemblyBrain::KIND.as_str(),
+                        name,
+                        || {
+                            Ok(
+                                Box::new(
+                                    scriptbots_brain::assembly::AssemblyFamilyAdapter::new()
+                                        .map_err(|error| TournamentError::UnbalancedOrders {
+                                            reason: format!("assembly adapter construction: {error}"),
+                                        })?,
+                                ) as Box<dyn scriptbots_core::BrainFamilyAdapter>,
+                            )
+                        },
+                    )?,
                 )
             } else {
                 return Err(TournamentError::UnbalancedOrders {
@@ -594,7 +721,10 @@ pub mod execution {
             .collect()
     }
 
-    fn live_family_counts(world: &WorldState, family_keys: &BTreeMap<u64, BrainKind>) -> BTreeMap<BrainKind, usize> {
+    fn live_family_counts(
+        world: &WorldState,
+        family_keys: &BTreeMap<u64, BrainKind>,
+    ) -> BTreeMap<BrainKind, usize> {
         let mut counts = BTreeMap::new();
         for id in world.agents().iter_handles() {
             let Some(runtime) = world.agent_runtime(id) else {
@@ -631,20 +761,25 @@ pub mod execution {
         // The config digest arms the cross-arm drift guard: every arm must run the same
         // effective configuration, and a mismatch anywhere must look like the bug it is.
         let config_digest = blake3::hash(
-            serde_json::to_string(&config).map_err(|error| TournamentError::UnbalancedOrders {
-                reason: format!("config serialization for the digest failed: {error}"),
-            })?
-            .as_bytes(),
+            serde_json::to_string(&config)
+                .map_err(|error| TournamentError::UnbalancedOrders {
+                    reason: format!("config serialization for the digest failed: {error}"),
+                })?
+                .as_bytes(),
         )
         .to_hex()
         .to_string();
-        let mut world = WorldState::new(config).map_err(|error| TournamentError::UnbalancedOrders {
-            reason: format!("match world construction failed: {error}"),
-        })?;
+        let mut world =
+            WorldState::new(config).map_err(|error| TournamentError::UnbalancedOrders {
+                reason: format!("match world construction failed: {error}"),
+            })?;
 
         let mut family_keys: BTreeMap<BrainKind, u64> = BTreeMap::new();
         for family in plan.spawn_order.iter() {
-            family_keys.extend(register_entered_families(&mut world, std::slice::from_ref(family))?);
+            family_keys.extend(register_entered_families(
+                &mut world,
+                std::slice::from_ref(family),
+            )?);
         }
         let key_to_family: BTreeMap<u64, BrainKind> = family_keys
             .iter()
@@ -673,12 +808,11 @@ pub mod execution {
                     .map_err(|error| TournamentError::UnbalancedOrders {
                         reason: format!("cohort spawn failed at slot {slot}: {error}"),
                     })?;
-                if !world
-                    .bind_agent_brain(id, key)
-                    .map_err(|error| TournamentError::UnbalancedOrders {
+                if !world.bind_agent_brain(id, key).map_err(|error| {
+                    TournamentError::UnbalancedOrders {
                         reason: format!("cohort brain bind failed at slot {slot}: {error}"),
-                    })?
-                {
+                    }
+                })? {
                     return Err(TournamentError::UnbalancedOrders {
                         reason: format!("brain bind returned false for family {}", family.as_str()),
                     });
@@ -689,9 +823,11 @@ pub mod execution {
         let mut extinct_at: BTreeMap<BrainKind, u64> = BTreeMap::new();
         let mut ticks_run = 0_u64;
         for tick in 1..=ticks {
-            world.step().map_err(|error| TournamentError::UnbalancedOrders {
-                reason: format!("match step {tick} failed: {error}"),
-            })?;
+            world
+                .step()
+                .map_err(|error| TournamentError::UnbalancedOrders {
+                    reason: format!("match step {tick} failed: {error}"),
+                })?;
             ticks_run = tick;
             let counts = live_family_counts(&world, &key_to_family);
             for family in &plan.spawn_order {
@@ -749,8 +885,7 @@ pub mod execution {
                 let mean = if values.is_empty() {
                     0.0
                 } else {
-                    values.iter().map(|value| f64::from(*value)).sum::<f64>()
-                        / values.len() as f64
+                    values.iter().map(|value| f64::from(*value)).sum::<f64>() / values.len() as f64
                 };
                 let max = values.iter().copied().max().unwrap_or(0);
                 (mean, max)
@@ -775,9 +910,8 @@ pub mod execution {
                 },
             );
         }
-        let mut warnings = outcome.warnings.clone();
         if !closed {
-            warnings.push(
+            outcome.warnings.push(
                 "open-world respawn active; survival share includes respawned agents".to_owned(),
             );
         }
@@ -785,7 +919,7 @@ pub mod execution {
             if let Some(tick) = extinct_at.get(family)
                 && *tick <= ticks / 10
             {
-                warnings.push(format!(
+                outcome.warnings.push(format!(
                     "family {} extinct at tick {tick} (<=10% of budget; likely a spawn bug, not a finding)",
                     family.as_str()
                 ));

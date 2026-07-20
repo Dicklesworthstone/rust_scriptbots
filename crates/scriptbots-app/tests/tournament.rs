@@ -41,10 +41,10 @@ fn matches_reproduce_byte_identical_outcomes() {
     let plans = plan(&spec).expect("balanced plan");
     assert_eq!(plans.len(), 2, "[A,B] and [B,A]");
     for match_plan in &plans {
-        let first = run_match(match_plan, spec.ticks, spec.closed, &small_world())
-            .expect("first run");
-        let second = run_match(match_plan, spec.ticks, spec.closed, &small_world())
-            .expect("second run");
+        let first =
+            run_match(match_plan, spec.ticks, spec.closed, &small_world()).expect("first run");
+        let second =
+            run_match(match_plan, spec.ticks, spec.closed, &small_world()).expect("second run");
         assert_eq!(
             first.outcome, second.outcome,
             "a match must reproduce its outcome byte-identically"
@@ -73,8 +73,8 @@ fn open_world_stamps_the_respawn_warning_into_every_outcome() {
     let mut spec = two_family_spec(60);
     spec.closed = false;
     let plans = plan(&spec).expect("plan");
-    let report = run_match(&plans[0], spec.ticks, spec.closed, &small_world())
-        .expect("open-world match");
+    let report =
+        run_match(&plans[0], spec.ticks, spec.closed, &small_world()).expect("open-world match");
     assert!(
         report
             .outcome
@@ -107,8 +107,8 @@ fn null_tournament_arms_are_indistinguishable_beyond_seed_noise() {
     let mut total_a = 0.0_f64;
     let mut total_b = 0.0_f64;
     for match_plan in &plans {
-        let report = run_match(match_plan, spec.ticks, spec.closed, &small_world())
-            .expect("null match");
+        let report =
+            run_match(match_plan, spec.ticks, spec.closed, &small_world()).expect("null match");
         let share_of = |family: BrainKind| -> f64 {
             report
                 .outcome
@@ -136,8 +136,7 @@ fn null_tournament_arms_are_indistinguishable_beyond_seed_noise() {
 fn outcomes_record_every_family_with_warnings_channel() {
     let spec = two_family_spec(40);
     let plans = plan(&spec).expect("plan");
-    let report = run_match(&plans[0], spec.ticks, spec.closed, &small_world())
-        .expect("match");
+    let report = run_match(&plans[0], spec.ticks, spec.closed, &small_world()).expect("match");
     let outcome: &MatchOutcome = &report.outcome;
     assert_eq!(
         outcome.per_family.len(),
