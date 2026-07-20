@@ -8,7 +8,7 @@
 //! serialized dumps. A reordered field must never read as a mutation, and a retarget from
 //! 88 to 14 must read as exactly one typed [`GenomeDelta::Retarget`].
 
-use crate::{BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainProtocolError};
+use crate::{BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope};
 use std::collections::BTreeMap;
 
 #[cfg(test)]

@@ -32,16 +32,14 @@ use crate::{
     AgentRngCounterStateV1, AgentRuntime, AgentUid, BirthOrigin, BirthRecord,
     BrainAdapterIdentityV1, BrainBinding, BrainEvaluatorStateEnvelope, BrainFamilyId,
     BrainGenomeEnvelope, BrainProtocolError, BrainRegistry, BrainRegistryDigestEntryV1,
-    BrainRunner, CharacterizationError, CombatEventFlags, FoodCellProfile, FoodGrid, Generation,
-    HydrologyField, HydrologyFlowDirection, HydrologyState, HydrologyTile, HydrologyTileLayer,
-    INPUT_SIZE, IndicatorState, MapArtifactMetadata, MapGeneratorKind, MutationRates, NUM_EYES,
-    OUTPUT_SIZE, PersistenceBoundaryStatus, Position, Region, RngDomainDigestV1,
-    RngDomainDigestsV1, ScientificStateError, ScriptBotsConfig, SelectionState, TerrainLayer,
-    TerrainTile, Tick, TickCadence, TraitModifiers, WorldDigestV1, WorldDigestV1ContractError,
-    WorldState, WorldStateError, brain_registry_digest_v1, clamp01, validate_finite,
-    world_counters_digest_v1,
+    CharacterizationError, CombatEventFlags, FoodCellProfile, FoodGrid, Generation, HydrologyField,
+    HydrologyFlowDirection, HydrologyState, HydrologyTile, HydrologyTileLayer, INPUT_SIZE,
+    IndicatorState, MapArtifactMetadata, MapGeneratorKind, MutationRates, NUM_EYES, OUTPUT_SIZE,
+    PersistenceBoundaryStatus, Position, Region, RngDomainDigestV1, RngDomainDigestsV1,
+    ScientificStateError, ScriptBotsConfig, SelectionState, TerrainLayer, TerrainTile, Tick,
+    TickCadence, TraitModifiers, WorldDigestV1, WorldDigestV1ContractError, WorldState,
+    WorldStateError, brain_registry_digest_v1, clamp01, validate_finite, world_counters_digest_v1,
 };
-use rand::RngCore;
 use scriptbots_index::UniformGridIndex;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -2574,7 +2572,7 @@ mod tests {
     use crate::tests::{
         boxed_fixture_brain_family, boxed_fixture_brain_family_with_behavior_probe,
     };
-    use crate::{BrainGenomeDerivation, LocomotionModel};
+    use crate::{BrainGenomeDerivation, BrainRunner, LocomotionModel};
     use crate::{
         Intervention, MAX_NEUROFLOW_HIDDEN_LAYERS, MAX_NEUROFLOW_LAYER_NEURONS, RenderSettings,
     };
