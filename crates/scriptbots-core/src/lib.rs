@@ -9037,78 +9037,140 @@ impl AgentArena {
 pub enum ScientificStateError {
     /// A float that can influence simulation or imported environment state was not finite.
     #[error("non-finite scientific state at `{path}`")]
-    NonFinite { path: String },
+    NonFinite {
+        /// Exact field or collection path rejected.
+        path: String,
+    },
     /// A dense imported field did not contain exactly one value per declared cell.
     #[error("scientific-state length mismatch at `{path}`: expected {expected}, got {actual}")]
     LengthMismatch {
+        /// Exact field or collection path rejected.
         path: String,
+        /// Element count the path requires.
         expected: usize,
+        /// Element count supplied.
         actual: usize,
     },
     /// Declared dimensions could not be represented safely as a flat allocation length.
     #[error("scientific-state dimensions overflow at `{path}`")]
-    DimensionOverflow { path: String },
+    DimensionOverflow {
+        /// Exact field or collection path rejected.
+        path: String,
+    },
     /// Two coupled dense fields declared different shapes even when their flat lengths matched.
     #[error(
         "scientific-state dimensions mismatch at `{path}`: expected {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
     )]
     DimensionsMismatch {
+        /// Exact field or collection path rejected.
         path: String,
+        /// Width the coupled fields require.
         expected_width: u32,
+        /// Height the coupled fields require.
         expected_height: u32,
+        /// Width supplied.
         actual_width: u32,
+        /// Height supplied.
         actual_height: u32,
     },
     /// A coupled imported state supplied only one half of a required pair.
     #[error("incomplete coupled scientific state at `{path}`")]
-    IncompletePair { path: String },
+    IncompletePair {
+        /// Exact field or collection path rejected.
+        path: String,
+    },
     /// An external closure attempted to rewrite immutable ancestry metadata.
     #[error("external ancestry mutation is not permitted at `{path}`")]
-    ExternalLineageMutation { path: String },
+    ExternalLineageMutation {
+        /// Exact field or collection path rejected.
+        path: String,
+    },
     /// A child generation could not be represented without wrapping the lineage counter.
     #[error(
         "lineage generation {generation} cannot advance at `{path}` because the u32 generation space is exhausted"
     )]
-    GenerationOverflow { path: String, generation: u32 },
+    GenerationOverflow {
+        /// Exact field or collection path rejected.
+        path: String,
+        /// Generation that could not advance.
+        generation: u32,
+    },
     /// An agent-keyed random continuation could not advance without reusing an earlier ordinal.
     #[error("agent-keyed random continuation `{counter}` is exhausted at `{path}`")]
-    AgentRngCounterExhausted { path: String, counter: &'static str },
+    AgentRngCounterExhausted {
+        /// Exact field or collection path rejected.
+        path: String,
+        /// Name of the exhausted counter.
+        counter: &'static str,
+    },
     /// A live agent did not have the keyed-RNG continuation required by the protocol.
     #[error("agent-keyed random continuation is missing at `{path}`")]
-    MissingAgentRngCounters { path: String },
+    MissingAgentRngCounters {
+        /// Exact field or collection path rejected.
+        path: String,
+    },
     /// Scientific mutation was attempted while the current persistence admission was unresolved.
     #[error(
         "persistence boundary for tick {tick} is unresolved at `{path}`; retry the exact retained persistence batch before advancing the world or mutating scientific state"
     )]
-    PersistenceBoundaryUnresolved { path: String, tick: u64 },
+    PersistenceBoundaryUnresolved {
+        /// Exact field or collection path rejected.
+        path: String,
+        /// Tick whose persistence boundary is unresolved.
+        tick: u64,
+    },
     /// An external arrival was attempted after the current persistence boundary was admitted.
     #[error(
         "persistence boundary for tick {tick} is already sealed at `{path}`; advance to a new tick before adding an external arrival"
     )]
-    PersistenceBoundarySealed { path: String, tick: u64 },
+    PersistenceBoundarySealed {
+        /// Exact field or collection path rejected.
+        path: String,
+        /// Tick whose persistence boundary is sealed.
+        tick: u64,
+    },
     /// A caller attempted to label a post-start external arrival as a seeded founder.
     #[error(
         "seeded arrivals are only valid at the tick-zero bootstrap boundary at `{path}`; current tick is {tick}, so use an injected arrival"
     )]
-    SeededArrivalAfterBootstrap { path: String, tick: u64 },
+    SeededArrivalAfterBootstrap {
+        /// Exact field or collection path rejected.
+        path: String,
+        /// Current tick when the seeded arrival was attempted.
+        tick: u64,
+    },
     /// Disabling persistence would strand scientific material that has not reached its sink.
     #[error(
         "cannot disable persistence at `{path}` because tick {tick} has an unadmitted scientific tail; finalize the world's bound `PersistenceAdmissionSession` before disabling persistence"
     )]
-    PersistenceDisableRequiresFinalization { path: String, tick: u64 },
+    PersistenceDisableRequiresFinalization {
+        /// Exact field or collection path rejected.
+        path: String,
+        /// Tick with an unadmitted scientific tail.
+        tick: u64,
+    },
     /// Persistence was disabled long enough to discard scientific records from this run.
     #[error(
         "cannot re-enable persistence at `{path}` because scientific records were discarded while persistence was disabled at tick {discarded_at_tick}; construct a new world and storage identity instead of creating a run with a hidden history gap"
     )]
     PersistenceHistoryGap {
+        /// Exact field or collection path rejected.
         path: String,
+        /// Tick at which records were discarded.
         discarded_at_tick: u64,
     },
     /// Resetting time is only valid as a no-op on a pristine tick-zero world.
     #[error(
         "cannot reset time at `{path}` because the world is not a pristine tick-zero boundary (tick {tick}, epoch {epoch}); construct a new world and storage identity for the new run"
     )]
-    TimeResetRequiresNewRun { path: String, tick: u64, epoch: u64 },
+    TimeResetRequiresNewRun {
+        /// Exact field or collection path rejected.
+        path: String,
+        /// Current tick when the reset was attempted.
+        tick: u64,
+        /// Current epoch when the reset was attempted.
+        epoch: u64,
+    },
 }
 
 impl ScientificStateError {
