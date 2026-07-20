@@ -820,6 +820,47 @@ impl BrainFamilyCodec for MlpBrainFamily {
         self.decode_genome(genome).map(|_| ())
     }
 
+    fn genome_loci(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<Vec<(scriptbots_core::genome_diff::Locus, scriptbots_core::genome_diff::LocusValue)>, BrainProtocolError>
+    {
+        use scriptbots_core::genome_diff::{Locus, LocusValue};
+        let nodes = self.decode_genome(genome)?;
+        let mut loci = Vec::with_capacity(nodes.len() * (3 + CONNECTIONS * 3));
+        for (node_index, node) in nodes.iter().enumerate() {
+            let node_index = node_index as u32;
+            loci.push((Locus::NodeBias(node_index), LocusValue::Scalar(node.bias)));
+            loci.push((Locus::NodeDamping(node_index), LocusValue::Scalar(node.damping)));
+            loci.push((Locus::NodeGain(node_index), LocusValue::Scalar(node.gain)));
+            for conn in 0..CONNECTIONS {
+                let conn_u8 = conn as u8;
+                loci.push((
+                    Locus::NodeWeight {
+                        node: node_index,
+                        conn: conn_u8,
+                    },
+                    LocusValue::Scalar(node.weights[conn]),
+                ));
+                loci.push((
+                    Locus::NodeKind {
+                        node: node_index,
+                        conn: conn_u8,
+                    },
+                    LocusValue::Kind(node.kinds[conn] as u8),
+                ));
+                loci.push((
+                    Locus::NodeTarget {
+                        node: node_index,
+                        conn: conn_u8,
+                    },
+                    LocusValue::Target(node.targets[conn] as u32),
+                ));
+            }
+        }
+        Ok(loci)
+    }
+
     fn validate_evaluator_state(
         &self,
         state: &BrainEvaluatorStateEnvelope,

@@ -749,6 +749,56 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
         decode_genome(genome).map(|_| ())
     }
 
+    fn genome_loci(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<Vec<(scriptbots_core::genome_diff::Locus, scriptbots_core::genome_diff::LocusValue)>, BrainProtocolError>
+    {
+        use scriptbots_core::genome_diff::{Locus, LocusValue};
+        let nodes = decode_genome(genome)?;
+        let mut loci = Vec::with_capacity(nodes.len() * (3 + CONNECTIONS * 3 + 1));
+        for (node_index, node) in nodes.iter().enumerate() {
+            let node_index = node_index as u32;
+            loci.push((Locus::NodeBias(node_index), LocusValue::Scalar(node.bias)));
+            loci.push((Locus::NodeDamping(node_index), LocusValue::Scalar(node.damping)));
+            // DWRAON locus encoding: conn 0..CONNECTIONS-1 are per-connection
+            // weights/sources/inversion flags; conn CONNECTIONS is the node's And/Or
+            // operator kind.
+            loci.push((
+                Locus::NodeKind {
+                    node: node_index,
+                    conn: CONNECTIONS as u8,
+                },
+                LocusValue::Kind(node.kind as u8),
+            ));
+            for conn in 0..CONNECTIONS {
+                let conn_u8 = conn as u8;
+                loci.push((
+                    Locus::NodeWeight {
+                        node: node_index,
+                        conn: conn_u8,
+                    },
+                    LocusValue::Scalar(node.weights[conn]),
+                ));
+                loci.push((
+                    Locus::NodeTarget {
+                        node: node_index,
+                        conn: conn_u8,
+                    },
+                    LocusValue::Target(node.sources[conn] as u32),
+                ));
+                loci.push((
+                    Locus::NodeKind {
+                        node: node_index,
+                        conn: conn_u8,
+                    },
+                    LocusValue::Kind(u8::from(node.inverted[conn])),
+                ));
+            }
+        }
+        Ok(loci)
+    }
+
     fn validate_evaluator_state(
         &self,
         state: &BrainEvaluatorStateEnvelope,

@@ -332,6 +332,11 @@ jobs:
           bash ci/check_fsqlite_pin.sh --self-test
           bash ci/check_fsqlite_pin.sh
 
+      - name: Brain anti-coupling boundary guard (bd-16g.13.1)
+        run: |
+          bash ci/check_brain_coupling.sh --self-test
+          bash ci/check_brain_coupling.sh
+
   wasm:
     name: Wasm (ubuntu)
     runs-on: ubuntu-24.04
