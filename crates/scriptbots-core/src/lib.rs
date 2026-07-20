@@ -8193,24 +8193,6 @@ pub trait BrainFamilyCodec: Send + Sync {
     /// Validate generic versions and family-owned genome bytes.
     fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError>;
 
-    /// Decode a genome into its canonical typed locus list for structural diffing
-    /// (bd-16g.13.1). Loci are emitted in canonical index order — the same genome
-    /// always decodes to the same ordered list on any platform. Families that cannot
-    /// expose typed loci inherit the default, which refuses honestly rather than
-    /// letting the diff compare opaque bytes.
-    fn genome_loci(
-        &self,
-        genome: &BrainGenomeEnvelope,
-    ) -> Result<Vec<(crate::genome_diff::Locus, crate::genome_diff::LocusValue)>, BrainProtocolError>
-    {
-        let _ = genome;
-        Err(BrainProtocolError::InvalidPayload {
-            kind: BrainEnvelopeKind::Genome,
-            family_id: self.family_id().clone(),
-            detail: "family does not expose typed genome loci for structural diffing".to_owned(),
-        })
-    }
-
     /// Validate generic versions and family-owned future-affecting state bytes.
     fn validate_evaluator_state(
         &self,
