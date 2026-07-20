@@ -788,9 +788,9 @@ impl CueEmitter {
                 }
                 class_counts[class] += 1;
                 stats.cues_spawned += 1;
-                let batch = self
-                    .scheduler
-                    .schedule(tick, entry.ordinal, &entry.cue, entry.position);
+                let batch =
+                    self.scheduler
+                        .schedule(tick, entry.ordinal, &entry.cue, entry.position);
                 for particle in batch.particles {
                     if pool.spawn(particle).is_some() {
                         stats.particles_spawned += 1;
@@ -869,11 +869,16 @@ impl CueEmitter {
                 radius: 2.0,
                 duration_ticks: trail.duration_ticks,
             };
-            let batch = self.scheduler.schedule(tick, index as u32, &cue, [
-                position[0] + trail.anchor.offset[0],
-                position[1] + trail.anchor.offset[1],
-                position[2] + trail.anchor.offset[2],
-            ]);
+            let batch = self.scheduler.schedule(
+                tick,
+                index as u32,
+                &cue,
+                [
+                    position[0] + trail.anchor.offset[0],
+                    position[1] + trail.anchor.offset[1],
+                    position[2] + trail.anchor.offset[2],
+                ],
+            );
             // One puff per emission: the trail is a breadcrumb, not a burst.
             if let Some(particle) = batch.particles.into_iter().next()
                 && pool.spawn(particle).is_some()
@@ -1372,13 +1377,7 @@ mod tests {
     fn golden_cue_particle_count_vectors_per_recipe() {
         // The recipe contract: 4 + intensity * 20, clamped to [1, max_per_cue].
         let scheduler = CueScheduler::new(7);
-        let golden: [(f32, u32); 5] = [
-            (0.0, 4),
-            (0.25, 9),
-            (0.5, 14),
-            (0.75, 19),
-            (1.0, 24),
-        ];
+        let golden: [(f32, u32); 5] = [(0.0, 4), (0.25, 9), (0.5, 14), (0.75, 19), (1.0, 24)];
         for kind in [
             VisualCueKind::Sparkle,
             VisualCueKind::Shards,
@@ -1450,7 +1449,11 @@ mod tests {
         emitter_b.enqueue(9, cue(VisualCueKind::Wilt), [0.0; 3]);
         let stats_b = emitter_b.apply_tick(9, &mut pool_b);
         assert_eq!(stats, stats_b);
-        assert_eq!(pool.state_hash(), pool_b.state_hash(), "identical selection");
+        assert_eq!(
+            pool.state_hash(),
+            pool_b.state_hash(),
+            "identical selection"
+        );
         // Critical won over ambient: the spawned batch was sparkle-tagged.
         let mut saw_spark = false;
         pool.for_each_live(|particle| {
@@ -1485,7 +1488,11 @@ mod tests {
             }
             pool.state_hash()
         };
-        assert_eq!(run(), run(), "identical cue stream -> identical pool state hash");
+        assert_eq!(
+            run(),
+            run(),
+            "identical cue stream -> identical pool state hash"
+        );
         // A different stream must diverge (the hash actually observes state).
         let divergent = || {
             let mut emitter = CueEmitter::new(42);
@@ -1494,7 +1501,11 @@ mod tests {
             emitter.apply_tick(100, &mut pool);
             pool.state_hash()
         };
-        assert_ne!(run(), divergent(), "different streams produce different states");
+        assert_ne!(
+            run(),
+            divergent(),
+            "different streams produce different states"
+        );
     }
 
     #[test]
@@ -1514,9 +1525,8 @@ mod tests {
         let mut emitted_total = 0_u32;
         for tick in 0..=u64::from(CueEmitter::TRAIL_DURATION_TICKS) {
             let x = tick as f32;
-            emitted_total += emitter.emit_trails(tick, &mut pool, |uid| {
-                (uid == 99).then_some([x, 0.0, 0.0])
-            });
+            emitted_total +=
+                emitter.emit_trails(tick, &mut pool, |uid| (uid == 99).then_some([x, 0.0, 0.0]));
         }
         let expected = CueEmitter::TRAIL_DURATION_TICKS / CueEmitter::TRAIL_INTERVAL_TICKS;
         assert_eq!(emitted_total, expected, "one puff per interval");
@@ -1541,9 +1551,12 @@ mod tests {
         let mut a = ParticlePool::with_capacity(4);
         let b = ParticlePool::with_capacity(4);
         assert_eq!(a.state_hash(), b.state_hash(), "empty pools equal");
-        a.spawn(particle(ParticlePriority::Standard)).expect("spawn");
+        a.spawn(particle(ParticlePriority::Standard))
+            .expect("spawn");
         assert_ne!(a.state_hash(), b.state_hash(), "occupancy is observed");
-        let handle = a.spawn(particle(ParticlePriority::Critical)).expect("spawn");
+        let handle = a
+            .spawn(particle(ParticlePriority::Critical))
+            .expect("spawn");
         let before = a.state_hash();
         a.kill(handle);
         assert_ne!(a.state_hash(), before, "kill changes generations");

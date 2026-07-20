@@ -195,14 +195,9 @@ fn concurrent_lane_readers_observe_commit_boundaries_while_writer_applies_batche
     let path_string = path.to_string_lossy().to_string();
     write_fixture(&path_string, 3);
 
-    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
-        &path_string,
-        1,
-        1,
-        1,
-        1,
-    )
-    .expect("writer pipeline opens");
+    let mut pipeline =
+        StoragePipeline::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)
+            .expect("writer pipeline opens");
 
     let mut readers = Vec::new();
     for _reader_index in 0..4 {
