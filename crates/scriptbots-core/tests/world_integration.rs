@@ -1,3 +1,12 @@
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(clippy::suboptimal_flops, clippy::imprecise_flops)]
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(clippy::float_cmp, clippy::while_float)]
+#![allow(clippy::too_many_lines)]
+
 use scriptbots_core::{
     AgentData, AgentId, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE, LocomotionModel,
     NUM_EYES, NullPersistence, OUTPUT_SIZE, OutputChannel, Position, SENSOR_LAYOUT,
@@ -303,7 +312,7 @@ fn seeded_world_advances_deterministically() {
         food_cell_size: 16,
         initial_food: 0.25,
         food_max: 1.0,
-        rng_seed: Some(0xDEADBEEF),
+        rng_seed: Some(0xDEAD_BEEF),
         ..ScriptBotsConfig::default()
     };
 
@@ -1342,11 +1351,11 @@ fn sensory_pipeline_populates_expected_channels() {
         "blood sensor should detect wounded neighbor"
     );
     assert!(
-        sensors[16] >= 0.0 && sensors[16] <= 1.0,
+        (0.0..=1.0).contains(&sensors[16]),
         "clock sensor within bounds"
     );
     assert!(
-        sensors[20] >= 0.0 && sensors[20] <= 1.0,
+        (0.0..=1.0).contains(&sensors[20]),
         "temperature discomfort normalized"
     );
     assert!(

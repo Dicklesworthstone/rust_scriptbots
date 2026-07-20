@@ -1,3 +1,12 @@
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. Function lengths mirror
+// the legacy C++ parity layout and are reviewed as units.
+#![allow(clippy::suboptimal_flops, clippy::imprecise_flops)]
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(clippy::float_cmp, clippy::while_float)]
+#![allow(clippy::too_many_lines)]
+
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 use scriptbots_brain::MlpBrain;
 use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig};
@@ -14,6 +23,7 @@ use scriptbots_core::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::hint::black_box;
 use std::io::Write;
@@ -961,9 +971,9 @@ fn bench_world_steps(c: &mut Criterion) {
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec![2000_usize, 5000, 10000]);
+        .unwrap_or_else(|| vec![2000_usize, 5000, 10_000]);
     for &agents in &agents_list {
-        group.bench_function(format!("steps{}_agents{}_ticks", steps, agents), |b| {
+        group.bench_function(format!("steps{steps}_agents{agents}_ticks"), |b| {
             b.iter_batched(
                 || {
                     let mut config = ScriptBotsConfig::default();
@@ -1689,7 +1699,7 @@ fn scenario_config_hash(brain_family: GateBrainFamily) -> GateResult<String> {
 }
 
 fn build_perf_world(agents: usize, brain_family: GateBrainFamily) -> GateResult<WorldState> {
-    let mut world = WorldState::new(perf_config()).map_err(|error| error.to_string())?;
+    let mut world = WorldState::new(perf_config()).map_err(ToString::to_string)?;
     let brain_key = brain_family.register(&mut world)?;
     for ordinal in 0..agents {
         let x = (ordinal % 800) as f32;
@@ -1890,7 +1900,7 @@ fn run_scenario(
     );
     let mut warmups = Vec::with_capacity(PERF_WARMUPS);
     for index in 0..PERF_WARMUPS {
-        eprintln!("perf-gate: warmup {}/{}", index + 1, PERF_WARMUPS);
+        eprintln!("perf-gate: warmup {}/{PERF_WARMUPS}", index + 1);
         warmups.push(run_repetition(
             agents,
             brain_family,
@@ -1902,7 +1912,7 @@ fn run_scenario(
     }
     let mut measurements = Vec::with_capacity(PERF_REPETITIONS);
     for index in 0..PERF_REPETITIONS {
-        eprintln!("perf-gate: measurement {}/{}", index + 1, PERF_REPETITIONS);
+        eprintln!("perf-gate: measurement {}/{PERF_REPETITIONS}", index + 1);
         let marker = if index < PERF_MARKER_REPETITIONS {
             marker_writer.as_deref_mut().map(|writer| RepetitionMarker {
                 writer,
@@ -2191,10 +2201,10 @@ fn filesystem_kind() -> String {
 
 fn cpu_brand() -> String {
     let linux = proc_cpu_field("model name");
-    if !linux.is_empty() {
-        linux
-    } else {
+    if linux.is_empty() {
         command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+    } else {
+        linux
     }
 }
 
@@ -2204,10 +2214,10 @@ fn memory_fingerprint() -> String {
         .find(|line| line.starts_with("MemTotal:"))
         .unwrap_or_default()
         .to_owned();
-    if !linux.is_empty() {
-        linux
-    } else {
+    if linux.is_empty() {
         command_output("sysctl", &["-n", "hw.memsize"])
+    } else {
+        linux
     }
 }
 
@@ -2249,8 +2259,7 @@ fn memory_class_identity(raw: &str) -> GateResult<String> {
 fn capture_fingerprint() -> GateResult<Fingerprint> {
     let workspace_root = workspace_root()?;
     let logical_cpus = thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1);
+        .map_or(1, usize::from);
     let scriptbots_thread_budget = env::var("SCRIPTBOTS_MAX_THREADS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
@@ -3122,7 +3131,8 @@ fn write_json(path: &Path, value: &impl Serialize) -> GateResult<()> {
 fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
     let mut output = String::new();
     output.push_str("# ScriptBots performance gate\n\n");
-    output.push_str(&format!(
+    write!(
+        output,
         "- Verdict: `{:?}`\n- Machine class: `{}`\n- Commit: `{}`\n- Mode: `{}`\n- Snapshot operation: `{}`\n- Snapshot sampling: `{} separately timed operations/tick; {} raw samples/repetition`\n- Stage schema: `{}`\n\n",
         verdict.status,
         artifact.fingerprint.machine_class_id,
@@ -3132,9 +3142,10 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
         artifact.policy.snapshot_samples_per_tick,
         artifact.policy.snapshot_samples_per_repetition,
         artifact.world_step_profile_schema
-    ));
+    )
+    .expect("writing to a String cannot fail");
     for reason in &verdict.reasons {
-        output.push_str(&format!("- {reason}\n"));
+        write!(output, "- {reason}\n").expect("writing to a String cannot fail");
     }
     output.push_str("\n## Measurements\n\n");
     output.push_str(
@@ -3148,7 +3159,8 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
             .map(|run| format!("{:.2}", run.total_tps))
             .collect::<Vec<_>>()
             .join(", ");
-        output.push_str(&format!(
+        write!(
+            output,
             "| `{}` | {:.2} | {:.2}% | {:.3} ms | {:.2}% | {} |\n",
             scenario.id,
             scenario.median_of_run_total_tps,
@@ -3156,7 +3168,8 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
             scenario.median_of_run_snapshot_p95_ns as f64 / 1_000_000.0,
             scenario.snapshot_p95_cv_pct,
             raw
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
     if !verdict.scenarios.is_empty() {
         output.push_str("\n## Comparison\n\n");
@@ -3179,14 +3192,16 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
             if flags.is_empty() {
                 flags.push("pass");
             }
-            output.push_str(&format!(
+            write!(
+                output,
                 "| `{}` | {:.2} | {:.2} | {:+.2}% | {} |\n",
                 scenario.id,
                 scenario.baseline_tps,
                 scenario.candidate_tps,
                 -scenario.tps_regression_pct,
                 flags.join(", ")
-            ));
+            )
+            .expect("writing to a String cannot fail");
         }
     }
     output.push_str(
