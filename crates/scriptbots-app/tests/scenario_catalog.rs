@@ -119,10 +119,9 @@ fn run_cohort(document_path: &Path, seed: u64, frames: u64) -> CohortRun {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let report: HeadlessReportDto = serde_json::from_slice(
-        &std::fs::read(&report_path).expect("headless report exists"),
-    )
-    .expect("headless report parses");
+    let report: HeadlessReportDto =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("headless report exists"))
+            .expect("headless report parses");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let world_digest = parse_digest(&stderr);
     let _ = std::fs::remove_dir_all(&dir);
@@ -183,7 +182,10 @@ fn every_catalog_scenario_satisfies_its_envelope_on_every_cohort_seed_and_replay
             .unwrap_or_else(|error| panic!("catalog document {name} unreadable: {error}"));
         let document = ScenarioDocumentV1::parse_toml(&bytes)
             .unwrap_or_else(|error| panic!("catalog document {name} must validate: {error}"));
-        assert_eq!(document.id, name, "catalog file name and scenario id must agree");
+        assert_eq!(
+            document.id, name,
+            "catalog file name and scenario id must agree"
+        );
         assert!(
             !document.seeds.is_empty(),
             "{name}: a curated scenario must declare its cohort seed schedule"
@@ -192,10 +194,9 @@ fn every_catalog_scenario_satisfies_its_envelope_on_every_cohort_seed_and_replay
             document.hypothesis.is_some(),
             "{name}: a curated scenario must state its intended phenomenon"
         );
-        let envelope = document
-            .envelope
-            .clone()
-            .unwrap_or_else(|| panic!("{name}: a curated scenario must declare a measurable envelope"));
+        let envelope = document.envelope.clone().unwrap_or_else(|| {
+            panic!("{name}: a curated scenario must declare a measurable envelope")
+        });
 
         for &seed in &document.seeds {
             let first = run_cohort(&document_path, seed, envelope.ticks);
@@ -211,5 +212,9 @@ fn every_catalog_scenario_satisfies_its_envelope_on_every_cohort_seed_and_replay
         }
         validated += 1;
     }
-    assert_eq!(validated, CATALOG.len(), "every catalog scenario was validated");
+    assert_eq!(
+        validated,
+        CATALOG.len(),
+        "every catalog scenario was validated"
+    );
 }

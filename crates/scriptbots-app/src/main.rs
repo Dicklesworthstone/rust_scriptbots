@@ -2322,7 +2322,7 @@ fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
     use scriptbots_app::scene::{
         BevyOffscreenDriver, GoldenOutcome, SceneManifest, process_golden, run_scene,
     };
-    use scriptbots_bevy::capture::{CapturedFrame, CaptureProvenance, decode_png};
+    use scriptbots_bevy::capture::{CaptureProvenance, CapturedFrame, decode_png};
 
     let manifest = SceneManifest::load(scene_path)
         .map_err(|error| anyhow!("load scene manifest {}: {error}", scene_path.display()))?;
@@ -2348,8 +2348,8 @@ fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
     let mut capture_outcomes = Vec::new();
     for capture in &manifest.captures {
         let png_path = artifacts_dir.join(format!("{}.png", capture.name));
-        let png_bytes = fs::read(&png_path)
-            .with_context(|| format!("read capture {}", png_path.display()))?;
+        let png_bytes =
+            fs::read(&png_path).with_context(|| format!("read capture {}", png_path.display()))?;
         let (width, height, rgba8) = decode_png(&png_bytes)
             .with_context(|| format!("decode capture {}", png_path.display()))?;
         let provenance_path = artifacts_dir.join(format!("{}.provenance.json", capture.name));
@@ -2389,9 +2389,7 @@ fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
                     heatmap.display()
                 ));
             }
-            GoldenOutcome::MissingGolden {
-                instructions, ..
-            } => {
+            GoldenOutcome::MissingGolden { instructions, .. } => {
                 failures.push(format!("capture `{}`: {instructions}", capture.name));
             }
             GoldenOutcome::Regenerated { golden } => info!(

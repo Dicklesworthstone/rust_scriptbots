@@ -611,7 +611,9 @@ pub enum ScenarioRunError {
     #[error("registered-brain selection invariant failed while seeding founder {0}")]
     FounderSelectionInvariant(u64),
     /// The registered brain family vanished between registration and binding.
-    #[error("registered brain {key} disappeared while binding a seeded founder; refusing an unbound fallback")]
+    #[error(
+        "registered brain {key} disappeared while binding a seeded founder; refusing an unbound fallback"
+    )]
     FounderBrainVanished {
         /// The registry key that vanished.
         key: u64,
@@ -682,12 +684,10 @@ pub fn apply_scenario_interventions(
                 fields: intervention.set.clone(),
             }],
         );
-        let merged_config: ScriptBotsConfig =
-            serde_json::from_value(resolved.merged.clone()).map_err(|error| {
-                ScenarioRunError::Intervention {
-                    tick,
-                    detail: format!("merged config does not deserialize: {error}"),
-                }
+        let merged_config: ScriptBotsConfig = serde_json::from_value(resolved.merged.clone())
+            .map_err(|error| ScenarioRunError::Intervention {
+                tick,
+                detail: format!("merged config does not deserialize: {error}"),
             })?;
         let disposition = scriptbots_core::apply_control_command(
             world,

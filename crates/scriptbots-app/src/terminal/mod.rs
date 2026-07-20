@@ -596,7 +596,10 @@ impl<'a> TerminalApp<'a> {
         match crate::apply_scenario_interventions(&mut world, &mut config_value, &due, current_tick)
         {
             Ok(applied) if applied > 0 => {
-                info!(tick = current_tick, applied, "applied scenario interventions");
+                info!(
+                    tick = current_tick,
+                    applied, "applied scenario interventions"
+                );
             }
             Ok(_) => {}
             Err(error) => {
