@@ -1,0 +1,19 @@
+{
+  "schema": "scriptbots.capture-provenance.v1",
+  "scene": "empty_world",
+  "seed": 1001,
+  "tick": 60,
+  "frontend": "bevy_offscreen",
+  "adapter_name": "Apple M4",
+  "backend": "Metal",
+  "device_type": "Integrated",
+  "quality_tier": "Medium",
+  "viewport": [
+    1280,
+    720
+  ],
+  "colorspace": "rgba8-srgb",
+  "rustc_version": "",
+  "target_triple": "aarch64-apple-darwin",
+  "corrupt": false
+}

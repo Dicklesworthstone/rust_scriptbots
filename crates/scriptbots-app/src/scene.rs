@@ -795,17 +795,21 @@ impl SceneDriver for BevyOffscreenDriver {
                         })?;
                     let hash = fnv1a64_hex(&frame.rgba8);
                     for point in due {
-                        facts
-                            .captures
-                            .push((point.name.clone(), tick, hash.clone(), frame.rgba8.len()));
+                        facts.captures.push((
+                            point.name.clone(),
+                            tick,
+                            hash.clone(),
+                            frame.rgba8.len(),
+                        ));
                         if let Some(dir) = &self.artifacts_dir {
                             std::fs::create_dir_all(dir).map_err(|error| SceneError {
                                 problems: vec![format!("create {}: {error}", dir.display())],
                             })?;
-                            let png = encode_png(frame.width, frame.height, &frame.rgba8)
-                                .map_err(|error| SceneError {
+                            let png = encode_png(frame.width, frame.height, &frame.rgba8).map_err(
+                                |error| SceneError {
                                     problems: vec![format!("encode png {}: {error:#}", point.name)],
-                                })?;
+                                },
+                            )?;
                             std::fs::write(dir.join(format!("{}.png", point.name)), png).map_err(
                                 |error| SceneError {
                                     problems: vec![format!("write {}.png: {error}", point.name)],
@@ -832,9 +836,9 @@ impl SceneDriver for BevyOffscreenDriver {
 
                 do_captures(&world, 0, &mut facts).map_err(|e| anyhow::anyhow!("{e}"))?;
                 for tick in 1..=manifest.ticks {
-                    world.step().map_err(|error| {
-                        anyhow::anyhow!("world step {tick}: {error}")
-                    })?;
+                    world
+                        .step()
+                        .map_err(|error| anyhow::anyhow!("world step {tick}: {error}"))?;
                     collect_tick_facts(&world, tick, &mut facts, &mut tracker);
                     do_captures(&world, tick, &mut facts).map_err(|e| anyhow::anyhow!("{e}"))?;
                 }

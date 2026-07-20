@@ -24,14 +24,13 @@ use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::system::RunSystemOnce;
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
 use bevy::prelude::*;
-use bevy::render::gpu_readback::{Readback, ReadbackComplete};
+use bevy::render::RenderApp;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::renderer::RenderDevice;
-use bevy::render::RenderApp;
 use bevy::render::view::{ColorGrading, Hdr};
 use bevy::window::{ExitCondition, WindowPlugin};
 use scriptbots_core::{RenderQuality, RenderSettings, WorldState};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -296,8 +295,7 @@ struct CaptureCorrupt(bool);
 /// bind group layout, so constructing a second render App in one process
 /// panics; the harness therefore builds exactly one App (lazily) and
 /// reconfigures it per scene via [`OffscreenCapture::run`].
-static CAPTURE_APP: LazyLock<Mutex<Option<SendCaptureApp>>> =
-    LazyLock::new(|| Mutex::new(None));
+static CAPTURE_APP: LazyLock<Mutex<Option<SendCaptureApp>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Send wrapper for the capture App. Bevy's `App` is `!Send` (it stores a
 /// non-Send runner trait object and can hold non-Send resources).
@@ -452,56 +450,119 @@ impl<'a> OffscreenCapture<'a> {
         // Frame 2: full draw of the settled scene (async pipeline
         // compilation can never leak a half-drawn frame into evidence).
         self.app.update();
-        // Readback: spawn, pump until the GPU copy lands, then detach.
-        let slot: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-        let slot_in_observer = Arc::clone(&slot);
-        let readback_entity = self
-            .app
-            .world_mut()
-            .spawn(Readback::texture(self.target.clone()))
-            .observe(move |event: On<ReadbackComplete>, mut commands: Commands| {
-                if let Ok(mut guard) = slot_in_observer.lock() {
-                    *guard = Some(event.data.clone());
-                }
-                commands.entity(event.entity).despawn();
-            })
-            .id();
-        let mut pumps = 0_u32;
-        let data = loop {
-            self.app.update();
-            // Headless has no surface, and only present() polls the wgpu
-            // device in windowed mode; without an explicit poll the
-            // readback's map_async callback can never fire.
-            let polled = if let Some(render_app) = self.app.get_sub_app_mut(RenderApp) {
-                if let Some(device) = render_app.world_mut().get_resource::<RenderDevice>() {
-                    device.poll(wgpu::PollType::Wait).is_ok()
-                } else {
-                    debug!(pumps, "render device not yet available in render app");
-                    false
-                }
-            } else {
-                debug!(pumps, "render sub-app not found during readback pump");
-                false
-            };
-            debug!(pumps, polled, "readback pump");
-            pumps += 1;
-            if let Ok(mut guard) = slot.lock()
-                && let Some(data) = guard.take()
+        // Frames 3-4: attachment/ViewTarget preparation has frame latency
+        // (prepare_assets runs after ManageViews on the first frame).
+        self.app.update();
+        self.app.update();
+        {
+            let world = self.app.world_mut();
             {
-                break data;
-            }
-            if pumps >= 16 {
-                warn!(pumps, "offscreen readback did not complete in budget");
-                // The observer may already have despawned the entity.
-                if let Ok(mut entity) = self.app.world_mut().get_entity_mut(readback_entity) {
-                    entity.despawn();
+                let mut probe = world.query_filtered::<Entity, With<CaptureCamera>>();
+                let entities: Vec<Entity> = probe.iter(world).collect();
+                for entity in entities {
+                    let has_camera_graph = world
+                        .get::<bevy::render::camera::CameraRenderGraph>(entity)
+                        .is_some();
+                    let has_frustum = world
+                        .get::<bevy::camera::primitives::Frustum>(entity)
+                        .is_some();
+                    let has_visible_entities = world
+                        .get::<bevy::render::sync_world::RenderEntity>(entity)
+                        .is_some();
+                    debug!(
+                        ?entity,
+                        has_camera_graph,
+                        has_frustum,
+                        render_entity = has_visible_entities,
+                        "capture camera component probe"
+                    );
                 }
-                self.set_camera_active(false);
-                return Err(anyhow!(
-                    "offscreen readback wedged after {pumps} frames (GPU driver stall?)"
-                ));
             }
-        };
+            let mut cameras = world.query_filtered::<&Camera, With<CaptureCamera>>();
+            let mut camera_states = 0_u32;
+            let mut any_active = false;
+            let mut viewport: Option<(f32, f32)> = None;
+            for camera in cameras.iter(world) {
+                camera_states += 1;
+                any_active |= camera.is_active;
+                viewport = camera.logical_viewport_size().map(|v| (v.x, v.y));
+            }
+            let mut mesh_query = world.query::<&Mesh3d>();
+            let mesh_count = mesh_query.iter(world).count();
+            let mut light_query = world.query::<&DirectionalLight>();
+            let light_count = light_query.iter(world).count();
+            let (extracted_cameras, view_targets) = self
+                .app
+                .get_sub_app_mut(RenderApp)
+                .map(|render_app| {
+                    let render_world = render_app.world_mut();
+                    let mut c = render_world.query::<&bevy::render::camera::ExtractedCamera>();
+                    let camera_debug: Vec<String> = c
+                        .iter(render_world)
+                        .map(|camera| {
+                            let attachment_present = camera
+                                .target
+                                .as_ref()
+                                .and_then(|target| {
+                                    render_world
+                                        .get_resource::<bevy::render::view::ViewTargetAttachments>()
+                                        .and_then(|attachments| attachments.get(target))
+                                        .map(|_| ())
+                                })
+                                .is_some();
+                            format!(
+                                "physical_target_size={:?} target={:?} hdr={} attachment_present={}",
+                                camera.physical_target_size, camera.target, camera.hdr,
+                                attachment_present
+                            )
+                        })
+                        .collect();
+                    let extracted_count = camera_debug.len();
+                    for line in &camera_debug {
+                        debug!(%line, "extracted camera probe");
+                    }
+                    // prepare_view_targets requires the full tuple
+                    // (ExtractedCamera, ExtractedView, CameraMainTextureUsages, Msaa);
+                    // ExtractedView is crate-private, probe the public parts.
+                    let with_usages_count = {
+                        let mut with_usages = render_world.query::<(
+                            &bevy::render::camera::ExtractedCamera,
+                            &bevy::camera::CameraMainTextureUsages,
+                        )>();
+                        with_usages.iter(render_world).count()
+                    };
+                    let with_msaa_count = {
+                        let mut with_msaa = render_world.query::<(
+                            &bevy::render::camera::ExtractedCamera,
+                            &bevy::render::view::Msaa,
+                        )>();
+                        with_msaa.iter(render_world).count()
+                    };
+                    debug!(
+                        with_usages_count,
+                        with_msaa_count,
+                        "prepare_view_targets public-tuple probes"
+                    );
+                    let mut q = render_world.query::<&bevy::render::view::ViewTarget>();
+                    (extracted_count, q.iter(render_world).count())
+                })
+                .unwrap_or((0, 0));
+            debug!(
+                camera_states,
+                any_active,
+                ?viewport,
+                mesh_count,
+                light_count,
+                extracted_cameras,
+                view_targets,
+                "capture scene state before readback"
+            );
+        }
+        // Manual texture readback (the official headless pattern): the
+        // `Readback` component's completion depends on extraction/plugin
+        // wiring, while this path drives the copy, submission, and device
+        // poll directly and fails loudly at each step.
+        let data = self.readback_target()?;
         self.set_camera_active(false);
         let (width, height) = self.viewport;
         let rgba8 = unpad_readback(&data, width, height);
@@ -528,6 +589,80 @@ impl<'a> OffscreenCapture<'a> {
         for mut camera in cameras.iter_mut(self.app.world_mut()) {
             camera.is_active = active;
         }
+    }
+
+    /// Manual texture readback via the render sub-app: copy the target to a
+    /// MAP_READ buffer, submit, poll the device until the map completes.
+    /// Every step has a typed failure — a missing GPU image, a wedged
+    /// device, or a map error can never masquerade as a black frame.
+    fn readback_target(&mut self) -> Result<Vec<u8>> {
+        use bevy::render::render_asset::RenderAssets;
+        use bevy::render::renderer::RenderQueue;
+        use bevy::render::texture::GpuImage;
+
+        let render_app = self
+            .app
+            .get_sub_app_mut(RenderApp)
+            .ok_or_else(|| anyhow!("render sub-app missing"))?;
+        let world = render_app.world_mut();
+        let device = world
+            .get_resource::<RenderDevice>()
+            .ok_or_else(|| anyhow!("render device unavailable"))?
+            .clone();
+        let queue = world
+            .get_resource::<RenderQueue>()
+            .ok_or_else(|| anyhow!("render queue unavailable"))?
+            .clone();
+        let gpu_images = world
+            .get_resource::<RenderAssets<GpuImage>>()
+            .ok_or_else(|| anyhow!("gpu image registry unavailable"))?;
+        let gpu_image = gpu_images.get(&self.target).ok_or_else(|| {
+            anyhow!("capture target was never prepared on the GPU (image extraction failed)")
+        })?;
+        // The target is hardcoded Rgba8UnormSrgb = 4 bytes/pixel.
+        let bytes_per_row =
+            RenderDevice::align_copy_bytes_per_row(gpu_image.size.width as usize * 4) as u32;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scriptbots_capture_readback"),
+            size: u64::from(bytes_per_row) * u64::from(gpu_image.size.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("scriptbots_capture_copy"),
+        });
+        encoder.copy_texture_to_buffer(
+            gpu_image.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            gpu_image.size,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        device
+            .poll(wgpu::PollType::Wait)
+            .map_err(|error| anyhow!("device poll during readback: {error}"))?;
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|error| anyhow!("readback map timed out (wedged GPU?): {error}"))?
+            .map_err(|error| anyhow!("readback buffer map failed: {error}"))?;
+        let data = {
+            let mapped = buffer.slice(..).get_mapped_range();
+            Vec::from(&*mapped)
+        };
+        buffer.unmap();
+        debug!(bytes = data.len(), "offscreen readback complete");
+        Ok(data)
     }
 }
 
@@ -586,10 +721,27 @@ fn configure_session<'a>(
              llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)"
         ));
     }
-    // Wipe the previous scene completely: camera, light, terrain chunks,
-    // agents, readbacks-in-flight.
-    let entities: Vec<Entity> = app.world_mut().iter_entities().map(|e| e.id()).collect();
-    for entity in entities {
+    // Wipe the previous SCENE completely (camera, lights, meshes, agents,
+    // readbacks-in-flight) — but never infrastructure entities. A blanket
+    // wipe of every entity kills plugin-owned startup entities the render
+    // path depends on (the wiped app then produces no ViewTargets and every
+    // capture reads back as the initial fill).
+    let scene_entities: Vec<Entity> = {
+        let world = app.world_mut();
+        let mut found = Vec::new();
+        let mut cameras = world.query_filtered::<Entity, With<Camera>>();
+        found.extend(cameras.iter(world));
+        let mut lights =
+            world.query_filtered::<Entity, Or<(With<DirectionalLight>, With<PointLight>)>>();
+        found.extend(lights.iter(world));
+        let mut meshes = world.query_filtered::<Entity, With<Mesh3d>>();
+        found.extend(meshes.iter(world));
+        let mut readbacks =
+            world.query_filtered::<Entity, With<bevy::render::gpu_readback::Readback>>();
+        found.extend(readbacks.iter(world));
+        found
+    };
+    for entity in scene_entities {
         let _ = app.world_mut().despawn(entity);
     }
     *app.world_mut().resource_mut::<SnapshotState>() = SnapshotState::default();
@@ -613,9 +765,8 @@ fn configure_session<'a>(
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
     );
-    image.texture_descriptor.usage = TextureUsages::RENDER_ATTACHMENT
-        | TextureUsages::COPY_SRC
-        | TextureUsages::TEXTURE_BINDING;
+    image.texture_descriptor.usage =
+        TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING;
     let target = app.world_mut().resource_mut::<Assets<Image>>().add(image);
     app.insert_resource(CaptureTarget(target.clone()));
 
@@ -650,6 +801,7 @@ fn configure_session<'a>(
 fn setup_capture_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     target: Res<CaptureTarget>,
     corrupt: Res<CaptureCorrupt>,
     effective: Res<crate::EffectiveRenderSettings>,
@@ -666,9 +818,6 @@ fn setup_capture_scene(
         GlobalTransform::default(),
         Visibility::default(),
         InheritedVisibility::default(),
-        Tonemapping::AcesFitted,
-        ColorGrading::default(),
-        Hdr,
         CaptureCamera,
     ));
 
@@ -703,9 +852,30 @@ fn setup_capture_scene(
         height_scale: crate::TERRAIN_HEIGHT_SCALE,
         ..default()
     });
+    // Valid 1x1 black CUBE textures for the reflection probes: the PBR
+    // environment-map bind group expects Cube-dimension views, and the
+    // default (empty) handle resolves to a 2D texture — which panics wgpu
+    // validation ('expects dimension = Cube, but given a view with
+    // dimension = D2') the moment a lit 3D scene renders.
+    let mut cube = Image::new_fill(
+        bevy::render::render_resource::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 6,
+        },
+        bevy::render::render_resource::TextureDimension::D2,
+        &[0, 0, 0, 255],
+        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    cube.texture_view_descriptor = Some(bevy::render::render_resource::TextureViewDescriptor {
+        dimension: Some(bevy::render::render_resource::TextureViewDimension::Cube),
+        ..Default::default()
+    });
+    let cube_handle = images.add(cube);
     commands.insert_resource(ReflectionProbeAssets {
-        diffuse: Handle::default(),
-        specular: Handle::default(),
+        diffuse: cube_handle.clone(),
+        specular: cube_handle,
     });
 }
 
@@ -715,6 +885,79 @@ mod tests {
 
     fn frame(width: u32, height: u32, value: u8) -> Vec<u8> {
         vec![value; (width * height * 4) as usize]
+    }
+
+    fn seeded_world(seed: u64) -> scriptbots_core::WorldState {
+        let mut world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            rng_seed: Some(seed),
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })
+        .expect("world");
+        for i in 0..4u32 {
+            let mut agent = scriptbots_core::AgentData::default();
+            agent.position.x = 100.0 + i as f32 * 60.0;
+            agent.position.y = 100.0;
+            agent.spike_length = 10.0;
+            world.try_spawn_agent(agent).expect("spawn");
+        }
+        world.step().expect("step");
+        world
+    }
+
+    /// The C4 alarm contract: a deliberately corrupted render (blackout sun +
+    /// crushed exposure) MUST fail the golden comparison against the honest
+    /// capture — if it passes, the harness cannot see a broken pipeline.
+    #[test]
+    fn corrupted_capture_fails_comparison_against_honest_frame() {
+        if crate::probe_gpu_capability().is_none() {
+            eprintln!("no GPU adapter; skipping live corruption alarm test");
+            return;
+        }
+        let world = seeded_world(0xA14A2);
+        let honest_config = OffscreenCaptureConfig {
+            viewport: (160, 120),
+            render_settings: RenderSettings::default(),
+            corrupt: false,
+        };
+        let corrupt_config = OffscreenCaptureConfig {
+            corrupt: true,
+            ..honest_config.clone()
+        };
+        let honest = OffscreenCapture::run(&honest_config, |session| {
+            session.render(&world, "alarm-honest", 42, 1)
+        })
+        .expect("honest capture");
+        let corrupted = OffscreenCapture::run(&corrupt_config, |session| {
+            session.render(&world, "alarm-corrupt", 42, 1)
+        })
+        .expect("corrupted capture");
+        let stats = compare_frames(
+            &honest.rgba8,
+            &corrupted.rgba8,
+            honest.width,
+            honest.height,
+            &CompareThresholds::default(),
+        )
+        .expect("comparison runs");
+        assert!(
+            !stats.pass,
+            "the corrupted frame MUST fail the golden comparison (alarm fires): {stats:?}"
+        );
+        // And the honest pipeline is not monochrome: a dead pipeline would
+        // also 'pass' a black-golden comparison, so assert content variance.
+        let mut min = [255u8; 3];
+        let mut max = [0u8; 3];
+        for px in honest.rgba8.chunks_exact(4) {
+            for channel in 0..3 {
+                min[channel] = min[channel].min(px[channel]);
+                max[channel] = max[channel].max(px[channel]);
+            }
+        }
+        let spread: u32 = (0..3).map(|c| u32::from(max[c] - min[c])).sum();
+        assert!(
+            spread > 24,
+            "honest capture must contain visual variance (live pipeline), got {spread}"
+        );
     }
 
     #[test]

@@ -23,7 +23,8 @@ scriptbots*.db.wal
 *.sqlite3-journal
 crates/scriptbots-render/frames_render_test/*.png
 *.png
-!docs/rendering_reference/golden/
+!docs/rendering_reference/golden/*.png
+!crates/scriptbots-app/tests/scenes/goldens/**/*.png
 !docs/rendering_reference/golden/*.png
 /tmp/
 /logs/

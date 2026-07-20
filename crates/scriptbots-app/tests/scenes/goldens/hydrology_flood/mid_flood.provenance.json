@@ -1,0 +1,19 @@
+{
+  "schema": "scriptbots.capture-provenance.v1",
+  "scene": "hydrology_flood",
+  "seed": 5005,
+  "tick": 45,
+  "frontend": "bevy_offscreen",
+  "adapter_name": "Apple M4",
+  "backend": "Metal",
+  "device_type": "Integrated",
+  "quality_tier": "High",
+  "viewport": [
+    1280,
+    720
+  ],
+  "colorspace": "rgba8-srgb",
+  "rustc_version": "",
+  "target_triple": "aarch64-apple-darwin",
+  "corrupt": false
+}
