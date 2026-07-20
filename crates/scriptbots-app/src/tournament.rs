@@ -285,7 +285,7 @@ pub fn plan(spec: &TournamentSpec) -> Result<Vec<MatchPlan>, TournamentError> {
         }
     }
     let family_count = spec.families.len();
-    if spec.cohort_size % family_count != 0 {
+    if !spec.cohort_size.is_multiple_of(family_count) {
         return Err(TournamentError::UnequalCohorts {
             cohort_size: spec.cohort_size,
             families: family_count,
@@ -721,7 +721,7 @@ pub mod execution {
                 reason: format!("match world construction failed: {error}"),
             })?;
 
-        let mut family_keys = register_entered_families(&mut world, &plan.spawn_order)?;
+        let family_keys = register_entered_families(&mut world, &plan.spawn_order)?;
 
         // Spawn the cohort in spawn order on a deterministic grid, recording each
         // founder's arm by stable uid; every later agent inherits its arm through its

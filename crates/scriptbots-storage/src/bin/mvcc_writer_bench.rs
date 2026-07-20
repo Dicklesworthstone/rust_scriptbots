@@ -59,7 +59,7 @@ fn parse_args() -> Result<Config, String> {
     let mut agents = None;
     let mut out = None;
     let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
+    for arg in args {
         let Some((flag, value)) = arg.split_once('=') else {
             return Err(format!("expected --flag=value, got {arg:?}"));
         };
@@ -284,7 +284,7 @@ fn run_writer(config: &Config, writer_index: u32, barrier: Arc<Barrier>) -> Writ
     barrier.wait();
     let started = Instant::now();
     for batch in 0..config.batches_per_writer {
-        let tick = i64::from(batch) * 16 + i64::try_from(writer_index).unwrap_or(0) + 1;
+        let tick = i64::from(batch) * 16 + i64::from(writer_index) + 1;
         match apply_batch(&connection, &run_id, tick, config.agents_per_batch) {
             Ok(conflicts) => {
                 report.committed_batches += 1;
