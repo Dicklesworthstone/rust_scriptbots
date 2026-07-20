@@ -986,6 +986,9 @@ const HALF_TURN: f32 = std::f32::consts::PI;
 // cone on this baseline; the shared contribution function below proves its strict boundary.
 const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.1875;
 
+// bd-tqpj: while-on-float mirrors the legacy C++ wrap loop; a modulo rewrite would change
+// evaluation order for large angles and shift world digests.
+#[allow(clippy::while_float)]
 fn wrap_signed_angle(mut angle: f32) -> f32 {
     if angle.is_nan() {
         return 0.0;
@@ -999,6 +1002,9 @@ fn wrap_signed_angle(mut angle: f32) -> f32 {
     angle
 }
 
+// bd-tqpj: while-on-float mirrors the legacy C++ wrap loop; a modulo rewrite would change
+// evaluation order for large angles and shift world digests.
+#[allow(clippy::while_float)]
 fn wrap_unsigned_angle(mut angle: f32) -> f32 {
     if angle.is_nan() {
         return 0.0;
@@ -1147,6 +1153,9 @@ fn sense_distance_terms(
     (distance_factor > 0.0).then_some((distance, distance_factor))
 }
 
+// bd-tqpj: pinned FP evaluation order for the WGSL-lane parity contract; fma fusion
+// would alter sensor contribution bytes.
+#[allow(clippy::suboptimal_flops)]
 fn fixed_sense_contribution(
     observer: &SenseObserverGeometry,
     neighbor: SenseNeighborInputs,
@@ -1217,7 +1226,7 @@ pub struct SimulationCommand {
 
 impl SimulationCommand {
     /// Validate values supplied by renderer and control front-ends before queue admission.
-    pub fn validate(&self) -> Result<(), WorldStateError> {
+    pub const fn validate(&self) -> Result<(), WorldStateError> {
         if let Some(speed) = self.speed_multiplier
             && !speed.is_finite()
         {
@@ -1284,6 +1293,8 @@ pub fn apply_control_command(
     }
 }
 
+// bd-tqpj: pinned FP evaluation order; fma fusion would alter digests.
+#[allow(clippy::suboptimal_flops)]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -1364,6 +1375,9 @@ pub fn legacy_temperature_health_drain(
     discomfort_rate * discomfort
 }
 
+// bd-tqpj: u32→f32 world-width cast is the legacy grid contract; pinned (a wider
+// intermediate would drift the gradient).
+#[allow(clippy::cast_precision_loss)]
 fn sample_temperature(config: &ScriptBotsConfig, x: f32) -> f32 {
     if config.world_width == 0 {
         return 0.5;
@@ -1390,8 +1404,13 @@ struct RunningStats {
 }
 
 impl RunningStats {
-    // bd-tqpj: Welford recurrence; FP evaluation order pinned for determinism.
-    #[allow(clippy::imprecise_flops)]
+    // bd-tqpj: Welford recurrence; FP evaluation order and usize→f64 count cast pinned
+    // for determinism.
+    #[allow(
+        clippy::imprecise_flops,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops
+    )]
     fn update(&mut self, value: f64) {
         self.count += 1;
         let delta = value - self.mean;
@@ -1400,10 +1419,12 @@ impl RunningStats {
         self.m2 += delta * delta2;
     }
 
-    fn mean(&self) -> f64 {
+    const fn mean(&self) -> f64 {
         self.mean
     }
 
+    // bd-tqpj: usize→f64 count cast pinned for deterministic series encoding.
+    #[allow(clippy::cast_precision_loss)]
     fn variance(&self) -> f64 {
         if self.count > 1 {
             self.m2 / (self.count - 1) as f64
@@ -1417,6 +1438,8 @@ impl RunningStats {
     }
 }
 
+// bd-tqpj: usize→f64 count cast and FP evaluation order pinned for deterministic series.
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
 fn summarize_signal(values: &[f32]) -> (f64, f64, f64) {
     if values.is_empty() {
         return (0.0, 0.0, 0.0);
@@ -1439,7 +1462,7 @@ fn summarize_signal(values: &[f32]) -> (f64, f64, f64) {
         }
     }
     let mean = sum / len;
-    let peak = max as f64;
+    let peak = f64::from(max);
 
     if positive_sum <= f64::EPSILON {
         return (mean, peak, 0.0);
@@ -1447,7 +1470,7 @@ fn summarize_signal(values: &[f32]) -> (f64, f64, f64) {
 
     let mut entropy = 0.0f64;
     for &value in values {
-        let weight = value.abs() as f64 / positive_sum;
+        let weight = f64::from(value.abs()) / positive_sum;
         if weight > 0.0 {
             entropy -= weight * weight.ln();
         }
@@ -1467,6 +1490,8 @@ fn sanitize_metric_key(label: &str) -> String {
     result
 }
 
+// bd-tqpj: usize→f64 count cast and FP evaluation order pinned for deterministic series.
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
 fn summarize_food_grid(cells: &[f32]) -> Option<(f64, f64, f64, f32)> {
     if cells.is_empty() {
         return None;
@@ -1703,6 +1728,9 @@ pub struct AgentDebugInfo {
 }
 
 /// Per-tick combat markers used by UI, analytics, and audio layers.
+// bd-tqpj: flat per-tick combat flag bag mirrors the legacy event record; the bool count
+// is the parity layout, so the excessive-bools lint is waived.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CombatEventFlags {
     /// Set when the agent attacked with its spike this tick.
@@ -1829,7 +1857,7 @@ impl fmt::Debug for BrainBinding {
 impl BrainBinding {
     /// Construct an unbound brain attachment.
     #[must_use]
-    pub fn unbound() -> Self {
+    pub const fn unbound() -> Self {
         Self::Unbound
     }
 
@@ -1848,6 +1876,11 @@ impl BrainBinding {
     ///
     /// Protocol entries require caller-owned provenance and evaluator state, so live-world code
     /// constructs them through `WorldState`'s admitted-family path instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry spawned a runner for `key` yet no longer retains the entry's kind;
+    /// that combination violates the registry's spawn-retains-kind invariant.
     pub fn from_registry(
         registry: &BrainRegistry,
         rng: &mut dyn RandomStream,
@@ -1904,7 +1937,7 @@ impl BrainBinding {
 
     /// Return the semantic registry identity, even when no live executor is attached.
     #[must_use]
-    pub fn registry_key(&self) -> Option<u64> {
+    pub const fn registry_key(&self) -> Option<u64> {
         match self {
             Self::Unbound => None,
             Self::Protocol { registry_key, .. } => Some(*registry_key),
@@ -1977,13 +2010,16 @@ impl BrainBinding {
     /// read-model snapshots. Call [`Self::is_bound`] when the live execution attachment matters.
     #[must_use]
     pub fn describe(&self) -> Cow<'_, str> {
-        if let Some(key) = self.registry_key() {
-            Cow::Owned(format!("registry:{key}"))
-        } else if let Some(kind) = self.kind() {
-            Cow::Borrowed(kind)
-        } else {
-            Cow::Borrowed("unbound")
-        }
+        self.registry_key().map_or_else(
+            || {
+                if let Some(kind) = self.kind() {
+                    Cow::Borrowed(kind)
+                } else {
+                    Cow::Borrowed("unbound")
+                }
+            },
+            |key| Cow::Owned(format!("registry:{key}")),
+        )
     }
 
     /// Perform one explicit bounded read-only inspection if supported by the runner.
@@ -2421,7 +2457,7 @@ impl BrainRegistry {
     }
 }
 
-/// Runtime data associated with an agent beyond the dense SoA columns.
+/// Runtime data associated with an agent beyond the dense `SoA` columns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRuntime {
     /// Current energy reserve.
@@ -2773,7 +2809,7 @@ impl AgentRuntime {
         )
     }
 
-    /// Sample randomized sensory parameters matching the legacy ScriptBots defaults.
+    /// Sample randomized sensory parameters matching the legacy `ScriptBots` defaults.
     #[must_use]
     pub fn new_random(rng: &mut dyn RandomStream) -> Self {
         let mut runtime = Self::default();
@@ -2820,7 +2856,7 @@ impl AgentRuntime {
 
     fn log_change(&mut self, capacity: usize, label: &str, before: f32, after: f32) {
         if (after - before).abs() > 1e-4 {
-            self.push_gene_log(capacity, format!("{label}: {:.3}->{:.3}", before, after));
+            self.push_gene_log(capacity, format!("{label}: {before:.3}->{after:.3}"));
         }
     }
 }
@@ -2933,6 +2969,9 @@ impl DynamicWorldSnapshot {
     /// Panics if internal live-agent identity/runtime maps have diverged from the arena. Such a
     /// divergence is a core invariant violation, not a recoverable renderer condition.
     #[must_use]
+    // bd-tqpj: usize→f32 population divisor cast is the snapshot-summary contract;
+    // pinned for byte-stable encodings.
+    #[allow(clippy::cast_precision_loss)]
     pub fn from_world(world: &WorldState) -> Self {
         let arena = world.agents();
         let columns = arena.columns();
@@ -4120,6 +4159,9 @@ impl Region {
     /// injectivity radius a disc wraps onto itself and membership is ambiguous, and a
     /// rect larger than its world axis is meaningless — clamping either would silently
     /// run a different experiment than the one the caller asked for.
+    // bd-tqpj: u32→f32 world-extent casts mirror the legacy region-check math; pinned
+    // (a wider intermediate would drift the comparison boundary).
+    #[allow(clippy::cast_precision_loss)]
     fn validate_for_world(
         &self,
         world_width: u32,
@@ -4153,10 +4195,11 @@ impl Region {
     }
 }
 
-/// Maximum cohort size a single injection command may carry. The arena grows
-/// dynamically, so this is the documented command-level headroom that keeps one
-/// pathological command from inserting an unbounded population at one boundary — not a
-/// slot limit.
+/// Maximum cohort size a single injection command may carry.
+///
+/// The arena grows dynamically, so this is the documented command-level headroom that
+/// keeps one pathological command from inserting an unbounded population at one
+/// boundary — not a slot limit.
 pub const MAX_COHORT_INJECTION: u32 = 1_024;
 
 /// Where an injected cohort's brains come from.
@@ -4185,7 +4228,7 @@ pub enum Placement {
 }
 
 impl Placement {
-    fn region(&self) -> Region {
+    const fn region(&self) -> Region {
         match *self {
             Self::Seeded { region, .. } => region,
         }
@@ -4543,6 +4586,9 @@ struct DamageBucket {
     herbivore: f32,
 }
 
+// bd-tqpj: the shared `_energy` postfix marks the food-stage energy ledger family;
+// renaming fields would desync the ledger vocabulary, so the field-names lint is waived.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, Default)]
 struct FoodResourceActivity {
     shared_energy: f64,
@@ -4639,7 +4685,7 @@ impl ResourceAmounts {
             .max(self.health.abs())
     }
 
-    fn within(self, tolerance: f64) -> bool {
+    const fn within(self, tolerance: f64) -> bool {
         self.food.abs() <= tolerance
             && self.energy.abs() <= tolerance
             && self.health.abs() <= tolerance
@@ -4875,6 +4921,9 @@ impl ResourceLedgerState {
         self.record(kind, after.delta_from(before), ResourceAmounts::default());
     }
 
+    // bd-tqpj: tolerance mul-add form pinned for deterministic reconciliation boundaries;
+    // fma fusion would shift the pass/fail edge.
+    #[allow(clippy::suboptimal_flops)]
     fn finish_tick(&mut self, closing: ResourceAmounts) {
         let Some(working) = self.working.take() else {
             return;
@@ -5190,7 +5239,7 @@ impl WorldStepProfiler {
         self.latest.as_ref()
     }
 
-    fn select_schema(&mut self, schema: &'static str) {
+    const fn select_schema(&mut self, schema: &'static str) {
         self.next_schema = schema;
     }
 
@@ -5926,6 +5975,8 @@ impl WorldStepTrace {
         Ok(())
     }
 
+    // bd-tqpj: ~106-line sequential stage-contract check list; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn validate_complete_stage(
         &self,
         point: WorldStepTracePoint,
@@ -6452,7 +6503,7 @@ impl PresetKind {
     }
 
     /// Apply the preset's field overrides onto a live configuration.
-    pub fn apply_to_config(self, config: &mut ScriptBotsConfig) {
+    pub const fn apply_to_config(self, config: &mut ScriptBotsConfig) {
         match self {
             Self::Arctic => {
                 config.temperature_gradient_exponent = 1.6;
@@ -7969,7 +8020,7 @@ pub enum BrainProtocolError {
     },
 }
 
-fn ensure_payload_bound(
+const fn ensure_payload_bound(
     kind: BrainEnvelopeKind,
     found: usize,
     maximum: usize,
@@ -7985,7 +8036,7 @@ fn ensure_payload_bound(
     }
 }
 
-fn require_envelope_version(
+const fn require_envelope_version(
     kind: BrainEnvelopeKind,
     found: u16,
     expected: u16,
@@ -8015,7 +8066,7 @@ fn require_family(
     }
 }
 
-fn require_schema(
+const fn require_schema(
     kind: BrainEnvelopeKind,
     found: u32,
     expected: u32,
@@ -8031,7 +8082,7 @@ fn require_schema(
     }
 }
 
-fn require_codec(
+const fn require_codec(
     kind: BrainEnvelopeKind,
     found: u16,
     expected: u16,
@@ -8073,7 +8124,7 @@ pub trait BrainEvaluator: Send + Sync {
     /// Owning protocol family.
     fn family_id(&self) -> &BrainFamilyId;
 
-    /// Evaluate one fixed ScriptBots sensor vector.
+    /// Evaluate one fixed `ScriptBots` sensor vector.
     ///
     /// Returning `Err` must leave every future-affecting evaluator value unchanged. Core uses a
     /// deterministic zero-output containment action for that completed terminal tick and then
@@ -8452,7 +8503,7 @@ impl Tick {
     }
 }
 
-/// Axis-aligned 2D position (SoA column representation).
+/// Axis-aligned 2D position (`SoA` column representation).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct Position {
     /// World-space x coordinate.
@@ -8517,7 +8568,7 @@ impl Generation {
     }
 }
 
-/// Scalar fields for a single agent used when inserting or snapshotting from the SoA store.
+/// Scalar fields for a single agent used when inserting or snapshotting from the `SoA` store.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct AgentData {
     /// World-space position column value.
@@ -8873,7 +8924,7 @@ impl AgentColumns {
     }
 }
 
-/// Dense SoA storage with generational handles for agent access.
+/// Dense `SoA` storage with generational handles for agent access.
 #[derive(Debug)]
 pub struct AgentArena {
     slots: SlotMap<AgentId, usize>,
@@ -10394,7 +10445,7 @@ pub enum LocomotionModel {
     Differential,
 }
 
-/// Static configuration for a ScriptBots world.
+/// Static configuration for a `ScriptBots` world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScriptBotsConfig {
     /// Width of the world in world units.
