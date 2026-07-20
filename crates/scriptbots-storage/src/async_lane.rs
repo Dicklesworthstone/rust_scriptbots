@@ -39,12 +39,11 @@ impl AsyncReadLane {
     /// `StorageReader::open`, the lane refuses databases with zero or multiple runs so a
     /// control-plane consumer can never silently read the wrong run.
     pub fn open(path: &str) -> Result<Self, StorageError> {
-        let connection = AsyncConnection::open_sync(path).map_err(|source| {
-            StorageError::InvalidData {
+        let connection =
+            AsyncConnection::open_sync(path).map_err(|source| StorageError::InvalidData {
                 context: "async_read_lane.open",
                 reason: format!("failed to open async read lane at {path}: {source}"),
-            }
-        })?;
+            })?;
         let run_id = resolve_single_run_id(&connection, path)?;
         Ok(Self { connection, run_id })
     }
@@ -99,11 +98,7 @@ impl AsyncReadLane {
     }
 
     /// Top predators by average energy, mirroring `StorageReader::top_predators`.
-    pub fn top_predators(
-        &self,
-        limit: usize,
-        cx: &Cx,
-    ) -> Result<Vec<PredatorStats>, StorageError> {
+    pub fn top_predators(&self, limit: usize, cx: &Cx) -> Result<Vec<PredatorStats>, StorageError> {
         let runtime = Self::runtime()?;
         let bound = checked_lane_limit("top_predators.limit", limit)?;
         let run_id = self.run_id.clone();
@@ -183,8 +178,9 @@ impl AsyncReadLane {
                             epoch: u64::try_from(row.get_typed::<i64>(1)?)
                                 .map_err(|_| FrankenError::Internal("negative epoch".into()))?,
                             closed: row.get_typed(2)?,
-                            agent_count: usize::try_from(row.get_typed::<i64>(3)?)
-                                .map_err(|_| FrankenError::Internal("negative agent count".into()))?,
+                            agent_count: usize::try_from(row.get_typed::<i64>(3)?).map_err(
+                                |_| FrankenError::Internal("negative agent count".into()),
+                            )?,
                             births: usize::try_from(row.get_typed::<i64>(4)?)
                                 .map_err(|_| FrankenError::Internal("negative births".into()))?,
                             deaths: usize::try_from(row.get_typed::<i64>(5)?)
@@ -195,7 +191,7 @@ impl AsyncReadLane {
                         })
                     })
                     .transpose()?;
-                Ok(RunLedgerSummary {
+                Ok::<_, FrankenError>(RunLedgerSummary {
                     tick_count: u64::try_from(count_row.get_typed::<i64>(0)?)
                         .map_err(|_| FrankenError::Internal("negative tick count".into()))?,
                     latest_tick,
@@ -232,7 +228,7 @@ impl AsyncReadLane {
         let runtime = Self::runtime()?;
         runtime
             .block_on(async {
-                let cx = Cx::with_budget(Budget::MINIMAL);
+                let cx: Cx = Cx::with_budget(Budget::MINIMAL);
                 self.connection.close(&cx).await
             })
             .map_err(Into::into)
@@ -240,27 +236,26 @@ impl AsyncReadLane {
 }
 
 /// Resolve the single run recorded in a lane database, refusing zero- or multi-run files.
-fn resolve_single_run_id(
-    connection: &AsyncConnection,
-    path: &str,
-) -> Result<String, StorageError> {
+fn resolve_single_run_id(connection: &AsyncConnection, path: &str) -> Result<String, StorageError> {
     let runtime = AsyncReadLane::runtime()?;
     runtime
         .block_on(async {
-            let cx = Cx::with_budget(Budget::INFINITE);
-            connection.query(&cx, "SELECT run_id FROM runs ORDER BY run_id ASC").await
+            let cx: Cx = Cx::with_budget(Budget::INFINITE);
+            connection
+                .query(&cx, "SELECT run_id FROM runs ORDER BY run_id ASC")
+                .await
         })
         .map_err(|source| StorageError::InvalidData {
             context: "async_read_lane.resolve_run_id",
             reason: format!("failed to list runs in {path}: {source}"),
         })
         .and_then(|rows| match rows.as_slice() {
-            [row] => row.get_typed::<String>(0).map_err(|source| {
-                StorageError::InvalidData {
+            [row] => row
+                .get_typed::<String>(0)
+                .map_err(|source| StorageError::InvalidData {
                     context: "async_read_lane.resolve_run_id",
                     reason: format!("run id in {path} does not decode as text: {source}"),
-                }
-            }),
+                }),
             [] => Err(StorageError::InvalidData {
                 context: "async_read_lane.resolve_run_id",
                 reason: format!("{path} contains no registered runs"),
