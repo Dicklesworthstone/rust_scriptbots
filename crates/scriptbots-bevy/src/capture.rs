@@ -21,14 +21,17 @@ use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::prelude::*;
 use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::ecs::system::RunSystemOnce;
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
 use bevy::prelude::*;
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevy::render::renderer::RenderDevice;
+use bevy::render::RenderApp;
 use bevy::render::view::{ColorGrading, Hdr};
 use bevy::window::{ExitCondition, WindowPlugin};
 use scriptbots_core::{RenderQuality, RenderSettings, WorldState};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tracing::{info, warn};
 
 use crate::{
@@ -197,7 +200,10 @@ pub fn diff_heatmap(golden: &[u8], candidate: &[u8], width: u32, height: u32) ->
     let mut out = Vec::with_capacity(expected);
     for px in golden.chunks_exact(4).zip(candidate.chunks_exact(4)) {
         let (g, c) = (px.0, px.1);
-        let diff = g[0].abs_diff(c[0]).max(g[1].abs_diff(c[1])).max(g[2].abs_diff(c[2]));
+        let diff = g[0]
+            .abs_diff(c[0])
+            .max(g[1].abs_diff(c[1]))
+            .max(g[2].abs_diff(c[2]));
         out.push(diff);
         out.push(255 - diff);
         out.push(0);
@@ -286,109 +292,75 @@ struct CaptureCamera;
 #[derive(Resource, Clone, Copy)]
 struct CaptureCorrupt(bool);
 
-/// A headless, offscreen instance of the real Bevy render pipeline.
+/// Process-wide capture app. `bevy_render` keeps a process-global empty
+/// bind group layout, so constructing a second render App in one process
+/// panics; the harness therefore builds exactly one App (lazily) and
+/// reconfigures it per scene via [`OffscreenCapture::run`].
+static CAPTURE_APP: LazyLock<Mutex<Option<SendCaptureApp>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Send wrapper for the capture App. Bevy's `App` is `!Send` (it stores a
+/// non-Send runner trait object and can hold non-Send resources).
 ///
-/// The app runs with no window; every [`Self::render`] call syncs the scene
-/// from the world state through the exact `sync_world` system the
-/// interactive renderer uses, renders one frame into the offscreen target,
-/// and reads the pixels back. Construction compiles pipelines eagerly (one
-/// warmup update) so the first real capture is representative.
-pub struct OffscreenCapture {
-    app: App,
+/// SAFETY: the App is only ever accessed while holding `CAPTURE_APP`'s
+/// mutex, so all access is exclusive and serialized; the App is never
+/// cloned, never moved out of the static, and no reference to it escapes
+/// the critical section (the session borrows it from the guard by
+/// construction). Moving the App across threads at lock time therefore
+/// cannot create aliasing or data races.
+struct SendCaptureApp(App);
+
+#[allow(unsafe_code)]
+unsafe impl Send for SendCaptureApp {}
+
+/// A headless, offscreen capture session on the process-wide render app.
+///
+/// Every [`Self::render`] call syncs the scene from the world state through
+/// the exact `sync_world` system the interactive renderer uses, renders
+/// into the offscreen target, and reads the pixels back. Sessions are
+/// created by [`Self::run`], which fully resets the previous scene (all
+/// entities despawned, registries reset, fresh render target) so scenes
+/// cannot contaminate each other.
+pub struct OffscreenCapture<'a> {
+    app: &'a mut App,
     target: Handle<Image>,
     viewport: (u32, u32),
     effective: crate::EffectiveRenderSettings,
     corrupt: bool,
 }
 
-impl OffscreenCapture {
-    /// Build the headless render app and compile its pipelines.
+impl<'a> OffscreenCapture<'a> {
+    /// Run `f` with a freshly configured capture session.
+    ///
+    /// The first call in the process builds the render app; every call
+    /// reconfigures it for `config`: previous scene entities are wiped,
+    /// registries reset, a new offscreen target of the requested viewport
+    /// is created, and the scene rig is respawned.
     ///
     /// # Errors
-    /// Returns an error when plugin/render-device initialization fails
-    /// (no adapter, driver failure). A missing GPU must surface here, never
-    /// as a silently black frame.
-    pub fn new(config: &OffscreenCaptureConfig) -> Result<Self> {
+    /// Returns an error when the viewport is out of range, no GPU adapter is
+    /// available, or render-device initialization failed on first build. A
+    /// missing GPU must surface here, never as a silently black frame.
+    pub fn run<R>(
+        config: &OffscreenCaptureConfig,
+        f: impl FnOnce(&mut OffscreenCapture) -> Result<R>,
+    ) -> Result<R> {
         let (width, height) = config.viewport;
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return Err(anyhow!(
                 "capture viewport {width}x{height} outside 1..=8192"
             ));
         }
-        let effective = resolve_effective_render_settings(&config.render_settings);
-        if effective.gpu.is_none() {
-            return Err(anyhow!(
-                "no GPU adapter available for offscreen capture (software lane requires \
-                 llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)"
-            ));
+        let mut guard = CAPTURE_APP.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(SendCaptureApp(build_capture_app(config)?));
         }
-
-        let mut app = App::new();
-        app.insert_resource(AmbientLight {
-            color: Color::srgb(0.45, 0.52, 0.65),
-            brightness: if config.corrupt { 0.0 } else { 800.0 },
-            affects_lightmapped_meshes: true,
-        })
-        .insert_resource(SnapshotState::default())
-        .insert_resource(AgentRegistry::default())
-        .insert_resource(AccessibilityState::new())
-        .insert_resource(CaptureCorrupt(config.corrupt))
-        .insert_resource(effective.clone())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: None,
-            exit_condition: ExitCondition::DontExit,
-            close_when_requested: false,
-            ..Default::default()
-        }))
-        .add_systems(Startup, setup_capture_scene)
-        .add_systems(Update, sync_world);
-
-        // Offscreen render target: sRGB RGBA8, render attachment + copy-src
-        // for the readback path.
-        let size = Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-        let mut image = Image::new_fill(
-            size,
-            TextureDimension::D2,
-            &[0, 0, 0, 255],
-            TextureFormat::Rgba8UnormSrgb,
-            RenderAssetUsages::default(),
-        );
-        image.texture_descriptor.usage = TextureUsages::RENDER_ATTACHMENT
-            | TextureUsages::COPY_SRC
-            | TextureUsages::TEXTURE_BINDING;
-        let target = app
-            .world_mut()
-            .resource_mut::<Assets<Image>>()
-            .add(image);
-        app.insert_resource(CaptureTarget(target.clone()));
-
-        // finish/cleanup are required before manual update() pumping: the
-        // render device initializes in RenderPlugin::finish.
-        app.finish();
-        app.cleanup();
-        // Warmup: run startup + one frame so pipeline compilation is out of
-        // the capture path.
-        app.update();
-        info!(
-            viewport = ?config.viewport,
-            tier = ?effective.tier,
-            corrupt = config.corrupt,
-            "offscreen capture context ready"
-        );
-        Ok(Self {
-            app,
-            target,
-            viewport: (width, height),
-            effective,
-            corrupt: config.corrupt,
-        })
+        let SendCaptureApp(app) = guard.as_mut().expect("capture app present");
+        let mut session = configure_session(app, config)?;
+        f(&mut session)
     }
 
-    /// Probed GPU info (always `Some` after a successful [`Self::new`]).
+    /// Probed GPU info (always `Some` inside a session).
     #[must_use]
     pub fn gpu_info(&self) -> Option<&scriptbots_core::GpuInfo> {
         self.effective.gpu.as_ref()
@@ -437,18 +409,20 @@ impl OffscreenCapture {
                 .unwrap_or("unknown")
                 .to_string(),
             target_triple: option_env!("SCRIPTBOTS_TARGET_TRIPLE")
-                .unwrap_or(if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
-                    "aarch64-apple-darwin"
-                } else if cfg!(target_os = "macos") {
-                    "x86_64-apple-darwin"
-                } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-                    "aarch64-unknown-linux-gnu"
-                } else if cfg!(target_os = "linux") {
-                    "x86_64-unknown-linux-gnu"
-                } else {
-                    "windows-msvc"
-                })
-            .to_string(),
+                .unwrap_or(
+                    if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
+                        "aarch64-apple-darwin"
+                    } else if cfg!(target_os = "macos") {
+                        "x86_64-apple-darwin"
+                    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+                        "aarch64-unknown-linux-gnu"
+                    } else if cfg!(target_os = "linux") {
+                        "x86_64-unknown-linux-gnu"
+                    } else {
+                        "windows-msvc"
+                    },
+                )
+                .to_string(),
             corrupt: self.corrupt,
         }
     }
@@ -462,15 +436,21 @@ impl OffscreenCapture {
     /// # Errors
     /// Returns an error when the world snapshot cannot be built or the
     /// readback does not complete within the pump budget (a wedged GPU).
-    pub fn render(&mut self, world: &WorldState, scene: &str, seed: u64, tick: u64) -> Result<CapturedFrame> {
+    pub fn render(
+        &mut self,
+        world: &WorldState,
+        scene: &str,
+        seed: u64,
+        tick: u64,
+    ) -> Result<CapturedFrame> {
         let snapshot = WorldSnapshot::from_world(world)
             .ok_or_else(|| anyhow!("world snapshot unavailable at tick {tick}"))?;
-        self.app
-            .world_mut()
-            .resource_mut::<SnapshotState>()
-            .latest = Some(snapshot);
+        self.app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
         self.set_camera_active(true);
-        // Frame 1: sync_world applies the snapshot, render graph draws it.
+        // Frame 1: sync_world applies the snapshot; pipelines compile.
+        self.app.update();
+        // Frame 2: full draw of the settled scene (async pipeline
+        // compilation can never leak a half-drawn frame into evidence).
         self.app.update();
         // Readback: spawn, pump until the GPU copy lands, then detach.
         let slot: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
@@ -489,6 +469,14 @@ impl OffscreenCapture {
         let mut pumps = 0_u32;
         let data = loop {
             self.app.update();
+            // Headless has no surface, and only present() polls the wgpu
+            // device in windowed mode; without an explicit poll the
+            // readback's map_async callback can never fire.
+            if let Some(render_app) = self.app.get_sub_app_mut(RenderApp)
+                && let Some(device) = render_app.world_mut().get_resource::<RenderDevice>()
+            {
+                let _ = device.poll(wgpu::PollType::Wait);
+            }
             pumps += 1;
             if let Ok(mut guard) = slot.lock()
                 && let Some(data) = guard.take()
@@ -534,6 +522,113 @@ impl OffscreenCapture {
             camera.is_active = active;
         }
     }
+}
+
+/// Build the process-wide render app (once). No window, no winit (macOS
+/// demands EventLoop creation on the main thread; captures run on
+/// test/worker threads), fixed exposure (no AutoExposure) for determinism.
+fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
+    let mut app = App::new();
+    app.insert_resource(AmbientLight {
+        color: Color::srgb(0.45, 0.52, 0.65),
+        brightness: 800.0,
+        affects_lightmapped_meshes: true,
+    })
+    .insert_resource(SnapshotState::default())
+    .insert_resource(AgentRegistry::default())
+    .insert_resource(AccessibilityState::new())
+    .add_plugins(
+        DefaultPlugins
+            .build()
+            .disable::<bevy::winit::WinitPlugin>()
+            .set(WindowPlugin {
+                primary_window: None,
+                exit_condition: ExitCondition::DontExit,
+                close_when_requested: false,
+                ..Default::default()
+            }),
+    )
+    .add_systems(Update, sync_world);
+    // finish/cleanup are required before manual update() pumping: the
+    // render device initializes in RenderPlugin::finish.
+    app.finish();
+    app.cleanup();
+    info!(
+        viewport = ?config.viewport,
+        "process-wide offscreen capture app built"
+    );
+    Ok(app)
+}
+
+/// Reset the process app for a new scene: wipe every entity, reset the
+/// registries, re-resolve the effective tier, create a fresh render target,
+/// respawn the scene rig, and warm the pipelines.
+fn configure_session<'a>(
+    app: &'a mut App,
+    config: &OffscreenCaptureConfig,
+) -> Result<OffscreenCapture<'a>> {
+    let effective = resolve_effective_render_settings(&config.render_settings);
+    if effective.gpu.is_none() {
+        return Err(anyhow!(
+            "no GPU adapter available for offscreen capture (software lane requires \
+             llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)"
+        ));
+    }
+    // Wipe the previous scene completely: camera, light, terrain chunks,
+    // agents, readbacks-in-flight.
+    let entities: Vec<Entity> = app.world_mut().iter_entities().map(|e| e.id()).collect();
+    for entity in entities {
+        let _ = app.world_mut().despawn(entity);
+    }
+    *app.world_mut().resource_mut::<SnapshotState>() = SnapshotState::default();
+    *app.world_mut().resource_mut::<AgentRegistry>() = AgentRegistry::default();
+    app.world_mut().resource_mut::<AmbientLight>().brightness =
+        if config.corrupt { 0.0 } else { 800.0 };
+    app.insert_resource(CaptureCorrupt(config.corrupt));
+    app.insert_resource(effective.clone());
+
+    // Fresh offscreen render target: sRGB RGBA8, render attachment +
+    // copy-src for the readback path.
+    let size = Extent3d {
+        width: config.viewport.0,
+        height: config.viewport.1,
+        depth_or_array_layers: 1,
+    };
+    let mut image = Image::new_fill(
+        size,
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::RENDER_ATTACHMENT
+        | TextureUsages::COPY_SRC
+        | TextureUsages::TEXTURE_BINDING;
+    let target = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+    app.insert_resource(CaptureTarget(target.clone()));
+
+    // Respawn the scene rig immediately (the same system a Startup schedule
+    // would run, driven imperatively so every session gets a fresh rig).
+    app.world_mut()
+        .run_system_once(setup_capture_scene)
+        .map_err(|error| anyhow!("capture scene setup: {error}"))?;
+    // Warmup: two frames with an empty scene so base pipelines compile
+    // outside the evidence path.
+    app.update();
+    app.update();
+    info!(
+        viewport = ?config.viewport,
+        tier = ?effective.tier,
+        corrupt = config.corrupt,
+        "offscreen capture session configured"
+    );
+    Ok(OffscreenCapture {
+        app,
+        target,
+        viewport: config.viewport,
+        effective,
+        corrupt: config.corrupt,
+    })
 }
 
 /// Capture-scene setup: the world-relevant subset of the interactive
@@ -613,8 +708,14 @@ mod tests {
     #[test]
     fn compare_identical_frames_passes() {
         let golden = frame(64, 64, 128);
-        let stats = compare_frames(&golden, &golden.clone(), 64, 64, &CompareThresholds::default())
-            .expect("compare");
+        let stats = compare_frames(
+            &golden,
+            &golden.clone(),
+            64,
+            64,
+            &CompareThresholds::default(),
+        )
+        .expect("compare");
         assert!(stats.pass);
         assert_eq!(stats.differing_pixels, 0);
         assert_eq!(stats.max_channel_diff, 0);
@@ -713,7 +814,10 @@ mod tests {
             "target_triple",
             "corrupt",
         ] {
-            assert!(json.get(field).is_some(), "missing provenance field {field}");
+            assert!(
+                json.get(field).is_some(),
+                "missing provenance field {field}"
+            );
         }
         assert_eq!(json["schema"], PROVENANCE_SCHEMA);
     }
