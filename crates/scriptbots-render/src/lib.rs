@@ -12,6 +12,9 @@ use gpui::{
 use gpui_platform::application;
 use rand::Rng;
 use scriptbots_core::PresetKind;
+use scriptbots_core::attribution::{
+    AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs,
+};
 use scriptbots_core::narrative::{
     EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord,
 };
@@ -1801,6 +1804,11 @@ struct SimulationView {
     /// One-shot latches for the rail's logging contract.
     rail_logged_first_show: bool,
     rail_warned_aged_out: bool,
+    /// One-shot latches for the attribution panel's warn-once-per-(agent, reason)
+    /// logging contract (bd-16g.4.3).
+    attribution_warned: std::collections::HashSet<(u64, &'static str)>,
+    /// The last (agent, tick) the panel's probed-tick debug line was emitted for.
+    attribution_last_debug: Option<(u64, u64)>,
 }
 impl SimulationView {
     fn new(
@@ -1865,6 +1873,8 @@ impl SimulationView {
             rail_selection_aged_out: false,
             rail_logged_first_show: false,
             rail_warned_aged_out: false,
+            attribution_warned: std::collections::HashSet::new(),
+            attribution_last_debug: None,
         }
     }
 
@@ -2399,6 +2409,7 @@ impl SimulationView {
         if brain_request_issued && let Some((_, revision)) = brain_request {
             self.brain_request_revision = revision;
         }
+        self.maybe_log_brain_panel(&snapshot);
 
         if let Some((tick, count)) = analytics_trigger {
             self.maybe_refresh_analytics(tick, count);
@@ -3255,6 +3266,97 @@ impl SimulationView {
             .gap_3()
             .child(header)
             .children(rows)
+    }
+
+    /// The attribution panel's logging contract (bd-16g.4.3): a standalone debug
+    /// line per probed tick, warn-once-per-(agent, reason) on Unavailable, and a
+    /// warn whenever non-finite values had to be excluded.
+    fn maybe_log_brain_panel(&mut self, snapshot: &HudSnapshot) {
+        let Some(capture) = &self.brain_inspection_cache else {
+            return;
+        };
+        let uid = capture.agent_uid.get();
+        let Some(detail) = snapshot.inspector.focused.as_ref() else {
+            return;
+        };
+        if detail.outputs.len() < scriptbots_core::OUTPUT_SIZE {
+            return;
+        }
+        let outputs: &[f32; scriptbots_core::OUTPUT_SIZE] = detail.outputs
+            [..scriptbots_core::OUTPUT_SIZE]
+            .try_into()
+            .expect("length checked above");
+        let explanations = explain_outputs(
+            outputs,
+            detail.brain_bound,
+            detail.brain_activations.as_ref(),
+            BRAIN_PANEL_TOP_K,
+        );
+        if self.attribution_last_debug != Some((uid, snapshot.tick)) {
+            self.attribution_last_debug = Some((uid, snapshot.tick));
+            let named_outputs: Vec<String> = explanations
+                .iter()
+                .map(|explanation| {
+                    let effective = match &explanation.effective {
+                        EffectiveOutput::Continuous(value) => format!("{value:.3}"),
+                        EffectiveOutput::Thresholded { raw, active, .. } => {
+                            format!("{raw:.3}/{}", if *active { "ON" } else { "OFF" })
+                        }
+                        EffectiveOutput::Clamped { raw, applied } => {
+                            format!("{raw:.3}>{applied:.3}")
+                        }
+                    };
+                    format!("{}={effective}", explanation.output_name)
+                })
+                .collect();
+            let wheels: Vec<String> = explanations
+                .iter()
+                .take(2)
+                .map(|explanation| {
+                    let top: Vec<String> = explanation
+                        .inputs
+                        .iter()
+                        .take(3)
+                        .map(|input| format!("{} {:+.3}", input.sensor_name, input.contribution))
+                        .collect();
+                    format!(
+                        "{}={:.3}({})",
+                        explanation.output_name,
+                        explanation.raw_value,
+                        top.join(", ")
+                    )
+                })
+                .collect();
+            tracing::debug!(
+                target = "scriptbots::brain_panel",
+                agent_uid = uid,
+                tick = snapshot.tick,
+                outputs = %named_outputs.join(" "),
+                wheels = %wheels.join(" | "),
+                "brain panel probed tick"
+            );
+        }
+        for explanation in &explanations {
+            if let AttributionMethod::Unavailable(reason) = explanation.method
+                && self.attribution_warned.insert((uid, reason.reason()))
+            {
+                tracing::warn!(
+                    target = "scriptbots::brain_panel",
+                    agent_uid = uid,
+                    reason = reason.reason(),
+                    "brain attribution unavailable"
+                );
+            }
+            if explanation.non_finite_skipped > 0 {
+                tracing::warn!(
+                    target = "scriptbots::brain_panel",
+                    agent_uid = uid,
+                    output = explanation.output_name,
+                    non_finite_skipped = explanation.non_finite_skipped,
+                    "non-finite values excluded from brain attribution"
+                );
+            }
+        }
     }
 
     /// The narrative rail (bd-16g.2.4): a read-only projection of `RunNarrative`
@@ -6642,6 +6744,7 @@ impl SimulationView {
                     .child(provenance)
             })
             .child(render_activation_heatmaps(&detail.brain_activations))
+            .child(render_output_attributions(detail))
             .child(self.render_output_sparklines_for(detail.agent_id))
             .child(self.render_diet_gauges())
             .child(render_brain_card(detail))
@@ -8631,6 +8734,118 @@ fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
     }
     div().flex().flex_col().gap_1().children(rows)
 }
+/// Top-k attribution rows computed per output in the brain panel (bd-16g.4.3).
+const BRAIN_PANEL_TOP_K: usize = 3;
+
+/// The brain panel's named-output attribution list (bd-16g.4.3): the same
+/// `OutputExplanation` the TUI consumes — every output with its canonical
+/// wire-map name, raw value, actuator state, and top-k driving sensors, or the
+/// honest reason the snapshot cannot say. Unbound agents get the passthrough
+/// explanation; the panel never fabricates attribution over an identity copy.
+fn render_output_attributions(detail: &AgentInspectorDetails) -> Div {
+    let mut rows: Vec<Div> = Vec::new();
+    rows.push(
+        div()
+            .text_xs()
+            .text_color(rgb(0x94a3b8))
+            .child("Output attribution"),
+    );
+
+    let explanations: Vec<OutputExplanation> =
+        if detail.outputs.len() >= scriptbots_core::OUTPUT_SIZE {
+            let outputs: &[f32; scriptbots_core::OUTPUT_SIZE] = detail.outputs
+                [..scriptbots_core::OUTPUT_SIZE]
+                .try_into()
+                .expect("length checked above");
+            explain_outputs(
+                outputs,
+                detail.brain_bound,
+                detail.brain_activations.as_ref(),
+                BRAIN_PANEL_TOP_K,
+            )
+        } else {
+            rows.push(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xf59e0b))
+                    .child("output vector not captured yet"),
+            );
+            return div().flex().flex_col().gap_1().children(rows);
+        };
+
+    // A shared Unavailable reason gets one line instead of nine.
+    let shared_reason = explanations.first().and_then(|first| {
+        if let AttributionMethod::Unavailable(reason) = first.method
+            && explanations
+                .iter()
+                .all(|explanation| explanation.method == AttributionMethod::Unavailable(reason))
+        {
+            Some(reason.reason())
+        } else {
+            None
+        }
+    });
+    if let Some(reason) = shared_reason {
+        rows.push(
+            div()
+                .text_xs()
+                .text_color(rgb(0xf59e0b))
+                .child(format!("({reason})")),
+        );
+    }
+
+    for explanation in &explanations {
+        let effective = match &explanation.effective {
+            EffectiveOutput::Continuous(value) => format!("{value:.2}"),
+            EffectiveOutput::Thresholded { raw, active, .. } => {
+                format!("{raw:.2} {}", if *active { "ON" } else { "off" })
+            }
+            EffectiveOutput::Clamped { raw, applied } => {
+                if (raw - applied).abs() > f32::EPSILON {
+                    format!("{raw:.2}>{applied:.2}")
+                } else {
+                    format!("{raw:.2}")
+                }
+            }
+        };
+        let drivers = match &explanation.method {
+            AttributionMethod::Unavailable(reason) if shared_reason.is_none() => {
+                format!(" ({})", reason.reason())
+            }
+            AttributionMethod::Unavailable(_) => String::new(),
+            _ if explanation.inputs.is_empty() => " (no drivers above k)".to_owned(),
+            _ => explanation
+                .inputs
+                .iter()
+                .take(2)
+                .map(|input| format!(" {} {:+.2}", input.sensor_name, input.contribution))
+                .collect::<Vec<_>>()
+                .join(""),
+        };
+        rows.push(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(110.0))
+                        .text_xs()
+                        .text_color(rgb(0xe2e8f0))
+                        .child(explanation.output_name),
+                )
+                .child(
+                    div()
+                        .w(px(90.0))
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child(effective),
+                )
+                .child(div().text_xs().text_color(rgb(0x7dd3fc)).child(drivers)),
+        );
+    }
+    div().flex().flex_col().gap_1().children(rows)
+}
+
 fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
     let mut rows: Vec<Div> = Vec::new();
     if let Some(act) = activations {
@@ -10983,6 +11198,10 @@ struct AgentInspectorDetails {
     spike_length: f32,
     sensors: Vec<f32>,
     outputs: Vec<f32>,
+    /// Whether the agent's brain binding has a runner; an unbound agent's
+    /// outputs are an identity copy of sensors and must not be "explained"
+    /// (bd-16g.4.3).
+    brain_bound: bool,
     brain_activations: Option<BrainActivations>,
     brain_source_tick: Option<u64>,
     brain_request_revision: Option<u64>,
@@ -11036,6 +11255,7 @@ impl AgentInspectorDetails {
 
         let sensors = agent_runtime.sensors.to_vec();
         let outputs = agent_runtime.outputs.to_vec();
+        let brain_bound = agent_runtime.brain.is_bound();
         let (
             brain_activations,
             brain_source_tick,
@@ -11088,6 +11308,7 @@ impl AgentInspectorDetails {
             spike_length,
             sensors,
             outputs,
+            brain_bound,
             brain_activations,
             brain_source_tick,
             brain_request_revision,
@@ -14530,6 +14751,48 @@ mod command_characterization_tests {
             snapshot.narrative_dropped, world_dropped,
             "the GPU lab rail must report the world's exact dropped count"
         );
+    }
+
+    /// bd-16g.4.3: the GPU lab panel consumes the same core explanations as the
+    /// TUI — an unbound agent gets the identity-passthrough table, and the
+    /// detail carries the bound flag the panel branches on.
+    #[test]
+    fn inspector_detail_carries_bound_state_and_passthrough_explanations() {
+        let world = command_characterization_world();
+        let agent = {
+            let mut guard = world.lock().expect("world lock");
+            let agent = guard
+                .try_spawn_agent(AgentData {
+                    position: Position::new(50.0, 50.0),
+                    ..AgentData::default()
+                })
+                .expect("spawn unbound agent");
+            guard.step().expect("one tick");
+            agent
+        };
+        let guard = world.lock().expect("world lock");
+        let detail = AgentInspectorDetails::from_world(&guard, agent, None)
+            .expect("detail for the live agent");
+        assert!(!detail.brain_bound, "fixture agent must be unbound");
+        let outputs: &[f32; scriptbots_core::OUTPUT_SIZE] = detail.outputs
+            [..scriptbots_core::OUTPUT_SIZE]
+            .try_into()
+            .expect("full output vector");
+        let explanations = explain_outputs(outputs, detail.brain_bound, None, 3);
+        assert_eq!(explanations.len(), scriptbots_core::OUTPUT_SIZE);
+        for (index, explanation) in explanations.iter().enumerate() {
+            assert_eq!(
+                explanation.method,
+                scriptbots_core::attribution::AttributionMethod::Unavailable(
+                    scriptbots_core::attribution::AttributionUnavailable::IdentityPassthrough
+                ),
+                "unbound output {index} must be a passthrough, not an attribution"
+            );
+            assert!(explanation.inputs.is_empty());
+            assert_eq!(explanation.raw_value, detail.outputs[index]);
+        }
+        assert_eq!(explanations[6].output_name, "boost");
+        assert_eq!(explanations[3].output_name, "color_green");
     }
 
     #[test]

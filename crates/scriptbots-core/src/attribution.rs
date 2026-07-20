@@ -184,6 +184,58 @@ fn effective_for(channel: OutputChannel, raw: f32) -> EffectiveOutput {
     }
 }
 
+/// Explain every output of one agent: the single helper BOTH inspector panels
+/// call (bd-16g.4.3), so the TUI and the GPU lab can never drift into
+/// different stories about the same brain.
+///
+/// Unbound agents get [`AttributionUnavailable::IdentityPassthrough`] rows —
+/// their outputs are an identity copy of sensors `0..OUTPUT_SIZE` and any
+/// "attribution" would be fabricated. A bound agent without an activation
+/// snapshot yields one `Unavailable(NoActivations)` table; with a snapshot,
+/// each output goes through [`attribute_output`].
+///
+/// # Panics
+///
+/// Never in practice: the internal `expect` is guarded by the `OUTPUT_SIZE`
+/// bound on the loop range, and `attribute_output` validates the same bound.
+#[must_use]
+pub fn explain_outputs(
+    outputs: &[f32; crate::OUTPUT_SIZE],
+    brain_bound: bool,
+    activations: Option<&BrainActivations>,
+    k: usize,
+) -> Vec<OutputExplanation> {
+    if !brain_bound {
+        return outputs
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| OutputExplanation::identity_passthrough(index, *raw))
+            .collect();
+    }
+    activations.map_or_else(
+        || {
+            (0..crate::OUTPUT_SIZE)
+                .map(|output| OutputExplanation {
+                    output_index: output,
+                    output_name: OutputChannel::ALL[output].name(),
+                    raw_value: outputs[output],
+                    effective: effective_for(OutputChannel::ALL[output], outputs[output]),
+                    method: AttributionMethod::Unavailable(AttributionUnavailable::NoActivations),
+                    inputs: Vec::new(),
+                    non_finite_skipped: 0,
+                })
+                .collect()
+        },
+        |act| {
+            (0..crate::OUTPUT_SIZE)
+                .map(|output| {
+                    attribute_output(act, output, k).expect("output index bounded by OUTPUT_SIZE")
+                })
+                .collect()
+        },
+    )
+}
+
 /// Attribute one output of a captured brain to its driving sensors.
 ///
 /// Pure and deterministic: the result depends only on `act`, `output`, and
@@ -193,6 +245,11 @@ fn effective_for(channel: OutputChannel, raw: f32) -> EffectiveOutput {
 ///
 /// Returns [`AttributionError::OutputOutOfRange`] when `output` is not a valid
 /// actuator slot.
+///
+/// # Panics
+///
+/// Never in practice: the internal `expect` fires only if the layers vector is
+/// empty, a case this function handles before reaching it.
 pub fn attribute_output(
     act: &BrainActivations,
     output: usize,
@@ -273,7 +330,10 @@ pub fn attribute_output(
         let (path_inputs, path_skipped) = path_product(act, output, PATH_PRODUCT_DEPTH_CAP);
         non_finite_skipped += path_skipped;
         if path_inputs.is_empty() {
-            return Ok(unavailable(act, AttributionUnavailable::UnsupportedTopology));
+            return Ok(unavailable(
+                act,
+                AttributionUnavailable::UnsupportedTopology,
+            ));
         }
         method = AttributionMethod::PathProduct {
             depth: PATH_PRODUCT_DEPTH_CAP,
@@ -282,7 +342,10 @@ pub fn attribute_output(
     } else {
         // Edges exist but none touch this output at all: that is a topology the
         // method cannot speak about, not "nothing drives this output".
-        return Ok(unavailable(act, AttributionUnavailable::UnsupportedTopology));
+        return Ok(unavailable(
+            act,
+            AttributionUnavailable::UnsupportedTopology,
+        ));
     }
 
     // Explicit total order: |contribution| descending, input_index ascending.
@@ -447,7 +510,8 @@ mod tests {
         let mut values = vec![0.0_f32; INPUT_SIZE + 16];
         values[OutputChannel::Boost.index()] = 0.49;
         let act = fixture(vec![fixture_layer(&values)], vec![edge(4, 6, 1.0)]);
-        let explanation = attribute_output(&act, OutputChannel::Boost.index(), 1).expect("attribution");
+        let explanation =
+            attribute_output(&act, OutputChannel::Boost.index(), 1).expect("attribution");
         assert_eq!(explanation.output_name, "boost");
         assert_eq!(
             explanation.effective,
@@ -504,7 +568,10 @@ mod tests {
         let indices: Vec<usize> = explanation.inputs.iter().map(|i| i.input_index).collect();
         assert_eq!(indices, vec![9], "only the finite sensor survives");
         assert!(
-            explanation.inputs.iter().all(|i| i.contribution.is_finite()),
+            explanation
+                .inputs
+                .iter()
+                .all(|i| i.contribution.is_finite()),
             "no NaN may poison a displayed contribution"
         );
     }
@@ -566,7 +633,10 @@ mod tests {
 
     #[test]
     fn out_of_range_output_is_a_typed_error() {
-        let act = fixture(vec![fixture_layer(&[0.0; INPUT_SIZE + 16])], vec![edge(0, 0, 1.0)]);
+        let act = fixture(
+            vec![fixture_layer(&[0.0; INPUT_SIZE + 16])],
+            vec![edge(0, 0, 1.0)],
+        );
         assert_eq!(
             attribute_output(&act, crate::OUTPUT_SIZE, 3),
             Err(AttributionError::OutputOutOfRange {
@@ -577,6 +647,9 @@ mod tests {
     }
 
     #[test]
+    // Test-only value synthesis: index-derived f32 fixtures, not simulation
+    // math; the precision of the fixture values is irrelevant to the assertion.
+    #[allow(clippy::cast_precision_loss)]
     fn attribution_is_deterministic_for_all_outputs() {
         let mut values = vec![0.0_f32; INPUT_SIZE + 16];
         for (index, value) in values.iter_mut().enumerate() {
@@ -584,9 +657,8 @@ mod tests {
         }
         let connections: Vec<ActivationEdge> = (0..INPUT_SIZE)
             .flat_map(|from| {
-                (0..crate::OUTPUT_SIZE).map(move |to| {
-                    edge(from, to, ((from * 13 + to * 7) % 9) as f32 / 4.0 - 1.0)
-                })
+                (0..crate::OUTPUT_SIZE)
+                    .map(move |to| edge(from, to, ((from * 13 + to * 7) % 9) as f32 / 4.0 - 1.0))
             })
             .collect();
         let act = fixture(vec![fixture_layer(&values)], connections);
@@ -607,7 +679,7 @@ mod tests {
             AttributionMethod::Unavailable(AttributionUnavailable::IdentityPassthrough)
         );
         assert!(explanation.inputs.is_empty());
-        assert!(explanation.output_name.len() > 0);
+        assert!(!explanation.output_name.is_empty());
         assert!(
             AttributionUnavailable::IdentityPassthrough
                 .reason()
@@ -625,7 +697,7 @@ mod tests {
             world_width: 200,
             world_height: 200,
             food_cell_size: 20,
-            rng_seed: Some(0xA77E_57),
+            rng_seed: Some(0x00A7_7E57),
             ..crate::ScriptBotsConfig::default()
         })
         .expect("world");
@@ -643,15 +715,16 @@ mod tests {
         world.step().expect("one tick");
         let runtime = world.agent_runtime(agent).expect("runtime");
         for index in 0..crate::OUTPUT_SIZE {
+            // The identity copy is a BITWISE property, not an approximation.
             assert_eq!(
-                runtime.outputs[index], runtime.sensors[index],
+                runtime.outputs[index].to_bits(),
+                runtime.sensors[index].to_bits(),
                 "unbound output {index} must be an identity copy of sensor {index}"
             );
         }
         // The panel's response to this agent is the passthrough explanation, not
         // an attribution over the identity mapping.
-        let explanation =
-            OutputExplanation::identity_passthrough(0, runtime.outputs[0]);
+        let explanation = OutputExplanation::identity_passthrough(0, runtime.outputs[0]);
         assert!(explanation.inputs.is_empty());
         assert_eq!(
             explanation.method,

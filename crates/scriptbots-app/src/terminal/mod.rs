@@ -32,6 +32,7 @@ use scriptbots_core::{
     BrainInspectionRevision, ControlCommand, ControlDisposition, ControlSettings, NUM_EYES,
     SENSOR_LAYOUT, SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer,
     TickSummary, WorldState, apply_control_command,
+    attribution::{AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs},
     narrative::{EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord},
 };
 #[cfg(test)]
@@ -67,6 +68,8 @@ const LEADERBOARD_LIMIT: usize = 6;
 /// Narrative rail strip height: one glyph row plus a two-row detail pane inside
 /// the block borders (bd-16g.2.4).
 const RAIL_HEIGHT: u16 = 5;
+/// Top-k attribution rows computed per output in the brain panel (bd-16g.4.3).
+const BRAIN_PANEL_TOP_K: usize = 3;
 const BRAINBOARD_LIMIT: usize = 4;
 const TERMINAL_BRAIN_INSPECTION_CLIENT_ID: BrainInspectionClientId =
     BrainInspectionClientId::new(0x5455_4900_0000_0001);
@@ -387,6 +390,9 @@ struct TerminalApp<'a> {
     probe_enabled: bool,
     brain_inspection_revision: BrainInspectionRevision,
     brain_inspection_cache: Option<TerminalBrainInspectionCache>,
+    /// One-shot latches for the attribution panel's warn-once-per-(agent, reason)
+    /// logging contract (bd-16g.4.3).
+    attribution_warned: std::collections::HashSet<(u64, &'static str)>,
     /// Narrative rail visibility (bd-16g.2.4); toggled with `r`.
     rail_visible: bool,
     /// Selected event index into the retained narrative, plus the identity of the
@@ -449,6 +455,7 @@ impl<'a> TerminalApp<'a> {
             probe_enabled: false,
             brain_inspection_revision: BrainInspectionRevision::new(0),
             brain_inspection_cache: None,
+            attribution_warned: std::collections::HashSet::new(),
             rail_visible: true,
             rail_selection: None,
             rail_selection_aged_out: false,
@@ -920,6 +927,92 @@ impl<'a> TerminalApp<'a> {
         );
     }
 
+    /// The brain panel's output explanations for the focused agent (bd-16g.4.3).
+    /// Both surfaces consume the same core helper, so the panels cannot drift.
+    fn output_explanations(&self, snapshot: &Snapshot) -> Option<Vec<OutputExplanation>> {
+        let outputs = snapshot.focused_outputs?;
+        Some(explain_outputs(
+            &outputs,
+            snapshot.focused_brain_bound,
+            snapshot.focused_activations.as_ref(),
+            BRAIN_PANEL_TOP_K,
+        ))
+    }
+
+    /// The attribution panel's logging contract (bd-16g.4.3): a standalone debug
+    /// line per probed tick, warn-once-per-(agent, reason) on Unavailable, and a
+    /// warn whenever non-finite values had to be excluded.
+    fn maybe_log_brain_panel(&mut self) {
+        let Some(explanations) = self.output_explanations(&self.snapshot) else {
+            return;
+        };
+        let Some(uid) = self.snapshot.focused_agent_uid else {
+            return;
+        };
+        let wheels: Vec<String> = explanations
+            .iter()
+            .take(2)
+            .map(|explanation| {
+                let top: Vec<String> = explanation
+                    .inputs
+                    .iter()
+                    .take(3)
+                    .map(|input| format!("{} {:+.3}", input.sensor_name, input.contribution))
+                    .collect();
+                format!(
+                    "{}={:.3}({})",
+                    explanation.output_name,
+                    explanation.raw_value,
+                    top.join(", ")
+                )
+            })
+            .collect();
+        let named_outputs: Vec<String> = explanations
+            .iter()
+            .map(|explanation| {
+                let effective = match &explanation.effective {
+                    EffectiveOutput::Continuous(value) => format!("{value:.3}"),
+                    EffectiveOutput::Thresholded { raw, active, .. } => {
+                        format!("{raw:.3}/{}", if *active { "ON" } else { "OFF" })
+                    }
+                    EffectiveOutput::Clamped { raw, applied } => {
+                        format!("{raw:.3}>{applied:.3}")
+                    }
+                };
+                format!("{}={effective}", explanation.output_name)
+            })
+            .collect();
+        tracing::debug!(
+            target: "scriptbots::brain_panel",
+            agent_uid = uid,
+            tick = self.snapshot.tick,
+            outputs = %named_outputs.join(" "),
+            wheels = %wheels.join(" | "),
+            "brain panel probed tick"
+        );
+        for explanation in &explanations {
+            if let AttributionMethod::Unavailable(reason) = explanation.method
+                && self.attribution_warned.insert((uid, reason.reason()))
+            {
+                warn!(
+                    target: "scriptbots::brain_panel",
+                    agent_uid = uid,
+                    reason = reason.reason(),
+                    "brain attribution unavailable"
+                );
+            }
+            if explanation.non_finite_skipped > 0 {
+                warn!(
+                    target: "scriptbots::brain_panel",
+                    agent_uid = uid,
+                    output = explanation.output_name,
+                    non_finite_skipped = explanation.non_finite_skipped,
+                    "non-finite values excluded from brain attribution"
+                );
+            }
+        }
+    }
+
     /// Keep the rail selection pointing at a live event. The ring can drop the
     /// very event the user selected; that must clamp loudly, never index into a
     /// dropped slot (bd-16g.2.4).
@@ -1359,6 +1452,65 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_insights(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
         let mut lines: Vec<Line> = Vec::new();
+        // Named-output table with top-k attribution (bd-16g.4.3) — the point of
+        // this panel, so it leads the block ahead of the status lines: every output shows its canonical
+        // wire-map name, its raw value, what the actuator does with it, and the
+        // sensors driving it — or the honest reason the snapshot cannot say.
+        if let Some(explanations) = self.output_explanations(&self.snapshot) {
+            // A shared Unavailable reason gets its own line (a 7-row block cannot
+            // afford the full sentence on every output row).
+            let shared_reason = explanations.first().and_then(|first| {
+                if let AttributionMethod::Unavailable(reason) = first.method
+                    && explanations.iter().all(|explanation| {
+                        explanation.method == AttributionMethod::Unavailable(reason)
+                    })
+                {
+                    Some(reason.reason())
+                } else {
+                    None
+                }
+            });
+            if let Some(reason) = shared_reason {
+                lines.push(Line::from(vec![
+                    Span::styled("Outputs ", self.palette.header_style()),
+                    Span::raw(format!("({reason})")),
+                ]));
+            }
+            for explanation in &explanations {
+                let effective = match &explanation.effective {
+                    EffectiveOutput::Continuous(value) => format!("{value:>5.2}"),
+                    EffectiveOutput::Thresholded { raw, active, .. } => {
+                        format!("{raw:>5.2} {}", if *active { "ON " } else { "off" })
+                    }
+                    EffectiveOutput::Clamped { raw, applied } => {
+                        if (raw - applied).abs() > f32::EPSILON {
+                            format!("{raw:>5.2}>{applied:>4.2}")
+                        } else {
+                            format!("{raw:>5.2}   ")
+                        }
+                    }
+                };
+                let drivers = match &explanation.method {
+                    AttributionMethod::Unavailable(reason) if shared_reason.is_none() => {
+                        format!(" ({})", reason.reason())
+                    }
+                    AttributionMethod::Unavailable(_) => String::new(),
+                    _ if explanation.inputs.is_empty() => " (no drivers above k)".to_string(),
+                    _ => explanation
+                        .inputs
+                        .iter()
+                        .take(2)
+                        .map(|input| format!(" {} {:+.2}", input.sensor_name, input.contribution))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(format!(" {:<12}", explanation.output_name)),
+                    Span::raw(effective),
+                    Span::styled(drivers, self.palette.header_style()),
+                ]));
+            }
+        }
         if let Some(inspection) = self.snapshot.brain_inspection {
             let (source, bounds) = inspection.status_lines(self.snapshot.tick);
             lines.push(Line::from(vec![
@@ -2205,12 +2357,20 @@ impl<'a> TerminalApp<'a> {
                     }),
                 };
                 if let Some(agent_uid) = agent_id_opt.and_then(|id| world.agent_uid(id)) {
+                    snap.focused_agent_uid = Some(agent_uid.get());
+                    if let Some(id) = agent_id_opt
+                        && let Some(runtime) = world.agent_runtime(id)
+                    {
+                        snap.focused_brain_bound = runtime.brain.is_bound();
+                        snap.focused_outputs = Some(runtime.outputs);
+                    }
                     if let Some(cached) = cached_inspection.as_ref().filter(|cached| {
                         cached.metadata.agent_uid == agent_uid.get()
                             && cached.metadata.source_tick == world.tick().0
                     }) {
                         snap.brain_layers.clone_from(&cached.layers);
                         snap.brain_inspection = Some(cached.metadata);
+                        snap.focused_activations.clone_from(&cached.activations);
                         next_inspection_cache = Some(cached.clone());
                     } else {
                         request_issued = true;
@@ -2239,7 +2399,14 @@ impl<'a> TerminalApp<'a> {
                                         convert_layers(&telemetry.inspection.activations)
                                     },
                                 );
-                                TerminalBrainInspectionCache { metadata, layers }
+                                let activations = response
+                                    .ready_for(agent_uid)
+                                    .map(|telemetry| telemetry.inspection.activations.clone());
+                                TerminalBrainInspectionCache {
+                                    metadata,
+                                    layers,
+                                    activations,
+                                }
                             }
                             Err(error) => {
                                 warn!(
@@ -2258,11 +2425,13 @@ impl<'a> TerminalApp<'a> {
                                         ready: false,
                                     },
                                     layers: Vec::new(),
+                                    activations: None,
                                 }
                             }
                         };
                         snap.brain_layers.clone_from(&cache.layers);
                         snap.brain_inspection = Some(cache.metadata);
+                        snap.focused_activations.clone_from(&cache.activations);
                         next_inspection_cache = Some(cache);
                     }
                 }
@@ -2294,6 +2463,7 @@ impl<'a> TerminalApp<'a> {
         self.snapshot = new_snapshot;
         self.validate_rail_selection();
         self.maybe_log_rail_first_show();
+        self.maybe_log_brain_panel();
         self.evaluate_auto_pause();
     }
 
@@ -2651,6 +2821,15 @@ struct Snapshot {
     narrative_dropped: u64,
     /// The narrative ring's configured capacity.
     narrative_capacity: usize,
+    /// Focused agent's identity for the brain panel (bd-16g.4.3).
+    focused_agent_uid: Option<u64>,
+    /// Whether the focused agent's brain binding has a runner; an unbound agent's
+    /// outputs are an identity copy of sensors and must not be "explained".
+    focused_brain_bound: bool,
+    /// The focused agent's latest brain outputs.
+    focused_outputs: Option<[f32; scriptbots_core::OUTPUT_SIZE]>,
+    /// The focused agent's raw bounded activation snapshot (for attribution).
+    focused_activations: Option<BrainActivations>,
 }
 
 /// One agent's senses, explained (bd-16g.4.2).
@@ -2678,6 +2857,9 @@ struct BrainInspectionViewMetadata {
 struct TerminalBrainInspectionCache {
     metadata: BrainInspectionViewMetadata,
     layers: Vec<BrainLayerView>,
+    /// The raw bounded activation snapshot the layer views were converted from;
+    /// the attribution panel consumes the connections (bd-16g.4.3).
+    activations: Option<BrainActivations>,
 }
 
 impl BrainInspectionViewMetadata {
@@ -3160,6 +3342,10 @@ impl Snapshot {
             narrative: world.narrative_events().iter().cloned().collect(),
             narrative_dropped: world.narrative_dropped_events(),
             narrative_capacity: config.narrative_capacity,
+            focused_agent_uid: None,
+            focused_brain_bound: false,
+            focused_outputs: None,
+            focused_activations: None,
         }
     }
 
@@ -5318,6 +5504,170 @@ mod tests {
             app.snapshot.narrative_dropped, world_dropped,
             "the TUI rail must report the world's exact dropped count"
         );
+    }
+
+    /// Fixture brain for the attribution panel (bd-16g.4.3): reports one
+    /// activation layer and NO connections, so the panel must state the honest
+    /// `NoConnections` reason rather than an empty top-k.
+    struct PanelBrain;
+
+    impl scriptbots_core::BrainRunner for PanelBrain {
+        fn kind(&self) -> &'static str {
+            "terminal.panel"
+        }
+
+        fn tick(
+            &mut self,
+            _inputs: &[f32; scriptbots_core::INPUT_SIZE],
+        ) -> [f32; scriptbots_core::OUTPUT_SIZE] {
+            [0.0; scriptbots_core::OUTPUT_SIZE]
+        }
+
+        fn inspect(
+            &self,
+            request: scriptbots_core::BrainInspection,
+        ) -> Result<
+            Option<scriptbots_core::BrainInspectionSnapshot>,
+            scriptbots_core::BrainInspectionError,
+        > {
+            let scriptbots_core::BrainInspection::Activations(limits) = request;
+            let values = vec![0.25_f32; scriptbots_core::INPUT_SIZE + 16];
+            let activations = BrainActivations {
+                layers: vec![scriptbots_core::ActivationLayer {
+                    name: "state".to_owned(),
+                    width: values.len(),
+                    height: 1,
+                    values,
+                }],
+                connections: Vec::new(),
+                truncated: false,
+            };
+            scriptbots_core::bound_brain_inspection("terminal.panel", activations, 0, limits)
+                .map(Some)
+        }
+    }
+
+    /// bd-16g.4.3: the panel names every output from the centralized wire map,
+    /// shows the boost threshold state, and states the honest NoConnections
+    /// reason for a brain that reports layers but no edges.
+    #[test]
+    fn brain_panel_names_outputs_and_states_no_connections_honestly() {
+        let world = command_characterization_world();
+        {
+            let mut guard = world.lock().expect("panel world lock");
+            let family = guard
+                .brain_registry_mut()
+                .expect("panel registry mutation")
+                .register_with_state_digest("terminal.panel", 0x5041_4e45_4c5f_4252, |_rng| {
+                    Ok(Box::new(PanelBrain))
+                });
+            let agent = guard
+                .try_spawn_agent(AgentData {
+                    position: Position::new(50.0, 50.0),
+                    ..AgentData::default()
+                })
+                .expect("spawn panel agent");
+            guard
+                .bind_agent_brain(agent, family)
+                .expect("bind panel brain");
+        }
+        rail_test_app!(world, app, backend);
+        app.refresh_snapshot();
+        assert!(
+            app.snapshot.focused_brain_bound,
+            "fixture agent must be bound"
+        );
+        assert!(
+            app.snapshot.focused_activations.is_some(),
+            "panel snapshot must carry the raw activations"
+        );
+
+        let mut terminal = Terminal::new(backend).expect("panel test backend");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("panel frame renders");
+        let text = buffer_text(&terminal);
+        for needle in ["wheel_left", "wheel_right", "no weighted connections"] {
+            assert!(
+                text.contains(needle),
+                "brain panel must render {needle:?}; buffer:\n{text}"
+            );
+        }
+        // The historical mislabeling regression is pinned at the explanations
+        // level (boost is output 6, green is output 3) by
+        // `brain_panel_output_values_match_runtime_outputs_exactly`; the visible
+        // rows depend on the block's height.
+    }
+
+    /// bd-16g.4.3 NEGATIVE: an unbound agent's outputs are an identity copy of
+    /// sensors 0..8; the panel must say so instead of fabricating attribution.
+    #[test]
+    fn brain_panel_refuses_to_explain_an_identity_passthrough() {
+        let world = command_characterization_world();
+        {
+            let mut guard = world.lock().expect("passthrough world lock");
+            guard
+                .try_spawn_agent(AgentData {
+                    position: Position::new(50.0, 50.0),
+                    ..AgentData::default()
+                })
+                .expect("spawn unbound agent");
+        }
+        rail_test_app!(world, app, backend);
+        {
+            let mut guard = world.lock().expect("step lock");
+            guard.step().expect("one tick");
+        }
+        app.refresh_snapshot();
+        assert!(
+            !app.snapshot.focused_brain_bound,
+            "fixture agent must be unbound"
+        );
+
+        let mut terminal = Terminal::new(backend).expect("passthrough test backend");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("passthrough frame renders");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("identity copy"),
+            "panel must display the passthrough reason; buffer:\n{text}"
+        );
+        assert!(
+            text.contains("wheel_left"),
+            "passthrough outputs still show canonical names; buffer:\n{text}"
+        );
+    }
+
+    /// bd-16g.4.3 round-trip against reality: the displayed output values equal
+    /// runtime.outputs exactly.
+    #[test]
+    fn brain_panel_output_values_match_runtime_outputs_exactly() {
+        let world = command_characterization_world();
+        let outputs = {
+            let mut guard = world.lock().expect("outputs lock");
+            let agent = guard
+                .try_spawn_agent(AgentData {
+                    position: Position::new(50.0, 50.0),
+                    ..AgentData::default()
+                })
+                .expect("spawn agent");
+            guard.step().expect("one tick");
+            guard.agent_runtime(agent).expect("runtime").outputs
+        };
+        rail_test_app!(world, app, _backend);
+        app.refresh_snapshot();
+        let explanations = app
+            .output_explanations(&app.snapshot)
+            .expect("explanations for a spawned agent");
+        for (index, explanation) in explanations.iter().enumerate() {
+            assert_eq!(
+                explanation.raw_value, outputs[index],
+                "displayed value for output {index} must equal runtime.outputs[{index}]"
+            );
+        }
+        assert_eq!(explanations[6].output_name, "boost");
+        assert_eq!(explanations[3].output_name, "color_green");
     }
 
     #[test]
