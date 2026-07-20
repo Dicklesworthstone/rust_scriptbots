@@ -26370,6 +26370,9 @@ mod tests {
     }
 
     #[test]
+    // The runner-drop clones below intentionally discard BrainBinding runners via
+    // the manual Clone impl — semantic fixture mechanics, not redundant clones (bd-tqpj).
+    #[allow(clippy::redundant_clone)]
     fn missing_legacy_runner_completes_one_zero_output_tick_then_latches() {
         let mut world = WorldState::new(ScriptBotsConfig {
             population_minimum: 0,
@@ -26398,7 +26401,6 @@ mod tests {
             // Cloning a Legacy binding intentionally DROPS the runner (the manual
             // Clone impl is the missing-runner fixture mechanism) — this clone is
             // semantic, not redundant; do not remove it.
-            #[allow(clippy::redundant_clone)]
             runtime.brain = BrainBinding::Legacy {
                 runner: Some(Box::new(StubBrain)),
                 registry_key: Some(41),
@@ -26492,6 +26494,71 @@ mod tests {
         assert_eq!(crash.metric, "population");
         assert_eq!(crash.human_text, "population fell 70% (1000 -> 300)");
         assert!(crash.severity > 0.0 && crash.severity <= 1.0);
+    }
+
+    #[test]
+    fn narrative_ring_wrap_counts_dropped_events() {
+        // A bounded buffer that cannot say how much it discarded presents a tail
+        // as if it were the whole history (bd-16g.2.4). Eight well-separated
+        // crash/boom cycles (each cycle spans 128 ticks, past the 200-tick
+        // per-kind cooldown of the cycle PAIR) fire far more events than a
+        // capacity-3 ring can hold, so the counter must track every drop.
+        let mut values = vec![1000usize; 64];
+        for _ in 0..8 {
+            values.extend(std::iter::repeat_n(200usize, 64));
+            values.extend(std::iter::repeat_n(1000usize, 64));
+        }
+        let history = narrative_history(&values);
+
+        let mut narrative = narrative::RunNarrative::default();
+        assert_eq!(narrative.dropped_events(), 0);
+        narrative.observe(history.iter(), 3);
+
+        assert!(
+            narrative.events().len() <= 3,
+            "ring must respect its capacity"
+        );
+        let dropped = narrative.dropped_events();
+        assert!(dropped > 0, "a wrapped ring must count what it dropped");
+        // Invariant: the ring and the counter can never disagree silently — every
+        // accepted event is either still retained or counted dropped.
+        assert!(
+            dropped + narrative.events().len() as u64 >= 4,
+            "eight cycles must emit at least four events; dropped={dropped}"
+        );
+    }
+
+    #[test]
+    fn narrative_rail_model_is_complete_and_distinct() {
+        use narrative::EventKind;
+        let kinds = [
+            EventKind::PopulationCrash,
+            EventKind::PopulationBoom,
+            EventKind::Extinction,
+            EventKind::EnergyCollapse,
+            EventKind::EnergyRecovery,
+            EventKind::CombatSurge,
+            EventKind::RegimeChange,
+        ];
+        let glyphs: std::collections::HashSet<char> =
+            kinds.iter().map(|kind| kind.rail_glyph()).collect();
+        assert_eq!(
+            glyphs.len(),
+            kinds.len(),
+            "every event kind needs a distinct rail glyph"
+        );
+        let colors: std::collections::HashSet<[u8; 3]> =
+            kinds.iter().map(|kind| kind.rail_rgb()).collect();
+        assert_eq!(
+            colors.len(),
+            kinds.len(),
+            "every event kind needs a distinct rail colour"
+        );
+        // The table is the ONLY kind-to-presentation mapping: both rails read it.
+        for kind in kinds {
+            assert!(kind.rail_glyph() != ' ');
+            assert!(!kind.as_str().is_empty());
+        }
     }
 
     #[test]
@@ -31927,6 +31994,9 @@ mod tests {
 
     #[cfg(feature = "batch-brains")]
     #[test]
+    // The runner-drop clones below intentionally discard BrainBinding runners via
+    // the manual Clone impl — semantic fixture mechanics, not redundant clones (bd-tqpj).
+    #[allow(clippy::redundant_clone)]
     fn stage_brains_excludes_missing_execution_from_live_protocol_cohorts() {
         let mut world = WorldState::new(ScriptBotsConfig {
             population_minimum: 0,
@@ -31968,7 +32038,6 @@ mod tests {
         let missing_legacy = world.spawn_agent(sample_agent(4));
         // Cloning a Legacy binding intentionally DROPS the runner (the manual
         // Clone impl is the missing-runner fixture mechanism) — semantic, not redundant.
-        #[allow(clippy::redundant_clone)]
         world
             .agent_runtime_mut(missing_legacy)
             .expect("missing legacy runtime")
