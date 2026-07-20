@@ -9329,9 +9329,12 @@ pub struct RenderSettings {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RenderTonemapMode {
+    /// ACES tonemapping curve.
     #[default]
     Aces,
+    /// AgX tonemapping curve.
     Agx,
+    /// Tony McMapFace tonemapping curve.
     Tony,
 }
 
@@ -9840,10 +9843,15 @@ pub struct RenderDayNightSettings {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiThemeId {
+    /// Cyberpunk Aurora theme.
     CyberpunkAurora,
+    /// Darcula theme.
     Darcula,
+    /// Lumen Light theme.
     LumenLight,
+    /// Nordic Frost theme.
     NordicFrost,
+    /// High Contrast theme.
     HighContrast,
 }
 
@@ -9855,9 +9863,13 @@ pub enum AccessibilityPalette {
     /// Untransformed semantic colors.
     #[default]
     Natural,
+    /// Deuteranopia color-vision-deficiency palette.
     Deuteranopia,
+    /// Protanopia color-vision-deficiency palette.
     Protanopia,
+    /// Tritanopia color-vision-deficiency palette.
     Tritanopia,
+    /// High-contrast palette.
     HighContrast,
 }
 
@@ -10717,9 +10729,12 @@ where
 /// Supported activation functions for NeuroFlow networks.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum NeuroflowActivationKind {
+    /// Hyperbolic tangent activation.
     #[default]
     Tanh,
+    /// Logistic sigmoid activation.
     Sigmoid,
+    /// Rectified linear unit activation.
     Relu,
 }
 impl ScriptBotsConfig {
@@ -11683,11 +11698,17 @@ const fn default_tile_palette_index(kind: TerrainKind) -> u16 {
 /// Terrain classification for each tile.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TerrainKind {
+    /// Deep water terrain.
     DeepWater,
+    /// Shallow water terrain.
     ShallowWater,
+    /// Sand terrain.
     Sand,
+    /// Grass terrain.
     Grass,
+    /// Nutrient bloom terrain.
     Bloom,
+    /// Rock terrain.
     Rock,
 }
 
