@@ -32,7 +32,7 @@ use bevy::render::view::{ColorGrading, Hdr};
 use bevy::window::{ExitCondition, WindowPlugin};
 use scriptbots_core::{RenderQuality, RenderSettings, WorldState};
 use std::sync::{Arc, LazyLock, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     AccessibilityState, AgentMeshes, AgentRegistry, ReflectionProbeAssets, SnapshotState,
@@ -472,11 +472,18 @@ impl<'a> OffscreenCapture<'a> {
             // Headless has no surface, and only present() polls the wgpu
             // device in windowed mode; without an explicit poll the
             // readback's map_async callback can never fire.
-            if let Some(render_app) = self.app.get_sub_app_mut(RenderApp)
-                && let Some(device) = render_app.world_mut().get_resource::<RenderDevice>()
-            {
-                let _ = device.poll(wgpu::PollType::Wait);
-            }
+            let polled = if let Some(render_app) = self.app.get_sub_app_mut(RenderApp) {
+                if let Some(device) = render_app.world_mut().get_resource::<RenderDevice>() {
+                    device.poll(wgpu::PollType::Wait).is_ok()
+                } else {
+                    debug!(pumps, "render device not yet available in render app");
+                    false
+                }
+            } else {
+                debug!(pumps, "render sub-app not found during readback pump");
+                false
+            };
+            debug!(pumps, polled, "readback pump");
             pumps += 1;
             if let Ok(mut guard) = slot.lock()
                 && let Some(data) = guard.take()
