@@ -16,14 +16,15 @@
 //! adapter are byte-identical (asserted in tests). Cross-adapter byte
 //! identity is NOT claimed — that is what the provenance labels are for.
 //!
-//! Documented divergence from the interactive pipeline: captures currently
-//! render LDR (no Hdr/tonemapping post chain). On Metal headless, an
-//! Hdr camera targeting an image writes only its internal HDR texture and
-//! the out attachment stays at its initial fill (probe data: extraction,
-//! attachments, and physical target all correct, yet zero ViewTarget
-//! draws reach the target). The scene graph, meshes, materials, lighting,
-//! and shadows are the REAL pipeline; only the HDR post chain is absent.
-//! Tracked as a follow-up investigation (see the bead comments).
+//! Documented pipeline contract: captures render through the real HDR +
+//! tonemapping chain (AcesFitted, fixed exposure — no AutoExposure).
+//! The bd-x6v6 investigation proved the capture camera must be spawned
+//! BEFORE `App::finish()` (Startup), because camera-dependent plugin
+//! initialization for the HDR path only runs for cameras present at finish
+//! time; a camera spawned later renders into its internal HDR texture but
+//! the out attachment stays initial-fill black. `setup_capture_rig` is
+//! therefore a Startup system and the camera/sun are app-lifetime entities
+//! (configure_session never respawns them).
 
 use anyhow::{Context, Result, anyhow};
 use bevy::asset::RenderAssetUsages;
@@ -681,6 +682,13 @@ impl<'a> OffscreenCapture<'a> {
 /// Build the process-wide render app (once). No window, no winit (macOS
 /// demands EventLoop creation on the main thread; captures run on
 /// test/worker threads), fixed exposure (no AutoExposure) for determinism.
+///
+/// The capture camera is spawned in Startup — BEFORE finish/cleanup —
+/// because camera-dependent plugin initialization (the HDR/tonemapping
+/// path) only runs for cameras that exist at finish time; a camera spawned
+/// later renders into its internal HDR texture but the out attachment
+/// stays initial-fill black (the bd-x6v6 root cause, isolated by the
+/// minimal `hdr_image_target_probe` repro test).
 fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     let mut app = App::new();
     app.insert_resource(AmbientLight {
@@ -703,7 +711,16 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
                 ..Default::default()
             }),
     )
-    .add_systems(Update, sync_world);
+    .add_systems(Update, sync_world)
+    .add_systems(
+        Startup,
+        (setup_capture_rig, setup_capture_resources).chain(),
+    );
+    // First session's render target: sRGB RGBA8, render attachment +
+    // copy-src for the readback path. Later sessions create fresh targets
+    // in configure_session and repoint this same camera.
+    let target = add_target_image(&mut app, config.viewport);
+    app.insert_resource(CaptureTarget(target));
     // finish/cleanup are required before manual update() pumping: the
     // render device initializes in RenderPlugin::finish. Pipelined rendering
     // is disabled above for exactly this reason: with the render app on its
@@ -712,6 +729,10 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     // wedges at "readback did not complete in budget" on Metal.
     app.finish();
     app.cleanup();
+    // Warmup: startup + two frames so base pipelines compile outside the
+    // evidence path.
+    app.update();
+    app.update();
     info!(
         viewport = ?config.viewport,
         "process-wide offscreen capture app built"
@@ -719,9 +740,31 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     Ok(app)
 }
 
-/// Reset the process app for a new scene: wipe every entity, reset the
-/// registries, re-resolve the effective tier, create a fresh render target,
-/// respawn the scene rig, and warm the pipelines.
+/// Create the offscreen render target image (sRGB RGBA8, render attachment
+/// + copy-src) and add it to the image assets.
+fn add_target_image(app: &mut App, viewport: (u32, u32)) -> Handle<Image> {
+    let size = Extent3d {
+        width: viewport.0,
+        height: viewport.1,
+        depth_or_array_layers: 1,
+    };
+    let mut image = Image::new_fill(
+        size,
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage =
+        TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING;
+    app.world_mut().resource_mut::<Assets<Image>>().add(image)
+}
+
+/// Reset the process app for a new scene: wipe scene CONTENT (meshes,
+/// readbacks, probes — never the capture camera or sun, which were spawned
+/// pre-finish and keep their plugin initialization), reset the registries,
+/// re-resolve the effective tier, create a fresh render target, repoint
+/// the camera, and retune the lighting for tier/corrupt mode.
 fn configure_session<'a>(
     app: &'a mut App,
     config: &OffscreenCaptureConfig,
@@ -733,21 +776,20 @@ fn configure_session<'a>(
              llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)"
         ));
     }
-    // Wipe the previous SCENE completely (camera, lights, meshes, agents,
-    // readbacks-in-flight) — but never infrastructure entities. A blanket
-    // wipe of every entity kills plugin-owned startup entities the render
-    // path depends on (the wiped app then produces no ViewTargets and every
-    // capture reads back as the initial fill).
+    // Wipe scene content only. A blanket wipe of every entity kills
+    // plugin-owned startup entities the render path depends on (the wiped
+    // app then produces no ViewTargets and every capture reads back as the
+    // initial fill); the camera and sun are app-lifetime entities.
     let scene_entities: Vec<Entity> = {
         let world = app.world_mut();
         let mut found = Vec::new();
-        let mut cameras = world.query_filtered::<Entity, With<Camera>>();
-        found.extend(cameras.iter(world));
-        let mut lights =
-            world.query_filtered::<Entity, Or<(With<DirectionalLight>, With<PointLight>)>>();
-        found.extend(lights.iter(world));
         let mut meshes = world.query_filtered::<Entity, With<Mesh3d>>();
         found.extend(meshes.iter(world));
+        let mut probes = world.query_filtered::<Entity, Or<(
+            With<bevy::light::LightProbe>,
+            With<bevy::light::EnvironmentMapLight>,
+        )>>();
+        found.extend(probes.iter(world));
         let mut readbacks =
             world.query_filtered::<Entity, With<bevy::render::gpu_readback::Readback>>();
         found.extend(readbacks.iter(world));
@@ -763,31 +805,32 @@ fn configure_session<'a>(
     app.insert_resource(CaptureCorrupt(config.corrupt));
     app.insert_resource(effective.clone());
 
-    // Fresh offscreen render target: sRGB RGBA8, render attachment +
-    // copy-src for the readback path.
-    let size = Extent3d {
-        width: config.viewport.0,
-        height: config.viewport.1,
-        depth_or_array_layers: 1,
-    };
-    let mut image = Image::new_fill(
-        size,
-        TextureDimension::D2,
-        &[0, 0, 0, 255],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    );
-    image.texture_descriptor.usage =
-        TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING;
-    let target = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+    // Fresh render target; repoint the app-lifetime capture camera and
+    // retune the sun for tier/corrupt without respawning either.
+    let target = add_target_image(app, config.viewport);
     app.insert_resource(CaptureTarget(target.clone()));
-
-    // Respawn the scene rig immediately (the same system a Startup schedule
-    // would run, driven imperatively so every session gets a fresh rig).
+    {
+        let world = app.world_mut();
+        let mut cameras = world.query_filtered::<&mut Camera, With<CaptureCamera>>();
+        for mut camera in cameras.iter_mut(world) {
+            camera.target = RenderTarget::Image(target.clone().into());
+            camera.clear_color = ClearColorConfig::Custom(if config.corrupt {
+                Color::srgb(0.9, 0.0, 0.9)
+            } else {
+                Color::srgb(0.03, 0.05, 0.09)
+            });
+        }
+        let mut lights = world.query::<&mut DirectionalLight>();
+        for mut light in lights.iter_mut(world) {
+            light.illuminance = if config.corrupt { 0.0 } else { 9000.0 };
+            light.shadows_enabled = effective.features.shadows;
+        }
+    }
+    // Refresh the mesh/registry/probe resources for the new scene.
     app.world_mut()
-        .run_system_once(setup_capture_scene)
-        .map_err(|error| anyhow!("capture scene setup: {error}"))?;
-    // Warmup: two frames with an empty scene so base pipelines compile
+        .run_system_once(setup_capture_resources)
+        .map_err(|error| anyhow!("capture resource setup: {error}"))?;
+    // Warmup: two frames with an empty scene so fresh-target state settles
     // outside the evidence path.
     app.update();
     app.update();
@@ -806,33 +849,14 @@ fn configure_session<'a>(
     })
 }
 
-/// Capture-scene setup: the world-relevant subset of the interactive
-/// `setup_scene` (same meshes, chunk registry, lighting rig) with the camera
-/// bound to the offscreen target and no HUD. Deliberate divergence: fixed
-/// exposure (no AutoExposure) so captures are deterministic.
-fn setup_capture_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut images: ResMut<Assets<Image>>,
-    target: Res<CaptureTarget>,
-    corrupt: Res<CaptureCorrupt>,
-    effective: Res<crate::EffectiveRenderSettings>,
-) {
+/// The app-lifetime rig: HDR capture camera + sun. Spawned once in Startup
+/// (see [`build_capture_app`] for the pre-finish requirement). The camera
+/// starts inactive; sessions toggle it around readbacks.
+fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
     commands.spawn((
         Camera3d::default(),
         Camera {
-            // LDR divergence (documented in the module docs): with Hdr +
-            // tonemapping the headless image-target path produced empty
-            // frames on Metal (out texture never written), so captures run
-            // the real scene/mesh/light pipeline without the HDR post chain.
-            // Alarm-test corruption paints a magenta clear color (a
-            // pipeline-level change any honest comparator must catch) in
-            // addition to the lights-off blackout.
-            clear_color: ClearColorConfig::Custom(if corrupt.0 {
-                Color::srgb(0.9, 0.0, 0.9)
-            } else {
-                Color::srgb(0.03, 0.05, 0.09)
-            }),
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
             target: RenderTarget::Image(target.0.clone().into()),
             is_active: false,
             ..default()
@@ -841,6 +865,9 @@ fn setup_capture_scene(
         GlobalTransform::default(),
         Visibility::default(),
         InheritedVisibility::default(),
+        bevy::core_pipeline::tonemapping::Tonemapping::AcesFitted,
+        bevy::render::view::ColorGrading::default(),
+        bevy::render::view::Hdr,
         CaptureCamera,
     ));
 
@@ -848,8 +875,8 @@ fn setup_capture_scene(
         Transform::from_xyz(-1200.0, 1800.0, 900.0).looking_at(Vec3::ZERO, Vec3::Y);
     commands.spawn((
         DirectionalLight {
-            illuminance: if corrupt.0 { 0.0 } else { 9000.0 },
-            shadows_enabled: effective.features.shadows,
+            illuminance: 9000.0,
+            shadows_enabled: true,
             ..default()
         },
         light_transform,
@@ -857,7 +884,16 @@ fn setup_capture_scene(
         Visibility::default(),
         InheritedVisibility::default(),
     ));
+}
 
+/// Per-session resources: creature/agent meshes, terrain chunk registry,
+/// and valid (non-empty) reflection probe textures — empty `Handle`s panic
+/// wgpu's cube/D2 texture validation on some backends.
+fn setup_capture_resources(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+) {
     commands.insert_resource(AgentMeshes {
         base_radius: 1.0,
         body: meshes.add(Mesh::from(Capsule3d::new(0.5, 1.6))),
@@ -875,30 +911,30 @@ fn setup_capture_scene(
         height_scale: crate::TERRAIN_HEIGHT_SCALE,
         ..default()
     });
-    // Valid 1x1 black CUBE textures for the reflection probes: the PBR
+    // Valid 1x1 CUBE textures for the reflection probes: the PBR
     // environment-map bind group expects Cube-dimension views, and the
     // default (empty) handle resolves to a 2D texture — which panics wgpu
-    // validation ('expects dimension = Cube, but given a view with
-    // dimension = D2') the moment a lit 3D scene renders.
-    let mut cube = Image::new_fill(
-        bevy::render::render_resource::Extent3d {
+    // validation the moment a lit 3D scene renders.
+    let mut cube_image = Image::new_fill(
+        Extent3d {
             width: 1,
             height: 1,
             depth_or_array_layers: 6,
         },
-        bevy::render::render_resource::TextureDimension::D2,
-        &[0, 0, 0, 255],
-        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+        TextureDimension::D2,
+        &[32, 32, 40, 255],
+        TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
     );
-    cube.texture_view_descriptor = Some(bevy::render::render_resource::TextureViewDescriptor {
-        dimension: Some(bevy::render::render_resource::TextureViewDimension::Cube),
-        ..Default::default()
-    });
-    let cube_handle = images.add(cube);
+    cube_image.texture_view_descriptor =
+        Some(bevy::render::render_resource::TextureViewDescriptor {
+            dimension: Some(bevy::render::render_resource::TextureViewDimension::Cube),
+            ..Default::default()
+        });
+    let cube = images.add(cube_image);
     commands.insert_resource(ReflectionProbeAssets {
-        diffuse: cube_handle.clone(),
-        specular: cube_handle,
+        diffuse: cube.clone(),
+        specular: cube,
     });
 }
 
@@ -1025,6 +1061,157 @@ mod tests {
         let short = frame(32, 32, 0);
         assert!(compare_frames(&golden, &short, 64, 64, &CompareThresholds::default()).is_err());
         assert!(compare_frames(&golden, &golden, 32, 32, &CompareThresholds::default()).is_err());
+    }
+
+    /// bd-x6v6 minimal bevy-only repro: an Hdr + tonemapping camera
+    /// targeting an image, one lit cube, no scriptbots systems. The answer
+    /// tells us whether the black-frame bug is upstream (bevy/wgpu/Metal)
+    /// or in the capture app's composition. Skip loudly without a GPU.
+    #[test]
+    fn hdr_image_target_probe() {
+        use bevy::core_pipeline::tonemapping::Tonemapping;
+        use bevy::render::render_asset::RenderAssets;
+        use bevy::render::renderer::RenderQueue;
+        use bevy::render::texture::GpuImage;
+        use bevy::render::view::Hdr;
+
+        if crate::probe_gpu_capability().is_none() {
+            eprintln!("SKIP: hdr_image_target_probe needs a GPU adapter");
+            return;
+        }
+        let mut app = App::new();
+        app.insert_resource(AmbientLight {
+            color: Color::WHITE,
+            brightness: 300.0,
+            affects_lightmapped_meshes: true,
+        })
+        .add_plugins(
+            DefaultPlugins
+                .build()
+                .disable::<bevy::winit::WinitPlugin>()
+                .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    close_when_requested: false,
+                    ..Default::default()
+                }),
+        );
+        let size = Extent3d {
+            width: 128,
+            height: 128,
+            depth_or_array_layers: 1,
+        };
+        let mut image = Image::new_fill(
+            size,
+            TextureDimension::D2,
+            &[0, 0, 0, 255],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::RENDER_ATTACHMENT
+            | TextureUsages::COPY_SRC
+            | TextureUsages::TEXTURE_BINDING;
+        let target = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Camera {
+                clear_color: ClearColorConfig::Custom(Color::srgb(0.2, 0.0, 0.4)),
+                target: RenderTarget::Image(target.clone().into()),
+                ..Default::default()
+            },
+            Transform::from_xyz(0.0, 0.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+            Tonemapping::AcesFitted,
+            Hdr,
+        ));
+        let mut meshes = app.world_mut().resource_mut::<Assets<Mesh>>();
+        let cube = meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 1.0)));
+        let mut materials = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.9, 0.4, 0.1),
+            ..Default::default()
+        });
+        app.world_mut()
+            .spawn((Mesh3d(cube), MeshMaterial3d(material), Transform::default()));
+        app.world_mut().spawn((
+            PointLight {
+                intensity: 800_000.0,
+                ..Default::default()
+            },
+            Transform::from_xyz(3.0, 4.0, 5.0),
+        ));
+        app.finish();
+        app.cleanup();
+        for _ in 0..6 {
+            app.update();
+        }
+        // Manual readback of the target.
+        let data = {
+            let render_app = app.get_sub_app_mut(RenderApp).expect("render app");
+            let world = render_app.world_mut();
+            let device = world.resource::<RenderDevice>().clone();
+            let queue = world.resource::<RenderQueue>().clone();
+            let gpu_images = world.resource::<RenderAssets<GpuImage>>().clone();
+            let gpu_image = gpu_images.get(&target).expect("gpu image prepared");
+            let bytes_per_row = RenderDevice::align_copy_bytes_per_row(128 * 4) as u32;
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hdr_probe_readback"),
+                size: u64::from(bytes_per_row) * 128,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_buffer(
+                gpu_image.texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                gpu_image.size,
+            );
+            queue.submit(std::iter::once(encoder.finish()));
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+            device.poll(wgpu::PollType::Wait).expect("poll");
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("map timeout")
+                .expect("map");
+            let data = {
+                let mapped = buffer.slice(..).get_mapped_range();
+                Vec::from(&*mapped)
+            };
+            buffer.unmap();
+            data
+        };
+        let tight = unpad_readback(&data, 128, 128);
+        let distinct: std::collections::HashSet<u8> = tight.iter().copied().collect();
+        let max_channel = tight
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| px[0].max(px[1]).max(px[2]))
+            .max()
+            .unwrap_or(0);
+        // The clear color (0.2, 0, 0.4) alone yields ~2-3 distinct bytes and
+        // a max channel of 102; a rendered lit cube adds variety and
+        // brighter pixels.
+        assert!(
+            distinct.len() > 8,
+            "HDR pipeline should draw content: distinct={} max_channel={max_channel}",
+            distinct.len()
+        );
+        assert!(
+            max_channel > 102,
+            "lit cube must exceed clear color: max_channel={max_channel}"
+        );
     }
 
     #[test]
