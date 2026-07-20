@@ -541,6 +541,7 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
         DefaultPlugins
             .build()
             .disable::<bevy::winit::WinitPlugin>()
+            .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
             .set(WindowPlugin {
                 primary_window: None,
                 exit_condition: ExitCondition::DontExit,
@@ -550,7 +551,11 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     )
     .add_systems(Update, sync_world);
     // finish/cleanup are required before manual update() pumping: the
-    // render device initializes in RenderPlugin::finish.
+    // render device initializes in RenderPlugin::finish. Pipelined rendering
+    // is disabled above for exactly this reason: with the render app on its
+    // own thread, `get_sub_app_mut(RenderApp)` returns None and the explicit
+    // wgpu device poll the readback path needs never happens — the capture
+    // wedges at "readback did not complete in budget" on Metal.
     app.finish();
     app.cleanup();
     info!(
