@@ -653,6 +653,282 @@ impl CueScheduler {
 }
 
 // ---------------------------------------------------------------------------
+// Event -> emitter bindings (bd-2z0.14.1.7.2): tick-exact cue queue,
+// per-family rate limiting, boost trail emitters.
+// ---------------------------------------------------------------------------
+
+/// One cue queued for a specific tick.
+#[derive(Debug, Clone)]
+struct QueuedCue {
+    /// Arrival order within the tick (stable tiebreak).
+    ordinal: u32,
+    /// The cue recipe.
+    cue: VisualCue,
+    /// World-space spawn position.
+    position: [f32; 3],
+}
+
+/// Per-tick spawn statistics (observability for storms).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmitterTickStats {
+    /// Cues accepted for spawning.
+    pub cues_spawned: u32,
+    /// Cues dropped by rate limits.
+    pub cues_dropped: u32,
+    /// Particles actually spawned (post-cap).
+    pub particles_spawned: u32,
+    /// Trail particles emitted this tick.
+    pub trail_particles: u32,
+}
+
+/// One boost trail emitter bound to an agent anchor.
+#[derive(Debug, Clone)]
+struct TrailState {
+    anchor: AgentAnchor,
+    color: [f32; 3],
+    accent: [f32; 3],
+    interval_ticks: u32,
+    last_emit_tick: u64,
+    /// Particle lifetime; trail length = duration / interval, bounded.
+    duration_ticks: u32,
+}
+
+/// The event->emitter binding: maps the world's typed [`VisualCue`] stream
+/// into deterministic particle spawns.
+///
+/// Contracts:
+/// - Tick-exact: cues queue for their tick and are only applied by
+///   [`Self::apply_tick`] for that exact tick — never wall-clock, never
+///   early.
+/// - Rate limiting: when a tick exceeds budget, cues are selected by
+///   (priority desc, arrival ordinal asc) — combat/death (Critical) always
+///   win over ambience; drops are counted in [`EmitterTickStats`].
+/// - Determinism: identical (seed, cue stream, positions) produce identical
+///   particle tables across runs and platforms; proof via
+///   [`ParticlePool::state_hash`].
+#[derive(Debug, Clone)]
+pub struct CueEmitter {
+    scheduler: CueScheduler,
+    queue_tick: Option<u64>,
+    queue: Vec<QueuedCue>,
+    next_ordinal: u32,
+    trails: Vec<TrailState>,
+    /// Max cues whose batches spawn per tick per priority class.
+    pub budget_per_class_per_tick: u32,
+    /// Max cues whose batches spawn per tick overall.
+    pub budget_global_per_tick: u32,
+}
+
+impl CueEmitter {
+    /// Default per-class per-tick cue budget (combat storms shed ambience
+    /// first, then standard, but critical cues are never class-capped below
+    /// this budget).
+    pub const DEFAULT_CLASS_BUDGET: u32 = 32;
+    /// Default global per-tick cue budget.
+    pub const DEFAULT_GLOBAL_BUDGET: u32 = 96;
+    /// Default trail emission interval (ticks between trail puffs).
+    pub const TRAIL_INTERVAL_TICKS: u32 = 3;
+    /// Default trail particle lifetime; trail length = 24/3 = 8 puffs.
+    pub const TRAIL_DURATION_TICKS: u32 = 24;
+
+    /// Create an emitter for a world seed.
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self {
+            scheduler: CueScheduler::new(seed),
+            queue_tick: None,
+            queue: Vec::new(),
+            next_ordinal: 0,
+            trails: Vec::new(),
+            budget_per_class_per_tick: Self::DEFAULT_CLASS_BUDGET,
+            budget_global_per_tick: Self::DEFAULT_GLOBAL_BUDGET,
+        }
+    }
+
+    /// Queue a cue for `tick` at a world position. Cues for different ticks
+    /// must not interleave: enqueue is append-only within one tick and a new
+    /// tick implicitly seals the previous queue (fail-closed via stats if
+    /// [`Self::apply_tick`] was skipped).
+    pub fn enqueue(&mut self, tick: u64, cue: VisualCue, position: [f32; 3]) {
+        if self.queue_tick != Some(tick) {
+            self.queue.clear();
+            self.queue_tick = Some(tick);
+            self.next_ordinal = 0;
+        }
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = self.next_ordinal.wrapping_add(1);
+        self.queue.push(QueuedCue {
+            ordinal,
+            cue,
+            position,
+        });
+    }
+
+    /// Drain the queue for `tick` into `pool`, applying rate limits, then
+    /// emit due boost-trail particles. Returns per-tick statistics.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn apply_tick(&mut self, tick: u64, pool: &mut ParticlePool) -> EmitterTickStats {
+        let mut stats = EmitterTickStats::default();
+        if self.queue_tick == Some(tick) && !self.queue.is_empty() {
+            // Stable priority selection: Critical first, arrival order inside.
+            let mut queued = std::mem::take(&mut self.queue);
+            queued.sort_by(|a, b| {
+                CueScheduler::priority_for(b.cue.kind)
+                    .cmp(&CueScheduler::priority_for(a.cue.kind))
+                    .then(a.ordinal.cmp(&b.ordinal))
+            });
+            let mut class_counts = [0_u32; 3];
+            for entry in queued {
+                let class = CueScheduler::priority_for(entry.cue.kind) as usize;
+                if stats.cues_spawned >= self.budget_global_per_tick
+                    || class_counts[class] >= self.budget_per_class_per_tick
+                {
+                    stats.cues_dropped += 1;
+                    continue;
+                }
+                class_counts[class] += 1;
+                stats.cues_spawned += 1;
+                let batch = self
+                    .scheduler
+                    .schedule(tick, entry.ordinal, &entry.cue, entry.position);
+                for particle in batch.particles {
+                    if pool.spawn(particle).is_some() {
+                        stats.particles_spawned += 1;
+                    }
+                }
+            }
+        } else {
+            // Stale or missing tick: cues queue for their tick and expire
+            // unapplied rather than firing late (tick-exactness).
+            stats.cues_dropped += self.queue.len() as u32;
+            self.queue.clear();
+            self.queue_tick = None;
+        }
+        stats
+    }
+
+    /// Bind a boost trail emitter to an agent anchor (one per agent; binding
+    /// again refreshes colors). The emitter follows the agent via the
+    /// `lookup` passed to [`Self::emit_trails`]; emitted puffs are static
+    /// (they stay where the agent WAS — a trail, not an aura).
+    pub fn bind_boost_trail(&mut self, anchor: AgentAnchor, color: [f32; 3], accent: [f32; 3]) {
+        if let Some(existing) = self.trails.iter_mut().find(|t| t.anchor.uid == anchor.uid) {
+            existing.color = color;
+            existing.accent = accent;
+            existing.anchor = anchor;
+            return;
+        }
+        self.trails.push(TrailState {
+            anchor,
+            color,
+            accent,
+            interval_ticks: Self::TRAIL_INTERVAL_TICKS,
+            last_emit_tick: 0,
+            duration_ticks: Self::TRAIL_DURATION_TICKS,
+        });
+    }
+
+    /// Detach every trail bound to `uid` (agent died or stopped boosting).
+    pub fn detach_trails_for(&mut self, uid: u64) {
+        self.trails.retain(|trail| trail.anchor.uid != uid);
+    }
+
+    /// Number of live trail bindings.
+    #[must_use]
+    pub fn trail_count(&self) -> usize {
+        self.trails.len()
+    }
+
+    /// Emit due trail puffs for `tick`. `lookup` resolves an anchor UID to
+    /// the agent's current world position; a dead agent detaches its trail
+    /// (same semantics as [`ParticlePool::update_anchors`]).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn emit_trails(
+        &mut self,
+        tick: u64,
+        pool: &mut ParticlePool,
+        mut lookup: impl FnMut(u64) -> Option<[f32; 3]>,
+    ) -> u32 {
+        let mut emitted = 0_u32;
+        let mut detached = Vec::new();
+        for (index, trail) in self.trails.iter_mut().enumerate() {
+            if tick < trail.last_emit_tick + u64::from(trail.interval_ticks) {
+                continue;
+            }
+            let Some(position) = lookup(trail.anchor.uid) else {
+                detached.push(index);
+                continue;
+            };
+            trail.last_emit_tick = tick;
+            // Deterministic per-trail jitter through the scheduler's hash.
+            let cue = VisualCue {
+                kind: VisualCueKind::Nibble,
+                color: trail.color,
+                accent_color: trail.accent,
+                intensity: 0.5,
+                radius: 2.0,
+                duration_ticks: trail.duration_ticks,
+            };
+            let batch = self.scheduler.schedule(tick, index as u32, &cue, [
+                position[0] + trail.anchor.offset[0],
+                position[1] + trail.anchor.offset[1],
+                position[2] + trail.anchor.offset[2],
+            ]);
+            // One puff per emission: the trail is a breadcrumb, not a burst.
+            if let Some(particle) = batch.particles.into_iter().next()
+                && pool.spawn(particle).is_some()
+            {
+                emitted += 1;
+            }
+        }
+        for index in detached.into_iter().rev() {
+            self.trails.remove(index);
+        }
+        emitted
+    }
+}
+
+impl ParticlePool {
+    /// Deterministic state fingerprint for replay-equivalence proofs: FNV-1a64
+    /// over every slot's occupancy, generation, and live particle fields in
+    /// slot order. Two pools with equal hashes hold equivalent state.
+    #[must_use]
+    pub fn state_hash(&self) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut absorb_u64 = |value: u64| {
+            for byte in value.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        for (slot, generation) in self.slots.iter().zip(self.generations.iter()) {
+            absorb_u64(u64::from(*generation));
+            match slot {
+                None => absorb_u64(0),
+                Some(particle) => {
+                    absorb_u64(1);
+                    for value in [
+                        particle.position[0].to_bits(),
+                        particle.position[1].to_bits(),
+                        particle.position[2].to_bits(),
+                        particle.velocity[0].to_bits(),
+                        particle.velocity[1].to_bits(),
+                        particle.velocity[2].to_bits(),
+                        particle.gravity.to_bits(),
+                        particle.drag.to_bits(),
+                    ] {
+                        absorb_u64(u64::from(value));
+                    }
+                    absorb_u64(particle.born_tick);
+                    absorb_u64(u64::from(particle.duration_ticks));
+                }
+            }
+        }
+        hash
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Deterministic sprite atlas (SDF-authored, byte-identical across runs).
 // ---------------------------------------------------------------------------
 
@@ -1090,6 +1366,187 @@ mod tests {
         // Ring tile has a transparent center.
         let center = (16 * 32 * 5 + 4 * 32 + 16) * 4;
         assert_eq!(a[center + 3], 0, "ring center is transparent");
+    }
+
+    #[test]
+    fn golden_cue_particle_count_vectors_per_recipe() {
+        // The recipe contract: 4 + intensity * 20, clamped to [1, max_per_cue].
+        let scheduler = CueScheduler::new(7);
+        let golden: [(f32, u32); 5] = [
+            (0.0, 4),
+            (0.25, 9),
+            (0.5, 14),
+            (0.75, 19),
+            (1.0, 24),
+        ];
+        for kind in [
+            VisualCueKind::Sparkle,
+            VisualCueKind::Shards,
+            VisualCueKind::Wilt,
+            VisualCueKind::Nibble,
+            VisualCueKind::SparkCone,
+            VisualCueKind::PulseRing,
+            VisualCueKind::Flash,
+        ] {
+            for (intensity, expected) in golden {
+                let mut c = cue(kind);
+                c.intensity = intensity;
+                assert_eq!(
+                    scheduler.count_for_cue(&c),
+                    expected,
+                    "{kind:?} at intensity {intensity}"
+                );
+            }
+        }
+        // Extreme intensity still respects the per-cue cap.
+        let mut storm = cue(VisualCueKind::Shards);
+        storm.intensity = 99.0;
+        assert!(scheduler.count_for_cue(&storm) <= CueScheduler::MAX_PER_CUE);
+    }
+
+    #[test]
+    fn emitter_is_tick_exact_and_seals_stale_queues() {
+        let mut emitter = CueEmitter::new(11);
+        let mut pool = ParticlePool::with_capacity(64);
+        emitter.enqueue(5, cue(VisualCueKind::Sparkle), [0.0; 3]);
+        // Wrong tick: nothing spawns; the stale queue is sealed and dropped.
+        let stats = emitter.apply_tick(4, &mut pool);
+        assert_eq!(stats.particles_spawned, 0, "cues never fire early");
+        assert_eq!(stats.cues_dropped, 1, "stale cue counted");
+        // Right tick on a fresh enqueue: fires exactly then.
+        emitter.enqueue(5, cue(VisualCueKind::Sparkle), [0.0; 3]);
+        let stats = emitter.apply_tick(5, &mut pool);
+        assert_eq!(stats.cues_spawned, 1);
+        assert!(stats.particles_spawned >= 4, "recipe count applied");
+        // Late apply of the same tick after a new tick started: dropped.
+        emitter.enqueue(6, cue(VisualCueKind::Wilt), [0.0; 3]);
+        let stats = emitter.apply_tick(7, &mut pool);
+        assert_eq!(stats.particles_spawned, 0);
+        assert_eq!(stats.cues_dropped, 1);
+    }
+
+    #[test]
+    fn emitter_rate_limits_by_priority_then_ordinal() {
+        let mut emitter = CueEmitter::new(13);
+        emitter.budget_per_class_per_tick = 1;
+        emitter.budget_global_per_tick = 2;
+        let mut pool = ParticlePool::with_capacity(512);
+        // Arrival order: ambient, standard, critical — over budget after two.
+        emitter.enqueue(9, cue(VisualCueKind::Nibble), [0.0; 3]);
+        emitter.enqueue(9, cue(VisualCueKind::Wilt), [0.0; 3]);
+        emitter.enqueue(9, cue(VisualCueKind::Sparkle), [0.0; 3]);
+        emitter.enqueue(9, cue(VisualCueKind::Wilt), [0.0; 3]);
+        let stats = emitter.apply_tick(9, &mut pool);
+        assert_eq!(stats.cues_spawned, 2, "global budget binds");
+        assert_eq!(stats.cues_dropped, 2);
+        // Determinism of the selection: replay the same stream.
+        let mut emitter_b = CueEmitter::new(13);
+        emitter_b.budget_per_class_per_tick = 1;
+        emitter_b.budget_global_per_tick = 2;
+        let mut pool_b = ParticlePool::with_capacity(512);
+        emitter_b.enqueue(9, cue(VisualCueKind::Nibble), [0.0; 3]);
+        emitter_b.enqueue(9, cue(VisualCueKind::Wilt), [0.0; 3]);
+        emitter_b.enqueue(9, cue(VisualCueKind::Sparkle), [0.0; 3]);
+        emitter_b.enqueue(9, cue(VisualCueKind::Wilt), [0.0; 3]);
+        let stats_b = emitter_b.apply_tick(9, &mut pool_b);
+        assert_eq!(stats, stats_b);
+        assert_eq!(pool.state_hash(), pool_b.state_hash(), "identical selection");
+        // Critical won over ambient: the spawned batch was sparkle-tagged.
+        let mut saw_spark = false;
+        pool.for_each_live(|particle| {
+            if particle.sprite == SpriteKind::Spark {
+                saw_spark = true;
+            }
+        });
+        assert!(saw_spark, "critical cue outranked ambience under budget");
+    }
+
+    #[test]
+    fn emitter_is_deterministic_across_replays() {
+        let stream = [
+            (100_u64, VisualCueKind::Sparkle, [1.0, 2.0, 3.0]),
+            (100, VisualCueKind::Shards, [4.0, 5.0, 6.0]),
+            (101, VisualCueKind::Wilt, [7.0, 8.0, 9.0]),
+            (101, VisualCueKind::Nibble, [10.0, 11.0, 12.0]),
+            (102, VisualCueKind::PulseRing, [0.0, 0.0, 0.0]),
+        ];
+        let run = || {
+            let mut emitter = CueEmitter::new(42);
+            let mut pool = ParticlePool::with_capacity(1024);
+            for tick in 100..=102 {
+                for (at, kind, pos) in &stream {
+                    if *at == tick {
+                        emitter.enqueue(tick, cue(*kind), *pos);
+                    }
+                }
+                emitter.apply_tick(tick, &mut pool);
+                pool.integrate_tick();
+                pool.expire(tick);
+            }
+            pool.state_hash()
+        };
+        assert_eq!(run(), run(), "identical cue stream -> identical pool state hash");
+        // A different stream must diverge (the hash actually observes state).
+        let divergent = || {
+            let mut emitter = CueEmitter::new(42);
+            let mut pool = ParticlePool::with_capacity(1024);
+            emitter.enqueue(100, cue(VisualCueKind::Sparkle), [9.0, 9.0, 9.0]);
+            emitter.apply_tick(100, &mut pool);
+            pool.state_hash()
+        };
+        assert_ne!(run(), divergent(), "different streams produce different states");
+    }
+
+    #[test]
+    fn boost_trail_follows_a_moving_agent_and_stays_bounded() {
+        let mut emitter = CueEmitter::new(17);
+        let mut pool = ParticlePool::with_capacity(256);
+        emitter.bind_boost_trail(
+            AgentAnchor {
+                uid: 99,
+                offset: [0.0, 0.5, 0.0],
+            },
+            [0.2, 0.6, 1.0],
+            [0.8, 0.9, 1.0],
+        );
+        assert_eq!(emitter.trail_count(), 1);
+        // Agent moves +1 x per tick; trail puffs appear at successive spots.
+        let mut emitted_total = 0_u32;
+        for tick in 0..=u64::from(CueEmitter::TRAIL_DURATION_TICKS) {
+            let x = tick as f32;
+            emitted_total += emitter.emit_trails(tick, &mut pool, |uid| {
+                (uid == 99).then_some([x, 0.0, 0.0])
+            });
+        }
+        let expected = CueEmitter::TRAIL_DURATION_TICKS / CueEmitter::TRAIL_INTERVAL_TICKS;
+        assert_eq!(emitted_total, expected, "one puff per interval");
+        // Agent dies: lookup yields None -> trail detaches and stops.
+        let emitted_after_death = emitter.emit_trails(999, &mut pool, |_| None);
+        assert_eq!(emitted_after_death, 0);
+        assert_eq!(emitter.trail_count(), 0, "dead agent's trail detached");
+        // Rebinding refreshes instead of duplicating.
+        let anchor = AgentAnchor {
+            uid: 7,
+            offset: [0.0; 3],
+        };
+        emitter.bind_boost_trail(anchor, [1.0; 3], [1.0; 3]);
+        emitter.bind_boost_trail(anchor, [0.5; 3], [0.5; 3]);
+        assert_eq!(emitter.trail_count(), 1, "rebind refreshes");
+        emitter.detach_trails_for(7);
+        assert_eq!(emitter.trail_count(), 0);
+    }
+
+    #[test]
+    fn state_hash_distinguishes_pool_states() {
+        let mut a = ParticlePool::with_capacity(4);
+        let b = ParticlePool::with_capacity(4);
+        assert_eq!(a.state_hash(), b.state_hash(), "empty pools equal");
+        a.spawn(particle(ParticlePriority::Standard)).expect("spawn");
+        assert_ne!(a.state_hash(), b.state_hash(), "occupancy is observed");
+        let handle = a.spawn(particle(ParticlePriority::Critical)).expect("spawn");
+        let before = a.state_hash();
+        a.kill(handle);
+        assert_ne!(a.state_hash(), before, "kill changes generations");
     }
 
     #[test]
