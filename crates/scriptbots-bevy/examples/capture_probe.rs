@@ -29,7 +29,7 @@ fn main() {
             let frame = session.render(&world, "probe", 42, 0)?;
             let mut min = [255u8; 3];
             let mut max = [0u8; 3];
-            for px in frame.rgba8.chunks_exact(4) {
+            for px in frame.rgba8.as_chunks::<4>().0 {
                 for c in 0..3 {
                     min[c] = min[c].min(px[c]);
                     max[c] = max[c].max(px[c]);
