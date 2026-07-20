@@ -6403,12 +6403,7 @@ impl PresetKind {
     /// Every preset, in stable declaration order.
     #[must_use]
     pub const fn all() -> &'static [Self] {
-        const ALL: &[PresetKind] = &[
-            PresetKind::Arctic,
-            PresetKind::BoomBust,
-            PresetKind::ClosedWorld,
-        ];
-        ALL
+        &[Self::Arctic, Self::BoomBust, Self::ClosedWorld]
     }
 
     /// Resolve a preset from a user-supplied name, case-insensitively.
@@ -8347,7 +8342,10 @@ impl BrainFamilyRegistry {
 
 /// High level simulation clock (ticks processed since boot).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Tick(pub u64);
+pub struct Tick(
+    /// Wrapped counter value.
+    pub u64,
+);
 
 impl fmt::Display for Tick {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -8393,7 +8391,9 @@ impl Tick {
 /// Axis-aligned 2D position (SoA column representation).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct Position {
+    /// World-space x coordinate.
     pub x: f32,
+    /// World-space y coordinate.
     pub y: f32,
 }
 
@@ -8408,7 +8408,9 @@ impl Position {
 /// Velocity (wheel outputs translated to world-space delta).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct Velocity {
+    /// World-space x velocity component.
     pub vx: f32,
+    /// World-space y velocity component.
     pub vy: f32,
 }
 
@@ -8424,7 +8426,10 @@ impl Velocity {
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
 )]
-pub struct Generation(pub u32);
+pub struct Generation(
+    /// Wrapped counter value.
+    pub u32,
+);
 
 impl Generation {
     /// Advances to the next lineage generation without wrapping.
@@ -8451,14 +8456,23 @@ impl Generation {
 /// Scalar fields for a single agent used when inserting or snapshotting from the SoA store.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct AgentData {
+    /// World-space position column value.
     pub position: Position,
+    /// World-space velocity column value.
     pub velocity: Velocity,
+    /// Facing angle in radians.
     pub heading: f32,
+    /// Current health.
     pub health: f32,
+    /// Display color in linear RGB.
     pub color: [f32; 3],
+    /// Current spike extension.
     pub spike_length: f32,
+    /// Whether movement boost is active.
     pub boost: bool,
+    /// Completed ticks lived.
     pub age: u32,
+    /// Heritable lineage generation.
     pub generation: Generation,
 }
 
@@ -10286,7 +10300,9 @@ fn parse_legacy_rgb(raw: &str) -> Option<[f32; 3]> {
 /// Configuration change audit entry captured in-process.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigAuditEntry {
+    /// Tick at which the change was applied.
     pub tick: u64,
+    /// Applied JSON patch.
     pub patch: serde_json::Value,
 }
 
@@ -11365,16 +11381,19 @@ impl FoodGrid {
         })
     }
 
+    /// Grid width in cells.
     #[must_use]
     pub const fn width(&self) -> u32 {
         self.width
     }
 
+    /// Grid height in cells.
     #[must_use]
     pub const fn height(&self) -> u32 {
         self.height
     }
 
+    /// Borrow the dense row-major cell values.
     #[must_use]
     pub fn cells(&self) -> &[f32] {
         &self.cells
@@ -11530,6 +11549,7 @@ impl TerrainLayer {
         })
     }
 
+    /// Import a pre-built tile field as a terrain layer.
     pub fn from_tiles(
         width: u32,
         height: u32,
@@ -11557,21 +11577,25 @@ impl TerrainLayer {
         Ok(layer)
     }
 
+    /// Grid width in tiles.
     #[must_use]
     pub const fn width(&self) -> u32 {
         self.width
     }
 
+    /// Grid height in tiles.
     #[must_use]
     pub const fn height(&self) -> u32 {
         self.height
     }
 
+    /// Edge length of one tile in world units.
     #[must_use]
     pub const fn cell_size(&self) -> u32 {
         self.cell_size
     }
 
+    /// Borrow the dense row-major tiles.
     #[must_use]
     pub fn tiles(&self) -> &[TerrainTile] {
         &self.tiles
@@ -11594,6 +11618,7 @@ impl TerrainLayer {
         Ok(())
     }
 
+    /// Borrow one tile by grid coordinate.
     #[must_use]
     pub fn tile(&self, x: u32, y: u32) -> Option<&TerrainTile> {
         if x < self.width && y < self.height {
@@ -11715,14 +11740,21 @@ pub enum TerrainKind {
 /// Metadata captured for every terrain tile.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TerrainTile {
+    /// Terrain class.
     pub kind: TerrainKind,
+    /// Normalized elevation scalar.
     pub elevation: f32,
+    /// Normalized moisture scalar.
     pub moisture: f32,
+    /// Accent variation scalar.
     pub accent: f32,
+    /// Food-fertility bias for this tile.
     #[serde(default)]
     pub fertility_bias: f32,
+    /// Temperature bias for this tile.
     #[serde(default)]
     pub temperature_bias: f32,
+    /// Palette override index.
     #[serde(default)]
     pub palette_index: u16,
 }
@@ -14094,6 +14126,8 @@ pub use map_sandbox::{
 };
 
 /// Runtime hydrology state tracked by the world.
+///
+/// Imported hydrology layers plus the live water-depth field.
 #[derive(Debug, Clone)]
 pub struct HydrologyState {
     tiles: HydrologyTileLayer,
@@ -14102,6 +14136,7 @@ pub struct HydrologyState {
 }
 
 impl HydrologyState {
+    /// Construct runtime hydrology from validated imported layers.
     pub fn new(
         tiles: HydrologyTileLayer,
         field: HydrologyField,
@@ -14132,31 +14167,37 @@ impl HydrologyState {
         })
     }
 
+    /// Borrow the imported hydrology tile layer.
     #[must_use]
     pub fn tiles(&self) -> &HydrologyTileLayer {
         &self.tiles
     }
 
+    /// Borrow the imported hydrology flow field.
     #[must_use]
     pub fn field(&self) -> &HydrologyField {
         &self.field
     }
 
+    /// Grid width in cells.
     #[must_use]
     pub fn width(&self) -> u32 {
         self.tiles.width()
     }
 
+    /// Grid height in cells.
     #[must_use]
     pub fn height(&self) -> u32 {
         self.tiles.height()
     }
 
+    /// Total number of hydrology cells.
     #[must_use]
     pub fn cell_count(&self) -> usize {
         self.water_depth.len()
     }
 
+    /// Borrow the live per-cell water depths.
     #[must_use]
     pub fn water_depth(&self) -> &[f32] {
         &self.water_depth
@@ -14174,11 +14215,13 @@ impl HydrologyState {
         Ok(())
     }
 
+    /// Sum of all live cell water depths.
     #[must_use]
     pub fn total_water_depth(&self) -> f32 {
         self.water_depth.iter().sum()
     }
 
+    /// Count of cells at or above the shallow and deep water thresholds.
     #[must_use]
     pub fn flooded_cell_counts(
         &self,
@@ -14209,12 +14252,19 @@ struct FoodCellProfile {
 }
 
 /// Public snapshot of derived food cell parameters.
+///
+/// Public projection of the per-cell food ecology profile.
 #[derive(Debug, Clone, Copy)]
 pub struct FoodCellProfileSnapshot {
+    /// Maximum food energy the cell can hold.
     pub capacity: f32,
+    /// Per-tick growth multiplier.
     pub growth_multiplier: f32,
+    /// Per-tick decay multiplier.
     pub decay_multiplier: f32,
+    /// Derived fertility score.
     pub fertility: f32,
+    /// Derived nutrient density.
     pub nutrient_density: f32,
 }
 
