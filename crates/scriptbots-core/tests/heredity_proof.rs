@@ -319,7 +319,7 @@ fn sexual_child_at_zero_mutation_is_a_per_node_bitwise_mix() {
     for_each_family(case);
 }
 
-fn locus_value_bit_eq(left: LocusValue, right: LocusValue) -> bool {
+const fn locus_value_bit_eq(left: LocusValue, right: LocusValue) -> bool {
     match (left, right) {
         (LocusValue::Scalar(a), LocusValue::Scalar(b)) => a.to_bits() == b.to_bits(),
         (LocusValue::Target(a), LocusValue::Target(b)) => a == b,
@@ -398,7 +398,7 @@ struct ExactBinomial {
 
 impl ExactBinomial {
     /// Probability mass function over the numerically relevant support, returned as
-    /// (start_k, weights) where `weights[i]` = P(X = start_k + i).
+    /// `(start_k, weights)` where `weights[i]` = P(X = `start_k` + i).
     ///
     /// `f64` accumulation error bounds the exactness.
     fn pmf_support(&self) -> (u64, Vec<f64>) {

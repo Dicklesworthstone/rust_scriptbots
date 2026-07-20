@@ -33130,6 +33130,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn tick_zero_seed_finalizes_exactly_once() {
         let config = ScriptBotsConfig {
             persistence_interval: 3,
@@ -34086,6 +34088,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn post_admission_updates_cannot_diverge_generation_or_hybrid_from_lifecycle_history() {
         let config = ScriptBotsConfig {
             persistence_interval: 3,
@@ -34819,6 +34823,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn skipped_persistence_ticks_retain_lifecycle_and_replay_rows() {
         let config = ScriptBotsConfig {
             persistence_interval: 3,
@@ -34895,6 +34901,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn persistence_and_analytics_cadence_preserve_science_and_event_totals() {
         let run = |persistence_interval: u32, lifecycle_events: u32| {
             let config = ScriptBotsConfig {
@@ -34935,8 +34943,6 @@ mod tests {
                 session.step(&mut world).expect("cadence comparison tick");
             }
 
-            // bd-tqpj: the spy-log mutex guard must stay held across the cadence aggregation; drop order is semantic.
-            #[allow(clippy::significant_drop_tightening)]
             let entries = logs.lock().unwrap();
             let mut event_totals = (0usize, 0usize, 0usize, 0usize);
             for event in entries.iter().flat_map(|batch| &batch.events) {
@@ -34991,6 +34997,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn persistence_and_lifecycle_cadences_do_not_double_count_events() {
         let config = ScriptBotsConfig {
             persistence_interval: 3,
@@ -35065,6 +35073,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn finalize_persistence_admits_partial_tail_exactly_once() {
         let config = ScriptBotsConfig {
             persistence_interval: 3,
@@ -35120,8 +35130,6 @@ mod tests {
             PersistenceBoundaryStatus::Sealed { tick: Tick(4) }
         );
 
-        // bd-tqpj: the spy-log mutex guard must stay held across the tail-batch assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].summary.tick, Tick(3));
@@ -35142,6 +35150,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn food_balance_accumulates_every_tick_between_persistence_boundaries() {
         let config = ScriptBotsConfig {
             persistence_interval: 3,
@@ -35187,6 +35197,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn persistence_receives_tick_batch() {
         let config = ScriptBotsConfig {
             world_width: 100,
@@ -35244,6 +35256,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn reproduction_spawns_child() {
         let config = ScriptBotsConfig {
             world_width: 200,
@@ -36363,6 +36377,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn carcass_rewards_emit_metrics() {
         let config = ScriptBotsConfig {
             world_width: 200,
@@ -36424,8 +36440,6 @@ mod tests {
                 .expect("carcass metrics should be admitted")
         );
 
-        // bd-tqpj: the spy-log mutex guard must stay held across the metric assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let metrics = &entries[0].metrics;
@@ -39600,6 +39614,8 @@ mod tests {
     // bd-tqpj: the `.count` suffix filter matches a metric-name convention, not a
     // filesystem extension — the case-sensitive comparison is intentional.
     #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
+    #[allow(clippy::significant_drop_tightening)]
     fn persistence_batch_orders_agents_and_brain_metrics_stably() {
         let config = ScriptBotsConfig {
             spike_damage: 0.0,
@@ -39639,8 +39655,6 @@ mod tests {
         session
             .step(&mut world)
             .expect("ordered persistence batch tick");
-        // bd-tqpj: the spy-log mutex guard must stay held across the ordered-batch assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().expect("ordered batch logs");
         let batch = entries.last().expect("ordered persistence batch");
         let agent_uids: Vec<_> = batch
