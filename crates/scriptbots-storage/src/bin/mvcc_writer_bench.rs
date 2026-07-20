@@ -58,7 +58,7 @@ fn parse_args() -> Result<Config, String> {
     let mut batches = None;
     let mut agents = None;
     let mut out = None;
-    let mut args = env::args().skip(1);
+    let args = env::args().skip(1);
     for arg in args {
         let Some((flag, value)) = arg.split_once('=') else {
             return Err(format!("expected --flag=value, got {arg:?}"));
