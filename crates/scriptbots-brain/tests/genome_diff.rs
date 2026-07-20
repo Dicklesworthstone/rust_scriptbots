@@ -8,9 +8,7 @@
 
 use scriptbots_brain::dwraon::DwraonFamilyAdapter;
 use scriptbots_brain::mlp::MlpBrainFamily;
-use scriptbots_core::genome_diff::{
-    GenomeDelta, GenomeDiffError, LocusValue, diff_genomes,
-};
+use scriptbots_core::genome_diff::{GenomeDelta, GenomeDiffError, LocusValue, diff_genomes};
 use scriptbots_core::{
     BrainFamilyAdapter, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainProvenance,
     MutationRates, SmallRngStream,
@@ -82,13 +80,11 @@ fn a_full_rate_mutation_produces_typed_deltas_matching_manual_loci() {
                     after: a,
                 })
             }
-            (LocusValue::Kind(b), LocusValue::Kind(a)) if b != a => {
-                Some(GenomeDelta::KindFlip {
-                    locus: *locus,
-                    before: b,
-                    after: a,
-                })
-            }
+            (LocusValue::Kind(b), LocusValue::Kind(a)) if b != a => Some(GenomeDelta::KindFlip {
+                locus: *locus,
+                before: b,
+                after: a,
+            }),
             _ => None,
         })
         .collect();
@@ -122,8 +118,8 @@ fn cross_family_and_cross_schema_diffs_are_typed_errors() {
         BrainProvenance::default(),
     )
     .expect("other family envelope");
-    let error = diff_genomes(&adapter, &parent, &other_family)
-        .expect_err("cross-family diff must refuse");
+    let error =
+        diff_genomes(&adapter, &parent, &other_family).expect_err("cross-family diff must refuse");
     assert!(
         matches!(error, GenomeDiffError::FamilyMismatch { .. }),
         "expected FamilyMismatch, got {error}"
@@ -137,8 +133,8 @@ fn cross_family_and_cross_schema_diffs_are_typed_errors() {
         BrainProvenance::default(),
     )
     .expect("other schema envelope");
-    let error = diff_genomes(&adapter, &parent, &other_schema)
-        .expect_err("cross-schema diff must refuse");
+    let error =
+        diff_genomes(&adapter, &parent, &other_schema).expect_err("cross-schema diff must refuse");
     assert!(
         matches!(error, GenomeDiffError::SchemaMismatch { .. }),
         "expected SchemaMismatch, got {error}"
@@ -185,13 +181,11 @@ fn dwraon_full_rate_mutation_produces_typed_deltas() {
                     after: a,
                 })
             }
-            (LocusValue::Kind(b), LocusValue::Kind(a)) if b != a => {
-                Some(GenomeDelta::KindFlip {
-                    locus: *locus,
-                    before: b,
-                    after: a,
-                })
-            }
+            (LocusValue::Kind(b), LocusValue::Kind(a)) if b != a => Some(GenomeDelta::KindFlip {
+                locus: *locus,
+                before: b,
+                after: a,
+            }),
             _ => None,
         })
         .collect();

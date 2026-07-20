@@ -752,15 +752,23 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
     fn genome_loci(
         &self,
         genome: &BrainGenomeEnvelope,
-    ) -> Result<Vec<(scriptbots_core::genome_diff::Locus, scriptbots_core::genome_diff::LocusValue)>, BrainProtocolError>
-    {
+    ) -> Result<
+        Vec<(
+            scriptbots_core::genome_diff::Locus,
+            scriptbots_core::genome_diff::LocusValue,
+        )>,
+        BrainProtocolError,
+    > {
         use scriptbots_core::genome_diff::{Locus, LocusValue};
         let nodes = decode_genome(genome)?;
         let mut loci = Vec::with_capacity(nodes.len() * (3 + CONNECTIONS * 3 + 1));
         for (node_index, node) in nodes.iter().enumerate() {
             let node_index = node_index as u32;
             loci.push((Locus::NodeBias(node_index), LocusValue::Scalar(node.bias)));
-            loci.push((Locus::NodeDamping(node_index), LocusValue::Scalar(node.damping)));
+            loci.push((
+                Locus::NodeDamping(node_index),
+                LocusValue::Scalar(node.damping),
+            ));
             // DWRAON locus encoding: conn 0..CONNECTIONS-1 are per-connection
             // weights/sources/inversion flags; conn CONNECTIONS is the node's And/Or
             // operator kind.

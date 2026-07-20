@@ -823,15 +823,23 @@ impl BrainFamilyCodec for MlpBrainFamily {
     fn genome_loci(
         &self,
         genome: &BrainGenomeEnvelope,
-    ) -> Result<Vec<(scriptbots_core::genome_diff::Locus, scriptbots_core::genome_diff::LocusValue)>, BrainProtocolError>
-    {
+    ) -> Result<
+        Vec<(
+            scriptbots_core::genome_diff::Locus,
+            scriptbots_core::genome_diff::LocusValue,
+        )>,
+        BrainProtocolError,
+    > {
         use scriptbots_core::genome_diff::{Locus, LocusValue};
         let nodes = self.decode_genome(genome)?;
         let mut loci = Vec::with_capacity(nodes.len() * (3 + CONNECTIONS * 3));
         for (node_index, node) in nodes.iter().enumerate() {
             let node_index = node_index as u32;
             loci.push((Locus::NodeBias(node_index), LocusValue::Scalar(node.bias)));
-            loci.push((Locus::NodeDamping(node_index), LocusValue::Scalar(node.damping)));
+            loci.push((
+                Locus::NodeDamping(node_index),
+                LocusValue::Scalar(node.damping),
+            ));
             loci.push((Locus::NodeGain(node_index), LocusValue::Scalar(node.gain)));
             for conn in 0..CONNECTIONS {
                 let conn_u8 = conn as u8;
