@@ -32,6 +32,7 @@ use scriptbots_core::{
     BrainInspectionRevision, ControlCommand, ControlDisposition, ControlSettings, NUM_EYES,
     SENSOR_LAYOUT, SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer,
     TickSummary, WorldState, apply_control_command,
+    narrative::{EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord},
 };
 #[cfg(test)]
 use scriptbots_storage::AnalyticsSnapshotProvider;
@@ -63,6 +64,9 @@ const PROBE_MAX_CONTRIBUTORS: usize = 12;
 /// Rows reserved below the map for the egocentric sense-probe panel.
 const PROBE_PANEL_HEIGHT: u16 = 18;
 const LEADERBOARD_LIMIT: usize = 6;
+/// Narrative rail strip height: one glyph row plus a two-row detail pane inside
+/// the block borders (bd-16g.2.4).
+const RAIL_HEIGHT: u16 = 5;
 const BRAINBOARD_LIMIT: usize = 4;
 const TERMINAL_BRAIN_INSPECTION_CLIENT_ID: BrainInspectionClientId =
     BrainInspectionClientId::new(0x5455_4900_0000_0001);
@@ -383,6 +387,18 @@ struct TerminalApp<'a> {
     probe_enabled: bool,
     brain_inspection_revision: BrainInspectionRevision,
     brain_inspection_cache: Option<TerminalBrainInspectionCache>,
+    /// Narrative rail visibility (bd-16g.2.4); toggled with `r`.
+    rail_visible: bool,
+    /// Selected event index into the retained narrative, plus the identity of the
+    /// selected event so a ring wrap that drops it is detected instead of
+    /// silently re-pointing the selection at a different event.
+    rail_selection: Option<(usize, u64, NarrativeEventKind)>,
+    /// Set when the ring dropped the user's selected event; cleared on the next
+    /// explicit selection.
+    rail_selection_aged_out: bool,
+    /// One-shot latches for the rail's logging contract.
+    rail_logged_first_show: bool,
+    rail_warned_aged_out: bool,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -433,6 +449,11 @@ impl<'a> TerminalApp<'a> {
             probe_enabled: false,
             brain_inspection_revision: BrainInspectionRevision::new(0),
             brain_inspection_cache: None,
+            rail_visible: true,
+            rail_selection: None,
+            rail_selection_aged_out: false,
+            rail_logged_first_show: false,
+            rail_warned_aged_out: false,
         };
         app.refresh_snapshot();
         app
@@ -612,15 +633,32 @@ impl<'a> TerminalApp<'a> {
         // Ensure we start from a clean buffer every frame to avoid ghosting artifacts
         frame.render_widget(Clear, frame.area());
 
-        let outer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(frame.area());
+        let outer = if self.rail_visible {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(RAIL_HEIGHT),
+                    Constraint::Min(0),
+                ])
+                .split(frame.area())
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(0)])
+                .split(frame.area())
+        };
 
         self.draw_header(frame, outer[0], &self.snapshot);
+        let body_anchor = if self.rail_visible {
+            self.draw_rail(frame, outer[1], &self.snapshot);
+            outer[2]
+        } else {
+            outer[1]
+        };
 
         // Auto-expand advanced panels on wide terminals unless the user has overridden
-        let area = outer[1];
+        let area = body_anchor;
         let wide = area.width >= 120;
         if !self.expanded_user_override {
             self.expanded = wide;
@@ -633,7 +671,7 @@ impl<'a> TerminalApp<'a> {
             } else {
                 [Constraint::Percentage(62), Constraint::Percentage(38)]
             })
-            .split(outer[1]);
+            .split(body_anchor);
 
         // Draw the map while avoiding holding an external borrow across &mut self
         let world_size = self.snapshot.world_size;
@@ -732,6 +770,187 @@ impl<'a> TerminalApp<'a> {
             published.readings.as_ref(),
         ) {
             self.analytics = Some(ana);
+        }
+    }
+
+    /// The narrative rail (bd-16g.2.4): a read-only projection of `RunNarrative`.
+    /// One glyph per retained event, coloured by the shared core rail model, with
+    /// the selected event's full text beneath. STAGE 1 of the seek contract: the
+    /// rail SELECTS — it never moves the simulation clock, and nothing here
+    /// invites the user to believe otherwise.
+    fn draw_rail(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Timeline — run history (select-only; rewind needs replay bd-2z0.5.3)");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height < 2 || inner.width < 8 {
+            return;
+        }
+
+        let events = &snapshot.narrative;
+        if events.is_empty() {
+            let empty = Paragraph::new(
+                "no narrative events yet — the run's story will appear here as it happens",
+            );
+            frame.render_widget(empty, inner);
+            return;
+        }
+
+        // Glyph row: truncation marker first, then one glyph per event, keeping the
+        // selection in view. Bounded work: at most `inner.width` cells per frame.
+        let marker_width = if snapshot.narrative_dropped > 0 {
+            9_usize
+        } else {
+            0
+        };
+        let glyph_capacity = (inner.width as usize).saturating_sub(marker_width).max(1);
+        let selection = self
+            .rail_selection
+            .map_or(events.len() - 1, |(index, _, _)| {
+                index.min(events.len() - 1)
+            });
+        let first_visible = if events.len() <= glyph_capacity {
+            0
+        } else {
+            selection
+                .saturating_sub(glyph_capacity / 2)
+                .min(events.len() - glyph_capacity)
+        };
+
+        let marker = if snapshot.narrative_dropped > 0 {
+            format!("+{}…", snapshot.narrative_dropped)
+        } else {
+            String::new()
+        };
+        let mut glyph_spans: Vec<ratatui::text::Span<'_>> = Vec::with_capacity(glyph_capacity + 1);
+        if !marker.is_empty() {
+            glyph_spans.push(ratatui::text::Span::styled(
+                format!("{marker:<9}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        for (offset, event) in events[first_visible..]
+            .iter()
+            .take(glyph_capacity)
+            .enumerate()
+        {
+            let index = first_visible + offset;
+            let [r, g, b] = event.kind.rail_rgb();
+            let mut style = Style::default().fg(Color::Rgb(r, g, b));
+            if index == selection {
+                style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+            }
+            glyph_spans.push(ratatui::text::Span::styled(
+                event.kind.rail_glyph().to_string(),
+                style,
+            ));
+        }
+        let glyph_row = Paragraph::new(ratatui::text::Line::from(glyph_spans));
+        frame.render_widget(
+            glyph_row,
+            Rect {
+                y: inner.y,
+                height: 1,
+                ..inner
+            },
+        );
+
+        // Detail pane: the selected event's full text, plus the honest markers.
+        let selected_event = &events[selection];
+        let aged_out = if self.rail_selection_aged_out {
+            " | selected event aged out of the ring"
+        } else {
+            ""
+        };
+        let truncated = if snapshot.narrative_dropped > 0 {
+            format!(
+                " | {} earlier events dropped — this is a TAIL of the run's history",
+                snapshot.narrative_dropped
+            )
+        } else {
+            String::new()
+        };
+        let detail = Paragraph::new(vec![
+            ratatui::text::Line::from(format!(
+                "tick {} | {} | severity {:.2}{aged_out}",
+                selected_event.tick.0,
+                selected_event.kind.as_str(),
+                selected_event.severity
+            )),
+            ratatui::text::Line::from(format!("{}{truncated}", selected_event.human_text)),
+        ]);
+        frame.render_widget(
+            detail,
+            Rect {
+                y: inner.y + 1,
+                height: inner.height - 1,
+                ..inner
+            },
+        );
+    }
+
+    /// Move the rail selection by `delta`, clamping at both ends — never wrapping
+    /// silently (bd-16g.2.4). A fresh selection clears the aged-out marker.
+    fn move_rail_selection(&mut self, delta: i64) {
+        let events = &self.snapshot.narrative;
+        if events.is_empty() {
+            self.rail_selection = None;
+            return;
+        }
+        let current = self
+            .rail_selection
+            .map_or(events.len() - 1, |(index, _, _)| {
+                index.min(events.len() - 1)
+            });
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            (current + delta as usize).min(events.len() - 1)
+        };
+        self.rail_selection = Some((next, events[next].tick.0, events[next].kind));
+        self.rail_selection_aged_out = false;
+        self.rail_warned_aged_out = false;
+        tracing::debug!(
+            target = "scriptbots::timeline",
+            event_index = next,
+            event_tick = events[next].tick.0,
+            event_kind = events[next].kind.as_str(),
+            "narrative rail selection moved"
+        );
+    }
+
+    /// Keep the rail selection pointing at a live event. The ring can drop the
+    /// very event the user selected; that must clamp loudly, never index into a
+    /// dropped slot (bd-16g.2.4).
+    fn validate_rail_selection(&mut self) {
+        let Some((index, tick, kind)) = self.rail_selection else {
+            return;
+        };
+        let events = &self.snapshot.narrative;
+        let still_live = events
+            .get(index)
+            .is_some_and(|event| event.tick.0 == tick && event.kind == kind);
+        if still_live {
+            return;
+        }
+        // The selected event aged out (or the identity moved). Clamp to the
+        // newest event and say so — once per wrap, not every frame.
+        if events.is_empty() {
+            self.rail_selection = None;
+        } else {
+            let newest = events.len() - 1;
+            self.rail_selection = Some((newest, events[newest].tick.0, events[newest].kind));
+        }
+        self.rail_selection_aged_out = true;
+        if !self.rail_warned_aged_out {
+            self.rail_warned_aged_out = true;
+            warn!(
+                target = "scriptbots::timeline",
+                event_tick = tick,
+                dropped_count = self.snapshot.narrative_dropped,
+                "selected narrative event was dropped by the bounded ring"
+            );
         }
     }
 
@@ -1858,12 +2077,32 @@ impl<'a> TerminalApp<'a> {
                 self.activation_row_offset = self.activation_row_offset.saturating_add(1);
             }
             (KeyCode::Left, _) => {
-                self.focused_agent_cursor = self.focused_agent_cursor.saturating_sub(1);
-                self.refresh_snapshot();
+                if self.rail_visible && !self.snapshot.narrative.is_empty() {
+                    self.move_rail_selection(-1);
+                } else {
+                    self.focused_agent_cursor = self.focused_agent_cursor.saturating_sub(1);
+                    self.refresh_snapshot();
+                }
             }
             (KeyCode::Right, _) => {
-                self.focused_agent_cursor = self.focused_agent_cursor.saturating_add(1);
-                self.refresh_snapshot();
+                if self.rail_visible && !self.snapshot.narrative.is_empty() {
+                    self.move_rail_selection(1);
+                } else {
+                    self.focused_agent_cursor = self.focused_agent_cursor.saturating_add(1);
+                    self.refresh_snapshot();
+                }
+            }
+            (KeyCode::Char('r') | KeyCode::Char('R'), _) => {
+                self.rail_visible = !self.rail_visible;
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    if self.rail_visible {
+                        "Timeline rail shown (select-only; rewind needs replay)"
+                    } else {
+                        "Timeline rail hidden"
+                    },
+                );
             }
             (KeyCode::Char('t') | KeyCode::Char('T'), _) => {
                 self.focus_lock = FocusLockMode::TopPredator;
@@ -2053,7 +2292,28 @@ impl<'a> TerminalApp<'a> {
         }
         self.ingest_events(&new_snapshot);
         self.snapshot = new_snapshot;
+        self.validate_rail_selection();
+        self.maybe_log_rail_first_show();
         self.evaluate_auto_pause();
+    }
+
+    /// The rail's first-show logging contract (bd-16g.2.4): one line from which a
+    /// reader can tell whether they are looking at a complete history or a tail.
+    fn maybe_log_rail_first_show(&mut self) {
+        if !self.rail_visible || self.rail_logged_first_show || self.snapshot.narrative.is_empty() {
+            return;
+        }
+        self.rail_logged_first_show = true;
+        let events = &self.snapshot.narrative;
+        info!(
+            target = "scriptbots::timeline",
+            retained_events = events.len(),
+            dropped_events = self.snapshot.narrative_dropped,
+            capacity = self.snapshot.narrative_capacity,
+            oldest_tick = events.first().map_or(0, |event| event.tick.0),
+            newest_tick = events.last().map_or(0, |event| event.tick.0),
+            "narrative rail first shown"
+        );
     }
 
     fn ingest_events(&mut self, new_snapshot: &Snapshot) {
@@ -2385,6 +2645,12 @@ struct Snapshot {
     brain_layers: Vec<BrainLayerView>,
     brain_inspection: Option<BrainInspectionViewMetadata>,
     probe: Option<ProbeSnapshot>,
+    /// The run's retained narrative events, oldest first (bd-16g.2.4 rail).
+    narrative: Vec<NarrativeEventRecord>,
+    /// Events the bounded narrative ring has discarded so far.
+    narrative_dropped: u64,
+    /// The narrative ring's configured capacity.
+    narrative_capacity: usize,
 }
 
 /// One agent's senses, explained (bd-16g.4.2).
@@ -2891,6 +3157,9 @@ impl Snapshot {
             brain_layers: Vec::new(),
             brain_inspection: None,
             probe: None,
+            narrative: world.narrative_events().iter().cloned().collect(),
+            narrative_dropped: world.narrative_dropped_events(),
+            narrative_capacity: config.narrative_capacity,
         }
     }
 
@@ -4462,13 +4731,16 @@ mod tests {
                 evidence.forced_width_cells,
                 evidence.empty_symbol_cells,
             ),
-            (2424, 1782, 0, 0, 0),
+            (2361, 1526, 0, 0, 0),
             "fixed-seed Ratatui TestBackend cell counts changed; inspect the rendered buffer before intentionally updating this reviewed evidence: {evidence:?}"
         );
         // Reviewed 2026-07-17 (bd-2z0.10.1): the header title now carries the scenario id
         // and bootstrap policy, shifting the pinned counts and full-cell digest below.
+        // Reviewed 2026-07-20 (bd-16g.2.4): the narrative rail now occupies five rows
+        // between the header and the body by design, shrinking the map's cell counts
+        // and changing the full-cell digest accordingly.
         assert_eq!(
-            evidence.full_cell_fnv1a64, "265533efd3ec40aa",
+            evidence.full_cell_fnv1a64, "0bfc28a0bdf694bd",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
         assert_eq!(
@@ -4687,6 +4959,364 @@ mod tests {
         assert!(
             app.paused,
             "should auto-pause when max age exceeds threshold"
+        );
+    }
+
+    fn rail_record(tick: u64, kind: NarrativeEventKind, text: &str) -> NarrativeEventRecord {
+        NarrativeEventRecord {
+            tick: scriptbots_core::Tick(tick),
+            kind,
+            severity: 0.5,
+            metric: "population",
+            before: 1.0,
+            after: 2.0,
+            score: 3.0,
+            human_text: text.to_string(),
+        }
+    }
+
+    macro_rules! rail_test_app {
+        ($world:expr, $app:ident, $backend:ident) => {
+            let analytics = AnalyticsSnapshotProvider::empty();
+            let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let ctx = crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&$world),
+                world: Arc::clone(&$world),
+                analytics,
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            };
+            let mut $app = TerminalApp::new(&renderer, ctx);
+            $app.palette = Palette::test_backend_evidence();
+            $app.paused = true;
+            let $backend = ratatui::backend::TestBackend::new(140, 48);
+        };
+    }
+
+    fn buffer_text(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut text = String::new();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn narrative_rail_paints_glyphs_detail_and_truncation_marker() {
+        let world = command_characterization_world();
+        rail_test_app!(world, app, backend);
+        app.snapshot.narrative = vec![
+            rail_record(
+                8100,
+                NarrativeEventKind::PopulationCrash,
+                "population fell 70% (1000 -> 300)",
+            ),
+            rail_record(
+                8420,
+                NarrativeEventKind::EnergyRecovery,
+                "mean energy recovered 40% (0.5 -> 0.7)",
+            ),
+            rail_record(
+                9001,
+                NarrativeEventKind::CombatSurge,
+                "combat surged (12 -> 61 spike hits)",
+            ),
+        ];
+        app.snapshot.narrative_dropped = 5;
+        app.snapshot.narrative_capacity = 256;
+
+        let mut terminal = Terminal::new(backend).expect("rail test backend");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("rail frame renders");
+        let text = buffer_text(&terminal);
+
+        for kind in [
+            NarrativeEventKind::PopulationCrash,
+            NarrativeEventKind::EnergyRecovery,
+            NarrativeEventKind::CombatSurge,
+        ] {
+            assert!(
+                text.contains(kind.rail_glyph().to_string().as_str()),
+                "rail must paint the {} glyph; buffer:\n{text}",
+                kind.as_str()
+            );
+        }
+        // The selected event (newest) shows its full text in the detail pane.
+        assert!(
+            text.contains("combat surged (12 -> 61 spike hits)"),
+            "detail pane must carry the selected event's text; buffer:\n{text}"
+        );
+        assert!(
+            text.contains("tick 9001 | combat_surge"),
+            "detail pane must name tick and kind; buffer:\n{text}"
+        );
+        // The truncation marker is explicit: a tail is never presented as a whole.
+        assert!(
+            text.contains("+5"),
+            "wrapped ring must show the dropped-event marker; buffer:\n{text}"
+        );
+        assert!(
+            text.contains("5 earlier events dropped"),
+            "detail pane must explain the truncation; buffer:\n{text}"
+        );
+        // THE SEEK CONTRACT: the rail says what it is — select-only history.
+        assert!(
+            text.contains("select-only"),
+            "rail title must not overstate the seek contract; buffer:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrative_rail_omits_truncation_marker_when_ring_has_not_wrapped() {
+        let world = command_characterization_world();
+        rail_test_app!(world, app, backend);
+        app.snapshot.narrative = vec![rail_record(
+            300,
+            NarrativeEventKind::PopulationBoom,
+            "population rose 60% (100 -> 160)",
+        )];
+        app.snapshot.narrative_dropped = 0;
+
+        let mut terminal = Terminal::new(backend).expect("rail test backend");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("rail frame renders");
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("earlier events dropped"),
+            "an unwrapped ring must not claim truncation; buffer:\n{text}"
+        );
+        assert!(
+            text.contains("population rose 60% (100 -> 160)"),
+            "single event renders its text; buffer:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrative_rail_selection_clamps_at_ends_without_silent_wrap() {
+        let world = command_characterization_world();
+        rail_test_app!(world, app, _backend);
+        app.snapshot.narrative = vec![
+            rail_record(10, NarrativeEventKind::PopulationCrash, "a"),
+            rail_record(20, NarrativeEventKind::PopulationBoom, "b"),
+            rail_record(30, NarrativeEventKind::CombatSurge, "c"),
+        ];
+        app.move_rail_selection(-99);
+        let (index, tick, kind) = app.rail_selection.expect("selection set");
+        assert_eq!(
+            (index, tick, kind),
+            (0, 10, NarrativeEventKind::PopulationCrash)
+        );
+        app.move_rail_selection(99);
+        let (index, tick, kind) = app.rail_selection.expect("selection set");
+        assert_eq!(
+            (index, tick, kind),
+            (2, 30, NarrativeEventKind::CombatSurge)
+        );
+        app.move_rail_selection(-1);
+        let (index, _, _) = app.rail_selection.expect("selection set");
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn narrative_rail_wrap_aged_out_selection_clamps_loudly() {
+        let world = command_characterization_world();
+        rail_test_app!(world, app, backend);
+        app.snapshot.narrative = vec![
+            rail_record(10, NarrativeEventKind::PopulationCrash, "old"),
+            rail_record(20, NarrativeEventKind::PopulationBoom, "newer"),
+        ];
+        app.rail_selection = Some((0, 10, NarrativeEventKind::PopulationCrash));
+        // The ring wraps: both retained events are newer than the selection.
+        app.snapshot.narrative = vec![
+            rail_record(50, NarrativeEventKind::CombatSurge, "fresh"),
+            rail_record(60, NarrativeEventKind::RegimeChange, "freshest"),
+        ];
+        app.snapshot.narrative_dropped = 2;
+        app.validate_rail_selection();
+        let (index, tick, kind) = app.rail_selection.expect("selection clamped, not dropped");
+        assert_eq!(
+            (index, tick, kind),
+            (1, 60, NarrativeEventKind::RegimeChange),
+            "an aged-out selection must clamp to the newest live event"
+        );
+        assert!(
+            app.rail_selection_aged_out,
+            "the wrap must be said out loud"
+        );
+
+        let mut terminal = Terminal::new(backend).expect("rail test backend");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("aged-out frame renders without panic");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("aged out"),
+            "detail pane must report the aged-out selection; buffer:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrative_rail_empty_renders_without_claiming_events() {
+        let world = command_characterization_world();
+        rail_test_app!(world, app, backend);
+        app.snapshot.narrative.clear();
+        app.snapshot.narrative_dropped = 0;
+        let mut terminal = Terminal::new(backend).expect("rail test backend");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("empty rail renders");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("no narrative events yet"),
+            "empty rail must say so; buffer:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrative_rail_render_is_read_only() {
+        let world = command_characterization_world();
+        let before = {
+            let guard = world.lock().expect("world lock");
+            guard.characterization_digest_v0().expect("digest before")
+        };
+        rail_test_app!(world, app, backend);
+        app.snapshot.narrative = vec![
+            rail_record(10, NarrativeEventKind::PopulationCrash, "a"),
+            rail_record(20, NarrativeEventKind::PopulationBoom, "b"),
+        ];
+        app.snapshot.narrative_dropped = 3;
+        let mut terminal = Terminal::new(backend).expect("rail test backend");
+        for _ in 0..16 {
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("repeated rail renders");
+        }
+        app.move_rail_selection(-1);
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("selection render");
+        let after = {
+            let guard = world.lock().expect("world lock");
+            guard.characterization_digest_v0().expect("digest after")
+        };
+        assert_eq!(
+            before, after,
+            "rendering and navigating the rail must not perturb the world: an \
+             instrument that changes what it observes is not an instrument"
+        );
+    }
+
+    /// Drive a seeded world through forced boom/crash cycles until the narrative
+    /// ring holds at least `target` events (bounded), then return the world. Each
+    /// cycle spans 210 ticks so the per-kind 200-tick cooldown allows a fresh
+    /// crash and boom per cycle.
+    fn narrative_e2e_world(target: usize) -> SharedWorld {
+        let config = ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            bot_speed: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.0,
+            persistence_interval: 0,
+            chart_flush_interval: 0,
+            narrative_interval: 1,
+            narrative_capacity: 64,
+            rng_seed: Some(0xE2E2_4A11),
+            ..ScriptBotsConfig::default()
+        };
+        let world = Arc::new(std::sync::Mutex::new(
+            WorldState::new(config).expect("narrative e2e world"),
+        ));
+        for cycle in 0..24 {
+            {
+                let mut guard = world.lock().expect("world lock");
+                if guard.narrative_events().len() >= target {
+                    break;
+                }
+                // Scale the injection with the accumulated population so every boom
+                // stays above the narrative policy's materiality floor.
+                let to_inject = guard.agent_count() / 2 + 10;
+                for _ in 0..to_inject {
+                    guard
+                        .try_inject_agent(AgentData::default())
+                        .expect("e2e injection is finite");
+                }
+            }
+            for _ in 0..40 {
+                let mut guard = world.lock().expect("world lock");
+                guard.step().expect("e2e boom step");
+            }
+            {
+                let mut guard = world.lock().expect("world lock");
+                let handles: Vec<AgentId> = guard.agents().iter_handles().collect();
+                for id in handles {
+                    guard
+                        .try_update_agent_runtime(id, |runtime| {
+                            runtime.energy = -1.0;
+                        })
+                        .expect("starve e2e population");
+                }
+            }
+            for _ in 0..170 {
+                let mut guard = world.lock().expect("world lock");
+                guard.step().expect("e2e crash step");
+            }
+            let _ = cycle;
+        }
+        world
+    }
+
+    #[test]
+    fn narrative_rail_e2e_snapshot_matches_the_worlds_ring() {
+        let world = narrative_e2e_world(20);
+        let (world_ticks, world_dropped) = {
+            let guard = world.lock().expect("world lock");
+            assert!(
+                guard.narrative_events().len() >= 20,
+                "e2e fixture must produce at least 20 narrative events, found {}",
+                guard.narrative_events().len()
+            );
+            (
+                guard
+                    .narrative_events()
+                    .iter()
+                    .map(|event| (event.tick.0, event.kind))
+                    .collect::<Vec<_>>(),
+                guard.narrative_dropped_events(),
+            )
+        };
+
+        rail_test_app!(world, app, _backend);
+        let snapshot_sequence: Vec<(u64, NarrativeEventKind)> = app
+            .snapshot
+            .narrative
+            .iter()
+            .map(|event| (event.tick.0, event.kind))
+            .collect();
+        assert_eq!(
+            snapshot_sequence, world_ticks,
+            "the TUI rail must show the world's events in the world's order"
+        );
+        assert_eq!(
+            app.snapshot.narrative_dropped, world_dropped,
+            "the TUI rail must report the world's exact dropped count"
         );
     }
 

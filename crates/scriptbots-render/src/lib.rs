@@ -12,6 +12,9 @@ use gpui::{
 use gpui_platform::application;
 use rand::Rng;
 use scriptbots_core::PresetKind;
+use scriptbots_core::narrative::{
+    EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord,
+};
 use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime, AgentUid,
@@ -1786,6 +1789,18 @@ struct SimulationView {
     brain_client_id: BrainInspectionClientId,
     brain_request_revision: BrainInspectionRevision,
     brain_inspection_cache: Option<BrainInspectorCapture>,
+    /// Narrative rail visibility (bd-16g.2.4); toggled from the rail header.
+    rail_visible: bool,
+    /// Selected event index into the retained narrative, plus the selected event's
+    /// identity so a ring wrap that drops it is detected rather than silently
+    /// re-pointing the selection at a different event.
+    rail_selection: Option<(usize, u64, NarrativeEventKind)>,
+    /// Set when the ring dropped the user's selected event; cleared on the next
+    /// explicit selection.
+    rail_selection_aged_out: bool,
+    /// One-shot latches for the rail's logging contract.
+    rail_logged_first_show: bool,
+    rail_warned_aged_out: bool,
 }
 impl SimulationView {
     fn new(
@@ -1845,6 +1860,11 @@ impl SimulationView {
             ),
             brain_request_revision: BrainInspectionRevision::new(0),
             brain_inspection_cache: None,
+            rail_visible: true,
+            rail_selection: None,
+            rail_selection_aged_out: false,
+            rail_logged_first_show: false,
+            rail_warned_aged_out: false,
         }
     }
 
@@ -2344,6 +2364,9 @@ impl SimulationView {
                 let config = world.config();
                 snapshot.world_size = (config.world_width, config.world_height);
                 snapshot.history_capacity = config.history_capacity;
+                snapshot.narrative = world.narrative_events().iter().cloned().collect();
+                snapshot.narrative_dropped = world.narrative_dropped_events();
+                snapshot.narrative_capacity = config.narrative_capacity;
                 snapshot.render_frame = RenderFrame::from_world(&world, self.accessibility.palette);
 
                 let mut ring: VecDeque<TickSummary> = VecDeque::with_capacity(12);
@@ -3232,6 +3255,193 @@ impl SimulationView {
             .gap_3()
             .child(header)
             .children(rows)
+    }
+
+    /// The narrative rail (bd-16g.2.4): a read-only projection of `RunNarrative`
+    /// along the bottom of the canvas — one glyph per retained event, coloured by
+    /// the shared core rail model (the same table the TUI reads), click to select.
+    /// STAGE 1 of the seek contract: selection never moves the simulation clock.
+    fn render_narrative_rail(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
+        let events = &snapshot.narrative;
+        let mut rail = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(0x111c33))
+            .border_1()
+            .border_color(rgb(0x24334f));
+
+        let mut header_row = div().flex().justify_between().items_center().child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x94a3b8))
+                .child("Timeline — run history (select-only; rewind needs replay bd-2z0.5.3)"),
+        );
+        let toggle_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.rail_visible = !this.rail_visible;
+            cx.notify();
+        });
+        header_row = header_row.child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x60a5fa))
+                .cursor_pointer()
+                .child("hide")
+                .on_mouse_down(MouseButton::Left, toggle_listener),
+        );
+        rail = rail.child(header_row);
+
+        if events.is_empty() {
+            return rail.child(div().text_xs().text_color(rgb(0x64748b)).child(
+                "no narrative events yet — the run's story will appear here as it happens",
+            ));
+        }
+
+        // Glyph row: an explicit truncation marker first, then one clickable glyph
+        // per retained event with the selection highlighted. Bounded work: at most
+        // `narrative_capacity` cells, reusing the retained slice directly.
+        let selection = self
+            .rail_selection
+            .map_or(events.len() - 1, |(index, _, _)| {
+                index.min(events.len() - 1)
+            });
+        let mut glyph_row = div().flex().gap_1().items_center().flex_wrap();
+        if snapshot.narrative_dropped > 0 {
+            glyph_row = glyph_row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(format!("+{}…", snapshot.narrative_dropped)),
+            );
+        }
+        for (index, event) in events.iter().enumerate() {
+            let [r, g, b] = event.kind.rail_rgb();
+            let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+            let selected = index == selection;
+            let listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                this.select_rail_event(index);
+                cx.notify();
+            });
+            let mut glyph = div()
+                .cursor_pointer()
+                .text_sm()
+                .text_color(rgb(color))
+                .child(event.kind.rail_glyph().to_string());
+            if selected {
+                glyph = glyph
+                    .rounded_sm()
+                    .bg(rgb(0x24334f))
+                    .border_1()
+                    .border_color(rgb(color));
+            }
+            glyph_row = glyph_row.child(glyph.on_mouse_down(MouseButton::Left, listener));
+        }
+        rail = rail.child(glyph_row);
+
+        // Detail line: the selected event's full text, plus the honest markers.
+        let selected_event = &events[selection];
+        let aged_out = if self.rail_selection_aged_out {
+            " | selected event aged out of the ring"
+        } else {
+            ""
+        };
+        let truncated = if snapshot.narrative_dropped > 0 {
+            format!(
+                " | {} earlier events dropped — this is a TAIL of the run's history",
+                snapshot.narrative_dropped
+            )
+        } else {
+            String::new()
+        };
+        rail = rail.child(div().text_xs().text_color(rgb(0xe2e8f0)).child(format!(
+            "tick {} | {} | severity {:.2} — {}{aged_out}{truncated}",
+            selected_event.tick.0,
+            selected_event.kind.as_str(),
+            selected_event.severity,
+            selected_event.human_text
+        )));
+        rail
+    }
+
+    /// Select a rail event by index, clamped to the retained events. A fresh
+    /// selection clears the aged-out marker (bd-16g.2.4).
+    fn select_rail_event(&mut self, index: usize) {
+        let events_len = {
+            let world = self.world.lock().expect("world mutex poisoned");
+            world.narrative_events().len()
+        };
+        if events_len == 0 {
+            self.rail_selection = None;
+            return;
+        }
+        let clamped = index.min(events_len - 1);
+        let (tick, kind) = {
+            let world = self.world.lock().expect("world mutex poisoned");
+            let event = &world.narrative_events()[clamped];
+            (event.tick.0, event.kind)
+        };
+        self.rail_selection = Some((clamped, tick, kind));
+        self.rail_selection_aged_out = false;
+        self.rail_warned_aged_out = false;
+        tracing::debug!(
+            target = "scriptbots::timeline",
+            event_index = clamped,
+            event_tick = tick,
+            event_kind = kind.as_str(),
+            "narrative rail selection moved"
+        );
+    }
+
+    /// Keep the rail selection pointing at a live event. The ring can drop the
+    /// very event the user selected; that must clamp loudly, never index into a
+    /// dropped slot (bd-16g.2.4).
+    fn validate_rail_selection(&mut self, snapshot: &HudSnapshot) {
+        let Some((index, tick, kind)) = self.rail_selection else {
+            return;
+        };
+        let events = &snapshot.narrative;
+        let still_live = events
+            .get(index)
+            .is_some_and(|event| event.tick.0 == tick && event.kind == kind);
+        if still_live {
+            return;
+        }
+        if events.is_empty() {
+            self.rail_selection = None;
+        } else {
+            let newest = events.len() - 1;
+            self.rail_selection = Some((newest, events[newest].tick.0, events[newest].kind));
+        }
+        self.rail_selection_aged_out = true;
+        if !self.rail_warned_aged_out {
+            self.rail_warned_aged_out = true;
+            tracing::warn!(
+                target = "scriptbots::timeline",
+                event_tick = tick,
+                dropped_count = snapshot.narrative_dropped,
+                "selected narrative event was dropped by the bounded ring"
+            );
+        }
+    }
+
+    /// The rail's first-show logging contract (bd-16g.2.4): one line from which a
+    /// reader can tell whether they are looking at a complete history or a tail.
+    fn maybe_log_rail_first_show(&mut self, snapshot: &HudSnapshot) {
+        if !self.rail_visible || self.rail_logged_first_show || snapshot.narrative.is_empty() {
+            return;
+        }
+        self.rail_logged_first_show = true;
+        tracing::info!(
+            target = "scriptbots::timeline",
+            retained_events = snapshot.narrative.len(),
+            dropped_events = snapshot.narrative_dropped,
+            capacity = snapshot.narrative_capacity,
+            oldest_tick = snapshot.narrative.first().map_or(0, |event| event.tick.0),
+            newest_tick = snapshot.narrative.last().map_or(0, |event| event.tick.0),
+            "narrative rail first shown"
+        );
     }
 
     fn render_canvas(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
@@ -9106,6 +9316,8 @@ impl Render for SimulationView {
 
         // Update per-agent brain output history from the current inspector focus
         self.update_brain_history(&snapshot);
+        self.validate_rail_selection(&snapshot);
+        self.maybe_log_rail_first_show(&snapshot);
 
         let mut content = if self.minimal_canvas_mode {
             // Dedicated window: render only canvas + overlay and skip heavy HUD sections
@@ -9143,6 +9355,9 @@ impl Render for SimulationView {
                         .child(self.render_inspector(&snapshot, cx));
                     canvas_row.style().align_items = Some(AlignItems::Stretch);
                     canvas_row
+                })
+                .when(self.rail_visible, |content| {
+                    content.child(self.render_narrative_rail(&snapshot, cx))
                 })
                 .child(self.render_footer(&snapshot))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -9392,6 +9607,12 @@ struct HudSnapshot {
     inspector: InspectorSnapshot,
     controls: ControlsSnapshot,
     perf: PerfSnapshot,
+    /// The run's retained narrative events, oldest first (bd-16g.2.4 rail).
+    narrative: Vec<NarrativeEventRecord>,
+    /// Events the bounded narrative ring has discarded so far.
+    narrative_dropped: u64,
+    /// The narrative ring's configured capacity.
+    narrative_capacity: usize,
 }
 
 #[derive(Default, Clone)]
@@ -14205,6 +14426,110 @@ mod command_characterization_tests {
         view.sim_accumulator = 0.0;
         view.last_sim_instant =
             Some(Instant::now() - Duration::from_secs_f32(SIM_TICK_INTERVAL * 1.25));
+    }
+
+    /// Mirror of the TUI-side e2e fixture (bd-16g.2.4): forced boom/crash cycles
+    /// until the narrative ring holds at least `target` events. Both surfaces read
+    /// the same ring, so pinning each surface to the ring proves parity.
+    fn narrative_e2e_world(target: usize) -> Arc<Mutex<WorldState>> {
+        let config = ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            bot_speed: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.0,
+            persistence_interval: 0,
+            chart_flush_interval: 0,
+            narrative_interval: 1,
+            narrative_capacity: 64,
+            rng_seed: Some(0xE2E2_4A11),
+            ..ScriptBotsConfig::default()
+        };
+        let world = Arc::new(std::sync::Mutex::new(
+            WorldState::new(config).expect("narrative e2e world"),
+        ));
+        for _ in 0..24 {
+            {
+                let mut guard = world.lock().expect("world lock");
+                if guard.narrative_events().len() >= target {
+                    break;
+                }
+                // Scale the injection with the accumulated population so every boom
+                // stays above the narrative policy's materiality floor.
+                let to_inject = guard.agent_count() / 2 + 10;
+                for _ in 0..to_inject {
+                    guard
+                        .try_inject_agent(AgentData::default())
+                        .expect("e2e injection is finite");
+                }
+            }
+            for _ in 0..40 {
+                let mut guard = world.lock().expect("world lock");
+                guard.step().expect("e2e boom step");
+            }
+            {
+                let mut guard = world.lock().expect("world lock");
+                let handles: Vec<AgentId> = guard.agents().iter_handles().collect();
+                for id in handles {
+                    guard
+                        .try_update_agent_runtime(id, |runtime| {
+                            runtime.energy = -1.0;
+                        })
+                        .expect("starve e2e population");
+                }
+            }
+            for _ in 0..170 {
+                let mut guard = world.lock().expect("world lock");
+                guard.step().expect("e2e crash step");
+            }
+        }
+        world
+    }
+
+    #[test]
+    fn narrative_rail_e2e_snapshot_matches_the_worlds_ring() {
+        let world = narrative_e2e_world(20);
+        let (world_ticks, world_dropped) = {
+            let guard = world.lock().expect("world lock");
+            assert!(
+                guard.narrative_events().len() >= 20,
+                "e2e fixture must produce at least 20 narrative events, found {}",
+                guard.narrative_events().len()
+            );
+            (
+                guard
+                    .narrative_events()
+                    .iter()
+                    .map(|event| (event.tick.0, event.kind))
+                    .collect::<Vec<_>>(),
+                guard.narrative_dropped_events(),
+            )
+        };
+
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let mut view = simulation_view(Arc::clone(&world), drain);
+        view.drives_simulation = false;
+        let snapshot = view.snapshot();
+        let snapshot_sequence: Vec<(u64, NarrativeEventKind)> = snapshot
+            .narrative
+            .iter()
+            .map(|event| (event.tick.0, event.kind))
+            .collect();
+        assert_eq!(
+            snapshot_sequence, world_ticks,
+            "the GPU lab rail must show the world's events in the world's order"
+        );
+        assert_eq!(
+            snapshot.narrative_dropped, world_dropped,
+            "the GPU lab rail must report the world's exact dropped count"
+        );
     }
 
     #[test]
