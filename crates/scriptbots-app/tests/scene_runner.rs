@@ -25,7 +25,9 @@ fn load_all() -> Vec<SceneManifest> {
         })
         .collect();
     manifests.sort_by(|a, b| a.name.cmp(&b.name));
-    assert_eq!(manifests.len(), 5, "all five reference scenes load");
+    // Five bd-2z0.14.3.5.1 reference scenes plus the bd-2z0.14.3.4 offscreen
+    // smoke scene; the count is explicit so a dropped scene fails loudly.
+    assert_eq!(manifests.len(), 6, "all six reference scenes load");
     manifests
 }
 

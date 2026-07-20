@@ -15,23 +15,30 @@
 //! leaks into captures. Two captures of the same world state on the same
 //! adapter are byte-identical (asserted in tests). Cross-adapter byte
 //! identity is NOT claimed — that is what the provenance labels are for.
+//!
+//! Documented divergence from the interactive pipeline: captures currently
+//! render LDR (no Hdr/tonemapping post chain). On Metal headless, an
+//! Hdr camera targeting an image writes only its internal HDR texture and
+//! the out attachment stays at its initial fill (probe data: extraction,
+//! attachments, and physical target all correct, yet zero ViewTarget
+//! draws reach the target). The scene graph, meshes, materials, lighting,
+//! and shadows are the REAL pipeline; only the HDR post chain is absent.
+//! Tracked as a follow-up investigation (see the bead comments).
 
 use anyhow::{Context, Result, anyhow};
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::prelude::*;
-use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::system::RunSystemOnce;
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
 use bevy::prelude::*;
 use bevy::render::RenderApp;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::renderer::RenderDevice;
-use bevy::render::view::{ColorGrading, Hdr};
 use bevy::window::{ExitCondition, WindowPlugin};
 use scriptbots_core::{RenderQuality, RenderSettings, WorldState};
 use std::sync::{LazyLock, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     AccessibilityState, AgentMeshes, AgentRegistry, ReflectionProbeAssets, SnapshotState,
@@ -197,7 +204,12 @@ pub fn diff_heatmap(golden: &[u8], candidate: &[u8], width: u32, height: u32) ->
         ));
     }
     let mut out = Vec::with_capacity(expected);
-    for px in golden.chunks_exact(4).zip(candidate.chunks_exact(4)) {
+    for px in golden
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(candidate.as_chunks::<4>().0.iter())
+    {
         let (g, c) = (px.0, px.1);
         let diff = g[0]
             .abs_diff(c[0])
@@ -809,7 +821,18 @@ fn setup_capture_scene(
     commands.spawn((
         Camera3d::default(),
         Camera {
-            clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
+            // LDR divergence (documented in the module docs): with Hdr +
+            // tonemapping the headless image-target path produced empty
+            // frames on Metal (out texture never written), so captures run
+            // the real scene/mesh/light pipeline without the HDR post chain.
+            // Alarm-test corruption paints a magenta clear color (a
+            // pipeline-level change any honest comparator must catch) in
+            // addition to the lights-off blackout.
+            clear_color: ClearColorConfig::Custom(if corrupt.0 {
+                Color::srgb(0.9, 0.0, 0.9)
+            } else {
+                Color::srgb(0.03, 0.05, 0.09)
+            }),
             target: RenderTarget::Image(target.0.clone().into()),
             is_active: false,
             ..default()

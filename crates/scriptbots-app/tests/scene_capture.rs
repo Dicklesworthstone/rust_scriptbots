@@ -213,7 +213,7 @@ fn golden_workflow_pass_regen_missing() {
 
     // 4. Tampered candidate: mismatch with a written heatmap.
     let mut tampered = frame.clone();
-    for px in tampered.rgba8.chunks_exact_mut(4).take(4096) {
+    for px in tampered.rgba8.as_chunks_mut::<4>().0.iter_mut().take(4096) {
         px[0] = px[0].wrapping_add(64);
     }
     let outcome = process_golden(&tampered, &golden, false).expect("mismatch workflow");

@@ -1044,7 +1044,6 @@ pub fn process_golden(
 
 /// FNV-1a64 hex over bytes (the headless evidence hash family).
 #[must_use]
-#[must_use]
 pub fn fnv1a64_hex(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
