@@ -15,6 +15,8 @@ use scriptbots_brain::BrainKind;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
+pub use execution::{MatchRunReport, run_match};
+
 /// Largest match count one spec may emit (orders × seeds). Guards the factorial policy
 /// from scheduling an untestable tournament by accident.
 const MAX_MATCHES: usize = 4_096;
@@ -499,5 +501,301 @@ mod tests {
                 "each family leads exactly twice"
             );
         }
+    }
+}
+
+/// Match execution and outcome computation.
+pub mod execution {
+    use super::{
+        FamilyOutcome, MatchOutcome, MatchPlan, TournamentError,
+    };
+    use scriptbots_brain::BrainKind;
+    use scriptbots_core::{
+        AgentData, BrainBinding, ScriptBotsConfig, WorldState,
+    };
+    use std::collections::BTreeMap;
+
+    /// A completed match: the outcome plus the config digest it ran under, so every arm
+    /// can be checked against the plan's digest before anyone reads a leaderboard.
+    #[derive(Debug, Clone)]
+    pub struct MatchRunReport {
+        pub outcome: MatchOutcome,
+        pub config_digest: String,
+    }
+
+    /// Register exactly the families the spec entered. Unknown family names are a typed
+    /// error, never a silent substitution.
+    fn register_entered_families(
+        world: &mut WorldState,
+        families: &[BrainKind],
+    ) -> Result<BTreeMap<BrainKind, u64>, TournamentError> {
+        let mut keys = BTreeMap::new();
+        for family in families {
+            let name = family.as_str();
+            // Exact built-in names, or any name with the family's dotted prefix — the
+            // null-tournament bias probe needs one adapter under two names ("mlp.a",
+            // "mlp.b") to prove the harness itself adds no signal.
+            let resolves = |prefix: &str| name == prefix || name.starts_with(&format!("{prefix}."));
+            let key = if resolves("mlp") {
+                world.register_brain_family(
+                    name,
+                    Box::new(scriptbots_brain::mlp::MlpBrainFamily::new()),
+                )
+            } else if resolves("dwraon") {
+                world.register_brain_family(
+                    name,
+                    Box::new(scriptbots_brain::dwraon::DwraonFamilyAdapter::default()),
+                )
+            } else if resolves("assembly") {
+                world.register_brain_family(
+                    name,
+                    Box::new(
+                        scriptbots_brain::assembly::AssemblyFamilyAdapter::new()
+                            .map_err(|error| TournamentError::UnbalancedOrders {
+                                reason: format!("assembly adapter construction: {error}"),
+                            })?,
+                    ),
+                )
+            } else {
+                return Err(TournamentError::UnbalancedOrders {
+                    reason: format!(
+                        "no built-in adapter for entered family {name:?}; enter one of mlp.baseline, dwraon.baseline, assembly.experimental"
+                    ),
+                });
+            }
+            .map_err(|error| TournamentError::UnbalancedOrders {
+                reason: format!("registering family {name:?} failed: {error}"),
+            })?;
+            keys.insert(*family, key);
+        }
+        Ok(keys)
+    }
+
+    /// Deterministic cohort placement: spawn-order slot index drives the grid, so the
+    /// order effect is a measurement, not a nuisance. No RNG is touched.
+    fn cohort_grid_positions(
+        cohort_total: usize,
+        world_width: f32,
+        world_height: f32,
+    ) -> Vec<(f32, f32)> {
+        let cols = (cohort_total as f32).sqrt().ceil().max(1.0) as usize;
+        let rows = cohort_total.div_ceil(cols);
+        let spacing_x = world_width / (cols as f32 + 1.0);
+        let spacing_y = world_height / (rows as f32 + 1.0);
+        (0..cohort_total)
+            .map(|slot| {
+                let col = slot % cols;
+                let row = slot / cols;
+                (
+                    spacing_x * (col as f32 + 1.0),
+                    spacing_y * (row as f32 + 1.0),
+                )
+            })
+            .collect()
+    }
+
+    fn live_family_counts(world: &WorldState, family_keys: &BTreeMap<u64, BrainKind>) -> BTreeMap<BrainKind, usize> {
+        let mut counts = BTreeMap::new();
+        for id in world.agents().iter_handles() {
+            let Some(runtime) = world.agent_runtime(id) else {
+                continue;
+            };
+            let key = match &runtime.brain {
+                BrainBinding::Protocol { registry_key, .. } => Some(*registry_key),
+                BrainBinding::Legacy { registry_key, .. } => *registry_key,
+                BrainBinding::Unbound => None,
+            };
+            if let Some(family) = key.and_then(|key| family_keys.get(&key)) {
+                *counts.entry(*family).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    /// Execute one match headlessly and compute its outcome. The match world is
+    /// single-seeded (`plan.world_seed`), closed unless the caller says otherwise, and
+    /// independent of scheduling: `--jobs N` cannot change any number because every
+    /// match owns its own world and seed.
+    pub fn run_match(
+        plan: &MatchPlan,
+        ticks: u64,
+        closed: bool,
+        base_config: &ScriptBotsConfig,
+    ) -> Result<MatchRunReport, TournamentError> {
+        let mut config = base_config.clone();
+        config.rng_seed = Some(plan.world_seed);
+        config.closed = closed;
+        // The open-world lifeline is deliberately NOT touched: a tournament that sets
+        // closed=false must experience the respawner and carry the qualifier, or the
+        // warning would certify a respawn-inflated result as clean.
+        // The config digest arms the cross-arm drift guard: every arm must run the same
+        // effective configuration, and a mismatch anywhere must look like the bug it is.
+        let config_digest = blake3::hash(
+            serde_json::to_string(&config).map_err(|error| TournamentError::UnbalancedOrders {
+                reason: format!("config serialization for the digest failed: {error}"),
+            })?
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        let mut world = WorldState::new(config).map_err(|error| TournamentError::UnbalancedOrders {
+            reason: format!("match world construction failed: {error}"),
+        })?;
+
+        let mut family_keys: BTreeMap<BrainKind, u64> = BTreeMap::new();
+        for family in plan.spawn_order.iter() {
+            family_keys.extend(register_entered_families(&mut world, std::slice::from_ref(family))?);
+        }
+        let key_to_family: BTreeMap<u64, BrainKind> = family_keys
+            .iter()
+            .map(|(family, key)| (*key, *family))
+            .collect();
+
+        // Spawn the cohort in spawn order on a deterministic grid.
+        let cohort_total: usize = plan.cohort.values().sum();
+        let positions = cohort_grid_positions(
+            cohort_total,
+            world.config().world_width as f32,
+            world.config().world_height as f32,
+        );
+        let mut slot = 0_usize;
+        for family in &plan.spawn_order {
+            let key = family_keys[family];
+            let members = plan.cohort[family];
+            for _ in 0..members {
+                let (x, y) = positions[slot];
+                slot += 1;
+                let id = world
+                    .try_spawn_agent(AgentData {
+                        position: scriptbots_core::Position::new(x, y),
+                        ..AgentData::default()
+                    })
+                    .map_err(|error| TournamentError::UnbalancedOrders {
+                        reason: format!("cohort spawn failed at slot {slot}: {error}"),
+                    })?;
+                if !world
+                    .bind_agent_brain(id, key)
+                    .map_err(|error| TournamentError::UnbalancedOrders {
+                        reason: format!("cohort brain bind failed at slot {slot}: {error}"),
+                    })?
+                {
+                    return Err(TournamentError::UnbalancedOrders {
+                        reason: format!("brain bind returned false for family {}", family.as_str()),
+                    });
+                }
+            }
+        }
+
+        let mut extinct_at: BTreeMap<BrainKind, u64> = BTreeMap::new();
+        let mut ticks_run = 0_u64;
+        for tick in 1..=ticks {
+            world.step().map_err(|error| TournamentError::UnbalancedOrders {
+                reason: format!("match step {tick} failed: {error}"),
+            })?;
+            ticks_run = tick;
+            let counts = live_family_counts(&world, &key_to_family);
+            for family in &plan.spawn_order {
+                if counts.get(family).copied().unwrap_or(0) == 0 {
+                    extinct_at.entry(*family).or_insert(tick);
+                }
+            }
+        }
+
+        // Outcome from the final state.
+        let columns = world.agents().columns();
+        let generations = columns.generations();
+        let mut total_live = 0_usize;
+        let mut total_energy = 0.0_f64;
+        let mut family_live: BTreeMap<BrainKind, usize> = BTreeMap::new();
+        let mut family_energy: BTreeMap<BrainKind, f64> = BTreeMap::new();
+        let mut family_generations: BTreeMap<BrainKind, Vec<u32>> = BTreeMap::new();
+        for id in world.agents().iter_handles() {
+            let Some(idx) = world.agents().index_of(id) else {
+                continue;
+            };
+            let Some(runtime) = world.agent_runtime(id) else {
+                continue;
+            };
+            let key = match &runtime.brain {
+                BrainBinding::Protocol { registry_key, .. } => Some(*registry_key),
+                BrainBinding::Legacy { registry_key, .. } => *registry_key,
+                BrainBinding::Unbound => None,
+            };
+            let Some(family) = key.and_then(|key| key_to_family.get(&key)) else {
+                continue;
+            };
+            total_live += 1;
+            let energy = f64::from(runtime.energy.max(0.0));
+            total_energy += energy;
+            *family_live.entry(*family).or_insert(0) += 1;
+            *family_energy.entry(*family).or_insert(0.0) += energy;
+            family_generations
+                .entry(*family)
+                .or_default()
+                .push(generations[idx].0);
+        }
+
+        let mut per_family = BTreeMap::new();
+        for family in &plan.spawn_order {
+            let live = family_live.get(family).copied().unwrap_or(0);
+            let energy = family_energy.get(family).copied().unwrap_or(0.0);
+            let gens = family_generations.get(family);
+            let (mean_depth, max_depth) = gens.map_or((0.0, 0), |values| {
+                let mean = if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().map(|value| f64::from(*value)).sum::<f64>()
+                        / values.len() as f64
+                };
+                let max = values.iter().copied().max().unwrap_or(0);
+                (mean, max)
+            });
+            per_family.insert(
+                family.as_str().to_string(),
+                FamilyOutcome {
+                    survival_share: if total_live == 0 {
+                        0.0
+                    } else {
+                        live as f64 / total_live as f64
+                    },
+                    biomass_share: if total_energy <= 0.0 {
+                        0.0
+                    } else {
+                        energy / total_energy
+                    },
+                    mean_lineage_depth: mean_depth,
+                    max_lineage_depth: max_depth,
+                    extinct_at: extinct_at.get(family).copied(),
+                    novelty_coverage: None,
+                },
+            );
+        }
+
+        let mut warnings = Vec::new();
+        if !closed {
+            warnings.push(
+                "open-world respawn active; survival share includes respawned agents".to_owned(),
+            );
+        }
+        for family in &plan.spawn_order {
+            if let Some(tick) = extinct_at.get(family)
+                && *tick <= ticks / 10
+            {
+                warnings.push(format!(
+                    "family {} extinct at tick {tick} (<=10% of budget; likely a spawn bug, not a finding)",
+                    family.as_str()
+                ));
+            }
+        }
+
+        Ok(MatchRunReport {
+            outcome: MatchOutcome {
+                match_id: plan.match_id,
+                ticks_run,
+                per_family,
+                warnings,
+            },
+            config_digest,
+        })
     }
 }
