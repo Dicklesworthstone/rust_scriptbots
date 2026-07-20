@@ -177,7 +177,7 @@ impl AsyncReadLane {
                     .into_iter()
                     .next()
                     .map(|row| {
-                        Ok(PersistedTick {
+                        Ok::<_, FrankenError>(PersistedTick {
                             tick: u64::try_from(row.get_typed::<i64>(0)?)
                                 .map_err(|_| FrankenError::Internal("negative tick".into()))?,
                             epoch: u64::try_from(row.get_typed::<i64>(1)?)
