@@ -17922,7 +17922,14 @@ impl WorldState {
         // exact wire identity. Display kinds are insufficient: two adapters can share a label
         // while interpreting genome bytes differently. Legacy runners retain their kind gate.
         if let Some(partner_rt) = &partner_runtime {
-            let compatible = Self::brains_compatible(&parent_runtime, partner_rt);
+            let compatible = match (parent_runtime.brain.genome(), partner_rt.brain.genome()) {
+                (Some(parent), Some(partner)) => parent.family_id() == partner.family_id(),
+                (Some(_), None) | (None, Some(_)) => false,
+                (None, None) => {
+                    let parent_kind = parent_runtime.brain.kind();
+                    parent_kind.is_some() && parent_kind == partner_rt.brain.kind()
+                }
+            };
             if !compatible {
                 return Ok(None); // fall back to random spawn in caller
             }
@@ -19280,21 +19287,9 @@ impl WorldState {
         if rng.random_range(0.0..1.0) >= partner_chance {
             return None;
         }
-        // The species barrier applies to the whole child, not just the brain: a
-        // cross-kind partner must not blend runtime physiology, mutation rates, or
-        // lineage into a clone-brained child (bd-16g.13.2). Candidates are filtered
-        // by the same compatibility rule the scheduled crossover stage enforces.
-        let parent_runtime = self.runtime.get(handles[parent_idx]);
         let mut best: Option<(usize, u32, AgentUid)> = None;
         for (idx, age) in ages.iter().enumerate() {
             if idx == parent_idx {
-                continue;
-            }
-            let compatible = match (parent_runtime, self.runtime.get(handles[idx])) {
-                (Some(parent), Some(candidate)) => Self::brains_compatible(parent, candidate),
-                _ => false,
-            };
-            if !compatible {
                 continue;
             }
             let uid = self
@@ -19310,20 +19305,6 @@ impl WorldState {
             }
         }
         best.map(|(idx, _, _)| idx)
-    }
-
-    /// The species-barrier rule shared by the reproduction and scheduled-crossover
-    /// stages: protocol brains pair only within an exact wire family; legacy
-    /// runners retain their display-kind gate.
-    fn brains_compatible(parent: &AgentRuntime, partner: &AgentRuntime) -> bool {
-        match (parent.brain.genome(), partner.brain.genome()) {
-            (Some(parent), Some(partner)) => parent.family_id() == partner.family_id(),
-            (Some(_), None) | (None, Some(_)) => false,
-            (None, None) => {
-                let parent_kind = parent.brain.kind();
-                parent_kind.is_some() && parent_kind == partner.brain.kind()
-            }
-        }
     }
 
     fn refund_spawn_orders(&mut self, orders: &[SpawnOrder]) {
@@ -34199,6 +34180,8 @@ mod tests {
         );
 
         {
+            // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
+            #[allow(clippy::significant_drop_tightening)]
             let entries = logs.lock().unwrap();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].births, vec![insertion_record.clone()]);
@@ -35252,6 +35235,8 @@ mod tests {
 
         session.step(&mut world).expect("persistence fixture step");
 
+        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let batch = &entries[0];

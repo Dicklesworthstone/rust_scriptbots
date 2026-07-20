@@ -10,6 +10,18 @@
 //!   (never a blend, never a fresh node), with evaluator state reset, not inherited;
 //! * the mixed-kind barrier holds (a mismatched partner produces a same-kind clone);
 //! * changed-locus counts at a nonzero rate land inside an EXACT binomial tail
+
+// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
+// order and fixed-width casts are part of the science contract; fma fusion,
+// reassociation, or width changes alter world digests. The exact-binomial
+// statistician casts counts to f64 deliberately.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+#![allow(clippy::float_cmp, clippy::while_float)]
 //!   interval (mutation is neither dead nor total);
 //! * spawn determinism is independent of the ambient Rayon schedule.
 //!
@@ -21,7 +33,8 @@ use scriptbots_brain::mlp::MlpBrainFamily;
 use scriptbots_core::genome_diff::{LocusValue, diff_genomes};
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BirthOrigin, BrainFamilyAdapter, BrainFamilyCodec,
-    BrainGenomeEnvelope, MutationRates, Position, ScriptBotsConfig, WorldState,
+    BrainGenomeDerivation, BrainGenomeEnvelope, MutationRates, Position, ScriptBotsConfig,
+    WorldState,
 };
 
 const DWRAON_KIND: &str = "dwraon-baseline";
@@ -260,8 +273,8 @@ fn sexual_child_at_zero_mutation_is_a_per_node_bitwise_mix() {
         for (index, (locus, child_value)) in child_loci.iter().enumerate() {
             let (_, a_value) = &a_loci[index];
             let (_, b_value) = &b_loci[index];
-            let matches_a = locus_value_bit_eq(child_value, a_value);
-            let matches_b = locus_value_bit_eq(child_value, b_value);
+            let matches_a = locus_value_bit_eq(*child_value, *a_value);
+            let matches_b = locus_value_bit_eq(*child_value, *b_value);
             assert!(
                 matches_a || matches_b,
                 "heredity_proof: family={family} locus {} of child came from NEITHER parent \
@@ -306,7 +319,7 @@ fn sexual_child_at_zero_mutation_is_a_per_node_bitwise_mix() {
     for_each_family(case);
 }
 
-fn locus_value_bit_eq(left: &LocusValue, right: &LocusValue) -> bool {
+fn locus_value_bit_eq(left: LocusValue, right: LocusValue) -> bool {
     match (left, right) {
         (LocusValue::Scalar(a), LocusValue::Scalar(b)) => a.to_bits() == b.to_bits(),
         (LocusValue::Target(a), LocusValue::Target(b)) => a == b,
@@ -340,23 +353,38 @@ fn mixed_kind_mating_falls_back_to_same_kind_clone() {
         );
         (DWRAON_KIND, dwraon_parent)
     };
-    let child_family = genome_of(&world, child.id).family_id().clone();
+    let child_genome = genome_of(&world, child.id);
+    let child_family = child_genome.family_id().clone();
     assert_eq!(
         child_family.as_str(),
         parent_kind,
         "heredity_proof: mixed-kind pairing produced a child of family {child_family} — the \
          species barrier must preserve the reproducing parent's family, never a hybrid"
     );
+    // The barrier is brain-scoped by design (see the in-crate
+    // `incompatible_body_partner_does_not_fabricate_a_brain_crossover` test): a cross-kind
+    // body partner may blend runtime physiology and appear in the lineage record, but the
+    // child's brain must come from `clone_runner` — the genome provenance must never claim
+    // a crossover that did not happen.
     assert!(
-        child.parent_b.is_none(),
-        "heredity_proof: the species-barrier child carries a second parent — the barrier \
-         must clone (no cross-kind runtime blending or lineage), not cross"
+        !matches!(
+            child_genome.provenance().derivation,
+            BrainGenomeDerivation::Crossover | BrainGenomeDerivation::CrossoverThenMutation
+        ),
+        "heredity_proof: family={parent_kind} barrier child's genome provenance claims a \
+         crossover with a different brain family — `clone_runner` semantics broken"
     );
-    assert_bit_identical(
-        &*dyn_codec_for(parent_kind),
-        &genome_of(&world, parent_id),
-        &genome_of(&world, child.id),
-        parent_kind,
+    assert_eq!(
+        child_genome.provenance().parents[1],
+        None,
+        "heredity_proof: family={parent_kind} barrier child's genome records a second brain \
+         parent — a cross-kind partner must never enter the genome lineage"
+    );
+    assert_eq!(
+        child_genome.provenance().parent_genome_hashes[0],
+        Some(genome_of(&world, parent_id).material_hash()),
+        "heredity_proof: family={parent_kind} barrier child does not derive from the \
+         reproducing parent's genome — the spawn path substituted a fresh brain"
     );
 }
 
@@ -370,7 +398,9 @@ struct ExactBinomial {
 
 impl ExactBinomial {
     /// Probability mass function over the numerically relevant support, returned as
-    /// (start_k, weights) where weights[i] = P(X = start_k + i).
+    /// (start_k, weights) where `weights[i]` = P(X = start_k + i).
+    ///
+    /// `f64` accumulation error bounds the exactness.
     fn pmf_support(&self) -> (u64, Vec<f64>) {
         let n = self.n;
         let p = self.p;
@@ -409,7 +439,10 @@ impl ExactBinomial {
         (start, down)
     }
 
-    /// P(X <= x), exact up to f64 accumulation error.
+    /// P(X <= x), exact up to `f64` accumulation error.
+    // bd-tqpj: retained as the method-level counterpart of the free `support_cdf`
+    // used below; kept for future exact-tail assertions.
+    #[allow(dead_code)]
     fn cdf(&self, x: u64) -> f64 {
         let (start, weights) = self.pmf_support();
         let mut mass = 0.0;
