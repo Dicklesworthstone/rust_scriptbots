@@ -1704,7 +1704,7 @@ fn scenario_config_hash(brain_family: GateBrainFamily) -> GateResult<String> {
 }
 
 fn build_perf_world(agents: usize, brain_family: GateBrainFamily) -> GateResult<WorldState> {
-    let mut world = WorldState::new(perf_config()).map_err(ToString::to_string)?;
+    let mut world = WorldState::new(perf_config()).map_err(|error| error.to_string())?;
     let brain_key = brain_family.register(&mut world)?;
     for ordinal in 0..agents {
         let x = (ordinal % 800) as f32;

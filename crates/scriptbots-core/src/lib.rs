@@ -1267,7 +1267,7 @@ pub fn apply_control_command(
             Ok(ControlDisposition::WorldApplied)
         }
         ControlCommand::UpdateSelection(update) => {
-            world.apply_selection_update(update);
+            let _ = world.apply_selection_update(update);
             Ok(ControlDisposition::WorldApplied)
         }
         ControlCommand::UpdateSimulation(update) => {
@@ -4156,7 +4156,10 @@ pub const MAX_COHORT_INJECTION: u32 = 1_024;
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum CohortSource {
     /// Bind every cohort member to the brain family registered under this registry key.
-    RegisteredBrain { key: u64 },
+    RegisteredBrain {
+        /// Registry key of the pre-registered brain family to bind.
+        key: u64,
+    },
 }
 
 /// How cohort positions are sampled without consuming world RNG.
@@ -4165,7 +4168,12 @@ pub enum CohortSource {
 pub enum Placement {
     /// Uniform sampling inside the region, driven by the carried seed. The seed IS the
     /// domain: no world RNG stream is consumed, so replay reproduces the cohort exactly.
-    Seeded { region: Region, seed: u64 },
+    Seeded {
+        /// Region the cohort is sampled inside.
+        region: Region,
+        /// Seed driving the sampling; carried so replay reproduces the cohort exactly.
+        seed: u64,
+    },
 }
 
 impl Placement {
@@ -35419,7 +35427,7 @@ mod tests {
         ));
 
         // Clearing specific ids
-        world.apply_selection_update(SelectionUpdate {
+        let _ = world.apply_selection_update(SelectionUpdate {
             mode: SelectionMode::Add,
             agent_ids: vec![raw_a, raw_b],
             state: SelectionState::Selected,
@@ -35455,7 +35463,7 @@ mod tests {
         world.agent_runtime_mut(id_b).unwrap().herbivore_tendency = 0.1;
         world.agent_runtime_mut(id_b).unwrap().energy = 5.0;
 
-        world.apply_selection_update(SelectionUpdate {
+        let _ = world.apply_selection_update(SelectionUpdate {
             mode: SelectionMode::Replace,
             agent_ids: vec![id_a.data().as_ffi()],
             state: SelectionState::Selected,
