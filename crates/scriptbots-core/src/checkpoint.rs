@@ -2574,6 +2574,7 @@ mod tests {
     use crate::tests::{
         boxed_fixture_brain_family, boxed_fixture_brain_family_with_behavior_probe,
     };
+    use crate::{BrainGenomeDerivation, LocomotionModel};
     use rand::RngCore;
     use std::sync::{
         Arc,
