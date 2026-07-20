@@ -16868,6 +16868,8 @@ impl WorldState {
     ///
     /// Applied in queue order, which is the order they were enqueued: the same
     /// command sequence against the same seed produces the same world.
+    // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
+    #[allow(clippy::too_many_lines)]
     fn stage_interventions(&mut self) -> ResourceAmounts {
         let mut rejected = ResourceAmounts::default();
         let queued = std::mem::take(&mut self.pending_interventions);
@@ -19595,6 +19597,8 @@ impl WorldState {
             value.clamp(min, max)
         }
     }
+    // bd-tqpj: ~600-line cadence batch assembly; reviewed as a unit per lint policy.
+    #[allow(clippy::too_many_lines)]
     fn prepare_persistence(
         &mut self,
         next_tick: Tick,
