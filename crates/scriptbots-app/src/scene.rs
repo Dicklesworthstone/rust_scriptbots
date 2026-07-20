@@ -12,7 +12,7 @@
 //! run facts on every machine (timings excluded by convention).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState, parse_render_quality};
@@ -526,6 +526,114 @@ impl SceneDriver for NullDriver {
     }
 }
 
+/// Shared grid seeding for world-backed drivers: `count` agents in a
+/// deterministic square lattice with combat-capable spike lengths.
+fn seed_grid(world: &mut WorldState, count: u32) -> Result<(), SceneError> {
+    let cols = (count as f32).sqrt().ceil() as u32;
+    for index in 0..count {
+        let mut agent = AgentData::default();
+        agent.position.x = 60.0 + (index % cols) as f32 * 120.0;
+        agent.position.y = 60.0 + (index / cols) as f32 * 120.0;
+        agent.spike_length = 10.0;
+        world.try_spawn_agent(agent).map_err(|error| SceneError {
+            problems: vec![format!("seed agent {index}: {error}")],
+        })?;
+    }
+    Ok(())
+}
+
+/// Rolling per-tick summary state for event/cue fact collection (shared by
+/// the terminal and offscreen drivers so both emit identical facts).
+#[derive(Default)]
+struct TickFactTracker {
+    last_births: usize,
+    last_deaths: usize,
+    last_spike_hits: u32,
+}
+
+/// Collect agent-count, event, and cue facts for one completed tick.
+fn collect_tick_facts(
+    world: &WorldState,
+    tick: u64,
+    facts: &mut SceneRunFacts,
+    tracker: &mut TickFactTracker,
+) {
+    facts.agent_counts.push(world.agent_count());
+    if let Some(summary) = world.history().next_back() {
+        if summary.births > tracker.last_births && !facts.events.iter().any(|(k, _)| k == "birth") {
+            facts.events.push(("birth".to_string(), tick));
+        }
+        if summary.deaths > tracker.last_deaths && !facts.events.iter().any(|(k, _)| k == "death") {
+            facts.events.push(("death".to_string(), tick));
+        }
+        if summary.spike_hits > tracker.last_spike_hits
+            && !facts.events.iter().any(|(k, _)| k == "spike_hit")
+        {
+            facts.events.push(("spike_hit".to_string(), tick));
+        }
+        tracker.last_births = summary.births;
+        tracker.last_deaths = summary.deaths;
+        tracker.last_spike_hits = summary.spike_hits;
+    }
+    // Cue observations mirror the shared event->cue table: every observed
+    // world event maps to exactly one cue family.
+    for (kind, at) in facts.events.clone() {
+        if at == tick {
+            let cue_kind = match kind.as_str() {
+                "birth" => "sparkle",
+                "death" => "wilt",
+                "spike_hit" => "spark_cone",
+                _ => "nibble",
+            };
+            if !facts.cues.iter().any(|(c, _)| c == cue_kind) {
+                facts.cues.push((cue_kind.to_string(), tick));
+            }
+        }
+    }
+}
+
+/// Resolve a stable agent UID to its world position (camera follow targets).
+#[cfg(feature = "bevy_render")]
+fn agent_world_position(world: &WorldState, uid: u64) -> Option<[f32; 2]> {
+    world
+        .agents()
+        .iter()
+        .find(|(id, _)| world.agent_uid(id).is_some_and(|u| u.get() == uid))
+        .map(|(_, agent)| [agent.position.x, agent.position.y])
+}
+
+/// The camera pose for one tick: the latest keyframe at or before `tick`,
+/// falling back to the classic 3/4 overview. `pos` is Bevy space (world X-Z
+/// ground plane, +Y up); the look target is the followed agent (converted
+/// into Bevy space) or a yaw/pitch ray from `pos`.
+#[cfg(feature = "bevy_render")]
+fn camera_pose_at(manifest: &SceneManifest, tick: u64, world: &WorldState) -> ([f32; 3], [f32; 3], f32) {
+    let Some(key) = manifest.camera.iter().rev().find(|key| key.tick <= tick) else {
+        return ([0.0, 1800.0, 1400.0], [0.0, 0.0, 0.0], 55.0);
+    };
+    if let Some(uid) = key.follow_uid
+        && let Some([x, y]) = agent_world_position(world, uid)
+    {
+        let config = world.config();
+        let look_at = [
+            x - config.world_width as f32 * 0.5,
+            0.0,
+            y - config.world_height as f32 * 0.5,
+        ];
+        return (key.pos, look_at, key.fov);
+    }
+    // No follow target: yaw/pitch define the look direction.
+    let (sin_yaw, cos_yaw) = key.yaw.sin_cos();
+    let (sin_pitch, cos_pitch) = key.pitch.sin_cos();
+    let dir = [cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw];
+    let look_at = [
+        key.pos[0] + dir[0] * 1000.0,
+        key.pos[1] + dir[1] * 1000.0,
+        key.pos[2] + dir[2] * 1000.0,
+    ];
+    (key.pos, look_at, key.fov)
+}
+
 /// The real terminal-headless driver: runs the world and the ratatui
 /// TestBackend evidence path.
 pub struct TerminalHeadlessDriver {
@@ -541,17 +649,7 @@ impl Default for TerminalHeadlessDriver {
 
 impl TerminalHeadlessDriver {
     fn seed_grid(world: &mut WorldState, count: u32) -> Result<(), SceneError> {
-        let cols = (count as f32).sqrt().ceil() as u32;
-        for index in 0..count {
-            let mut agent = AgentData::default();
-            agent.position.x = 60.0 + (index % cols) as f32 * 120.0;
-            agent.position.y = 60.0 + (index / cols) as f32 * 120.0;
-            agent.spike_length = 10.0;
-            world.try_spawn_agent(agent).map_err(|error| SceneError {
-                problems: vec![format!("seed agent {index}: {error}")],
-            })?;
-        }
-        Ok(())
+        seed_grid(world, count)
     }
 }
 
@@ -570,49 +668,12 @@ impl SceneDriver for TerminalHeadlessDriver {
         // The terminal headless evidence contract caps frames; scenes honor
         // the same cap so the driver always matches the product path.
         let frames = manifest.ticks.min(TERMINAL_HEADLESS_MAX_FRAMES);
-        let mut last_summary_births = 0usize;
-        let mut last_summary_deaths = 0usize;
-        let mut last_spike_hits = 0u32;
+        let mut tracker = TickFactTracker::default();
         for tick in 1..=frames {
             world.step().map_err(|error| SceneError {
                 problems: vec![format!("world step {tick}: {error}")],
             })?;
-            facts.agent_counts.push(world.agent_count());
-            if let Some(summary) = world.history().next_back() {
-                if summary.births > last_summary_births
-                    && !facts.events.iter().any(|(k, _)| k == "birth")
-                {
-                    facts.events.push(("birth".to_string(), tick));
-                }
-                if summary.deaths > last_summary_deaths
-                    && !facts.events.iter().any(|(k, _)| k == "death")
-                {
-                    facts.events.push(("death".to_string(), tick));
-                }
-                if summary.spike_hits > last_spike_hits
-                    && !facts.events.iter().any(|(k, _)| k == "spike_hit")
-                {
-                    facts.events.push(("spike_hit".to_string(), tick));
-                }
-                last_summary_births = summary.births;
-                last_summary_deaths = summary.deaths;
-                last_spike_hits = summary.spike_hits;
-            }
-            // Cue observations mirror the shared event->cue table: every
-            // observed world event maps to exactly one cue family.
-            for (kind, at) in facts.events.clone() {
-                if at == tick {
-                    let cue_kind = match kind.as_str() {
-                        "birth" => "sparkle",
-                        "death" => "wilt",
-                        "spike_hit" => "spark_cone",
-                        _ => "nibble",
-                    };
-                    if !facts.cues.iter().any(|(c, _)| c == cue_kind) {
-                        facts.cues.push((cue_kind.to_string(), tick));
-                    }
-                }
-            }
+            collect_tick_facts(&world, tick, &mut facts, &mut tracker);
             if manifest.captures.iter().any(|capture| capture.tick == tick) {
                 let digest = world.world_digest_v1().map_err(|error| SceneError {
                     problems: vec![format!("capture digest at tick {tick}: {error}")],
@@ -640,7 +701,324 @@ impl SceneDriver for TerminalHeadlessDriver {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Offscreen live-renderer driver + golden evidence workflow (bd-2z0.14.3.4).
+// ---------------------------------------------------------------------------
+
+/// Driver for the real Bevy GPU pipeline rendered offscreen (the
+/// `bevy_offscreen` frontend). Captures are full-fidelity frames with a
+/// provenance block; when `artifacts_dir` is set each capture also writes
+/// `<name>.png` + `<name>.provenance.json` there.
+#[cfg(feature = "bevy_render")]
+pub struct BevyOffscreenDriver {
+    /// Grid agents to seed.
+    pub seed_agents: u32,
+    /// Viewport in pixels.
+    pub viewport: (u32, u32),
+    /// Artifact directory (PNG + provenance JSON); `None` = hashes only.
+    pub artifacts_dir: Option<PathBuf>,
+}
+
+#[cfg(feature = "bevy_render")]
+impl Default for BevyOffscreenDriver {
+    fn default() -> Self {
+        Self {
+            seed_agents: 16,
+            viewport: (1280, 720),
+            artifacts_dir: None,
+        }
+    }
+}
+
+/// Env flag enabling the alarm-test corruption mode (black frame).
+#[cfg(feature = "bevy_render")]
+const CAPTURE_CORRUPT_ENV: &str = "SCRIPTBOTS_CAPTURE_CORRUPT";
+
+#[cfg(feature = "bevy_render")]
+impl SceneDriver for BevyOffscreenDriver {
+    fn run(&mut self, manifest: &SceneManifest) -> Result<SceneRunFacts, SceneError> {
+        use scriptbots_bevy::capture::{OffscreenCapture, OffscreenCaptureConfig, encode_png};
+
+        manifest.validate()?;
+        let mut config = manifest.compose_config()?;
+        if let Some(quality) = &manifest.quality {
+            config.render.quality = parse_render_quality(quality);
+        }
+        let corrupt = std::env::var(CAPTURE_CORRUPT_ENV)
+            .ok()
+            .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+        let mut world = WorldState::new(config.clone()).map_err(|error| SceneError {
+            problems: vec![format!("construct world: {error}")],
+        })?;
+        seed_grid(&mut world, self.seed_agents)?;
+
+        let mut capture = OffscreenCapture::new(&OffscreenCaptureConfig {
+            viewport: self.viewport,
+            render_settings: config.render.clone(),
+            corrupt,
+        })
+        .map_err(|error| SceneError {
+            problems: vec![format!("offscreen capture init: {error:#}")],
+        })?;
+
+        let mut facts = SceneRunFacts::default();
+        facts.agent_counts.push(world.agent_count());
+        let mut tracker = TickFactTracker::default();
+
+        let mut do_captures =
+            |world: &WorldState, tick: u64, facts: &mut SceneRunFacts| -> Result<(), SceneError> {
+                let due: Vec<&CapturePoint> = manifest
+                    .captures
+                    .iter()
+                    .filter(|capture| capture.tick == tick)
+                    .collect();
+                if due.is_empty() {
+                    return Ok(());
+                }
+                let (pos, look_at, fov) = camera_pose_at(manifest, tick, world);
+                capture.set_camera_pose(pos, look_at, fov);
+                let frame = capture
+                    .render(world, &manifest.name, manifest.seed, tick)
+                    .map_err(|error| SceneError {
+                        problems: vec![format!("offscreen render at tick {tick}: {error:#}")],
+                    })?;
+                let hash = fnv1a64_hex(&frame.rgba8);
+                for point in due {
+                    facts
+                        .captures
+                        .push((point.name.clone(), tick, hash.clone(), frame.rgba8.len()));
+                    if let Some(dir) = &self.artifacts_dir {
+                        std::fs::create_dir_all(dir).map_err(|error| SceneError {
+                            problems: vec![format!("create {}: {error}", dir.display())],
+                        })?;
+                        let png = encode_png(frame.width, frame.height, &frame.rgba8).map_err(
+                            |error| SceneError {
+                                problems: vec![format!("encode png {}: {error:#}", point.name)],
+                            },
+                        )?;
+                        std::fs::write(dir.join(format!("{}.png", point.name)), png).map_err(
+                            |error| SceneError {
+                                problems: vec![format!("write {}.png: {error}", point.name)],
+                            },
+                        )?;
+                        let provenance = serde_json::to_string_pretty(&frame.provenance).map_err(
+                            |error| SceneError {
+                                problems: vec![format!("encode provenance: {error}")],
+                            },
+                        )?;
+                        std::fs::write(
+                            dir.join(format!("{}.provenance.json", point.name)),
+                            provenance,
+                        )
+                        .map_err(|error| SceneError {
+                            problems: vec![format!("write {}.provenance.json: {error}", point.name)],
+                        })?;
+                    }
+                }
+                Ok(())
+            };
+
+        do_captures(&world, 0, &mut facts)?;
+        for tick in 1..=manifest.ticks {
+            world.step().map_err(|error| SceneError {
+                problems: vec![format!("world step {tick}: {error}")],
+            })?;
+            collect_tick_facts(&world, tick, &mut facts, &mut tracker);
+            do_captures(&world, tick, &mut facts)?;
+        }
+        if let Ok(digest) = world.world_digest_v1() {
+            facts.world_digest = Some(digest.overall);
+        }
+        Ok(facts)
+    }
+
+    fn name(&self) -> &'static str {
+        "bevy_offscreen"
+    }
+}
+
+/// Stub used when the binary was built without the `bevy_render` feature:
+/// parses and validates, then fails closed with an actionable error.
+#[cfg(not(feature = "bevy_render"))]
+pub struct BevyOffscreenDriver {
+    /// Grid agents to seed (unused without the feature).
+    pub seed_agents: u32,
+    /// Viewport in pixels (unused without the feature).
+    pub viewport: (u32, u32),
+    /// Artifact directory (unused without the feature).
+    pub artifacts_dir: Option<PathBuf>,
+}
+
+#[cfg(not(feature = "bevy_render"))]
+impl SceneDriver for BevyOffscreenDriver {
+    fn run(&mut self, manifest: &SceneManifest) -> Result<SceneRunFacts, SceneError> {
+        manifest.validate()?;
+        Err(SceneError {
+            problems: vec![
+                "frontend `bevy_offscreen` requires the bevy_render feature; recompile with \
+                 `--features bevy_render`"
+                    .to_string(),
+            ],
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "bevy_offscreen"
+    }
+}
+
+/// What the golden workflow decided for one capture.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum GoldenOutcome {
+    /// Candidate matched the blessed golden within thresholds.
+    Pass {
+        /// Golden path.
+        golden: PathBuf,
+        /// Differing-pixel ratio observed.
+        differing_ratio: f64,
+        /// Mean absolute channel deviation observed.
+        mean_abs_diff: f64,
+    },
+    /// Candidate mismatched the golden; a diff heatmap was written.
+    Mismatch {
+        /// Golden path.
+        golden: PathBuf,
+        /// Written diff heatmap.
+        heatmap: PathBuf,
+        /// Differing-pixel ratio observed.
+        differing_ratio: f64,
+        /// Mean absolute channel deviation observed.
+        mean_abs_diff: f64,
+        /// Largest single-channel deviation.
+        max_channel_diff: u8,
+    },
+    /// No blessed golden exists; the candidate was written for review.
+    MissingGolden {
+        /// Where the candidate PNG was written.
+        candidate: PathBuf,
+        /// Regeneration instructions.
+        instructions: String,
+    },
+    /// `RUST_REGEN_GOLDEN` path: the candidate was blessed as the golden.
+    Regenerated {
+        /// Golden path written.
+        golden: PathBuf,
+    },
+}
+
+/// Run the golden workflow for one captured frame.
+///
+/// `golden_path` is the blessed PNG location (`goldens/<scene>/<name>.png`);
+/// the provenance JSON rides alongside as `<name>.provenance.json`. With
+/// `regen` the frame is blessed byte-for-byte; otherwise an existing golden
+/// is compared (mismatch writes `<name>.diff.png`) and a missing golden is
+/// an explicit failure with regeneration instructions — never an auto-bless.
+#[cfg(feature = "bevy_render")]
+pub fn process_golden(
+    frame: &scriptbots_bevy::capture::CapturedFrame,
+    golden_path: &Path,
+    regen: bool,
+) -> Result<GoldenOutcome, SceneError> {
+    use scriptbots_bevy::capture::{
+        CompareThresholds, compare_frames, decode_png, diff_heatmap, encode_png,
+    };
+
+    let io = |action: &str, error: std::io::Error| SceneError {
+        problems: vec![format!("{action} {}: {error}", golden_path.display())],
+    };
+    let parent = golden_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = golden_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("capture")
+        .to_string();
+    let png = encode_png(frame.width, frame.height, &frame.rgba8).map_err(|error| SceneError {
+        problems: vec![format!("encode png: {error:#}")],
+    })?;
+    let provenance_json =
+        serde_json::to_string_pretty(&frame.provenance).map_err(|error| SceneError {
+            problems: vec![format!("encode provenance: {error}")],
+        })?;
+    if regen {
+        std::fs::create_dir_all(parent).map_err(|e| io("create", e))?;
+        std::fs::write(golden_path, &png).map_err(|e| io("write golden", e))?;
+        std::fs::write(
+            parent.join(format!("{stem}.provenance.json")),
+            &provenance_json,
+        )
+        .map_err(|e| io("write provenance", e))?;
+        return Ok(GoldenOutcome::Regenerated {
+            golden: golden_path.to_path_buf(),
+        });
+    }
+    if !golden_path.exists() {
+        std::fs::create_dir_all(parent).map_err(|e| io("create", e))?;
+        let candidate = parent.join(format!("{stem}.candidate.png"));
+        std::fs::write(&candidate, &png).map_err(|e| io("write candidate", e))?;
+        std::fs::write(
+            parent.join(format!("{stem}.provenance.json")),
+            &provenance_json,
+        )
+        .map_err(|e| io("write provenance", e))?;
+        return Ok(GoldenOutcome::MissingGolden {
+            candidate,
+            instructions: format!(
+                "no blessed golden at {}; review the candidate, then bless with \
+                 `RUST_REGEN_GOLDEN=1` on the same adapter class and commit the result",
+                golden_path.display()
+            ),
+        });
+    }
+    let golden_bytes = std::fs::read(golden_path).map_err(|e| io("read golden", e))?;
+    let (gw, gh, golden_rgba) = decode_png(&golden_bytes).map_err(|error| SceneError {
+        problems: vec![format!("decode golden {}: {error:#}", golden_path.display())],
+    })?;
+    let stats = if (gw, gh) == (frame.width, frame.height) {
+        compare_frames(
+            &golden_rgba,
+            &frame.rgba8,
+            frame.width,
+            frame.height,
+            &CompareThresholds::default(),
+        )
+    } else {
+        Err(anyhow::anyhow!(
+            "golden dimensions {gw}x{gh} != candidate {}x{}",
+            frame.width,
+            frame.height
+        ))
+    };
+    match stats {
+        Ok(stats) if stats.pass => Ok(GoldenOutcome::Pass {
+            golden: golden_path.to_path_buf(),
+            differing_ratio: stats.differing_ratio,
+            mean_abs_diff: stats.mean_abs_diff,
+        }),
+        Ok(stats) => {
+            let heat = diff_heatmap(&golden_rgba, &frame.rgba8, frame.width, frame.height)
+                .and_then(|rgba| encode_png(frame.width, frame.height, &rgba))
+                .map_err(|error| SceneError {
+                    problems: vec![format!("encode heatmap: {error:#}")],
+                })?;
+            let heatmap = parent.join(format!("{stem}.diff.png"));
+            std::fs::write(&heatmap, heat).map_err(|e| io("write heatmap", e))?;
+            Ok(GoldenOutcome::Mismatch {
+                golden: golden_path.to_path_buf(),
+                heatmap,
+                differing_ratio: stats.differing_ratio,
+                mean_abs_diff: stats.mean_abs_diff,
+                max_channel_diff: stats.max_channel_diff,
+            })
+        }
+        Err(error) => Err(SceneError {
+            problems: vec![format!("golden comparison failed closed: {error:#}")],
+        }),
+    }
+}
+
 /// FNV-1a64 hex over bytes (the headless evidence hash family).
+#[must_use]
 #[must_use]
 pub fn fnv1a64_hex(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

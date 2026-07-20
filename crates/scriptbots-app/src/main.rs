@@ -432,9 +432,10 @@ fn main() -> Result<()> {
             }
         }
         #[cfg(feature = "bevy_render")]
-        if let Some(path) = cli.dump_bevy_png.as_ref() {
-            // Name the exact adapter a snapshot came from: offscreen captures must never
-            // be mistaken for CPU-surrogate output (bd-2z0.7.1).
+        if let Some(path) = cli.dump_semantic_png.as_ref() {
+            // Semantic projection only: this CPU rasterizer does NOT exercise the
+            // GPU pipeline (bd-2z0.14.3.4 renamed it to make the dishonesty
+            // impossible to miss); --dump-scene-png owns real GPU captures.
             match scriptbots_bevy::probe_gpu_capability() {
                 Some(gpu) => info!(
                     adapter = %gpu.name,
@@ -464,13 +465,17 @@ fn main() -> Result<()> {
             }
             fs::write(path, &bytes)?;
             println!(
-                "{} Wrote Bevy snapshot {} ({}x{})",
-                "✔".green().bold(),
+                "{} Wrote semantic projection {} ({}x{}; CPU reference raster, NOT GPU-rendered)",
+                "\u{2714}".green().bold(),
                 path.display(),
                 w,
                 h
             );
             return Ok(());
+        }
+        #[cfg(feature = "bevy_render")]
+        if let Some(scene_path) = cli.dump_scene_png.as_ref() {
+            return run_scene_capture_cli(scene_path);
         }
 
         let (active_mode, renderer) = resolved_renderer.ok_or_else(|| {
@@ -2184,10 +2189,18 @@ struct AppCli {
     /// Write an offscreen PNG snapshot and exit (no UI).
     #[arg(long = "dump-png", value_name = "FILE")]
     dump_png: Option<PathBuf>,
-    /// Write a Bevy offscreen PNG (requires bevy_render feature) and exit (no UI).
+    /// Write a Bevy SEMANTIC PNG projection (CPU reference raster, requires bevy_render
+    /// feature) and exit (no UI). This is a semantic reference only: it does NOT
+    /// exercise the GPU pipeline. For real offscreen GPU captures use --dump-scene-png.
     #[cfg(feature = "bevy_render")]
-    #[arg(long = "dump-bevy-png", value_name = "FILE")]
-    dump_bevy_png: Option<PathBuf>,
+    #[arg(long = "dump-semantic-png", value_name = "FILE")]
+    dump_semantic_png: Option<PathBuf>,
+    /// Render a scene manifest offscreen through the REAL Bevy GPU pipeline and write
+    /// capture PNGs + provenance JSON + scene log, honoring the golden workflow
+    /// (RUST_REGEN_GOLDEN=1 blesses; missing golden = explicit failure).
+    #[cfg(feature = "bevy_render")]
+    #[arg(long = "dump-scene-png", value_name = "SCENE.toml")]
+    dump_scene_png: Option<PathBuf>,
     /// Snapshot size for --dump-png, formatted as WIDTHxHEIGHT (e.g., 1280x720).
     #[arg(long = "png-size", value_name = "WxH")]
     png_size: Option<String>,
@@ -2293,10 +2306,135 @@ fn snapshot_exit_requested(cli: &AppCli) -> bool {
         return true;
     }
     #[cfg(feature = "bevy_render")]
-    if cli.dump_bevy_png.is_some() {
+    if cli.dump_semantic_png.is_some() || cli.dump_scene_png.is_some() {
         return true;
     }
     false
+}
+
+/// `--dump-scene-png SCENE.toml`: render a scene manifest through the REAL
+/// offscreen Bevy GPU pipeline, write capture PNGs + provenance JSON +
+/// scene log under `captures/<scene>/`, then run the golden workflow
+/// (RUST_REGEN_GOLDEN=1 blesses; missing golden = explicit failure, never
+/// an auto-bless). Exit non-zero on any golden mismatch or missing golden.
+#[cfg(feature = "bevy_render")]
+fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
+    use scriptbots_app::scene::{
+        BevyOffscreenDriver, GoldenOutcome, SceneManifest, process_golden, run_scene,
+    };
+    use scriptbots_bevy::capture::{CapturedFrame, CaptureProvenance, decode_png};
+
+    let manifest = SceneManifest::load(scene_path)
+        .map_err(|error| anyhow!("load scene manifest {}: {error}", scene_path.display()))?;
+    let artifacts_dir = PathBuf::from("captures").join(&manifest.name);
+    let goldens_dir =
+        PathBuf::from("crates/scriptbots-app/tests/scenes/goldens").join(&manifest.name);
+    let regen = env::var("RUST_REGEN_GOLDEN").ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+
+    let mut driver = BevyOffscreenDriver {
+        artifacts_dir: Some(artifacts_dir.clone()),
+        ..BevyOffscreenDriver::default()
+    };
+    let log = run_scene(&manifest, &mut driver).map_err(|error| anyhow!("scene run: {error}"))?;
+
+    // Golden workflow per capture, re-reading the artifacts from disk so
+    // the comparison path exercises exactly what a reviewer receives.
+    let mut failures: Vec<String> = Vec::new();
+    let mut capture_outcomes = Vec::new();
+    for capture in &manifest.captures {
+        let png_path = artifacts_dir.join(format!("{}.png", capture.name));
+        let png_bytes = fs::read(&png_path)
+            .with_context(|| format!("read capture {}", png_path.display()))?;
+        let (width, height, rgba8) = decode_png(&png_bytes)
+            .with_context(|| format!("decode capture {}", png_path.display()))?;
+        let provenance_path = artifacts_dir.join(format!("{}.provenance.json", capture.name));
+        let provenance: CaptureProvenance = serde_json::from_str(
+            &fs::read_to_string(&provenance_path)
+                .with_context(|| format!("read {}", provenance_path.display()))?,
+        )
+        .with_context(|| format!("parse {}", provenance_path.display()))?;
+        let frame = CapturedFrame {
+            width,
+            height,
+            rgba8,
+            provenance,
+        };
+        let golden_path = goldens_dir.join(format!("{}.png", capture.name));
+        let outcome = process_golden(&frame, &golden_path, regen)
+            .map_err(|error| anyhow!("golden workflow for {}: {error}", capture.name))?;
+        match &outcome {
+            GoldenOutcome::Pass {
+                differing_ratio,
+                mean_abs_diff,
+                ..
+            } => info!(
+                capture = %capture.name,
+                differing_ratio, mean_abs_diff, "golden comparison pass"
+            ),
+            GoldenOutcome::Mismatch {
+                heatmap,
+                differing_ratio,
+                max_channel_diff,
+                ..
+            } => {
+                failures.push(format!(
+                    "capture `{}` mismatched its golden (differing ratio {differing_ratio:.6}, \
+                     max channel diff {max_channel_diff}); diff heatmap: {}",
+                    capture.name,
+                    heatmap.display()
+                ));
+            }
+            GoldenOutcome::MissingGolden {
+                instructions, ..
+            } => {
+                failures.push(format!("capture `{}`: {instructions}", capture.name));
+            }
+            GoldenOutcome::Regenerated { golden } => info!(
+                capture = %capture.name,
+                golden = %golden.display(),
+                "golden regenerated (review before committing)"
+            ),
+        }
+        capture_outcomes.push(serde_json::json!({
+            "name": capture.name,
+            "tick": capture.tick,
+            "outcome": outcome,
+        }));
+    }
+
+    let summary = serde_json::json!({
+        "scene": log.name,
+        "frontend": log.frontend,
+        "seed": log.seed,
+        "ticks_executed": log.ticks_executed,
+        "world_digest": log.world_digest,
+        "captures": capture_outcomes,
+        "expectations": log.expectations,
+        "regen_mode": regen,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).context("serialize scene summary")?
+    );
+    if failures.is_empty() {
+        println!(
+            "{} Scene {} captured and verified ({} captures)",
+            "\u{2714}".green().bold(),
+            manifest.name,
+            manifest.captures.len()
+        );
+        Ok(())
+    } else {
+        for failure in &failures {
+            eprintln!("{} {failure}", "golden failure:".red().bold());
+        }
+        bail!("{} golden failure(s)", failures.len())
+    }
 }
 
 fn storage_owning_startup_requested(cli: &AppCli) -> bool {

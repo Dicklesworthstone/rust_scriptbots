@@ -1,0 +1,27 @@
+# Canonical offscreen live-render smoke scene (bd-2z0.14.3.4).
+# Exercises the REAL Bevy GPU pipeline headless: terrain chunks, agent
+# parts, directional lighting, HDR tonemapping. Small and fast so the
+# software CI lane (llvmpipe) can run it; deterministic per adapter class.
+name = "bevy_offscreen_smoke"
+seed = 3
+ticks = 6
+quality = "medium"
+frontend = "bevy_offscreen"
+
+[config_overrides]
+world_width = 600
+world_height = 600
+
+# Capture the classic 3/4 overview at the midpoint and at the end.
+[[captures]]
+tick = 3
+name = "mid"
+
+[[captures]]
+tick = 6
+name = "final"
+
+[[expect]]
+kind = "agent_count"
+min = 1
+max = 10000

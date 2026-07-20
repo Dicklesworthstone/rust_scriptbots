@@ -303,7 +303,7 @@ Use the convenience scripts in the repo root to launch ScriptBots with sensible 
 - Customize:
   - Retina tweaks: set `SB_WGPU_RES_SCALE` to `0.5` or `2.0` before running
   - Lower CPU use: `THREADS=4 ./run_macos_version_with_bevy.sh`
-  - Add Bevy-specific CLI flags after `--`, e.g., `./run_macos_version_with_bevy.sh -- --dump-bevy-png docs/rendering_reference/golden/bevy_default.png`
+  - Add Bevy-specific CLI flags after `--`, e.g., `./run_macos_version_with_bevy.sh -- --dump-semantic-png docs/rendering_reference/golden/bevy_default.png` (CPU semantic raster; for real offscreen GPU captures use `--dump-scene-png SCENE.toml`)
 
 ### Windows — terminal console (MSVC)
 - Script: `run_windows_version_with_console.bat`
@@ -345,7 +345,7 @@ Use the convenience scripts in the repo root to launch ScriptBots with sensible 
   - Builds with `--features bevy_render` and launches the Bevy renderer (`--mode bevy`) using `--threads 8`
 - Customize:
   - To force D3D12 instead of Vulkan: set `set WGPU_BACKEND=d3d12` before running
-  - Add Bevy-only flags (e.g., `--dump-bevy-png`) after the final `--` in the script
+  - Add Bevy-only flags (e.g., `--dump-semantic-png`, `--dump-scene-png`) after the final `--` in the script
 
 Notes (all platforms):
 - The final `-- ...` segment in each script passes flags to the application binary. You can add flags like `--storage memory`, `--profile-steps 1000`, or `--det-check 200` there.
@@ -449,6 +449,8 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
  - `--set PATH=VALUE`: dotted-path configuration override in TOML syntax, repeatable (e.g., `--set world_width=800 --set neuroflow.enabled=true`; string values use TOML quotes). Configuration layers apply defaults → `--config` files (in order) → environment → CLI; every applied layer appends a kind-tagged content digest to the run manifest's `scenario.ordered_config_layer_digests`, and any field where one explicit layer displaced another is recorded in the manifest's `config_overrides`.
 - `--quality TIER`: visual quality shortcut for `--set render.quality=TIER`, validated at parse time (`auto|potato|low|medium|high|ultra`). The unified `render.*` settings (quality tier, post stack bloom/vignette/fog/AA, day/night cycle, TUI theme, accessibility palette) are consumed by every frontend; `None` values defer to per-tier frontend defaults.
  - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.
+ - `--dump-semantic-png FILE` (Bevy builds): write the CPU semantic projection raster and exit. This is a semantic reference only — it does NOT exercise the GPU pipeline (formerly `--dump-bevy-png`, renamed so it can never be mistaken for a GPU capture).
+ - `--dump-scene-png SCENE.toml` (Bevy builds): render a scene manifest through the REAL offscreen Bevy GPU pipeline and write capture PNGs + provenance JSON + a JSON scene log under `captures/<scene>/`. Golden workflow: `RUST_REGEN_GOLDEN=1` blesses new goldens under `crates/scriptbots-app/tests/scenes/goldens/<scene>/`; an existing golden is compared with per-channel/perceptual thresholds (mismatch writes a `<name>.diff.png` heatmap and fails); a missing golden is an explicit failure with regeneration instructions, never an auto-bless. `SCRIPTBOTS_CAPTURE_CORRUPT=1` enables the alarm-test corruption mode (blacked-out lighting) used to prove a broken pipeline fails the harness.
  - `--storage {file|memory}`: select the FrankenSQLite target. `file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a fresh generated run path and refuses existing databases or stale sidecars; `memory` opens volatile `:memory:` through the same engine.
  - `--recover-storage FILE`: exclusively reopen a validated existing ScriptBots run, replay/finalize its durable outbox, print the admitted/applied/durable watermarks, and exit. This repairs persistence only; it does not reconstruct the in-memory world or resume simulation ticks.
  - Auto-pause (any renderer):

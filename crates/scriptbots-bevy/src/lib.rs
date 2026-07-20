@@ -1,5 +1,6 @@
 //! Bevy renderer integration for ScriptBots.
 
+pub mod capture;
 pub mod creature_meshes;
 pub mod particles;
 
@@ -546,7 +547,7 @@ struct SnapshotInbox {
 }
 
 #[derive(Default, Resource)]
-struct SnapshotState {
+pub(crate) struct SnapshotState {
     latest: Option<WorldSnapshot>,
     last_applied_tick: u64,
     last_reported_tick: u64,
@@ -563,12 +564,12 @@ struct SnapshotState {
 }
 
 #[derive(Default, Resource)]
-struct AgentRegistry {
+pub(crate) struct AgentRegistry {
     records: HashMap<AgentId, AgentRecord>,
 }
 
 #[derive(Resource, Clone)]
-struct ReflectionProbeAssets {
+pub(crate) struct ReflectionProbeAssets {
     diffuse: Handle<Image>,
     specular: Handle<Image>,
 }
@@ -603,7 +604,7 @@ struct AgentRecord {
 }
 
 #[derive(Resource)]
-struct AgentMeshes {
+pub(crate) struct AgentMeshes {
     base_radius: f32,
     body: Handle<Mesh>,
     wheel: Handle<Mesh>,
@@ -646,7 +647,7 @@ impl ColorPaletteMode {
 }
 
 #[derive(Resource)]
-struct AccessibilityState {
+pub(crate) struct AccessibilityState {
     palette: ColorPaletteMode,
 }
 
@@ -1055,8 +1056,8 @@ fn follow_hover_color() -> Color {
 fn follow_active_color() -> Color {
     Color::srgba(0.34, 0.26, 0.64, 0.95)
 }
-const TERRAIN_CHUNK_SIZE: u32 = 64;
-const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
+pub(crate) const TERRAIN_CHUNK_SIZE: u32 = 64;
+pub(crate) const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
 
 fn bounds_extent(bounds: (Vec2, Vec2)) -> Vec2 {
     let size = bounds.1 - bounds.0;
@@ -1445,7 +1446,7 @@ impl TerrainChunkSignature {
 }
 
 #[derive(Clone)]
-struct WorldSnapshot {
+pub(crate) struct WorldSnapshot {
     tick: u64,
     world_size: Vec2,
     agent_radius: f32,
@@ -1996,7 +1997,7 @@ fn poll_snapshots(inbox: NonSendMut<SnapshotInbox>, mut state: ResMut<SnapshotSt
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sync_world(
+pub(crate) fn sync_world(
     mut commands: Commands,
     mut state: ResMut<SnapshotState>,
     mut registry: ResMut<AgentRegistry>,

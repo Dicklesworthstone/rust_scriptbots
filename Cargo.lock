@@ -10123,6 +10123,8 @@ dependencies = [
  "image",
  "naga 26.0.0",
  "scriptbots-core",
+ "serde",
+ "serde_json",
  "slotmap",
  "tracing",
  "wgpu 26.0.1",

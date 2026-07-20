@@ -9,6 +9,7 @@ bevy = { version = "0.17" }
 bevy_mesh = { version = "0.17" }
 bevy_post_process = { version = "0.17" }
 scriptbots-core = { path = "../scriptbots-core" }
+serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 slotmap = { workspace = true }
@@ -20,3 +21,4 @@ wgpu = { version = "26", default-features = false, features = ["metal", "wgsl"] 
 # Same naga 26 already in the lockfile as wgpu 26's dependency: WGSL source
 # validation in particle/creature tests without a second naga universe.
 naga = { version = "=26.0.0", default-features = false, features = ["wgsl-in"] }
+serde_json = { workspace = true }
