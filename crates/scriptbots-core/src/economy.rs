@@ -71,7 +71,7 @@ impl EconomyStock {
     const ALL: [Self; STOCK_COUNT] = [Self::GridFood, Self::AgentEnergy, Self::AgentHealth];
 
     /// Extract this stock's lane from a [`ResourceAmounts`] triple.
-    fn lane(self, amounts: ResourceAmounts) -> f64 {
+    const fn lane(self, amounts: ResourceAmounts) -> f64 {
         match self {
             Self::GridFood => amounts.food,
             Self::AgentEnergy => amounts.energy,

@@ -405,7 +405,7 @@ impl AgentRngCountersV1 {
         Self::take_counter(&mut self.brain_initialization, "brain-initialization")
     }
 
-    fn take_counter(
+    const fn take_counter(
         counter: &mut u64,
         counter_name: &'static str,
     ) -> Result<u64, AgentRngCounterError> {
@@ -729,7 +729,7 @@ impl DomainStreams {
     pub fn from_root_seed(root_seed: u64) -> Self {
         let streams = RngDomain::ALL
             .map(|domain| SmallRngStream::seed_from_u64(derive_domain_seed(root_seed, domain)));
-        Self { streams, root_seed }
+        Self { root_seed, streams }
     }
 
     /// The root seed these streams were derived from.
@@ -750,7 +750,7 @@ impl DomainStreams {
     ///
     /// Never: `RngDomain::index` yields a lane index below `streams.len()` for every variant, so
     /// the indexing cannot go out of bounds.
-    pub fn stream(&mut self, domain: RngDomain) -> &mut SmallRngStream {
+    pub const fn stream(&mut self, domain: RngDomain) -> &mut SmallRngStream {
         &mut self.streams[domain.index()]
     }
 

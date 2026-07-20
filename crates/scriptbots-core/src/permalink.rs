@@ -19,6 +19,7 @@
 //! diagnostic line about a rejected link.
 
 use std::fmt;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,8 @@ pub const MAX_KNOB_PATH_BYTES: usize = 128;
 pub const MAX_KNOB_ENTRIES: usize = 64;
 /// Largest accepted raw payload. Fits 64 worst-case knobs with headroom.
 pub const MAX_PAYLOAD_BYTES: usize = 12_288;
+// bd-tqpj: referenced only by the hostile-input decoder tests (cfg(test) builds).
+#[allow(dead_code)]
 const U16_MAX_AS_USIZE: usize = u16::MAX as usize;
 
 /// Build identity carried by a link: the three digests that decide whether a
@@ -290,6 +293,9 @@ impl Permalink {
     /// entries, build identity, CRC32. Encoding is a pure function of the
     /// inputs — knob entries are emitted in ascending path order regardless of
     /// the caller's map iteration order.
+    // bd-tqpj: wire-format length casts — lengths are bounded by MAX_SCENARIO_ID_BYTES,
+    // MAX_KNOB_ENTRIES, and MAX_KNOB_PATH_BYTES upstream, and the format pins u16 fields.
+    #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut sorted = self.knob_diff.clone();
@@ -329,6 +335,9 @@ impl Permalink {
 
     /// Parse a raw payload. Length-bounded per field before any allocation;
     /// arbitrary bytes can never panic or over-allocate.
+    // bd-tqpj: decode is one sequential field parser reviewed as a single hostile-input
+    // codec unit; splitting it would scatter the cursor/offset arithmetic it must keep consistent.
+    #[allow(clippy::too_many_lines)]
     pub fn decode(bytes: &[u8]) -> Result<Self, PermalinkError> {
         if bytes.len() > MAX_PAYLOAD_BYTES {
             return Err(PermalinkError::OversizedPayload {
@@ -484,10 +493,7 @@ impl Permalink {
     /// Canonicality check: `encode(decode(s)) == s` for every accepted payload.
     #[must_use]
     pub fn is_canonical(bytes: &[u8]) -> bool {
-        match Self::decode(bytes) {
-            Ok(link) => link.encode() == bytes,
-            Err(_) => false,
-        }
+        Self::decode(bytes).map_or(false, |link| link.encode() == bytes)
     }
 
     /// Validate the scenario id with the manifest's identity rules.
@@ -514,7 +520,7 @@ impl Permalink {
     /// naming the offending knob. Runs before any world allocation.
     pub fn validate_knobs(&self) -> Result<(), PermalinkError> {
         let assignments: Vec<(String, f64)> = self.knob_diff.clone();
-        for violation in crate::check_knob_ranges(&assignments) {
+        if let Some(violation) = crate::check_knob_ranges(&assignments).into_iter().next() {
             return Err(PermalinkError::OutOfRange {
                 path: violation.path,
                 value: violation.value,
@@ -558,11 +564,16 @@ impl Permalink {
     }
 }
 
-/// Compute the permalink config digest over a scenario's resolved config value
-/// with a knob diff applied. The digest covers the canonical reconstruction —
-/// scenario id plus every knob path with its exact f64 bit pattern, in
-/// ascending path order — so two runs with the same reconstruction always
-/// agree and any tampering always disagrees.
+/// Compute the permalink config digest over a scenario's resolved config
+/// value with a knob diff applied.
+///
+/// The digest covers the canonical reconstruction — scenario id plus every
+/// knob path with its exact f64 bit pattern, in ascending path order — so two
+/// runs with the same reconstruction always agree and any tampering always
+/// disagrees.
+// bd-tqpj: knob paths are bounded to MAX_KNOB_PATH_BYTES before a diff can be
+// applied, so the pinned u16 wire length cannot truncate; the width is a digest input.
+#[allow(clippy::cast_possible_truncation)]
 #[must_use]
 pub fn config_digest_with_diff(
     scenario_config: &serde_json::Value,
@@ -625,11 +636,10 @@ fn canonical_config_bytes(value: &serde_json::Value) -> Vec<u8> {
         other => {
             // Numbers are emitted with their exact f64 bit pattern, never a
             // locale-formatted decimal.
-            if let Some(number) = other.as_f64() {
-                number.to_bits().to_le_bytes().to_vec()
-            } else {
-                other.to_string().into_bytes()
-            }
+            other.as_f64().map_or_else(
+                || other.to_string().into_bytes(),
+                |number| number.to_bits().to_le_bytes().to_vec(),
+            )
         }
     }
 }
@@ -681,7 +691,7 @@ fn take_u16(bytes: &[u8], cursor: &mut usize, field: &'static str) -> Result<u16
 fn hex_prefix(bytes: &[u8], max: usize) -> String {
     let mut out = String::with_capacity(max * 2);
     for byte in bytes.iter().take(max) {
-        out.push_str(&format!("{byte:02x}"));
+        write!(out, "{byte:02x}").expect("writing to a String is infallible");
     }
     out
 }
@@ -719,13 +729,16 @@ fn base64url_encode(bytes: &[u8], out: &mut String) {
     }
 }
 
+// bd-tqpj: sextet positions are < 64 and the u8 casts are intentional bit-field
+// extraction; the widths are the base64url codec contract.
+#[allow(clippy::cast_possible_truncation)]
 fn base64url_decode(text: &str) -> Result<Vec<u8>, PermalinkError> {
     let mut values = Vec::with_capacity(text.len());
     for (index, byte) in text.bytes().enumerate() {
         let value = BASE64URL_ALPHABET
             .iter()
             .position(|candidate| *candidate == byte)
-            .ok_or(PermalinkError::BadMagic {
+            .ok_or_else(|| PermalinkError::BadMagic {
                 first_16_bytes_hex: format!("invalid base64url byte 0x{byte:02x} at {index}"),
             })?;
         values.push(value as u32);

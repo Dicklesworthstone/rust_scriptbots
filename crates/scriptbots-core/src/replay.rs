@@ -58,7 +58,7 @@ impl WorldState {
     /// tick completes, so the digest covers the final post-tick state and rides the same
     /// admitted batch as the tick's action events. The request is a no-op while emission is
     /// disabled by `replay_event_tick_cap == 0`.
-    pub fn request_replay_world_digest(&mut self) {
+    pub const fn request_replay_world_digest(&mut self) {
         if self.config.replay_event_tick_cap > 0 {
             self.replay_world_digest_pending = true;
         }
