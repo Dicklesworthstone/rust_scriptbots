@@ -12639,7 +12639,7 @@ impl Drop for Storage {
 }
 
 /// Aggregated predator statistics used for analytics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PredatorStats {
     pub agent_uid: u64,
     pub avg_energy: f64,

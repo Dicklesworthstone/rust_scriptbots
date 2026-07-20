@@ -1355,7 +1355,7 @@ mod tests {
             let id = world
                 .try_spawn_agent(scriptbots_core::AgentData::default())
                 .expect("default agent is finite");
-            world.apply_selection_update(SelectionUpdate {
+            let _ = world.apply_selection_update(SelectionUpdate {
                 mode: SelectionMode::Replace,
                 agent_ids: vec![id.data().as_ffi()],
                 state: SelectionState::Selected,
