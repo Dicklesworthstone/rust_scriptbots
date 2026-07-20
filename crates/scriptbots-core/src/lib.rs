@@ -4191,21 +4191,38 @@ pub enum InterventionError {
     /// The disc radius exceeds the world's injectivity radius, so membership would be
     /// ambiguous where the disc wraps onto itself.
     #[error("disc radius {radius} exceeds the injectivity radius {max_radius}")]
-    RegionTooLarge { radius: f32, max_radius: f32 },
+    RegionTooLarge {
+        /// Requested disc radius in world units.
+        radius: f32,
+        /// Injectivity radius of the toroidal world: the largest disc radius with unambiguous membership.
+        max_radius: f32,
+    },
     /// The rectangle exceeds a world axis outright.
     #[error("rect {w}x{h} exceeds the {world_width}x{world_height} world extents")]
     RectTooLarge {
+        /// Requested rectangle width in world units.
         w: f32,
+        /// Requested rectangle height in world units.
         h: f32,
+        /// World width in world units.
         world_width: u32,
+        /// World height in world units.
         world_height: u32,
     },
     /// The requested cohort exceeds the documented command-level headroom.
     #[error("cohort injection of {requested} exceeds the command headroom {headroom}")]
-    PopulationCapExceeded { requested: u32, headroom: u32 },
+    PopulationCapExceeded {
+        /// Cohort size the command asked to inject.
+        requested: u32,
+        /// Command-level headroom: the most agents one injection may add.
+        headroom: u32,
+    },
     /// No brain family is registered under the requested registry key.
     #[error("no brain family is registered under key {key}")]
-    UnknownBrainKey { key: u64 },
+    UnknownBrainKey {
+        /// Registry key that has no brain family bound to it.
+        key: u64,
+    },
 }
 
 /// A deliberate perturbation of the world.
@@ -6917,11 +6934,20 @@ pub trait WorldPersistence: Send {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceBoundaryStatus {
     /// No immutable batch has been staged for the current tick.
-    Open { tick: Tick },
+    Open {
+        /// Tick of the current boundary.
+        tick: Tick,
+    },
     /// The external admission session owns the exact immutable batch for this tick.
-    Pending { tick: Tick },
+    Pending {
+        /// Tick of the current boundary.
+        tick: Tick,
+    },
     /// The external sink acknowledged the immutable batch for this tick.
-    Sealed { tick: Tick },
+    Sealed {
+        /// Tick of the current boundary.
+        tick: Tick,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -8020,7 +8046,10 @@ pub enum OffspringStatePolicy {
     /// Construct a fresh state from the child genome.
     Reset,
     /// Copy one selected parent state after full protocol validation.
-    Inherit { parent_index: u8 },
+    Inherit {
+        /// Index of the parent whose validated state is copied to the child.
+        parent_index: u8,
+    },
     /// Ask the family to deterministically combine the supplied parent states.
     Blend,
 }
@@ -12212,72 +12241,111 @@ mod map_sandbox {
 
     const DEFAULT_RETRY_BUDGET: usize = 32;
 
+    /// Every way rule-based map generation can fail before producing an artifact.
     #[derive(Debug, thiserror::Error)]
     pub enum MapGenerationError {
+        /// The tileset declared no tiles, so there is nothing to place.
         #[error("tileset contains no tiles")]
         EmptyTileset,
+        /// Two tiles share an id; ids are the adjacency namespace and must be unique.
         #[error("duplicate tile id `{0}` in tileset")]
         DuplicateTileId(String),
+        /// An adjacency rule names a tile id the tileset does not declare.
         #[error("adjacency references unknown tile `{0}`")]
         UnknownTile(String),
+        /// An adjacency rule uses a side string that is not a cardinal direction.
         #[error("adjacency uses invalid direction `{0}`")]
         InvalidDirection(String),
+        /// A tile's selection weight was zero; weights must be positive for the sampler.
         #[error("tile `{0}` weight must be greater than zero")]
         InvalidTileWeight(String),
+        /// Constraint propagation left no compatible neighbor for a tile in some direction.
         #[error("no compatible neighbors remain for tile `{tile}` toward `{direction:?}`")]
         EmptyAdjacency {
+            /// Id of the tile with no remaining compatible neighbors.
             tile: String,
+            /// Cardinal direction in which no compatible neighbor remains.
             direction: CardinalDirection,
         },
+        /// The generator exhausted its retry budget; every attempt hit a contradiction.
         #[error("generation failed after {attempts} attempts due to contradictions")]
-        Contradiction { attempts: usize },
+        Contradiction {
+            /// Number of collapse attempts made before giving up (the retry budget).
+            attempts: usize,
+        },
+        /// The requested map width or height was zero.
         #[error("terrain dimensions must be non-zero")]
         InvalidDimensions,
+        /// A generated field violated a scientific-state invariant.
         #[error(transparent)]
         InvalidState(#[from] ScientificStateError),
     }
 
+    /// Declarative tileset consumed by the rule-based map generator: the placeable
+    /// tile prototypes plus their directional adjacency rules.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct TilesetSpec {
+        /// Stable identifier of the tileset, recorded in artifact metadata.
         pub id: String,
+        /// Optional human-readable name.
         #[serde(default)]
         pub label: Option<String>,
+        /// Optional free-form description of the tileset's intent.
         #[serde(default)]
         pub description: Option<String>,
+        /// Tile definitions the generator may place; generation rejects an empty set.
         #[serde(default)]
         pub tiles: Vec<TileSpec>,
+        /// Directional compatibility rules between tile ids; unconstrained where absent.
         #[serde(default)]
         pub adjacency: Vec<AdjacencySpec>,
     }
 
+    /// One placeable tile prototype: terrain identity plus optional environmental
+    /// and hydrology overrides that fall back to terrain-kind defaults when unset.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct TileSpec {
+        /// Unique tile identifier referenced by adjacency rules.
         pub id: String,
+        /// Optional human-readable name.
         #[serde(default)]
         pub label: Option<String>,
+        /// Relative selection weight during collapse; must be greater than zero.
         #[serde(default = "TileSpec::default_weight")]
         pub weight: u32,
+        /// Base terrain classification the tile stamps onto the map.
         pub terrain_kind: TerrainKind,
+        /// Optional override of the tile's food fertility bias.
         #[serde(default)]
         pub fertility_bias: Option<f32>,
+        /// Optional override of the tile's temperature bias.
         #[serde(default)]
         pub temperature_bias: Option<f32>,
+        /// Optional fixed elevation for the tile.
         #[serde(default)]
         pub elevation: Option<f32>,
+        /// Optional fixed moisture level for the tile.
         #[serde(default)]
         pub moisture: Option<f32>,
+        /// Optional accent value used for cosmetic variation.
         #[serde(default)]
         pub accent: Option<f32>,
+        /// Optional explicit palette index for rendering.
         #[serde(default)]
         pub palette_index: Option<u16>,
+        /// Optional hydrology permeability override (how readily water passes through).
         #[serde(default)]
         pub permeability: Option<f32>,
+        /// Optional bias toward surface runoff versus absorption.
         #[serde(default)]
         pub runoff_bias: Option<f32>,
+        /// Optional rank used when ordering cells into drainage basins.
         #[serde(default)]
         pub basin_rank: Option<f32>,
+        /// Optional priority for channel/river formation.
         #[serde(default)]
         pub channel_priority: Option<f32>,
+        /// Optional locomotion cost for agents swimming through this tile.
         #[serde(default)]
         pub swim_cost: Option<f32>,
     }
@@ -12293,12 +12361,18 @@ mod map_sandbox {
         }
     }
 
+    /// One directional compatibility rule between two tile ids.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct AdjacencySpec {
+        /// Id of the source tile.
         pub tile_a: String,
+        /// Side of `tile_a` the rule constrains (a cardinal direction name).
         pub side_a: String,
+        /// Id of the candidate neighbor tile.
         pub tile_b: String,
+        /// Side of `tile_b` facing `tile_a`.
         pub side_b: String,
+        /// Whether the pairing is allowed (`true`) or explicitly forbidden.
         #[serde(default = "AdjacencySpec::default_allowed")]
         pub allowed: bool,
     }
@@ -12309,24 +12383,39 @@ mod map_sandbox {
         }
     }
 
+    /// Which generator produced a map artifact, recorded for provenance.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
     pub enum MapGeneratorKind {
+        /// The rule-based wave-function-collapse generator over a declarative tileset.
         RuleBased,
     }
 
+    /// Provenance record for a generated map: what was generated, from what, and how.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct MapArtifactMetadata {
+        /// Which generator produced the artifact.
         pub generator: MapGeneratorKind,
+        /// Id of the tileset the map was generated from.
         pub tileset_id: String,
+        /// Content hash of the tileset, for detecting tileset drift against the artifact.
         pub tileset_hash: u64,
+        /// RNG seed the generation run consumed; the same seed and tileset reproduce the map.
         pub seed: u64,
+        /// Map width in cells.
         pub width: u32,
+        /// Map height in cells.
         pub height: u32,
+        /// Total collapse attempts the run made.
         pub attempt_count: usize,
+        /// Which attempt produced the final map (1-based).
         pub succeeded_on: usize,
+        /// Wall-clock generation timestamp (ms since the Unix epoch); provenance only,
+        /// never fed back into the deterministic simulation.
         pub generated_at_epoch_ms: u128,
     }
 
+    /// A validated `width` x `height` grid of finite `f32` values (e.g. fertility
+    /// or temperature), stored row-major.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ScalarField {
         width: u32,
@@ -12335,6 +12424,8 @@ mod map_sandbox {
     }
 
     impl ScalarField {
+        /// Construct a field, rejecting a length other than `width * height` or
+        /// non-finite values.
         pub fn new(
             width: u32,
             height: u32,
@@ -12349,18 +12440,23 @@ mod map_sandbox {
             Ok(field)
         }
 
+        /// Field width in cells.
         pub fn width(&self) -> u32 {
             self.width
         }
 
+        /// Field height in cells.
         pub fn height(&self) -> u32 {
             self.height
         }
 
+        /// Row-major cell values, exactly `width * height` long.
         pub fn values(&self) -> &[f32] {
             &self.values
         }
 
+        /// Re-check the length and finiteness invariants (already enforced by
+        /// [`ScalarField::new`]).
         pub fn validate(&self) -> Result<(), ScientificStateError> {
             self.validate_at("scalar_field")
         }
@@ -12378,16 +12474,23 @@ mod map_sandbox {
         }
     }
 
+    /// Per-cell hydrology parameters stamped by a placed tile.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct HydrologyTile {
+        /// How readily water passes through the cell.
         pub permeability: f32,
+        /// Bias toward surface runoff versus absorption.
         pub runoff_bias: f32,
+        /// Rank used when ordering cells into drainage basins.
         pub basin_rank: f32,
+        /// Priority for channel/river formation.
         pub channel_priority: f32,
+        /// Locomotion cost for agents swimming through the cell.
         pub swim_cost: f32,
     }
 
     impl HydrologyTile {
+        /// Check that every parameter is finite.
         pub fn validate(&self) -> Result<(), ScientificStateError> {
             self.validate_at("hydrology_tile")
         }
@@ -12401,6 +12504,8 @@ mod map_sandbox {
         }
     }
 
+    /// A validated `width` x `height` grid of per-cell hydrology parameters,
+    /// stored row-major.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct HydrologyTileLayer {
         width: u32,
@@ -12409,6 +12514,8 @@ mod map_sandbox {
     }
 
     impl HydrologyTileLayer {
+        /// Construct a layer, rejecting a tile count other than `width * height`
+        /// or any non-finite tile parameter.
         pub fn new(
             width: u32,
             height: u32,
@@ -12423,18 +12530,22 @@ mod map_sandbox {
             Ok(layer)
         }
 
+        /// Layer width in cells.
         pub fn width(&self) -> u32 {
             self.width
         }
 
+        /// Layer height in cells.
         pub fn height(&self) -> u32 {
             self.height
         }
 
+        /// Row-major per-cell hydrology parameters, exactly `width * height` long.
         pub fn tiles(&self) -> &[HydrologyTile] {
             &self.tiles
         }
 
+        /// Re-check the tile-count invariant and every tile's finiteness.
         pub fn validate(&self) -> Result<(), ScientificStateError> {
             let expected = validated_cell_count_for::<HydrologyTile>(
                 "hydrology.tiles",
@@ -12455,12 +12566,18 @@ mod map_sandbox {
         }
     }
 
+    /// Direction water leaves a cell, derived from the terrain's drainage.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     pub enum HydrologyFlowDirection {
+        /// No outflow: a pit, sink, or flat cell.
         None,
+        /// Water flows toward the northern neighbor.
         North,
+        /// Water flows toward the southern neighbor.
         South,
+        /// Water flows toward the eastern neighbor.
         East,
+        /// Water flows toward the western neighbor.
         West,
     }
 
@@ -12476,6 +12593,9 @@ mod map_sandbox {
         }
     }
 
+    /// A validated `width` x `height` hydrology solution: per-cell flow directions,
+    /// accumulation, spill elevations, basin assignment, and starting water depth,
+    /// all stored row-major.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct HydrologyField {
         width: u32,
@@ -12488,6 +12608,8 @@ mod map_sandbox {
     }
 
     impl HydrologyField {
+        /// Construct a field, rejecting any lane whose length is not `width * height`
+        /// or any non-finite value.
         pub fn new(
             width: u32,
             height: u32,
@@ -12510,34 +12632,42 @@ mod map_sandbox {
             Ok(field)
         }
 
+        /// Field width in cells.
         pub fn width(&self) -> u32 {
             self.width
         }
 
+        /// Field height in cells.
         pub fn height(&self) -> u32 {
             self.height
         }
 
+        /// Row-major outflow direction per cell.
         pub fn flow_directions(&self) -> &[HydrologyFlowDirection] {
             &self.flow_directions
         }
 
+        /// Row-major flow accumulation (upstream contributing area) per cell.
         pub fn accumulation(&self) -> &[f32] {
             &self.accumulation
         }
 
+        /// Row-major elevation at which a cell spills into its outflow neighbor.
         pub fn spill_elevation(&self) -> &[f32] {
             &self.spill_elevation
         }
 
+        /// Row-major drainage-basin identifier per cell.
         pub fn basin_ids(&self) -> &[u32] {
             &self.basin_ids
         }
 
+        /// Row-major starting water depth per cell.
         pub fn initial_water_depth(&self) -> &[f32] {
             &self.initial_water_depth
         }
 
+        /// Re-check that every lane is `width * height` long and all floats finite.
         pub fn validate(&self) -> Result<(), ScientificStateError> {
             let expected =
                 validated_cell_count_for::<f32>("hydrology.field", self.width, self.height)?;
@@ -12574,6 +12704,8 @@ mod map_sandbox {
         }
     }
 
+    /// A fully generated, validated map: terrain plus optional environmental
+    /// fields, optional hydrology, and provenance metadata.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct MapArtifact {
         terrain: TerrainLayer,
@@ -12585,6 +12717,9 @@ mod map_sandbox {
     }
 
     impl MapArtifact {
+        /// Assemble an artifact, validating every component, cross-checking that
+        /// field dimensions match the terrain, and requiring the hydrology pair
+        /// to be both present or both absent.
         pub fn new(
             terrain: TerrainLayer,
             fertility: Option<ScalarField>,
@@ -12605,30 +12740,38 @@ mod map_sandbox {
             Ok(artifact)
         }
 
+        /// The generated terrain layer.
         pub fn terrain(&self) -> &TerrainLayer {
             &self.terrain
         }
 
+        /// Optional per-cell fertility field.
         pub fn fertility(&self) -> Option<&ScalarField> {
             self.fertility.as_ref()
         }
 
+        /// Optional per-cell temperature field.
         pub fn temperature(&self) -> Option<&ScalarField> {
             self.temperature.as_ref()
         }
 
+        /// Optional per-cell hydrology parameters; present iff [`MapArtifact::hydrology_field`] is.
         pub fn hydrology_tiles(&self) -> Option<&HydrologyTileLayer> {
             self.hydrology_tiles.as_ref()
         }
 
+        /// Optional hydrology solution; present iff [`MapArtifact::hydrology_tiles`] is.
         pub fn hydrology_field(&self) -> Option<&HydrologyField> {
             self.hydrology_field.as_ref()
         }
 
+        /// Provenance record for the generation run.
         pub fn metadata(&self) -> &MapArtifactMetadata {
             &self.metadata
         }
 
+        /// Re-check every component plus the dimension-match and hydrology-pair
+        /// invariants (already enforced by [`MapArtifact::new`]).
         pub fn validate(&self) -> Result<(), ScientificStateError> {
             self.terrain.validate()?;
             if let Some(field) = &self.fertility {
@@ -12759,6 +12902,9 @@ mod map_sandbox {
         }
     }
 
+    /// Generates maps by collapsing a declarative tileset under its adjacency
+    /// rules (wave-function-collapse style), retrying on contradiction up to a
+    /// bounded budget.
     pub struct RuleBasedMapGenerator {
         spec: TilesetSpec,
         compiled_tiles: Vec<CompiledTile>,
@@ -12768,6 +12914,8 @@ mod map_sandbox {
     }
 
     impl RuleBasedMapGenerator {
+        /// Compile a tileset into placement patterns; fails on tileset errors
+        /// (empty tileset, duplicate ids, dangling adjacency, zero weights).
         pub fn new(spec: TilesetSpec) -> Result<Self, MapGenerationError> {
             let tileset_hash = compute_tileset_hash(&spec);
             let (compiled_tiles, global_stats) = compile_tileset(&spec)?;
@@ -12780,15 +12928,22 @@ mod map_sandbox {
             })
         }
 
+        /// Override how many collapse attempts [`RuleBasedMapGenerator::generate`]
+        /// makes before reporting [`MapGenerationError::Contradiction`].
         pub fn with_retry_budget(mut self, retries: usize) -> Self {
             self.retry_budget = retries;
             self
         }
 
+        /// The tileset specification this generator was built from.
         pub fn spec(&self) -> &TilesetSpec {
             &self.spec
         }
 
+        /// Generate a `width` x `height` map with the given cell size and seed.
+        ///
+        /// Deterministic for a given (tileset, seed, dimensions) triple; retries
+        /// internally on contradiction up to the configured retry budget.
         // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
         #[allow(clippy::too_many_lines)]
         pub fn generate(

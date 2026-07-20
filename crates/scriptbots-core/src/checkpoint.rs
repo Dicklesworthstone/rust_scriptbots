@@ -122,26 +122,42 @@ impl fmt::Debug for WorldCheckpointV1 {
 pub enum WorldCheckpointError {
     /// The complete wire or declared payload exceeds its fixed resource ceiling.
     #[error("checkpoint wire is {found} bytes; maximum is {maximum}")]
-    WireTooLarge { found: usize, maximum: usize },
+    WireTooLarge {
+        /// Size in bytes of the offending wire or declared payload.
+        found: usize,
+        /// Fixed resource ceiling in bytes that `found` exceeded.
+        maximum: usize,
+    },
     /// Postcard could not encode, decode, or canonicalize one layer.
     #[error("checkpoint {operation} failed: {detail}")]
     Codec {
+        /// Which codec stage failed (e.g. encode, decode, canonicalize).
         operation: &'static str,
+        /// Human-readable failure detail from Postcard.
         detail: String,
     },
     /// The envelope names a foreign schema.
     #[error("checkpoint schema `{found}` does not match `{expected}`")]
     Schema {
+        /// Schema identifier found in the envelope.
         found: String,
+        /// Schema identifier this build expects.
         expected: &'static str,
     },
     /// The envelope names a foreign codec revision.
     #[error("checkpoint codec version {found} does not match {expected}")]
-    CodecVersion { found: u16, expected: u16 },
+    CodecVersion {
+        /// Codec revision found in the envelope.
+        found: u16,
+        /// Codec revision this build expects.
+        expected: u16,
+    },
     /// The envelope names a foreign serialization/checksum combination.
     #[error("checkpoint codec `{found}` does not match `{expected}`")]
     CodecIdentity {
+        /// Serialization/checksum combination found in the envelope.
         found: String,
+        /// Serialization/checksum combination this build expects.
         expected: &'static str,
     },
     /// The payload does not match the unkeyed corruption checksum in its envelope.
@@ -149,55 +165,88 @@ pub enum WorldCheckpointError {
     PayloadHashMismatch,
     /// A decoded Postcard value left extra bytes unconsumed.
     #[error("checkpoint {layer} contains {count} trailing bytes")]
-    TrailingBytes { layer: &'static str, count: usize },
+    TrailingBytes {
+        /// Which checkpoint layer (envelope or payload) held the extra bytes.
+        layer: &'static str,
+        /// Number of unconsumed trailing bytes.
+        count: usize,
+    },
     /// A semantically decodable Postcard value used a noncanonical representation.
     #[error("checkpoint {layer} is not in canonical Postcard form")]
-    NonCanonical { layer: &'static str },
+    NonCanonical {
+        /// Which checkpoint layer (envelope or payload) was noncanonical.
+        layer: &'static str,
+    },
     /// A decoded value violates a checkpoint-local semantic invariant.
     #[error("checkpoint contract violation at `{path}`: {detail}")]
-    Contract { path: String, detail: String },
+    Contract {
+        /// Dotted path to the value that violated the invariant.
+        path: String,
+        /// Human-readable description of the violated invariant.
+        detail: String,
+    },
     /// Core checkpoint capture does not own or reconstruct persistence sessions.
     #[error(
         "checkpoint capture requires persistence_interval=0; found {persistence_interval} (product persistence/resume belongs to the later runtime replay layer)"
     )]
-    PersistenceEnabled { persistence_interval: u32 },
+    PersistenceEnabled {
+        /// The configured persistence interval that must be zero for core capture.
+        persistence_interval: u32,
+    },
     /// Capture was attempted outside an open completed persistence boundary.
     #[error(
         "checkpoint capture requires an open persistence boundary at tick {tick}; found {found:?}"
     )]
     PersistenceBoundary {
+        /// Tick at which capture was attempted.
         tick: u64,
+        /// Actual boundary status observed at that tick.
         found: PersistenceBoundaryStatus,
     },
     /// Host-owned deferred output remained at the requested capture boundary.
     #[error("checkpoint capture found deferred host/persistence output at `{field}`")]
-    DeferredHostOutput { field: &'static str },
+    DeferredHostOutput {
+        /// Name of the state field still holding deferred host/persistence output.
+        field: &'static str,
+    },
     /// A live legacy runner has no versioned genome/evaluator reconstruction protocol.
     #[error(
         "agent UID {agent_uid} has legacy brain `{kind}` at registry key {registry_key:?}; only versioned protocol brains are restorable"
     )]
     LegacyBrain {
+        /// UID of the agent whose brain is not restorable.
         agent_uid: u64,
+        /// Legacy brain kind string.
         kind: String,
+        /// Registry key the legacy brain occupies, if any.
         registry_key: Option<u64>,
     },
     /// A versioned brain family rejected capture or reconstruction.
     #[error("agent UID {agent_uid} brain `{kind}` could not be checkpointed or restored: {detail}")]
     Brain {
+        /// UID of the agent whose brain failed capture or reconstruction.
         agent_uid: u64,
+        /// Versioned brain kind string.
         kind: String,
+        /// Human-readable failure detail from the brain family.
         detail: String,
     },
     /// The trusted host prepared a registry roster different from the saved declaration.
     #[error("prepared brain registry does not match the checkpoint: {detail}")]
-    RegistryMismatch { detail: String },
+    RegistryMismatch {
+        /// Human-readable description of how the prepared roster diverges.
+        detail: String,
+    },
     /// Reconstructed science state differs from the source boundary digest.
     #[error(
         "restored world diverged in `{lane}`: checkpoint recorded `{expected}`, reconstructed `{actual}`"
     )]
     DigestMismatch {
+        /// Which digest lane (state domain) diverged.
         lane: &'static str,
+        /// Digest recorded in the checkpoint.
         expected: String,
+        /// Digest reconstructed from restored state.
         actual: String,
     },
     /// A nested legacy characterization contract failed validation.

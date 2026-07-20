@@ -574,13 +574,25 @@ pub fn shimmer(tick: u64, cell_x: u32, cell_y: u32) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WorldVisualEvent {
     /// An agent arrived. Color follows the origin.
-    Birth { origin: BirthOrigin },
+    Birth {
+        /// How the agent entered the world (spawn, reproduction, etc.); selects the cue color.
+        origin: BirthOrigin,
+    },
     /// An agent died. Effect follows the cause.
-    Death { cause: DeathCause },
+    Death {
+        /// What killed the agent (combat, starvation, age); selects the cue family.
+        cause: DeathCause,
+    },
     /// A spike connected. `damage` is the dealt amount (pre-normalization).
-    CombatHit { damage: f32 },
+    CombatHit {
+        /// Damage dealt by the connecting spike, pre-normalization; drives shard intensity.
+        damage: f32,
+    },
     /// An agent ate. `amount` is the intake delta.
-    Eat { amount: f32 },
+    Eat {
+        /// Energy intake delta from the bite; scales the nibble fleck effect.
+        amount: f32,
+    },
     /// A reproduction pulse (distinct from the child's Birth cue).
     Reproduce,
     /// A spike began extending (telegraph).

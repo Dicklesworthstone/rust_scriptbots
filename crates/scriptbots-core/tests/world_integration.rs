@@ -1,3 +1,10 @@
+//! Legacy-oracle integration tests for the Rust scriptbots port.
+//!
+//! Each case replays a deterministic world setup against the numeric behavior
+//! of the original C++ simulation (cited by file/line in `LegacyOracleCase`)
+//! and asserts either legacy parity or an explicitly-ratified deliberate Rust
+//! policy divergence.
+
 // bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
 // order and fixed-width casts are part of the science contract; fma fusion,
 // reassociation, or width changes alter world digests. Function lengths mirror

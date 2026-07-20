@@ -1,3 +1,10 @@
+//! Criterion benchmarks for world stepping and brain evaluation.
+//!
+//! Measures per-tick world-step cost (with a fixed dense `25x16x9` MLP bench
+//! brain and neuro-flow brain adapters), brain batch-evaluation throughput,
+//! and per-stage profiling overhead so simulation performance regressions are
+//! caught before release.
+
 // bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
 // order and fixed-width casts are part of the science contract; fma fusion,
 // reassociation, or width changes alter world digests. Function lengths mirror

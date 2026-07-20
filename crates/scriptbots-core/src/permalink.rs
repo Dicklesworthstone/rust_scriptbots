@@ -83,50 +83,111 @@ pub struct Permalink {
 pub enum PermalinkError {
     /// Fewer bytes than the fixed header needs.
     TruncatedHeader {
+        /// Byte offset at which the header ran out.
         offset: usize,
+        /// Bytes the fixed header requires at that point.
         needed: usize,
+        /// Bytes actually remaining in the input.
         available: usize,
     },
     /// A declared field length overran the payload.
     TruncatedField {
+        /// Name of the length-prefixed field that overran the payload.
         field: &'static str,
+        /// Byte offset where the field begins.
         offset: usize,
+        /// Length the field declared for itself.
         declared: usize,
+        /// Bytes actually remaining after `offset`.
         remaining: usize,
     },
     /// Payload exceeds the documented cap before parsing starts.
-    OversizedPayload { actual: usize, maximum: usize },
+    OversizedPayload {
+        /// Payload size in bytes presented by the caller.
+        actual: usize,
+        /// Documented payload cap in bytes.
+        maximum: usize,
+    },
     /// Magic prefix mismatch.
-    BadMagic { first_16_bytes_hex: String },
+    BadMagic {
+        /// First 16 input bytes, hex-encoded, for one-line diagnosis.
+        first_16_bytes_hex: String,
+    },
     /// Unsupported format version.
-    UnsupportedVersion { found: u8, supported: u8 },
+    UnsupportedVersion {
+        /// Format version byte found in the header.
+        found: u8,
+        /// Format version this build supports.
+        supported: u8,
+    },
     /// Reserved flag bits were set.
-    NonzeroFlags { found: u8 },
+    NonzeroFlags {
+        /// The offending flags byte (reserved bits must be zero).
+        found: u8,
+    },
     /// CRC32 mismatch — the payload is corrupt.
-    CrcMismatch { expected: u32, actual: u32 },
+    CrcMismatch {
+        /// CRC32 stored in the header.
+        expected: u32,
+        /// CRC32 computed over the received payload.
+        actual: u32,
+    },
     /// A length-prefixed field was not valid UTF-8.
-    InvalidUtf8 { field: &'static str, offset: usize },
+    InvalidUtf8 {
+        /// Name of the length-prefixed field that failed UTF-8 validation.
+        field: &'static str,
+        /// Byte offset where the field begins.
+        offset: usize,
+    },
     /// Scenario id violates the manifest's identity rules.
-    InvalidScenarioId { reason: &'static str },
+    InvalidScenarioId {
+        /// Which manifest identity rule the scenario id violated.
+        reason: &'static str,
+    },
     /// A knob path was empty, overlong, or duplicated.
-    InvalidKnobPath { path: String, reason: &'static str },
+    InvalidKnobPath {
+        /// The offending knob path.
+        path: String,
+        /// Why it is invalid (empty, overlong, or duplicated).
+        reason: &'static str,
+    },
     /// A knob value was not finite.
-    NonFiniteKnobValue { path: String },
+    NonFiniteKnobValue {
+        /// Knob path whose value was NaN or infinite.
+        path: String,
+    },
     /// Too many knob entries.
-    TooManyKnobs { found: usize, maximum: usize },
+    TooManyKnobs {
+        /// Number of knob entries in the payload.
+        found: usize,
+        /// Maximum knob entries a permalink may carry.
+        maximum: usize,
+    },
     /// A knob assignment violates its declared range.
     OutOfRange {
+        /// Knob path whose assignment is out of range.
         path: String,
+        /// Value the link carried.
         value: f64,
+        /// Declared inclusive minimum for the knob.
         min: f64,
+        /// Declared inclusive maximum for the knob.
         max: f64,
     },
     /// The embedded digest does not match the config reconstructed from
     /// (scenario + knob diff). The link and the scenario disagree — the digest
     /// is the gate that keeps a tampered scenario from passing.
-    DigestMismatch { embedded: u64, reconstructed: u64 },
+    DigestMismatch {
+        /// Config digest embedded in the link.
+        embedded: u64,
+        /// Config digest reconstructed from (scenario + knob diff).
+        reconstructed: u64,
+    },
     /// Trailing bytes after the CRC.
-    TrailingBytes { count: usize },
+    TrailingBytes {
+        /// Number of bytes left after the CRC.
+        count: usize,
+    },
 }
 
 impl fmt::Display for PermalinkError {
