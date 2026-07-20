@@ -33161,8 +33161,6 @@ mod tests {
             world.persistence_boundary,
             PersistenceBoundaryStatus::Sealed { tick: Tick::zero() }
         );
-        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let batch = &entries[0];
@@ -34180,8 +34178,6 @@ mod tests {
         );
 
         {
-            // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
-            #[allow(clippy::significant_drop_tightening)]
             let entries = logs.lock().unwrap();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].births, vec![insertion_record.clone()]);
@@ -34871,8 +34867,6 @@ mod tests {
         assert_eq!(tick_three.births, 0);
         assert_eq!(tick_three.deaths, 0);
         assert_eq!(tick_three.spike_hits, 0);
-        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let batch = &entries[0];
@@ -35035,8 +35029,6 @@ mod tests {
             .step(&mut world)
             .expect("tick six persistence and lifecycle boundary");
 
-        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].summary.births, 1);
@@ -35186,8 +35178,6 @@ mod tests {
                 .abs()
                 < 1e-6
         );
-        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         assert!(
@@ -35235,8 +35225,6 @@ mod tests {
 
         session.step(&mut world).expect("persistence fixture step");
 
-        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let batch = &entries[0];
@@ -35326,8 +35314,6 @@ mod tests {
                 < 1.0
         );
 
-        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
-        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].summary.births, 1);
