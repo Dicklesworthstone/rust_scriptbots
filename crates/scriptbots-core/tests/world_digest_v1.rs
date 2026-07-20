@@ -248,6 +248,8 @@ fn a_food_draw_moves_only_the_food_rng_domain() {
     assert_eq!(before.agent_identity, after.agent_identity);
 }
 
+// bd-tqpj: the monolithic wire test keeps every legacy-contract rejection case in one reviewed unit.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn v1_6_wire_is_exact_and_rejects_older_contracts() {
     #[derive(Serialize)]
@@ -465,7 +467,7 @@ fn v1_6_wire_is_exact_and_rejects_older_contracts() {
         uncovered_families: digest.uncovered_families.clone(),
         factory_state_covered: digest.factory_state_covered,
         uncovered_factory_families: digest.uncovered_factory_families.clone(),
-        agent_identity: digest.agent_identity.clone(),
+        agent_identity: digest.agent_identity,
     };
     let legacy_json = serde_json::to_value(&legacy).expect("encode legacy V1.2 JSON fixture");
     assert!(

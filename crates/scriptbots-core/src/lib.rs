@@ -5209,6 +5209,8 @@ pub struct WorldStepProfiler {
 
 #[cfg(test)]
 #[derive(Debug, Default)]
+// bd-tqpj: the shared `_ns` postfix is intentional — every field is a nanosecond duration in the legacy profile test clock.
+#[allow(clippy::struct_field_names)]
 struct LegacyProfileTestClock {
     now_ns: u64,
     staging_advance_ns: u64,
@@ -5238,7 +5240,7 @@ impl WorldStepProfiler {
     }
 
     #[cfg(test)]
-    fn inject_legacy_tail_costs(&mut self, staging_ns: u64, result_ns: u64) {
+    const fn inject_legacy_tail_costs(&mut self, staging_ns: u64, result_ns: u64) {
         self.legacy_test_clock = LegacyProfileTestClock {
             now_ns: 0,
             staging_advance_ns: staging_ns,
@@ -5252,7 +5254,7 @@ impl WorldStepProfiler {
     }
 
     #[cfg(test)]
-    fn advance_legacy_test_staging(&mut self) {
+    const fn advance_legacy_test_staging(&mut self) {
         self.legacy_test_clock.now_ns = self
             .legacy_test_clock
             .now_ns
@@ -5260,7 +5262,7 @@ impl WorldStepProfiler {
     }
 
     #[cfg(test)]
-    fn advance_legacy_test_result(&mut self) {
+    const fn advance_legacy_test_result(&mut self) {
         self.legacy_test_clock.now_ns = self
             .legacy_test_clock
             .now_ns
@@ -13982,6 +13984,8 @@ mod map_sandbox {
             }
         }
 
+        // bd-tqpj: the u64→usize wrap cast is a pinned part of the deterministic seeded-graph fixture.
+        #[allow(clippy::cast_possible_truncation)]
         fn seeded_targets(seed: u64, len: usize) -> Vec<Option<usize>> {
             let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
             (0..len)
@@ -14016,6 +14020,8 @@ mod map_sandbox {
             (incoming_from_targets(&targets), path)
         }
 
+        // bd-tqpj: the u64→usize wrap cast in the seed→length derivation is pinned fixture math.
+        #[allow(clippy::cast_possible_truncation)]
         #[test]
         fn iterative_hydrology_matches_frozen_recursive_oracle_on_shapes_and_seeded_graphs() {
             let one_by_n = incoming_from_targets(
@@ -14075,6 +14081,8 @@ mod map_sandbox {
             }
         }
 
+        // bd-tqpj: the usize→f32 depth cast reproduces the frozen recursive oracle's exact values.
+        #[allow(clippy::cast_precision_loss)]
         #[test]
         fn maximal_length_meandering_large_grid_is_stack_safe_and_deterministic() {
             // 512^2 first visits would require 262,144 nested calls in the
@@ -17913,15 +17921,8 @@ impl WorldState {
         // Scheduled crossover is an explicit brain crossover, so protocol families must match by
         // exact wire identity. Display kinds are insufficient: two adapters can share a label
         // while interpreting genome bytes differently. Legacy runners retain their kind gate.
-        if let Some(ref partner_rt) = partner_runtime {
-            let compatible = match (parent_runtime.brain.genome(), partner_rt.brain.genome()) {
-                (Some(parent), Some(partner)) => parent.family_id() == partner.family_id(),
-                (Some(_), None) | (None, Some(_)) => false,
-                (None, None) => {
-                    let parent_kind = parent_runtime.brain.kind();
-                    parent_kind.is_some() && parent_kind == partner_rt.brain.kind()
-                }
-            };
+        if let Some(partner_rt) = &partner_runtime {
+            let compatible = Self::brains_compatible(&parent_runtime, partner_rt);
             if !compatible {
                 return Ok(None); // fall back to random spawn in caller
             }
@@ -19279,9 +19280,21 @@ impl WorldState {
         if rng.random_range(0.0..1.0) >= partner_chance {
             return None;
         }
+        // The species barrier applies to the whole child, not just the brain: a
+        // cross-kind partner must not blend runtime physiology, mutation rates, or
+        // lineage into a clone-brained child (bd-16g.13.2). Candidates are filtered
+        // by the same compatibility rule the scheduled crossover stage enforces.
+        let parent_runtime = self.runtime.get(handles[parent_idx]);
         let mut best: Option<(usize, u32, AgentUid)> = None;
         for (idx, age) in ages.iter().enumerate() {
             if idx == parent_idx {
+                continue;
+            }
+            let compatible = match (parent_runtime, self.runtime.get(handles[idx])) {
+                (Some(parent), Some(candidate)) => Self::brains_compatible(parent, candidate),
+                _ => false,
+            };
+            if !compatible {
                 continue;
             }
             let uid = self
@@ -19297,6 +19310,20 @@ impl WorldState {
             }
         }
         best.map(|(idx, _, _)| idx)
+    }
+
+    /// The species-barrier rule shared by the reproduction and scheduled-crossover
+    /// stages: protocol brains pair only within an exact wire family; legacy
+    /// runners retain their display-kind gate.
+    fn brains_compatible(parent: &AgentRuntime, partner: &AgentRuntime) -> bool {
+        match (parent.brain.genome(), partner.brain.genome()) {
+            (Some(parent), Some(partner)) => parent.family_id() == partner.family_id(),
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => {
+                let parent_kind = parent.brain.kind();
+                parent_kind.is_some() && parent_kind == partner.brain.kind()
+            }
+        }
     }
 
     fn refund_spawn_orders(&mut self, orders: &[SpawnOrder]) {
@@ -22180,7 +22207,7 @@ impl WorldState {
     /// Internal mutable access to trusted agent storage.
     #[cfg(test)]
     #[must_use]
-    fn agents_mut(&mut self) -> &mut AgentArena {
+    const fn agents_mut(&mut self) -> &mut AgentArena {
         &mut self.agents
     }
 
@@ -22479,7 +22506,7 @@ impl WorldState {
     /// Internal mutable access to the trusted food grid.
     #[cfg(test)]
     #[must_use]
-    fn food_mut(&mut self) -> &mut FoodGrid {
+    const fn food_mut(&mut self) -> &mut FoodGrid {
         &mut self.food
     }
 
@@ -23531,12 +23558,12 @@ mod tests {
         assert_eq!(decode_le_u64(&stream.checkpoint().state), 42);
     }
 
-    fn invalid_config_message(error: WorldStateError) -> &'static str {
+    fn invalid_config_message(error: &WorldStateError) -> &'static str {
         assert!(
-            matches!(&error, WorldStateError::InvalidConfig(_)),
+            matches!(error, WorldStateError::InvalidConfig(_)),
             "expected configuration rejection, got {error}"
         );
-        let WorldStateError::InvalidConfig(message) = error else {
+        let &WorldStateError::InvalidConfig(message) = error else {
             return "unexpected non-configuration error";
         };
         message
@@ -23781,8 +23808,8 @@ mod tests {
         .expect("world");
         let parent_a = world.spawn_agent(sample_agent(2));
         let parent_b = world.spawn_agent(sample_agent(5));
-        let parent_a_uid = world.agent_uid(parent_a).expect("first parent uid");
-        let parent_b_uid = world.agent_uid(parent_b).expect("second parent uid");
+        let first_parent_uid = world.agent_uid(parent_a).expect("first parent uid");
+        let second_parent_uid = world.agent_uid(parent_b).expect("second parent uid");
         world.advance_tick();
         let records_before = world.pending_birth_records.len();
         let callback_calls = Cell::new(0usize);
@@ -23809,7 +23836,7 @@ mod tests {
         assert_eq!(child.data.generation, Generation(6));
         assert_eq!(
             child.runtime.lineage,
-            [Some(parent_a_uid), Some(parent_b_uid)]
+            [Some(first_parent_uid), Some(second_parent_uid)]
         );
         assert!(child.runtime.hybrid);
         assert!((child.runtime.herbivore_tendency - 0.75).abs() < f32::EPSILON);
@@ -23825,8 +23852,8 @@ mod tests {
         assert_eq!(record.agent_uid, child.identity.uid);
         assert_eq!(record.origin, BirthOrigin::Injected);
         assert_eq!(record.birth_ordinal, None);
-        assert_eq!(record.parent_a, Some(parent_a_uid));
-        assert_eq!(record.parent_b, Some(parent_b_uid));
+        assert_eq!(record.parent_a, Some(first_parent_uid));
+        assert_eq!(record.parent_b, Some(second_parent_uid));
         assert_eq!(record.generation, Generation(6));
         assert!(record.is_hybrid);
         assert_eq!(world.last_births, 0);
@@ -24307,7 +24334,7 @@ mod tests {
         );
     }
 
-    fn assert_non_finite_path(error: ScientificStateError, expected_path: &str) {
+    fn assert_non_finite_path(error: &ScientificStateError, expected_path: &str) {
         assert_eq!(error.path(), expected_path);
         assert!(matches!(error, ScientificStateError::NonFinite { .. }));
     }
@@ -24350,7 +24377,7 @@ mod tests {
                     ..AgentData::default()
                 })
                 .expect_err("non-finite velocity must be rejected");
-            assert_non_finite_path(error, "agent.velocity.vy");
+            assert_non_finite_path(&error, "agent.velocity.vy");
             assert_eq!(
                 rejected
                     .characterization_digest_v0()
@@ -24365,7 +24392,7 @@ mod tests {
                     runtime.outputs[2] = value;
                 })
                 .expect_err("non-finite runtime must reject the whole spawn");
-            assert_non_finite_path(error, "agent.runtime.outputs[2]");
+            assert_non_finite_path(&error, "agent.runtime.outputs[2]");
             assert_eq!(
                 rejected
                     .characterization_digest_v0()
@@ -24443,7 +24470,7 @@ mod tests {
                 })
                 .expect_err("runtime non-finite value must reject the whole candidate");
             assert_non_finite_path(
-                error,
+                &error,
                 &format!("agents[{}].runtime.sensors[7]", agent.raw()),
             );
             assert_eq!(
@@ -24460,7 +24487,7 @@ mod tests {
                     cells[3] = value;
                 })
                 .expect_err("bulk food update must reject non-finite cell");
-            assert_non_finite_path(error, "food.cells[3]");
+            assert_non_finite_path(&error, "food.cells[3]");
             assert_eq!(world.food().cells(), baseline_food);
             assert_eq!(world.config_revision(), baseline_revision);
             assert_eq!(world.config_audit(), baseline_audit);
@@ -24487,7 +24514,7 @@ mod tests {
                 ..AgentData::default()
             })
             .expect_err("invalid append must reject before touching any column");
-        assert_non_finite_path(error, "agents[2].color[1]");
+        assert_non_finite_path(&error, "agents[2].color[1]");
         assert_eq!(columns.len(), before_len);
 
         let mut food = FoodGrid::new(2, 2, -0.0).expect("finite initial field");
@@ -24507,7 +24534,7 @@ mod tests {
         let WorldStateError::InvalidState(error) = error else {
             return;
         };
-        assert_non_finite_path(error, "food.initial");
+        assert_non_finite_path(&error, "food.initial");
     }
 
     #[test]
@@ -25349,7 +25376,7 @@ mod tests {
         type Setter = fn(&mut ScriptBotsConfig, f32);
         let fields: [(&str, f32, Setter); 72] = [
             ("initial_food", -1.0, |config, value| {
-                config.initial_food = value
+                config.initial_food = value;
             }),
             ("food_respawn_amount", -1.0, |config, value| {
                 config.food_respawn_amount = value;
@@ -25365,7 +25392,7 @@ mod tests {
                 config.food_diffusion_rate = value;
             }),
             ("sense_radius", 0.0, |config, value| {
-                config.sense_radius = value
+                config.sense_radius = value;
             }),
             ("sense_max_neighbors", 0.0, |config, value| {
                 config.sense_max_neighbors = value;
@@ -25533,10 +25560,10 @@ mod tests {
                 config.population_crossover_chance = value;
             }),
             ("spike_radius", 0.0, |config, value| {
-                config.spike_radius = value
+                config.spike_radius = value;
             }),
             ("spike_damage", -1.0, |config, value| {
-                config.spike_damage = value
+                config.spike_damage = value;
             }),
             ("spike_energy_cost", -1.0, |config, value| {
                 config.spike_energy_cost = value;
@@ -25629,7 +25656,7 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
         let message = invalid_config_message(
-            capacity
+            &capacity
                 .validate()
                 .expect_err("capacity fractions above one must be rejected"),
         );
@@ -25643,7 +25670,7 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
         let message = invalid_config_message(
-            reproduction
+            &reproduction
                 .validate()
                 .expect_err("reproduction cost above threshold must be rejected"),
         );
@@ -25658,7 +25685,7 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
         let message = invalid_config_message(
-            aging
+            &aging
                 .validate()
                 .expect_err("enabled aging decay must fit within its cap"),
         );
@@ -25737,7 +25764,7 @@ mod tests {
     fn config_validation_rejects_excessive_food_waste() {
         let mut config = ScriptBotsConfig::default();
         config.food_waste_rate = config.food_max + 0.1;
-        let message = invalid_config_message(WorldState::new(config).unwrap_err());
+        let message = invalid_config_message(&WorldState::new(config).unwrap_err());
         assert!(
             message.contains("food_waste_rate"),
             "expected food_waste_rate validation error, got {message}"
@@ -26342,8 +26369,7 @@ mod tests {
                 runner: Some(Box::new(StubBrain)),
                 registry_key: Some(41),
                 kind: "stub".to_owned(),
-            }
-            .clone();
+            };
             runtime.energy = 1.0;
             runtime.reproduction_counter = 1.0;
             runtime.outputs = [0.75; OUTPUT_SIZE];
@@ -26612,7 +26638,7 @@ mod tests {
     /// whose entire job is to explain.
     ///
     /// The proof: explain what the agent perceives now, then step the world once
-    /// (stage_sense runs before anything moves, so it senses exactly the world we
+    /// (`stage_sense` runs before anything moves, so it senses exactly the world we
     /// just explained) and require core's sensors to match what we predicted.
     #[test]
     fn a_meteor_selects_agents_across_the_toroidal_seam() {
@@ -27093,7 +27119,7 @@ mod tests {
                 genome: CohortSource::RegisteredBrain { key },
                 placement: Placement::Seeded {
                     region,
-                    seed: 0xC0FFEE,
+                    seed: 0xC0_FFEE,
                 },
             })
             .expect("valid cohort injection");
@@ -27888,6 +27914,8 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the float while-loops bisect the f32 bit pattern adjacent to the EPSILON radius gate; float comparison is the pinned intent.
+    #[allow(clippy::while_float)]
     fn production_fixed_sense_preserves_near_zero_and_radius_exclusions() {
         let sensed_smell = |neighbour_x: f32, radius: f32| {
             let mut world = WorldState::new(ScriptBotsConfig {
@@ -28678,12 +28706,12 @@ mod tests {
         assert_eq!(inspections.load(AtomicUsizeOrdering::Relaxed), 2);
 
         let unbound_id = world.spawn_agent(sample_agent(100));
-        let unbound_uid = world.agent_uid(unbound_id).expect("unbound stable uid");
+        let uid_of_unbound = world.agent_uid(unbound_id).expect("unbound stable uid");
         let unbound = world
             .inspect_brains(&BrainInspectionRequest::single(
                 BrainInspectionClientId::new(8),
                 BrainInspectionRevision::new(2),
-                unbound_uid,
+                uid_of_unbound,
             ))
             .expect("unbound brain outcome");
         assert!(matches!(
@@ -28704,14 +28732,14 @@ mod tests {
         world
             .bind_agent_brain(unsupported_id, unsupported_key)
             .expect("bind unsupported brain");
-        let unsupported_uid = world
+        let uid_of_unsupported = world
             .agent_uid(unsupported_id)
             .expect("unsupported stable uid");
         let unsupported = world
             .inspect_brains(&BrainInspectionRequest::single(
                 BrainInspectionClientId::new(8),
                 BrainInspectionRevision::new(3),
-                unsupported_uid,
+                uid_of_unsupported,
             ))
             .expect("unsupported brain outcome");
         assert!(matches!(
@@ -29492,7 +29520,7 @@ mod tests {
             food_respawn_amount: 0.3,
             food_max: 1.5,
             chart_flush_interval: 12,
-            rng_seed: Some(0xDEADBEEF),
+            rng_seed: Some(0xDEAD_BEEF),
             ..ScriptBotsConfig::default()
         };
 
@@ -29508,7 +29536,7 @@ mod tests {
         );
 
         let mut different_seed = base_config;
-        different_seed.rng_seed = Some(0xF00DF00D);
+        different_seed.rng_seed = Some(0xF00D_F00D);
         let (history_c, food_c) = run_seeded_history(different_seed, STEPS);
         assert!(
             history_a != history_c || food_a != food_c,
@@ -29700,6 +29728,8 @@ mod tests {
     const FIXTURE_STATE_CODEC: u16 = 5;
 
     #[derive(Debug)]
+    // bd-tqpj: the independent batch/evaluation bool flags mirror the fixture family's orthogonal failure modes.
+    #[allow(clippy::struct_excessive_bools)]
     struct FixtureBrainFamily {
         id: BrainFamilyId,
         offspring_policy: OffspringStatePolicy,
@@ -29822,7 +29852,7 @@ mod tests {
             .expect("fixture genome")
         }
 
-        fn genome_material(&self, gain: i8, bias: i8) -> BrainGenomeMaterial {
+        fn genome_material(gain: i8, bias: i8) -> BrainGenomeMaterial {
             BrainGenomeMaterial::new(
                 FIXTURE_GENOME_SCHEMA,
                 FIXTURE_GENOME_CODEC,
@@ -30026,7 +30056,7 @@ mod tests {
             rng: &mut dyn RandomStream,
         ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
             let sample = rng.next_u32().to_le_bytes();
-            Ok(self.genome_material(sample[0] as i8, sample[1] as i8))
+            Ok(Self::genome_material(sample[0] as i8, sample[1] as i8))
         }
 
         fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
@@ -30052,7 +30082,7 @@ mod tests {
             } else {
                 0
             };
-            Ok(self.genome_material(gain.wrapping_add(delta), bias))
+            Ok(Self::genome_material(gain.wrapping_add(delta), bias))
         }
 
         fn crossover_genomes_material(
@@ -30063,7 +30093,7 @@ mod tests {
         ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
             let (left_gain, _) = self.decode_genome(left)?;
             let (_, right_bias) = self.decode_genome(right)?;
-            Ok(self.genome_material(left_gain, right_bias))
+            Ok(Self::genome_material(left_gain, right_bias))
         }
 
         fn initial_state(
@@ -30602,6 +30632,35 @@ mod tests {
 
     #[test]
     fn brain_protocol_rejects_invalid_ids_versions_families_codecs_and_sizes() {
+        struct WrongCheckpointEvaluator {
+            id: BrainFamilyId,
+            state: BrainEvaluatorStateEnvelope,
+        }
+
+        impl BrainEvaluator for WrongCheckpointEvaluator {
+            fn family_id(&self) -> &BrainFamilyId {
+                &self.id
+            }
+
+            fn evaluate(
+                &mut self,
+                _sensors: &[f32; INPUT_SIZE],
+            ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
+                Ok([0.0; OUTPUT_SIZE])
+            }
+
+            fn inspect(
+                &self,
+                _request: BrainInspection,
+            ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+                Ok(None)
+            }
+
+            fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+                Ok(self.state.clone())
+            }
+        }
+
         assert!(matches!(
             BrainFamilyId::new("Fixture.Bad"),
             Err(BrainProtocolError::InvalidFamilyId { .. })
@@ -30811,35 +30870,6 @@ mod tests {
             })
         ));
 
-        struct WrongCheckpointEvaluator {
-            id: BrainFamilyId,
-            state: BrainEvaluatorStateEnvelope,
-        }
-
-        impl BrainEvaluator for WrongCheckpointEvaluator {
-            fn family_id(&self) -> &BrainFamilyId {
-                &self.id
-            }
-
-            fn evaluate(
-                &mut self,
-                _sensors: &[f32; INPUT_SIZE],
-            ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
-                Ok([0.0; OUTPUT_SIZE])
-            }
-
-            fn inspect(
-                &self,
-                _request: BrainInspection,
-            ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
-                Ok(None)
-            }
-
-            fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
-                Ok(self.state.clone())
-            }
-        }
-
         let bad_checkpoint = WrongCheckpointEvaluator {
             id: family.id.clone(),
             state: wrong_state_codec,
@@ -30994,7 +31024,7 @@ mod tests {
             registry.adapter_identity(protocol),
             registry
                 .family(protocol)
-                .map(|adapter| adapter.adapter_identity()),
+                .map(<dyn BrainFamilyAdapter>::adapter_identity),
             "registration must capture the exact family-authored semantic identity"
         );
 
@@ -31414,7 +31444,7 @@ mod tests {
                 *offspring_parent_counts
                     .lock()
                     .expect("fixture offspring probe mutex"),
-                vec![if inherits { 1 } else { 0 }],
+                vec![usize::from(inherits)],
                 "the core must invoke the family offspring hook exactly once and expose parent \
                  state only for a declared inheritance policy"
             );
@@ -31904,7 +31934,7 @@ mod tests {
         world
             .agent_runtime_mut(missing_legacy)
             .expect("missing legacy runtime")
-            .brain = BrainBinding::with_runner(Box::new(StubBrain)).clone();
+            .brain = BrainBinding::with_runner(Box::new(StubBrain));
 
         let error = world
             .stage_brains()
@@ -32898,9 +32928,9 @@ mod tests {
         assert!(plain_logs.lock().unwrap().is_empty());
 
         let (mut profiled, mut profiled_session, profiled_logs) = outcome_world(0x0A71_0002);
-        let mut profiler = WorldStepProfiler::default();
+        let mut step_profiler = WorldStepProfiler::default();
         let profiled_completion = profiled_session
-            .step_profiled_outcome(&mut profiled, &mut profiler)
+            .step_profiled_outcome(&mut profiled, &mut step_profiler)
             .expect("profiled outcome");
         assert_eq!(
             profiled_completion.outcome.persistence.status(),
@@ -32910,14 +32940,14 @@ mod tests {
         assert_same_staged_batch(&profiled_session, &profiled_batch);
         assert!(profiled_logs.lock().unwrap().is_empty());
         assert_eq!(
-            profiler.latest().expect("core profile").schema,
+            step_profiler.latest().expect("core profile").schema,
             WORLD_STEP_OUTCOME_PROFILE_SCHEMA
         );
 
         let (mut traced, mut traced_session, traced_logs) = outcome_world(0x0A71_0003);
-        let mut tracer = WorldStepTracer::default();
+        let mut step_tracer = WorldStepTracer::default();
         let traced_completion = traced_session
-            .step_traced_outcome(&mut traced, &mut tracer)
+            .step_traced_outcome(&mut traced, &mut step_tracer)
             .expect("traced outcome");
         assert_eq!(
             traced_completion.outcome.persistence.status(),
@@ -32926,7 +32956,7 @@ mod tests {
         let traced_batch = ready_batch_arc(&traced_completion.outcome.persistence);
         assert_same_staged_batch(&traced_session, &traced_batch);
         assert!(traced_logs.lock().unwrap().is_empty());
-        tracer
+        step_tracer
             .latest()
             .expect("outcome trace")
             .validate_contract()
@@ -33150,6 +33180,8 @@ mod tests {
             world.persistence_boundary,
             PersistenceBoundaryStatus::Sealed { tick: Tick::zero() }
         );
+        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let batch = &entries[0];
@@ -34856,6 +34888,8 @@ mod tests {
         assert_eq!(tick_three.births, 0);
         assert_eq!(tick_three.deaths, 0);
         assert_eq!(tick_three.spike_hits, 0);
+        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let batch = &entries[0];
@@ -34924,6 +34958,8 @@ mod tests {
                 session.step(&mut world).expect("cadence comparison tick");
             }
 
+            // bd-tqpj: the spy-log mutex guard must stay held across the cadence aggregation; drop order is semantic.
+            #[allow(clippy::significant_drop_tightening)]
             let entries = logs.lock().unwrap();
             let mut event_totals = (0usize, 0usize, 0usize, 0usize);
             for event in entries.iter().flat_map(|batch| &batch.events) {
@@ -35016,6 +35052,8 @@ mod tests {
             .step(&mut world)
             .expect("tick six persistence and lifecycle boundary");
 
+        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].summary.births, 1);
@@ -35107,6 +35145,8 @@ mod tests {
             PersistenceBoundaryStatus::Sealed { tick: Tick(4) }
         );
 
+        // bd-tqpj: the spy-log mutex guard must stay held across the tail-batch assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].summary.tick, Tick(3));
@@ -35163,6 +35203,8 @@ mod tests {
                 .abs()
                 < 1e-6
         );
+        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         assert!(
@@ -35278,18 +35320,18 @@ mod tests {
         session.step(&mut world).expect("reproduction step");
         assert_eq!(world.agent_count(), 2);
 
-        let handles: Vec<_> = world.agents().iter_handles().collect();
-        let child_id = handles
-            .into_iter()
+        let child_id = world
+            .agents()
+            .iter_handles()
             .find(|id| *id != parent_id)
             .expect("child");
         let child_state = world.snapshot_agent(child_id).expect("child state");
-        let parent_uid = world.agent_uid(parent_id).expect("parent uid");
+        let parent_stable_uid = world.agent_uid(parent_id).expect("parent uid");
         assert_eq!(child_state.data.generation, Generation(1));
         assert_eq!(child_state.identity.uid, AgentUid(2));
         assert_eq!(child_state.identity.spawn_ordinal, 1);
         assert_eq!(child_state.identity.birth_ordinal, Some(0));
-        assert_eq!(child_state.runtime.lineage, [Some(parent_uid), None]);
+        assert_eq!(child_state.runtime.lineage, [Some(parent_stable_uid), None]);
         assert!((child_state.runtime.energy - 0.6).abs() < 1e-6);
         assert!(
             world
@@ -35299,6 +35341,8 @@ mod tests {
                 < 1.0
         );
 
+        // bd-tqpj: the spy-log mutex guard must stay held across the batch assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].summary.births, 1);
@@ -35316,7 +35360,7 @@ mod tests {
             .find(|record| record.origin == BirthOrigin::Born)
             .expect("natural birth record");
         assert_eq!(born.tick, Tick(1));
-        assert_eq!(born.parent_a, Some(parent_uid));
+        assert_eq!(born.parent_a, Some(parent_stable_uid));
         assert_eq!(born.parent_b, None);
         assert_eq!(born.generation, Generation(1));
     }
@@ -35405,7 +35449,7 @@ mod tests {
         };
 
         let ticks_a = reproduction_tick_sequence(base.clone(), 24);
-        let ticks_b = reproduction_tick_sequence(base.clone(), 24);
+        let ticks_b = reproduction_tick_sequence(base, 24);
         assert_eq!(ticks_a, ticks_b);
         assert!(!ticks_a.is_empty());
     }
@@ -36409,6 +36453,8 @@ mod tests {
                 .expect("carcass metrics should be admitted")
         );
 
+        // bd-tqpj: the spy-log mutex guard must stay held across the metric assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let metrics = &entries[0].metrics;
@@ -36516,9 +36562,7 @@ mod tests {
         let expected_cell = (0.2 - config.food_waste_rate).max(0.0);
         assert!(
             (cell_value - expected_cell).abs() < 1e-6,
-            "expected cell value {:.6}, got {:.6}",
-            expected_cell,
-            cell_value
+            "expected cell value {expected_cell:.6}, got {cell_value:.6}"
         );
     }
 
@@ -36577,9 +36621,7 @@ mod tests {
         let expected_cell = (0.15 - world.config().food_waste_rate).max(0.0);
         assert!(
             (cell_value - expected_cell).abs() < 1e-6,
-            "expected ground food to waste down to {:.6}, got {:.6}",
-            expected_cell,
-            cell_value
+            "expected ground food to waste down to {expected_cell:.6}, got {cell_value:.6}"
         );
     }
 
@@ -36636,9 +36678,7 @@ mod tests {
         let infertile_value = cells[infertile_idx];
         assert!(
             fertile_value > infertile_value + 1e-4,
-            "fertile cell should regrow faster ({} <= {})",
-            fertile_value,
-            infertile_value
+            "fertile cell should regrow faster ({fertile_value} <= {infertile_value})"
         );
         assert!(
             fertile_value <= profiles[fertile_idx].capacity + 1e-6,
@@ -36681,9 +36721,7 @@ mod tests {
         let cell_value = world.food().cells()[idx];
         assert!(
             cell_value <= capacity + 1e-6,
-            "respawned value {:.6} should not exceed local capacity {:.6}",
-            cell_value,
-            capacity
+            "respawned value {cell_value:.6} should not exceed local capacity {capacity:.6}"
         );
     }
 
@@ -37580,8 +37618,8 @@ mod tests {
 
     #[test]
     fn characterization_v0_is_repeatable_and_does_not_advance_rng() {
-        let (mut world_a, _) = characterization_world(0xC0FFEE);
-        let (mut world_b, _) = characterization_world(0xC0FFEE);
+        let (mut world_a, _) = characterization_world(0xC0_FFEE);
+        let (mut world_b, _) = characterization_world(0xC0_FFEE);
 
         let first = world_a.characterization_digest_v0().expect("first digest");
         let second = world_a.characterization_digest_v0().expect("second digest");
@@ -37757,7 +37795,7 @@ mod tests {
         let mut invalid = world.config().clone();
         invalid.food_growth_rate = f32::NAN;
         let message = invalid_config_message(
-            world
+            &world
                 .apply_config_update(invalid)
                 .expect_err("non-finite runtime update must be rejected"),
         );
@@ -37782,7 +37820,7 @@ mod tests {
             step_once: false,
         };
         let message = invalid_config_message(
-            apply_control_command(&mut world, ControlCommand::UpdateSimulation(command))
+            &apply_control_command(&mut world, ControlCommand::UpdateSimulation(command))
                 .expect_err("non-finite speed must be rejected"),
         );
         assert_eq!(message, "speed_multiplier must be finite");
@@ -38210,7 +38248,7 @@ mod tests {
         };
         let mut control = WorldState::new(config.clone()).expect("control world");
         let mut profiled = WorldState::new(config).expect("profiled world");
-        let mut profiler = WorldStepProfiler::default();
+        let mut step_profiler = WorldStepProfiler::default();
         let control_brain = control
             .brain_registry_mut()
             .expect("control profiler registry mutation")
@@ -38240,11 +38278,11 @@ mod tests {
         for expected_tick in 1..=3 {
             let control_events = control.step().expect("control tick");
             let profiled_events = profiled
-                .step_profiled(&mut profiler)
+                .step_profiled(&mut step_profiler)
                 .expect("profiled tick");
             assert_eq!(control_events, profiled_events);
 
-            let report = profiler.latest().expect("completed profile");
+            let report = step_profiler.latest().expect("completed profile");
             assert_eq!(report.schema, WORLD_STEP_OUTCOME_PROFILE_SCHEMA);
             assert_eq!(report.tick, Tick(expected_tick));
             assert_eq!(report.stages().count(), WorldStepStage::COUNT);
@@ -38364,13 +38402,73 @@ mod tests {
             world
         }
 
+        // Re-pinned in bd-300o after the CPU sense lane adopted the shared Q20 fixed-point
+        // accumulator and poly-acos geometry. Re-pinned again in bd-2i1 after WorldDigest and the
+        // trace advanced to V1.6 and default locomotion returned to the exact legacy two-rotation
+        // model. Re-pinned in bd-hiv1 after sensing adopted the prior completed runtime wheel
+        // outputs instead of physical velocity. Re-pinned in bd-2z0.14.3.1 after RenderSettings
+        // v2 added presentation-only fields (quality tier, post stack, day/night, theme,
+        // palette) to the serialized config tree: as in bd-2i1, the transition, output-tail,
+        // and resource lanes are unchanged while the stage-world and aggregate lanes advanced
+        // transitively through the config-lane encoding; no science value moved.
+        const EXPECTED: [(&str, &str, &str, &str, &str, &str); 6] = [
+            (
+                "sense",
+                "004a8ff34232c73a",
+                "79c9f653219e2e99",
+                "a5c3391527f7be0f",
+                "15b8ace5445abf68",
+                "865000ef38f32868",
+            ),
+            (
+                "brains",
+                "e47a9ca0b75f3bd2",
+                "0784675f322b8c77",
+                "e253563076bd2b5d",
+                "338ece8c58e3aa54",
+                "9f39057a48ff0d55",
+            ),
+            (
+                "actuation",
+                "0b123cc4186c53d6",
+                "9372d014d2c797ef",
+                "d47fa5d7b8cf2959",
+                "f86a99d091268ea6",
+                "9c4573ee33022788",
+            ),
+            (
+                "food",
+                "f0ca325e4c9a4c56",
+                "c015084f9ab60410",
+                "fc08078be123d220",
+                "b02ed06b5635e312",
+                "0855fe48c69c007d",
+            ),
+            (
+                "death_cleanup",
+                "f0ca325e4c9a4c56",
+                "46581b2d02073daa",
+                "9b909fd41eae4aca",
+                "69b3e219fb68f4da",
+                "c28f4b1678fcf8d7",
+            ),
+            (
+                "population",
+                "b3afba363a569824",
+                "ff09abb6bd938d55",
+                "1aad4a0f35a0c69b",
+                "e94c6bb812e4088d",
+                "7520bda32943fa12",
+            ),
+        ];
+
         let mut control = traced_world();
         let mut traced = traced_world();
-        let mut tracer = WorldStepTracer::default();
+        let mut step_tracer = WorldStepTracer::default();
 
         let control_events = control.step().expect("control trace tick");
         let traced_events = traced
-            .step_traced(&mut tracer)
+            .step_traced(&mut step_tracer)
             .expect("instrumented trace tick");
         assert_eq!(control_events, traced_events);
         assert_eq!(
@@ -38379,7 +38477,7 @@ mod tests {
         );
         assert_eq!(control.resource_ledger(), traced.resource_ledger());
 
-        let trace = tracer.latest().expect("completed stage trace");
+        let trace = step_tracer.latest().expect("completed stage trace");
         assert_eq!(trace.schema, WORLD_STEP_TRACE_SCHEMA);
         assert_eq!(trace.codec_version, WORLD_STEP_TRACE_CODEC_VERSION);
         assert_eq!(trace.tick, Tick(1));
@@ -38404,7 +38502,7 @@ mod tests {
             .expect("repeated instrumented trace tick");
         assert_eq!(traced_events, repeated_events);
         assert_eq!(
-            tracer.latest(),
+            step_tracer.latest(),
             repeated_tracer.latest(),
             "same-lane repeated trace diverged"
         );
@@ -38678,65 +38776,6 @@ mod tests {
                 )
             })
             .collect();
-        // Re-pinned in bd-300o after the CPU sense lane adopted the shared Q20 fixed-point
-        // accumulator and poly-acos geometry. Re-pinned again in bd-2i1 after WorldDigest and the
-        // trace advanced to V1.6 and default locomotion returned to the exact legacy two-rotation
-        // model. Re-pinned in bd-hiv1 after sensing adopted the prior completed runtime wheel
-        // outputs instead of physical velocity. Re-pinned in bd-2z0.14.3.1 after RenderSettings
-        // v2 added presentation-only fields (quality tier, post stack, day/night, theme,
-        // palette) to the serialized config tree: as in bd-2i1, the transition, output-tail,
-        // and resource lanes are unchanged while the stage-world and aggregate lanes advanced
-        // transitively through the config-lane encoding; no science value moved.
-        const EXPECTED: [(&str, &str, &str, &str, &str, &str); 6] = [
-            (
-                "sense",
-                "004a8ff34232c73a",
-                "79c9f653219e2e99",
-                "a5c3391527f7be0f",
-                "15b8ace5445abf68",
-                "865000ef38f32868",
-            ),
-            (
-                "brains",
-                "e47a9ca0b75f3bd2",
-                "0784675f322b8c77",
-                "e253563076bd2b5d",
-                "338ece8c58e3aa54",
-                "9f39057a48ff0d55",
-            ),
-            (
-                "actuation",
-                "0b123cc4186c53d6",
-                "9372d014d2c797ef",
-                "d47fa5d7b8cf2959",
-                "f86a99d091268ea6",
-                "9c4573ee33022788",
-            ),
-            (
-                "food",
-                "f0ca325e4c9a4c56",
-                "c015084f9ab60410",
-                "fc08078be123d220",
-                "b02ed06b5635e312",
-                "0855fe48c69c007d",
-            ),
-            (
-                "death_cleanup",
-                "f0ca325e4c9a4c56",
-                "46581b2d02073daa",
-                "9b909fd41eae4aca",
-                "69b3e219fb68f4da",
-                "c28f4b1678fcf8d7",
-            ),
-            (
-                "population",
-                "b3afba363a569824",
-                "ff09abb6bd938d55",
-                "1aad4a0f35a0c69b",
-                "e94c6bb812e4088d",
-                "7520bda32943fa12",
-            ),
-        ];
         if std::env::var("SCRIPTBOTS_WORLD_DIGEST_GOLDEN").as_deref() == Ok("1") {
             let build = CoreBuildIdentityV0::current();
             assert!(build.parallel);
@@ -39587,6 +39626,9 @@ mod tests {
     }
 
     #[test]
+    // bd-tqpj: the `.count` suffix filter matches a metric-name convention, not a
+    // filesystem extension — the case-sensitive comparison is intentional.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn persistence_batch_orders_agents_and_brain_metrics_stably() {
         let config = ScriptBotsConfig {
             spike_damage: 0.0,
@@ -39626,6 +39668,8 @@ mod tests {
         session
             .step(&mut world)
             .expect("ordered persistence batch tick");
+        // bd-tqpj: the spy-log mutex guard must stay held across the ordered-batch assertions; drop order is semantic.
+        #[allow(clippy::significant_drop_tightening)]
         let entries = logs.lock().expect("ordered batch logs");
         let batch = entries.last().expect("ordered persistence batch");
         let agent_uids: Vec<_> = batch
@@ -39810,13 +39854,13 @@ mod tests {
                 reject_next: true,
             },
         );
-        let mut profiler = WorldStepProfiler::default();
+        let mut step_profiler = WorldStepProfiler::default();
 
         let control_error = control_session
             .step(&mut control)
             .expect_err("control persistence rejection");
         let profiled_error = profiled_session
-            .step_profiled(&mut profiled, &mut profiler)
+            .step_profiled(&mut profiled, &mut step_profiler)
             .expect_err("profiled persistence rejection");
         assert!(
             matches!(
@@ -39867,7 +39911,7 @@ mod tests {
                 .batch,
         );
         assert_eq!(
-            profiler.latest().expect("failed tick profile").tick,
+            step_profiler.latest().expect("failed tick profile").tick,
             Tick(1)
         );
         assert_eq!(
@@ -39887,7 +39931,7 @@ mod tests {
             .characterization_digest_v0()
             .expect("latched digest");
         let repeated = profiled_session
-            .step_profiled(&mut profiled, &mut profiler)
+            .step_profiled(&mut profiled, &mut step_profiler)
             .expect_err("latched failure blocks a second tick");
         assert_eq!(repeated.to_string(), profiled_error.to_string());
         assert_same_staged_batch(&profiled_session, &profiled_retained);
@@ -39955,23 +39999,25 @@ mod tests {
             assert_eq!(projected.brain_key, runtime.brain.registry_key());
         }
 
-        let first_uid = world.agent_uid(first_id).expect("first uid before removal");
+        let first_stable_uid = world.agent_uid(first_id).expect("first uid before removal");
         world
             .remove_agent(first_id)
             .expect("remove first snapshot agent");
         let replacement_id = world.spawn_agent(sample_agent(2));
-        let replacement_uid = world
+        let replacement_stable_uid = world
             .agent_uid(replacement_id)
             .expect("replacement stable uid");
         let churned = DynamicWorldSnapshot::from_world(&world);
-        assert_ne!(replacement_uid, first_uid);
-        assert!(churned.agents.iter().all(|agent| agent.uid != first_uid));
+        assert_ne!(replacement_stable_uid, first_stable_uid);
         assert!(
             churned
                 .agents
                 .iter()
-                .any(|agent| { agent.id == replacement_id.raw() && agent.uid == replacement_uid })
+                .all(|agent| agent.uid != first_stable_uid)
         );
+        assert!(churned.agents.iter().any(|agent| {
+            agent.id == replacement_id.raw() && agent.uid == replacement_stable_uid
+        }));
     }
 
     fn reference_render_settings() -> RenderSettings {

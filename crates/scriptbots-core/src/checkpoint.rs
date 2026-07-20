@@ -2573,9 +2573,7 @@ mod tests {
         boxed_fixture_brain_family, boxed_fixture_brain_family_with_behavior_probe,
     };
     use crate::{BrainGenomeDerivation, BrainRunner, LocomotionModel};
-    use crate::{
-        Intervention, MAX_NEUROFLOW_HIDDEN_LAYERS, MAX_NEUROFLOW_LAYER_NEURONS, RenderSettings,
-    };
+    use crate::{Intervention, MAX_NEUROFLOW_HIDDEN_LAYERS, MAX_NEUROFLOW_LAYER_NEURONS};
     use rand::RngCore;
     use std::sync::{
         Arc,
@@ -3001,16 +2999,23 @@ mod tests {
         assert_eq!(original.agent_count(), 2, "one death and one birth");
         let child_uid = evolution.births[0].agent_uid;
         assert_ne!(child_uid, victim_uid, "stable UIDs are never recycled");
-        let child_id = agent_id_for_uid(&original, child_uid);
-        assert_ne!(child_id, victim, "slot reuse must advance the generation");
+        let child_agent_id = agent_id_for_uid(&original, child_uid);
+        assert_ne!(
+            child_agent_id, victim,
+            "slot reuse must advance the generation"
+        );
         assert_eq!(
-            child_id.raw() & u64::from(u32::MAX),
+            child_agent_id.raw() & u64::from(u32::MAX),
             victim_slot,
             "death-before-birth must recycle the physical slot in this fixture"
         );
-        let child_runtime = original.agent_runtime(child_id).expect("child runtime");
+        let child_runtime = original
+            .agent_runtime(child_agent_id)
+            .expect("child runtime");
         assert_eq!(child_runtime.lineage, [Some(founder_uid), None]);
-        let child_genome = original.agent_brain_genome(child_id).expect("child genome");
+        let child_genome = original
+            .agent_brain_genome(child_agent_id)
+            .expect("child genome");
         assert_ne!(
             child_genome.material_hash(),
             founder_genome.material_hash(),
@@ -3771,7 +3776,7 @@ mod tests {
             "registry identity mismatch must reject before reconstructing any evaluator or agent"
         );
 
-        let mut tampered = checkpoint.clone();
+        let mut tampered = checkpoint;
         tampered.state.registry.entries[0].adapter_identity = Some(changed_identity);
         let tampered_wire = encode_unvalidated_state(&tampered.state);
         assert!(matches!(

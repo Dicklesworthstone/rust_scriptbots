@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(found[0].direction, Direction::Up);
 
         // And the noiseless ramp: sigma ~ 0, so this is a real change.
-        let noiseless: Vec<f64> = (0..800).map(|i| 100.0 + i as f64 * 0.001).collect();
+        let noiseless: Vec<f64> = (0..800).map(|i| 100.0 + f64::from(i) * 0.001).collect();
         let found =
             change_points_cusum(&series_from(&noiseless), CusumParams::default()).expect("valid");
         assert!(
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn regimes_classify_growth_equilibrium_and_collapse() {
-        let growth: Vec<f64> = (0..64).map(|i| 100.0 + i as f64 * 2.0).collect();
+        let growth: Vec<f64> = (0..64).map(|i| 100.0 + f64::from(i) * 2.0).collect();
         let windows = regimes(&series_from(&growth), RegimeParams::default()).expect("valid");
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].regime, Regime::Growth);
@@ -1060,7 +1060,7 @@ mod tests {
         let windows = regimes(&series_from(&flat), RegimeParams::default()).expect("valid");
         assert_eq!(windows[0].regime, Regime::Equilibrium);
 
-        let collapse: Vec<f64> = (0..64).map(|i| 500.0 - i as f64 * 4.0).collect();
+        let collapse: Vec<f64> = (0..64).map(|i| 500.0 - f64::from(i) * 4.0).collect();
         let windows = regimes(&series_from(&collapse), RegimeParams::default()).expect("valid");
         assert_eq!(windows[0].regime, Regime::Collapse);
     }
@@ -1068,7 +1068,7 @@ mod tests {
     #[test]
     fn regimes_classify_oscillation() {
         let osc: Vec<f64> = (0..128)
-            .map(|i| 200.0 + 30.0 * (i as f64 * 0.9).sin())
+            .map(|i| 200.0 + 30.0 * (f64::from(i) * 0.9).sin())
             .collect();
         let windows = regimes(&series_from(&osc), RegimeParams::default()).expect("valid");
         assert!(
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn regimes_produce_a_timeline_not_a_single_label() {
-        let mut values: Vec<f64> = (0..64).map(|i| 100.0 + i as f64 * 3.0).collect();
+        let mut values: Vec<f64> = (0..64).map(|i| 100.0 + f64::from(i) * 3.0).collect();
         values.extend(std::iter::repeat_n(292.0, 64));
         let windows = regimes(&series_from(&values), RegimeParams::default()).expect("valid");
         assert_eq!(windows.len(), 2);

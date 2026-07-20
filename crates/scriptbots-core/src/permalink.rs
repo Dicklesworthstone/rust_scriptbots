@@ -809,6 +809,8 @@ mod tests {
         assert_eq!(sample_link().encode(), shuffled.encode());
     }
 
+    // bd-tqpj: fixed-width `usize as f64` cast is the worst-case payload surface under test; encoded knob values must keep this exact mapping.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn worst_case_diff_fits_the_documented_cap() {
         let mut link = sample_link();
@@ -881,7 +883,7 @@ mod tests {
         ));
 
         // CRC corruption.
-        let mut bad_crc = good.clone();
+        let mut bad_crc = good;
         let last = bad_crc.len() - 1;
         bad_crc[last] ^= 0xFF;
         assert!(matches!(
@@ -905,8 +907,8 @@ mod tests {
             Err(PermalinkError::TruncatedField {
                 field: "scenario_id",
                 ..
-            }) | Err(PermalinkError::CrcMismatch { .. })
-                | Err(PermalinkError::TrailingBytes { .. })
+            } | PermalinkError::CrcMismatch { .. }
+                | PermalinkError::TrailingBytes { .. })
         ));
 
         // Oversized payload: 10 MB of 'A'.

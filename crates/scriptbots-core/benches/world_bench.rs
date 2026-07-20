@@ -33,7 +33,7 @@ use scriptbots_core::{
     WORLD_STEP_OUTCOME_PROFILE_SCHEMA, WorldState, WorldStepProfiler, WorldStepStage,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -1357,7 +1357,7 @@ impl GateMode {
         }
     }
 
-    fn agent_counts(self) -> &'static [usize] {
+    const fn agent_counts(self) -> &'static [usize] {
         match self {
             Self::Short => &[1_000],
             Self::Full => &[1_000, 5_000],
@@ -1998,6 +1998,8 @@ fn unix_time_ns() -> GateResult<u64> {
         .map_err(|error| format!("Unix timestamp did not fit u64 nanoseconds: {error}"))
 }
 
+// bd-tqpj: pinned FP expression `(a + b) / 2.0` is part of the reviewed statistic; `f64::midpoint` would change the evaluation form (science contract).
+#[allow(clippy::manual_midpoint)]
 fn median_f64(values: &[f64]) -> GateResult<f64> {
     if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
         return Err("median requires finite, non-empty samples".to_owned());
@@ -2452,6 +2454,8 @@ impl VerdictStatus {
     }
 }
 
+// bd-tqpj: verdict bools are the serialized JSON artifact schema (reviewed as one report unit), not independent toggles.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScenarioVerdict {
     id: String,
@@ -2789,9 +2793,9 @@ fn validate_artifact(artifact: &PerfArtifact, require_baseline: bool) -> GateRes
             artifact.scenarios.len()
         ));
     }
-    let mut ids = BTreeMap::new();
+    let mut ids = BTreeSet::new();
     for scenario in &artifact.scenarios {
-        if ids.insert(&scenario.id, ()).is_some() {
+        if !ids.insert(&scenario.id) {
             return Err(format!("duplicate scenario id `{}`", scenario.id));
         }
         let Some((_, expected_agents, brain_family)) =
@@ -3156,7 +3160,7 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
     )
     .expect("writing to a String cannot fail");
     for reason in &verdict.reasons {
-        write!(output, "- {reason}\n").expect("writing to a String cannot fail");
+        writeln!(output, "- {reason}").expect("writing to a String cannot fail");
     }
     output.push_str("\n## Measurements\n\n");
     output.push_str(
@@ -3170,9 +3174,9 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
             .map(|run| format!("{:.2}", run.total_tps))
             .collect::<Vec<_>>()
             .join(", ");
-        write!(
+        writeln!(
             output,
-            "| `{}` | {:.2} | {:.2}% | {:.3} ms | {:.2}% | {} |\n",
+            "| `{}` | {:.2} | {:.2}% | {:.3} ms | {:.2}% | {} |",
             scenario.id,
             scenario.median_of_run_total_tps,
             scenario.run_tps_cv_pct,
@@ -3203,9 +3207,9 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
             if flags.is_empty() {
                 flags.push("pass");
             }
-            write!(
+            writeln!(
                 output,
-                "| `{}` | {:.2} | {:.2} | {:+.2}% | {} |\n",
+                "| `{}` | {:.2} | {:.2} | {:+.2}% | {} |",
                 scenario.id,
                 scenario.baseline_tps,
                 scenario.candidate_tps,
@@ -3221,7 +3225,7 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
     output
 }
 
-fn gate_policy(ticks: usize) -> GatePolicy {
+const fn gate_policy(ticks: usize) -> GatePolicy {
     GatePolicy {
         warmup_repetitions: PERF_WARMUPS,
         measured_repetitions: PERF_REPETITIONS,
@@ -3568,7 +3572,8 @@ fn run_self_test() -> GateResult<()> {
 
     let mut stale_profile_schema =
         synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
-    stale_profile_schema.world_step_profile_schema = "scriptbots.world-step-profile.v2".to_owned();
+    "scriptbots.world-step-profile.v2"
+        .clone_into(&mut stale_profile_schema.world_step_profile_schema);
     assert_self_test_status(
         "stale v2 world-step profile schema is refused",
         &compare_artifacts(&baseline, &stale_profile_schema),
@@ -3733,7 +3738,7 @@ fn run_self_test() -> GateResult<()> {
         .iter_mut()
         .chain(&mut changed_scenario.measurements)
     {
-        repetition.final_digest = "synthetic-different-science".to_owned();
+        "synthetic-different-science".clone_into(&mut repetition.final_digest);
     }
     assert_self_test_status(
         "cross-artifact science drift is refused",

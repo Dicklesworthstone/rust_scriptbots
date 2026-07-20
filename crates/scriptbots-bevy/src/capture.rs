@@ -302,7 +302,10 @@ struct CaptureCamera;
 
 /// Corruption flag resource (alarm tests).
 #[derive(Resource, Clone, Copy)]
-struct CaptureCorrupt(bool);
+struct CaptureCorrupt(
+    // bd-tqpj: inserted at app build for the alarm-test corruption path; reading system is in-flight capture-harness work (minimal touch on active file).
+    #[allow(dead_code)] bool,
+);
 
 /// Process-wide capture app. `bevy_render` keeps a process-global empty
 /// bind group layout, so constructing a second render App in one process
@@ -1006,7 +1009,7 @@ mod tests {
         // also 'pass' a black-golden comparison, so assert content variance.
         let mut min = [255u8; 3];
         let mut max = [0u8; 3];
-        for px in honest.rgba8.chunks_exact(4) {
+        for px in honest.rgba8.as_chunks::<4>().0 {
             for channel in 0..3 {
                 min[channel] = min[channel].min(px[channel]);
                 max[channel] = max[channel].max(px[channel]);
@@ -1040,7 +1043,7 @@ mod tests {
         let golden = frame(64, 64, 100);
         // Jitter within the differing_channel bound on a few pixels: pass.
         let mut jittered = golden.clone();
-        for px in jittered.chunks_exact_mut(4).take(4) {
+        for px in jittered.as_chunks_mut::<4>().0.iter_mut().take(4) {
             px[0] += 3;
         }
         let stats = compare_frames(&golden, &jittered, 64, 64, &CompareThresholds::default())

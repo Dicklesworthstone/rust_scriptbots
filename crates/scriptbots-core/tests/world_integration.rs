@@ -183,7 +183,7 @@ fn bind_fixed_outputs_brain(
     );
 }
 
-fn wheel_outputs(left: f32, right: f32) -> [f32; OUTPUT_SIZE] {
+const fn wheel_outputs(left: f32, right: f32) -> [f32; OUTPUT_SIZE] {
     let mut outputs = [0.0; OUTPUT_SIZE];
     outputs[OutputChannel::WheelLeft.index()] = left;
     outputs[OutputChannel::WheelRight.index()] = right;
@@ -248,7 +248,7 @@ fn reposition_agent(world: &mut WorldState, agent: AgentId, position: Position) 
     );
 }
 
-fn default_profile(config: &ScriptBotsConfig) -> FoodCellProfileSnapshot {
+const fn default_profile(config: &ScriptBotsConfig) -> FoodCellProfileSnapshot {
     FoodCellProfileSnapshot {
         capacity: config.food_max,
         growth_multiplier: 1.0,

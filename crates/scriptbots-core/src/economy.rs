@@ -489,9 +489,10 @@ mod tests {
                 let (delta, activity) = overrides
                     .iter()
                     .find(|(candidate, _, _)| *candidate == kind)
-                    .map_or((zero_amounts(), zero_amounts()), |(_, delta, activity)| {
-                        (*delta, *activity)
-                    });
+                    .map_or_else(
+                        || (zero_amounts(), zero_amounts()),
+                        |(_, delta, activity)| (*delta, *activity),
+                    );
                 ResourceFlow {
                     kind,
                     delta,
