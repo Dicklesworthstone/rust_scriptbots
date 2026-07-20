@@ -113,7 +113,7 @@ fn null_tournament_arms_are_indistinguishable_beyond_seed_noise() {
             report
                 .outcome
                 .per_family
-                .get(&family)
+                .get(family.as_str())
                 .map_or(0.5, |outcome: &FamilyOutcome| outcome.survival_share)
         };
         let gap = (share_of(MLP_A) - share_of(MLP_B)).abs();

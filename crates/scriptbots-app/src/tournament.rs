@@ -735,7 +735,12 @@ pub mod execution {
                 .push(generations[idx].0);
         }
 
-        let mut per_family = BTreeMap::new();
+        let mut outcome = MatchOutcome {
+            match_id: plan.match_id,
+            ticks_run,
+            per_family: BTreeMap::new(),
+            warnings: Vec::new(),
+        };
         for family in &plan.spawn_order {
             let live = family_live.get(family).copied().unwrap_or(0);
             let energy = family_energy.get(family).copied().unwrap_or(0.0);
@@ -750,8 +755,8 @@ pub mod execution {
                 let max = values.iter().copied().max().unwrap_or(0);
                 (mean, max)
             });
-            per_family.insert(
-                family.as_str().to_string(),
+            outcome.set_family(
+                *family,
                 FamilyOutcome {
                     survival_share: if total_live == 0 {
                         0.0
@@ -770,8 +775,7 @@ pub mod execution {
                 },
             );
         }
-
-        let mut warnings = Vec::new();
+        let mut warnings = outcome.warnings.clone();
         if !closed {
             warnings.push(
                 "open-world respawn active; survival share includes respawned agents".to_owned(),
@@ -789,12 +793,7 @@ pub mod execution {
         }
 
         Ok(MatchRunReport {
-            outcome: MatchOutcome {
-                match_id: plan.match_id,
-                ticks_run,
-                per_family,
-                warnings,
-            },
+            outcome,
             config_digest,
         })
     }
