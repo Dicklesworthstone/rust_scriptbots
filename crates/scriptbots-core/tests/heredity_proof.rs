@@ -32,9 +32,10 @@ use scriptbots_brain::dwraon::DwraonFamilyAdapter;
 use scriptbots_brain::mlp::MlpBrainFamily;
 use scriptbots_core::genome_diff::{LocusValue, diff_genomes};
 use scriptbots_core::{
-    AgentData, AgentId, AgentUid, BirthOrigin, BrainFamilyAdapter, BrainFamilyCodec,
-    BrainGenomeDerivation, BrainGenomeEnvelope, MutationRates, Position, ScriptBotsConfig,
-    WorldState,
+    AgentData, AgentId, AgentUid, BirthOrigin, BrainAdapterIdentityV1, BrainEvaluator,
+    BrainEvaluatorStateEnvelope, BrainFamilyAdapter, BrainFamilyCodec, BrainGenomeDerivation,
+    BrainGenomeEnvelope, BrainGenomeMaterial, BrainProtocolError, MutationRates,
+    OffspringStatePolicy, Position, RandomStream, ScriptBotsConfig, WorldState,
 };
 
 const DWRAON_KIND: &str = "dwraon-baseline";
@@ -548,6 +549,237 @@ fn changed_locus_counts_land_inside_the_exact_binomial_band() {
              unrelated to parents (search, not evolution)",
             1.0 - lower_tail
         );
+    }
+    for_each_family(case);
+}
+
+/// FAULT INJECTION for the negative control: an exact MLP delegate except that
+/// `mutate_genome_material` returns FRESH founder material regardless of the parent --
+/// the e2d9aaa bug (offspring brains replaced by a fresh registry brain), restored on
+/// purpose. Registered as the world's only family so the MLP wire id stays unique.
+struct SabotagedMutationFamily {
+    inner: MlpBrainFamily,
+}
+
+impl BrainFamilyCodec for SabotagedMutationFamily {
+    fn family_id(&self) -> &scriptbots_core::BrainFamilyId {
+        self.inner.family_id()
+    }
+    fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
+        self.inner.adapter_identity()
+    }
+    fn random_genome_material(
+        &self,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        self.inner.random_genome_material(rng)
+    }
+    fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
+        self.inner.validate_genome(genome)
+    }
+    fn genome_loci(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<Vec<(scriptbots_core::genome_diff::Locus, LocusValue)>, BrainProtocolError>
+    {
+        self.inner.genome_loci(genome)
+    }
+    fn validate_evaluator_state(
+        &self,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<(), BrainProtocolError> {
+        self.inner.validate_evaluator_state(state)
+    }
+    fn mutate_genome_material(
+        &self,
+        _genome: &BrainGenomeEnvelope,
+        _rates: MutationRates,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        // THE BUG: offspring material is a fresh random founder's, not the parent's.
+        self.inner.random_genome_material(rng)
+    }
+    fn crossover_genomes_material(
+        &self,
+        left: &BrainGenomeEnvelope,
+        right: &BrainGenomeEnvelope,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        self.inner.crossover_genomes_material(left, right, rng)
+    }
+    fn initial_state(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        self.inner.initial_state(genome, rng)
+    }
+    fn offspring_state_policy(&self) -> OffspringStatePolicy {
+        self.inner.offspring_state_policy()
+    }
+    fn offspring_state(
+        &self,
+        child: &BrainGenomeEnvelope,
+        parents: &[&BrainEvaluatorStateEnvelope],
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        self.inner.offspring_state(child, parents, rng)
+    }
+    fn evaluator(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+        self.inner.evaluator(genome, state)
+    }
+}
+
+
+#[test]
+fn the_proof_detects_the_restored_e2d9aaa_bug() {
+    // The zero-rate heredity proof MUST reject the saboteur: a proof that cannot
+    // detect the historical bug is not a proof of anything.
+    let mut world = WorldState::new(reproduction_config(0.0)).expect("world");
+    let key = world
+        .register_brain_family(
+            "sabotaged-mlp".to_owned(),
+            Box::new(SabotagedMutationFamily {
+                inner: MlpBrainFamily::new(),
+            }),
+        )
+        .expect("register saboteur");
+    let parent = spawn_parent(
+        &mut world,
+        key,
+        100.0,
+        100.0,
+        MutationRates {
+            primary: 0.0,
+            secondary: 0.0,
+        },
+    );
+    let parent_uid = uid_of(&world, parent);
+    let children = drive_until_children(&mut world, &[parent_uid], 1, 64);
+
+    let codec = dyn_codec_for(MLP_KIND);
+    let diff = diff_genomes(
+        &*codec,
+        &genome_of(&world, parent),
+        &genome_of(&world, children[0].id),
+    )
+    .expect("sabotaged diff");
+    assert!(
+        !diff.deltas.is_empty(),
+        "heredity_proof NEGATIVE CONTROL FAILED: the restored e2d9aaa bug (fresh founder \
+         material substituted for the parent's) produced an EMPTY zero-rate diff — the \
+         proof machinery cannot detect the exact regression it exists to catch"
+    );
+}
+
+/// Drive a single asexual lineage for `generations` consecutive births, returning the
+/// (parent genome, child genome) pairs. Only the designated chain child receives energy
+/// above the reproduction threshold, so the population grows linearly instead of
+/// exploding exponentially.
+fn drive_lineage_chain(
+    family: &str,
+    rates: MutationRates,
+    generations: usize,
+) -> Vec<(BrainGenomeEnvelope, BrainGenomeEnvelope)> {
+    let mut config = reproduction_config(0.0);
+    config.reproduction_child_energy = 0.4; // below the 0.5 threshold: no uncontrolled growth
+    let mut world = WorldState::new(config).expect("world");
+    let key = register_family(&mut world, family);
+    let founder = spawn_parent(&mut world, key, 100.0, 100.0, rates);
+    let mut chain_parent = uid_of(&world, founder);
+
+    let mut pairs = Vec::with_capacity(generations);
+    for _ in 0..4096_u64 {
+        if pairs.len() >= generations {
+            return pairs;
+        }
+        let children = drive_until_children(&mut world, &[chain_parent], 1, 512);
+        let child = &children[0];
+        let parent_id = world
+            .agents()
+            .iter_handles()
+            .find(|id| world.agent_uid(*id) == Some(chain_parent))
+            .expect("chain parent alive (nothing drains energy)");
+        pairs.push((genome_of(&world, parent_id), genome_of(&world, child.id)));
+        world
+            .try_update_agent_runtime(child.id, |runtime| {
+                runtime.energy = 1.5;
+            })
+            .expect("chain child energy above reproduction threshold");
+        chain_parent = world.agent_uid(child.id).expect("chain child uid");
+    }
+    panic!("lineage stalled after {} generations", pairs.len());
+}
+
+#[test]
+fn e2e_mutation_on_every_consecutive_diff_is_nonempty_and_in_band() {
+    const GENERATIONS: usize = 20;
+    const RATE: f32 = 0.05;
+    const ALPHA: f64 = 0.0005;
+
+    fn case(family: &str) {
+        let pairs = drive_lineage_chain(
+            family,
+            MutationRates {
+                primary: RATE,
+                secondary: RATE,
+            },
+            GENERATIONS,
+        );
+        assert_eq!(pairs.len(), GENERATIONS);
+        let codec = dyn_codec_for(family);
+        let mut total_changed = 0_u64;
+        for (index, (parent, child)) in pairs.iter().enumerate() {
+            let diff = diff_genomes(&*codec, parent, child).expect("e2e diff");
+            assert!(
+                !diff.deltas.is_empty(),
+                "heredity_proof: family={family} generation {index}: mutation rate {RATE} \
+                 produced an IDENTICAL child — 20 consecutive identical children means \
+                 mutation is dead"
+            );
+            total_changed += diff.summary.changed_loci as u64;
+        }
+        let support = changed_locus_distribution(family, GENERATIONS, RATE);
+        let lower_tail = support_cdf(&support, total_changed);
+        assert!(
+            lower_tail > ALPHA && lower_tail < 1.0 - ALPHA,
+            "heredity_proof: family={family} {GENERATIONS} consecutive diffs changed \
+             {total_changed} loci total (lower_tail={lower_tail:.6}) — outside the exact \
+             binomial band at rate {RATE}"
+        );
+    }
+    for_each_family(case);
+}
+
+#[test]
+fn e2e_zero_rate_every_consecutive_diff_is_empty() {
+    const GENERATIONS: usize = 20;
+
+    fn case(family: &str) {
+        let pairs = drive_lineage_chain(
+            family,
+            MutationRates {
+                primary: 0.0,
+                secondary: 0.0,
+            },
+            GENERATIONS,
+        );
+        assert_eq!(pairs.len(), GENERATIONS);
+        let codec = dyn_codec_for(family);
+        for (index, (parent, child)) in pairs.iter().enumerate() {
+            let diff = diff_genomes(&*codec, parent, child).expect("mirror diff");
+            assert!(
+                diff.deltas.is_empty(),
+                "heredity_proof: family={family} generation {index}: zero-rate lineage \
+                 changed {} loci — either heredity is broken or something re-randomizes \
+                 brains on the spawn path (both catastrophic and previously undetectable)",
+                diff.summary.changed_loci
+            );
+        }
     }
     for_each_family(case);
 }
