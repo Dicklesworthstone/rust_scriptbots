@@ -3,7 +3,12 @@
 // reassociation, or width changes alter world digests. Function lengths mirror
 // the legacy C++ parity layout and are reviewed as units.
 #![allow(clippy::suboptimal_flops, clippy::imprecise_flops)]
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 #![allow(clippy::float_cmp, clippy::while_float)]
 #![allow(clippy::too_many_lines)]
 
@@ -2258,8 +2263,7 @@ fn memory_class_identity(raw: &str) -> GateResult<String> {
 
 fn capture_fingerprint() -> GateResult<Fingerprint> {
     let workspace_root = workspace_root()?;
-    let logical_cpus = thread::available_parallelism()
-        .map_or(1, usize::from);
+    let logical_cpus = thread::available_parallelism().map_or(1, usize::from);
     let scriptbots_thread_budget = env::var("SCRIPTBOTS_MAX_THREADS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())

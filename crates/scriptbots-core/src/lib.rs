@@ -12960,9 +12960,9 @@ mod map_sandbox {
         let moisture = tile
             .moisture
             .unwrap_or(default_moisture_for_kind(tile.terrain_kind));
-        let fertility_bias = tile.fertility_bias.unwrap_or_else(|| {
-            default_tile_fertility_bias(tile.terrain_kind, elevation, moisture)
-        });
+        let fertility_bias = tile
+            .fertility_bias
+            .unwrap_or_else(|| default_tile_fertility_bias(tile.terrain_kind, elevation, moisture));
         let temperature_bias = tile.temperature_bias.unwrap_or(0.5);
         let accent = tile.accent.unwrap_or(0.5);
         let palette_index = tile
@@ -26841,8 +26841,7 @@ mod tests {
             assert!(
                 inside,
                 "cohort member at ({}, {}) must land inside the placement region (plus one tick of movement)",
-                position.x,
-                position.y
+                position.x, position.y
             );
             let bound_key = match &world.agent_runtime(id).expect("runtime").brain {
                 BrainBinding::Protocol { registry_key, .. } => Some(*registry_key),
