@@ -33,7 +33,9 @@
 )]
 #![allow(clippy::float_cmp, clippy::while_float)]
 
-use crate::{RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick};
+use crate::{RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick, Tick};
+#[cfg(any(test, feature = "economy-faults"))]
+use crate::LedgerFault;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -437,6 +439,192 @@ fn amounts_from_lanes(lanes: &[NeumaierSum; STOCK_COUNT]) -> ResourceAmounts {
     }
 }
 
+/// One tick's failure to reconcile, recorded for the gate's artifact
+/// (bd-16g.11.2). The artifact exists so a red CI run is diagnosable without
+/// reproducing it locally.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConservationBreach {
+    /// Tick whose books did not close.
+    pub tick: Tick,
+    /// The stock that broke worst.
+    pub stock: EconomyStock,
+    /// The unexplained delta on that stock.
+    pub residual: f64,
+    /// The tolerance the tick declared.
+    pub tolerance: f64,
+    /// The largest-magnitude flow category on the broken stock — the prime suspect.
+    pub worst_category: Option<ResourceFlowKind>,
+}
+
+/// Per-seed outcome of the conservation gate (bd-16g.11.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeedVerdict {
+    /// The seed that built the world.
+    pub seed: u64,
+    /// Ticks observed.
+    pub ticks: u64,
+    /// Largest per-tick absolute residual per stock.
+    pub max_abs_residual: [f64; STOCK_COUNT],
+    /// Tick of each stock's maximum.
+    pub argmax_tick: [Option<Tick>; STOCK_COUNT],
+    /// Cumulative signed residual per stock (compensated summation).
+    pub cumulative_residual: [f64; STOCK_COUNT],
+    /// Gross attributed flow per stock, for the cumulative tolerance derivation.
+    pub gross_flow: [f64; STOCK_COUNT],
+    /// The first [`BREACH_REPORT_CAP`] breaches, in tick order.
+    pub breaches: Vec<ConservationBreach>,
+    /// Breaches beyond the cap (a log that prints 50,000 breaches is a log
+    /// nobody reads).
+    pub truncated_breaches: u64,
+}
+
+/// Number of breaches retained per seed in the verdict artifact.
+pub const BREACH_REPORT_CAP: usize = 100;
+
+/// Incremental, memory-light conservation gate (bd-16g.11.2). Feed every
+/// [`ResourceLedgerTick`] of one seed's run; [`Self::finish`] yields the seed's
+/// verdict. O(1) per tick, no allocation beyond the bounded breach list.
+#[derive(Debug, Default)]
+pub struct ConservationGate {
+    ticks: u64,
+    max_abs: [f64; STOCK_COUNT],
+    argmax: [Option<Tick>; STOCK_COUNT],
+    cumulative: [NeumaierSum; STOCK_COUNT],
+    gross: [NeumaierSum; STOCK_COUNT],
+    breaches: Vec<ConservationBreach>,
+    truncated: u64,
+}
+
+impl ConservationGate {
+    /// A fresh gate for one seed's run.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe one completed tick's books.
+    pub fn observe(&mut self, report: &ResourceLedgerTick) {
+        self.ticks = self.ticks.saturating_add(1);
+        let unexplained = report.reconciliation.unexplained_delta;
+        let attributed = report.reconciliation.attributed_delta;
+        for (stock_index, stock) in EconomyStock::ALL.into_iter().enumerate() {
+            let residual = stock.lane(unexplained);
+            self.cumulative[stock_index].add(residual);
+            self.gross[stock_index].add(stock.lane(attributed).abs());
+            if residual.abs() > self.max_abs[stock_index] {
+                self.max_abs[stock_index] = residual.abs();
+                self.argmax[stock_index] = Some(report.tick);
+            }
+        }
+        if !report.reconciliation.reconciled {
+            let (stock, residual) = EconomyStock::ALL
+                .into_iter()
+                .map(|stock| (stock, stock.lane(unexplained)))
+                .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+                .expect("three stocks");
+            let worst_category = report
+                .flows
+                .iter()
+                .map(|flow| (flow.kind, stock.lane(flow.delta).abs()))
+                .filter(|(_, magnitude)| *magnitude > 0.0)
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+                .map(|(kind, _)| kind);
+            if self.breaches.len() < BREACH_REPORT_CAP {
+                self.breaches.push(ConservationBreach {
+                    tick: report.tick,
+                    stock,
+                    residual,
+                    tolerance: report.reconciliation.tolerance,
+                    worst_category,
+                });
+            } else {
+                self.truncated = self.truncated.saturating_add(1);
+            }
+        }
+    }
+
+    /// Seal the seed's verdict.
+    #[must_use]
+    pub fn finish(&self, seed: u64) -> SeedVerdict {
+        SeedVerdict {
+            seed,
+            ticks: self.ticks,
+            max_abs_residual: self.max_abs,
+            argmax_tick: self.argmax,
+            cumulative_residual: core::array::from_fn(|index| self.cumulative[index].value()),
+            gross_flow: core::array::from_fn(|index| self.gross[index].value()),
+            breaches: self.breaches.clone(),
+            truncated_breaches: self.truncated,
+        }
+    }
+}
+
+/// The full conservation-gate verdict (bd-16g.11.2). Byte-identical for the
+/// same (seed, config, tick count) inputs — a flaky gate gets disabled within
+/// a month, and then the economy is unguarded again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConservationVerdict {
+    /// Per-seed outcomes.
+    pub seeds: Vec<SeedVerdict>,
+    /// True only when every criterion holds on every seed.
+    pub pass: bool,
+    /// Human-readable failure lines, one per violated criterion.
+    pub failures: Vec<String>,
+    /// Set when the harness was run with a debugging tolerance override; a CI
+    /// job must never produce artifacts with this set.
+    pub tolerance_overridden: bool,
+}
+
+/// Relative bound for the cumulative criterion (bd-16g.11.2): catches a tiny
+/// systematic bias that per-tick tolerance would wave through — precisely how
+/// a 0.0002-vs-0.002 drain error hides. Mirrors
+/// [`EPOCH_RESIDUAL_RELATIVE_TOLERANCE`]; a change to either is a reviewable diff.
+pub const CUMULATIVE_RESIDUAL_RELATIVE_TOLERANCE: f64 = 1.0e-7;
+
+/// Evaluate the three gate criteria over the sealed seed verdicts. All three
+/// are required — any one alone is gameable: (1) zero per-tick breaches;
+/// (2) cumulative residual within the derived bound per stock; (3) a quiet run
+/// (zero warn-level economy events, which in-process is exactly the breach
+/// count).
+#[must_use]
+pub fn evaluate_conservation(seeds: &[SeedVerdict]) -> ConservationVerdict {
+    let mut failures = Vec::new();
+    for seed in seeds {
+        if !seed.breaches.is_empty() || seed.truncated_breaches > 0 {
+            let first = seed.breaches.first().expect("nonempty checked");
+            failures.push(format!(
+                "seed {}: {} per-tick breaches (+{} truncated); first at tick {} on \
+                 {:?} (residual {:.6e}, worst category {:?})",
+                seed.seed,
+                seed.breaches.len(),
+                seed.truncated_breaches,
+                first.tick.0,
+                first.stock,
+                first.residual,
+                first.worst_category,
+            ));
+        }
+        for (stock_index, stock) in EconomyStock::ALL.into_iter().enumerate() {
+            let gross = seed.gross_flow[stock_index];
+            let bound = CUMULATIVE_RESIDUAL_RELATIVE_TOLERANCE * gross.max(1.0);
+            let cumulative = seed.cumulative_residual[stock_index];
+            if cumulative.abs() > bound {
+                failures.push(format!(
+                    "seed {}: cumulative residual on {stock:?} is {cumulative:.6e}, beyond \
+                     the derived cumulative bound {bound:.6e} (gross {gross:.6e})",
+                    seed.seed,
+                ));
+            }
+        }
+    }
+    ConservationVerdict {
+        seeds: seeds.to_vec(),
+        pass: failures.is_empty(),
+        failures,
+        tolerance_overridden: false,
+    }
+}
+
 fn validate_report(report: &ResourceLedgerTick) -> Result<(), EconomyAggregationError> {
     let tick = report.tick.0;
     if report.flows.len() != CATEGORY_COUNT {
@@ -797,6 +985,141 @@ mod tests {
         assert_eq!(
             naive, 0.0,
             "if this fails, the fixture no longer proves anything"
+        );
+    }
+
+    /// The fault-coverage table (bd-16g.11.2): every flow category is exercised
+    /// by at least one injectable fault. Add a category without adding a fault
+    /// and the length check below fails the build; remove a fault's coverage
+    /// and the per-category check fails the test.
+    const KIND_TO_FAULTS: [&[LedgerFault]; CATEGORY_COUNT] = [
+        &[LedgerFault::DropInterventionPosting],         // ScenarioIntervention
+        &[LedgerFault::MislabelSunlightAsTransfer],     // FoodDynamics
+        &[LedgerFault::DropAgingPosting],               // Aging
+        &[LedgerFault::DropActuationPosting, LedgerFault::ScaleMetabolismDrainBy10], // BasalMetabolism
+        &[LedgerFault::DropActuationPosting],           // Movement
+        &[LedgerFault::DropActuationPosting],           // MetabolismRamp
+        &[LedgerFault::DropActuationPosting],           // Boost
+        &[LedgerFault::DropActuationPosting],           // Topography
+        &[LedgerFault::DropTemperaturePosting],         // TemperatureStress
+        &[
+            LedgerFault::DoubleCreditIntake,
+            LedgerFault::HalveWasteDebit,
+            LedgerFault::CreditIntakeWithoutHealthGate,
+        ], // GroundFoodConversion
+        &[LedgerFault::CorruptGiveTransfer],            // EnergySharing
+        &[LedgerFault::DropCombatPosting],              // Combat
+        &[LedgerFault::MislabelCarcassAsTransfer],      // CarcassReward
+        &[LedgerFault::SkipDeathResidue],               // DeathRemoval
+        &[LedgerFault::DropReproductionPosting],        // ReproductionAllocation
+        &[LedgerFault::DropPopulationPosting],          // PopulationInjection
+        &[LedgerFault::ForgetEnergyCapSpill, LedgerFault::ForgetHealthCapSpill], // CapacityRejection
+    ];
+
+    #[test]
+    fn every_flow_category_is_exercised_by_at_least_one_fault() {
+        assert_eq!(KIND_TO_FAULTS.len(), CATEGORY_COUNT, "compile-time length");
+        for (index, kind) in RESOURCE_FLOW_KINDS.into_iter().enumerate() {
+            assert!(
+                !KIND_TO_FAULTS[index].is_empty(),
+                "{kind:?} has no injectable fault — the gate would decay silently"
+            );
+        }
+        // Every listed fault is a real variant of LedgerFault::ALL.
+        for faults in &KIND_TO_FAULTS {
+            for fault in *faults {
+                assert!(LedgerFault::ALL.contains(fault));
+            }
+        }
+    }
+
+    fn clean_tick(tick: u64) -> ResourceLedgerTick {
+        ledger_tick(
+            tick,
+            &[(ResourceFlowKind::FoodDynamics, amounts(0.5, 0.0, 0.0), zero_amounts())],
+            zero_amounts(),
+        )
+    }
+
+    fn breached_tick(tick: u64, residual: ResourceAmounts) -> ResourceLedgerTick {
+        let mut report = ledger_tick(
+            tick,
+            &[(ResourceFlowKind::FoodDynamics, amounts(0.5, 0.0, 0.0), zero_amounts())],
+            residual,
+        );
+        report.reconciliation.reconciled = false;
+        report
+    }
+
+    #[test]
+    fn gate_passes_a_clean_run() {
+        let mut gate = ConservationGate::new();
+        for tick in 1..=64 {
+            gate.observe(&clean_tick(tick));
+        }
+        let seed = gate.finish(7);
+        assert!(seed.breaches.is_empty());
+        let verdict = evaluate_conservation(&[seed]);
+        assert!(verdict.pass, "clean run must pass: {:?}", verdict.failures);
+    }
+
+    #[test]
+    fn gate_fails_on_a_per_tick_breach_with_the_right_suspect() {
+        let mut gate = ConservationGate::new();
+        for tick in 1..=8 {
+            gate.observe(&clean_tick(tick));
+        }
+        gate.observe(&breached_tick(9, amounts(-0.5, 0.0, 0.0)));
+        let verdict = evaluate_conservation(&[gate.finish(11)]);
+        assert!(!verdict.pass);
+        let failure = &verdict.failures[0];
+        assert!(failure.contains("per-tick breaches"), "{failure}");
+        assert!(failure.contains("GridFood"), "the broken stock is named: {failure}");
+        let breach = &verdict.seeds[0].breaches[0];
+        assert_eq!(breach.tick, Tick(9));
+        assert_eq!(breach.worst_category, Some(ResourceFlowKind::FoodDynamics));
+    }
+
+    #[test]
+    fn gate_fails_on_cumulative_bias_without_any_single_breach() {
+        // A bias below per-tick tolerance, repeated every tick: each tick is
+        // individually clean, and the cumulative criterion is the only thing
+        // that can catch it — precisely how a 0.0002-vs-0.002 drain error hides.
+        let mut gate = ConservationGate::new();
+        let whisper = amounts(0.0, 0.02, 0.0);
+        for tick in 1..=200 {
+            let mut report = clean_tick(tick);
+            report.reconciliation.unexplained_delta = whisper;
+            report.reconciliation.reconciled = true; // under per-tick tolerance
+            report.reconciliation.observed_delta = whisper;
+            gate.observe(&report);
+        }
+        let seed = gate.finish(13);
+        assert!(seed.breaches.is_empty(), "no single tick breaches");
+        let verdict = evaluate_conservation(&[seed]);
+        assert!(!verdict.pass, "cumulative bias must fail the gate");
+        assert!(
+            verdict.failures[0].contains("cumulative residual"),
+            "{}",
+            verdict.failures[0]
+        );
+    }
+
+    #[test]
+    fn gate_artifact_is_byte_identical_across_invocations() {
+        let run = || {
+            let mut gate = ConservationGate::new();
+            for tick in 1..=32 {
+                gate.observe(&clean_tick(tick));
+            }
+            gate.observe(&breached_tick(33, amounts(0.0, 0.0, -0.25)));
+            evaluate_conservation(&[gate.finish(17)])
+        };
+        let first = serde_json::to_vec(&run()).expect("encode verdict");
+        let second = serde_json::to_vec(&run()).expect("encode verdict");
+        assert_eq!(
+            first, second,
+            "the verdict is a pure function of the inputs"
         );
     }
 }

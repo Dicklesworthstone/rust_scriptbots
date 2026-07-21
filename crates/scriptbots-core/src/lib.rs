@@ -4951,11 +4951,86 @@ struct WorkingResourceLedger {
     flows: Vec<ResourceFlow>,
 }
 
+/// Injectable economy faults for the conservation gate's mutation suite
+/// (bd-16g.11.2). Each variant reproduces one historical shape of economy bug;
+/// every one MUST turn the gate red. Available only in tests or with the
+/// `economy-faults` feature — production code paths keep one shape and consult
+/// a cheap `Option`.
+#[cfg(any(test, feature = "economy-faults"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerFault {
+    /// The agent is credited twice for one intake.
+    DoubleCreditIntake,
+    /// The actuation drain never reaches the books (the `food_delta` blind spot).
+    DropActuationPosting,
+    /// The temperature penalty never reaches the books.
+    DropTemperaturePosting,
+    /// The cell is debited half of what the agent consumed.
+    HalveWasteDebit,
+    /// Sunlight regrowth posted as an internal transfer instead of an external input.
+    MislabelSunlightAsTransfer,
+    /// Manufactured carcass rewards posted as an internal transfer.
+    MislabelCarcassAsTransfer,
+    /// Death removes the corpse from the world but not from the books.
+    SkipDeathResidue,
+    /// The energy cap destroys value with no rejection posted.
+    ForgetEnergyCapSpill,
+    /// Basal metabolism is ten times the configured drain while the books post
+    /// it at the configured rate — the hidden death timer exactly as it
+    /// presented: science wrong, postings blind to the difference.
+    ScaleMetabolismDrainBy10,
+    /// Full agents (health >= 2.0) drain cells forever while the books post the
+    /// agent's credit and drop the cell's debit — how the full-agent grazing
+    /// bug presented in the books.
+    CreditIntakeWithoutHealthGate,
+    /// The health cap destroys value with no rejection posted.
+    ForgetHealthCapSpill,
+    /// Aging decay never reaches the books.
+    DropAgingPosting,
+    /// Combat damage never reaches the books.
+    DropCombatPosting,
+    /// Reproduction allocation never reaches the books.
+    DropReproductionPosting,
+    /// Population injection never reaches the books.
+    DropPopulationPosting,
+    /// Scenario interventions never reach the books.
+    DropInterventionPosting,
+    /// The giver is debited in full but the recipient credited half — the only
+    /// strictly conserved flow no longer nets to zero.
+    CorruptGiveTransfer,
+}
+
+#[cfg(any(test, feature = "economy-faults"))]
+impl LedgerFault {
+    /// Every injectable fault, for the mutation suite's table drive.
+    pub const ALL: [Self; 17] = [
+        Self::DoubleCreditIntake,
+        Self::DropActuationPosting,
+        Self::DropTemperaturePosting,
+        Self::HalveWasteDebit,
+        Self::MislabelSunlightAsTransfer,
+        Self::MislabelCarcassAsTransfer,
+        Self::SkipDeathResidue,
+        Self::ForgetEnergyCapSpill,
+        Self::ScaleMetabolismDrainBy10,
+        Self::CreditIntakeWithoutHealthGate,
+        Self::ForgetHealthCapSpill,
+        Self::DropAgingPosting,
+        Self::DropCombatPosting,
+        Self::DropReproductionPosting,
+        Self::DropPopulationPosting,
+        Self::DropInterventionPosting,
+        Self::CorruptGiveTransfer,
+    ];
+}
+
 #[derive(Debug, Default)]
 struct ResourceLedgerState {
     enabled: bool,
     working: Option<WorkingResourceLedger>,
     report: ResourceLedgerReport,
+    #[cfg(any(test, feature = "economy-faults"))]
+    fault: Option<LedgerFault>,
 }
 
 impl ResourceLedgerState {
@@ -4980,6 +5055,69 @@ impl ResourceLedgerState {
     }
 
     fn record(
+        &mut self,
+        kind: ResourceFlowKind,
+        mut delta: ResourceAmounts,
+        activity: ResourceAmounts,
+    ) {
+        #[cfg(any(test, feature = "economy-faults"))]
+        if let Some(fault) = self.fault {
+            use ResourceFlowKind as K;
+            match fault {
+                LedgerFault::DropActuationPosting
+                    if matches!(
+                        kind,
+                        K::BasalMetabolism | K::Movement | K::MetabolismRamp | K::Boost | K::Topography
+                    ) =>
+                {
+                    return;
+                }
+                LedgerFault::DropTemperaturePosting if kind == K::TemperatureStress => return,
+                LedgerFault::SkipDeathResidue if kind == K::DeathRemoval => return,
+                LedgerFault::DropAgingPosting if kind == K::Aging => return,
+                LedgerFault::DropCombatPosting if kind == K::Combat => return,
+                LedgerFault::DropReproductionPosting if kind == K::ReproductionAllocation => {
+                    return;
+                }
+                LedgerFault::DropPopulationPosting if kind == K::PopulationInjection => return,
+                LedgerFault::DropInterventionPosting if kind == K::ScenarioIntervention => {
+                    return;
+                }
+                LedgerFault::CorruptGiveTransfer if kind == K::EnergySharing => {
+                    // The giver is debited in full but the recipient credited half:
+                    // the strictly conserved flow's net delta is no longer zero.
+                    delta.energy -= activity.energy * 0.5;
+                }
+                LedgerFault::ForgetEnergyCapSpill | LedgerFault::ForgetHealthCapSpill
+                    if kind == K::CapacityRejection =>
+                {
+                    return;
+                }
+                LedgerFault::DoubleCreditIntake if kind == K::GroundFoodConversion => {
+                    delta.energy *= 2.0;
+                }
+                LedgerFault::CreditIntakeWithoutHealthGate if kind == K::GroundFoodConversion => {
+                    // The books post the agent's credit and drop the cell's debit.
+                    delta.food = 0.0;
+                }
+                LedgerFault::HalveWasteDebit if kind == K::GroundFoodConversion => {
+                    delta.food *= 0.5;
+                }
+                LedgerFault::MislabelSunlightAsTransfer if kind == K::FoodDynamics => {
+                    self.record_raw(K::GroundFoodConversion, delta, activity);
+                    return;
+                }
+                LedgerFault::MislabelCarcassAsTransfer if kind == K::CarcassReward => {
+                    self.record_raw(K::GroundFoodConversion, delta, activity);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.record_raw(kind, delta, activity);
+    }
+
+    fn record_raw(
         &mut self,
         kind: ResourceFlowKind,
         delta: ResourceAmounts,
@@ -5070,11 +5208,18 @@ impl ResourceLedgerState {
         // inspectable in the report.
         #[cfg(debug_assertions)]
         {
+            #[cfg(any(test, feature = "economy-faults"))]
+            let fault_installed = self.fault.is_some();
+            #[cfg(not(any(test, feature = "economy-faults")))]
+            let fault_installed = false;
             let unexplained = reconciliation.unexplained_delta;
             let tick = working.tick;
             let limit = reconciliation.tolerance;
+            // An intentionally injected fault (bd-16g.11.2's mutation suite) is
+            // the ONE case the guard must not panic on: the gate's job is to
+            // catch it through the verdict, not a test-harness panic.
             debug_assert!(
-                reconciliation.reconciled,
+                reconciliation.reconciled || fault_installed,
                 "StockGuard: tick {} books do not balance: unexplained \
                  (food={}, energy={}, health={}) exceeds derived tolerance {limit}",
                 tick.0, unexplained.food, unexplained.energy, unexplained.health,
@@ -16632,6 +16777,8 @@ impl WorldState {
         let spike_growth = self.config.spike_growth_rate.max(0.0);
         let movement_drain = self.config.movement_drain;
         let metabolism_drain = self.config.metabolism_drain;
+        #[cfg(any(test, feature = "economy-faults"))]
+        let ledger_fault = self.current_ledger_fault();
         let ramp_floor = self.config.metabolism_ramp_floor;
         let ramp_rate = self.config.metabolism_ramp_rate;
         let boost_penalty = self.config.metabolism_boost_penalty.max(0.0);
@@ -16715,6 +16862,12 @@ impl WorldState {
 
                     let movement_penalty = movement_drain * locomotion.wheel_effort;
                     let mut drain = metabolism_drain + movement_penalty;
+                    #[cfg(any(test, feature = "economy-faults"))]
+                    if ledger_fault == Some(LedgerFault::ScaleMetabolismDrainBy10) {
+                        // THE FAULT (bd-16g.11.2): basal metabolism ten times the
+                        // configured drain — the hidden death timer.
+                        drain += metabolism_drain * 9.0;
+                    }
                     let mut ramp_penalty = 0.0;
                     if ramp_rate > 0.0 {
                         let active_energy = (rt.energy - ramp_floor).max(0.0);
@@ -16928,6 +17081,8 @@ impl WorldState {
             let mut deltas = [ResourceAmounts::default(); 5];
             let mut capacity_rejection = ResourceAmounts::default();
             let healths = self.agents.columns().health();
+            #[cfg(any(test, feature = "economy-faults"))]
+            let ledger_fault = self.current_ledger_fault();
             for (idx, agent_id) in handles.iter().enumerate() {
                 let Some(runtime) = self.runtime.get(*agent_id) else {
                     continue;
@@ -16958,6 +17113,15 @@ impl WorldState {
                     let share = f64::from(component / total);
                     flow.energy -= f64::from(energy_loss) * share;
                     flow.health -= f64::from(health_loss) * share;
+                }
+            }
+            #[cfg(any(test, feature = "economy-faults"))]
+            if ledger_fault == Some(LedgerFault::ScaleMetabolismDrainBy10) {
+                // THE BLIND SPOT (bd-16g.11.2): science drains ten times the
+                // configured rate; the books post one tenth of the real loss.
+                for flow in &mut deltas {
+                    flow.energy *= 0.1;
+                    flow.health *= 0.1;
                 }
             }
             if capacity_rejection.energy != 0.0 || capacity_rejection.health != 0.0 {
@@ -17725,6 +17889,8 @@ impl WorldState {
     fn stage_food(&mut self) -> FoodResourceActivity {
         let mut activity = FoodResourceActivity::default();
         let cell_size = self.config.food_cell_size as f32;
+        #[cfg(any(test, feature = "economy-faults"))]
+        let ledger_fault = self.current_ledger_fault();
         // Reuse buffers: positions, handles, sharers
         self.work_positions.clear();
         self.work_positions
@@ -17753,7 +17919,18 @@ impl WorldState {
             let embargo_scale = self.intake_scale_for_position(pos.x, pos.y);
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 // legacy C++ gate: a full agent neither eats nor wastes cell food
-                if (intake_rate > 0.0 || waste_rate > 0.0) && healths[idx] < 2.0 {
+                #[cfg(any(test, feature = "economy-faults"))]
+                let health_gate = if ledger_fault
+                    == Some(LedgerFault::CreditIntakeWithoutHealthGate)
+                {
+                    // THE FAULT (bd-16g.11.2): full agents drain cells forever.
+                    true
+                } else {
+                    healths[idx] < 2.0
+                };
+                #[cfg(not(any(test, feature = "economy-faults")))]
+                let health_gate = healths[idx] < 2.0;
+                if (intake_rate > 0.0 || waste_rate > 0.0) && health_gate {
                     let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
                     let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
                     let profile_index = (cell_y as usize) * food_width + cell_x as usize;
@@ -21321,6 +21498,21 @@ impl WorldState {
     /// digests, persistence, replay, RNG use, and every simulation decision.
     pub fn set_resource_ledger_enabled(&mut self, enabled: bool) {
         self.resource_ledger.set_enabled(enabled);
+    }
+
+    /// Install an economy fault for the conservation gate's mutation suite
+    /// (bd-16g.11.2). Test/feature-gated; never available in a production build
+    /// without the `economy-faults` feature.
+    #[cfg(any(test, feature = "economy-faults"))]
+    pub fn inject_ledger_fault(&mut self, fault: LedgerFault) {
+        self.resource_ledger.fault = Some(fault);
+    }
+
+    /// The currently installed economy fault, when the fault machinery is built in.
+    #[cfg(any(test, feature = "economy-faults"))]
+    #[must_use]
+    pub const fn current_ledger_fault(&self) -> Option<LedgerFault> {
+        self.resource_ledger.fault
     }
 
     /// Whether future ticks will produce resource-ledger reports.
@@ -38714,6 +38906,140 @@ mod tests {
                 by_class[1],
                 by_class[2]
             );
+        }
+    }
+
+    /// Base scenario for the conservation-gate mutation suite (bd-16g.11.2):
+    /// exercises grazing, regrowth, metabolism, reproduction, population
+    /// injection, interventions, and giving in one world.
+    fn mutation_suite_world(seed: u64) -> WorldState {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            initial_food: 0.9,
+            food_max: 1.0,
+            food_growth_rate: 0.04,
+            food_intake_rate: 0.4,
+            food_transfer_rate: 0.4,
+            food_respawn_interval: 7,
+            food_respawn_amount: 0.2,
+            metabolism_drain: 0.002,
+            movement_drain: 0.001,
+            temperature_discomfort_rate: 0.003,
+            reproduction_energy_threshold: 0.5,
+            reproduction_energy_cost: 0.8,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
+            reproduction_child_energy: 0.4,
+            closed: false,
+            population_minimum: 8,
+            population_spawn_interval: 5,
+            persistence_interval: 0,
+            chart_flush_interval: 0,
+            rng_seed: Some(seed),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("mutation suite world");
+        for index in 0..6_u32 {
+            let agent = world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(40.0 + f32::from(index as u16) * 6.0, 60.0),
+                    ..AgentData::default()
+                })
+                .expect("suite spawn");
+            world
+                .try_update_agent_runtime(agent, |runtime| {
+                    runtime.energy = 1.5;
+                    runtime.reproduction_counter = 10.0;
+                })
+                .expect("suite energy");
+        }
+        world
+            .enqueue_intervention(Intervention::Bloom {
+                region: Region::All,
+                amount: 0.1,
+            })
+            .expect("suite bloom validates");
+        world
+    }
+
+    fn run_gate(world: &mut WorldState, seed: u64, ticks: u64) -> economy::ConservationVerdict {
+        world.set_resource_ledger_enabled(true);
+        let mut gate = economy::ConservationGate::new();
+        for _ in 0..ticks {
+            world.step().expect("gate step");
+            let latest = world.resource_ledger().latest.clone();
+            if let Some(latest) = latest {
+                gate.observe(&latest);
+            }
+        }
+        economy::evaluate_conservation(&[gate.finish(seed)])
+    }
+
+    #[test]
+    fn the_unmutated_gate_run_is_green() {
+        // The alarm must stay quiet on a legal run: a gate that fires on a
+        // legal-but-weird config gets muted, and a muted gate is a lie in a
+        // green checkmark (bd-16g.11.2 anti-alarm-fatigue).
+        let mut world = mutation_suite_world(0x6A7E_0001);
+        let verdict = run_gate(&mut world, 0x6A7E_0001, 64);
+        assert!(
+            verdict.pass,
+            "unmutated run must be green: {:?}",
+            verdict.failures
+        );
+    }
+
+    #[test]
+    fn every_injectable_fault_turns_the_gate_red() {
+        // The centerpiece of bd-16g.11.2: a conservation gate that has never
+        // been observed to fail is not evidence of conservation. Every fault
+        // must fail the gate — and within a documented bound, because a leak
+        // that takes 40k ticks to detect would not have caught the historical
+        // bugs in practice.
+        for fault in LedgerFault::ALL {
+            let seed = 0xFA07_0000 + fault as u64;
+            let mut world = mutation_suite_world(seed);
+            // Give the fault's activity class its stage: aged agents for aging,
+            // adjacent agents at full health for the health-gate fault.
+            {
+                let handles: Vec<AgentId> = world.agents().iter_handles().collect();
+                if matches!(fault, LedgerFault::DropAgingPosting) {
+                    let arena = world.agents.columns_mut();
+                    for index in arena.ages_mut().iter_mut() {
+                        *index = 12_500;
+                    }
+                }
+                if matches!(fault, LedgerFault::CreditIntakeWithoutHealthGate) {
+                    let arena = world.agents.columns_mut();
+                    for health in arena.health_mut().iter_mut() {
+                        *health = 2.0;
+                    }
+                }
+                let _ = handles;
+            }
+            world.inject_ledger_fault(fault);
+            let verdict = run_gate(&mut world, seed, 64);
+            assert!(
+                !verdict.pass,
+                "fault {fault:?} was not detected within 64 ticks"
+            );
+            let first_breach = verdict.seeds[0]
+                .breaches
+                .first()
+                .or_else(|| {
+                    // Cumulative-only detections have no per-tick breach rows.
+                    None
+                });
+            if let Some(breach) = first_breach {
+                assert!(
+                    breach.tick.0 <= 64,
+                    "fault {fault:?} detected too late (tick {})",
+                    breach.tick.0
+                );
+            }
         }
     }
 

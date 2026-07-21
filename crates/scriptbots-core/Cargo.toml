@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["batch-brains", "parallel", "simd_wide"]
 batch-brains = []
+economy-faults = []
 parallel = ["dep:rayon"]
 simd_wide = ["dep:wide"]
 
