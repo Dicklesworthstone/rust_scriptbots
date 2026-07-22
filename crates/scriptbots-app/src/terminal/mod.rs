@@ -4092,12 +4092,12 @@ impl Palette {
         self.mode.label()
     }
 
-    fn cycle_theme(&mut self) -> &'static str {
+    pub fn cycle_theme(&mut self) -> &'static str {
         self.theme_id = self.theme_id.next();
         self.theme_id.label()
     }
 
-    fn theme_label(&self) -> &'static str {
+    pub fn theme_label(&self) -> &'static str {
         self.theme_id.label()
     }
 
@@ -5902,7 +5902,7 @@ mod tests {
         for theme in themes {
             for mode in palettes {
                 let p = Palette {
-                    level: Some(supports_color::ColorLevel::TrueColor),
+                    level: on_cached(Stream::Stdout),
                     emoji: true,
                     emoji_narrow: false,
                     mode,

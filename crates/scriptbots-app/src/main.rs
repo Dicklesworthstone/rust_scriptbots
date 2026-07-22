@@ -1053,7 +1053,7 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         ticks
     );
 
-    let master_seed = match cli.seed {
+    let master_seed = match cli.rng_seed {
         Some(seed) => seed,
         None => 987654321,
     };
@@ -1066,7 +1066,10 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
 
     let build_arch = |thread_count: Option<&str>| -> Result<Archipelago> {
         if let Some(tc) = thread_count {
-            std::env::set_var("RAYON_NUM_THREADS", tc);
+            // SAFETY: Process initialization during CLI setup before spawn
+            unsafe {
+                std::env::set_var("RAYON_NUM_THREADS", tc);
+            }
         }
         let specs: Vec<IslandSpec> = (0..island_count)
             .map(|id| IslandSpec {
@@ -1075,16 +1078,12 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
                 config: base_config.clone(),
             })
             .collect();
-        let migration_cfg = MigrationConfig {
-            interval_ticks: (ticks / 4).max(1),
-            emigrants_per_edge: 2,
-            selection_rule: EmigrantSelectionRule::Fittest,
-            topology: MigrationTopology::Ring,
-            replace: true,
-        };
         let arch_cfg = ArchipelagoConfig {
             islands: specs,
-            migration: migration_cfg,
+            topology: scriptbots_runtime::Topology::Ring,
+            barrier_interval: std::num::NonZeroU64::new((ticks / 4).max(1)).unwrap(),
+            master_seed,
+            host_options: scriptbots_runtime::HostCoreOptions::default(),
         };
         Archipelago::new(arch_cfg).context("failed to build archipelago")
     };
@@ -2885,8 +2884,11 @@ impl Renderer for ServerRenderer {
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
         info!("ScriptBots server mode starting (headless background simulation with REST/MCP API)");
-        let target_interval = Duration::from_millis(16);
-        while !ctx.control_runtime.is_failed() {
+        let target_interval = std::time::Duration::from_millis(16);
+        while !matches!(
+            ctx.control_runtime.status(),
+            scriptbots_app::servers::ControlRuntimeStatus::Failed(_)
+        ) {
             let start = std::time::Instant::now();
             if let Err(error) = (ctx.simulation_step)() {
                 warn!(%error, "Simulation step failed in server mode; stopping loop");
