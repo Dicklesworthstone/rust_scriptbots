@@ -17,6 +17,7 @@ wasm-bindgen = { workspace = true }
 rand = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core", default-features = false, features = ["batch-brains"] }
 scriptbots-brain = { path = "../scriptbots-brain", default-features = false, features = ["mlp"] }
+scriptbots-runtime = { path = "../scriptbots-runtime", default-features = false }
 postcard = { workspace = true }
 js-sys = "0.3.73"
 

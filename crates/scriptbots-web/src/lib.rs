@@ -12,8 +12,7 @@ use scriptbots_brain::{MlpBrain, mlp::MlpBrainFamily};
 use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::{
     AgentData, AgentId, BrainBinding, BrainRunner, DynamicWorldSnapshot as SimulationSnapshot,
-    Generation, INPUT_SIZE, NullPersistence, OUTPUT_SIZE, PersistenceAdmissionSession, Position,
-    ScriptBotsConfig, Velocity, WorldState,
+    Generation, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, Velocity, WorldState,
 };
 #[cfg(test)]
 use scriptbots_core::{
@@ -24,16 +23,20 @@ use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
 
+use scriptbots_runtime::{
+    HostCore, HostCoreOptions, HostSessionId, ManualHostDriver, ManualInstant, PlaybackSnapshot,
+};
+
 #[wasm_bindgen]
 pub struct SimHandle {
     inner: Rc<RefCell<Simulation>>,
 }
 
 struct Simulation {
-    world: WorldState,
-    persistence: PersistenceAdmissionSession,
+    core: HostCore,
     spec: SimSpec,
     mlp_key: Option<u64>,
+    now_nanos: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,93 +108,77 @@ impl SimSpec {
 
 impl Simulation {
     fn new(spec: SimSpec) -> Result<Self> {
-        let (world, persistence) =
-            WorldState::with_persistence(spec.config(), Box::new(NullPersistence))
-                .context("failed to initialize ScriptBots world state")?;
-        let mut sim = Self {
-            world,
-            persistence,
-            spec,
-            mlp_key: None,
+        let mut world = WorldState::new(spec.config())
+            .context("failed to initialize ScriptBots world state")?;
+        let mut mlp_key = None;
+        seed_agents(
+            &mut world,
+            spec.initial_population,
+            spec.seed_strategy,
+            spec.default_brain,
+            &mut mlp_key,
+        )?;
+        let session_id = HostSessionId::new(spec.seed.unwrap_or(0));
+        let options = HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: false,
+                speed_multiplier: 1.0,
+            },
+            ..Default::default()
         };
-        sim.seed_population()?;
-        Ok(sim)
+        let core = HostCore::new(session_id, world, options)
+            .map_err(|e| anyhow::anyhow!("failed to build HostCore for web: {e}"))?;
+        Ok(Self {
+            core,
+            spec,
+            mlp_key,
+            now_nanos: 0,
+        })
     }
 
     fn reset(&mut self, seed: Option<u64>) -> Result<()> {
         let spec = self.spec.with_seed(seed);
-        let (world, persistence) =
-            WorldState::with_persistence(spec.config(), Box::new(NullPersistence))
-                .context("failed to rebuild ScriptBots world state during reset")?;
-        self.world = world;
-        self.persistence = persistence;
+        let mut world = WorldState::new(spec.config())
+            .context("failed to rebuild ScriptBots world state during reset")?;
         self.mlp_key = None;
+        seed_agents(
+            &mut world,
+            spec.initial_population,
+            spec.seed_strategy,
+            spec.default_brain,
+            &mut self.mlp_key,
+        )?;
+        let session_id = HostSessionId::new(seed.unwrap_or(0));
+        let options = HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: false,
+                speed_multiplier: 1.0,
+            },
+            ..Default::default()
+        };
+        let core = HostCore::new(session_id, world, options)
+            .map_err(|e| anyhow::anyhow!("failed to rebuild HostCore for web: {e}"))?;
+        self.core = core;
         self.spec = spec;
-        self.seed_population()?;
+        self.now_nanos = 0;
         Ok(())
     }
 
     fn tick(&mut self, steps: u32) -> Result<SimulationSnapshot> {
+        let period = self.core.tick_period_nanos();
         for step_index in 0..steps {
-            self.persistence.step(&mut self.world).with_context(|| {
-                format!(
-                    "simulation failed during WASM step {} of {steps}",
-                    step_index + 1
-                )
-            })?;
+            self.now_nanos = self.now_nanos.saturating_add(period);
+            self.core
+                .drive(ManualInstant::from_nanos(self.now_nanos))
+                .with_context(|| {
+                    format!("HostCore failed during WASM step {} of {steps}", step_index + 1)
+                })?;
         }
-        Ok(SimulationSnapshot::from_world(&self.world))
+        Ok(self.core.latest_snapshot().world.clone())
     }
 
     fn snapshot(&self) -> SimulationSnapshot {
-        SimulationSnapshot::from_world(&self.world)
-    }
-
-    fn seed_population(&mut self) -> Result<()> {
-        seed_agents(
-            &mut self.world,
-            self.spec.initial_population,
-            self.spec.seed_strategy,
-            self.spec.default_brain,
-            &mut self.mlp_key,
-        )
-    }
-
-    fn ensure_mlp_key(&mut self) -> Result<u64> {
-        if let Some(key) = self.mlp_key {
-            return Ok(key);
-        }
-        let key = self
-            .world
-            .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
-            .context("failed to register the versioned MLP brain family")?;
-        self.mlp_key = Some(key);
-        Ok(key)
-    }
-
-    fn bind_brain_to_all(&mut self, key: u64) -> Result<()> {
-        let handles: Vec<_> = self.world.agents().iter_handles().collect();
-        for id in handles {
-            ensure!(
-                self.world
-                    .bind_agent_brain(id, key)
-                    .with_context(|| format!("failed to construct brain {key} for agent {id:?}"))?,
-                "registered brain key {key} disappeared before binding agent {id:?}"
-            );
-        }
-        Ok(())
-    }
-
-    fn apply_wander_to_all(&mut self) -> Result<()> {
-        let handles: Vec<_> = self.world.agents().iter_handles().collect();
-        for id in handles {
-            let seed = {
-                let rng = self.world.rng(RngDomain::Population)?;
-                rng.random::<u64>()
-            };
-            bind_wander_brain(&mut self.world, id, seed)?;
-        }
-        Ok(())
+        self.core.latest_snapshot().world.clone()
     }
 }
 
@@ -278,21 +265,24 @@ impl SimHandle {
         let mut simulation = self.inner.borrow_mut();
         match kind.as_str() {
             "mlp" => {
-                let key = simulation.ensure_mlp_key().map_err(js_error)?;
                 simulation.spec.default_brain = Some(BrainPreset::Mlp);
                 simulation.spec.seed_strategy = SeedStrategy::None;
-                simulation.bind_brain_to_all(key).map_err(js_error)?;
+                let seed = simulation.spec.seed;
+                simulation.reset(seed).map_err(js_error)?;
                 Ok(())
             }
             "wander" => {
                 simulation.spec.default_brain = None;
                 simulation.spec.seed_strategy = SeedStrategy::Wander;
-                simulation.apply_wander_to_all().map_err(js_error)?;
+                let seed = simulation.spec.seed;
+                simulation.reset(seed).map_err(js_error)?;
                 Ok(())
             }
             "none" => {
                 simulation.spec.default_brain = None;
                 simulation.spec.seed_strategy = SeedStrategy::None;
+                let seed = simulation.spec.seed;
+                simulation.reset(seed).map_err(js_error)?;
                 Ok(())
             }
             other => Err(js_error(format!("unknown brain preset: {other}"))),
