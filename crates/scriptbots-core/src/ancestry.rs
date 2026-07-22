@@ -469,6 +469,93 @@ impl AncestryGraph {
         report
     }
 
+    /// Computes founder contributions across all root founders in the ancestry graph (bd-2z0.11.1).
+    #[must_use]
+    pub fn compute_founder_contributions(&self) -> Vec<FounderContribution> {
+        let roots = self.roots();
+        let total_living = self.living();
+
+        let mut results = Vec::new();
+        for founder_uid in roots {
+            let mut visited = std::collections::BTreeSet::new();
+            let mut stack = vec![founder_uid];
+            let mut living_count = 0;
+
+            while let Some(current) = stack.pop() {
+                if !visited.insert(current) {
+                    continue;
+                }
+                if let Some(node) = self.nodes.get(&current) {
+                    if node.death_tick.is_none() && !node.pruned {
+                        living_count += 1;
+                    }
+                    for &child in &node.children {
+                        stack.push(child);
+                    }
+                }
+            }
+
+            let total_descendants = visited.len().saturating_sub(1);
+            let share = if total_living > 0 {
+                living_count as f32 / total_living as f32
+            } else {
+                0.0
+            };
+
+            results.push(FounderContribution {
+                founder_uid,
+                total_descendants,
+                living_descendants: living_count,
+                contribution_share: share,
+            });
+        }
+
+        results
+    }
+
+    /// Computes detailed fitness summary for a specific founder lineage (bd-2z0.11.1).
+    #[must_use]
+    pub fn compute_lineage_fitness(&self, founder_uid: AgentUid) -> Option<LineageFitnessSummary> {
+        let node = self.nodes.get(&founder_uid)?;
+        let lifetime_offspring_count = node.children.len();
+
+        let mut visited = std::collections::BTreeSet::new();
+        let mut stack = vec![(founder_uid, 0u32)];
+        let mut max_depth = 0u32;
+        let mut living_count = 0usize;
+
+        while let Some((current, depth)) = stack.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            max_depth = max_depth.max(depth);
+
+            if let Some(n) = self.nodes.get(&current) {
+                if n.death_tick.is_none() && !n.pruned {
+                    living_count += 1;
+                }
+                for &child in &n.children {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+
+        let total_living = self.living();
+        let share = if total_living > 0 {
+            living_count as f32 / total_living as f32
+        } else {
+            0.0
+        };
+
+        Some(LineageFitnessSummary {
+            founder_uid,
+            lifetime_offspring_count,
+            total_lineage_offspring: visited.len().saturating_sub(1),
+            max_generation_depth: max_depth,
+            founder_contribution_share: share,
+        })
+    }
+
     /// A stable fingerprint of the whole graph.
     ///
     /// THE ORACLE. An offline rebuild from the run DB is correct exactly when its
@@ -986,4 +1073,31 @@ mod tests {
         // And an unknown uid walks nowhere rather than panicking.
         assert!(graph.lineage_path(AgentUid(123_456), 32).is_empty());
     }
+
+    #[test]
+    fn test_lineage_fitness_and_founder_contributions() {
+        let mut graph = AncestryGraph::new();
+        // Seed 2 founders
+        graph.apply_birth(&birth_with_origin(1, 0, [None, None], 0, BirthOrigin::Seeded)).unwrap();
+        graph.apply_birth(&birth_with_origin(2, 0, [None, None], 0, BirthOrigin::Seeded)).unwrap();
+
+        // Founder 1 produces child 3
+        graph.apply_birth(&birth(3, 10, [Some(1), None], 1)).unwrap();
+        // Child 3 produces grandchild 4
+        graph.apply_birth(&birth(4, 20, [Some(3), None], 2)).unwrap();
+
+        let contributions = graph.compute_founder_contributions();
+        assert_eq!(contributions.len(), 2);
+
+        let f1_contrib = contributions.iter().find(|c| c.founder_uid == AgentUid(1)).unwrap();
+        assert_eq!(f1_contrib.total_descendants, 2);
+        assert_eq!(f1_contrib.living_descendants, 3); // 1, 3, 4 all living
+
+        let fitness = graph.compute_lineage_fitness(AgentUid(1)).unwrap();
+        assert_eq!(fitness.founder_uid, AgentUid(1));
+        assert_eq!(fitness.lifetime_offspring_count, 1);
+        assert_eq!(fitness.total_lineage_offspring, 2);
+        assert_eq!(fitness.max_generation_depth, 2);
+    }
 }
+
