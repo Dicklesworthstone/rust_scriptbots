@@ -66,6 +66,35 @@ use std::collections::BTreeMap;
 /// Roughly how many bytes one node costs, used by the asserted memory bound.
 pub const APPROX_BYTES_PER_NODE: usize = 80;
 
+/// Contribution of a root founder to the active population and total descendants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FounderContribution {
+    /// Logical identity of the root founder.
+    pub founder_uid: AgentUid,
+    /// Total descendants produced across all generations.
+    pub total_descendants: usize,
+    /// Living descendants currently active in the simulation.
+    pub living_descendants: usize,
+    /// Share of the total living population descended from this founder.
+    pub contribution_share: f32,
+}
+
+/// Detailed fitness summary for a specific founder lineage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineageFitnessSummary {
+    /// Logical identity of the root founder.
+    pub founder_uid: AgentUid,
+    /// Count of direct offspring (1st generation).
+    pub lifetime_offspring_count: usize,
+    /// Total descendants produced across all generations.
+    pub total_lineage_offspring: usize,
+    /// Maximum generation depth reached by any descendant.
+    pub max_generation_depth: u32,
+    /// Share of the total living population descended from this founder.
+    pub founder_contribution_share: f32,
+}
+
+
 /// One agent's place in the tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AncestryNode {
@@ -206,6 +235,8 @@ pub struct AncestryGraph {
 }
 
 impl AncestryGraph {
+
+
     /// An empty graph.
     #[must_use]
     pub fn new() -> Self {
