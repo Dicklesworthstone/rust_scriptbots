@@ -1208,7 +1208,7 @@ fn dot2(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 }
 
 /// Commands that can be applied to the world from external control surfaces.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ControlCommand {
     /// Replace the live configuration.
     UpdateConfig(Box<ScriptBotsConfig>),
@@ -1216,6 +1216,16 @@ pub enum ControlCommand {
     UpdateSelection(SelectionUpdate),
     /// Playback control for the external simulation driver.
     UpdateSimulation(SimulationCommand),
+    /// Pause simulation playback.
+    Pause,
+    /// Resume simulation playback.
+    Resume,
+    /// Advance simulation by one tick.
+    Step,
+    /// Set target simulation playback speed.
+    SetSpeed(f32),
+    /// Request simulation shutdown.
+    Shutdown,
 }
 
 /// Playback command carried to the external simulation driver.
@@ -1252,15 +1262,10 @@ impl SimulationCommand {
     }
 }
 
-/// Result of applying the world-owned portion of a control command.
-///
-/// Playback remains owned by the external simulation driver. Returning it explicitly allows that
-/// driver to preserve command-stream order without installing a second transport queue inside
-/// [`WorldState`].
+/// Result of evaluating a control command against world state.
 #[derive(Debug, Clone, PartialEq)]
-#[must_use]
 pub enum ControlDisposition {
-    /// Fully world-applied; nothing remains for the driver.
+    /// World state modified; no playback changes required.
     WorldApplied,
     /// Playback portion returned to the external driver.
     Playback(SimulationCommand),
@@ -1273,6 +1278,16 @@ impl ControlCommand {
             Self::UpdateConfig(config) => config.validate(),
             Self::UpdateSelection(_) => Ok(()),
             Self::UpdateSimulation(command) => command.validate(),
+            Self::Pause | Self::Resume | Self::Step | Self::Shutdown => Ok(()),
+            Self::SetSpeed(speed) => {
+                if !speed.is_finite() || *speed < 0.0 {
+                    Err(WorldStateError::InvalidConfig(
+                        "speed_multiplier must be finite and non-negative",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -1295,6 +1310,27 @@ pub fn apply_control_command(
         ControlCommand::UpdateSimulation(update) => {
             Ok(ControlDisposition::Playback(update.into_normalized()?))
         }
+        ControlCommand::Pause => Ok(ControlDisposition::Playback(SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: None,
+            step_once: false,
+        })),
+        ControlCommand::Resume => Ok(ControlDisposition::Playback(SimulationCommand {
+            paused: Some(false),
+            speed_multiplier: None,
+            step_once: false,
+        })),
+        ControlCommand::Step => Ok(ControlDisposition::Playback(SimulationCommand {
+            paused: None,
+            speed_multiplier: None,
+            step_once: true,
+        })),
+        ControlCommand::SetSpeed(speed) => Ok(ControlDisposition::Playback(SimulationCommand {
+            paused: None,
+            speed_multiplier: Some(speed.clamp(0.0, 32.0)),
+            step_once: false,
+        })),
+        ControlCommand::Shutdown => Ok(ControlDisposition::WorldApplied),
     }
 }
 
@@ -1635,7 +1671,7 @@ pub enum SelectionMode {
 }
 
 /// External selection update request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SelectionUpdate {
     /// How the update merges with the existing selection.
     pub mode: SelectionMode,

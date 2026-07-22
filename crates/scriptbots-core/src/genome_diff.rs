@@ -79,7 +79,7 @@ pub enum LocusValue {
 }
 
 /// One typed change between two aligned genomes.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum GenomeDelta {
     /// A scalar parameter whose bits changed.
     Scalar {
@@ -111,7 +111,7 @@ pub enum GenomeDelta {
 }
 
 /// The kind of a delta, for the by-kind summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DeltaKind {
     /// Scalar value change.
     Scalar,
@@ -122,7 +122,7 @@ pub enum DeltaKind {
 }
 
 /// Aggregate diff statistics, computed in one pass over the canonical delta list.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiffSummary {
     /// Number of loci that differ (equal to the delta count).
     pub changed_loci: usize,
@@ -137,7 +137,7 @@ pub struct DiffSummary {
 }
 
 /// The complete structural diff between two genomes of one family and schema.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenomeDiff {
     /// Brain family both genomes belong to.
     pub family: BrainFamilyId,
@@ -164,18 +164,17 @@ pub struct LocusSample {
 
 /// Trace a specific locus value across a sequence of lineage ancestor envelopes.
 #[must_use]
-pub fn trace_lineage_locus(
-    registry: &crate::BrainRegistry,
+pub fn trace_lineage_locus<C: BrainFamilyCodec>(
+    codec: &C,
     lineage_samples: &[(u32, AgentUid, Tick, BrainGenomeEnvelope)],
     locus: Locus,
 ) -> Vec<LocusSample> {
     lineage_samples
         .iter()
         .map(|(generation, agent_uid, tick, envelope)| {
-            let value = registry
-                .find_codec(&envelope.family_id)
+            let value = codec
+                .genome_loci(envelope)
                 .ok()
-                .and_then(|codec| codec.genome_loci(envelope).ok())
                 .and_then(|loci| {
                     loci.into_iter()
                         .find(|(loc, _)| *loc == locus)
@@ -261,7 +260,7 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
             points.push_str(&format!("{x:.1},{y:.1}"));
         }
         svg.push_str(&format!(
-            r#"<polyline fill="none" stroke="#89b4fa" stroke-width="2" points="{points}"/>"#
+            "<polyline fill=\"none\" stroke=\"#89b4fa\" stroke-width=\"2\" points=\"{points}\"/>"
         ));
     }
 

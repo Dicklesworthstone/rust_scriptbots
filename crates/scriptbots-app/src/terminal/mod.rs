@@ -52,6 +52,7 @@ use crate::{
 /// Sub-cell painter engine (bd-2z0.14.2.1.1): pure braille/half-block/quadrant
 /// compositing primitives consumed by the high-resolution canvas work.
 pub mod canvas_inspector;
+pub mod canvas_ramps;
 pub mod command_palette;
 pub mod frankentui_shell;
 pub mod paint;
