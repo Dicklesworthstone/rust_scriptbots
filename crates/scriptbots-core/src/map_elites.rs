@@ -30,12 +30,16 @@ pub enum SelectionMode {
 /// MAP-Elites behavioral grid archive.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MapElitesArchive {
+    /// Number of discrete bins per behavioral dimension.
     pub grid_bins_per_dim: usize,
+    /// Min/max bounds for each behavioral dimension.
     pub dimension_ranges: Vec<(f32, f32)>,
+    /// Map of discretized cell coordinates to elite individual records.
     pub cells: BTreeMap<MapElitesCellKey, MapElitesRecord>,
 }
 
 impl MapElitesArchive {
+    /// Create a new MAP-Elites archive with specified resolution and dimension bounds.
     pub fn new(grid_bins: usize, ranges: Vec<(f32, f32)>) -> Self {
         Self {
             grid_bins_per_dim: grid_bins,
