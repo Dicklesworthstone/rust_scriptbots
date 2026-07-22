@@ -15536,7 +15536,11 @@ impl WorldState {
             last_deaths: 0,
             last_spike_hits: 0,
             last_max_age: 0,
+            capture_budget: CaptureBudget::default(),
+            probe_stats: ProbeStats::default(),
+            active_activation_probe: None,
             history: VecDeque::with_capacity(history_capacity),
+
             narrative: narrative::RunNarrative::default(),
             pending_interventions: Vec::new(),
             applied_interventions: VecDeque::with_capacity(APPLIED_INTERVENTION_CAPACITY),
@@ -15603,7 +15607,64 @@ impl WorldState {
         }
     }
 
+    /// Sets the hard ceiling on per-tick activation snapshotting (bd-16g.4.4).
+    pub fn set_capture_budget(&mut self, budget: CaptureBudget) {
+        self.capture_budget = budget;
+    }
+
+    /// Returns the active capture budget ceiling (bd-16g.4.4).
+    #[must_use]
+    pub fn capture_budget(&self) -> CaptureBudget {
+        self.capture_budget
+    }
+
+    /// Returns the diagnostic probe statistics from the last tick (bd-16g.4.4).
+    #[must_use]
+    pub fn probe_stats(&self) -> ProbeStats {
+        self.last_probe_stats
+    }
+
+    /// Sets or clears the active activation probe target, binding AgentUid for death detection (bd-16g.4.4).
+    pub fn set_activation_probe(&mut self, probe: Option<AgentId>) {
+        if let Some(id) = probe {
+            if let Some(uid) = self.agent_uid(id) {
+                self.active_activation_probe = Some((id, uid));
+            } else {
+                self.active_activation_probe = None;
+            }
+        } else {
+            self.active_activation_probe = None;
+        }
+    }
+
+    /// Returns the currently probed agent handle if alive and identity matches (bd-16g.4.4).
+    #[must_use]
+    pub fn active_activation_probe(&self) -> Option<AgentId> {
+        if let Some((id, uid)) = self.active_activation_probe {
+            if self.agent_uid(id) == Some(uid) {
+                Some(id)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Updates probe statistics for the current tick under the bounded capture budget (bd-16g.4.4).
+    pub fn update_probe_stats(&mut self, captured: usize, selected_total: usize) {
+        let budget = self.capture_budget.max_agents;
+        let dropped = selected_total.saturating_sub(captured);
+        self.last_probe_stats = ProbeStats {
+            captured,
+            budget,
+            dropped,
+            explain_calls: self.last_probe_stats.explain_calls + captured as u64,
+        };
+    }
+
     /// Make the dense `SoA` layout match stable logical identity before any tick work begins.
+
     ///
     /// Normal monotonic insertion and stable removal keep this invariant, so the hot path pays
     /// only one branch. A checkpoint restore or test that materializes the same scientific world
@@ -41863,12 +41924,16 @@ mod tests {
         // Test dead agent probe auto-clearing
         let invalid_id = AgentId::default();
         world.set_activation_probe(Some(invalid_id));
-        assert_eq!(world.activation_probe(), None);
+        assert_eq!(world.active_activation_probe(), None);
 
-        // Test probe stats
+        // Test update_probe_stats
+        world.update_probe_stats(4, 500);
         let stats = world.probe_stats();
-        assert_eq!(stats.budget, 0);
+        assert_eq!(stats.captured, 4);
+        assert_eq!(stats.budget, 8);
+        assert_eq!(stats.dropped, 496);
     }
+
 
     #[test]
     fn render_settings_are_digest_neutral() {
