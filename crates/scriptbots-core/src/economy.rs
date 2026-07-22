@@ -1454,7 +1454,9 @@ mod tests {
     #[test]
     fn sankey_layout_generates_nodes_and_links() {
         let mut aggregator = EpochAggregator::new(2);
-        aggregator.observe(&clean_tick(1)).expect("tick 1");
+        let mut t1 = clean_tick(1);
+        t1.flows[0].activity.energy = 10.0;
+        aggregator.observe(&t1).expect("tick 1");
         let epoch = aggregator
             .observe(&clean_tick(2))
             .expect("tick 2")
