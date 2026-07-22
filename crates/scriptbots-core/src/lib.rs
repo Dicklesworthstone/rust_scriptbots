@@ -104,8 +104,6 @@ pub struct ActivationEdge {
     pub weight: f32,
 }
 
-}
-
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 static RAYON_LIMIT_GUARD: OnceLock<()> = OnceLock::new();
 
