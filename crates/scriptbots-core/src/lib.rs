@@ -5128,7 +5128,7 @@ impl ResourceLedgerState {
     fn record(
         &mut self,
         kind: ResourceFlowKind,
-        mut delta: ResourceAmounts,
+        #[allow(unused_mut)] mut delta: ResourceAmounts,
         activity: ResourceAmounts,
     ) {
         #[cfg(any(test, feature = "economy-faults"))]
@@ -15589,7 +15589,7 @@ impl WorldState {
     /// Returns the diagnostic probe statistics from the last tick (bd-16g.4.4).
     #[must_use]
     pub fn probe_stats(&self) -> ProbeStats {
-        self.last_probe_stats
+        self.probe_stats
     }
 
     /// Sets or clears the active activation probe target, binding AgentUid for death detection (bd-16g.4.4).
@@ -15623,11 +15623,11 @@ impl WorldState {
     pub fn update_probe_stats(&mut self, captured: usize, selected_total: usize) {
         let budget = self.capture_budget.max_agents;
         let dropped = selected_total.saturating_sub(captured);
-        self.last_probe_stats = ProbeStats {
+        self.probe_stats = ProbeStats {
             captured,
             budget,
             dropped,
-            explain_calls: self.last_probe_stats.explain_calls + captured as u64,
+            explain_calls: self.probe_stats.explain_calls + captured as u64,
         };
     }
 
