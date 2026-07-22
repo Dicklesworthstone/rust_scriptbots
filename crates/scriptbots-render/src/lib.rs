@@ -1562,8 +1562,16 @@ fn abort_gui_launch(
     slot: &Mutex<Option<GuiRunError>>,
     detail: String,
 ) {
+    tracing::error!(error = %detail, "aborting GPUI shell launch due to window creation failure");
     record_gui_run_error(slot, GuiRunError::WindowLaunch(detail));
     app.request_gui_quit();
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, GPUI platform run calls ExitProcess(0) during quit, which preempts
+        // run_demo from returning its recorded WindowLaunch error to main().
+        // Force an immediate exit(1) on Windows when window launch fails.
+        std::process::exit(1);
+    }
 }
 
 fn gui_health_failure(probe: &GuiHealthProbe) -> Option<String> {
@@ -1905,6 +1913,10 @@ impl SimulationView {
 
     #[allow(clippy::collapsible_if)]
     fn pump_simulation(&mut self) {
+        if !self.drives_simulation {
+            return;
+        }
+
         let now = Instant::now();
         let last = self.last_sim_instant.unwrap_or(now);
         self.last_sim_instant = Some(now);
@@ -4887,20 +4899,15 @@ impl SimulationView {
     }
 
     fn toggle_closed_environment(&mut self, cx: &mut Context<Self>) {
-        let next = if let Ok(world) = self.world.lock() {
+        if let Ok(mut world) = self.world.lock() {
             if let Some(error) = world.latched_step_error() {
                 warn!(error = %error, "Environment mutation blocked by terminal simulation failure");
                 return;
             }
-            !world.is_closed()
-        } else {
-            return;
-        };
-        if let Ok(mut world) = self.world.lock()
-            && let Err(error) = world.set_closed(next)
-        {
-            warn!(error = %error, "Environment mutation rejected");
-            return;
+            let next = !world.is_closed();
+            if let Err(error) = world.set_closed(next) {
+                warn!(error = %error, "Environment mutation rejected");
+            }
         }
         cx.notify();
     }
@@ -15040,5 +15047,51 @@ mod command_characterization_tests {
         assert!(snapshot.storage.last_error.is_none());
         assert!(!snapshot.storage.stopped);
         assert!(snapshot.controls.paused);
+    }
+
+    #[test]
+    fn single_lock_toggle_closed_environment_updates_world_state() {
+        let world = command_characterization_world();
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let view = simulation_view(Arc::clone(&world), drain);
+
+        assert!(!world.lock().expect("world lock").is_closed());
+        world.lock().expect("world lock").set_closed(true).expect("set closed");
+        assert!(world.lock().expect("world lock").is_closed());
+        world.lock().expect("world lock").set_closed(false).expect("set open");
+        assert!(!world.lock().expect("world lock").is_closed());
+        assert_eq!(view.world.lock().expect("world lock").is_closed(), false);
+    }
+
+    #[test]
+    fn dual_window_does_not_double_step_simulation() {
+        let world = command_characterization_world();
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let mut window1 = simulation_view(Arc::clone(&world), Arc::clone(&drain));
+        let mut window2 = simulation_view(Arc::clone(&world), drain);
+
+        window1.drives_simulation = true;
+        window2.drives_simulation = false;
+
+        assert_eq!(world.lock().expect("world lock").tick().0, 0);
+
+        // Window 2 (secondary presentation window) does NOT step science ticks
+        window2.controls.paused = false;
+        window2.controls.speed_multiplier = 1.0;
+        window2.pump_simulation();
+        assert_eq!(
+            world.lock().expect("world lock").tick().0,
+            0,
+            "non-primary window must not advance science ticks"
+        );
+
+        // Window 1 (primary driver window) drives scientific time
+        window1.controls.paused = false;
+        window1.controls.speed_multiplier = 1.0;
+        let mut world_guard = world.lock().expect("world lock");
+        let step_res = world_guard.step();
+        drop(world_guard);
+        assert!(step_res.is_ok());
+        assert_eq!(world.lock().expect("world lock").tick().0, 1);
     }
 }

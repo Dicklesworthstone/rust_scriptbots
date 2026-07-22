@@ -7,8 +7,11 @@ mod checkpoint;
 pub mod detect;
 pub mod economy;
 pub mod genome_diff;
+pub mod infotheory;
 pub mod narrative_text;
 pub mod permalink;
+pub mod phylo;
+pub mod species;
 mod replay;
 pub mod rng_domains;
 pub mod sense_fixed;
@@ -21,8 +24,8 @@ pub use checkpoint::{
 };
 
 pub use channels::{
-    BOOST_THRESHOLD, OutputChannel, OutputsExt, SENSOR_LAYOUT, SensorChannel, SensorKind,
-    SensorsExt,
+    BOOST_THRESHOLD, IoLayoutError, OutputChannel, OutputsExt, SENSOR_LAYOUT, SensorChannel,
+    SensorKind, SensorsExt, WorldIoLayout,
 };
 use rng_domains::{
     AgentRngCounterError, AgentRngCountersV1, AgentRngOperationV1, AgentSubstreamProtocolV1,
