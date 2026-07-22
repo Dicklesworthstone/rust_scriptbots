@@ -70,30 +70,65 @@ pub enum LabPhase {
     Finished,
 }
 
-/// Autonomous lab assistant state machine runner.
+/// Multi-axis budget constraints for autonomous lab execution (bd-16g.1.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabBudget {
+    pub max_runs: usize,
+    pub max_ticks: u64,
+    pub max_tokens: usize,
+    pub max_iterations: usize,
+}
+
+impl Default for LabBudget {
+    fn default() -> Self {
+        Self {
+            max_runs: 10,
+            max_ticks: 10_000,
+            max_tokens: 100_000,
+            max_iterations: 20,
+        }
+    }
+}
+
+/// Autonomous lab assistant state machine runner (bd-16g.1.3).
 pub struct LabStateMachine {
     pub phase: LabPhase,
     pub spec: Option<ExperimentSpec>,
     pub client: Box<dyn LlmClient>,
+    pub budget: LabBudget,
     pub runs_spent: usize,
-    pub max_runs: usize,
+    pub ticks_spent: u64,
+    pub tokens_spent: usize,
+    pub iterations: usize,
+    pub executed_spec_hashes: std::collections::BTreeSet<String>,
 }
 
 impl LabStateMachine {
-    pub fn new(client: Box<dyn LlmClient>, max_runs: usize) -> Self {
+    pub fn new(client: Box<dyn LlmClient>, budget: LabBudget) -> Self {
         Self {
             phase: LabPhase::Propose,
             spec: None,
             client,
+            budget,
             runs_spent: 0,
-            max_runs,
+            ticks_spent: 0,
+            tokens_spent: 0,
+            iterations: 0,
+            executed_spec_hashes: std::collections::BTreeSet::new(),
         }
     }
 
     pub fn step(&mut self) -> Result<LabPhase> {
+        self.iterations += 1;
+        if self.iterations > self.budget.max_iterations {
+            self.phase = LabPhase::Report;
+            return Ok(self.phase);
+        }
+
         match self.phase {
             LabPhase::Propose => {
                 let proposal = self.client.complete("Propose hypothesis")?;
+                self.tokens_spent += proposal.len() / 4;
                 let mut knobs = HashMap::new();
                 knobs.insert("food_growth_rate".to_string(), 1.5);
                 self.spec = Some(ExperimentSpec {
@@ -108,12 +143,43 @@ impl LabStateMachine {
             LabPhase::Validate => {
                 if let Some(ref spec) = self.spec {
                     spec.validate()?;
+                    if self.runs_spent + spec.seeds.len() > self.budget.max_runs {
+                        self.phase = LabPhase::Report;
+                        return Ok(self.phase);
+                    }
                 }
                 self.phase = LabPhase::Execute;
             }
             LabPhase::Execute => {
                 if let Some(ref spec) = self.spec {
-                    self.runs_spent += spec.seeds.len();
+                    let cohort = crate::experiment_runner::MatchedSeedCohort {
+                        cohort_id: "lab-cohort".into(),
+                        seeds: spec.seeds.clone(),
+                    };
+                    let variant = crate::experiment_runner::ScenarioVariant {
+                        variant_id: "lab_variant".into(),
+                        brain_family: "mlp".into(),
+                        config_overrides: spec.target_knobs.clone(),
+                    };
+
+                    let run_dir = std::env::temp_dir().join(format!("scriptbots_lab_{}", self.iterations));
+                    let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
+                        format!("lab-exp-{}", self.iterations),
+                        cohort,
+                        vec![variant],
+                        spec.max_ticks,
+                        2,
+                        &run_dir,
+                    );
+
+                    let state_file = run_dir.join("status.json");
+                    if let Ok(batch_status) = runner.execute_batch(&state_file) {
+                        self.runs_spent += batch_status.completed_runs;
+                        self.ticks_spent += spec.max_ticks * batch_status.completed_runs as u64;
+                    } else {
+                        self.runs_spent += spec.seeds.len();
+                        self.ticks_spent += spec.max_ticks * spec.seeds.len() as u64;
+                    }
                 }
                 self.phase = LabPhase::Analyze;
             }
@@ -139,16 +205,18 @@ impl LabStateMachine {
              ## Hypothesis\n\
              {hypothesis}\n\n\
              ## Provenance & Reproducibility\n\
-             - Runs Spent: {}\n\
-             - Maximum Budget: {}\n\n\
+             - Runs Spent: {} / {}\n\
+             - Ticks Spent: {} / {}\n\
+             - Iterations: {} / {}\n\n\
              ```bash\n\
              # reproduce.sh\n\
              scriptbots-control experiment run --seeds 42,100,2026 --knobs food_growth_rate=1.5\n\
              ```\n",
-            self.runs_spent, self.max_runs
+            self.runs_spent, self.budget.max_runs, self.ticks_spent, self.budget.max_ticks, self.iterations, self.budget.max_iterations
         )
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -183,7 +251,7 @@ mod tests {
         let client = Box::new(ScriptedLlmClient::new(
             "Hypothesis: food growth increases population",
         ));
-        let mut runner = LabStateMachine::new(client, 10);
+        let mut runner = LabStateMachine::new(client, LabBudget::default());
 
         while runner.phase != LabPhase::Finished {
             runner.step().expect("lab state machine step succeeds");
@@ -197,3 +265,4 @@ mod tests {
         assert!(notebook.contains("reproduce.sh"));
     }
 }
+
