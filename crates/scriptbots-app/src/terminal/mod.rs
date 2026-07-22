@@ -3678,7 +3678,7 @@ impl TerminalPaletteMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CuratedThemeId {
     CyberpunkAurora,
     Darcula,
@@ -5902,7 +5902,7 @@ mod tests {
         for theme in themes {
             for mode in palettes {
                 let p = Palette {
-                    level: Some(ratatui::style::ColorLevel::TrueColor),
+                    level: Some(supports_color::ColorLevel::TrueColor),
                     emoji: true,
                     emoji_narrow: false,
                     mode,
