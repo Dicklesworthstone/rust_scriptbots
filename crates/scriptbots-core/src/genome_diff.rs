@@ -172,14 +172,11 @@ pub fn trace_lineage_locus<C: BrainFamilyCodec>(
     lineage_samples
         .iter()
         .map(|(generation, agent_uid, tick, envelope)| {
-            let value = codec
-                .genome_loci(envelope)
-                .ok()
-                .and_then(|loci| {
-                    loci.into_iter()
-                        .find(|(loc, _)| *loc == locus)
-                        .map(|(_, val)| val)
-                });
+            let value = codec.genome_loci(envelope).ok().and_then(|loci| {
+                loci.into_iter()
+                    .find(|(loc, _)| *loc == locus)
+                    .map(|(_, val)| val)
+            });
             LocusSample {
                 generation: *generation,
                 agent_uid: *agent_uid,
@@ -199,16 +196,28 @@ pub fn export_locus_trace_csv(samples: &[LocusSample], locus: Locus) -> String {
     for s in samples {
         match s.value {
             Some(LocusValue::Scalar(v)) => {
-                out.push_str(&format!("{},{},{},scalar,{v}\n", s.generation, s.agent_uid.0, s.tick.0));
+                out.push_str(&format!(
+                    "{},{},{},scalar,{v}\n",
+                    s.generation, s.agent_uid.0, s.tick.0
+                ));
             }
             Some(LocusValue::Target(v)) => {
-                out.push_str(&format!("{},{},{},target,{v}\n", s.generation, s.agent_uid.0, s.tick.0));
+                out.push_str(&format!(
+                    "{},{},{},target,{v}\n",
+                    s.generation, s.agent_uid.0, s.tick.0
+                ));
             }
             Some(LocusValue::Kind(v)) => {
-                out.push_str(&format!("{},{},{},kind,{v}\n", s.generation, s.agent_uid.0, s.tick.0));
+                out.push_str(&format!(
+                    "{},{},{},kind,{v}\n",
+                    s.generation, s.agent_uid.0, s.tick.0
+                ));
             }
             None => {
-                out.push_str(&format!("{},{},{},gap,GAP\n", s.generation, s.agent_uid.0, s.tick.0));
+                out.push_str(&format!(
+                    "{},{},{},gap,GAP\n",
+                    s.generation, s.agent_uid.0, s.tick.0
+                ));
             }
         }
     }
@@ -242,10 +251,22 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
         .collect();
 
     if valid_scalars.len() >= 2 {
-        let min_gen = valid_scalars.iter().map(|(g, _)| *g).fold(f32::INFINITY, f32::min);
-        let max_gen = valid_scalars.iter().map(|(g, _)| *g).fold(f32::NEG_INFINITY, f32::max);
-        let min_val = valid_scalars.iter().map(|(_, v)| *v).fold(f32::INFINITY, f32::min);
-        let max_val = valid_scalars.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+        let min_gen = valid_scalars
+            .iter()
+            .map(|(g, _)| *g)
+            .fold(f32::INFINITY, f32::min);
+        let max_gen = valid_scalars
+            .iter()
+            .map(|(g, _)| *g)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_val = valid_scalars
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f32::INFINITY, f32::min);
+        let max_val = valid_scalars
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f32::NEG_INFINITY, f32::max);
 
         let gen_span = (max_gen - min_gen).max(1.0);
         let val_span = (max_val - min_val).max(0.001);

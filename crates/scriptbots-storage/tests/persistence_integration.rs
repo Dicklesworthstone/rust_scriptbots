@@ -125,3 +125,73 @@ fn storage_persists_metrics_roundtrip() {
     storage.close().expect("close storage reader explicitly");
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn online_offline_narrative_event_parity_test() {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_micros();
+    let path = std::env::temp_dir().join(format!(
+        "scriptbots_narrative_parity_{}_{}.sqlite",
+        std::process::id(),
+        timestamp
+    ));
+    let path_str = path.to_str().expect("utf8 path");
+    let mut pipeline =
+        StoragePipeline::create_unattributed_file_with_thresholds(path_str, 1, 1, 1, 1)
+            .expect("pipeline");
+
+    let config = ScriptBotsConfig {
+        world_width: 200,
+        world_height: 200,
+        food_cell_size: 20,
+        rng_seed: Some(0xCA1F),
+        persistence_interval: 1,
+        ..ScriptBotsConfig::default()
+    };
+
+    let online_events = {
+        let (mut world, mut persistence) =
+            WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
+
+        for seed in 0..24 {
+            world
+                .try_spawn_agent(AgentData {
+                    position: scriptbots_core::Position::new(
+                        (seed * 37 % 190) as f32,
+                        (seed * 53 % 190) as f32,
+                    ),
+                    health: 1.0,
+                    ..AgentData::default()
+                })
+                .expect("valid agent");
+        }
+
+        for _ in 0..500 {
+            persistence.step(&mut world).expect("persistence step");
+        }
+
+        world
+            .narrative_events()
+            .iter()
+            .map(|e| (e.tick.0, e.human_text.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    pipeline.shutdown().expect("clean shutdown");
+
+    let storage = StorageReader::open(path_str).expect("open storage");
+    let (offline_hits, total) = storage
+        .search_narrative("", None, 100)
+        .expect("search narrative hits");
+
+    assert!(total >= offline_hits.len());
+    assert!(
+        !online_events.is_empty(),
+        "expected online events generated during run"
+    );
+
+    storage.close().expect("close storage reader");
+    let _ = fs::remove_file(&path);
+}

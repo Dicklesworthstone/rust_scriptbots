@@ -1,6 +1,6 @@
 //! Autonomous LLM lab assistant: hypothesis -> matched-seed sweep -> analysis -> lab notebook (bd-16g.1).
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

@@ -173,13 +173,10 @@ pub fn compare_candidates(
             .energy
             .total_cmp(&a.energy)
             .then_with(|| a.uid.cmp(&b.uid)),
-        EmigrantSelectionRule::Youngest => {
-            a.age.cmp(&b.age).then_with(|| a.uid.cmp(&b.uid))
+        EmigrantSelectionRule::Youngest => a.age.cmp(&b.age).then_with(|| a.uid.cmp(&b.uid)),
+        EmigrantSelectionRule::Wanderer => {
+            b.speed.total_cmp(&a.speed).then_with(|| a.uid.cmp(&b.uid))
         }
-        EmigrantSelectionRule::Wanderer => b
-            .speed
-            .total_cmp(&a.speed)
-            .then_with(|| a.uid.cmp(&b.uid)),
         EmigrantSelectionRule::Random => random_rank_a
             .cmp(&random_rank_b)
             .then_with(|| a.uid.cmp(&b.uid)),
@@ -235,7 +232,9 @@ pub fn select_emigrants(
                     EmigrantSelectionRule::Fittest => c.energy as f64,
                     EmigrantSelectionRule::Youngest => c.age as f64,
                     EmigrantSelectionRule::Wanderer => c.speed as f64,
-                    EmigrantSelectionRule::Random => random_ranks.get(&c.uid).copied().unwrap_or(0) as f64,
+                    EmigrantSelectionRule::Random => {
+                        random_ranks.get(&c.uid).copied().unwrap_or(0) as f64
+                    }
                 };
                 (c, val)
             })
@@ -327,9 +326,27 @@ mod tests {
         candidates.insert(
             0,
             vec![
-                CandidateAgent { uid: 10, energy: 1.0, health: 1.0, age: 100, speed: 0.5 },
-                CandidateAgent { uid: 5, energy: 1.0, health: 1.0, age: 100, speed: 0.5 },
-                CandidateAgent { uid: 2, energy: 2.0, health: 1.0, age: 100, speed: 0.5 },
+                CandidateAgent {
+                    uid: 10,
+                    energy: 1.0,
+                    health: 1.0,
+                    age: 100,
+                    speed: 0.5,
+                },
+                CandidateAgent {
+                    uid: 5,
+                    energy: 1.0,
+                    health: 1.0,
+                    age: 100,
+                    speed: 0.5,
+                },
+                CandidateAgent {
+                    uid: 2,
+                    energy: 2.0,
+                    health: 1.0,
+                    age: 100,
+                    speed: 0.5,
+                },
             ],
         );
         candidates.insert(1, vec![]);
@@ -353,7 +370,16 @@ mod tests {
     #[test]
     fn test_two_phase_no_duplicate_emigration() {
         let mut candidates = BTreeMap::new();
-        candidates.insert(0, vec![CandidateAgent { uid: 1, energy: 1.0, health: 1.0, age: 10, speed: 0.1 }]);
+        candidates.insert(
+            0,
+            vec![CandidateAgent {
+                uid: 1,
+                energy: 1.0,
+                health: 1.0,
+                age: 10,
+                speed: 0.1,
+            }],
+        );
         candidates.insert(1, vec![]);
         candidates.insert(2, vec![]);
 

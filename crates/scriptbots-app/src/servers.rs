@@ -17,16 +17,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use futures_util::stream::{Stream, StreamExt};
-use mcp_protocol_sdk::{
-    core::error::McpResult,
-    prelude::*,
-    protocol::types::{
-        JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-        error_codes,
-    },
-    server::McpServer,
+use fastmcp_rust::{
+    CallToolResult, Content, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, McpError, McpErrorCode, McpResult, Server, ToolHandler,
 };
+use futures_util::stream::{Stream, StreamExt};
 use scriptbots_core::PresetKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -552,7 +547,10 @@ fn control_runtime_health(
             Ok(true) => continue,
             Err(_) => {
                 let current = probe.borrow().clone();
-                if matches!(current, ControlRuntimeStatus::Disabled | ControlRuntimeStatus::Stopped) {
+                if matches!(
+                    current,
+                    ControlRuntimeStatus::Disabled | ControlRuntimeStatus::Stopped
+                ) {
                     return Ok(());
                 }
                 return Err(
@@ -1034,6 +1032,7 @@ pub struct SpeedRequestBody {
         get_hydrology_snapshot,
         stream_ticks_sse,
         get_events_tail,
+        get_narrative_search,
         get_scoreboard,
         get_agents_debug,
         get_config_audit,
@@ -1060,6 +1059,7 @@ pub struct SpeedRequestBody {
             PresetApplyRequest,
             ErrorResponse,
             EventEntry,
+            NarrativeSearchHitDto,
             EventKind,
             DietClassDto,
             SelectionStateDto,
@@ -1336,6 +1336,30 @@ async fn get_events_tail(
     Ok(Json(events))
 }
 
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct NarrativeSearchHitDto {
+    pub tick: u64,
+    pub kind: String,
+    pub severity: f32,
+    pub human_text: String,
+    pub score: f64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/narrative/search",
+    tag = "control",
+    params(("q" = String, Query, description = "Search query")),
+    responses((status = 200, body = [NarrativeSearchHitDto]))
+)]
+async fn get_narrative_search(
+    State(_state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<NarrativeSearchHitDto>>, AppError> {
+    let _q = params.get("q").cloned().unwrap_or_default();
+    Ok(Json(vec![]))
+}
+
 #[utoipa::path(
     get,
     path = "/api/scoreboard",
@@ -1567,7 +1591,9 @@ async fn apply_preset(
     tag = "control",
     responses((status = 200, body = CommandStatusDto))
 )]
-async fn post_control_pause(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+async fn post_control_pause(
+    State(state): State<ApiState>,
+) -> Result<Json<CommandStatusDto>, AppError> {
     let status = run_control(move || state.handle.pause()).await?;
     Ok(Json(status))
 }
@@ -1578,7 +1604,9 @@ async fn post_control_pause(State(state): State<ApiState>) -> Result<Json<Comman
     tag = "control",
     responses((status = 200, body = CommandStatusDto))
 )]
-async fn post_control_resume(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+async fn post_control_resume(
+    State(state): State<ApiState>,
+) -> Result<Json<CommandStatusDto>, AppError> {
     let status = run_control(move || state.handle.resume()).await?;
     Ok(Json(status))
 }
@@ -1589,7 +1617,9 @@ async fn post_control_resume(State(state): State<ApiState>) -> Result<Json<Comma
     tag = "control",
     responses((status = 200, body = CommandStatusDto))
 )]
-async fn post_control_step(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+async fn post_control_step(
+    State(state): State<ApiState>,
+) -> Result<Json<CommandStatusDto>, AppError> {
     let status = run_control(move || state.handle.step()).await?;
     Ok(Json(status))
 }
@@ -1615,7 +1645,9 @@ async fn post_control_speed(
     tag = "control",
     responses((status = 200, body = CommandStatusDto))
 )]
-async fn post_control_shutdown(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+async fn post_control_shutdown(
+    State(state): State<ApiState>,
+) -> Result<Json<CommandStatusDto>, AppError> {
     let status = run_control(move || state.handle.shutdown()).await?;
     Ok(Json(status))
 }
@@ -1706,9 +1738,7 @@ async fn post_speed(
     tag = "control",
     responses((status = 200, body = SimulationStatusDto))
 )]
-async fn get_status(
-    State(state): State<ApiState>,
-) -> Result<Json<SimulationStatusDto>, AppError> {
+async fn get_status(State(state): State<ApiState>) -> Result<Json<SimulationStatusDto>, AppError> {
     let status = run_control(move || state.handle.status()).await?;
     Ok(Json(status))
 }
@@ -1739,6 +1769,7 @@ fn prepare_rest_server(
         .route("/api/hydrology", get(get_hydrology_snapshot))
         // Event tail and scoreboard
         .route("/api/events/tail", get(get_events_tail))
+        .route("/api/narrative/search", get(get_narrative_search))
         .route("/api/scoreboard", get(get_scoreboard))
         .route("/api/agents/debug", get(get_agents_debug))
         .route("/api/selection", post(post_selection))
@@ -2137,12 +2168,18 @@ impl ToolHandler for ControlTool {
                 Ok(make_tool_result(presets)?)
             }
             ControlToolKind::ApplyPreset => {
-                let name_value = arguments
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| McpError::Validation("missing 'name' field".into()))?;
+                let name_value =
+                    arguments
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            McpError::new(McpErrorCode::InvalidParams, "missing 'name' field")
+                        })?;
                 let kind = PresetKind::from_name(name_value).ok_or_else(|| {
-                    McpError::Validation(format!("unknown preset: {}", name_value))
+                    McpError::new(
+                        McpErrorCode::InvalidParams,
+                        format!("unknown preset: {}", name_value),
+                    )
                 })?;
                 let handle = self.handle.clone();
                 let snapshot = run_control_mcp(move || handle.apply_patch(kind.patch())).await?;
@@ -2159,27 +2196,35 @@ impl ToolHandler for ControlTool {
                 Ok(make_tool_result(snapshot)?)
             }
             ControlToolKind::ApplyUpdates => {
-                let updates_value = arguments
-                    .get("updates")
-                    .ok_or_else(|| McpError::Validation("missing 'updates' field".into()))?;
+                let updates_value = arguments.get("updates").ok_or_else(|| {
+                    McpError::new(McpErrorCode::InvalidParams, "missing 'updates' field")
+                })?;
                 let updates: Vec<KnobUpdate> = serde_json::from_value(updates_value.clone())
                     .map_err(|err| {
-                        McpError::Validation(format!("invalid updates payload: {err}"))
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid updates payload: {err}"),
+                        )
                     })?;
                 if updates.is_empty() {
-                    return Err(McpError::Validation("updates cannot be empty".into()));
+                    return Err(McpError::new(
+                        McpErrorCode::InvalidParams,
+                        "updates cannot be empty",
+                    ));
                 }
                 let handle = self.handle.clone();
                 let snapshot = run_control_mcp(move || handle.apply_updates(&updates)).await?;
                 Ok(make_tool_result(snapshot)?)
             }
             ControlToolKind::ApplyPatch => {
-                let patch_value = arguments
-                    .get("patch")
-                    .cloned()
-                    .ok_or_else(|| McpError::Validation("missing 'patch' field".into()))?;
+                let patch_value = arguments.get("patch").cloned().ok_or_else(|| {
+                    McpError::new(McpErrorCode::InvalidParams, "missing 'patch' field")
+                })?;
                 if !patch_value.is_object() {
-                    return Err(McpError::Validation("patch must be a JSON object".into()));
+                    return Err(McpError::new(
+                        McpErrorCode::InvalidParams,
+                        "patch must be a JSON object",
+                    ));
                 }
                 let handle = self.handle.clone();
                 let snapshot = run_control_mcp(move || handle.apply_patch(patch_value)).await?;
@@ -2196,10 +2241,7 @@ impl ToolHandler for ControlTool {
                 Ok(make_tool_result(json!({"paused": false}))?)
             }
             ControlToolKind::Step => {
-                let count = arguments
-                    .get("count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1);
+                let count = arguments.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
                 let handle = self.handle.clone();
                 run_control_mcp(move || handle.step_count(count)).await?;
                 Ok(make_tool_result(json!({"stepped": count}))?)
@@ -2208,8 +2250,9 @@ impl ToolHandler for ControlTool {
                 let speed = arguments
                     .get("speed")
                     .and_then(|v| v.as_f64())
-                    .ok_or_else(|| McpError::Validation("missing 'speed' parameter".into()))?
-                    as f32;
+                    .ok_or_else(|| {
+                        McpError::new(McpErrorCode::InvalidParams, "missing 'speed' parameter")
+                    })? as f32;
                 let handle = self.handle.clone();
                 run_control_mcp(move || handle.set_speed(speed)).await?;
                 Ok(make_tool_result(json!({"speed": speed}))?)
@@ -2228,7 +2271,12 @@ impl ToolHandler for ControlTool {
                 let command_id = arguments
                     .get("command_id")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| McpError::Validation("missing 'command_id' parameter".into()))?
+                    .ok_or_else(|| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            "missing 'command_id' parameter",
+                        )
+                    })?
                     .to_string();
                 let handle = self.handle.clone();
                 let status = run_control_mcp(move || handle.command_status(&command_id)).await?;
@@ -2238,16 +2286,24 @@ impl ToolHandler for ControlTool {
     }
 }
 
-fn make_tool_result<T>(value: T) -> McpResult<ToolResult>
+fn make_tool_result<T>(value: T) -> McpResult<CallToolResult>
 where
     T: Serialize,
 {
-    let structured = serde_json::to_value(&value)
-        .map_err(|err| McpError::Internal(format!("failed to serialize result: {err}")))?;
-    let pretty = serde_json::to_string_pretty(&structured)
-        .map_err(|err| McpError::Internal(format!("failed to format result: {err}")))?;
+    let structured = serde_json::to_value(&value).map_err(|err| {
+        McpError::new(
+            McpErrorCode::InternalError,
+            format!("failed to serialize result: {err}"),
+        )
+    })?;
+    let pretty = serde_json::to_string_pretty(&structured).map_err(|err| {
+        McpError::new(
+            McpErrorCode::InternalError,
+            format!("failed to format result: {err}"),
+        )
+    })?;
 
-    Ok(ToolResult {
+    Ok(CallToolResult {
         content: vec![Content::text(pretty)],
         is_error: Some(false),
         structured_content: Some(structured),
@@ -2265,23 +2321,32 @@ where
     tokio::task::spawn_blocking(operation)
         .await
         .map_err(|join_error| {
-            McpError::Internal(format!("control operation task failed: {join_error}"))
+            McpError::new(
+                McpErrorCode::InternalError,
+                format!("control operation task failed: {join_error}"),
+            )
         })?
         .map_err(map_control_error)
 }
 
 fn map_control_error(err: ControlError) -> McpError {
     match err {
-        ControlError::UnknownPath(path) => {
-            McpError::Validation(format!("unknown knob path: {path}"))
+        ControlError::UnknownPath(path) => McpError::new(
+            McpErrorCode::InvalidParams,
+            format!("unknown knob path: {path}"),
+        ),
+        ControlError::InvalidPatch(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
+        ControlError::Serialization(msg) => McpError::new(McpErrorCode::InternalError, msg),
+        ControlError::Lock => {
+            McpError::new(McpErrorCode::InternalError, "world state is unavailable")
         }
-        ControlError::InvalidPatch(msg) => McpError::Validation(msg),
-        ControlError::Serialization(msg) => McpError::Internal(msg),
-        ControlError::Lock => McpError::Internal("world state is unavailable".into()),
-        ControlError::CommandQueueFull => {
-            McpError::Internal("command queue is full; retry shortly".into())
+        ControlError::CommandQueueFull => McpError::new(
+            McpErrorCode::InternalError,
+            "command queue is full; retry shortly",
+        ),
+        ControlError::CommandQueueClosed => {
+            McpError::new(McpErrorCode::InternalError, "command queue is closed")
         }
-        ControlError::CommandQueueClosed => McpError::Internal("command queue is closed".into()),
     }
 }
 
@@ -2951,12 +3016,37 @@ mod tests {
     fn test_openapi_spec_conformance() {
         let openapi = ApiDoc::openapi();
         let json_spec = serde_json::to_string(&openapi).expect("OpenAPI spec serializes");
-        assert!(json_spec.contains("/api/knobs"), "spec must contain /api/knobs");
-        assert!(json_spec.contains("/api/config"), "spec must contain /api/config");
-        assert!(json_spec.contains("/api/control/pause"), "spec must contain /api/control/pause");
-        assert!(json_spec.contains("/api/control/resume"), "spec must contain /api/control/resume");
-        assert!(json_spec.contains("/api/control/step"), "spec must contain /api/control/step");
-        assert!(json_spec.contains("/api/control/speed"), "spec must contain /api/control/speed");
-        assert!(json_spec.contains("/api/control/shutdown"), "spec must contain /api/control/shutdown");
+        assert!(
+            json_spec.contains("/api/knobs"),
+            "spec must contain /api/knobs"
+        );
+        assert!(
+            json_spec.contains("/api/config"),
+            "spec must contain /api/config"
+        );
+        assert!(
+            json_spec.contains("/api/control/pause"),
+            "spec must contain /api/control/pause"
+        );
+        assert!(
+            json_spec.contains("/api/control/resume"),
+            "spec must contain /api/control/resume"
+        );
+        assert!(
+            json_spec.contains("/api/control/step"),
+            "spec must contain /api/control/step"
+        );
+        assert!(
+            json_spec.contains("/api/control/speed"),
+            "spec must contain /api/control/speed"
+        );
+        assert!(
+            json_spec.contains("/api/control/shutdown"),
+            "spec must contain /api/control/shutdown"
+        );
+        assert!(
+            json_spec.contains("/api/narrative/search"),
+            "spec must contain /api/narrative/search"
+        );
     }
 }

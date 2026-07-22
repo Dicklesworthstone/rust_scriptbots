@@ -91,7 +91,9 @@ impl CommandPalette {
             let q = self.query.to_lowercase();
             self.entries
                 .iter()
-                .filter(|e| e.label.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q))
+                .filter(|e| {
+                    e.label.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q)
+                })
                 .collect()
         }
     }
@@ -114,7 +116,10 @@ impl CommandPalette {
         }
     }
 
-    pub fn execute_selected(&self, handle: &ControlHandle) -> Option<Result<CommandStatusDto, ControlError>> {
+    pub fn execute_selected(
+        &self,
+        handle: &ControlHandle,
+    ) -> Option<Result<CommandStatusDto, ControlError>> {
         let filtered = self.filtered_entries();
         if let Some(entry) = filtered.get(self.selected_index) {
             match entry.command {

@@ -86,7 +86,10 @@ mod tests {
         assert_eq!(HeadingSector::from_angle(0.0), HeadingSector::East);
         assert_eq!(HeadingSector::from_angle(PI / 2.0), HeadingSector::North);
         assert_eq!(HeadingSector::from_angle(PI), HeadingSector::West);
-        assert_eq!(HeadingSector::from_angle(3.0 * PI / 2.0), HeadingSector::South);
+        assert_eq!(
+            HeadingSector::from_angle(3.0 * PI / 2.0),
+            HeadingSector::South
+        );
 
         assert!(HeadingSector::North.braille_dot_mask() > 0);
     }

@@ -638,7 +638,9 @@ impl ControlHandle {
     /// Set simulation playback speed multiplier.
     pub fn set_speed(&self, speed: f32) -> Result<CommandStatusDto, ControlError> {
         if !speed.is_finite() || speed < 0.0 {
-            return Err(ControlError::InvalidPatch("invalid speed multiplier".into()));
+            return Err(ControlError::InvalidPatch(
+                "invalid speed multiplier".into(),
+            ));
         }
         self.submit_control_command(ControlCommand::SetSpeed(speed))
     }
@@ -649,18 +651,27 @@ impl ControlHandle {
     }
 
     /// Look up status of a command by ID.
-    pub fn command_status(&self, command_id: &str) -> Result<Option<CommandStatusDto>, ControlError> {
+    pub fn command_status(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<CommandStatusDto>, ControlError> {
         let cache = self.status_cache.lock().unwrap();
         Ok(cache.get(command_id).cloned())
     }
 
-    fn submit_control_command(&self, cmd: ControlCommand) -> Result<CommandStatusDto, ControlError> {
+    fn submit_control_command(
+        &self,
+        cmd: ControlCommand,
+    ) -> Result<CommandStatusDto, ControlError> {
         self.enqueue(cmd)?;
         let (tick, rev) = {
             let world = self.lock_world()?;
             (world.tick().0, world.config_revision())
         };
-        let id_num = self.command_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let id_num = self
+            .command_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let command_id = format!("cmd-{id_num}");
         let status = CommandStatusDto {
             command_id: command_id.clone(),
@@ -1537,7 +1548,9 @@ mod tests {
         let non_existent = handle.command_status("cmd-invalid-9999").expect("lookup");
         assert!(non_existent.is_none());
 
-        let err = handle.set_speed(-1.0).expect_err("negative speed must fail");
+        let err = handle
+            .set_speed(-1.0)
+            .expect_err("negative speed must fail");
         assert!(matches!(err, ControlError::InvalidPatch(_)));
     }
 }

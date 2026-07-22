@@ -33,9 +33,9 @@
 )]
 #![allow(clippy::float_cmp, clippy::while_float)]
 
-use crate::{RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick, Tick};
 #[cfg(any(test, feature = "economy-faults"))]
 use crate::LedgerFault;
+use crate::{RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick, Tick};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1321,27 +1321,33 @@ mod tests {
     /// and the length check below fails the build; remove a fault's coverage
     /// and the per-category check fails the test.
     const KIND_TO_FAULTS: [&[LedgerFault]; CATEGORY_COUNT] = [
-        &[LedgerFault::DropInterventionPosting],         // ScenarioIntervention
-        &[LedgerFault::MislabelSunlightAsTransfer],     // FoodDynamics
-        &[LedgerFault::DropAgingPosting],               // Aging
-        &[LedgerFault::DropActuationPosting, LedgerFault::ScaleMetabolismDrainBy10], // BasalMetabolism
-        &[LedgerFault::DropActuationPosting],           // Movement
-        &[LedgerFault::DropActuationPosting],           // MetabolismRamp
-        &[LedgerFault::DropActuationPosting],           // Boost
-        &[LedgerFault::DropActuationPosting],           // Topography
-        &[LedgerFault::DropTemperaturePosting],         // TemperatureStress
+        &[LedgerFault::DropInterventionPosting], // ScenarioIntervention
+        &[LedgerFault::MislabelSunlightAsTransfer], // FoodDynamics
+        &[LedgerFault::DropAgingPosting],        // Aging
+        &[
+            LedgerFault::DropActuationPosting,
+            LedgerFault::ScaleMetabolismDrainBy10,
+        ], // BasalMetabolism
+        &[LedgerFault::DropActuationPosting],    // Movement
+        &[LedgerFault::DropActuationPosting],    // MetabolismRamp
+        &[LedgerFault::DropActuationPosting],    // Boost
+        &[LedgerFault::DropActuationPosting],    // Topography
+        &[LedgerFault::DropTemperaturePosting],  // TemperatureStress
         &[
             LedgerFault::DoubleCreditIntake,
             LedgerFault::HalveWasteDebit,
             LedgerFault::CreditIntakeWithoutHealthGate,
         ], // GroundFoodConversion
-        &[LedgerFault::CorruptGiveTransfer],            // EnergySharing
-        &[LedgerFault::DropCombatPosting],              // Combat
-        &[LedgerFault::MislabelCarcassAsTransfer],      // CarcassReward
-        &[LedgerFault::SkipDeathResidue],               // DeathRemoval
-        &[LedgerFault::DropReproductionPosting],        // ReproductionAllocation
-        &[LedgerFault::DropPopulationPosting],          // PopulationInjection
-        &[LedgerFault::ForgetEnergyCapSpill, LedgerFault::ForgetHealthCapSpill], // CapacityRejection
+        &[LedgerFault::CorruptGiveTransfer],     // EnergySharing
+        &[LedgerFault::DropCombatPosting],       // Combat
+        &[LedgerFault::MislabelCarcassAsTransfer], // CarcassReward
+        &[LedgerFault::SkipDeathResidue],        // DeathRemoval
+        &[LedgerFault::DropReproductionPosting], // ReproductionAllocation
+        &[LedgerFault::DropPopulationPosting],   // PopulationInjection
+        &[
+            LedgerFault::ForgetEnergyCapSpill,
+            LedgerFault::ForgetHealthCapSpill,
+        ], // CapacityRejection
     ];
 
     #[test]
@@ -1364,7 +1370,11 @@ mod tests {
     fn clean_tick(tick: u64) -> ResourceLedgerTick {
         ledger_tick(
             tick,
-            &[(ResourceFlowKind::FoodDynamics, amounts(0.5, 0.0, 0.0), zero_amounts())],
+            &[(
+                ResourceFlowKind::FoodDynamics,
+                amounts(0.5, 0.0, 0.0),
+                zero_amounts(),
+            )],
             zero_amounts(),
         )
     }
@@ -1372,7 +1382,11 @@ mod tests {
     fn breached_tick(tick: u64, residual: ResourceAmounts) -> ResourceLedgerTick {
         let mut report = ledger_tick(
             tick,
-            &[(ResourceFlowKind::FoodDynamics, amounts(0.5, 0.0, 0.0), zero_amounts())],
+            &[(
+                ResourceFlowKind::FoodDynamics,
+                amounts(0.5, 0.0, 0.0),
+                zero_amounts(),
+            )],
             residual,
         );
         report.reconciliation.reconciled = false;
@@ -1402,7 +1416,10 @@ mod tests {
         assert!(!verdict.pass);
         let failure = &verdict.failures[0];
         assert!(failure.contains("per-tick breaches"), "{failure}");
-        assert!(failure.contains("GridFood"), "the broken stock is named: {failure}");
+        assert!(
+            failure.contains("GridFood"),
+            "the broken stock is named: {failure}"
+        );
         let breach = &verdict.seeds[0].breaches[0];
         assert_eq!(breach.tick, Tick(9));
         assert_eq!(breach.worst_category, Some(ResourceFlowKind::FoodDynamics));
@@ -1462,7 +1479,12 @@ mod tests {
             .expect("tick 2")
             .expect("epoch");
 
-        let graph = sankey_layout(&epoch, &SankeyOpts { include_zero_links: false });
+        let graph = sankey_layout(
+            &epoch,
+            &SankeyOpts {
+                include_zero_links: false,
+            },
+        );
         assert_eq!(graph.nodes.len(), 7);
         assert!(!graph.links.is_empty());
         let total_value: f64 = graph.links.iter().map(|l| l.value).sum();
@@ -1518,4 +1540,3 @@ mod tests {
         assert!(json_table.contains("herbivore"));
     }
 }
-

@@ -15056,9 +15056,17 @@ mod command_characterization_tests {
         let view = simulation_view(Arc::clone(&world), drain);
 
         assert!(!world.lock().expect("world lock").is_closed());
-        world.lock().expect("world lock").set_closed(true).expect("set closed");
+        world
+            .lock()
+            .expect("world lock")
+            .set_closed(true)
+            .expect("set closed");
         assert!(world.lock().expect("world lock").is_closed());
-        world.lock().expect("world lock").set_closed(false).expect("set open");
+        world
+            .lock()
+            .expect("world lock")
+            .set_closed(false)
+            .expect("set open");
         assert!(!world.lock().expect("world lock").is_closed());
         assert_eq!(view.world.lock().expect("world lock").is_closed(), false);
     }

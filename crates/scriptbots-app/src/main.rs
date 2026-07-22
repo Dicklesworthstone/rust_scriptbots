@@ -1045,7 +1045,6 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
 
 fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
     use scriptbots_runtime::archipelago::{Archipelago, ArchipelagoConfig, IslandId, IslandSpec};
-    use scriptbots_runtime::migrator::{EmigrantSelectionRule, MigrationConfig, MigrationTopology};
 
     println!(
         "{} Starting archipelago determinism self-check matrix for {} ticks...",
@@ -1097,7 +1096,10 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         }
         let mut cell_digests = Vec::new();
         for i in 0..island_count {
-            let digest = arch.island_digest(IslandId(i as u16)).context("island digest")?.overall;
+            let digest = arch
+                .island_digest(IslandId(i as u16))
+                .context("island digest")?
+                .overall;
             cell_digests.push(digest);
         }
 
@@ -2214,6 +2216,15 @@ struct AppCli {
     /// Limit the number of ticks simulated during replay verification.
     #[arg(long = "tick-limit", value_name = "TICKS", requires = "replay_db")]
     tick_limit: Option<u64>,
+    /// Path to a run database from which to create a portable deterministic run bundle.
+    #[arg(long = "create-bundle", value_name = "RUN_DB")]
+    create_bundle: Option<PathBuf>,
+    /// Target path/directory for bundle output when using --create-bundle.
+    #[arg(long = "bundle-output", value_name = "PATH", requires = "create_bundle")]
+    bundle_output: Option<PathBuf>,
+    /// Path to a run bundle directory to verify reproducibility.
+    #[arg(long = "verify-bundle", value_name = "BUNDLE_PATH")]
+    verify_bundle: Option<PathBuf>,
     /// Auto-pause when population is at or below this count.
     /// (`SCRIPTBOTS_AUTO_PAUSE_BELOW` supplies the environment-layer equivalent.)
     #[arg(long = "auto-pause-below", value_name = "COUNT")]
@@ -3056,6 +3067,15 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
     let recorded_max_tick = storage.max_tick()?.unwrap_or(0);
     let persisted_events = storage.load_replay_events()?;
     let recorded_counts = storage.replay_event_counts()?;
+    let latest_checkpoint = storage.load_latest_checkpoint()?;
+    if let Some(ref cp) = latest_checkpoint {
+        info!(
+            checkpoint_id = %cp.checkpoint_id,
+            tick = cp.tick,
+            format = %cp.format,
+            "Discovered persisted world checkpoint in replay database"
+        );
+    }
     storage.close()?;
 
     let events_max_tick = persisted_events.iter().map(|e| e.tick).max().unwrap_or(0);

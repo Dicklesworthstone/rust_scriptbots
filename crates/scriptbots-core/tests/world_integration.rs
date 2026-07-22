@@ -1817,3 +1817,55 @@ fn narrated_timeline_respects_its_false_positive_budget_on_real_runs() {
         "same seed must tell the same story"
     );
 }
+
+#[test]
+fn gallery_manifest_in_repo_is_valid_and_verifiable() {
+    use scriptbots_core::gallery::GalleryManifest;
+    use std::fs;
+
+    let manifest_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../gallery/manifest.toml");
+    let content = fs::read_to_string(manifest_path).expect("read gallery/manifest.toml");
+
+    let manifest = GalleryManifest::parse_toml(&content).expect("parse gallery/manifest.toml");
+    manifest
+        .validate()
+        .expect("validate gallery/manifest.toml structural bounds");
+
+    assert!(
+        !manifest.worlds.is_empty(),
+        "gallery manifest must contain at least one world"
+    );
+
+    for world in &manifest.worlds {
+        assert!(
+            !world.title.is_empty(),
+            "world title must not be empty: {}",
+            world.id
+        );
+        assert!(
+            !world.story.is_empty(),
+            "world story must not be empty: {}",
+            world.id
+        );
+        assert!(
+            world.story.len() <= 200,
+            "story length bound for {}",
+            world.id
+        );
+        assert!(
+            world.horizon_ticks <= 50_000,
+            "horizon_ticks bound for {}",
+            world.id
+        );
+
+        // Verify empty timeline produces valid passing report on mock actuals
+        let report = world.verify_timeline(&[]);
+        if world.expected_timeline.is_empty() {
+            assert!(
+                report.passed,
+                "world {} with empty expected timeline must pass",
+                world.id
+            );
+        }
+    }
+}

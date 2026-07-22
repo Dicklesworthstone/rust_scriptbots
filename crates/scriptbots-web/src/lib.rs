@@ -171,7 +171,10 @@ impl Simulation {
             self.core
                 .drive(ManualInstant::from_nanos(self.now_nanos))
                 .with_context(|| {
-                    format!("HostCore failed during WASM step {} of {steps}", step_index + 1)
+                    format!(
+                        "HostCore failed during WASM step {} of {steps}",
+                        step_index + 1
+                    )
                 })?;
         }
         Ok(self.core.latest_snapshot().world.clone())

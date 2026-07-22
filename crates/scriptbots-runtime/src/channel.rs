@@ -31,8 +31,8 @@
 use crate::{
     CommandEnvelope, CommandId, CommandStatus, EventCatchUp, EventCatchUpLocator, EventCursor,
     EventHub, EventPoll, FixedDeadlineHost, HostAccessError, HostDriveInterest, HostEvent,
-    HostPort, HostSessionId, LocalHostPort, ManualInstant, NativeDriveTrigger,
-    NativeScheduleError, ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
+    HostPort, HostSessionId, LocalHostPort, ManualInstant, NativeDriveTrigger, NativeScheduleError,
+    ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
@@ -172,10 +172,7 @@ impl StatusBoard {
 
 /// Whether both axes of a command status reached a terminal state.
 fn status_is_finished(status: &CommandStatus) -> bool {
-    let application_finished = !matches!(
-        status.application(),
-        crate::ApplicationState::Admitted
-    );
+    let application_finished = !matches!(status.application(), crate::ApplicationState::Admitted);
     let journal_finished = !matches!(status.journal(), crate::JournalState::Pending);
     application_finished && journal_finished
 }
@@ -281,15 +278,15 @@ impl HostPort for ChannelHostPort {
             }
             Err(TrySendError::Disconnected(_)) => return Err(HostAccessError::Disconnected),
         }
-        reply_rx.recv_timeout(self.submit_deadline).map_err(|error| {
-            match error {
+        reply_rx
+            .recv_timeout(self.submit_deadline)
+            .map_err(|error| match error {
                 RecvTimeoutError::Timeout => Self::protocol_violation(format!(
                     "channel host admission reply exceeded {:?}",
                     self.submit_deadline
                 )),
                 RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
-            }
-        })?
+            })?
     }
 
     fn command_status(
@@ -322,7 +319,11 @@ impl HostPort for ChannelHostPort {
         Ok(board.after(cursor, limit))
     }
 
-    fn poll_events(&mut self, cursor: EventCursor, limit: usize) -> Result<EventPoll, HostAccessError> {
+    fn poll_events(
+        &mut self,
+        cursor: EventCursor,
+        limit: usize,
+    ) -> Result<EventPoll, HostAccessError> {
         self.events.poll(cursor, limit)
     }
 
@@ -527,7 +528,10 @@ impl ChannelHostDriver {
                 drove = true;
             }
             HostDriveInterest::Deadline => {
-                let due = self.host.next_deadline().is_none_or(|deadline| now >= deadline);
+                let due = self
+                    .host
+                    .next_deadline()
+                    .is_none_or(|deadline| now >= deadline);
                 if due {
                     self.host.drive_at(now, NativeDriveTrigger::Deadline)?;
                     drove = true;
@@ -756,10 +760,7 @@ mod tests {
             .command_status(CommandId::new(999_999))
             .expect("post-exit status")
             .expect("shutdown status retained");
-        assert!(matches!(
-            status.application(),
-            ApplicationState::Applied(_)
-        ));
+        assert!(matches!(status.application(), ApplicationState::Applied(_)));
     }
 
     #[test]
@@ -791,9 +792,7 @@ mod tests {
         port.submit(envelope).expect("submit");
         let resolved = wait_resolved(&mut port, CommandId::new(31));
         match resolved.application() {
-            ApplicationState::Rejected(RejectionReason::ControlRevisionConflict {
-                ..
-            }) => {}
+            ApplicationState::Rejected(RejectionReason::ControlRevisionConflict { .. }) => {}
             other => panic!("expected control-revision conflict, got {other:?}"),
         }
         assert!(resolved.admission_sequence().is_some());
@@ -934,10 +933,7 @@ mod tests {
         // Owner never runs: a wake occupies the only ingress slot.
         let _ = port.sender.try_send(IngressMessage::Wake);
         let error = port
-            .submit(CommandEnvelope::new(
-                CommandId::new(61),
-                HostCommand::Pause,
-            ))
+            .submit(CommandEnvelope::new(CommandId::new(61), HostCommand::Pause))
             .expect_err("stalled owner must fail truthfully");
         assert!(matches!(error, HostAccessError::ProtocolViolation { .. }));
     }

@@ -5,8 +5,8 @@ use scriptbots_core::{
     WorldState,
 };
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,7 +56,10 @@ fn test_runtime_lifecycle_contention_storm_and_soak() {
     let sent = storm_handle.join().expect("storm thread joins cleanly");
 
     assert!(sent > 0, "storm thread submitted commands");
-    assert!(processed > 0, "receiver processed commands safely under contention");
+    assert!(
+        processed > 0,
+        "receiver processed commands safely under contention"
+    );
 }
 
 #[test]

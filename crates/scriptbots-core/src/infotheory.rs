@@ -363,7 +363,8 @@ fn calc_mi_mm(emitter: &[f64], receiver: &[f64], b: usize) -> (f64, f64) {
     let k_x = margin_e.iter().filter(|&&c| c > 0).count();
     let k_y = margin_r.iter().filter(|&&c| c > 0).count();
 
-    let mm_correction = (k_xy as f64 - k_x as f64 - k_y as f64 + 1.0) / (2.0 * n * std::f64::consts::LN_2);
+    let mm_correction =
+        (k_xy as f64 - k_x as f64 - k_y as f64 + 1.0) / (2.0 * n * std::f64::consts::LN_2);
     let corrected = (plugin - mm_correction).max(0.0);
 
     (plugin.max(0.0), corrected)
@@ -553,7 +554,8 @@ fn calc_te_mm(r_next: &[f64], e_curr: &[f64], r_curr: &[f64], b: usize) -> f64 {
     let k_ec_rc = counts_ec_rc.iter().filter(|&&c| c > 0).count();
     let k_rc = counts_rc.iter().filter(|&&c| c > 0).count();
 
-    let mm_correction = (k_rn_rc as f64 + k_ec_rc as f64 - k_rc as f64 - k_3d as f64) / (2.0 * n * std::f64::consts::LN_2);
+    let mm_correction = (k_rn_rc as f64 + k_ec_rc as f64 - k_rc as f64 - k_3d as f64)
+        / (2.0 * n * std::f64::consts::LN_2);
     (plugin - mm_correction).max(0.0)
 }
 
@@ -578,7 +580,11 @@ mod tests {
             seed: 42,
         };
         let est = compute_mi(&e, &r, &params).unwrap();
-        assert!((est.bits_corrected - 1.0).abs() < 0.05, "Copy channel 2 symbols should be ~1 bit, got {}", est.bits_corrected);
+        assert!(
+            (est.bits_corrected - 1.0).abs() < 0.05,
+            "Copy channel 2 symbols should be ~1 bit, got {}",
+            est.bits_corrected
+        );
     }
 
     #[test]
@@ -607,8 +613,16 @@ mod tests {
         let mean_uncorrected = uncorrected_sum / runs as f64;
         let mean_corrected = corrected_sum / runs as f64;
 
-        assert!(mean_uncorrected > 0.05, "Uncorrected MI on noise should be positively biased, got {}", mean_uncorrected);
-        assert!(mean_corrected < 0.03, "Corrected MI on noise should be near zero, got {}", mean_corrected);
+        assert!(
+            mean_uncorrected > 0.05,
+            "Uncorrected MI on noise should be positively biased, got {}",
+            mean_uncorrected
+        );
+        assert!(
+            mean_corrected < 0.03,
+            "Corrected MI on noise should be near zero, got {}",
+            mean_corrected
+        );
     }
 
     #[test]
@@ -641,7 +655,11 @@ mod tests {
 
         let est = compute_mi(&e, &r, &params).unwrap();
         // Circular-shift null should yield high p-value (>= 0.05) for independent AR(1) series
-        assert!(est.p_value >= 0.05, "Circular shift null p-value should be >= 0.05 for independent AR(1) processes, got {}", est.p_value);
+        assert!(
+            est.p_value >= 0.05,
+            "Circular shift null p-value should be >= 0.05 for independent AR(1) processes, got {}",
+            est.p_value
+        );
     }
 
     #[test]
@@ -668,8 +686,17 @@ mod tests {
         let te_forward = compute_te(&e, &r, &params).unwrap();
         let te_backward = compute_te(&r, &e, &params).unwrap();
 
-        assert!(te_forward.te_bits > te_backward.te_bits, "TE(E->R) ({}) should be greater than TE(R->E) ({})", te_forward.te_bits, te_backward.te_bits);
-        assert!(te_backward.te_bits < 0.1, "Backward TE should be ~0, got {}", te_backward.te_bits);
+        assert!(
+            te_forward.te_bits > te_backward.te_bits,
+            "TE(E->R) ({}) should be greater than TE(R->E) ({})",
+            te_forward.te_bits,
+            te_backward.te_bits
+        );
+        assert!(
+            te_backward.te_bits < 0.1,
+            "Backward TE should be ~0, got {}",
+            te_backward.te_bits
+        );
     }
 
     #[test]
@@ -684,26 +711,32 @@ mod tests {
         };
 
         let est = compute_mi(&e, &r, &params).unwrap();
-        assert!(!est.sufficient, "Small N=10 with B=8 should return sufficient=false");
+        assert!(
+            !est.sufficient,
+            "Small N=10 with B=8 should return sufficient=false"
+        );
     }
 
     #[test]
     fn test_anti_p_hacking_emergence_verdict() {
         // Positive case: all 3 criteria met
-        let report_pos = evaluate_study_emergence(0.005, 0.20, 0.12, "sentinel", "digest_123", 1, 3);
+        let report_pos =
+            evaluate_study_emergence(0.005, 0.20, 0.12, "sentinel", "digest_123", 1, 3);
         assert_eq!(report_pos.verdict, EmergenceVerdict::Positive);
         assert!(report_pos.criterion_1_signal_mi);
         assert!(report_pos.criterion_2_scrambled_null);
         assert!(report_pos.criterion_3_behavioral_conditioning);
 
         // Negative case: Criterion 1 passes but Criterion 2 fails (scrambled arm ALSO shows low p-value)
-        let report_neg2 = evaluate_study_emergence(0.005, 0.01, 0.12, "sentinel", "digest_123", 1, 3);
+        let report_neg2 =
+            evaluate_study_emergence(0.005, 0.01, 0.12, "sentinel", "digest_123", 1, 3);
         assert_eq!(report_neg2.verdict, EmergenceVerdict::Negative);
         assert!(report_neg2.criterion_1_signal_mi);
         assert!(!report_neg2.criterion_2_scrambled_null);
 
         // Negative case: Criterion 3 fails (no behavioral effect)
-        let report_neg3 = evaluate_study_emergence(0.005, 0.20, 0.01, "sentinel", "digest_123", 1, 3);
+        let report_neg3 =
+            evaluate_study_emergence(0.005, 0.20, 0.01, "sentinel", "digest_123", 1, 3);
         assert_eq!(report_neg3.verdict, EmergenceVerdict::Negative);
         assert!(!report_neg3.criterion_3_behavioral_conditioning);
     }

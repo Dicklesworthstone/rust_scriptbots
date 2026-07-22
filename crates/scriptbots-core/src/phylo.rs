@@ -360,8 +360,7 @@ impl TreeLayout {
             .enumerate()
             .filter(|(_, node)| {
                 let node_end = node.last_tick.unwrap_or(Tick(u64::MAX));
-                let tick_overlap =
-                    node.first_tick <= viewport.end && node_end >= viewport.start;
+                let tick_overlap = node.first_tick <= viewport.end && node_end >= viewport.start;
                 let y_overlap = node.y >= y_range.start && node.y <= y_range.end;
                 tick_overlap && y_overlap
             })
@@ -372,8 +371,16 @@ impl TreeLayout {
         candidate_indices.sort_by(|&a, &b| {
             let na = &self.nodes[a];
             let nb = &self.nodes[b];
-            let dur_a = na.last_tick.unwrap_or(viewport.end).0.saturating_sub(na.first_tick.0);
-            let dur_b = nb.last_tick.unwrap_or(viewport.end).0.saturating_sub(nb.first_tick.0);
+            let dur_a = na
+                .last_tick
+                .unwrap_or(viewport.end)
+                .0
+                .saturating_sub(na.first_tick.0);
+            let dur_b = nb
+                .last_tick
+                .unwrap_or(viewport.end)
+                .0
+                .saturating_sub(nb.first_tick.0);
 
             nb.peak_population
                 .cmp(&na.peak_population)

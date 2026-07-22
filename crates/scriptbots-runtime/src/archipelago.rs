@@ -1780,7 +1780,10 @@ mod tests {
 
         let derived_island_0 = derive_island_value("FOOD", 0xDEAD_BEEF, IslandId(0));
         let derived_island_1 = derive_island_value("FOOD", 0xDEAD_BEEF, IslandId(1));
-        assert_ne!(derived_island_0, derived_island_1, "Different islands MUST derive distinct RNG seeds");
+        assert_ne!(
+            derived_island_0, derived_island_1,
+            "Different islands MUST derive distinct RNG seeds"
+        );
     }
 
     #[test]
@@ -1798,7 +1801,10 @@ mod tests {
         let specs = vec![spec(0, populated_config(Some(master_seed)))];
         let mut arch_1 = populated_archipelago(archipelago_config(specs, 100)).expect("arch 1");
         arch_1.step_to_barrier().expect("barrier 1");
-        let arch_1_digest = arch_1.island_digest(IslandId(0)).expect("digest arch 1").overall;
+        let arch_1_digest = arch_1
+            .island_digest(IslandId(0))
+            .expect("digest arch 1")
+            .overall;
 
         assert_eq!(
             single_digest, arch_1_digest,

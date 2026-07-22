@@ -9,13 +9,15 @@ pub mod economy;
 pub mod gallery;
 pub mod genome_diff;
 pub mod infotheory;
+pub mod interventions;
+pub mod map_elites;
 pub mod narrative_text;
 pub mod permalink;
 pub mod phylo;
-pub mod species;
 mod replay;
 pub mod rng_domains;
 pub mod sense_fixed;
+pub mod species;
 pub mod visual;
 
 pub use checkpoint::{
@@ -5107,7 +5109,11 @@ impl ResourceLedgerState {
                 LedgerFault::DropActuationPosting
                     if matches!(
                         kind,
-                        K::BasalMetabolism | K::Movement | K::MetabolismRamp | K::Boost | K::Topography
+                        K::BasalMetabolism
+                            | K::Movement
+                            | K::MetabolismRamp
+                            | K::Boost
+                            | K::Topography
                     ) =>
                 {
                     return;
@@ -5262,7 +5268,10 @@ impl ResourceLedgerState {
                 reconciliation.reconciled || fault_installed,
                 "StockGuard: tick {} books do not balance: unexplained \
                  (food={}, energy={}, health={}) exceeds derived tolerance {limit}",
-                tick.0, unexplained.food, unexplained.energy, unexplained.health,
+                tick.0,
+                unexplained.food,
+                unexplained.energy,
+                unexplained.health,
             );
         }
     }
@@ -7154,6 +7163,8 @@ pub struct PersistenceBatch {
     pub deaths: Vec<DeathRecord>,
     /// Replay event stream for the boundary.
     pub replay_events: Vec<ReplayEvent>,
+    /// Narrative events detected at this boundary.
+    pub narrative_events: Vec<narrative::EventRecord>,
 }
 
 /// Result of evaluating persistence policy at a completed simulation boundary.
@@ -12273,13 +12284,15 @@ pub mod narrative {
     use std::collections::VecDeque;
 
     /// What kind of thing happened.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum EventKind {
         /// The population fell sharply.
         PopulationCrash,
         /// The population rose sharply.
         PopulationBoom,
+        /// Diet distribution shifted significantly.
+        DietShift,
         /// The population reached zero.
         Extinction,
         /// Mean energy fell sharply.
@@ -12290,6 +12303,16 @@ pub mod narrative {
         CombatSurge,
         /// The population dynamics changed character.
         RegimeChange,
+        /// Predators emerged in the population.
+        PredatorEmergence,
+        /// Altruistic behavior onset detected.
+        AltruismOnset,
+        /// Speciation hint detected.
+        SpeciationHint,
+        /// Population floor engaged.
+        FloorEngaged,
+        /// Resource supply collapsed.
+        ResourceCollapse,
     }
 
     impl EventKind {
@@ -12299,42 +12322,133 @@ pub mod narrative {
             match self {
                 Self::PopulationCrash => "population_crash",
                 Self::PopulationBoom => "population_boom",
+                Self::DietShift => "diet_shift",
                 Self::Extinction => "extinction",
                 Self::EnergyCollapse => "energy_collapse",
                 Self::EnergyRecovery => "energy_recovery",
                 Self::CombatSurge => "combat_surge",
                 Self::RegimeChange => "regime_change",
+                Self::PredatorEmergence => "predator_emergence",
+                Self::AltruismOnset => "altruism_onset",
+                Self::SpeciationHint => "speciation_hint",
+                Self::FloorEngaged => "floor_engaged",
+                Self::ResourceCollapse => "resource_collapse",
             }
         }
 
-        /// The single rail glyph for this kind (bd-16g.2.4). This table is the ONLY
-        /// kind-to-presentation mapping: the TUI rail and the GPU lab rail both read
-        /// it, so the two surfaces can never drift into showing different stories.
+        /// The single rail glyph for this kind (bd-16g.2.4).
         #[must_use]
         pub const fn rail_glyph(self) -> char {
             match self {
-                Self::PopulationCrash => '\u{25BC}', // v
-                Self::PopulationBoom => '\u{25B2}',  // ^
-                Self::Extinction => '\u{2716}',      // x
-                Self::EnergyCollapse => '\u{25C6}',  // diamond
-                Self::EnergyRecovery => '\u{25C7}',  // open diamond
-                Self::CombatSurge => '\u{271A}',     // cross
-                Self::RegimeChange => '\u{25CF}',    // circle
+                Self::PopulationCrash => '\u{25BC}',
+                Self::PopulationBoom => '\u{25B2}',
+                Self::DietShift => '\u{25C7}',
+                Self::Extinction => '\u{2716}',
+                Self::EnergyCollapse => '\u{25C6}',
+                Self::EnergyRecovery => '\u{25C7}',
+                Self::CombatSurge => '\u{271A}',
+                Self::RegimeChange => '\u{25CF}',
+                Self::PredatorEmergence => '\u{26A1}',
+                Self::AltruismOnset => '\u{2665}',
+                Self::SpeciationHint => '\u{26A1}',
+                Self::FloorEngaged => '\u{25B2}',
+                Self::ResourceCollapse => '\u{25C6}',
             }
         }
 
-        /// The single rail colour for this kind as an RGB triple (bd-16g.2.4). Each
-        /// surface converts the triple to its native colour type.
+        /// The single rail colour for this kind as an RGB triple (bd-16g.2.4).
         #[must_use]
         pub const fn rail_rgb(self) -> [u8; 3] {
             match self {
                 Self::PopulationCrash => [0xE5, 0x39, 0x35],
                 Self::PopulationBoom => [0x43, 0xA0, 0x47],
+                Self::DietShift => [0x8E, 0x24, 0xAA],
                 Self::Extinction => [0xFF, 0xFF, 0xFF],
                 Self::EnergyCollapse => [0xFB, 0x8C, 0x00],
                 Self::EnergyRecovery => [0xFF, 0xEB, 0x3B],
                 Self::CombatSurge => [0xAB, 0x47, 0xBC],
                 Self::RegimeChange => [0x42, 0xA5, 0xF5],
+                Self::PredatorEmergence => [0xD8, 0x1B, 0x60],
+                Self::AltruismOnset => [0x00, 0xAC, 0xC1],
+                Self::SpeciationHint => [0x39, 0x49, 0xAB],
+                Self::FloorEngaged => [0x7C, 0x4D, 0xFF],
+                Self::ResourceCollapse => [0xD8, 0x43, 0x15],
+            }
+        }
+    }
+
+    impl std::str::FromStr for EventKind {
+        type Err = String;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "population_crash" => Ok(Self::PopulationCrash),
+                "population_boom" => Ok(Self::PopulationBoom),
+                "diet_shift" => Ok(Self::DietShift),
+                "extinction" => Ok(Self::Extinction),
+                "energy_collapse" => Ok(Self::EnergyCollapse),
+                "energy_recovery" => Ok(Self::EnergyRecovery),
+                "combat_surge" => Ok(Self::CombatSurge),
+                "regime_change" => Ok(Self::RegimeChange),
+                "predator_emergence" => Ok(Self::PredatorEmergence),
+                "altruism_onset" => Ok(Self::AltruismOnset),
+                "speciation_hint" => Ok(Self::SpeciationHint),
+                "floor_engaged" => Ok(Self::FloorEngaged),
+                "resource_collapse" => Ok(Self::ResourceCollapse),
+                other => Err(format!("unknown event kind: {other}")),
+            }
+        }
+    }
+
+    /// Current schema version for narrative `EventRecord`s.
+    pub const EVENT_RECORD_SCHEMA_VERSION: u32 = 1;
+
+    const fn default_event_schema_version() -> u32 {
+        EVENT_RECORD_SCHEMA_VERSION
+    }
+
+    /// Stable UID (agent/species/island) for narrative events.
+    /// Never a slotmap key (slotmap keys are reused after death, corrupting ancestry).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case", tag = "type", content = "id")]
+    pub enum SubjectRef {
+        /// Agent identity.
+        Agent(crate::AgentUid),
+        /// Species identity.
+        Species(u64),
+        /// Island/archipelago identity.
+        Island(u64),
+    }
+
+    impl SubjectRef {
+        /// Encode SubjectRef to string for database storage.
+        #[must_use]
+        pub fn to_db_string(self) -> String {
+            match self {
+                Self::Agent(uid) => format!("agent:{}", uid.0),
+                Self::Species(id) => format!("species:{id}"),
+                Self::Island(id) => format!("island:{id}"),
+            }
+        }
+
+        /// Decode SubjectRef from database string.
+        pub fn from_db_string(s: &str) -> Result<Self, String> {
+            let (kind, id_str) = s
+                .split_once(':')
+                .ok_or_else(|| format!("invalid subject_ref format: '{s}'"))?;
+            match kind {
+                "agent" => id_str
+                    .parse::<u64>()
+                    .map(|id| Self::Agent(crate::AgentUid(id)))
+                    .map_err(|e| format!("invalid agent id '{id_str}': {e}")),
+                "species" => id_str
+                    .parse::<u64>()
+                    .map(Self::Species)
+                    .map_err(|e| format!("invalid species id '{id_str}': {e}")),
+                "island" => id_str
+                    .parse::<u64>()
+                    .map(Self::Island)
+                    .map_err(|e| format!("invalid island id '{id_str}': {e}")),
+                other => Err(format!("unknown subject_ref type '{other}'")),
             }
         }
     }
@@ -12342,20 +12456,32 @@ pub mod narrative {
     /// One thing that happened, with the evidence that says so.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct EventRecord {
+        /// Schema version for narrative events (schema_version = 1).
+        #[serde(default = "default_event_schema_version")]
+        pub schema_version: u32,
         /// Tick the detector fired at.
         pub tick: Tick,
         /// What happened.
         pub kind: EventKind,
         /// Rough importance in `[0, 1]`, for ranking and for highlight reels.
         pub severity: f32,
+        /// Magnitude of the change.
+        #[serde(default)]
+        pub magnitude: f64,
+        /// Window of detection (start_tick, end_tick).
+        #[serde(default)]
+        pub window: (u64, u64),
         /// Which series this was detected on.
-        pub metric: &'static str,
+        pub metric: String,
         /// Representative value before the change.
         pub before: f64,
         /// Representative value after the change.
         pub after: f64,
         /// Detector statistic that fired.
         pub score: f64,
+        /// Stable UID (agent/species/island) where applicable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<SubjectRef>,
         /// Deterministic, templated prose. Never model-generated.
         pub human_text: String,
     }
@@ -12404,6 +12530,7 @@ pub mod narrative {
     #[derive(Debug, Default)]
     pub struct RunNarrative {
         events: VecDeque<EventRecord>,
+        pending_persistence: Vec<EventRecord>,
         /// Events discarded when the bounded ring wrapped. A rail that cannot say
         /// how much history it dropped presents a tail as if it were the whole
         /// story (bd-16g.2.4). Instrumentation only: it affects no future
@@ -12422,6 +12549,11 @@ pub mod narrative {
         #[must_use]
         pub const fn events(&self) -> &VecDeque<EventRecord> {
             &self.events
+        }
+
+        /// Drain events that have not yet been written to persistence.
+        pub fn drain_pending_persistence(&mut self) -> Vec<EventRecord> {
+            std::mem::take(&mut self.pending_persistence)
         }
 
         /// Total events discarded by ring truncation since the run began.
@@ -12507,13 +12639,17 @@ pub mod narrative {
             if let Ok(crossings) = threshold_crossings(&population, &[extinction]) {
                 for crossing in crossings {
                     let record = EventRecord {
+                        schema_version: EVENT_RECORD_SCHEMA_VERSION,
                         tick: Tick(crossing.tick),
                         kind: EventKind::Extinction,
                         severity: 1.0,
-                        metric: "population",
+                        magnitude: (crossing.to - crossing.from).abs(),
+                        window: (crossing.tick.saturating_sub(10), crossing.tick),
+                        metric: "population".to_string(),
                         before: crossing.from,
                         after: crossing.to,
                         score: f64::INFINITY.min(f64::MAX),
+                        subject: None,
                         human_text: "population reached zero".to_owned(),
                     };
                     self.push(record, capacity);
@@ -12533,13 +12669,17 @@ pub mod narrative {
                         continue;
                     }
                     let record = EventRecord {
+                        schema_version: EVENT_RECORD_SCHEMA_VERSION,
                         tick: Tick(current.start_tick),
                         kind: EventKind::RegimeChange,
                         severity: 0.4,
-                        metric: "population",
+                        magnitude: (current.relative_slope - previous.relative_slope).abs(),
+                        window: (previous.start_tick, current.end_tick),
+                        metric: "population".to_string(),
                         before: previous.relative_slope,
                         after: current.relative_slope,
                         score: current.autocorrelation,
+                        subject: None,
                         human_text: format!(
                             "population dynamics shifted from {} to {}",
                             regime_word(previous.regime),
@@ -12570,8 +12710,7 @@ pub mod narrative {
                 EventKind::CombatSurge => {
                     after >= self.policy.min_combat_absolute && after > before
                 }
-                // Extinction and regime shifts carry their own gates.
-                EventKind::Extinction | EventKind::RegimeChange => true,
+                _ => true,
             }
         }
 
@@ -12597,13 +12736,17 @@ pub mod narrative {
                     continue;
                 }
                 let record = EventRecord {
+                    schema_version: EVENT_RECORD_SCHEMA_VERSION,
                     tick: Tick(change.tick),
                     kind,
                     severity: severity_from(change.score),
-                    metric,
+                    magnitude: change.magnitude.abs(),
+                    window: (change.tick.saturating_sub(10), change.tick),
+                    metric: metric.to_string(),
                     before,
                     after,
                     score: change.score,
+                    subject: None,
                     human_text: describe(kind, metric, before, after),
                 };
                 self.push(record, capacity);
@@ -12632,6 +12775,7 @@ pub mod narrative {
                 self.events.pop_front();
                 self.dropped = self.dropped.saturating_add(1);
             }
+            self.pending_persistence.push(record.clone());
             self.events.push_back(record);
         }
     }
@@ -12656,35 +12800,49 @@ pub mod narrative {
 
     /// Render deterministic prose. Fixed precision, no locale-dependent
     /// formatting, so the text is byte-stable across runs and platforms.
-    // bd-tqpj: f64→f32 squash pinned for determinism.
     #[allow(clippy::cast_precision_loss)]
     fn describe(kind: EventKind, metric: &str, before: f64, after: f64) -> String {
-        let delta = after - before;
-        let percent = if before.abs() > f64::EPSILON {
-            (delta / before) * 100.0
-        } else {
-            0.0
-        };
         match kind {
             EventKind::PopulationCrash => format!(
-                "population fell {:.0}% ({before:.0} -> {after:.0})",
-                percent.abs(),
+                "population fell {}% ({})",
+                crate::narrative_text::pct_magnitude(before, after),
+                crate::narrative_text::count_transition(before, after),
             ),
             EventKind::PopulationBoom => format!(
-                "population rose {:.0}% ({before:.0} -> {after:.0})",
-                percent.abs(),
+                "population rose {}% ({})",
+                crate::narrative_text::pct_magnitude(before, after),
+                crate::narrative_text::count_transition(before, after),
             ),
-            EventKind::EnergyCollapse => {
-                format!("mean energy collapsed ({before:.2} -> {after:.2})")
-            }
-            EventKind::EnergyRecovery => {
-                format!("mean energy recovered ({before:.2} -> {after:.2})")
-            }
-            EventKind::CombatSurge => {
-                format!("combat surged ({before:.0} -> {after:.0} spike hits per tick)")
-            }
+            EventKind::DietShift => format!(
+                "diet shifted ({})",
+                crate::narrative_text::count_transition(before, after),
+            ),
+            EventKind::EnergyCollapse => format!(
+                "mean energy collapsed ({} -> {})",
+                crate::narrative_text::fixed(before, 2),
+                crate::narrative_text::fixed(after, 2),
+            ),
+            EventKind::EnergyRecovery => format!(
+                "mean energy recovered ({} -> {})",
+                crate::narrative_text::fixed(before, 2),
+                crate::narrative_text::fixed(after, 2),
+            ),
+            EventKind::CombatSurge => format!(
+                "combat surged ({} -> {} spike hits per tick)",
+                crate::narrative_text::count(before),
+                crate::narrative_text::count(after),
+            ),
             EventKind::Extinction => "population reached zero".to_owned(),
             EventKind::RegimeChange => format!("{metric} dynamics changed"),
+            EventKind::PredatorEmergence => "predators emerged".to_owned(),
+            EventKind::AltruismOnset => "altruistic behavior onset".to_owned(),
+            EventKind::SpeciationHint => "speciation hint observed".to_owned(),
+            EventKind::FloorEngaged => "population floor engaged".to_owned(),
+            EventKind::ResourceCollapse => format!(
+                "resource collapse ({} -> {})",
+                crate::narrative_text::fixed(before, 2),
+                crate::narrative_text::fixed(after, 2),
+            ),
         }
     }
 }
@@ -17965,14 +18123,13 @@ impl WorldState {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 // legacy C++ gate: a full agent neither eats nor wastes cell food
                 #[cfg(any(test, feature = "economy-faults"))]
-                let health_gate = if ledger_fault
-                    == Some(LedgerFault::CreditIntakeWithoutHealthGate)
-                {
-                    // THE FAULT (bd-16g.11.2): full agents drain cells forever.
-                    true
-                } else {
-                    healths[idx] < 2.0
-                };
+                let health_gate =
+                    if ledger_fault == Some(LedgerFault::CreditIntakeWithoutHealthGate) {
+                        // THE FAULT (bd-16g.11.2): full agents drain cells forever.
+                        true
+                    } else {
+                        healths[idx] < 2.0
+                    };
                 #[cfg(not(any(test, feature = "economy-faults")))]
                 let health_gate = healths[idx] < 2.0;
                 if (intake_rate > 0.0 || waste_rate > 0.0) && health_gate {
@@ -21075,6 +21232,7 @@ impl WorldState {
             births,
             deaths,
             replay_events: std::mem::take(&mut self.replay_events),
+            narrative_events: self.narrative.drain_pending_persistence(),
         };
         self.pending_persistence_runtime_tail.clear();
         self.pending_birth_events = 0;
@@ -39071,13 +39229,10 @@ mod tests {
                 !verdict.pass,
                 "fault {fault:?} was not detected within 64 ticks"
             );
-            let first_breach = verdict.seeds[0]
-                .breaches
-                .first()
-                .or_else(|| {
-                    // Cumulative-only detections have no per-tick breach rows.
-                    None
-                });
+            let first_breach = verdict.seeds[0].breaches.first().or_else(|| {
+                // Cumulative-only detections have no per-tick breach rows.
+                None
+            });
             if let Some(breach) = first_breach {
                 assert!(
                     breach.tick.0 <= 64,

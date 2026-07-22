@@ -192,7 +192,9 @@ async fn main() -> Result<()> {
                 Command::Speed { value } => speed_command(&client, &cli.base_url, value).await?,
                 Command::Status => status_command(&client, &cli.base_url).await?,
                 Command::Shutdown => shutdown_command(&client, &cli.base_url).await?,
-                Command::LookupStatus { id } => lookup_status_command(&client, &cli.base_url, &id).await?,
+                Command::LookupStatus { id } => {
+                    lookup_status_command(&client, &cli.base_url, &id).await?
+                }
             }
         }
     }
@@ -897,7 +899,9 @@ async fn step_command(client: &Client, base_url: &str, count: u64) -> Result<()>
     if status.is_success() {
         println!(
             "{}",
-            format!("✔ Enqueued step command ({count} ticks)").green().bold()
+            format!("✔ Enqueued step command ({count} ticks)")
+                .green()
+                .bold()
         );
     } else {
         bail!("step failed ({status}): {body}");

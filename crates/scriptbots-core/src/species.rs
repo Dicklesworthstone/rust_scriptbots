@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// Stable identifier for a species, monotonically increasing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub struct SpeciesId(pub u64);
 
 /// Configuration parameters for species segmentation.
@@ -102,17 +104,73 @@ pub struct SegmentReport {
 }
 
 const ADJECTIVES: &[&str] = &[
-    "Swift", "Amber", "Crystal", "Solar", "Frost", "Zenith", "Prismatic", "Radiant",
-    "Silent", "Verdant", "Obsidian", "Astral", "Crimson", "Echo", "Golden", "Velvet",
-    "Shadow", "Lunar", "Starlight", "Copper", "Cobalt", "Emerald", "Sylvan", "Iron",
-    "Silver", "Coral", "Topaz", "Azure", "Scarlet", "Granite", "Breeze", "Thunder",
+    "Swift",
+    "Amber",
+    "Crystal",
+    "Solar",
+    "Frost",
+    "Zenith",
+    "Prismatic",
+    "Radiant",
+    "Silent",
+    "Verdant",
+    "Obsidian",
+    "Astral",
+    "Crimson",
+    "Echo",
+    "Golden",
+    "Velvet",
+    "Shadow",
+    "Lunar",
+    "Starlight",
+    "Copper",
+    "Cobalt",
+    "Emerald",
+    "Sylvan",
+    "Iron",
+    "Silver",
+    "Coral",
+    "Topaz",
+    "Azure",
+    "Scarlet",
+    "Granite",
+    "Breeze",
+    "Thunder",
 ];
 
 const NOUNS: &[&str] = &[
-    "giver", "hunter", "wanderer", "seeker", "glider", "weaver", "runner", "striker",
-    "sentinel", "forager", "chaser", "crawler", "observer", "strider", "guardian", "nomad",
-    "stalker", "pioneer", "drifter", "watcher", "racer", "harvester", "scout", "ranger",
-    "sailor", "diver", "flyer", "bounder", "weaver", "tracker", "voyager", "prowler",
+    "giver",
+    "hunter",
+    "wanderer",
+    "seeker",
+    "glider",
+    "weaver",
+    "runner",
+    "striker",
+    "sentinel",
+    "forager",
+    "chaser",
+    "crawler",
+    "observer",
+    "strider",
+    "guardian",
+    "nomad",
+    "stalker",
+    "pioneer",
+    "drifter",
+    "watcher",
+    "racer",
+    "harvester",
+    "scout",
+    "ranger",
+    "sailor",
+    "diver",
+    "flyer",
+    "bounder",
+    "weaver",
+    "tracker",
+    "voyager",
+    "prowler",
 ];
 
 /// Generates a deterministic human-readable species name from founder UID and tick.
@@ -131,7 +189,10 @@ pub fn generate_species_name(founder_uid: AgentUid, first_tick: Tick) -> String 
     let adj_idx = (hash as usize) % ADJECTIVES.len();
     let noun_idx = ((hash >> 16) as usize) % NOUNS.len();
 
-    format!("{}{}-{}", ADJECTIVES[adj_idx], NOUNS[noun_idx], first_tick.0)
+    format!(
+        "{}{}-{}",
+        ADJECTIVES[adj_idx], NOUNS[noun_idx], first_tick.0
+    )
 }
 
 /// Normalizes a single raw phenotype vector against fixed dimension ranges.
@@ -382,7 +443,10 @@ mod tests {
         let name3 = generate_species_name(AgentUid(2), Tick(100));
 
         assert_eq!(name1, name2, "same inputs must produce identical name");
-        assert_ne!(name1, name3, "different UIDs should produce different names");
+        assert_ne!(
+            name1, name3,
+            "different UIDs should produce different names"
+        );
         assert!(name1.contains("-100"), "name must contain tick suffix");
     }
 
@@ -427,7 +491,10 @@ mod tests {
         let (table1, _) = segment_species(Tick(10), &samples1, &prev, &params);
         let (table2, _) = segment_species(Tick(10), &samples2, &prev, &params);
 
-        assert_eq!(table1, table2, "shuffling input samples must produce identical SpeciesTable");
+        assert_eq!(
+            table1, table2,
+            "shuffling input samples must produce identical SpeciesTable"
+        );
     }
 
     #[test]
@@ -455,7 +522,10 @@ mod tests {
         let (table2, report2) = segment_species(Tick(20), &step2_samples, &table1, &params);
         assert_eq!(table2.species.len(), 1);
         assert_eq!(table2.species[0].id, sp1_id, "species ID must be preserved");
-        assert_eq!(table2.species[0].name, sp1_name, "species name must be preserved");
+        assert_eq!(
+            table2.species[0].name, sp1_name,
+            "species name must be preserved"
+        );
         assert!(report2.new_species_minted.is_empty());
         assert!(report2.extinct_species_dropped.is_empty());
     }

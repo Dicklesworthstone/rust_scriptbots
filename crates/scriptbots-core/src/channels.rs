@@ -547,7 +547,9 @@ pub enum IoLayoutError {
     #[error("invalid bands count {0}, must be 1..=8")]
     InvalidBands(u8),
     /// Brain layout mismatch between expected and actual sizes.
-    #[error("brain IO layout mismatch for '{brain_kind}': expected {expected_inputs}in/{expected_outputs}out, got {actual_inputs}in/{actual_outputs}out")]
+    #[error(
+        "brain IO layout mismatch for '{brain_kind}': expected {expected_inputs}in/{expected_outputs}out, got {actual_inputs}in/{actual_outputs}out"
+    )]
     LayoutMismatch {
         brain_kind: String,
         expected_inputs: usize,

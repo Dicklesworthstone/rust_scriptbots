@@ -5,6 +5,13 @@
 mod journal;
 
 pub mod async_lane;
+pub mod bundle;
+pub mod export_pipeline;
+
+pub use bundle::{
+    BundleError, RUN_BUNDLE_SCHEMA_VERSION, RunBundleArtifactEntry, RunBundleDigests,
+    RunBundleV1, RunBundleVerificationResult, create_run_bundle, verify_run_bundle,
+};
 
 pub use journal::{
     CommandJournalCursor, CommandJournalEvidence, CommandJournalPage, CommandJournalRecord,
@@ -264,6 +271,34 @@ pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
     CREATE INDEX events_run_kind_tick_index ON events (run_id, kind, tick);
+
+    CREATE TABLE run_events (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        kind TEXT NOT NULL CHECK (kind <> ''),
+        severity REAL NOT NULL CHECK (severity >= 0.0 AND severity <= 1.0),
+        magnitude REAL NOT NULL,
+        window_start INTEGER NOT NULL CHECK (window_start >= 0),
+        window_end INTEGER NOT NULL CHECK (window_end >= 0),
+        metric TEXT NOT NULL CHECK (metric <> ''),
+        before_value REAL NOT NULL,
+        after_value REAL NOT NULL,
+        score REAL NOT NULL,
+        subject_ref TEXT,
+        human_text TEXT NOT NULL CHECK (human_text <> ''),
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (run_id, tick, kind, metric),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX run_events_run_kind_tick_index ON run_events (run_id, kind, tick);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS run_events_fts USING fts5(
+        run_id UNINDEXED,
+        kind,
+        human_text,
+        content='run_events',
+        content_rowid='rowid'
+    );
 
     CREATE TABLE replay_events (
         run_id TEXT NOT NULL,
@@ -3189,6 +3224,24 @@ struct EventRow {
     count: i64,
 }
 
+/// Narrative event row persisted for run timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunEventRow {
+    tick: i64,
+    kind: String,
+    severity: f64,
+    magnitude: f64,
+    window_start: i64,
+    window_end: i64,
+    metric: String,
+    before_value: f64,
+    after_value: f64,
+    score: f64,
+    subject_ref: Option<String>,
+    human_text: String,
+    schema_version: i64,
+}
+
 /// Latest metric reading fetched for analytics displays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricReading {
@@ -3761,6 +3814,18 @@ pub struct PersistedReplayEvent {
     pub event: ReplayEvent,
 }
 
+/// Checkpoint record reconstructed from persisted storage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedCheckpointRecord {
+    pub checkpoint_id: String,
+    pub tick: u64,
+    pub checkpoint_ordinal: u64,
+    pub format: String,
+    pub payload: String,
+    pub payload_digest: String,
+    pub metadata_json: String,
+}
+
 /// Holds a reservation on the in-flight byte counter and releases it on drop.
 ///
 /// RAII rather than a manual decrement, because "released exactly once on commit,
@@ -3871,6 +3936,7 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
         payload.births.len(),
         payload.deaths.len(),
         payload.replay_events.len(),
+        payload.narrative_events.len(),
     ]
     .into_iter()
     .fold(0usize, usize::saturating_add);
@@ -3884,6 +3950,7 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
     const BIRTH_BYTES: usize = 192;
     const DEATH_BYTES: usize = 192;
     const REPLAY_BYTES: usize = 512;
+    const NARRATIVE_EVENT_BYTES: usize = 256;
     const SUMMARY_BYTES: usize = 256;
 
     // A JSON string byte can expand to six ASCII bytes (`\u00xx`). The prepared
@@ -3904,6 +3971,7 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
         (payload.births.len(), BIRTH_BYTES),
         (payload.deaths.len(), DEATH_BYTES),
         (payload.replay_events.len(), REPLAY_BYTES),
+        (payload.narrative_events.len(), NARRATIVE_EVENT_BYTES),
     ] {
         bytes = bytes.saturating_add(count.saturating_mul(row_bytes));
     }
@@ -3950,6 +4018,14 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
             bytes = bytes.saturating_add(outputs.len().saturating_mul(REPLAY_OUTPUT_BYTES));
         }
     }
+    for event in &payload.narrative_events {
+        bytes = bytes.saturating_add(
+            event
+                .human_text
+                .len()
+                .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
+        );
+    }
 
     (bytes, events)
 }
@@ -3963,6 +4039,8 @@ struct StorageBuffer {
     births: Vec<BirthRow>,
     deaths: Vec<DeathRow>,
     replay_events: Vec<ReplayEventRow>,
+    #[serde(default)]
+    run_events: Vec<RunEventRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -6808,6 +6886,61 @@ impl StorageReader {
         Ok(events)
     }
 
+    /// Load checkpoints in tick/ordinal order.
+    pub fn load_checkpoints(&self) -> Result<Vec<PersistedCheckpointRecord>, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json
+             FROM checkpoints
+             WHERE run_id = ?1
+             ORDER BY tick ASC, checkpoint_ordinal ASC",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let mut checkpoints = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tick_val: i64 = decode(&row, 1, "checkpoints.tick")?;
+            let ord_val: i64 = decode(&row, 2, "checkpoints.checkpoint_ordinal")?;
+            checkpoints.push(PersistedCheckpointRecord {
+                checkpoint_id: decode(&row, 0, "checkpoints.checkpoint_id")?,
+                tick: checked_u64("checkpoints.tick", tick_val)?,
+                checkpoint_ordinal: checked_u64("checkpoints.checkpoint_ordinal", ord_val)?,
+                format: decode(&row, 3, "checkpoints.format")?,
+                payload: decode(&row, 4, "checkpoints.payload")?,
+                payload_digest: decode(&row, 5, "checkpoints.payload_digest")?,
+                metadata_json: decode(&row, 6, "checkpoints.metadata_json")?,
+            });
+        }
+        Ok(checkpoints)
+    }
+
+    /// Load the latest checkpoint in tick/ordinal order.
+    pub fn load_latest_checkpoint(
+        &self,
+    ) -> Result<Option<PersistedCheckpointRecord>, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json
+             FROM checkpoints
+             WHERE run_id = ?1
+             ORDER BY tick DESC, checkpoint_ordinal DESC
+             LIMIT 1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let row = &rows[0];
+        let tick_val: i64 = decode(row, 1, "checkpoints.tick")?;
+        let ord_val: i64 = decode(row, 2, "checkpoints.checkpoint_ordinal")?;
+        Ok(Some(PersistedCheckpointRecord {
+            checkpoint_id: decode(row, 0, "checkpoints.checkpoint_id")?,
+            tick: checked_u64("checkpoints.tick", tick_val)?,
+            checkpoint_ordinal: checked_u64("checkpoints.checkpoint_ordinal", ord_val)?,
+            format: decode(row, 3, "checkpoints.format")?,
+            payload: decode(row, 4, "checkpoints.payload")?,
+            payload_digest: decode(row, 5, "checkpoints.payload_digest")?,
+            metadata_json: decode(row, 6, "checkpoints.metadata_json")?,
+        }))
+    }
+
     /// Load every agent-arrival ancestry edge recorded in this run for offline rebuild.
     ///
     /// THE PHYSICAL `births` ROW IS THE EDGE FOR EVERY ORIGIN. Every field the
@@ -8100,6 +8233,43 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Save a checkpoint record to the checkpoints table.
+    pub fn record_checkpoint(
+        &mut self,
+        checkpoint_id: &str,
+        tick: u64,
+        checkpoint_ordinal: u64,
+        format: &str,
+        payload: &str,
+        payload_digest: &str,
+        metadata_json: &str,
+    ) -> Result<(), StorageError> {
+        let tick_i64 = i64::try_from(tick).map_err(|error| StorageError::InvalidData {
+            context: "checkpoints.tick",
+            reason: error.to_string(),
+        })?;
+        let ordinal_i64 =
+            i64::try_from(checkpoint_ordinal).map_err(|error| StorageError::InvalidData {
+                context: "checkpoints.checkpoint_ordinal",
+                reason: error.to_string(),
+            })?;
+        self.connection()?.execute_with_params(
+            "INSERT INTO checkpoints (run_id, checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                sqlite_run_id(self.run_id),
+                checkpoint_id.into(),
+                tick_i64.into(),
+                ordinal_i64.into(),
+                format.into(),
+                payload.into(),
+                payload_digest.into(),
+                metadata_json.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Atomically reserve and create an unattributed file-backed database.
     ///
     /// This constructor is reserved for non-production fixtures and embedders that explicitly do
@@ -19575,6 +19745,47 @@ mod tests {
         let replay = storage.load_replay_events()?;
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].event, batch.replay_events[0]);
+        storage.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn record_and_load_checkpoint_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-checkpoint-roundtrip");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        storage.record_checkpoint(
+            "cp-001",
+            10,
+            0,
+            "scriptbots.world-checkpoint.v1.3+postcard_hex",
+            "aabbccdd",
+            "digest123",
+            r#"{"test":true}"#,
+        )?;
+        storage.flush()?;
+
+        let reader = StorageReader::open(&path_string)?;
+        let checkpoints = reader.load_checkpoints()?;
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].checkpoint_id, "cp-001");
+        assert_eq!(checkpoints[0].tick, 10);
+        assert_eq!(checkpoints[0].checkpoint_ordinal, 0);
+        assert_eq!(
+            checkpoints[0].format,
+            "scriptbots.world-checkpoint.v1.3+postcard_hex"
+        );
+        assert_eq!(checkpoints[0].payload, "aabbccdd");
+        assert_eq!(checkpoints[0].payload_digest, "digest123");
+        assert_eq!(checkpoints[0].metadata_json, r#"{"test":true}"#);
+
+        let latest = reader.load_latest_checkpoint()?;
+        assert!(latest.is_some());
+        assert_eq!(latest.unwrap(), checkpoints[0]);
+
+        reader.close()?;
         storage.close()?;
         let _ = fs::remove_file(path);
         Ok(())

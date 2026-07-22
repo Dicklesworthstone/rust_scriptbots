@@ -13,6 +13,8 @@ use std::time::Instant;
 /// (bd-2z0.7.11). The value preserves the legacy ~60 ticks-per-second visual rate.
 pub const ANIM_SECONDS_PER_TICK: f32 = 1.0 / 60.0;
 
+pub mod sense_wgsl;
+
 /// Public snapshot format the renderer expects. Keep minimal; the app will adapt
 /// its internal world snapshot to this view before passing to the renderer.
 #[derive(Clone, Debug)]
