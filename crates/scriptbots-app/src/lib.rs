@@ -18,6 +18,8 @@ use thiserror::Error;
 pub type SharedWorld = Arc<Mutex<WorldState>>;
 pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
+pub mod lab_assistant;
+
 /// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
 pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
 /// Compatible V3 minor schema used when a manifest carries WorldDigestV1.6 bootstrap evidence.
