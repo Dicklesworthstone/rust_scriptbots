@@ -329,44 +329,14 @@ impl ControlHandle {
         self.enqueue(ControlCommand::UpdateSelection(update))
     }
 
-    /// Enqueue a pause command for the simulation driver.
-    pub fn pause(&self) -> Result<(), ControlError> {
-        self.enqueue(ControlCommand::UpdateSimulation(SimulationCommand {
-            paused: Some(true),
-            speed_multiplier: None,
-            step_once: false,
-        }))
-    }
-
-    /// Enqueue a resume command for the simulation driver.
-    pub fn resume(&self) -> Result<(), ControlError> {
-        self.enqueue(ControlCommand::UpdateSimulation(SimulationCommand {
-            paused: Some(false),
-            speed_multiplier: None,
-            step_once: false,
-        }))
-    }
-
     /// Enqueue step commands for the simulation driver to advance `count` ticks.
-    pub fn step(&self, count: u64) -> Result<(), ControlError> {
+    pub fn step_count(&self, count: u64) -> Result<CommandStatusDto, ControlError> {
         let iterations = count.max(1);
+        let mut last_status = None;
         for _ in 0..iterations {
-            self.enqueue(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: None,
-                speed_multiplier: None,
-                step_once: true,
-            }))?;
+            last_status = Some(self.submit_control_command(ControlCommand::Step)?);
         }
-        Ok(())
-    }
-
-    /// Enqueue a speed update command for the simulation driver.
-    pub fn set_speed(&self, speed: f32) -> Result<(), ControlError> {
-        self.enqueue(ControlCommand::UpdateSimulation(SimulationCommand {
-            paused: None,
-            speed_multiplier: Some(speed),
-            step_once: false,
-        }))
+        Ok(last_status.expect("at least one iteration"))
     }
 
     /// Retrieve the current status summary of the running simulation.

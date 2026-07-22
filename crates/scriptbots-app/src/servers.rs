@@ -45,7 +45,7 @@ use crate::command::{
 use crate::control::{
     AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, DietClassDto,
     EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
-    SelectionStateDto, SharedLatestSummary, SpeedRequest,
+    SelectionStateDto, SharedLatestSummary, SimulationStatusDto, SpeedRequest,
 };
 use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
 // keep image out of servers unless needed
@@ -1675,7 +1675,7 @@ async fn post_step(
     body: Option<Json<StepRequestBody>>,
 ) -> Result<Json<CommandAcknowledge>, AppError> {
     let count = body.map(|b| b.count).unwrap_or(1);
-    run_control(move || state.handle.step(count)).await?;
+    run_control(move || state.handle.step_count(count)).await?;
     Ok(Json(CommandAcknowledge {
         success: true,
         message: format!("simulation step command ({count} ticks) enqueued"),
@@ -2123,6 +2123,8 @@ enum ControlToolKind {
     Step,
     SetSpeed,
     GetStatus,
+    Shutdown,
+    GetCommandStatus,
 }
 
 #[async_trait]
@@ -2199,7 +2201,7 @@ impl ToolHandler for ControlTool {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1);
                 let handle = self.handle.clone();
-                run_control_mcp(move || handle.step(count)).await?;
+                run_control_mcp(move || handle.step_count(count)).await?;
                 Ok(make_tool_result(json!({"stepped": count}))?)
             }
             ControlToolKind::SetSpeed => {
@@ -2215,6 +2217,21 @@ impl ToolHandler for ControlTool {
             ControlToolKind::GetStatus => {
                 let handle = self.handle.clone();
                 let status = run_control_mcp(move || handle.status()).await?;
+                Ok(make_tool_result(status)?)
+            }
+            ControlToolKind::Shutdown => {
+                let handle = self.handle.clone();
+                let status = run_control_mcp(move || handle.shutdown()).await?;
+                Ok(make_tool_result(status)?)
+            }
+            ControlToolKind::GetCommandStatus => {
+                let command_id = arguments
+                    .get("command_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| McpError::Validation("missing 'command_id' parameter".into()))?
+                    .to_string();
+                let handle = self.handle.clone();
+                let status = run_control_mcp(move || handle.command_status(&command_id)).await?;
                 Ok(make_tool_result(status)?)
             }
         }
