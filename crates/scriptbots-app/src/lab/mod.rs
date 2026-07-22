@@ -12,6 +12,8 @@
 //! could wedge a user's running simulation. Experiments run in fresh worlds.
 
 pub mod llm;
+pub mod notebook;
 pub mod spec;
 pub mod stats;
+
 
