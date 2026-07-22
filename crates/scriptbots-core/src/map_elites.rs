@@ -50,7 +50,8 @@ impl MapElitesArchive {
         for (i, &val) in phenotype.iter().enumerate() {
             let (min, max) = self.dimension_ranges.get(i).copied().unwrap_or((0.0, 1.0));
             let span = (max - min).max(1e-6);
-            let normalized = ((val - min) / span).clamp(0.0, 0.9999);
+            let val_clean = if val.is_nan() { min } else { val };
+            let normalized = ((val_clean - min) / span).clamp(0.0, 0.9999);
             let bin = (normalized * self.grid_bins_per_dim as f32).floor() as i32;
             coords.push(bin);
         }
@@ -61,17 +62,17 @@ impl MapElitesArchive {
     pub fn insert(&mut self, record: MapElitesRecord) -> bool {
         let key = self.discretize(&record.phenotype);
         match self.cells.get(&key) {
-            Some(existing) => {
-                // Better fitness or tie-break on lower UID
-                if record.fitness > existing.fitness
-                    || (record.fitness == existing.fitness && record.agent_uid < existing.agent_uid)
-                {
+            Some(existing) => match record.fitness.total_cmp(&existing.fitness) {
+                std::cmp::Ordering::Greater => {
                     self.cells.insert(key, record);
                     true
-                } else {
-                    false
                 }
-            }
+                std::cmp::Ordering::Equal if record.agent_uid < existing.agent_uid => {
+                    self.cells.insert(key, record);
+                    true
+                }
+                _ => false,
+            },
             None => {
                 self.cells.insert(key, record);
                 true
@@ -86,7 +87,10 @@ impl MapElitesArchive {
 
     /// Compute percentage of total grid cells filled.
     pub fn coverage_ratio(&self, num_dims: usize) -> f32 {
-        let total_cells = self.grid_bins_per_dim.pow(num_dims as u32);
+        let total_cells = self
+            .grid_bins_per_dim
+            .checked_pow(num_dims as u32)
+            .unwrap_or(usize::MAX);
         if total_cells == 0 {
             0.0
         } else {
@@ -114,7 +118,7 @@ pub fn compute_novelty_score(candidate: &[f32], archive: &MapElitesArchive, k: u
         })
         .collect();
 
-    distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    distances.sort_by(f32::total_cmp);
     let take_k = k.min(distances.len());
     let sum: f32 = distances.iter().take(take_k).sum();
     sum / take_k as f32

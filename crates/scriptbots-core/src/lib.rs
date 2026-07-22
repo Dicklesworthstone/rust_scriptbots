@@ -104,30 +104,6 @@ pub struct ActivationEdge {
     pub weight: f32,
 }
 
-/// Bounded activation capture budget per tick to prevent population-proportional allocation overhead (`bd-16g.4.4`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CaptureBudget {
-    /// Maximum number of agents captured for brain activation snapshots per tick.
-    pub max_agents: usize,
-}
-
-impl Default for CaptureBudget {
-    fn default() -> Self {
-        Self { max_agents: 4 }
-    }
-}
-
-/// Activation probe telemetry statistics for the previous tick (`bd-16g.4.4`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ProbeStats {
-    /// Number of agent activation snapshots captured.
-    pub captured: usize,
-    /// Configured maximum capture budget.
-    pub budget: usize,
-    /// Number of agents requesting capture that were dropped due to budget limit.
-    pub dropped: usize,
-    /// Total sensor attribution explain_sensors calls made.
-    pub explain_calls: u64,
 }
 
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
@@ -15391,9 +15367,6 @@ pub struct WorldState {
     config_audit: Vec<ConfigAuditEntry>,
     config_revision: u64,
     resource_ledger: ResourceLedgerState,
-    activation_probe: Option<AgentId>,
-    capture_budget: CaptureBudget,
-    probe_stats: ProbeStats,
 }
 
 // bd-tqpj: intentional curated summary — a full-field Debug would dump entire world
@@ -15554,9 +15527,6 @@ impl WorldState {
             config_audit: Vec::with_capacity(32),
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
-            activation_probe: None,
-            capture_budget: CaptureBudget::default(),
-            probe_stats: ProbeStats::default(),
         })
     }
 
@@ -16377,42 +16347,6 @@ impl WorldState {
     /// then display the wrong explanation with total confidence.
     ///
     /// Only the probed agent is ever explained — this is an on-demand,
-    /// population-independent query (see `ACTIVATION_CAPTURE_BUDGET` for the same
-    /// principle applied to brain activations).
-    /// Return the active activation probe target agent ID, if set (`bd-16g.4.4`).
-    #[must_use]
-    pub fn activation_probe(&self) -> Option<AgentId> {
-        self.activation_probe
-    }
-
-    /// Set or clear the active activation probe target agent ID (`bd-16g.4.4`).
-    pub fn set_activation_probe(&mut self, probe: Option<AgentId>) {
-        if let Some(id) = probe {
-            if !self.agents.contains(id) {
-                self.activation_probe = None;
-                return;
-            }
-        }
-        self.activation_probe = probe;
-    }
-
-    /// Return the current activation capture budget (`bd-16g.4.4`).
-    #[must_use]
-    pub fn capture_budget(&self) -> CaptureBudget {
-        self.capture_budget
-    }
-
-    /// Set the activation capture budget per tick (`bd-16g.4.4`).
-    pub fn set_capture_budget(&mut self, budget: CaptureBudget) {
-        self.capture_budget = budget;
-    }
-
-    /// Return activation probe statistics for the previous tick (`bd-16g.4.4`).
-    #[must_use]
-    pub fn probe_stats(&self) -> ProbeStats {
-        self.probe_stats
-    }
-
     ///
     /// Returns `None` if the agent is gone.
     #[must_use]

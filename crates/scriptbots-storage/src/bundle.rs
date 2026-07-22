@@ -56,7 +56,8 @@ pub enum BundleError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunBundleArtifactEntry {
     pub relative_path: String,
-    pub sha256_hex: String,
+    #[serde(alias = "sha256_hex")]
+    pub blake3_hex: String,
     pub bytes_len: u64,
     pub artifact_type: String,
 }
@@ -131,7 +132,7 @@ pub fn create_run_bundle(
 
     let mut artifacts = vec![RunBundleArtifactEntry {
         relative_path: "run.db".to_owned(),
-        sha256_hex: db_hash,
+        blake3_hex: db_hash,
         bytes_len: db_bytes.len() as u64,
         artifact_type: "database".to_owned(),
     }];
@@ -146,7 +147,7 @@ pub fn create_run_bundle(
     let events_hash = hash_hex(events_json.as_bytes());
     artifacts.push(RunBundleArtifactEntry {
         relative_path: "events.json".to_owned(),
-        sha256_hex: events_hash,
+        blake3_hex: events_hash,
         bytes_len: events_json.len() as u64,
         artifact_type: "events".to_owned(),
     });
@@ -161,7 +162,7 @@ pub fn create_run_bundle(
     let cp_hash = hash_hex(checkpoints_json.as_bytes());
     artifacts.push(RunBundleArtifactEntry {
         relative_path: "checkpoints.json".to_owned(),
-        sha256_hex: cp_hash,
+        blake3_hex: cp_hash,
         bytes_len: checkpoints_json.len() as u64,
         artifact_type: "checkpoints".to_owned(),
     });
@@ -238,10 +239,10 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
         }
 
         let actual_hash = hash_hex(&bytes);
-        if actual_hash != entry.sha256_hex {
+        if actual_hash != entry.blake3_hex {
             return Err(BundleError::HashMismatch {
                 path: rel_path.to_path_buf(),
-                expected: entry.sha256_hex.clone(),
+                expected: entry.blake3_hex.clone(),
                 actual: actual_hash,
             });
         }

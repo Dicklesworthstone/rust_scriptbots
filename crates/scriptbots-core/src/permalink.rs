@@ -670,7 +670,15 @@ fn take_slice<'a>(
     count: usize,
     field: &'static str,
 ) -> Result<&'a [u8], PermalinkError> {
-    let remaining = bytes.len().saturating_sub(offset);
+    if offset > bytes.len() {
+        return Err(PermalinkError::TruncatedField {
+            field,
+            offset,
+            declared: count,
+            remaining: 0,
+        });
+    }
+    let remaining = bytes.len() - offset;
     if remaining < count {
         return Err(PermalinkError::TruncatedField {
             field,
@@ -1044,5 +1052,12 @@ mod tests {
             Err(PermalinkError::InvalidKnobPath { .. })
         ));
         let _ = bytes;
+    }
+
+    #[test]
+    fn take_slice_out_of_bounds_zero_count_does_not_panic() {
+        let bytes = b"short";
+        let res = take_slice(bytes, 10, 0, "test");
+        assert!(matches!(res, Err(PermalinkError::TruncatedField { .. })));
     }
 }

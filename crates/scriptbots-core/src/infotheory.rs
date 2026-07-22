@@ -283,7 +283,7 @@ pub fn compute_mi(
     let surr_sd = surr_var.sqrt();
 
     let mut sorted_surr = surrogates.clone();
-    sorted_surr.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_surr.sort_by(f64::total_cmp);
     let q95_idx = ((r_runs as f64) * 0.95).floor() as usize;
     let q95 = sorted_surr[q95_idx.min(r_runs - 1)];
 
@@ -309,7 +309,7 @@ pub fn compute_mi(
         let (_, b_corr) = calc_mi_mm(&boot_e, &boot_r, b);
         boot_mis.push(b_corr);
     }
-    boot_mis.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    boot_mis.sort_by(f64::total_cmp);
     let lo_idx = ((boot_runs as f64) * 0.025).floor() as usize;
     let hi_idx = ((boot_runs as f64) * 0.975).floor() as usize;
     let ci_lo = boot_mis[lo_idx.min(boot_runs - 1)];
@@ -464,7 +464,7 @@ pub fn compute_te(
     let surr_sd = surr_var.sqrt();
 
     let mut sorted_surr = surrogates.clone();
-    sorted_surr.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_surr.sort_by(f64::total_cmp);
     let q95_idx = ((r_runs as f64) * 0.95).floor() as usize;
     let q95 = sorted_surr[q95_idx.min(r_runs - 1)];
 
@@ -492,7 +492,7 @@ pub fn compute_te(
         let b_te = calc_te_mm(&boot_rn, &boot_ec, &boot_rc, b);
         boot_tes.push(b_te);
     }
-    boot_tes.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    boot_tes.sort_by(f64::total_cmp);
     let lo_idx = ((boot_runs as f64) * 0.025).floor() as usize;
     let hi_idx = ((boot_runs as f64) * 0.975).floor() as usize;
     let ci_lo = boot_tes[lo_idx.min(boot_runs - 1)];
@@ -554,9 +554,9 @@ fn calc_te_mm(r_next: &[f64], e_curr: &[f64], r_curr: &[f64], b: usize) -> f64 {
     let k_ec_rc = counts_ec_rc.iter().filter(|&&c| c > 0).count();
     let k_rc = counts_rc.iter().filter(|&&c| c > 0).count();
 
-    let mm_correction = (k_rn_rc as f64 + k_ec_rc as f64 - k_rc as f64 - k_3d as f64)
+    let mm_bias = (k_3d as f64 - k_rn_rc as f64 - k_ec_rc as f64 + k_rc as f64)
         / (2.0 * n * std::f64::consts::LN_2);
-    (plugin - mm_correction).max(0.0)
+    (plugin - mm_bias).max(0.0)
 }
 
 #[cfg(test)]

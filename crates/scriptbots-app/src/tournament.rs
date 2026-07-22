@@ -74,21 +74,20 @@ impl TournamentHarness {
     pub fn record_match(&mut self, result: MatchResult) {
         // Record match and update ratings for top 2 families
         let mut sorted: Vec<_> = result.family_scores.iter().collect();
-        sorted.sort_by(|a, b| b.1.survival_share.partial_cmp(&a.1.survival_share).unwrap());
+        sorted.sort_by(|a, b| b.1.survival_share.total_cmp(&a.1.survival_share));
 
         if sorted.len() >= 2 {
             let winner_id = sorted[0].0;
             let loser_id = sorted[1].0;
 
-            if let (Some(w), Some(l)) = (
-                self.ratings.get_mut(winner_id),
-                self.ratings.get_mut(loser_id),
-            ) {
-                let mut w_clone = w.clone();
-                let mut l_clone = l.clone();
-                EloRating::update_elo(&mut w_clone, &mut l_clone, 32.0);
-                *w = w_clone;
-                *l = l_clone;
+            if winner_id != loser_id {
+                if let Some(mut winner) = self.ratings.get(winner_id).cloned() {
+                    if let Some(mut loser) = self.ratings.get(loser_id).cloned() {
+                        EloRating::update_elo(&mut winner, &mut loser, 32.0);
+                        self.ratings.insert(winner_id.clone(), winner);
+                        self.ratings.insert(loser_id.clone(), loser);
+                    }
+                }
             }
         }
         self.match_history.push(result);
@@ -96,7 +95,7 @@ impl TournamentHarness {
 
     pub fn generate_leaderboard_markdown(&self) -> String {
         let mut sorted_ratings: Vec<_> = self.ratings.values().collect();
-        sorted_ratings.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap());
+        sorted_ratings.sort_by(|a, b| b.rating.total_cmp(&a.rating));
 
         let mut out = String::from(
             "# ScriptBots Brain Family Tournament Leaderboard\n\n\
