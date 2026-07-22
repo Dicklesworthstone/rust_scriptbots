@@ -14,7 +14,10 @@ pub mod subcell;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -265,12 +268,18 @@ fn run_event_loop(
             .saturating_duration_since(now)
             .min(next_sim_due.saturating_duration_since(now));
 
-        if event::poll(sleep_for)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && app.handle_key(key)?
-        {
-            break;
+        if event::poll(sleep_for)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if app.handle_key(key)? {
+                        break;
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse)?;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -409,6 +418,15 @@ struct TerminalApp<'a> {
     /// One-shot latches for the rail's logging contract.
     rail_logged_first_show: bool,
     rail_warned_aged_out: bool,
+    /// Transient status toast notifications (bd-2z0.14.2.4)
+    toasts: VecDeque<ToastEntry>,
+    /// Command palette modal state (bd-2z0.14.2.5)
+    palette_open: bool,
+    palette_query: String,
+    palette_selected_index: usize,
+    map_zoom_level: f32,
+    map_pan_offset: (f32, f32),
+    hover_tooltip: Option<MouseHoverTooltip>,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -465,6 +483,13 @@ impl<'a> TerminalApp<'a> {
             rail_selection_aged_out: false,
             rail_logged_first_show: false,
             rail_warned_aged_out: false,
+            toasts: VecDeque::with_capacity(8),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected_index: 0,
+            map_zoom_level: 1.0,
+            map_pan_offset: (0.0, 0.0),
+            hover_tooltip: None,
         };
         app.refresh_snapshot();
         app
@@ -750,6 +775,14 @@ impl<'a> TerminalApp<'a> {
             };
             frame.render_widget(Block::default().style(overlay_style), size);
             self.draw_help(frame);
+        }
+
+        self.draw_toasts(frame, frame.area());
+        if self.palette_open {
+            self.draw_command_palette(frame, frame.area());
+        }
+        if let Some(tooltip) = &self.hover_tooltip {
+            self.draw_hover_tooltip(frame, tooltip, frame.area());
         }
     }
 
@@ -2040,7 +2073,314 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(paragraph, area);
     }
 
+    pub fn push_toast(&mut self, msg: impl Into<String>) {
+        if self.toasts.len() >= 4 {
+            self.toasts.pop_front();
+        }
+        let current_tick = self.snapshot.tick;
+        self.toasts
+            .push_back(ToastEntry::new(msg, current_tick, 180));
+    }
+
+    fn draw_toasts(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let current_tick = self.snapshot.tick;
+        self.toasts.retain(|t| !t.is_expired(current_tick));
+        if self.toasts.is_empty() {
+            return;
+        }
+
+        let toast_count = self.toasts.len() as u16;
+        let box_height = toast_count.saturating_add(2);
+        let box_width = 34u16.min(area.width.saturating_sub(4));
+        if area.width < box_width + 4 || area.height < box_height + 4 {
+            return;
+        }
+
+        let x = area.width.saturating_sub(box_width + 2);
+        let y = area.height.saturating_sub(box_height + 2);
+        let toast_area = Rect::new(x, y, box_width, box_height);
+
+        let border_style = self.palette.accent_style();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(Span::styled(" Status ", self.palette.header_style()));
+
+        let lines: Vec<Line<'_>> = self
+            .toasts
+            .iter()
+            .map(|t| Line::from(Span::styled(format!(" • {}", t.message), Style::default())))
+            .collect();
+
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(Clear, toast_area);
+        frame.render_widget(paragraph, toast_area);
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.handle_mouse_click(mouse.column, mouse.row);
+            }
+            MouseEventKind::ScrollUp => {
+                self.zoom_in();
+            }
+            MouseEventKind::ScrollDown => {
+                self.zoom_out();
+            }
+            MouseEventKind::Moved => {
+                self.update_hover_tooltip(mouse.column, mouse.row);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        if self.palette_open {
+            return;
+        }
+        let (world_w, world_h) = self.snapshot.world_size;
+        if world_w == 0 || world_h == 0 {
+            return;
+        }
+        let wx = (col as f32 / 80.0) * world_w as f32;
+        let wy = (row as f32 / 36.0) * world_h as f32;
+
+        let mut nearest: Option<(usize, f32)> = None;
+        for (idx, agent) in self.snapshot.agents.iter().enumerate() {
+            let dx = agent.position.0 - wx;
+            let dy = agent.position.1 - wy;
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq < 2500.0 {
+                if nearest.map_or(true, |(_, min_d)| dist_sq < min_d) {
+                    nearest = Some((idx, dist_sq));
+                }
+            }
+        }
+
+        if let Some((best_idx, _)) = nearest {
+            self.focused_agent_cursor = best_idx;
+            self.focus_lock = FocusLockMode::Manual;
+            let uid = self.snapshot.agents[best_idx].uid;
+            self.push_toast(format!("Selected Agent #{uid}"));
+            self.refresh_snapshot();
+        }
+    }
+
+    pub fn zoom_in(&mut self) {
+        self.map_zoom_level = (self.map_zoom_level * 1.2).min(4.0);
+        self.push_toast(format!("Zoom: {:.1}x", self.map_zoom_level));
+    }
+
+    pub fn zoom_out(&mut self) {
+        self.map_zoom_level = (self.map_zoom_level / 1.2).max(0.5);
+        self.push_toast(format!("Zoom: {:.1}x", self.map_zoom_level));
+    }
+
+    fn update_hover_tooltip(&mut self, col: u16, row: u16) {
+        let (world_w, world_h) = self.snapshot.world_size;
+        if world_w == 0 || world_h == 0 {
+            self.hover_tooltip = None;
+            return;
+        }
+        let wx = (col as f32 / 80.0) * world_w as f32;
+        let wy = (row as f32 / 36.0) * world_h as f32;
+
+        let mut nearest: Option<&AgentSummary> = None;
+        let mut min_d = 1600.0f32;
+        for agent in &self.snapshot.agents {
+            let dx = agent.position.0 - wx;
+            let dy = agent.position.1 - wy;
+            let d_sq = dx * dx + dy * dy;
+            if d_sq < min_d {
+                min_d = d_sq;
+                nearest = Some(agent);
+            }
+        }
+
+        if let Some(agent) = nearest {
+            self.hover_tooltip = Some(MouseHoverTooltip {
+                cell_x: col,
+                cell_y: row,
+                agent_uid: agent.uid,
+                energy: agent.energy,
+                health: agent.health,
+                age: agent.age,
+            });
+        } else {
+            self.hover_tooltip = None;
+        }
+    }
+
+    pub fn execute_palette_action(&mut self, action: CommandPaletteAction) {
+        match action {
+            CommandPaletteAction::TogglePause => {
+                self.paused = !self.paused;
+                self.push_toast(if self.paused { "Paused" } else { "Resumed" });
+            }
+            CommandPaletteAction::StepOnce => {
+                self.step_once();
+                self.paused = true;
+                self.push_toast("Single-step");
+            }
+            CommandPaletteAction::SpeedUp => {
+                self.speed_multiplier = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
+                self.push_toast(format!("Speed: {:.1}x", self.speed_multiplier));
+            }
+            CommandPaletteAction::SpeedDown => {
+                self.speed_multiplier = (self.speed_multiplier - 0.5).max(0.0);
+                self.push_toast(format!("Speed: {:.1}x", self.speed_multiplier));
+            }
+            CommandPaletteAction::CycleTheme => {
+                let lbl = self.palette.cycle_theme();
+                self.push_toast(format!("Theme: {lbl}"));
+            }
+            CommandPaletteAction::CyclePalette => {
+                let lbl = self.palette.cycle_mode();
+                self.push_toast(format!("Palette: {lbl}"));
+            }
+            CommandPaletteAction::ToggleRail => {
+                self.rail_visible = !self.rail_visible;
+                self.push_toast(if self.rail_visible {
+                    "Rail On"
+                } else {
+                    "Rail Off"
+                });
+            }
+            CommandPaletteAction::FocusTopPredator => {
+                self.focus_lock = FocusLockMode::TopPredator;
+                self.refresh_snapshot();
+                self.push_toast("Focus: Top Predator");
+            }
+            CommandPaletteAction::FocusOldest => {
+                self.focus_lock = FocusLockMode::Oldest;
+                self.refresh_snapshot();
+                self.push_toast("Focus: Oldest");
+            }
+            CommandPaletteAction::ToggleProbe => {
+                self.probe_enabled = !self.probe_enabled;
+                self.push_toast(if self.probe_enabled {
+                    "Probe On"
+                } else {
+                    "Probe Off"
+                });
+            }
+            CommandPaletteAction::ShowHelp => {
+                self.help_visible = !self.help_visible;
+            }
+        }
+    }
+
+    fn draw_command_palette(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let width = 50u16.min(area.width.saturating_sub(4));
+        let height = 16u16.min(area.height.saturating_sub(4));
+        if width < 10 || height < 6 {
+            return;
+        }
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let palette_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, palette_area);
+
+        let items = all_command_palette_items();
+        let matched = fuzzy_match_command_palette(&items, &self.palette_query);
+
+        let title = format!(" Command Palette ({}) ", self.palette_query);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.palette.accent_style())
+            .title(Span::styled(title, self.palette.header_style()));
+
+        let list_items: Vec<ListItem<'_>> = matched
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let is_selected = idx
+                    == self
+                        .palette_selected_index
+                        .min(matched.len().saturating_sub(1));
+                let prefix = if is_selected { "> " } else { "  " };
+                let style = if is_selected {
+                    self.palette.header_style()
+                } else {
+                    Style::default()
+                };
+                let content = format!(
+                    "{prefix}[{}] {} ({})",
+                    item.category, item.label, item.keybind_hint
+                );
+                ListItem::new(Span::styled(content, style))
+            })
+            .collect();
+
+        let list = List::new(list_items).block(block);
+        frame.render_widget(list, palette_area);
+    }
+
+    fn draw_hover_tooltip(&self, frame: &mut Frame<'_>, tooltip: &MouseHoverTooltip, area: Rect) {
+        let width = 24u16;
+        let height = 5u16;
+        let x = tooltip.cell_x.min(area.width.saturating_sub(width + 1));
+        let y = tooltip.cell_y.min(area.height.saturating_sub(height + 1));
+        let tip_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, tip_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.palette.accent_style())
+            .title(Span::styled(
+                format!(" Agent #{} ", tooltip.agent_uid),
+                self.palette.header_style(),
+            ));
+
+        let text = vec![
+            Line::from(format!("Health: {:.1}", tooltip.health)),
+            Line::from(format!("Energy: {:.1}", tooltip.energy)),
+            Line::from(format!("Age: {} ticks", tooltip.age)),
+        ];
+
+        let para = Paragraph::new(text).block(block);
+        frame.render_widget(para, tip_area);
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.palette_open {
+            match key.code {
+                KeyCode::Esc => {
+                    self.palette_open = false;
+                }
+                KeyCode::Up => {
+                    self.palette_selected_index = self.palette_selected_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.palette_selected_index = self.palette_selected_index.saturating_add(1);
+                }
+                KeyCode::Backspace => {
+                    self.palette_query.pop();
+                    self.palette_selected_index = 0;
+                }
+                KeyCode::Char(c) => {
+                    self.palette_query.push(c);
+                    self.palette_selected_index = 0;
+                }
+                KeyCode::Enter => {
+                    let items = all_command_palette_items();
+                    let matched = fuzzy_match_command_palette(&items, &self.palette_query);
+                    if !matched.is_empty() {
+                        let idx = self.palette_selected_index.min(matched.len() - 1);
+                        let action = matched[idx].action;
+                        self.execute_palette_action(action);
+                    }
+                    self.palette_open = false;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _)
             | (KeyCode::Char('q'), _)
@@ -2048,8 +2388,16 @@ impl<'a> TerminalApp<'a> {
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 return Ok(true);
             }
+            (KeyCode::Char('p') | KeyCode::Char('P'), KeyModifiers::CONTROL)
+            | (KeyCode::Char(':'), KeyModifiers::NONE) => {
+                self.palette_open = !self.palette_open;
+                self.palette_query.clear();
+                self.palette_selected_index = 0;
+                return Ok(false);
+            }
             (KeyCode::Char('c'), KeyModifiers::NONE) => {
-                self.palette.cycle_mode();
+                let mode_label = self.palette.cycle_mode();
+                self.push_toast(format!("Palette: {mode_label}"));
                 return Ok(false);
             }
             (KeyCode::Char(' '), _) => {
@@ -2059,6 +2407,7 @@ impl<'a> TerminalApp<'a> {
                 } else if self.speed_multiplier <= 0.0 {
                     self.speed_multiplier = 1.0;
                 }
+                self.push_toast(if self.paused { "Paused" } else { "Resumed" });
                 self.submit_simulation_command(SimulationCommand {
                     paused: Some(self.paused),
                     speed_multiplier: Some(self.speed_multiplier),
@@ -2105,6 +2454,7 @@ impl<'a> TerminalApp<'a> {
                 self.step_once();
                 self.paused = true;
                 self.speed_multiplier = 0.0;
+                self.push_toast("Single-step");
                 self.push_event(self.snapshot.tick, EventKind::Info, "Single-step executed");
             }
             (KeyCode::Char('S'), _) => {
@@ -3678,6 +4028,233 @@ impl TerminalPaletteMode {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToastEntry {
+    pub message: String,
+    pub created_tick: u64,
+    pub expiry_tick: u64,
+}
+
+impl ToastEntry {
+    pub fn new(message: impl Into<String>, current_tick: u64, lifetime_ticks: u64) -> Self {
+        Self {
+            message: message.into(),
+            created_tick: current_tick,
+            expiry_tick: current_tick.saturating_add(lifetime_ticks),
+        }
+    }
+
+    pub fn is_expired(&self, current_tick: u64) -> bool {
+        current_tick >= self.expiry_tick
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MouseHoverTooltip {
+    pub cell_x: u16,
+    pub cell_y: u16,
+    pub agent_uid: u64,
+    pub energy: f32,
+    pub health: f32,
+    pub age: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandPaletteItem {
+    pub label: &'static str,
+    pub keybind_hint: &'static str,
+    pub category: &'static str,
+    pub action: CommandPaletteAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CommandPaletteAction {
+    TogglePause,
+    StepOnce,
+    SpeedUp,
+    SpeedDown,
+    CycleTheme,
+    CyclePalette,
+    ToggleRail,
+    FocusTopPredator,
+    FocusOldest,
+    ToggleProbe,
+    ShowHelp,
+}
+
+pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
+    vec![
+        CommandPaletteItem {
+            label: "Toggle Pause / Resume",
+            keybind_hint: "Space",
+            category: "Playback",
+            action: CommandPaletteAction::TogglePause,
+        },
+        CommandPaletteItem {
+            label: "Step Single Sim Tick",
+            keybind_hint: "s",
+            category: "Playback",
+            action: CommandPaletteAction::StepOnce,
+        },
+        CommandPaletteItem {
+            label: "Faster Sim Speed",
+            keybind_hint: "+",
+            category: "Playback",
+            action: CommandPaletteAction::SpeedUp,
+        },
+        CommandPaletteItem {
+            label: "Slower Sim Speed",
+            keybind_hint: "-",
+            category: "Playback",
+            action: CommandPaletteAction::SpeedDown,
+        },
+        CommandPaletteItem {
+            label: "Cycle Curated Theme",
+            keybind_hint: "Ctrl+T",
+            category: "View",
+            action: CommandPaletteAction::CycleTheme,
+        },
+        CommandPaletteItem {
+            label: "Cycle Accessibility Palette",
+            keybind_hint: "c",
+            category: "View",
+            action: CommandPaletteAction::CyclePalette,
+        },
+        CommandPaletteItem {
+            label: "Toggle Narrative Timeline Rail",
+            keybind_hint: "r",
+            category: "View",
+            action: CommandPaletteAction::ToggleRail,
+        },
+        CommandPaletteItem {
+            label: "Focus Top Predator Agent",
+            keybind_hint: "t",
+            category: "Science",
+            action: CommandPaletteAction::FocusTopPredator,
+        },
+        CommandPaletteItem {
+            label: "Focus Oldest Living Agent",
+            keybind_hint: "o",
+            category: "Science",
+            action: CommandPaletteAction::FocusOldest,
+        },
+        CommandPaletteItem {
+            label: "Toggle Senses Attribution Probe",
+            keybind_hint: "b",
+            category: "Science",
+            action: CommandPaletteAction::ToggleProbe,
+        },
+        CommandPaletteItem {
+            label: "Show Keybindings & Legend",
+            keybind_hint: "?",
+            category: "Help",
+            action: CommandPaletteAction::ShowHelp,
+        },
+    ]
+}
+
+pub fn fuzzy_match_command_palette<'a>(
+    items: &'a [CommandPaletteItem],
+    query: &str,
+) -> Vec<&'a CommandPaletteItem> {
+    if query.trim().is_empty() {
+        return items.iter().collect();
+    }
+    let query_lower = query.to_lowercase();
+    let mut matched: Vec<(&'a CommandPaletteItem, usize)> = items
+        .iter()
+        .filter_map(|item| {
+            let label_lower = item.label.to_lowercase();
+            let cat_lower = item.category.to_lowercase();
+            if label_lower.contains(&query_lower) || cat_lower.contains(&query_lower) {
+                let score = if label_lower.starts_with(&query_lower) {
+                    0
+                } else {
+                    1
+                };
+                Some((item, score))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    matched.sort_by_key(|(_, score)| *score);
+    matched.into_iter().map(|(item, _)| item).collect()
+}
+
+/// Deterministic motion clock (bd-2z0.14.2.4).
+/// Single tick_phase source derived from sim tick and deterministic UI subdivisions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TickPhase {
+    pub tick: u64,
+    pub phase: f32,
+    pub reduced_motion: bool,
+    pub paused: bool,
+}
+
+impl TickPhase {
+    pub fn compute(tick: u64, paused: bool, sub_step: u8) -> Self {
+        let reduced = is_reduced_motion_requested();
+        let sub = if paused || reduced {
+            0.0
+        } else {
+            (sub_step % 16) as f32 / 16.0
+        };
+        let phase = if reduced || paused {
+            0.0
+        } else {
+            ((tick % 60) as f32 + sub) / 60.0
+        };
+        Self {
+            tick,
+            phase,
+            reduced_motion: reduced,
+            paused,
+        }
+    }
+
+    pub fn pulse(&self, frequency: f32, min_val: f32, max_val: f32) -> f32 {
+        if self.reduced_motion || self.paused {
+            return (min_val + max_val) * 0.5;
+        }
+        let rad = (self.tick as f32 * frequency + self.phase * 2.0 * std::f32::consts::PI)
+            % (2.0 * std::f32::consts::PI);
+        let s = (rad.sin() + 1.0) * 0.5;
+        min_val + s * (max_val - min_val)
+    }
+}
+
+/// Event pulse ring radiating from event locations (bd-2z0.14.2.4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EventPulseRing {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub intensity: f32,
+}
+
+impl EventPulseRing {
+    pub fn from_event(event_tick: u64, current_tick: u64, x: f32, y: f32) -> Option<Self> {
+        let age = current_tick.saturating_sub(event_tick);
+        if age > 5 {
+            return None;
+        }
+        let radius = age as f32 * 1.5 + 0.5;
+        let intensity = (1.0 - age as f32 / 6.0).clamp(0.0, 1.0);
+        Some(Self {
+            x,
+            y,
+            radius,
+            intensity,
+        })
+    }
+}
+
+pub fn is_reduced_motion_requested() -> bool {
+    std::env::var("SCRIPTBOTS_REDUCED_MOTION").is_ok() || std::env::var("NO_COLOR").is_ok()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CuratedThemeId {
     CyberpunkAurora,
@@ -4084,8 +4661,9 @@ impl Palette {
         self.emoji = !self.emoji;
     }
 
-    fn cycle_mode(&mut self) {
+    pub fn cycle_mode(&mut self) -> &'static str {
         self.mode = self.mode.next();
+        self.mode.label()
     }
 
     fn mode_label(&self) -> &'static str {
@@ -5876,7 +6454,11 @@ mod tests {
         assert_eq!(t3, CuratedThemeId::LumenLight);
         assert_eq!(t4, CuratedThemeId::NordicFrost);
         assert_eq!(t5, CuratedThemeId::HighContrast);
-        assert_eq!(t6, CuratedThemeId::CyberpunkAurora, "theme cycle must wrap back to start");
+        assert_eq!(
+            t6,
+            CuratedThemeId::CyberpunkAurora,
+            "theme cycle must wrap back to start"
+        );
 
         assert_eq!(t1.label(), "Cyberpunk Aurora");
         assert_ne!(t1.header_color(), t2.header_color());
@@ -5914,6 +6496,108 @@ mod tests {
                 assert_ne!(p.theme_label(), "", "theme label must not be empty");
             }
         }
+    }
+
+    #[test]
+    fn test_tick_phase_determinism() {
+        let tp1 = TickPhase::compute(120, false, 4);
+        let tp2 = TickPhase::compute(120, false, 4);
+        assert_eq!(tp1, tp2, "TickPhase calculation must be deterministic");
+        assert_eq!(tp1.tick, 120);
+        assert!((tp1.phase - (4.0 / 16.0) / 60.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_tick_phase_paused_frozen() {
+        let tp_paused = TickPhase::compute(120, true, 4);
+        assert_eq!(tp_paused.phase, 0.0, "paused phase must be frozen at 0.0");
+        let pulse = tp_paused.pulse(1.0, 0.2, 0.8);
+        assert_eq!(pulse, 0.5, "paused pulse must be static mid-value");
+    }
+
+    #[test]
+    fn test_toast_lifecycle() {
+        let toast = ToastEntry::new("Test Toast", 10, 50);
+        assert_eq!(toast.created_tick, 10);
+        assert_eq!(toast.expiry_tick, 60);
+
+        assert!(!toast.is_expired(10));
+        assert!(!toast.is_expired(59));
+        assert!(toast.is_expired(60));
+        assert!(toast.is_expired(100));
+    }
+
+    #[test]
+    fn test_event_pulse_ring() {
+        let ring0 = EventPulseRing::from_event(100, 100, 10.0, 20.0).expect("ring");
+        assert_eq!(ring0.radius, 0.5);
+        assert_eq!(ring0.intensity, 1.0);
+
+        let ring3 = EventPulseRing::from_event(100, 103, 10.0, 20.0).expect("ring");
+        assert!(
+            ring3.radius > ring0.radius,
+            "pulse ring radius must expand with age"
+        );
+        assert!(
+            ring3.intensity < ring0.intensity,
+            "pulse ring intensity must fade with age"
+        );
+
+        let ring_expired = EventPulseRing::from_event(100, 107, 10.0, 20.0);
+        assert!(
+            ring_expired.is_none(),
+            "pulse ring must expire after 5 ticks"
+        );
+    }
+
+    #[test]
+    fn test_command_palette_fuzzy_matching() {
+        let items = all_command_palette_items();
+        let matched = fuzzy_match_command_palette(&items, "pause");
+        assert!(!matched.is_empty(), "query 'pause' must match Toggle Pause");
+        assert_eq!(matched[0].action, CommandPaletteAction::TogglePause);
+
+        let matched_cat = fuzzy_match_command_palette(&items, "science");
+        assert!(
+            matched_cat.len() >= 3,
+            "category query 'science' must match science items"
+        );
+    }
+
+    #[test]
+    fn test_command_palette_action_execution() {
+        let config = ScriptBotsConfig::default();
+        let world = WorldState::new(config).expect("world");
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+            scenario: test_scenario(),
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+
+        assert!(!app.paused);
+        app.execute_palette_action(CommandPaletteAction::TogglePause);
+        assert!(app.paused, "TogglePause action must set app.paused to true");
+
+        assert_eq!(app.map_zoom_level, 1.0);
+        app.zoom_in();
+        assert!(
+            app.map_zoom_level > 1.0,
+            "zoom_in must increase map_zoom_level"
+        );
+        app.zoom_out();
+        assert_eq!(
+            app.map_zoom_level, 1.0,
+            "zoom_out must decrease map_zoom_level"
+        );
     }
 }
 
