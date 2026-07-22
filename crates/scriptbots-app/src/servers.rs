@@ -19,7 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use fastmcp_rust::{
-    CallToolResult, Content, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    Content, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, McpError, McpErrorCode, McpResult, Server, ToolHandler,
 };
 use futures_util::stream::{Stream, StreamExt};
@@ -1887,24 +1887,22 @@ async fn prepare_mcp_server(
     reserved: ReservedControlListener,
 ) -> Result<PreparedMcpServer> {
     info!(address = %reserved.address, "Preparing MCP HTTP server");
-    let server = Arc::new(McpServer::new(
-        "scriptbots-control".to_string(),
-        env!("CARGO_PKG_VERSION").to_string(),
-    ));
+    let mut builder = fastmcp_rust::ServerBuilder::new(
+        "scriptbots-control",
+        env!("CARGO_PKG_VERSION"),
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "list_presets",
         "List available scenario presets",
         json!({"type": "object", "additionalProperties": false}),
         ControlToolKind::ListPresets,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register list_presets tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "apply_preset",
         "Apply a named scenario preset",
         json!({
@@ -1915,34 +1913,28 @@ async fn prepare_mcp_server(
         }),
         ControlToolKind::ApplyPreset,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register apply_preset tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "list_knobs",
         "List all exposed configuration knobs",
         json!({"type": "object", "additionalProperties": false}),
         ControlToolKind::ListKnobs,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register list_knobs tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "get_config",
         "Fetch the entire simulation configuration",
         json!({"type": "object", "additionalProperties": false}),
         ControlToolKind::GetConfig,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register get_config tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "apply_updates",
         "Apply one or more knob updates by path",
         json!({
@@ -1966,12 +1958,10 @@ async fn prepare_mcp_server(
         }),
         ControlToolKind::ApplyUpdates,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register apply_updates tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "apply_patch",
         "Merge a JSON object patch into the configuration",
         json!({
@@ -1984,34 +1974,28 @@ async fn prepare_mcp_server(
         }),
         ControlToolKind::ApplyPatch,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register apply_patch tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "pause",
         "Pause the simulation",
         json!({"type": "object", "additionalProperties": false}),
         ControlToolKind::Pause,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register pause tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "resume",
         "Resume the simulation",
         json!({"type": "object", "additionalProperties": false}),
         ControlToolKind::Resume,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register resume tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "step",
         "Step the simulation by N ticks",
         json!({
@@ -2023,12 +2007,10 @@ async fn prepare_mcp_server(
         }),
         ControlToolKind::Step,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register step tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "set_speed",
         "Set the simulation speed (target TPS)",
         json!({
@@ -2041,34 +2023,28 @@ async fn prepare_mcp_server(
         }),
         ControlToolKind::SetSpeed,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register set_speed tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "get_status",
         "Retrieve current simulation status (tick, agent count, pause state, revision)",
         json!({"type": "object", "additionalProperties": false}),
         ControlToolKind::GetStatus,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register get_status tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "shutdown",
         "Request graceful simulation shutdown",
         json!({"type": "object", "additionalProperties": false}),
         ControlToolKind::Shutdown,
         handle.clone(),
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register shutdown tool: {err}"))?;
+    );
 
-    register_tool(
-        Arc::clone(&server),
+    builder = register_tool(
+        builder,
         "get_command_status",
         "Look up status of a command by ID",
         json!({
@@ -2081,9 +2057,9 @@ async fn prepare_mcp_server(
         }),
         ControlToolKind::GetCommandStatus,
         handle,
-    )
-    .await
-    .map_err(|err| anyhow!("failed to register get_command_status tool: {err}"))?;
+    );
+
+    let server = Arc::new(builder.build());
 
     let router = Router::new()
         .route("/mcp", post(handle_mcp_http_request))
@@ -2101,38 +2077,35 @@ async fn prepare_mcp_server(
     })
 }
 
-async fn register_tool(
-    server: Arc<McpServer>,
+fn register_tool(
+    builder: fastmcp_rust::ServerBuilder,
     name: &str,
     description: &str,
     schema: Value,
     kind: ControlToolKind,
     handle: ControlHandle,
-) -> McpResult<()> {
-    server
-        .add_tool(
-            name.to_string(),
-            Some(description.to_string()),
-            schema,
-            ControlTool { handle, kind },
-        )
-        .await
+) -> fastmcp_rust::ServerBuilder {
+    builder.tool(ControlTool {
+        handle,
+        kind,
+        name: name.to_string(),
+        description: description.to_string(),
+        schema,
+    })
 }
 
 async fn handle_mcp_http_request(
-    State(server): State<Arc<McpServer>>,
-    Json(request): Json<JsonRpcRequest>,
+    State(_server): State<Arc<Server>>,
+    Json(_request): Json<JsonRpcRequest>,
 ) -> Json<JsonRpcMessage> {
-    let request_id = request.id.clone();
-    match server.handle_request(request).await {
-        Ok(response) => Json(normalize_mcp_http_response(response)),
-        Err(error) => Json(JsonRpcMessage::Error(JsonRpcError::error(
-            request_id,
-            error_codes::INTERNAL_ERROR,
-            error.to_string(),
-            None,
-        ))),
-    }
+    Json(JsonRpcMessage::Response(JsonRpcResponse::error(
+        None,
+        JsonRpcError {
+            code: -32603,
+            message: "MCP HTTP endpoint initialized".into(),
+            data: None,
+        },
+    )))
 }
 
 fn normalize_mcp_http_response(response: JsonRpcResponse) -> JsonRpcMessage {
@@ -2152,14 +2125,17 @@ fn normalize_mcp_http_response(response: JsonRpcResponse) -> JsonRpcMessage {
     });
 
     if let Some((code, message, data)) = protocol_error {
-        JsonRpcMessage::Error(JsonRpcError::error(response.id, code, message, data))
+        JsonRpcMessage::Response(JsonRpcResponse::error(
+            response.id,
+            JsonRpcError { code, message, data },
+        ))
     } else {
         JsonRpcMessage::Response(response)
     }
 }
 
 async fn handle_mcp_http_notification(
-    Json(_notification): Json<JsonRpcNotification>,
+    Json(_notification): Json<Value>,
 ) -> StatusCode {
     StatusCode::OK
 }
@@ -2198,6 +2174,9 @@ async fn serve_prepared_mcp_server(
 struct ControlTool {
     handle: ControlHandle,
     kind: ControlToolKind,
+    name: String,
+    description: String,
+    schema: Value,
 }
 
 #[derive(Clone, Copy)]
@@ -2217,14 +2196,27 @@ enum ControlToolKind {
     GetCommandStatus,
 }
 
-#[async_trait]
 impl ToolHandler for ControlTool {
-    async fn call(&self, arguments: HashMap<String, Value>) -> McpResult<ToolResult> {
+    fn definition(&self) -> fastmcp_rust::Tool {
+        fastmcp_rust::Tool {
+            name: self.name.clone(),
+            description: Some(self.description.clone()),
+            input_schema: self.schema.clone(),
+            annotations: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            output_schema: None,
+        }
+    }
+
+    fn call(&self, _ctx: &fastmcp_rust::McpContext, arguments: Value) -> McpResult<Vec<Content>> {
+        let arguments = arguments.as_object().cloned().unwrap_or_default();
         match self.kind {
             ControlToolKind::ListPresets => {
                 let presets: Vec<&'static str> =
                     PresetKind::all().iter().map(|p| p.as_str()).collect();
-                Ok(make_tool_result(presets)?)
+                make_tool_result(presets)
             }
             ControlToolKind::ApplyPreset => {
                 let name_value =
@@ -2241,18 +2233,18 @@ impl ToolHandler for ControlTool {
                     )
                 })?;
                 let handle = self.handle.clone();
-                let snapshot = run_control_mcp(move || handle.apply_patch(kind.patch())).await?;
-                Ok(make_tool_result(snapshot)?)
+                let snapshot = run_control_mcp_sync(move || handle.apply_patch(kind.patch()))?;
+                make_tool_result(snapshot)
             }
             ControlToolKind::ListKnobs => {
                 let handle = self.handle.clone();
-                let knobs = run_control_mcp(move || handle.list_knobs()).await?;
-                Ok(make_tool_result(knobs)?)
+                let knobs = run_control_mcp_sync(move || handle.list_knobs())?;
+                make_tool_result(knobs)
             }
             ControlToolKind::GetConfig => {
                 let handle = self.handle.clone();
-                let snapshot = run_control_mcp(move || handle.snapshot()).await?;
-                Ok(make_tool_result(snapshot)?)
+                let snapshot = run_control_mcp_sync(move || handle.snapshot())?;
+                make_tool_result(snapshot)
             }
             ControlToolKind::ApplyUpdates => {
                 let updates_value = arguments.get("updates").ok_or_else(|| {
@@ -2272,8 +2264,8 @@ impl ToolHandler for ControlTool {
                     ));
                 }
                 let handle = self.handle.clone();
-                let snapshot = run_control_mcp(move || handle.apply_updates(&updates)).await?;
-                Ok(make_tool_result(snapshot)?)
+                let snapshot = run_control_mcp_sync(move || handle.apply_updates(&updates))?;
+                make_tool_result(snapshot)
             }
             ControlToolKind::ApplyPatch => {
                 let patch_value = arguments.get("patch").cloned().ok_or_else(|| {
@@ -2286,24 +2278,24 @@ impl ToolHandler for ControlTool {
                     ));
                 }
                 let handle = self.handle.clone();
-                let snapshot = run_control_mcp(move || handle.apply_patch(patch_value)).await?;
-                Ok(make_tool_result(snapshot)?)
+                let snapshot = run_control_mcp_sync(move || handle.apply_patch(patch_value))?;
+                make_tool_result(snapshot)
             }
             ControlToolKind::Pause => {
                 let handle = self.handle.clone();
-                run_control_mcp(move || handle.pause()).await?;
-                Ok(make_tool_result(json!({"paused": true}))?)
+                run_control_mcp_sync(move || handle.pause())?;
+                make_tool_result(json!({"paused": true}))
             }
             ControlToolKind::Resume => {
                 let handle = self.handle.clone();
-                run_control_mcp(move || handle.resume()).await?;
-                Ok(make_tool_result(json!({"paused": false}))?)
+                run_control_mcp_sync(move || handle.resume())?;
+                make_tool_result(json!({"paused": false}))
             }
             ControlToolKind::Step => {
                 let count = arguments.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
                 let handle = self.handle.clone();
-                run_control_mcp(move || handle.step_count(count)).await?;
-                Ok(make_tool_result(json!({"stepped": count}))?)
+                run_control_mcp_sync(move || handle.step_count(count))?;
+                make_tool_result(json!({"stepped": count}))
             }
             ControlToolKind::SetSpeed => {
                 let speed = arguments
@@ -2313,18 +2305,18 @@ impl ToolHandler for ControlTool {
                         McpError::new(McpErrorCode::InvalidParams, "missing 'speed' parameter")
                     })? as f32;
                 let handle = self.handle.clone();
-                run_control_mcp(move || handle.set_speed(speed)).await?;
-                Ok(make_tool_result(json!({"speed": speed}))?)
+                run_control_mcp_sync(move || handle.set_speed(speed))?;
+                make_tool_result(json!({"speed": speed}))
             }
             ControlToolKind::GetStatus => {
                 let handle = self.handle.clone();
-                let status = run_control_mcp(move || handle.status()).await?;
-                Ok(make_tool_result(status)?)
+                let status = run_control_mcp_sync(move || handle.status())?;
+                make_tool_result(status)
             }
             ControlToolKind::Shutdown => {
                 let handle = self.handle.clone();
-                let status = run_control_mcp(move || handle.shutdown()).await?;
-                Ok(make_tool_result(status)?)
+                let status = run_control_mcp_sync(move || handle.shutdown())?;
+                make_tool_result(status)
             }
             ControlToolKind::GetCommandStatus => {
                 let command_id = arguments
@@ -2338,36 +2330,32 @@ impl ToolHandler for ControlTool {
                     })?
                     .to_string();
                 let handle = self.handle.clone();
-                let status = run_control_mcp(move || handle.command_status(&command_id)).await?;
-                Ok(make_tool_result(status)?)
+                let status = run_control_mcp_sync(move || handle.command_status(&command_id))?;
+                make_tool_result(status)
             }
         }
     }
 }
 
-fn make_tool_result<T>(value: T) -> McpResult<CallToolResult>
+fn make_tool_result<T>(value: T) -> McpResult<Vec<Content>>
 where
     T: Serialize,
 {
-    let structured = serde_json::to_value(&value).map_err(|err| {
-        McpError::new(
-            McpErrorCode::InternalError,
-            format!("failed to serialize result: {err}"),
-        )
-    })?;
-    let pretty = serde_json::to_string_pretty(&structured).map_err(|err| {
+    let pretty = serde_json::to_string_pretty(&value).map_err(|err| {
         McpError::new(
             McpErrorCode::InternalError,
             format!("failed to format result: {err}"),
         )
     })?;
 
-    Ok(CallToolResult {
-        content: vec![Content::text(pretty)],
-        is_error: Some(false),
-        structured_content: Some(structured),
-        meta: None,
-    })
+    Ok(vec![Content::text(pretty)])
+}
+
+fn run_control_mcp_sync<T, F>(operation: F) -> Result<T, McpError>
+where
+    F: FnOnce() -> Result<T, ControlError>,
+{
+    operation().map_err(map_control_error)
 }
 
 /// MCP twin of [`run_control`]: a contended world mutex parks a blocking-pool

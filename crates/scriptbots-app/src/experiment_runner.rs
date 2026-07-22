@@ -160,26 +160,25 @@ impl MatchedSeedExperimentRunner {
     ) -> Result<RunRecord, String> {
         let run_id = format!("{}-{}-seed{}", self.experiment_id, variant.variant_id, seed);
         let mut config = ScriptBotsConfig::default();
-        config.seed = seed;
-        config.closed = true;
+        config.rng_seed = Some(seed);
 
         for (k, &v) in &variant.config_overrides {
             match k.as_str() {
                 "food_max" => config.food_max = v,
                 "food_growth_rate" => config.food_growth_rate = v,
-                "agent_max_speed" => config.agent_max_speed = v,
+                "agent_max_speed" => config.bot_speed = v,
                 _ => {}
             }
         }
 
-        let mut world = WorldState::new_with_seed(config, seed);
+        let mut world = WorldState::new(config).map_err(|e| e.to_string())?;
 
         for _ in 0..self.max_ticks {
-            world.step();
+            let _ = world.step();
         }
 
-        let digest = world.digest_v1().calculate();
-        let digest_hex = format!("{:016x}", digest.world_counters_hash);
+        let digest = world.world_digest_v1().map_err(|e| e.to_string())?;
+        let digest_hex = digest.overall;
         let bundle_dir = self.output_dir.join(&run_id);
 
         let manifest = RunBundleManifest {
@@ -194,14 +193,14 @@ impl MatchedSeedExperimentRunner {
             cargo_lock_digest: "lock".into(),
             target_triple: std::env::consts::ARCH.into(),
             total_ticks: self.max_ticks,
-            final_agent_count: world.alive_agents(),
-            config_hash: format!("{:016x}", world.config().seed),
+            final_agent_count: world.agents().len(),
+            config_hash: format!("{:016x}", world.config().rng_seed.unwrap_or(0)),
         };
 
         let summary_csv = format!(
             "tick,alive_agents,seed\n{},{},{}\n",
             self.max_ticks,
-            world.alive_agents(),
+            world.agents().len(),
             seed
         );
 

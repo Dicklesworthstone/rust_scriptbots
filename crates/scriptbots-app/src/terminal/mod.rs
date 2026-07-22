@@ -2162,7 +2162,7 @@ impl<'a> TerminalApp<'a> {
         if let Some((best_idx, _)) = nearest {
             self.focused_agent_cursor = best_idx;
             self.focus_lock = FocusLockMode::Manual;
-            let uid = self.snapshot.agents[best_idx].uid;
+            let uid = self.snapshot.agents[best_idx].id;
             self.push_toast(format!("Selected Agent #{uid}"));
             self.refresh_snapshot();
         }
@@ -2187,7 +2187,7 @@ impl<'a> TerminalApp<'a> {
         let wx = (col as f32 / 80.0) * world_w as f32;
         let wy = (row as f32 / 36.0) * world_h as f32;
 
-        let mut nearest: Option<&AgentSummary> = None;
+        let mut nearest: Option<&AgentViz> = None;
         let mut min_d = 1600.0f32;
         for agent in &self.snapshot.agents {
             let dx = agent.position.0 - wx;
@@ -2203,7 +2203,7 @@ impl<'a> TerminalApp<'a> {
             self.hover_tooltip = Some(MouseHoverTooltip {
                 cell_x: col,
                 cell_y: row,
-                agent_uid: agent.uid,
+                agent_uid: agent.id,
                 energy: agent.energy,
                 health: agent.health,
                 age: agent.age,
