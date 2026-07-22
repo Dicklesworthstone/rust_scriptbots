@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::sse::{Event, Sse};
 use axum::{
     Json, Router,
@@ -1031,6 +1032,7 @@ pub struct SpeedRequestBody {
         get_latest_tick_summary,
         get_hydrology_snapshot,
         stream_ticks_sse,
+        stream_ticks_ws,
         get_events_tail,
         get_narrative_search,
         get_scoreboard,
@@ -1253,6 +1255,62 @@ async fn stream_ticks_sse(
             }
         });
     Ok(Sse::new(stream))
+}
+
+/// Upgrade HTTP connection to a WebSocket binary/text real-time stream.
+#[utoipa::path(
+    get,
+    path = "/api/ws/stream",
+    tag = "control",
+    responses((status = 101, description = "WebSocket upgrade for tick & event stream"))
+)]
+async fn stream_ticks_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> Response {
+    ws.on_upgrade(move |socket| handle_ws_stream(socket, state))
+}
+
+async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
+    let handle = state.handle.clone();
+    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let handle_clone = handle.clone();
+                let summary_res = tokio::task::spawn_blocking(move || handle_clone.latest_summary()).await;
+                if let Ok(Ok(summary)) = summary_res {
+                    let dto = TickSummaryDto::from(summary);
+                    if let Ok(bytes) = postcard::to_stdvec(&dto) {
+                        if socket.send(WsMessage::Binary(bytes.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        let text_str = text.trim();
+                        if text_str.eq_ignore_ascii_case("pause") {
+                            let _ = handle.pause();
+                        } else if text_str.eq_ignore_ascii_case("resume") {
+                            let _ = handle.resume();
+                        } else if text_str.eq_ignore_ascii_case("step") {
+                            let _ = handle.step();
+                        } else if let Ok(json) = serde_json::from_str::<Value>(text_str) {
+                            if let Some(cmd) = json.get("command").and_then(|c| c.as_str()) {
+                                if cmd == "speed" {
+                                    if let Some(speed) = json.get("speed").and_then(|s| s.as_f64()) {
+                                        let _ = handle.set_speed(speed as f32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// Return an ASCII snapshot of the current world mini-map.
@@ -1762,6 +1820,7 @@ fn prepare_rest_server(
         // Tick summaries (JSON one-shot and SSE stream)
         .route("/api/ticks/latest", get(get_latest_tick_summary))
         .route("/api/ticks/stream", get(stream_ticks_sse))
+        .route("/api/ws/stream", get(stream_ticks_ws))
         // Screenshots
         .route("/api/screenshot/ascii", get(screenshot_ascii))
         .route("/api/screenshot/png", get(screenshot_png))
@@ -3047,6 +3106,10 @@ mod tests {
         assert!(
             json_spec.contains("/api/narrative/search"),
             "spec must contain /api/narrative/search"
+        );
+        assert!(
+            json_spec.contains("/api/ws/stream"),
+            "spec must contain /api/ws/stream"
         );
     }
 }

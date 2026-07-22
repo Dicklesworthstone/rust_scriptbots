@@ -214,6 +214,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(ref run_db) = cli.create_bundle {
+        let output_dir = cli
+            .bundle_output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("{}-bundle", run_db.display())));
+        run_create_bundle_cli(run_db, &output_dir)?;
+        return Ok(());
+    }
+
+    if let Some(ref bundle_path) = cli.verify_bundle {
+        run_verify_bundle_cli(bundle_path)?;
+        return Ok(());
+    }
+
     if let Some(ticks) = cli.det_check {
         run_det_check(&cli, ticks)?;
         return Ok(());
@@ -2220,7 +2234,11 @@ struct AppCli {
     #[arg(long = "create-bundle", value_name = "RUN_DB")]
     create_bundle: Option<PathBuf>,
     /// Target path/directory for bundle output when using --create-bundle.
-    #[arg(long = "bundle-output", value_name = "PATH", requires = "create_bundle")]
+    #[arg(
+        long = "bundle-output",
+        value_name = "PATH",
+        requires = "create_bundle"
+    )]
     bundle_output: Option<PathBuf>,
     /// Path to a run bundle directory to verify reproducibility.
     #[arg(long = "verify-bundle", value_name = "BUNDLE_PATH")]
@@ -3052,6 +3070,45 @@ fn maybe_force_x11_for_legacy_wayland() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn run_create_bundle_cli(run_db: &Path, output_dir: &Path) -> Result<()> {
+    info!(
+        run_db = %run_db.display(),
+        output_dir = %output_dir.display(),
+        "Creating portable deterministic run bundle"
+    );
+    let bundle = scriptbots_storage::create_run_bundle(run_db, output_dir)?;
+    println!(
+        "✓ Created run bundle V1 for run {} at {}",
+        bundle.manifest.run_id,
+        output_dir.display()
+    );
+    println!("  Artifacts: {} files", bundle.artifacts.len());
+    println!("  Max Tick: {}", bundle.digests.max_tick);
+    println!("  Reproducible: {}", bundle.manifest.reproducible);
+    Ok(())
+}
+
+fn run_verify_bundle_cli(bundle_path: &Path) -> Result<()> {
+    info!(
+        bundle_path = %bundle_path.display(),
+        "Verifying portable deterministic run bundle"
+    );
+    let result = scriptbots_storage::verify_run_bundle(bundle_path)?;
+    println!(
+        "✓ Verified run bundle V1 for run {} at {}",
+        result.run_id,
+        bundle_path.display()
+    );
+    println!(
+        "  Verified Artifacts: {} files",
+        result.total_artifacts_verified
+    );
+    println!("  Total Bytes Verified: {}", result.total_bytes_verified);
+    println!("  Max Tick: {}", result.max_tick);
+    println!("  Reproducible: {}", result.reproducible);
     Ok(())
 }
 

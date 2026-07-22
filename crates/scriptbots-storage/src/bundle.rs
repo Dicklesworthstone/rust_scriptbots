@@ -1,14 +1,26 @@
 //! Portable deterministic run bundle assembly and verification.
 
-use crate::{PersistedCheckpointRecord, RunManifestRecord, StorageError, StorageReader};
+use crate::{RunManifestRecord, StorageError, StorageReader};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Schema version tag for portable run bundles.
 pub const RUN_BUNDLE_SCHEMA_VERSION: &str = "scriptbots.run-bundle.v1";
+
+fn hash_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+fn current_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
 
 #[derive(Debug, Error)]
 pub enum BundleError {
@@ -97,11 +109,11 @@ pub fn create_run_bundle(
     })?;
 
     let reader = StorageReader::open(&run_db_path.to_string_lossy())?;
-    let manifest = reader.load_manifest()?;
+    let manifest = reader.run_manifest()?;
     let max_tick = reader.max_tick()?.unwrap_or(0);
     let events = reader.load_replay_events()?;
     let checkpoints = reader.load_checkpoints()?;
-    let run_id = manifest.run_id.clone();
+    let run_id = manifest.run_id.to_string();
     reader.close()?;
 
     // 1. Copy run.db into bundle
@@ -115,7 +127,7 @@ pub fn create_run_bundle(
         path: db_dst.clone(),
         error,
     })?;
-    let db_hash = hex::encode(Sha256::digest(&db_bytes));
+    let db_hash = hash_hex(&db_bytes);
 
     let mut artifacts = vec![RunBundleArtifactEntry {
         relative_path: "run.db".to_owned(),
@@ -131,7 +143,7 @@ pub fn create_run_bundle(
         path: events_dst.clone(),
         error,
     })?;
-    let events_hash = hex::encode(Sha256::digest(events_json.as_bytes()));
+    let events_hash = hash_hex(events_json.as_bytes());
     artifacts.push(RunBundleArtifactEntry {
         relative_path: "events.json".to_owned(),
         sha256_hex: events_hash,
@@ -146,7 +158,7 @@ pub fn create_run_bundle(
         path: cp_dst.clone(),
         error,
     })?;
-    let cp_hash = hex::encode(Sha256::digest(checkpoints_json.as_bytes()));
+    let cp_hash = hash_hex(checkpoints_json.as_bytes());
     artifacts.push(RunBundleArtifactEntry {
         relative_path: "checkpoints.json".to_owned(),
         sha256_hex: cp_hash,
@@ -156,7 +168,7 @@ pub fn create_run_bundle(
 
     let bundle_digests = RunBundleDigests {
         source_revision: manifest.source_revision.clone(),
-        lockfile_digest: manifest.cargo_lock_digest.clone(),
+        lockfile_digest: Some(manifest.cargo_lock_digest.clone()),
         run_id: run_id.clone(),
         max_tick,
         event_count: events.len() as u64,
@@ -165,7 +177,7 @@ pub fn create_run_bundle(
 
     let bundle = RunBundleV1 {
         bundle_version: RUN_BUNDLE_SCHEMA_VERSION.to_owned(),
-        created_at_utc: chrono::Utc::now().to_rfc3339(),
+        created_at_utc: current_timestamp(),
         manifest,
         digests: bundle_digests,
         artifacts,
@@ -182,9 +194,7 @@ pub fn create_run_bundle(
 }
 
 /// Verify the integrity, schema, and portability of a run bundle directory.
-pub fn verify_run_bundle(
-    bundle_dir: &Path,
-) -> Result<RunBundleVerificationResult, BundleError> {
+pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResult, BundleError> {
     let manifest_path = bundle_dir.join("bundle_manifest.json");
     if !manifest_path.exists() {
         return Err(BundleError::InvalidManifest(manifest_path));
@@ -227,7 +237,7 @@ pub fn verify_run_bundle(
             });
         }
 
-        let actual_hash = hex::encode(Sha256::digest(&bytes));
+        let actual_hash = hash_hex(&bytes);
         if actual_hash != entry.sha256_hex {
             return Err(BundleError::HashMismatch {
                 path: rel_path.to_path_buf(),
@@ -243,11 +253,11 @@ pub fn verify_run_bundle(
     let db_path = bundle_dir.join("run.db");
     if db_path.exists() {
         let reader = StorageReader::open(&db_path.to_string_lossy())?;
-        let db_manifest = reader.load_manifest()?;
+        let db_manifest = reader.run_manifest()?;
         if db_manifest.run_id != bundle.manifest.run_id {
             return Err(BundleError::RunIdMismatch {
-                manifest_run_id: bundle.manifest.run_id.clone(),
-                db_run_id: db_manifest.run_id,
+                manifest_run_id: bundle.manifest.run_id.to_string(),
+                db_run_id: db_manifest.run_id.to_string(),
             });
         }
         reader.close()?;
@@ -255,12 +265,12 @@ pub fn verify_run_bundle(
 
     Ok(RunBundleVerificationResult {
         bundle_version: bundle.bundle_version,
-        run_id: bundle.manifest.run_id,
+        run_id: bundle.manifest.run_id.to_string(),
         max_tick: bundle.digests.max_tick,
         total_artifacts_verified: bundle.artifacts.len(),
         total_bytes_verified: total_bytes,
         reproducible: bundle.manifest.reproducible,
-        verified_at_utc: chrono::Utc::now().to_rfc3339(),
+        verified_at_utc: current_timestamp(),
     })
 }
 
@@ -271,13 +281,15 @@ mod tests {
 
     fn temp_db_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("scriptbots-{name}-{}.db", uuid::Uuid::new_v4()));
+        let rnd = rand::random::<u64>();
+        path.push(format!("scriptbots-{name}-{rnd}.db"));
         path
     }
 
     fn temp_bundle_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("scriptbots-bundle-{name}-{}", uuid::Uuid::new_v4()));
+        let rnd = rand::random::<u64>();
+        path.push(format!("scriptbots-bundle-{name}-{rnd}"));
         path
     }
 

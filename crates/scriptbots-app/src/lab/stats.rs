@@ -141,24 +141,29 @@ pub fn paired_diff(
 }
 
 /// Computes Hedges' g effect size with small-sample bias correction.
-pub fn hedges_g(
-    a: &[RunSummary],
-    b: &[RunSummary],
-    metric: &str,
-) -> Result<Effect, StatsError> {
+pub fn hedges_g(a: &[RunSummary], b: &[RunSummary], metric: &str) -> Result<Effect, StatsError> {
     if a.is_empty() || b.is_empty() {
         return Err(StatsError::NoSamples);
     }
 
     let vals_a: Vec<f64> = a
         .iter()
-        .map(|r| r.metrics.get(metric).copied().ok_or_else(|| StatsError::MissingMetric(metric.to_string())))
-
+        .map(|r| {
+            r.metrics
+                .get(metric)
+                .copied()
+                .ok_or_else(|| StatsError::MissingMetric(metric.to_string()))
+        })
         .collect::<Result<_, _>>()?;
 
     let vals_b: Vec<f64> = b
         .iter()
-        .map(|r| r.metrics.get(metric).copied().ok_or_else(|| StatsError::MissingMetric(metric.to_string())))
+        .map(|r| {
+            r.metrics
+                .get(metric)
+                .copied()
+                .ok_or_else(|| StatsError::MissingMetric(metric.to_string()))
+        })
         .collect::<Result<_, _>>()?;
 
     let na = vals_a.len() as f64;
@@ -211,7 +216,9 @@ pub fn bootstrap_ci(values: &[f64], iters: usize, seed: u64) -> (f64, f64) {
         let mut sample_sum = 0.0;
         for _ in 0..values.len() {
             // LCG deterministic pseudorandom index selection
-            current_seed = current_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            current_seed = current_seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
             let idx = (current_seed as usize) % values.len();
             sample_sum += values[idx];
         }

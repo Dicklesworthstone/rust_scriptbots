@@ -9,8 +9,8 @@ pub mod bundle;
 pub mod export_pipeline;
 
 pub use bundle::{
-    BundleError, RUN_BUNDLE_SCHEMA_VERSION, RunBundleArtifactEntry, RunBundleDigests,
-    RunBundleV1, RunBundleVerificationResult, create_run_bundle, verify_run_bundle,
+    BundleError, RUN_BUNDLE_SCHEMA_VERSION, RunBundleArtifactEntry, RunBundleDigests, RunBundleV1,
+    RunBundleVerificationResult, create_run_bundle, verify_run_bundle,
 };
 
 pub use journal::{
@@ -3807,7 +3807,7 @@ pub fn rebuild_ancestry(
 }
 
 /// Replay event reconstructed from persisted storage.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedReplayEvent {
     pub tick: u64,
     pub seq: u64,

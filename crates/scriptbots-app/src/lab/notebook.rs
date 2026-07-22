@@ -88,10 +88,8 @@ impl NotebookRenderer {
         }
 
         // Validate claim provenance against known runs
-        let known_run_map: std::collections::HashMap<_, _> = known_runs
-            .iter()
-            .map(|r| (r.run_id.clone(), r))
-            .collect();
+        let known_run_map: std::collections::HashMap<_, _> =
+            known_runs.iter().map(|r| (r.run_id.clone(), r)).collect();
 
         for claim in claims {
             match &claim.support {
@@ -102,9 +100,9 @@ impl NotebookRenderer {
                         ));
                     }
                     for run_ref in &eff.runs {
-                        let known = known_run_map
-                            .get(&run_ref.run_id)
-                            .ok_or_else(|| NotebookRenderError::MissingRunSupport(run_ref.run_id.clone()))?;
+                        let known = known_run_map.get(&run_ref.run_id).ok_or_else(|| {
+                            NotebookRenderError::MissingRunSupport(run_ref.run_id.clone())
+                        })?;
                         if known.digest != run_ref.digest {
                             return Err(NotebookRenderError::DigestMismatch {
                                 run_id: run_ref.run_id.clone(),
@@ -116,9 +114,9 @@ impl NotebookRenderer {
                 }
                 Support::Descriptive(runs) => {
                     for run_ref in runs {
-                        let known = known_run_map
-                            .get(&run_ref.run_id)
-                            .ok_or_else(|| NotebookRenderError::MissingRunSupport(run_ref.run_id.clone()))?;
+                        let known = known_run_map.get(&run_ref.run_id).ok_or_else(|| {
+                            NotebookRenderError::MissingRunSupport(run_ref.run_id.clone())
+                        })?;
                         if known.digest != run_ref.digest {
                             return Err(NotebookRenderError::DigestMismatch {
                                 run_id: run_ref.run_id.clone(),
@@ -131,8 +129,7 @@ impl NotebookRenderer {
             }
         }
 
-        fs::create_dir_all(out_dir)
-            .map_err(|e| NotebookRenderError::Io(e.to_string()))?;
+        fs::create_dir_all(out_dir).map_err(|e| NotebookRenderError::Io(e.to_string()))?;
 
         let mut md = String::new();
         md.push_str("# ScriptBots Autonomous Science Lab Notebook\n\n");
@@ -149,7 +146,10 @@ impl NotebookRenderer {
         for (i, claim) in claims.iter().enumerate() {
             md.push_str(&format!("### Claim {}\n", i + 1));
             md.push_str(&format!("**Statement**: {}\n\n", claim.text));
-            md.push_str(&format!("**Falsification Criteria**: {}\n\n", claim.falsifier));
+            md.push_str(&format!(
+                "**Falsification Criteria**: {}\n\n",
+                claim.falsifier
+            ));
 
             match &claim.support {
                 Support::Effect(eff) => {
@@ -175,11 +175,12 @@ impl NotebookRenderer {
         }
 
         md.push_str("## 4. Reproducibility\n");
-        md.push_str("To reproduce this exact experiment cohort, run `./reproduce.sh` in this directory.\n");
+        md.push_str(
+            "To reproduce this exact experiment cohort, run `./reproduce.sh` in this directory.\n",
+        );
 
         let notebook_path = out_dir.join("notebook.md");
-        fs::write(&notebook_path, &md)
-            .map_err(|e| NotebookRenderError::Io(e.to_string()))?;
+        fs::write(&notebook_path, &md).map_err(|e| NotebookRenderError::Io(e.to_string()))?;
 
         // Emit reproduce.sh
         let mut script = String::new();
@@ -197,8 +198,7 @@ impl NotebookRenderer {
         script.push_str("echo \"[REPRODUCE] All run bundles verified cleanly.\"\n");
 
         let reproduce_path = out_dir.join("reproduce.sh");
-        fs::write(&reproduce_path, &script)
-            .map_err(|e| NotebookRenderError::Io(e.to_string()))?;
+        fs::write(&reproduce_path, &script).map_err(|e| NotebookRenderError::Io(e.to_string()))?;
 
         #[cfg(unix)]
         {
@@ -245,7 +245,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(err, NotebookRenderError::MissingRunSupport("run-missing".into()));
+        assert_eq!(
+            err,
+            NotebookRenderError::MissingRunSupport("run-missing".into())
+        );
     }
 
     #[test]

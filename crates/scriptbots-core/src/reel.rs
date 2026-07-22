@@ -92,7 +92,6 @@ pub fn kind_weight(kind: EventKind, version: ScoringVersion) -> f32 {
     }
 }
 
-
 /// Compute rarity multiplier based on occurrence count in run.
 #[must_use]
 pub fn rarity_weight(count_of_kind: usize) -> f32 {

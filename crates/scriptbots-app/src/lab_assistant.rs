@@ -162,7 +162,8 @@ impl LabStateMachine {
                         config_overrides: spec.target_knobs.clone(),
                     };
 
-                    let run_dir = std::env::temp_dir().join(format!("scriptbots_lab_{}", self.iterations));
+                    let run_dir =
+                        std::env::temp_dir().join(format!("scriptbots_lab_{}", self.iterations));
                     let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
                         format!("lab-exp-{}", self.iterations),
                         cohort,
@@ -212,11 +213,15 @@ impl LabStateMachine {
              # reproduce.sh\n\
              scriptbots-control experiment run --seeds 42,100,2026 --knobs food_growth_rate=1.5\n\
              ```\n",
-            self.runs_spent, self.budget.max_runs, self.ticks_spent, self.budget.max_ticks, self.iterations, self.budget.max_iterations
+            self.runs_spent,
+            self.budget.max_runs,
+            self.ticks_spent,
+            self.budget.max_ticks,
+            self.iterations,
+            self.budget.max_iterations
         )
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -265,4 +270,3 @@ mod tests {
         assert!(notebook.contains("reproduce.sh"));
     }
 }
-

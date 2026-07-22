@@ -1,9 +1,7 @@
 //! Deterministic matched-seed experiment runner and batch execution engine (bd-2z0.5.5).
 
 use scriptbots_core::{ScriptBotsConfig, WorldState};
-use scriptbots_storage::export_pipeline::{
-    DeterministicRunBundle, RunBundleManifest,
-};
+use scriptbots_storage::export_pipeline::{DeterministicRunBundle, RunBundleManifest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -114,7 +112,10 @@ impl MatchedSeedExperimentRunner {
     }
 
     /// Loads existing status file if present, or initializes a new batch plan.
-    pub fn load_or_create_status(&self, state_file: &Path) -> std::io::Result<ExperimentBatchStatus> {
+    pub fn load_or_create_status(
+        &self,
+        state_file: &Path,
+    ) -> std::io::Result<ExperimentBatchStatus> {
         if state_file.exists() {
             let bytes = fs::read(state_file)?;
             if let Ok(status) = serde_json::from_slice::<ExperimentBatchStatus>(&bytes) {
@@ -135,7 +136,11 @@ impl MatchedSeedExperimentRunner {
     }
 
     /// Atomically flushes status updates to disk.
-    pub fn save_status(&self, state_file: &Path, status: &ExperimentBatchStatus) -> std::io::Result<()> {
+    pub fn save_status(
+        &self,
+        state_file: &Path,
+        status: &ExperimentBatchStatus,
+    ) -> std::io::Result<()> {
         if let Some(parent) = state_file.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -148,7 +153,11 @@ impl MatchedSeedExperimentRunner {
     }
 
     /// Executes a single run deterministically, creating and verifying its run bundle.
-    pub fn execute_single_run(&self, variant: &ScenarioVariant, seed: u64) -> Result<RunRecord, String> {
+    pub fn execute_single_run(
+        &self,
+        variant: &ScenarioVariant,
+        seed: u64,
+    ) -> Result<RunRecord, String> {
         let run_id = format!("{}-{}-seed{}", self.experiment_id, variant.variant_id, seed);
         let mut config = ScriptBotsConfig::default();
         config.seed = seed;
@@ -189,7 +198,12 @@ impl MatchedSeedExperimentRunner {
             config_hash: format!("{:016x}", world.config().seed),
         };
 
-        let summary_csv = format!("tick,alive_agents,seed\n{},{},{}\n", self.max_ticks, world.alive_agents(), seed);
+        let summary_csv = format!(
+            "tick,alive_agents,seed\n{},{},{}\n",
+            self.max_ticks,
+            world.alive_agents(),
+            seed
+        );
 
         DeterministicRunBundle::assemble_bundle(
             &bundle_dir,
@@ -279,14 +293,8 @@ mod tests {
             },
         ];
 
-        let runner = MatchedSeedExperimentRunner::new(
-            "exp-001",
-            cohort,
-            variants,
-            50,
-            2,
-            "/tmp/exp_test",
-        );
+        let runner =
+            MatchedSeedExperimentRunner::new("exp-001", cohort, variants, 50, 2, "/tmp/exp_test");
 
         let plan = runner.plan_batch();
         assert_eq!(plan.len(), 6);
@@ -317,14 +325,8 @@ mod tests {
             },
         ];
 
-        let runner = MatchedSeedExperimentRunner::new(
-            "exp-matched",
-            cohort,
-            variants,
-            20,
-            2,
-            output_dir,
-        );
+        let runner =
+            MatchedSeedExperimentRunner::new("exp-matched", cohort, variants, 20, 2, output_dir);
 
         let status = runner.execute_batch(&state_file).unwrap();
         assert_eq!(status.completed_runs, 4);

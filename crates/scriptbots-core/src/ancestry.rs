@@ -94,7 +94,6 @@ pub struct LineageFitnessSummary {
     pub founder_contribution_share: f32,
 }
 
-
 /// One agent's place in the tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AncestryNode {
@@ -235,8 +234,6 @@ pub struct AncestryGraph {
 }
 
 impl AncestryGraph {
-
-
     /// An empty graph.
     #[must_use]
     pub fn new() -> Self {
@@ -1109,18 +1106,41 @@ mod tests {
     fn test_lineage_fitness_and_founder_contributions() {
         let mut graph = AncestryGraph::new();
         // Seed 2 founders
-        graph.apply_birth(&birth_with_origin(1, 0, [None, None], 0, BirthOrigin::Seeded)).unwrap();
-        graph.apply_birth(&birth_with_origin(2, 0, [None, None], 0, BirthOrigin::Seeded)).unwrap();
+        graph
+            .apply_birth(&birth_with_origin(
+                1,
+                0,
+                [None, None],
+                0,
+                BirthOrigin::Seeded,
+            ))
+            .unwrap();
+        graph
+            .apply_birth(&birth_with_origin(
+                2,
+                0,
+                [None, None],
+                0,
+                BirthOrigin::Seeded,
+            ))
+            .unwrap();
 
         // Founder 1 produces child 3
-        graph.apply_birth(&birth(3, 10, [Some(1), None], 1)).unwrap();
+        graph
+            .apply_birth(&birth(3, 10, [Some(1), None], 1))
+            .unwrap();
         // Child 3 produces grandchild 4
-        graph.apply_birth(&birth(4, 20, [Some(3), None], 2)).unwrap();
+        graph
+            .apply_birth(&birth(4, 20, [Some(3), None], 2))
+            .unwrap();
 
         let contributions = graph.compute_founder_contributions();
         assert_eq!(contributions.len(), 2);
 
-        let f1_contrib = contributions.iter().find(|c| c.founder_uid == AgentUid(1)).unwrap();
+        let f1_contrib = contributions
+            .iter()
+            .find(|c| c.founder_uid == AgentUid(1))
+            .unwrap();
         assert_eq!(f1_contrib.total_descendants, 2);
         assert_eq!(f1_contrib.living_descendants, 3); // 1, 3, 4 all living
 
@@ -1131,4 +1151,3 @@ mod tests {
         assert_eq!(fitness.max_generation_depth, 2);
     }
 }
-

@@ -311,10 +311,7 @@ mod tests {
         let index = DeterministicRunBundle::assemble_bundle(
             &bundle_path,
             manifest.clone(),
-            &[
-                ("db.sqlite", db_bytes),
-                ("exports/metrics.csv", csv_bytes),
-            ],
+            &[("db.sqlite", db_bytes), ("exports/metrics.csv", csv_bytes)],
         )
         .unwrap();
 
@@ -367,4 +364,3 @@ mod tests {
         }
     }
 }
-

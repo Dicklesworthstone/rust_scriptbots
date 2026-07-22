@@ -505,8 +505,10 @@ pub fn compare_phenotype_clusters(
             let mean_a = vals_a.iter().sum::<f32>() / vals_a.len() as f32;
             let mean_b = vals_b.iter().sum::<f32>() / vals_b.len() as f32;
 
-            let var_a = vals_a.iter().map(|x| (x - mean_a).powi(2)).sum::<f32>() / vals_a.len() as f32;
-            let var_b = vals_b.iter().map(|x| (x - mean_b).powi(2)).sum::<f32>() / vals_b.len() as f32;
+            let var_a =
+                vals_a.iter().map(|x| (x - mean_a).powi(2)).sum::<f32>() / vals_a.len() as f32;
+            let var_b =
+                vals_b.iter().map(|x| (x - mean_b).powi(2)).sum::<f32>() / vals_b.len() as f32;
 
             let pooled_sd = ((var_a + var_b) / 2.0).sqrt().max(1e-6);
             let cohens_d = (mean_a - mean_b) / pooled_sd;
@@ -736,26 +738,28 @@ mod tests {
             },
         ];
 
-        let cohort_b = vec![
-            AgentPhenotypeVector {
-                agent_uid: AgentUid(3),
-                movement_speed_mean: 0.5,
-                diet_herbivore_ratio: 0.1,
-                sensing_range_mean: 0.3,
-                aggression_index: 0.8,
-                giving_altruism_index: 0.0,
-                reproduction_rate: 0.01,
-            },
-        ];
+        let cohort_b = vec![AgentPhenotypeVector {
+            agent_uid: AgentUid(3),
+            movement_speed_mean: 0.5,
+            diet_herbivore_ratio: 0.1,
+            sensing_range_mean: 0.3,
+            aggression_index: 0.8,
+            giving_altruism_index: 0.0,
+            reproduction_rate: 0.01,
+        }];
 
         let report = compute_phenotype_analysis("run-test", Tick(100), &cohort_a);
         assert_eq!(report.total_agents_analyzed, 2);
         assert_eq!(report.mean_phenotype.len(), 6);
 
-        let comparison = compare_phenotype_clusters("Herbivores", &cohort_a, "Carnivores", &cohort_b);
+        let comparison =
+            compare_phenotype_clusters("Herbivores", &cohort_a, "Carnivores", &cohort_b);
         assert_eq!(comparison.sample_size_a, 2);
         assert_eq!(comparison.sample_size_b, 1);
-        assert!(comparison.feature_effect_sizes.contains_key("movement_speed"));
+        assert!(
+            comparison
+                .feature_effect_sizes
+                .contains_key("movement_speed")
+        );
     }
 }
-
