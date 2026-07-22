@@ -8,14 +8,15 @@
 //! serialized dumps. A reordered field must never read as a mutation, and a retarget from
 //! 88 to 14 must read as exactly one typed [`GenomeDelta::Retarget`].
 
-use crate::{BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope};
+use crate::{AgentUid, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, Tick};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// One addressable genome locus, in canonical order (index order, never a hash walk).
 ///
 /// Two genomes of the same family and schema produce loci in the same order, so the diff
 /// is a single aligned pass and its bytes are reproducible on any platform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Locus {
     /// Bias of the node with the given index.
     NodeBias(u32),
@@ -67,7 +68,7 @@ impl Locus {
 /// One decoded locus value. Float comparison for scalars is BITWISE (`f32::to_bits`) —
 /// heredity is an exact claim, and an epsilon-tolerant diff would hide exactly the
 /// corruption it exists to find.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LocusValue {
     /// A continuous scalar parameter; compared bitwise via `f32::to_bits`.
     Scalar(f32),
@@ -164,15 +165,17 @@ pub struct LocusSample {
 /// Trace a specific locus value across a sequence of lineage ancestor envelopes.
 #[must_use]
 pub fn trace_lineage_locus(
+    registry: &crate::BrainRegistry,
     lineage_samples: &[(u32, AgentUid, Tick, BrainGenomeEnvelope)],
     locus: Locus,
 ) -> Vec<LocusSample> {
     lineage_samples
         .iter()
         .map(|(generation, agent_uid, tick, envelope)| {
-            let value = envelope
-                .genome_loci()
+            let value = registry
+                .find_codec(&envelope.family_id)
                 .ok()
+                .and_then(|codec| codec.genome_loci(envelope).ok())
                 .and_then(|loci| {
                     loci.into_iter()
                         .find(|(loc, _)| *loc == locus)
@@ -222,11 +225,11 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
 
     let mut svg = String::new();
     svg.push_str(&format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"#
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"##
     ));
-    svg.push_str(r#"<rect width="100%" height="100%" fill="#1e1e2e"/>"#);
+    svg.push_str(r##"<rect width="100%" height="100%" fill="#1e1e2e"/>"##);
     svg.push_str(&format!(
-        r#"<text x="{}" y="25" fill="#cdd6f4" font-size="14" font-family="sans-serif" text-anchor="middle">Locus Trace: {}</text>"#,
+        r##"<text x="{}" y="25" fill="#cdd6f4" font-size="14" font-family="sans-serif" text-anchor="middle">Locus Trace: {}</text>"##,
         width / 2.0,
         locus.human()
     ));
