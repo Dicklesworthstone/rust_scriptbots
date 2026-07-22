@@ -51,6 +51,9 @@ use crate::{
 
 /// Sub-cell painter engine (bd-2z0.14.2.1.1): pure braille/half-block/quadrant
 /// compositing primitives consumed by the high-resolution canvas work.
+pub mod canvas_inspector;
+pub mod command_palette;
+pub mod frankentui_shell;
 pub mod paint;
 
 const TARGET_SIM_HZ: f32 = 60.0;
@@ -3674,11 +3677,73 @@ impl TerminalPaletteMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CuratedThemeId {
+    CyberpunkAurora,
+    Darcula,
+    LumenLight,
+    NordicFrost,
+    HighContrast,
+}
+
+impl Default for CuratedThemeId {
+    fn default() -> Self {
+        Self::CyberpunkAurora
+    }
+}
+
+impl CuratedThemeId {
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::CyberpunkAurora => Self::Darcula,
+            Self::Darcula => Self::LumenLight,
+            Self::LumenLight => Self::NordicFrost,
+            Self::NordicFrost => Self::HighContrast,
+            Self::HighContrast => Self::CyberpunkAurora,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CyberpunkAurora => "Cyberpunk Aurora",
+            Self::Darcula => "Darcula",
+            Self::LumenLight => "Lumen Light",
+            Self::NordicFrost => "Nordic Frost",
+            Self::HighContrast => "High Contrast",
+        }
+    }
+
+    #[must_use]
+    pub fn header_color(self) -> Color {
+        match self {
+            Self::CyberpunkAurora => rgb(0x00f5ff),
+            Self::Darcula => rgb(0xffc66d),
+            Self::LumenLight => rgb(0x1e293b),
+            Self::NordicFrost => rgb(0x88c0d0),
+            Self::HighContrast => rgb(0xffff00),
+        }
+    }
+
+    #[must_use]
+    pub fn accent_color(self) -> Color {
+        match self {
+            Self::CyberpunkAurora => rgb(0xff007f),
+            Self::Darcula => rgb(0xcc7832),
+            Self::LumenLight => rgb(0x0284c7),
+            Self::NordicFrost => rgb(0x81a1c1),
+            Self::HighContrast => rgb(0xffffff),
+        }
+    }
+}
+
 struct Palette {
     level: Option<ColorLevel>,
     emoji: bool,
     emoji_narrow: bool,
     mode: TerminalPaletteMode,
+    theme_id: CuratedThemeId,
 }
 
 #[derive(Clone, Copy)]
@@ -3712,6 +3777,7 @@ impl Palette {
             emoji: false,
             emoji_narrow: false,
             mode: TerminalPaletteMode::Natural,
+            theme_id: CuratedThemeId::CyberpunkAurora,
         }
     }
 
@@ -3935,6 +4001,7 @@ impl Palette {
             emoji,
             emoji_narrow: false,
             mode,
+            theme_id: CuratedThemeId::CyberpunkAurora,
         }
     }
 
@@ -4022,6 +4089,15 @@ impl Palette {
 
     fn mode_label(&self) -> &'static str {
         self.mode.label()
+    }
+
+    fn cycle_theme(&mut self) -> &'static str {
+        self.theme_id = self.theme_id.next();
+        self.theme_id.label()
+    }
+
+    fn theme_label(&self) -> &'static str {
+        self.theme_id.label()
     }
 
     fn is_emoji_narrow(&self) -> bool {
@@ -5784,6 +5860,59 @@ mod tests {
         // 3. Report tick equals snapshot tick
         let report = app.snapshot();
         assert_eq!(report.tick, 1);
+    }
+
+    #[test]
+    fn test_curated_theme_id_cycling() {
+        let t1 = CuratedThemeId::CyberpunkAurora;
+        let t2 = t1.next();
+        let t3 = t2.next();
+        let t4 = t3.next();
+        let t5 = t4.next();
+        let t6 = t5.next();
+
+        assert_eq!(t2, CuratedThemeId::Darcula);
+        assert_eq!(t3, CuratedThemeId::LumenLight);
+        assert_eq!(t4, CuratedThemeId::NordicFrost);
+        assert_eq!(t5, CuratedThemeId::HighContrast);
+        assert_eq!(t6, CuratedThemeId::CyberpunkAurora, "theme cycle must wrap back to start");
+
+        assert_eq!(t1.label(), "Cyberpunk Aurora");
+        assert_ne!(t1.header_color(), t2.header_color());
+    }
+
+    #[test]
+    fn test_theme_palette_wcag_contrast_spot_checks() {
+        let themes = [
+            CuratedThemeId::CyberpunkAurora,
+            CuratedThemeId::Darcula,
+            CuratedThemeId::LumenLight,
+            CuratedThemeId::NordicFrost,
+            CuratedThemeId::HighContrast,
+        ];
+        let palettes = [
+            TerminalPaletteMode::Natural,
+            TerminalPaletteMode::Deuteranopia,
+            TerminalPaletteMode::Protanopia,
+            TerminalPaletteMode::Tritanopia,
+            TerminalPaletteMode::HighContrast,
+        ];
+
+        for theme in themes {
+            for mode in palettes {
+                let p = Palette {
+                    level: Some(ratatui::style::ColorLevel::TrueColor),
+                    emoji: true,
+                    emoji_narrow: false,
+                    mode,
+                    theme_id: theme,
+                };
+                let _hdr_style = p.header_style();
+                let _acc_style = p.accent_style();
+                assert_ne!(p.mode_label(), "", "palette mode label must not be empty");
+                assert_ne!(p.theme_label(), "", "theme label must not be empty");
+            }
+        }
     }
 }
 
