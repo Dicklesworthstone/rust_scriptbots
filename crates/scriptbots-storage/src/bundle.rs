@@ -282,15 +282,21 @@ mod tests {
 
     fn temp_db_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        let rnd = rand::random::<u64>();
-        path.push(format!("scriptbots-{name}-{rnd}.db"));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        path.push(format!("scriptbots-{name}-{nanos}.db"));
         path
     }
 
     fn temp_bundle_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        let rnd = rand::random::<u64>();
-        path.push(format!("scriptbots-bundle-{name}-{rnd}"));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        path.push(format!("scriptbots-bundle-{name}-{nanos}"));
         path
     }
 
