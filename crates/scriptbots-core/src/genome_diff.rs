@@ -148,6 +148,124 @@ pub struct GenomeDiff {
     pub summary: DiffSummary,
 }
 
+/// A single point sample along a lineage trace for a specific locus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocusSample {
+    /// Lineage generation.
+    pub generation: u32,
+    /// Stable Agent UID.
+    pub agent_uid: AgentUid,
+    /// Tick when the sample was recorded.
+    pub tick: Tick,
+    /// Value at this locus, or `None` if the locus is absent in an older schema/shape.
+    pub value: Option<LocusValue>,
+}
+
+/// Trace a specific locus value across a sequence of lineage ancestor envelopes.
+#[must_use]
+pub fn trace_lineage_locus(
+    lineage_samples: &[(u32, AgentUid, Tick, BrainGenomeEnvelope)],
+    locus: Locus,
+) -> Vec<LocusSample> {
+    lineage_samples
+        .iter()
+        .map(|(generation, agent_uid, tick, envelope)| {
+            let value = envelope
+                .genome_loci()
+                .ok()
+                .and_then(|loci| {
+                    loci.into_iter()
+                        .find(|(loc, _)| *loc == locus)
+                        .map(|(_, val)| val)
+                });
+            LocusSample {
+                generation: *generation,
+                agent_uid: *agent_uid,
+                tick: *tick,
+                value,
+            }
+        })
+        .collect()
+}
+
+/// Export a locus trace as a CSV string.
+#[must_use]
+pub fn export_locus_trace_csv(samples: &[LocusSample], locus: Locus) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Locus Trace: {}\n", locus.human()));
+    out.push_str("generation,agent_uid,tick,value_type,value\n");
+    for s in samples {
+        match s.value {
+            Some(LocusValue::Scalar(v)) => {
+                out.push_str(&format!("{},{},{},scalar,{v}\n", s.generation, s.agent_uid.0, s.tick.0));
+            }
+            Some(LocusValue::Target(v)) => {
+                out.push_str(&format!("{},{},{},target,{v}\n", s.generation, s.agent_uid.0, s.tick.0));
+            }
+            Some(LocusValue::Kind(v)) => {
+                out.push_str(&format!("{},{},{},kind,{v}\n", s.generation, s.agent_uid.0, s.tick.0));
+            }
+            None => {
+                out.push_str(&format!("{},{},{},gap,GAP\n", s.generation, s.agent_uid.0, s.tick.0));
+            }
+        }
+    }
+    out
+}
+
+/// Export a locus trace as an SVG chart string.
+#[must_use]
+pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
+    let width = 600.0;
+    let height = 300.0;
+    let padding = 40.0;
+
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"#
+    ));
+    svg.push_str(r#"<rect width="100%" height="100%" fill="#1e1e2e"/>"#);
+    svg.push_str(&format!(
+        r#"<text x="{}" y="25" fill="#cdd6f4" font-size="14" font-family="sans-serif" text-anchor="middle">Locus Trace: {}</text>"#,
+        width / 2.0,
+        locus.human()
+    ));
+
+    let valid_scalars: Vec<(f32, f32)> = samples
+        .iter()
+        .filter_map(|s| match s.value {
+            Some(LocusValue::Scalar(v)) => Some((s.generation as f32, v)),
+            _ => None,
+        })
+        .collect();
+
+    if valid_scalars.len() >= 2 {
+        let min_gen = valid_scalars.iter().map(|(g, _)| *g).fold(f32::INFINITY, f32::min);
+        let max_gen = valid_scalars.iter().map(|(g, _)| *g).fold(f32::NEG_INFINITY, f32::max);
+        let min_val = valid_scalars.iter().map(|(_, v)| *v).fold(f32::INFINITY, f32::min);
+        let max_val = valid_scalars.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+
+        let gen_span = (max_gen - min_gen).max(1.0);
+        let val_span = (max_val - min_val).max(0.001);
+
+        let mut points = String::new();
+        for (g, v) in &valid_scalars {
+            let x = padding + (g - min_gen) / gen_span * (width - 2.0 * padding);
+            let y = height - padding - (v - min_val) / val_span * (height - 2.0 * padding);
+            if !points.is_empty() {
+                points.push(' ');
+            }
+            points.push_str(&format!("{x:.1},{y:.1}"));
+        }
+        svg.push_str(&format!(
+            r#"<polyline fill="none" stroke="#89b4fa" stroke-width="2" points="{points}"/>"#
+        ));
+    }
+
+    svg.push_str("</svg>");
+    svg
+}
+
 /// Degenerate inputs are typed, never a panic and never a silent empty diff.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenomeDiffError {
@@ -313,5 +431,40 @@ mod tests {
             Locus::NodeTarget { node: 3, conn: 0 }.human(),
             "node 3 conn 0 target"
         );
+    }
+
+    #[test]
+    fn test_trace_lineage_locus_and_exporters() {
+        let locus = Locus::NodeBias(0);
+        let samples = vec![
+            LocusSample {
+                generation: 1,
+                agent_uid: AgentUid(100),
+                tick: Tick(10),
+                value: Some(LocusValue::Scalar(0.5)),
+            },
+            LocusSample {
+                generation: 2,
+                agent_uid: AgentUid(101),
+                tick: Tick(20),
+                value: Some(LocusValue::Scalar(0.75)),
+            },
+            LocusSample {
+                generation: 3,
+                agent_uid: AgentUid(102),
+                tick: Tick(30),
+                value: None, // gap
+            },
+        ];
+
+        let csv = export_locus_trace_csv(&samples, locus);
+        assert!(csv.contains("generation,agent_uid,tick,value_type,value"));
+        assert!(csv.contains("1,100,10,scalar,0.5"));
+        assert!(csv.contains("3,102,30,gap,GAP"));
+
+        let svg = export_locus_trace_svg(&samples, locus);
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("Locus Trace: node 0 bias"));
+        assert!(svg.contains("<polyline"));
     }
 }
