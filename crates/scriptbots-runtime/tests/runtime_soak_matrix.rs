@@ -1,8 +1,7 @@
 //! Runtime lifecycle, contention, and soak matrix integration tests (bd-2z0.4.11).
 
 use scriptbots_core::{
-    AgentId, ControlCommand, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate,
-    WorldState,
+    ControlCommand, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, WorldState,
 };
 use std::sync::{
     Arc,
@@ -65,12 +64,12 @@ fn test_runtime_lifecycle_contention_storm_and_soak() {
 #[test]
 fn test_runtime_soak_digest_invariance() {
     let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
-    let initial_tick = world.tick_count();
+    let initial_tick = world.tick().0;
 
     // Step world 50 ticks deterministically
     for _ in 0..50 {
         let _ = world.step();
     }
 
-    assert_eq!(world.tick_count(), initial_tick + 50);
+    assert_eq!(world.tick().0, initial_tick + 50);
 }
