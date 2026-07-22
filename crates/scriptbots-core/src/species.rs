@@ -432,8 +432,152 @@ pub fn segment_species(
     )
 }
 
+/// Multi-axis behavior feature vector for an agent (bd-2z0.11.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentPhenotypeVector {
+    pub agent_uid: AgentUid,
+    pub movement_speed_mean: f32,
+    pub diet_herbivore_ratio: f32,
+    pub sensing_range_mean: f32,
+    pub aggression_index: f32,
+    pub giving_altruism_index: f32,
+    pub reproduction_rate: f32,
+}
+
+impl AgentPhenotypeVector {
+    pub fn features(&self) -> [f32; 6] {
+        [
+            self.movement_speed_mean,
+            self.diet_herbivore_ratio,
+            self.sensing_range_mean,
+            self.aggression_index,
+            self.giving_altruism_index,
+            self.reproduction_rate,
+        ]
+    }
+}
+
+/// Statistical comparison between two phenotype clusters (bd-2z0.11.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PhenotypeClusterComparison {
+    pub cluster_a_name: String,
+    pub cluster_b_name: String,
+    pub sample_size_a: usize,
+    pub sample_size_b: usize,
+    pub feature_effect_sizes: std::collections::HashMap<String, f32>,
+    pub overall_mahalanobis_distance: f32,
+}
+
+/// Comprehensive phenotype shift and interaction analysis report (bd-2z0.11.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PhenotypeAnalysisReport {
+    pub run_id: String,
+    pub tick: Tick,
+    pub total_agents_analyzed: usize,
+    pub mean_phenotype: Vec<f32>,
+    pub phenotype_variance: Vec<f32>,
+    pub comparisons: Vec<PhenotypeClusterComparison>,
+}
+
+/// Compares two phenotype feature cohorts computing effect sizes (Cohen's d) per dimension (bd-2z0.11.2).
+pub fn compare_phenotype_clusters(
+    name_a: &str,
+    a: &[AgentPhenotypeVector],
+    name_b: &str,
+    b: &[AgentPhenotypeVector],
+) -> PhenotypeClusterComparison {
+    let feature_names = [
+        "movement_speed",
+        "diet_herbivore_ratio",
+        "sensing_range",
+        "aggression_index",
+        "giving_altruism_index",
+        "reproduction_rate",
+    ];
+
+    let mut effect_sizes = std::collections::HashMap::new();
+
+    if !a.is_empty() && !b.is_empty() {
+        for (i, &name) in feature_names.iter().enumerate() {
+            let vals_a: Vec<f32> = a.iter().map(|v| v.features()[i]).collect();
+            let vals_b: Vec<f32> = b.iter().map(|v| v.features()[i]).collect();
+
+            let mean_a = vals_a.iter().sum::<f32>() / vals_a.len() as f32;
+            let mean_b = vals_b.iter().sum::<f32>() / vals_b.len() as f32;
+
+            let var_a = vals_a.iter().map(|x| (x - mean_a).powi(2)).sum::<f32>() / vals_a.len() as f32;
+            let var_b = vals_b.iter().map(|x| (x - mean_b).powi(2)).sum::<f32>() / vals_b.len() as f32;
+
+            let pooled_sd = ((var_a + var_b) / 2.0).sqrt().max(1e-6);
+            let cohens_d = (mean_a - mean_b) / pooled_sd;
+            effect_sizes.insert(name.to_string(), cohens_d);
+        }
+    }
+
+    PhenotypeClusterComparison {
+        cluster_a_name: name_a.to_string(),
+        cluster_b_name: name_b.to_string(),
+        sample_size_a: a.len(),
+        sample_size_b: b.len(),
+        feature_effect_sizes: effect_sizes,
+        overall_mahalanobis_distance: 0.0,
+    }
+}
+
+/// Generates a comprehensive phenotype analysis report over population samples (bd-2z0.11.2).
+pub fn compute_phenotype_analysis(
+    run_id: &str,
+    tick: Tick,
+    vectors: &[AgentPhenotypeVector],
+) -> PhenotypeAnalysisReport {
+    if vectors.is_empty() {
+        return PhenotypeAnalysisReport {
+            run_id: run_id.to_string(),
+            tick,
+            total_agents_analyzed: 0,
+            mean_phenotype: vec![0.0; 6],
+            phenotype_variance: vec![0.0; 6],
+            comparisons: Vec::new(),
+        };
+    }
+
+    let count = vectors.len() as f32;
+    let mut means = vec![0.0f32; 6];
+
+    for vec in vectors {
+        let f = vec.features();
+        for i in 0..6 {
+            means[i] += f[i];
+        }
+    }
+    for i in 0..6 {
+        means[i] /= count;
+    }
+
+    let mut vars = vec![0.0f32; 6];
+    for vec in vectors {
+        let f = vec.features();
+        for i in 0..6 {
+            vars[i] += (f[i] - means[i]).powi(2);
+        }
+    }
+    for i in 0..6 {
+        vars[i] /= count;
+    }
+
+    PhenotypeAnalysisReport {
+        run_id: run_id.to_string(),
+        tick,
+        total_agents_analyzed: vectors.len(),
+        mean_phenotype: means,
+        phenotype_variance: vars,
+        comparisons: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -568,4 +712,50 @@ mod tests {
         assert_eq!(table_normal.species[0].members, vec![AgentUid(1)]);
         assert_eq!(table_outlier.species[0].members, vec![AgentUid(1)]);
     }
+
+    #[test]
+    fn test_phenotype_feature_analysis_and_clustering() {
+        let cohort_a = vec![
+            AgentPhenotypeVector {
+                agent_uid: AgentUid(1),
+                movement_speed_mean: 1.5,
+                diet_herbivore_ratio: 0.9,
+                sensing_range_mean: 0.8,
+                aggression_index: 0.1,
+                giving_altruism_index: 0.5,
+                reproduction_rate: 0.05,
+            },
+            AgentPhenotypeVector {
+                agent_uid: AgentUid(2),
+                movement_speed_mean: 1.6,
+                diet_herbivore_ratio: 0.95,
+                sensing_range_mean: 0.82,
+                aggression_index: 0.05,
+                giving_altruism_index: 0.6,
+                reproduction_rate: 0.06,
+            },
+        ];
+
+        let cohort_b = vec![
+            AgentPhenotypeVector {
+                agent_uid: AgentUid(3),
+                movement_speed_mean: 0.5,
+                diet_herbivore_ratio: 0.1,
+                sensing_range_mean: 0.3,
+                aggression_index: 0.8,
+                giving_altruism_index: 0.0,
+                reproduction_rate: 0.01,
+            },
+        ];
+
+        let report = compute_phenotype_analysis("run-test", Tick(100), &cohort_a);
+        assert_eq!(report.total_agents_analyzed, 2);
+        assert_eq!(report.mean_phenotype.len(), 6);
+
+        let comparison = compare_phenotype_clusters("Herbivores", &cohort_a, "Carnivores", &cohort_b);
+        assert_eq!(comparison.sample_size_a, 2);
+        assert_eq!(comparison.sample_size_b, 1);
+        assert!(comparison.feature_effect_sizes.contains_key("movement_speed"));
+    }
 }
+
