@@ -5739,6 +5739,52 @@ mod tests {
         assert!(app.paused);
         assert_eq!(app.last_autopause_tick, Some(app.snapshot.tick));
     }
+
+    #[test]
+    fn test_terminal_app_host_client_snapshot_and_cadence_parity() {
+        let config = ScriptBotsConfig::default();
+        let world = WorldState::new(config).expect("world");
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+            scenario: test_scenario(),
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+
+        // Initial snapshot tick parity
+        assert_eq!(app.snapshot().tick, 0);
+
+        // 1. Paused state by default: renderer cadence cannot advance science
+        app.paused = true;
+        let now = Instant::now();
+        app.advance_simulation(now + Duration::from_millis(500), false);
+        assert_eq!(
+            app.snapshot().tick,
+            0,
+            "renderer cadence must not advance science when paused"
+        );
+
+        // 2. Single step advances science by exactly 1 tick
+        app.step_once();
+        assert_eq!(
+            app.snapshot().tick,
+            1,
+            "step_once must advance science by exactly 1 tick"
+        );
+        assert!(app.paused, "simulation must remain paused after step_once");
+
+        // 3. Report tick equals snapshot tick
+        let report = app.snapshot();
+        assert_eq!(report.tick, 1);
+    }
 }
 
 #[derive(Clone, Debug)]

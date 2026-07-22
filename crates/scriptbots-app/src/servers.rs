@@ -43,9 +43,9 @@ use crate::command::{
     CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
 };
 use crate::control::{
-    AgentScoreEntry, ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry,
-    EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
-    SelectionStateDto, SharedLatestSummary,
+    AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, DietClassDto,
+    EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
+    SelectionStateDto, SharedLatestSummary, SpeedRequest,
 };
 use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
 // keep image out of servers unless needed
@@ -365,6 +365,7 @@ fn reserve_control_listener(name: &str, address: SocketAddr) -> Result<ReservedC
 pub enum ControlRuntimeStatus {
     Starting,
     Running,
+    Disabled,
     Stopped,
     Failed(String),
 }
@@ -525,6 +526,9 @@ fn publish_control_runtime_result(
     status: &watch::Sender<ControlRuntimeStatus>,
     result: &Result<()>,
 ) {
+    if matches!(*status.borrow(), ControlRuntimeStatus::Disabled) {
+        return;
+    }
     let final_status = match result {
         Ok(()) => ControlRuntimeStatus::Stopped,
         Err(error) => ControlRuntimeStatus::Failed(format!("{error:#}")),
@@ -540,13 +544,17 @@ fn control_runtime_health(
         let cached = probe.borrow_and_update().clone();
         match &cached {
             ControlRuntimeStatus::Failed(detail) => return Err(detail.clone()),
-            ControlRuntimeStatus::Stopped => return Err("control runtime stopped".to_string()),
+            ControlRuntimeStatus::Stopped | ControlRuntimeStatus::Disabled => return Ok(()),
             ControlRuntimeStatus::Starting | ControlRuntimeStatus::Running => {}
         }
 
         match probe.has_changed() {
             Ok(true) => continue,
             Err(_) => {
+                let current = probe.borrow().clone();
+                if matches!(current, ControlRuntimeStatus::Disabled | ControlRuntimeStatus::Stopped) {
+                    return Ok(());
+                }
                 return Err(
                     "control runtime terminated without publishing final status".to_string()
                 );
@@ -556,8 +564,10 @@ fn control_runtime_health(
                     ControlRuntimeStatus::Starting => {
                         Err("control runtime is still starting".to_string())
                     }
-                    ControlRuntimeStatus::Running => Ok(()),
-                    ControlRuntimeStatus::Stopped | ControlRuntimeStatus::Failed(_) => {
+                    ControlRuntimeStatus::Running
+                    | ControlRuntimeStatus::Disabled
+                    | ControlRuntimeStatus::Stopped => Ok(()),
+                    ControlRuntimeStatus::Failed(_) => {
                         unreachable!("terminal statuses returned before closure inspection")
                     }
                 };
@@ -624,7 +634,11 @@ async fn run_control_servers(
         }
     };
 
-    status.send_replace(ControlRuntimeStatus::Running);
+    if servers.rest.is_none() && servers.mcp.is_none() {
+        status.send_replace(ControlRuntimeStatus::Disabled);
+    } else {
+        status.send_replace(ControlRuntimeStatus::Running);
+    }
     if startup.send(ControlStartupSignal::Ready).is_err() {
         let _ = shutdown_signal.send(true);
         return servers
@@ -988,6 +1002,27 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
     }
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CommandAcknowledge {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct StepRequestBody {
+    #[serde(default = "default_step_count")]
+    pub count: u64,
+}
+
+fn default_step_count() -> u64 {
+    1
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SpeedRequestBody {
+    pub speed: f32,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1005,7 +1040,12 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
         get_scenario,
         list_presets,
         apply_preset,
-        post_selection
+        post_selection,
+        post_pause,
+        post_resume,
+        post_step,
+        post_speed,
+        get_status
     ),
     components(
         schemas(
@@ -1031,7 +1071,11 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
             AgentDebugEntryDto,
             PositionDto,
             SelectionUpdateRequestBody,
-            SelectionAcknowledge
+            SelectionAcknowledge,
+            CommandAcknowledge,
+            StepRequestBody,
+            SpeedRequestBody,
+            SimulationStatusDto
         )
     ),
     info(title = "ScriptBots Control API", version = "0.0.0"),
@@ -1517,6 +1561,158 @@ async fn apply_preset(
     Ok(Json(snapshot))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/control/pause",
+    tag = "control",
+    responses((status = 200, body = CommandStatusDto))
+)]
+async fn post_control_pause(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+    let status = run_control(move || state.handle.pause()).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/control/resume",
+    tag = "control",
+    responses((status = 200, body = CommandStatusDto))
+)]
+async fn post_control_resume(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+    let status = run_control(move || state.handle.resume()).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/control/step",
+    tag = "control",
+    responses((status = 200, body = CommandStatusDto))
+)]
+async fn post_control_step(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+    let status = run_control(move || state.handle.step()).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/control/speed",
+    tag = "control",
+    request_body = SpeedRequest,
+    responses((status = 200, body = CommandStatusDto))
+)]
+async fn post_control_speed(
+    State(state): State<ApiState>,
+    Json(payload): Json<SpeedRequest>,
+) -> Result<Json<CommandStatusDto>, AppError> {
+    let status = run_control(move || state.handle.set_speed(payload.speed)).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/control/shutdown",
+    tag = "control",
+    responses((status = 200, body = CommandStatusDto))
+)]
+async fn post_control_shutdown(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+    let status = run_control(move || state.handle.shutdown()).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/control/status/{command_id}",
+    tag = "control",
+    params(("command_id" = String, Path, description = "Command ID")),
+    responses((status = 200, body = Option<CommandStatusDto>))
+)]
+async fn get_control_status(
+    State(state): State<ApiState>,
+    axum::extract::Path(command_id): axum::extract::Path<String>,
+) -> Result<Json<Option<CommandStatusDto>>, AppError> {
+    let status = run_control(move || state.handle.command_status(&command_id)).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/pause",
+    tag = "control",
+    responses((status = 200, body = CommandAcknowledge))
+)]
+async fn post_pause(State(state): State<ApiState>) -> Result<Json<CommandAcknowledge>, AppError> {
+    run_control(move || state.handle.pause()).await?;
+    Ok(Json(CommandAcknowledge {
+        success: true,
+        message: "simulation pause command enqueued".into(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/resume",
+    tag = "control",
+    responses((status = 200, body = CommandAcknowledge))
+)]
+async fn post_resume(State(state): State<ApiState>) -> Result<Json<CommandAcknowledge>, AppError> {
+    run_control(move || state.handle.resume()).await?;
+    Ok(Json(CommandAcknowledge {
+        success: true,
+        message: "simulation resume command enqueued".into(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/step",
+    tag = "control",
+    request_body = StepRequestBody,
+    responses((status = 200, body = CommandAcknowledge))
+)]
+async fn post_step(
+    State(state): State<ApiState>,
+    body: Option<Json<StepRequestBody>>,
+) -> Result<Json<CommandAcknowledge>, AppError> {
+    let count = body.map(|b| b.count).unwrap_or(1);
+    run_control(move || state.handle.step(count)).await?;
+    Ok(Json(CommandAcknowledge {
+        success: true,
+        message: format!("simulation step command ({count} ticks) enqueued"),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/speed",
+    tag = "control",
+    request_body = SpeedRequestBody,
+    responses((status = 200, body = CommandAcknowledge))
+)]
+async fn post_speed(
+    State(state): State<ApiState>,
+    Json(body): Json<SpeedRequestBody>,
+) -> Result<Json<CommandAcknowledge>, AppError> {
+    run_control(move || state.handle.set_speed(body.speed)).await?;
+    Ok(Json(CommandAcknowledge {
+        success: true,
+        message: format!("simulation speed command ({}) enqueued", body.speed),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/status",
+    tag = "control",
+    responses((status = 200, body = SimulationStatusDto))
+)]
+async fn get_status(
+    State(state): State<ApiState>,
+) -> Result<Json<SimulationStatusDto>, AppError> {
+    let status = run_control(move || state.handle.status()).await?;
+    Ok(Json(status))
+}
+
 fn prepare_rest_server(
     handle: ControlHandle,
     config: &ControlServerConfig,
@@ -1551,6 +1747,19 @@ fn prepare_rest_server(
         .route("/api/presets", get(list_presets))
         .route("/api/presets/apply", post(apply_preset))
         .route("/api/config/audit", get(get_config_audit))
+        // Simulation playback & status controls
+        .route("/api/pause", post(post_pause))
+        .route("/api/resume", post(post_resume))
+        .route("/api/step", post(post_step))
+        .route("/api/speed", post(post_speed))
+        .route("/api/status", get(get_status))
+        // Direct simulation control commands
+        .route("/api/control/pause", post(post_control_pause))
+        .route("/api/control/resume", post(post_control_resume))
+        .route("/api/control/step", post(post_control_step))
+        .route("/api/control/speed", post(post_control_speed))
+        .route("/api/control/shutdown", post(post_control_shutdown))
+        .route("/api/control/status/{command_id}", get(get_control_status))
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
@@ -1684,10 +1893,107 @@ async fn prepare_mcp_server(
             "additionalProperties": false
         }),
         ControlToolKind::ApplyPatch,
-        handle,
+        handle.clone(),
     )
     .await
     .map_err(|err| anyhow!("failed to register apply_patch tool: {err}"))?;
+
+    register_tool(
+        Arc::clone(&server),
+        "pause",
+        "Pause the simulation",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::Pause,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register pause tool: {err}"))?;
+
+    register_tool(
+        Arc::clone(&server),
+        "resume",
+        "Resume the simulation",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::Resume,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register resume tool: {err}"))?;
+
+    register_tool(
+        Arc::clone(&server),
+        "step",
+        "Step the simulation by N ticks",
+        json!({
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "minimum": 1}
+            },
+            "additionalProperties": false
+        }),
+        ControlToolKind::Step,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register step tool: {err}"))?;
+
+    register_tool(
+        Arc::clone(&server),
+        "set_speed",
+        "Set the simulation speed (target TPS)",
+        json!({
+            "type": "object",
+            "properties": {
+                "speed": {"type": "number"}
+            },
+            "required": ["speed"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::SetSpeed,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register set_speed tool: {err}"))?;
+
+    register_tool(
+        Arc::clone(&server),
+        "get_status",
+        "Retrieve current simulation status (tick, agent count, pause state, revision)",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::GetStatus,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register get_status tool: {err}"))?;
+
+    register_tool(
+        Arc::clone(&server),
+        "shutdown",
+        "Request graceful simulation shutdown",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::Shutdown,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register shutdown tool: {err}"))?;
+
+    register_tool(
+        Arc::clone(&server),
+        "get_command_status",
+        "Look up status of a command by ID",
+        json!({
+            "type": "object",
+            "properties": {
+                "command_id": {"type": "string"}
+            },
+            "required": ["command_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::GetCommandStatus,
+        handle,
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register get_command_status tool: {err}"))?;
 
     let router = Router::new()
         .route("/mcp", post(handle_mcp_http_request))
@@ -1812,6 +2118,11 @@ enum ControlToolKind {
     GetConfig,
     ApplyUpdates,
     ApplyPatch,
+    Pause,
+    Resume,
+    Step,
+    SetSpeed,
+    GetStatus,
 }
 
 #[async_trait]
@@ -1871,6 +2182,40 @@ impl ToolHandler for ControlTool {
                 let handle = self.handle.clone();
                 let snapshot = run_control_mcp(move || handle.apply_patch(patch_value)).await?;
                 Ok(make_tool_result(snapshot)?)
+            }
+            ControlToolKind::Pause => {
+                let handle = self.handle.clone();
+                run_control_mcp(move || handle.pause()).await?;
+                Ok(make_tool_result(json!({"paused": true}))?)
+            }
+            ControlToolKind::Resume => {
+                let handle = self.handle.clone();
+                run_control_mcp(move || handle.resume()).await?;
+                Ok(make_tool_result(json!({"paused": false}))?)
+            }
+            ControlToolKind::Step => {
+                let count = arguments
+                    .get("count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+                let handle = self.handle.clone();
+                run_control_mcp(move || handle.step(count)).await?;
+                Ok(make_tool_result(json!({"stepped": count}))?)
+            }
+            ControlToolKind::SetSpeed => {
+                let speed = arguments
+                    .get("speed")
+                    .and_then(|v| v.as_f64())
+                    .ok_or_else(|| McpError::Validation("missing 'speed' parameter".into()))?
+                    as f32;
+                let handle = self.handle.clone();
+                run_control_mcp(move || handle.set_speed(speed)).await?;
+                Ok(make_tool_result(json!({"speed": speed}))?)
+            }
+            ControlToolKind::GetStatus => {
+                let handle = self.handle.clone();
+                let status = run_control_mcp(move || handle.status()).await?;
+                Ok(make_tool_result(status)?)
             }
         }
     }
@@ -2583,5 +2928,18 @@ mod tests {
         assert_eq!(rendered["id"], "fixture-equilibrium-study");
         assert_eq!(rendered["schema_version"], 1);
         assert_eq!(rendered["bootstrap_ticks"], 12);
+    }
+
+    #[test]
+    fn test_openapi_spec_conformance() {
+        let openapi = ApiDoc::openapi();
+        let json_spec = serde_json::to_string(&openapi).expect("OpenAPI spec serializes");
+        assert!(json_spec.contains("/api/knobs"), "spec must contain /api/knobs");
+        assert!(json_spec.contains("/api/config"), "spec must contain /api/config");
+        assert!(json_spec.contains("/api/control/pause"), "spec must contain /api/control/pause");
+        assert!(json_spec.contains("/api/control/resume"), "spec must contain /api/control/resume");
+        assert!(json_spec.contains("/api/control/step"), "spec must contain /api/control/step");
+        assert!(json_spec.contains("/api/control/speed"), "spec must contain /api/control/speed");
+        assert!(json_spec.contains("/api/control/shutdown"), "spec must contain /api/control/shutdown");
     }
 }

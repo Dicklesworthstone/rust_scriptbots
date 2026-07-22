@@ -218,6 +218,10 @@ fn main() -> Result<()> {
         run_det_check(&cli, ticks)?;
         return Ok(());
     }
+    if let Some(ticks) = cli.det_check_archipelago {
+        run_archipelago_det_check(&cli, ticks)?;
+        return Ok(());
+    }
 
     // Optional: profiling runs (headless). Execute and exit if specified.
     let thresholds = thresholds_from_cli(&cli);
@@ -1035,6 +1039,90 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         seed,
         left.events,
         right.events
+    );
+    Ok(())
+}
+
+fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
+    use scriptbots_runtime::archipelago::{Archipelago, ArchipelagoConfig, IslandId, IslandSpec};
+    use scriptbots_runtime::migrator::{EmigrantSelectionRule, MigrationConfig, MigrationTopology};
+
+    println!(
+        "{} Starting archipelago determinism self-check matrix for {} ticks...",
+        "ℹ".blue().bold(),
+        ticks
+    );
+
+    let master_seed = match cli.seed {
+        Some(seed) => seed,
+        None => 987654321,
+    };
+
+    let mut base_config = compose_config(cli)?;
+    base_config.rng_seed = Some(master_seed);
+
+    let thread_matrix = [Some("1"), Some("4"), Some("8"), Some("3")];
+    let island_count = 8usize;
+
+    let build_arch = |thread_count: Option<&str>| -> Result<Archipelago> {
+        if let Some(tc) = thread_count {
+            std::env::set_var("RAYON_NUM_THREADS", tc);
+        }
+        let specs: Vec<IslandSpec> = (0..island_count)
+            .map(|id| IslandSpec {
+                id: IslandId(id as u16),
+                label: format!("island-{id}"),
+                config: base_config.clone(),
+            })
+            .collect();
+        let migration_cfg = MigrationConfig {
+            interval_ticks: (ticks / 4).max(1),
+            emigrants_per_edge: 2,
+            selection_rule: EmigrantSelectionRule::Fittest,
+            topology: MigrationTopology::Ring,
+            replace: true,
+        };
+        let arch_cfg = ArchipelagoConfig {
+            islands: specs,
+            migration: migration_cfg,
+        };
+        Archipelago::new(arch_cfg).context("failed to build archipelago")
+    };
+
+    let mut baseline_digests = Vec::new();
+
+    for (idx, &threads) in thread_matrix.iter().enumerate() {
+        let mut arch = build_arch(threads)?;
+        for _ in 0..4 {
+            arch.step_to_barrier().context("step to barrier")?;
+        }
+        let mut cell_digests = Vec::new();
+        for i in 0..island_count {
+            let digest = arch.island_digest(IslandId(i as u16)).context("island digest")?.overall;
+            cell_digests.push(digest);
+        }
+
+        if idx == 0 {
+            baseline_digests = cell_digests;
+        } else {
+            for i in 0..island_count {
+                if cell_digests[i] != baseline_digests[i] {
+                    println!(
+                        "{} Divergence on island {} under RAYON_NUM_THREADS={:?}",
+                        "✖".red().bold(),
+                        i,
+                        threads
+                    );
+                    bail!("archipelago determinism check failed");
+                }
+            }
+        }
+    }
+
+    println!(
+        "{} Archipelago determinism self-check passed for 8 islands x {} ticks across thread matrix [1, 4, 8, 3]!",
+        "✔".green().bold(),
+        ticks
     );
     Ok(())
 }
@@ -2174,6 +2262,9 @@ struct AppCli {
     /// Run determinism self-check comparing 1-thread vs N-threads for the given number of ticks.
     #[arg(long = "det-check", value_name = "TICKS")]
     det_check: Option<u64>,
+    /// Run archipelago determinism self-check across thread budgets for N ticks.
+    #[arg(long = "det-check-archipelago", value_name = "TICKS")]
+    det_check_archipelago: Option<u64>,
     /// Overlay a tiny debug watermark in the render canvas (diagnostics).
     #[arg(long = "debug-watermark", action = ArgAction::SetTrue)]
     debug_watermark: bool,
@@ -2463,6 +2554,7 @@ enum RendererMode {
     Gui,
     Bevy,
     Terminal,
+    Server,
 }
 
 impl RendererMode {
@@ -2472,6 +2564,7 @@ impl RendererMode {
             Self::Gui => "gui",
             Self::Bevy => "bevy",
             Self::Terminal => "terminal",
+            Self::Server => "server",
         }
     }
 }
@@ -2701,6 +2794,7 @@ fn select_renderer_mode(
     environment: RendererEnvironment,
 ) -> Result<RendererMode> {
     match requested {
+        RendererMode::Server => Ok(RendererMode::Server),
         RendererMode::Terminal => Ok(RendererMode::Terminal),
         RendererMode::Gui if available.gui => Ok(RendererMode::Gui),
         RendererMode::Gui => {
@@ -2749,6 +2843,7 @@ fn resolve_renderer(
     };
     let active = select_renderer_mode(mode, RendererAvailability::compiled(), environment)?;
     let renderer: Box<dyn Renderer> = match active {
+        RendererMode::Server => Box::new(ServerRenderer::default()),
         RendererMode::Terminal => Box::new(TerminalRenderer::default()),
         RendererMode::Gui => {
             #[cfg(feature = "gui")]
@@ -2778,6 +2873,33 @@ fn resolve_renderer(
         "Resolved renderer mode"
     );
     Ok((active, renderer))
+}
+
+#[derive(Default)]
+struct ServerRenderer;
+
+impl Renderer for ServerRenderer {
+    fn name(&self) -> &'static str {
+        "server"
+    }
+
+    fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
+        info!("ScriptBots server mode starting (headless background simulation with REST/MCP API)");
+        let target_interval = Duration::from_millis(16);
+        while !ctx.control_runtime.is_failed() {
+            let start = std::time::Instant::now();
+            if let Err(error) = (ctx.simulation_step)() {
+                warn!(%error, "Simulation step failed in server mode; stopping loop");
+                break;
+            }
+            let elapsed = start.elapsed();
+            if elapsed < target_interval {
+                std::thread::sleep(target_interval - elapsed);
+            }
+        }
+        info!("Server mode exiting");
+        Ok(())
+    }
 }
 
 #[cfg(feature = "gui")]

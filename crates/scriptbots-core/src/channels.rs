@@ -22,16 +22,7 @@
 //! updated — which is exactly the failure mode we want, instead of a silent
 //! mislabel that survives for months.
 
-// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
-// order and fixed-width casts are part of the science contract; fma fusion,
-// reassociation, or width changes alter world digests. Function lengths mirror
-// the legacy C++ parity layout and are reviewed as units.
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
+use serde::{Deserialize, Serialize};
 
 use crate::{INPUT_SIZE, NUM_EYES, OUTPUT_SIZE};
 
@@ -473,5 +464,156 @@ mod tests {
 
         outputs[OutputChannel::WheelRight.index()] = 1e9;
         assert!((outputs.peak_wheel_output() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_world_io_layout_default_and_bands() {
+        let default_layout = WorldIoLayout::DEFAULT;
+        assert_eq!(default_layout.bands, 1);
+        assert_eq!(default_layout.inputs, INPUT_SIZE);
+        assert_eq!(default_layout.outputs, OUTPUT_SIZE);
+
+        let layout_3 = WorldIoLayout::new(3).unwrap();
+        assert_eq!(layout_3.bands, 3);
+        assert_eq!(layout_3.inputs, INPUT_SIZE + 2);
+        assert_eq!(layout_3.outputs, OUTPUT_SIZE + 2);
+
+        assert!(WorldIoLayout::new(0).is_err());
+        assert!(WorldIoLayout::new(9).is_err());
+    }
+
+    #[test]
+    fn test_layout_mismatch_rejection() {
+        let layout_3 = WorldIoLayout::new(3).unwrap();
+        let err = layout_3
+            .validate_brain_io("mlp", 25, 9)
+            .expect_err("mismatch must fail");
+        match err {
+            IoLayoutError::LayoutMismatch {
+                brain_kind,
+                expected_inputs,
+                expected_outputs,
+                actual_inputs,
+                actual_outputs,
+            } => {
+                assert_eq!(brain_kind, "mlp");
+                assert_eq!(expected_inputs, 27);
+                assert_eq!(expected_outputs, 11);
+                assert_eq!(actual_inputs, 25);
+                assert_eq!(actual_outputs, 9);
+            }
+            _ => panic!("unexpected error variant"),
+        }
+    }
+
+    #[test]
+    fn test_band_isolation_and_stride() {
+        // Stride test: 3 agents with 3 bands
+        let bands = 3usize;
+        let num_agents = 3usize;
+        let mut work_sound_emitters = vec![0.0f32; num_agents * bands];
+
+        // Agent 0 emits on band 0: [1.0, 0.0, 0.0]
+        work_sound_emitters[0 * bands + 0] = 1.0;
+        work_sound_emitters[0 * bands + 1] = 0.0;
+        work_sound_emitters[0 * bands + 2] = 0.0;
+
+        // Agent 1 emits on band 1: [0.0, 1.0, 0.0]
+        work_sound_emitters[1 * bands + 0] = 0.0;
+        work_sound_emitters[1 * bands + 1] = 1.0;
+        work_sound_emitters[1 * bands + 2] = 0.0;
+
+        // Agent 2 is listener, dist_factor = 0.5 to Agent 0 and 0.5 to Agent 1
+        let dist_factor_0 = 0.5f32;
+        let dist_factor_1 = 0.5f32;
+
+        let mut heard = vec![0.0f32; bands];
+        for b in 0..bands {
+            let sum = dist_factor_0 * work_sound_emitters[0 * bands + b]
+                + dist_factor_1 * work_sound_emitters[1 * bands + b];
+            heard[b] = sum.min(1.0).max(0.0);
+        }
+
+        assert_eq!(heard[0], 0.5);
+        assert_eq!(heard[1], 0.5);
+        assert_eq!(heard[2], 0.0, "band 2 must be exactly 0.0 (band isolation)");
+    }
+}
+
+/// Error variants for I/O layout validation and bounds.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+pub enum IoLayoutError {
+    /// Invalid bands count provided (must be 1..=8).
+    #[error("invalid bands count {0}, must be 1..=8")]
+    InvalidBands(u8),
+    /// Brain layout mismatch between expected and actual sizes.
+    #[error("brain IO layout mismatch for '{brain_kind}': expected {expected_inputs}in/{expected_outputs}out, got {actual_inputs}in/{actual_outputs}out")]
+    LayoutMismatch {
+        brain_kind: String,
+        expected_inputs: usize,
+        expected_outputs: usize,
+        actual_inputs: usize,
+        actual_outputs: usize,
+    },
+}
+
+/// Versioned World I/O layout specification for sensory inputs and actuator outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorldIoLayout {
+    /// Version of the I/O layout schema.
+    pub version: u16,
+    /// Number of signal communication bands (1..=8).
+    pub bands: u8,
+    /// Total sensor input size for this layout.
+    pub inputs: usize,
+    /// Total actuator output size for this layout.
+    pub outputs: usize,
+}
+
+impl Default for WorldIoLayout {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl WorldIoLayout {
+    /// Default single-band (legacy 25/9) layout.
+    pub const DEFAULT: Self = Self {
+        version: 1,
+        bands: 1,
+        inputs: INPUT_SIZE,
+        outputs: OUTPUT_SIZE,
+    };
+
+    /// Constructs a new layout specification with `bands` signal communication channels (1..=8).
+    pub fn new(bands: u8) -> Result<Self, IoLayoutError> {
+        if bands == 0 || bands > 8 {
+            return Err(IoLayoutError::InvalidBands(bands));
+        }
+        Ok(Self {
+            version: 1,
+            bands,
+            inputs: INPUT_SIZE + (bands as usize - 1),
+            outputs: OUTPUT_SIZE + (bands as usize - 1),
+        })
+    }
+
+    /// Validates that a brain's reported I/O layout matches this world layout.
+    pub fn validate_brain_io(
+        &self,
+        brain_kind: &str,
+        actual_inputs: usize,
+        actual_outputs: usize,
+    ) -> Result<(), IoLayoutError> {
+        if self.inputs != actual_inputs || self.outputs != actual_outputs {
+            return Err(IoLayoutError::LayoutMismatch {
+                brain_kind: brain_kind.to_owned(),
+                expected_inputs: self.inputs,
+                expected_outputs: self.outputs,
+                actual_inputs,
+                actual_outputs,
+            });
+        }
+        Ok(())
     }
 }

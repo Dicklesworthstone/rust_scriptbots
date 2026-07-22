@@ -1,0 +1,22 @@
+# Curated Gallery Manifest (bd-16g.8.3)
+# An in-repo, versioned manifest of worlds worth seeing.
+
+[[world]]
+id = "world-quiet-01"
+title = "Quiet Oasis"
+story = "A peaceful ecosystem with balanced food growth where species coexist in harmony."
+permalink = "sbw1.c2IxAAAAEHF1aWV0LW9hc2lzLXNjZW5hcmlvAAAAAACI3Z4AAAAA"
+horizon_ticks = 1000
+added_by = "jemanuel"
+added_at = "2026-07-22"
+blessed_on_build = 1
+
+[[world]]
+id = "world-extinction-01"
+title = "Great Drought"
+story = "A severe environmental collapse causes mass predator extinction."
+permalink = "sbw1.c2IxAAAAEGRyb3VnaHQtc2NlbmFyaW8AAAAAAIjZngAAAAA"
+horizon_ticks = 1000
+added_by = "jemanuel"
+added_at = "2026-07-22"
+blessed_on_build = 1

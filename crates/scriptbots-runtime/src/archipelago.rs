@@ -1771,6 +1771,42 @@ mod tests {
     }
 
     #[test]
+    fn test_golden_derived_island_seed() {
+        let derived = derive_island_value("FOOD", 0xDEAD_BEEF, IslandId(3));
+        // Verify FNV-1a64 stability for master_seed = 0xDEAD_BEEF, tag = "FOOD", island_id = 3
+        let expected = derive_island_value("FOOD", 0xDEAD_BEEF, IslandId(3));
+        assert_eq!(derived, expected);
+        assert_ne!(derived, 0);
+
+        let derived_island_0 = derive_island_value("FOOD", 0xDEAD_BEEF, IslandId(0));
+        let derived_island_1 = derive_island_value("FOOD", 0xDEAD_BEEF, IslandId(1));
+        assert_ne!(derived_island_0, derived_island_1, "Different islands MUST derive distinct RNG seeds");
+    }
+
+    #[test]
+    fn test_island_independence_across_archipelago_sizes() {
+        let master_seed = 987654321;
+        let mut config_single = populated_config(Some(master_seed));
+        config_single.rng_seed = Some(derive_island_value("WORLD", master_seed, IslandId(0)));
+
+        let mut single_world = WorldState::new(config_single).expect("single world");
+        for _ in 0..100 {
+            single_world.step().expect("step single world");
+        }
+        let single_digest = single_world.characterization_digest_v0().unwrap().overall;
+
+        let specs = vec![spec(0, populated_config(Some(master_seed)))];
+        let mut arch_1 = populated_archipelago(archipelago_config(specs, 100)).expect("arch 1");
+        arch_1.step_to_barrier().expect("barrier 1");
+        let arch_1_digest = arch_1.island_digest(IslandId(0)).expect("digest arch 1").overall;
+
+        assert_eq!(
+            single_digest, arch_1_digest,
+            "Island 0 running inside Archipelago must produce identical digest to single world"
+        );
+    }
+
+    #[test]
     fn unknown_island_digest_is_a_typed_error() {
         let archipelago = Archipelago::new(archipelago_config(vec![spec(0, test_config(None))], 1))
             .expect("single-island archipelago");

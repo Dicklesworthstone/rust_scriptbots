@@ -6,6 +6,7 @@ pub mod channels;
 mod checkpoint;
 pub mod detect;
 pub mod economy;
+pub mod gallery;
 pub mod genome_diff;
 pub mod infotheory;
 pub mod narrative_text;
@@ -8736,6 +8737,11 @@ pub struct Tick(
     /// Wrapped counter value.
     pub u64,
 );
+
+impl Tick {
+    /// Maximum representable Tick value.
+    pub const MAX: Tick = Tick(u64::MAX);
+}
 
 impl fmt::Display for Tick {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

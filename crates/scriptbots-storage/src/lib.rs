@@ -545,9 +545,32 @@ pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
     CREATE INDEX interactions_run_actor_tick_index
-        ON interactions (run_id, actor_agent_uid, tick, seq);
     CREATE INDEX interactions_run_target_tick_index
         ON interactions (run_id, target_agent_uid, tick, seq);
+
+    CREATE TABLE islands (
+        run_id TEXT NOT NULL,
+        island_id INTEGER NOT NULL CHECK (island_id >= 0),
+        label TEXT NOT NULL,
+        config_hash BLOB NOT NULL,
+        config_json TEXT NOT NULL,
+        PRIMARY KEY (run_id, island_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+
+    CREATE TABLE migrations (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        island_id_from INTEGER NOT NULL CHECK (island_id_from >= 0),
+        island_id_to INTEGER NOT NULL CHECK (island_id_to >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        rule TEXT NOT NULL CHECK (rule <> ''),
+        key_value REAL NOT NULL,
+        rank INTEGER NOT NULL CHECK (rank >= 0),
+        PRIMARY KEY (run_id, tick, seq),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
 
     PRAGMA user_version = 6;
 "#;

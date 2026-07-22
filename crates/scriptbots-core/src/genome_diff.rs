@@ -11,28 +11,6 @@
 use crate::{BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope};
 use std::collections::BTreeMap;
 
-#[cfg(test)]
-mod tests {
-    use super::Locus;
-
-    #[test]
-    fn locus_human_strings_name_the_gene() {
-        assert_eq!(Locus::NodeBias(47).human(), "node 47 bias");
-        assert_eq!(
-            Locus::NodeWeight { node: 47, conn: 2 }.human(),
-            "node 47 weight 2"
-        );
-        assert_eq!(
-            Locus::NodeKind { node: 130, conn: 1 }.human(),
-            "node 130 conn 1 kind"
-        );
-        assert_eq!(
-            Locus::NodeTarget { node: 3, conn: 0 }.human(),
-            "node 3 conn 0 target"
-        );
-    }
-}
-
 /// One addressable genome locus, in canonical order (index order, never a hash walk).
 ///
 /// Two genomes of the same family and schema produce loci in the same order, so the diff
@@ -314,4 +292,26 @@ pub fn diff_genomes(
         },
         deltas,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locus_human_strings_name_the_gene() {
+        assert_eq!(Locus::NodeBias(47).human(), "node 47 bias");
+        assert_eq!(
+            Locus::NodeWeight { node: 47, conn: 2 }.human(),
+            "node 47 weight 2"
+        );
+        assert_eq!(
+            Locus::NodeKind { node: 130, conn: 1 }.human(),
+            "node 130 conn 1 kind"
+        );
+        assert_eq!(
+            Locus::NodeTarget { node: 3, conn: 0 }.human(),
+            "node 3 conn 0 target"
+        );
+    }
 }

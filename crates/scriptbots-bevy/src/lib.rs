@@ -5364,4 +5364,78 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_bevy_presentation_snapshot_decoupling() -> Result<()> {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+
+        let mut snapshot_state = SnapshotState::default();
+        let snapshot = Snapshot {
+            tick: 42,
+            agent_count: 5,
+            world_size: Vec2::new(100.0, 100.0),
+            agents: vec![],
+            leaderboard: vec![],
+            oldest: vec![],
+            food_cells: vec![],
+            terrain_kind: vec![],
+            terrain_height: vec![],
+            spike_hits: 0,
+            brain_layers: vec![],
+            brain_inspection: None,
+            focused_agent_uid: None,
+            focused_brain_bound: false,
+            focused_activations: None,
+            focused_outputs: None,
+        };
+        snapshot_state.latest = Some(snapshot);
+        app.insert_resource(snapshot_state);
+        app.insert_resource(AgentRegistry::default());
+        app.insert_resource(TerrainChunkRegistry::default());
+        app.insert_resource(AgentMeshes::default());
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(ReflectionProbeAssets::default());
+        app.insert_resource(AccessibilityState::default());
+
+        app.add_systems(Update, sync_world);
+
+        // First presentation frame update
+        app.update();
+        let state = app.world().resource::<SnapshotState>();
+        assert_eq!(state.last_applied_tick, 42);
+
+        // Multiple presentation repaints on unchanged snapshot tick do not advance tick
+        app.update();
+        app.update();
+        let state = app.world().resource::<SnapshotState>();
+        assert_eq!(
+            state.last_applied_tick, 42,
+            "presentation repaints must not alter scientific tick count"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_toroidal_picking_across_wrap_seams() {
+        let extent = 1000.0;
+
+        // Picking near origin (x=5) against an agent near wrap boundary (x=995)
+        let dx = toroidal_delta(5.0, 995.0, extent);
+        assert_eq!(
+            dx.abs(),
+            10.0,
+            "toroidal_delta across wrap seam must compute minimum distance"
+        );
+
+        // Distance across opposite seam (origin=990, target=10)
+        let dx_reverse = toroidal_delta(990.0, 10.0, extent);
+        assert_eq!(
+            dx_reverse.abs(),
+            20.0,
+            "toroidal_delta across opposite wrap seam must compute minimum distance"
+        );
+    }
 }

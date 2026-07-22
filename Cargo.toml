@@ -57,6 +57,7 @@ ft-core = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/fran
 ft-kernel-cpu = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-nn = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-optim = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
+ftui = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "15cc65438a2095fbe8dd0dfce9adcfc7edab7612", default-features = false, features = ["crossterm"] }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", rev = "5f8a7413a31769e0882357f90dc424b3962ac72d" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", rev = "5f8a7413a31769e0882357f90dc424b3962ac72d" }
 kira = "0.10.1"

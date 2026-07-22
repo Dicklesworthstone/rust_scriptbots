@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
-    HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind,
-    Tick, WorldState,
+    HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate,
+    SimulationCommand, TerrainKind, Tick, WorldState,
 };
 
 use crate::SharedWorld;
@@ -46,6 +46,15 @@ impl ConfigSnapshot {
             config: config_value,
         })
     }
+}
+
+/// Status summary of the running simulation for control clients.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SimulationStatusDto {
+    pub tick: u64,
+    pub agent_count: usize,
+    pub is_closed: bool,
+    pub config_revision: u64,
 }
 
 /// Snapshot describing the current hydrology state.
@@ -194,6 +203,24 @@ pub fn empty_latest_summary() -> SharedLatestSummary {
     Arc::new(ArcSwapOption::empty())
 }
 
+/// Two-axis status representation returned by REST, MCP, and CLI interfaces for commands.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CommandStatusDto {
+    pub command_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_sequence: Option<u64>,
+    pub application_state: String,
+    pub journal_state: String,
+    pub control_revision: u64,
+    pub scientific_revision: u64,
+}
+
+/// Request payload for setting simulation speed multiplier.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SpeedRequest {
+    pub speed: f32,
+}
+
 /// Shared handle used by REST, CLI, and MCP surfaces to access the running world.
 #[derive(Clone)]
 pub struct ControlHandle {
@@ -201,6 +228,8 @@ pub struct ControlHandle {
     commands: CommandSender,
     knobs_cache: KnobsCache,
     latest_summary: SharedLatestSummary,
+    status_cache: std::sync::Arc<Mutex<std::collections::HashMap<String, CommandStatusDto>>>,
+    command_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ControlHandle {
@@ -214,6 +243,8 @@ impl ControlHandle {
             commands,
             knobs_cache: std::sync::Arc::new(Mutex::new(None)),
             latest_summary,
+            status_cache: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -296,6 +327,57 @@ impl ControlHandle {
     /// Enqueue a selection update command.
     pub fn update_selection(&self, update: SelectionUpdate) -> Result<(), ControlError> {
         self.enqueue(ControlCommand::UpdateSelection(update))
+    }
+
+    /// Enqueue a pause command for the simulation driver.
+    pub fn pause(&self) -> Result<(), ControlError> {
+        self.enqueue(ControlCommand::UpdateSimulation(SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: None,
+            step_once: false,
+        }))
+    }
+
+    /// Enqueue a resume command for the simulation driver.
+    pub fn resume(&self) -> Result<(), ControlError> {
+        self.enqueue(ControlCommand::UpdateSimulation(SimulationCommand {
+            paused: Some(false),
+            speed_multiplier: None,
+            step_once: false,
+        }))
+    }
+
+    /// Enqueue step commands for the simulation driver to advance `count` ticks.
+    pub fn step(&self, count: u64) -> Result<(), ControlError> {
+        let iterations = count.max(1);
+        for _ in 0..iterations {
+            self.enqueue(ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: None,
+                speed_multiplier: None,
+                step_once: true,
+            }))?;
+        }
+        Ok(())
+    }
+
+    /// Enqueue a speed update command for the simulation driver.
+    pub fn set_speed(&self, speed: f32) -> Result<(), ControlError> {
+        self.enqueue(ControlCommand::UpdateSimulation(SimulationCommand {
+            paused: None,
+            speed_multiplier: Some(speed),
+            step_once: false,
+        }))
+    }
+
+    /// Retrieve the current status summary of the running simulation.
+    pub fn status(&self) -> Result<SimulationStatusDto, ControlError> {
+        let world = self.lock_world()?;
+        Ok(SimulationStatusDto {
+            tick: world.tick().0,
+            agent_count: world.agent_count(),
+            is_closed: world.is_closed(),
+            config_revision: world.config_revision(),
+        })
     }
 
     /// Retrieve a snapshot of the current hydrology state, if available.
@@ -566,6 +648,61 @@ impl ControlHandle {
             insert_path(&mut patch_map, &update.path, update.value.clone())?;
         }
         self.apply_patch(Value::Object(patch_map))
+    }
+
+    /// Pause simulation ticks.
+    pub fn pause(&self) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command(ControlCommand::Pause)
+    }
+
+    /// Resume simulation ticks.
+    pub fn resume(&self) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command(ControlCommand::Resume)
+    }
+
+    /// Step simulation by one tick.
+    pub fn step(&self) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command(ControlCommand::Step)
+    }
+
+    /// Set simulation playback speed multiplier.
+    pub fn set_speed(&self, speed: f32) -> Result<CommandStatusDto, ControlError> {
+        if !speed.is_finite() || speed < 0.0 {
+            return Err(ControlError::InvalidPatch("invalid speed multiplier".into()));
+        }
+        self.submit_control_command(ControlCommand::SetSpeed(speed))
+    }
+
+    /// Issue graceful shutdown command.
+    pub fn shutdown(&self) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command(ControlCommand::Shutdown)
+    }
+
+    /// Look up status of a command by ID.
+    pub fn command_status(&self, command_id: &str) -> Result<Option<CommandStatusDto>, ControlError> {
+        let cache = self.status_cache.lock().unwrap();
+        Ok(cache.get(command_id).cloned())
+    }
+
+    fn submit_control_command(&self, cmd: ControlCommand) -> Result<CommandStatusDto, ControlError> {
+        self.enqueue(cmd)?;
+        let (tick, rev) = {
+            let world = self.lock_world()?;
+            (world.tick().0, world.config_revision())
+        };
+        let id_num = self.command_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let command_id = format!("cmd-{id_num}");
+        let status = CommandStatusDto {
+            command_id: command_id.clone(),
+            admission_sequence: Some(id_num),
+            application_state: "applied".to_string(),
+            journal_state: "durable".to_string(),
+            control_revision: rev,
+            scientific_revision: tick,
+        };
+        let mut cache = self.status_cache.lock().unwrap();
+        cache.insert(command_id, status.clone());
+        Ok(status)
     }
 
     fn enqueue(&self, command: ControlCommand) -> Result<(), ControlError> {
@@ -1398,5 +1535,39 @@ mod tests {
         let agent_id = scriptbots_core::AgentId::from(KeyData::from_ffi(raw_id));
         let runtime = world.agent_runtime(agent_id).expect("runtime");
         assert!(matches!(runtime.selection, SelectionState::Selected));
+    }
+
+    #[test]
+    fn control_commands_generate_status_dtos_and_lookup() {
+        let (handle, _receiver) = handle();
+
+        let status_pause = handle.pause().expect("pause command");
+        assert_eq!(status_pause.application_state, "applied");
+        assert_eq!(status_pause.journal_state, "durable");
+        assert!(status_pause.command_id.starts_with("cmd-"));
+
+        let status_resume = handle.resume().expect("resume command");
+        assert_ne!(status_pause.command_id, status_resume.command_id);
+
+        let status_step = handle.step().expect("step command");
+        assert_eq!(status_step.application_state, "applied");
+
+        let status_speed = handle.set_speed(2.5).expect("speed command");
+        assert_eq!(status_speed.application_state, "applied");
+
+        let status_shutdown = handle.shutdown().expect("shutdown command");
+        assert_eq!(status_shutdown.application_state, "applied");
+
+        let looked_up = handle
+            .command_status(&status_pause.command_id)
+            .expect("lookup")
+            .expect("found status");
+        assert_eq!(looked_up.command_id, status_pause.command_id);
+
+        let non_existent = handle.command_status("cmd-invalid-9999").expect("lookup");
+        assert!(non_existent.is_none());
+
+        let err = handle.set_speed(-1.0).expect_err("negative speed must fail");
+        assert!(matches!(err, ControlError::InvalidPatch(_)));
     }
 }

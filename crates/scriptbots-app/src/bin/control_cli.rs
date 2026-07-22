@@ -114,6 +114,30 @@ enum Command {
     },
     /// Show hydrology metrics and raw layers.
     Hydrology,
+    /// Pause the running simulation.
+    Pause,
+    /// Resume the running simulation.
+    Resume,
+    /// Advance the simulation by N ticks.
+    Step {
+        /// Number of ticks to advance (defaults to 1).
+        #[arg(default_value_t = 1)]
+        count: u64,
+    },
+    /// Set target simulation speed multiplier.
+    Speed {
+        /// Speed multiplier value (e.g. 1.0, 2.0, 0.5).
+        value: f32,
+    },
+    /// Fetch current simulation status.
+    Status,
+    /// Request graceful simulation shutdown.
+    Shutdown,
+    /// Look up status of a command by ID.
+    LookupStatus {
+        /// Command ID to look up (e.g. cmd-1).
+        id: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -162,6 +186,13 @@ async fn main() -> Result<()> {
                     screenshot_request(&client, &cli.base_url, out, png).await?
                 }
                 Command::Hydrology => hydrology_command(&client, &cli.base_url).await?,
+                Command::Pause => pause_command(&client, &cli.base_url).await?,
+                Command::Resume => resume_command(&client, &cli.base_url).await?,
+                Command::Step { count } => step_command(&client, &cli.base_url, count).await?,
+                Command::Speed { value } => speed_command(&client, &cli.base_url, value).await?,
+                Command::Status => status_command(&client, &cli.base_url).await?,
+                Command::Shutdown => shutdown_command(&client, &cli.base_url).await?,
+                Command::LookupStatus { id } => lookup_status_command(&client, &cli.base_url, &id).await?,
             }
         }
     }
@@ -824,6 +855,112 @@ async fn presets_list(client: &Client, base_url: &str) -> Result<()> {
         for name in list.presets {
             println!("  - {}", name);
         }
+    }
+    Ok(())
+}
+
+async fn pause_command(client: &Client, base_url: &str) -> Result<()> {
+    let url = join_url(base_url, "/api/pause");
+    let response = client.post(url).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        println!("{}", "✔ Simulation paused".green().bold());
+    } else {
+        bail!("pause failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+async fn resume_command(client: &Client, base_url: &str) -> Result<()> {
+    let url = join_url(base_url, "/api/resume");
+    let response = client.post(url).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        println!("{}", "✔ Simulation resumed".green().bold());
+    } else {
+        bail!("resume failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+async fn step_command(client: &Client, base_url: &str, count: u64) -> Result<()> {
+    let url = join_url(base_url, "/api/step");
+    let response = client
+        .post(url)
+        .json(&serde_json::json!({ "count": count }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        println!(
+            "{}",
+            format!("✔ Enqueued step command ({count} ticks)").green().bold()
+        );
+    } else {
+        bail!("step failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+async fn speed_command(client: &Client, base_url: &str, value: f32) -> Result<()> {
+    let url = join_url(base_url, "/api/speed");
+    let response = client
+        .post(url)
+        .json(&serde_json::json!({ "speed": value }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        println!(
+            "{}",
+            format!("✔ Enqueued speed command ({value})").green().bold()
+        );
+    } else {
+        bail!("speed failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+async fn status_command(client: &Client, base_url: &str) -> Result<()> {
+    let url = join_url(base_url, "/api/status");
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        println!("{body}");
+    } else {
+        bail!("status failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+async fn shutdown_command(client: &Client, base_url: &str) -> Result<()> {
+    let url = join_url(base_url, "/api/control/shutdown");
+    let response = client.post(url).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        println!("{}", "✔ Shutdown command issued".green().bold());
+        println!("{body}");
+    } else {
+        bail!("shutdown failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+async fn lookup_status_command(client: &Client, base_url: &str, id: &str) -> Result<()> {
+    let url = join_url(base_url, &format!("/api/control/status/{id}"));
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        println!("{body}");
+    } else {
+        bail!("status lookup failed ({status}): {body}");
     }
     Ok(())
 }

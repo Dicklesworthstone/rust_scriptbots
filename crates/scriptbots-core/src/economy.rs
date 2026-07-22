@@ -625,6 +625,334 @@ pub fn evaluate_conservation(seeds: &[SeedVerdict]) -> ConservationVerdict {
     }
 }
 
+/// Classification of agent diet based on heritable/phenotypic tendency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DietClass {
+    /// Herbivorous diet preference (herbivore_tendency >= 0.7).
+    Herbivore,
+    /// Omnivorous diet preference (0.3 < herbivore_tendency < 0.7).
+    Omnivore,
+    /// Carnivorous diet preference (herbivore_tendency <= 0.3).
+    Carnivore,
+}
+
+impl DietClass {
+    /// All diet classes in canonical order.
+    pub const ALL: [Self; 3] = [Self::Herbivore, Self::Omnivore, Self::Carnivore];
+
+    /// Classify an agent's diet based on heritable/phenotypic tendency.
+    #[must_use]
+    pub fn classify(herbivore_tendency: f32) -> Self {
+        if herbivore_tendency >= 0.7 {
+            Self::Herbivore
+        } else if herbivore_tendency <= 0.3 {
+            Self::Carnivore
+        } else {
+            Self::Omnivore
+        }
+    }
+}
+
+/// Standing census of living agents grouped by diet class.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DietCensus {
+    /// Count of living agents per [`DietClass`].
+    pub counts: [usize; 3],
+    /// Sum of standing health per [`DietClass`].
+    pub standing_health: [f64; 3],
+    /// Sum of standing energy per [`DietClass`].
+    pub standing_energy: [f64; 3],
+}
+
+impl DietCensus {
+    /// Map a [`DietClass`] to its index in census arrays.
+    #[must_use]
+    pub const fn class_index(class: DietClass) -> usize {
+        match class {
+            DietClass::Herbivore => 0,
+            DietClass::Omnivore => 1,
+            DietClass::Carnivore => 2,
+        }
+    }
+
+    /// Record one living agent in the census.
+    pub fn add_agent(&mut self, herbivore_tendency: f32, health: f64, energy: f64) {
+        let idx = Self::class_index(DietClass::classify(herbivore_tendency));
+        self.counts[idx] += 1;
+        self.standing_health[idx] += health;
+        self.standing_energy[idx] += energy;
+    }
+}
+
+/// Node classification for Sankey diagram layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeClass {
+    /// External resource input (sunlight, respawn, spawn endowment).
+    ExternalSource,
+    /// Soil/water food grid.
+    FoodGrid,
+    /// Herbivorous agents cohort.
+    Herbivores,
+    /// Omnivorous agents cohort.
+    Omnivores,
+    /// Carnivorous agents cohort.
+    Carnivores,
+    /// Energy and health dissipation sinks.
+    Sink,
+    /// Unaccounted residual pool.
+    Unaccounted,
+}
+
+/// A node in the Sankey energy-flow graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SankeyNode {
+    /// Node identifier.
+    pub id: usize,
+    /// Human-readable node label.
+    pub label: String,
+    /// Semantic node class.
+    pub class: NodeClass,
+}
+
+/// A link between two Sankey nodes carrying aggregated flow magnitude.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SankeyLink {
+    /// Origin node ID.
+    pub from: usize,
+    /// Target node ID.
+    pub to: usize,
+    /// Flow magnitude (f64).
+    pub value: f64,
+    /// Underlying resource flow category, if tied to one.
+    pub category: Option<ResourceFlowKind>,
+}
+
+/// Sankey graph structure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SankeyGraph {
+    /// All layout nodes.
+    pub nodes: Vec<SankeyNode>,
+    /// All layout links.
+    pub links: Vec<SankeyLink>,
+}
+
+/// Options for Sankey layout generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SankeyOpts {
+    /// Include zero-magnitude links.
+    pub include_zero_links: bool,
+}
+
+/// Generate the deterministic Sankey flow graph from an [`EpochFlows`] artifact.
+#[must_use]
+pub fn sankey_layout(flows: &EpochFlows, opts: &SankeyOpts) -> SankeyGraph {
+    let nodes = vec![
+        SankeyNode {
+            id: 0,
+            label: "External Sources".to_owned(),
+            class: NodeClass::ExternalSource,
+        },
+        SankeyNode {
+            id: 1,
+            label: "Food Grid".to_owned(),
+            class: NodeClass::FoodGrid,
+        },
+        SankeyNode {
+            id: 2,
+            label: "Herbivores".to_owned(),
+            class: NodeClass::Herbivores,
+        },
+        SankeyNode {
+            id: 3,
+            label: "Omnivores".to_owned(),
+            class: NodeClass::Omnivores,
+        },
+        SankeyNode {
+            id: 4,
+            label: "Carnivores".to_owned(),
+            class: NodeClass::Carnivores,
+        },
+        SankeyNode {
+            id: 5,
+            label: "Energy & Health Sinks".to_owned(),
+            class: NodeClass::Sink,
+        },
+        SankeyNode {
+            id: 6,
+            label: "Unaccounted Residual".to_owned(),
+            class: NodeClass::Unaccounted,
+        },
+    ];
+
+    let mut links = Vec::new();
+
+    for flow in &flows.per_category {
+        let val = flow.activity.scale().abs();
+        if val == 0.0 && !opts.include_zero_links {
+            continue;
+        }
+
+        let (from, to) = match flow.kind {
+            ResourceFlowKind::FoodDynamics | ResourceFlowKind::ScenarioIntervention => (0, 1),
+            ResourceFlowKind::GroundFoodConversion => (1, 2),
+            ResourceFlowKind::BasalMetabolism
+            | ResourceFlowKind::Movement
+            | ResourceFlowKind::MetabolismRamp
+            | ResourceFlowKind::Boost
+            | ResourceFlowKind::Topography
+            | ResourceFlowKind::TemperatureStress
+            | ResourceFlowKind::Aging
+            | ResourceFlowKind::DeathRemoval
+            | ResourceFlowKind::ReproductionAllocation
+            | ResourceFlowKind::CapacityRejection => (2, 5),
+            ResourceFlowKind::EnergySharing => (2, 3),
+            ResourceFlowKind::Combat => (2, 5),
+            ResourceFlowKind::CarcassReward | ResourceFlowKind::PopulationInjection => (0, 2),
+        };
+
+        links.push(SankeyLink {
+            from,
+            to,
+            value: val,
+            category: Some(flow.kind),
+        });
+    }
+
+    for res in &flows.residual {
+        let val = res.residual_sum.abs();
+        if val > 0.0 || opts.include_zero_links {
+            links.push(SankeyLink {
+                from: 1,
+                to: 6,
+                value: val,
+                category: None,
+            });
+        }
+    }
+
+    SankeyGraph { nodes, links }
+}
+
+/// Row in the trophic summary table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrophicRow {
+    /// Diet class.
+    pub class: DietClass,
+    /// Number of living agents in this class.
+    pub agent_count: usize,
+    /// Standing health in this class.
+    pub standing_health: f64,
+    /// Standing energy in this class.
+    pub standing_energy: f64,
+    /// Per-tick average intake rate across the epoch.
+    pub intake_rate: f64,
+    /// Per-tick average drain rate across the epoch.
+    pub drain_rate: f64,
+    /// Ratio of intake to drain (`None` if intake == 0 or drain == 0).
+    pub conversion_efficiency: Option<f64>,
+    /// Net rate (intake_rate - drain_rate).
+    pub net: f64,
+}
+
+/// Trophic summary table for an epoch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrophicTable {
+    /// Epoch ordinal.
+    pub epoch: u64,
+    /// First tick in epoch.
+    pub first_tick: u64,
+    /// Last tick in epoch.
+    pub last_tick: u64,
+    /// Per-diet-class trophic summary rows.
+    pub rows: Vec<TrophicRow>,
+}
+
+/// Compute the trophic table from an [`EpochFlows`] artifact and a [`DietCensus`].
+#[must_use]
+pub fn trophic_table(flows: &EpochFlows, pop: &DietCensus) -> TrophicTable {
+    let tick_count = flows.tick_count.max(1) as f64;
+
+    let gross_intake: f64 = flows
+        .per_category
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                ResourceFlowKind::GroundFoodConversion
+                    | ResourceFlowKind::EnergySharing
+                    | ResourceFlowKind::CarcassReward
+            )
+        })
+        .map(|f| f.activity.energy + f.activity.health)
+        .sum();
+
+    let gross_drain: f64 = flows
+        .per_category
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                ResourceFlowKind::BasalMetabolism
+                    | ResourceFlowKind::Movement
+                    | ResourceFlowKind::MetabolismRamp
+                    | ResourceFlowKind::Boost
+                    | ResourceFlowKind::Topography
+                    | ResourceFlowKind::TemperatureStress
+                    | ResourceFlowKind::Aging
+                    | ResourceFlowKind::CapacityRejection
+            )
+        })
+        .map(|f| f.activity.energy + f.activity.health)
+        .sum();
+
+    let total_count: usize = pop.counts.iter().sum();
+
+    let rows = DietClass::ALL
+        .into_iter()
+        .map(|class| {
+            let idx = DietCensus::class_index(class);
+            let count = pop.counts[idx];
+            let fraction = if total_count > 0 {
+                count as f64 / total_count as f64
+            } else {
+                0.0
+            };
+
+            let class_intake = gross_intake * fraction;
+            let class_drain = gross_drain * fraction;
+            let intake_rate = class_intake / tick_count;
+            let drain_rate = class_drain / tick_count;
+            let net = intake_rate - drain_rate;
+
+            let conversion_efficiency = if class_drain > 0.0 && class_intake > 0.0 {
+                Some(class_intake / class_drain)
+            } else {
+                None
+            };
+
+            TrophicRow {
+                class,
+                agent_count: count,
+                standing_health: pop.standing_health[idx],
+                standing_energy: pop.standing_energy[idx],
+                intake_rate,
+                drain_rate,
+                conversion_efficiency,
+                net,
+            }
+        })
+        .collect();
+
+    TrophicTable {
+        epoch: flows.epoch,
+        first_tick: flows.first_tick,
+        last_tick: flows.last_tick,
+        rows,
+    }
+}
+
 fn validate_report(report: &ResourceLedgerTick) -> Result<(), EconomyAggregationError> {
     let tick = report.tick.0;
     if report.flows.len() != CATEGORY_COUNT {
@@ -1122,4 +1450,70 @@ mod tests {
             "the verdict is a pure function of the inputs"
         );
     }
+
+    #[test]
+    fn sankey_layout_generates_nodes_and_links() {
+        let mut aggregator = EpochAggregator::new(2);
+        aggregator.observe(&clean_tick(1)).expect("tick 1");
+        let epoch = aggregator
+            .observe(&clean_tick(2))
+            .expect("tick 2")
+            .expect("epoch");
+
+        let graph = sankey_layout(&epoch, &SankeyOpts { include_zero_links: false });
+        assert_eq!(graph.nodes.len(), 7);
+        assert!(!graph.links.is_empty());
+        let total_value: f64 = graph.links.iter().map(|l| l.value).sum();
+        assert!(total_value > 0.0);
+    }
+
+    #[test]
+    fn trophic_table_handles_empty_and_present_diet_classes() {
+        let mut aggregator = EpochAggregator::new(2);
+        aggregator.observe(&clean_tick(1)).expect("tick 1");
+        let epoch = aggregator
+            .observe(&clean_tick(2))
+            .expect("tick 2")
+            .expect("epoch");
+
+        let mut census = DietCensus::default();
+        census.add_agent(0.8, 1.0, 1.5); // Herbivore
+        census.add_agent(0.1, 0.8, 1.2); // Carnivore
+
+        let table = trophic_table(&epoch, &census);
+        assert_eq!(table.rows.len(), 3);
+        let herbivore = &table.rows[0];
+        assert_eq!(herbivore.class, DietClass::Herbivore);
+        assert_eq!(herbivore.agent_count, 1);
+
+        let omnivore = &table.rows[1];
+        assert_eq!(omnivore.class, DietClass::Omnivore);
+        assert_eq!(omnivore.agent_count, 0);
+        assert_eq!(omnivore.conversion_efficiency, None);
+    }
+
+    #[test]
+    fn agreement_e2e_export_sankey_and_trophic_table_have_identical_epoch_numbers() {
+        let mut aggregator = EpochAggregator::new(2);
+        aggregator.observe(&clean_tick(1)).expect("tick 1");
+        let epoch = aggregator
+            .observe(&clean_tick(2))
+            .expect("tick 2")
+            .expect("epoch");
+
+        let mut census = DietCensus::default();
+        census.add_agent(0.8, 1.0, 1.5);
+
+        let sankey = sankey_layout(&epoch, &SankeyOpts::default());
+        let table = trophic_table(&epoch, &census);
+
+        let json_epoch = serde_json::to_string(&epoch).expect("json epoch");
+        let json_sankey = serde_json::to_string(&sankey).expect("json sankey");
+        let json_table = serde_json::to_string(&table).expect("json table");
+
+        assert!(json_epoch.contains(&epoch.epoch.to_string()));
+        assert!(json_sankey.contains("External Sources"));
+        assert!(json_table.contains("herbivore"));
+    }
 }
+
