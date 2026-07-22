@@ -19,8 +19,8 @@ use axum::{
     routing::{get, post},
 };
 use fastmcp_rust::{
-    Content, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, McpError, McpErrorCode, McpResult, Server, ToolHandler,
+    Content, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, McpError, McpErrorCode,
+    McpResult, Server, ToolHandler,
 };
 use futures_util::stream::{Stream, StreamExt};
 use scriptbots_core::PresetKind;
@@ -1887,10 +1887,8 @@ async fn prepare_mcp_server(
     reserved: ReservedControlListener,
 ) -> Result<PreparedMcpServer> {
     info!(address = %reserved.address, "Preparing MCP HTTP server");
-    let mut builder = fastmcp_rust::ServerBuilder::new(
-        "scriptbots-control",
-        env!("CARGO_PKG_VERSION"),
-    );
+    let mut builder =
+        fastmcp_rust::ServerBuilder::new("scriptbots-control", env!("CARGO_PKG_VERSION"));
 
     builder = register_tool(
         builder,
@@ -2127,16 +2125,18 @@ fn normalize_mcp_http_response(response: JsonRpcResponse) -> JsonRpcMessage {
     if let Some((code, message, data)) = protocol_error {
         JsonRpcMessage::Response(JsonRpcResponse::error(
             response.id,
-            JsonRpcError { code, message, data },
+            JsonRpcError {
+                code,
+                message,
+                data,
+            },
         ))
     } else {
         JsonRpcMessage::Response(response)
     }
 }
 
-async fn handle_mcp_http_notification(
-    Json(_notification): Json<Value>,
-) -> StatusCode {
+async fn handle_mcp_http_notification(Json(_notification): Json<Value>) -> StatusCode {
     StatusCode::OK
 }
 

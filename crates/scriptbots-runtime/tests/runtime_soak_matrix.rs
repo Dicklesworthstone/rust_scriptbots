@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn test_runtime_lifecycle_contention_storm_and_soak() {
-    let mut world = WorldState::new(ScriptBotsConfig::default());
-    let (mut handle, mut receiver) = scriptbots_core::channels::control_channel(128);
+    let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+    let (tx, rx) = std::sync::mpsc::channel();
 
     let running = Arc::new(AtomicBool::new(true));
     let r_clone = Arc::clone(&running);
@@ -34,7 +34,7 @@ fn test_runtime_lifecycle_contention_storm_and_soak() {
                     state: SelectionState::Selected,
                 }),
             };
-            let _ = handle.send(cmd);
+            let _ = tx.send(cmd);
             count += 1;
         }
         count
@@ -44,8 +44,8 @@ fn test_runtime_lifecycle_contention_storm_and_soak() {
     let start = Instant::now();
     let mut processed = 0;
     while start.elapsed() < Duration::from_millis(500) && processed < 1000 {
-        if let Ok(cmd) = receiver.try_recv() {
-            world.apply_control_command(cmd);
+        if let Ok(cmd) = rx.try_recv() {
+            let _ = scriptbots_core::apply_control_command(&mut world, cmd);
             processed += 1;
         } else {
             thread::sleep(Duration::from_millis(1));
@@ -64,12 +64,12 @@ fn test_runtime_lifecycle_contention_storm_and_soak() {
 
 #[test]
 fn test_runtime_soak_digest_invariance() {
-    let mut world = WorldState::new(ScriptBotsConfig::default());
+    let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
     let initial_tick = world.tick_count();
 
     // Step world 50 ticks deterministically
     for _ in 0..50 {
-        world.step();
+        let _ = world.step();
     }
 
     assert_eq!(world.tick_count(), initial_tick + 50);
