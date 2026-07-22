@@ -18,8 +18,10 @@ use thiserror::Error;
 pub type SharedWorld = Arc<Mutex<WorldState>>;
 pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
+pub mod experiment_runner;
 pub mod lab_assistant;
 pub mod tournament;
+
 
 /// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
 pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
