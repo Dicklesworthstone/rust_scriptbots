@@ -41934,7 +41934,6 @@ mod tests {
         assert_eq!(stats.dropped, 496);
     }
 
-
     #[test]
     fn render_settings_are_digest_neutral() {
         // The world digest must encode science state only: two worlds differing
