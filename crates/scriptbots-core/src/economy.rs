@@ -362,8 +362,7 @@ impl EpochAggregator {
                 .enumerate()
                 .filter(|(_, magnitude)| *magnitude > 0.0)
                 .max_by(|(left_index, left), (right_index, right)| {
-                    left.partial_cmp(right)
-                        .unwrap_or(core::cmp::Ordering::Equal)
+                    left.total_cmp(right)
                         // Ties resolve to the LOWER stable index so the answer
                         // is deterministic and platform-independent.
                         .then(right_index.cmp(left_index))
