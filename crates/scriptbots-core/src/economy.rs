@@ -524,10 +524,15 @@ impl ConservationGate {
             let worst_category = report
                 .flows
                 .iter()
-                .map(|flow| (flow.kind, stock.lane(flow.delta).abs()))
-                .filter(|(_, magnitude)| *magnitude > 0.0)
-                .max_by(|left, right| left.1.total_cmp(&right.1))
-                .map(|(kind, _)| kind);
+                .enumerate()
+                .map(|(idx, flow)| (flow.kind, stock.lane(flow.delta).abs(), idx))
+                .filter(|(_, magnitude, _)| *magnitude > 0.0)
+                .max_by(|left, right| {
+                    left.1
+                        .total_cmp(&right.1)
+                        .then_with(|| right.2.cmp(&left.2))
+                })
+                .map(|(kind, _, _)| kind);
             if self.breaches.len() < BREACH_REPORT_CAP {
                 self.breaches.push(ConservationBreach {
                     tick: report.tick,

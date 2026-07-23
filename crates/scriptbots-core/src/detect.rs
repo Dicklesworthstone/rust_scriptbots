@@ -222,7 +222,7 @@ pub fn change_points_cusum(
             let down = s_lo > params.h;
             if up || down {
                 let index = base + params.warmup + offset;
-                let (direction, score) = if up {
+                let (direction, score) = if up && (!down || s_hi >= s_lo) {
                     (Direction::Up, s_hi)
                 } else {
                     (Direction::Down, s_lo)
