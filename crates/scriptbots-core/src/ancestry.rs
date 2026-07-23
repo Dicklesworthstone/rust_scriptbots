@@ -514,7 +514,7 @@ impl AncestryGraph {
                     continue;
                 }
                 if let Some(node) = self.nodes.get(&current) {
-                    if node.death_tick.is_none() && !node.pruned {
+                    if current != founder_uid && node.death_tick.is_none() && !node.pruned {
                         living_count += 1;
                     }
                     for &child in &node.children {
@@ -559,7 +559,7 @@ impl AncestryGraph {
             max_depth = max_depth.max(depth);
 
             if let Some(n) = self.nodes.get(&current) {
-                if n.death_tick.is_none() && !n.pruned {
+                if current != founder_uid && n.death_tick.is_none() && !n.pruned {
                     living_count += 1;
                 }
                 for &child in &n.children {

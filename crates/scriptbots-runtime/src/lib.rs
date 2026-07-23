@@ -5500,6 +5500,7 @@ mod tests {
                     outputs: vec![0.0; replay_outputs],
                 },
             }],
+            narrative_events: Vec::new(),
         })
     }
 

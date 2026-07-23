@@ -723,26 +723,26 @@ mod tests {
         let before_reset = simulation.tick(1).expect("pre-reset session step");
         assert_eq!(before_reset.tick, 1);
         assert_eq!(
-            simulation.persistence.last_admitted_tick(),
+            simulation.core.persistence().last_admitted_tick(),
             Some(scriptbots_core::Tick(1))
         );
 
         simulation.reset(Some(22)).expect("reset web simulation");
-        assert_eq!(simulation.world.tick().0, 0);
-        assert_eq!(simulation.world.config().rng_seed, Some(22));
-        assert_eq!(simulation.world.agent_count(), 3);
-        assert_eq!(simulation.persistence.last_admitted_tick(), None);
+        assert_eq!(simulation.core.world().tick().0, 0);
+        assert_eq!(simulation.core.world().config().rng_seed, Some(22));
+        assert_eq!(simulation.core.world().agent_count(), 3);
+        assert_eq!(simulation.core.persistence().last_admitted_tick(), None);
 
         let after_reset = simulation
             .tick(2)
             .expect("replacement session must remain bound to the replacement world");
         assert_eq!(after_reset.tick, 2);
         assert_eq!(
-            simulation.persistence.last_admitted_tick(),
+            simulation.core.persistence().last_admitted_tick(),
             Some(scriptbots_core::Tick(2))
         );
-        assert!(!simulation.persistence.has_pending_batch());
-        assert!(simulation.persistence.fault().is_none());
+        assert!(!simulation.core.persistence().has_pending_batch());
+        assert!(simulation.core.persistence().fault().is_none());
     }
 
     /// One scenario of the parity matrix, used identically by the same-runtime

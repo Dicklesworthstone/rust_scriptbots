@@ -5805,13 +5805,17 @@ mod tests {
 
     fn rail_record(tick: u64, kind: NarrativeEventKind, text: &str) -> NarrativeEventRecord {
         NarrativeEventRecord {
+            schema_version: 1,
             tick: scriptbots_core::Tick(tick),
             kind,
             severity: 0.5,
-            metric: "population",
+            magnitude: 1.0,
+            window: (tick, tick),
+            metric: "population".to_string(),
             before: 1.0,
             after: 2.0,
             score: 3.0,
+            subject: None,
             human_text: text.to_string(),
         }
     }

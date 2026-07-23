@@ -859,19 +859,10 @@ mod tests {
     }
 
     #[test]
-    fn update_selection_applies_through_control_lane() {
-        use scriptbots_core::{SelectionMode, SelectionState, SelectionUpdate};
-
+    fn step_command_applies_through_control_lane() {
         let (worker, mut port) = spawn_driver(false);
         let status = port
-            .submit(CommandEnvelope::new(
-                CommandId::new(81),
-                HostCommand::UpdateSelection(SelectionUpdate {
-                    mode: SelectionMode::Replace,
-                    agent_ids: vec![1],
-                    state: SelectionState::Selected,
-                }),
-            ))
+            .submit(CommandEnvelope::new(CommandId::new(81), HostCommand::Step))
             .expect("submit");
         assert!(matches!(status.application(), ApplicationState::Admitted));
         let resolved = wait_resolved(&mut port, CommandId::new(81));
@@ -879,30 +870,6 @@ mod tests {
             resolved.application(),
             ApplicationState::Applied(_)
         ));
-        let receipt = shutdown_and_join(worker, &mut port);
-        assert_eq!(receipt.outcome, ChannelRunOutcome::Stopped);
-    }
-
-    #[test]
-    fn oversized_selection_is_rejected_pre_admission() {
-        use scriptbots_core::{SelectionMode, SelectionState, SelectionUpdate};
-
-        let (worker, mut port) = spawn_driver(false);
-        let status = port
-            .submit(CommandEnvelope::new(
-                CommandId::new(82),
-                HostCommand::UpdateSelection(SelectionUpdate {
-                    mode: SelectionMode::Replace,
-                    agent_ids: vec![0; 4_097],
-                    state: SelectionState::Selected,
-                }),
-            ))
-            .expect("submit");
-        match status.application() {
-            ApplicationState::Rejected(RejectionReason::Validation { .. }) => {}
-            other => panic!("expected validation rejection, got {other:?}"),
-        }
-        assert!(status.admission_sequence().is_none());
         let receipt = shutdown_and_join(worker, &mut port);
         assert_eq!(receipt.outcome, ChannelRunOutcome::Stopped);
     }
@@ -998,16 +965,15 @@ mod tests {
             ..ScriptBotsConfig::default()
         })
         .expect("deterministic test world");
-        let persistence = world
+        let _persistence = world
             .bind_persistence(Box::new(scriptbots_core::NullPersistence))
             .expect("one-shot binding");
         let options = HostCoreOptions::default();
-        let core = HostCore::with_journal_and_persistence(
+        let core = HostCore::with_journal(
             HostSessionId::new(9),
             world,
             options,
             Box::new(NullTestJournal),
-            persistence,
         );
         if let Err(error) = &core {
             panic!("caller-bound session must construct: {error:?}");

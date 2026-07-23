@@ -3008,12 +3008,14 @@ mod tests {
         let tool = ControlTool {
             handle,
             kind: ControlToolKind::ApplyPatch,
+            name: "apply_patch".to_string(),
+            description: "Merge a JSON object patch".to_string(),
+            schema: json!({"type": "object"}),
         };
-        let arguments =
-            HashMap::from([("patch".to_owned(), json!({"food_growth_rate": "Infinity"}))]);
+        let ctx = fastmcp_rust::McpContext::new(asupersync::Cx::for_testing(), 1);
+        let arguments = json!({"patch": {"food_growth_rate": "Infinity"}});
         let error = tool
-            .call(arguments)
-            .await
+            .call(&ctx, arguments)
             .expect_err("MCP patch accepted non-finite input");
         let rendered = error.to_string();
         assert!(
@@ -3072,20 +3074,20 @@ mod tests {
             "spec must contain /api/config"
         );
         assert!(
-            json_spec.contains("/api/control/pause"),
-            "spec must contain /api/control/pause"
+            json_spec.contains("/api/pause"),
+            "spec must contain /api/pause"
         );
         assert!(
-            json_spec.contains("/api/control/resume"),
-            "spec must contain /api/control/resume"
+            json_spec.contains("/api/resume"),
+            "spec must contain /api/resume"
         );
         assert!(
-            json_spec.contains("/api/control/step"),
-            "spec must contain /api/control/step"
+            json_spec.contains("/api/step"),
+            "spec must contain /api/step"
         );
         assert!(
-            json_spec.contains("/api/control/speed"),
-            "spec must contain /api/control/speed"
+            json_spec.contains("/api/speed"),
+            "spec must contain /api/speed"
         );
         assert!(
             json_spec.contains("/api/control/shutdown"),

@@ -183,8 +183,8 @@ impl MatchedSeedExperimentRunner {
                 "temperature_discomfort_rate" => config.temperature_discomfort_rate = v,
                 "reproduction_energy_threshold" => config.reproduction_energy_threshold = v,
                 "reproduction_energy_cost" => config.reproduction_energy_cost = v,
-                "population_minimum" => config.population_minimum = v,
-                "population_spawn_interval" => config.population_spawn_interval = v,
+                "population_minimum" => config.population_minimum = v as usize,
+                "population_spawn_interval" => config.population_spawn_interval = v as u32,
                 _ => {}
             }
         }

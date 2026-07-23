@@ -180,7 +180,8 @@ impl MlpBrain {
     }
 
     fn logistic(value: f32) -> f32 {
-        1.0 / (1.0 + (-value).exp())
+        let clean = if value.is_nan() { 0.0 } else { value };
+        1.0 / (1.0 + (-clean).exp())
     }
 
     fn gaussian(rng: &mut dyn RandomStream) -> f32 {

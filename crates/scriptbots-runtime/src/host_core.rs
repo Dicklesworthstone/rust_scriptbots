@@ -1496,6 +1496,18 @@ impl HostCore {
         &self.health
     }
 
+    /// Read-only access to the underlying world state.
+    #[must_use]
+    pub const fn world(&self) -> &WorldState {
+        &self.world
+    }
+
+    /// Read-only access to the persistence session.
+    #[must_use]
+    pub const fn persistence(&self) -> &PersistenceAdmissionSession {
+        &self.persistence
+    }
+
     /// Current completed scientific tick.
     #[must_use]
     pub const fn world_tick(&self) -> Tick {

@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     fn control_commands_generate_status_dtos_and_lookup() {
-        let (handle, _receiver) = handle();
+        let (handle, receiver) = handle();
 
         let status_pause = handle.pause().expect("pause command");
         assert_eq!(status_pause.application_state, "applied");
@@ -1535,6 +1535,8 @@ mod tests {
 
         let status_speed = handle.set_speed(2.5).expect("speed command");
         assert_eq!(status_speed.application_state, "applied");
+
+        while receiver.try_recv().is_ok() {}
 
         let status_shutdown = handle.shutdown().expect("shutdown command");
         assert_eq!(status_shutdown.application_state, "applied");

@@ -119,7 +119,9 @@ impl GalleryWorld {
             .enumerate()
         {
             let act_kind_str = format!("{:?}", act.kind);
-            let kind_matches = exp.kind == act_kind_str || exp.kind == act.metric;
+            let kind_matches = exp.kind == act_kind_str
+                || exp.kind == act.metric
+                || exp.metric.as_ref().map_or(false, |m| m == &act.metric);
             let tick_matches = exp.tick == act.tick.0;
 
             if !tick_matches || !kind_matches {

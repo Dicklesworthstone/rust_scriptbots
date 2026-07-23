@@ -568,7 +568,7 @@ pub(crate) struct AgentRegistry {
     records: HashMap<AgentId, AgentRecord>,
 }
 
-#[derive(Resource, Clone)]
+#[derive(Resource, Clone, Default)]
 pub(crate) struct ReflectionProbeAssets {
     diffuse: Handle<Image>,
     specular: Handle<Image>,
@@ -603,7 +603,7 @@ struct AgentRecord {
     eyes: Vec<EyePart>,
 }
 
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub(crate) struct AgentMeshes {
     base_radius: f32,
     body: Handle<Mesh>,
@@ -646,7 +646,7 @@ impl ColorPaletteMode {
     }
 }
 
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub(crate) struct AccessibilityState {
     palette: ColorPaletteMode,
 }
@@ -5370,25 +5370,12 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
 
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        for _ in 0..42 {
+            let _ = world.step();
+        }
+        let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
         let mut snapshot_state = SnapshotState::default();
-        let snapshot = Snapshot {
-            tick: 42,
-            agent_count: 5,
-            world_size: Vec2::new(100.0, 100.0),
-            agents: vec![],
-            leaderboard: vec![],
-            oldest: vec![],
-            food_cells: vec![],
-            terrain_kind: vec![],
-            terrain_height: vec![],
-            spike_hits: 0,
-            brain_layers: vec![],
-            brain_inspection: None,
-            focused_agent_uid: None,
-            focused_brain_bound: false,
-            focused_activations: None,
-            focused_outputs: None,
-        };
         snapshot_state.latest = Some(snapshot);
         app.insert_resource(snapshot_state);
         app.insert_resource(AgentRegistry::default());
