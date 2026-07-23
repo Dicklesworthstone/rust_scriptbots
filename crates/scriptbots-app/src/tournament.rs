@@ -72,9 +72,20 @@ impl TournamentHarness {
     }
 
     pub fn record_match(&mut self, result: MatchResult) {
-        // Record match and update ratings for top 2 families
+        // Auto-register any families mentioned in the match scores
+        for family_id in result.family_scores.keys() {
+            self.register_family(family_id);
+        }
+
+        // Record match and update ratings for top 2 families with deterministic multi-axis tie-breaking
         let mut sorted: Vec<_> = result.family_scores.iter().collect();
-        sorted.sort_by(|a, b| b.1.survival_share.total_cmp(&a.1.survival_share));
+        sorted.sort_by(|a, b| {
+            b.1.survival_share
+                .total_cmp(&a.1.survival_share)
+                .then_with(|| b.1.biomass_share.total_cmp(&a.1.biomass_share))
+                .then_with(|| b.1.max_generation.cmp(&a.1.max_generation))
+                .then_with(|| a.0.cmp(b.0))
+        });
 
         if sorted.len() >= 2 {
             let winner_id = sorted[0].0;

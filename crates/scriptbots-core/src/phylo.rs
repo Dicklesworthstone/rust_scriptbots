@@ -211,17 +211,10 @@ impl TreeLayout {
         }
 
         let mut added = Vec::new();
+        let mut new_node_parents = Vec::new();
         let mut updated = false;
 
         for update in &delta.updates {
-            let parent_idx = update.parent_key.and_then(|pk| {
-                if let Some(&idx) = self.index.get(&pk) {
-                    Some(idx)
-                } else {
-                    Some(self.ensure_pruned_sentinel())
-                }
-            });
-
             if let Some(&existing_idx) = self.index.get(&update.key) {
                 let node = &mut self.nodes[existing_idx.0];
                 node.last_tick = update.death_tick;
@@ -234,7 +227,7 @@ impl TreeLayout {
                 let new_idx = LayoutIdx(self.nodes.len());
                 let node = LayoutNode {
                     key: update.key,
-                    parent: parent_idx,
+                    parent: None, // Resolved in second pass
                     x: update.birth_tick.0 as f32,
                     y: 0.0,
                     thickness: (update.population as f32).max(1.0).sqrt(),
@@ -245,10 +238,23 @@ impl TreeLayout {
                 };
                 self.nodes.push(node);
                 self.index.insert(update.key, new_idx);
-                if let Some(pidx) = parent_idx {
-                    self.children_map.entry(pidx).or_default().push(new_idx);
-                }
+                new_node_parents.push((new_idx, update.parent_key));
                 added.push(new_idx);
+            }
+        }
+
+        // Second pass: resolve parent indices after all batch nodes exist in index.
+        for (new_idx, parent_key) in new_node_parents {
+            let parent_idx = parent_key.and_then(|pk| {
+                if let Some(&idx) = self.index.get(&pk) {
+                    Some(idx)
+                } else {
+                    Some(self.ensure_pruned_sentinel())
+                }
+            });
+            self.nodes[new_idx.0].parent = parent_idx;
+            if let Some(pidx) = parent_idx {
+                self.children_map.entry(pidx).or_default().push(new_idx);
             }
         }
 
@@ -624,5 +630,33 @@ mod tests {
         // Top by peak population: Species(3) has 500, Species(1) has 100
         assert_eq!(visible[0].key, PhyloKey::Species(3));
         assert_eq!(visible[1].key, PhyloKey::Species(1));
+    }
+
+    #[test]
+    fn test_out_of_order_parent_resolution() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+        let delta = PhyloDelta {
+            updates: vec![
+                PhyloNodeUpdate {
+                    key: PhyloKey::Species(2),
+                    parent_key: Some(PhyloKey::Species(1)),
+                    birth_tick: Tick(20),
+                    death_tick: None,
+                    population: 5,
+                },
+                PhyloNodeUpdate {
+                    key: PhyloKey::Species(1),
+                    parent_key: None,
+                    birth_tick: Tick(0),
+                    death_tick: None,
+                    population: 10,
+                },
+            ],
+        };
+
+        layout.extend(&delta);
+        let child = layout.get_node(&PhyloKey::Species(2)).unwrap();
+        let parent_idx = layout.get_idx(&PhyloKey::Species(1));
+        assert_eq!(child.parent, parent_idx);
     }
 }

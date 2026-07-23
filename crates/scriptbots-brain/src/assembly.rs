@@ -85,7 +85,11 @@ impl AssemblyBrain {
 
     fn clamp_cells(cells: &mut [f32]) {
         for value in cells {
-            *value = (*value).clamp(-10.0, 10.0);
+            if value.is_nan() {
+                *value = 0.0;
+            } else {
+                *value = (*value).clamp(-10.0, 10.0);
+            }
         }
     }
 
@@ -96,7 +100,7 @@ impl AssemblyBrain {
 
     fn tick_with_budget(&mut self, inputs: &[f32; INPUT_SIZE]) -> ([f32; OUTPUT_SIZE], usize) {
         for (idx, input) in inputs.iter().enumerate() {
-            self.cells[idx] = *input;
+            self.cells[idx] = if input.is_nan() { 0.0 } else { *input };
         }
 
         let mut scanned = 0;
@@ -156,7 +160,12 @@ impl AssemblyBrain {
         let mut outputs = [0.0; OUTPUT_SIZE];
         for (offset, output) in outputs.iter_mut().enumerate() {
             let idx = BRAIN_SIZE - 1 - offset;
-            *output = self.cells[idx].clamp(0.0, 1.0);
+            let val = self.cells[idx];
+            *output = if val.is_nan() {
+                0.0
+            } else {
+                val.clamp(0.0, 1.0)
+            };
         }
 
         (outputs, scanned)

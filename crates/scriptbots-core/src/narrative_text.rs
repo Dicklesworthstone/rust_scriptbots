@@ -74,11 +74,13 @@ pub fn count_transition(before: f64, after: f64) -> String {
 /// the absolute transition instead.
 #[must_use]
 pub fn pct_magnitude(before: f64, after: f64) -> String {
-    let pct = if before.abs() > f64::EPSILON {
-        ((after - before) / before * 100.0).abs()
-    } else {
-        0.0
-    };
+    if !before.is_finite() || !after.is_finite() || before.abs() <= f64::EPSILON {
+        return "0".to_string();
+    }
+    let pct = ((after - before) / before * 100.0).abs();
+    if !pct.is_finite() {
+        return "0".to_string();
+    }
     format!("{pct:.0}")
 }
 
@@ -153,6 +155,13 @@ mod tests {
     fn percent_magnitude_guards_a_zero_baseline() {
         // From zero, any change is an undefined percent; report 0 rather than inf/NaN text.
         assert_eq!(pct_magnitude(0.0, 5.0), "0");
+    }
+
+    #[test]
+    fn percent_magnitude_guards_non_finite_inputs() {
+        assert_eq!(pct_magnitude(100.0, f64::NAN), "0");
+        assert_eq!(pct_magnitude(f64::NAN, 100.0), "0");
+        assert_eq!(pct_magnitude(100.0, f64::INFINITY), "0");
     }
 
     #[test]

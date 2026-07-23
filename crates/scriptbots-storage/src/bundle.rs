@@ -281,7 +281,12 @@ mod tests {
     use crate::Storage;
 
     fn temp_db_path(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
+        let base = Path::new("/Volumes/USBNVME16TB/temp_agent_space");
+        let mut path = if base.exists() {
+            base.to_path_buf()
+        } else {
+            std::env::temp_dir()
+        };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -291,7 +296,12 @@ mod tests {
     }
 
     fn temp_bundle_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
+        let base = Path::new("/Volumes/USBNVME16TB/temp_agent_space");
+        let mut path = if base.exists() {
+            base.to_path_buf()
+        } else {
+            std::env::temp_dir()
+        };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())

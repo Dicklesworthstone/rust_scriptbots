@@ -166,7 +166,25 @@ impl MatchedSeedExperimentRunner {
             match k.as_str() {
                 "food_max" => config.food_max = v,
                 "food_growth_rate" => config.food_growth_rate = v,
-                "agent_max_speed" => config.bot_speed = v,
+                "food_decay_rate" => config.food_decay_rate = v,
+                "food_respawn_amount" => config.food_respawn_amount = v,
+                "initial_food" => config.initial_food = v,
+                "food_diffusion_rate" => config.food_diffusion_rate = v,
+                "food_intake_rate" => config.food_intake_rate = v,
+                "food_waste_rate" => config.food_waste_rate = v,
+                "agent_max_speed" | "bot_speed" => config.bot_speed = v,
+                "bot_radius" => config.bot_radius = v,
+                "sense_radius" => config.sense_radius = v,
+                "spike_damage" => config.spike_damage = v,
+                "spike_radius" => config.spike_radius = v,
+                "spike_energy_cost" => config.spike_energy_cost = v,
+                "metabolism_drain" => config.metabolism_drain = v,
+                "movement_drain" => config.movement_drain = v,
+                "temperature_discomfort_rate" => config.temperature_discomfort_rate = v,
+                "reproduction_energy_threshold" => config.reproduction_energy_threshold = v,
+                "reproduction_energy_cost" => config.reproduction_energy_cost = v,
+                "population_minimum" => config.population_minimum = v,
+                "population_spawn_interval" => config.population_spawn_interval = v,
                 _ => {}
             }
         }
