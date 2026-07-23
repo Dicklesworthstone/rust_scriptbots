@@ -162,6 +162,9 @@ impl UniformGridIndex {
 
     #[inline]
     const fn wrap(value: i32, max: i32) -> i32 {
+        if max <= 0 {
+            return 0;
+        }
         ((value % max) + max) % max
     }
 
@@ -866,5 +869,11 @@ mod tests {
                 "seam distance should be 2 units, got dist_sq {dist_sq}"
             );
         }
+    }
+
+    #[test]
+    fn wrap_zero_max_does_not_panic() {
+        assert_eq!(UniformGridIndex::wrap(5, 0), 0);
+        assert_eq!(UniformGridIndex::wrap(5, -10), 0);
     }
 }
