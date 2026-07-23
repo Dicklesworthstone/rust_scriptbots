@@ -1046,6 +1046,7 @@ pub struct SpeedRequestBody {
         post_resume,
         post_step,
         post_speed,
+        post_control_shutdown,
         get_status
     ),
     components(
@@ -2094,13 +2095,13 @@ fn register_tool(
 
 async fn handle_mcp_http_request(
     State(_server): State<Arc<Server>>,
-    Json(_request): Json<JsonRpcRequest>,
+    Json(request): Json<JsonRpcRequest>,
 ) -> Json<JsonRpcMessage> {
     Json(JsonRpcMessage::Response(JsonRpcResponse::error(
-        None,
+        request.id,
         JsonRpcError {
-            code: -32603,
-            message: "MCP HTTP endpoint initialized".into(),
+            code: -32601,
+            message: format!("unknown method: {}", request.method),
             data: None,
         },
     )))
