@@ -17007,7 +17007,7 @@ impl WorldState {
     }
 
     fn wrap_position(value: f32, extent: f32) -> f32 {
-        if extent <= 0.0 {
+        if extent <= 0.0 || !value.is_finite() {
             return 0.0;
         }
         let mut v = value % extent;
@@ -17020,6 +17020,9 @@ impl WorldState {
     fn wrap_delta(origin: f32, target: f32, extent: f32) -> f32 {
         if extent <= 0.0 {
             return target - origin;
+        }
+        if !origin.is_finite() || !target.is_finite() {
+            return 0.0;
         }
         let mut delta = target - origin;
         let half = extent * 0.5;

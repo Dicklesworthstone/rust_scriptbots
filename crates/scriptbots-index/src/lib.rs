@@ -123,20 +123,21 @@ impl UniformGridIndex {
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
-                        let indices = &b[lin];
-                        if indices.is_empty() {
-                            continue;
+                        if let Some(indices) = b.get(lin) {
+                            if indices.is_empty() {
+                                continue;
+                            }
+                            scratch_x.clear();
+                            scratch_y.clear();
+                            scratch_x.reserve(indices.len());
+                            scratch_y.reserve(indices.len());
+                            for &other_idx in indices {
+                                let (x, y) = self.positions[other_idx];
+                                scratch_x.push(x);
+                                scratch_y.push(y);
+                            }
+                            visitor(scratch_x.as_slice(), scratch_y.as_slice(), indices);
                         }
-                        scratch_x.clear();
-                        scratch_y.clear();
-                        scratch_x.reserve(indices.len());
-                        scratch_y.reserve(indices.len());
-                        for &other_idx in indices {
-                            let (x, y) = self.positions[other_idx];
-                            scratch_x.push(x);
-                            scratch_y.push(y);
-                        }
-                        visitor(scratch_x.as_slice(), scratch_y.as_slice(), indices);
                     }
                     Buckets::Sparse(m) => {
                         if let Some(indices) = m.get(&(nx, ny)) {
@@ -314,17 +315,18 @@ impl NeighborhoodIndex for UniformGridIndex {
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
-                        let indices = &b[lin];
-                        for &other_idx in indices {
-                            if other_idx == agent_idx {
-                                continue;
-                            }
-                            let (ox, oy) = self.positions[other_idx];
-                            let dx = Self::toroidal_delta(ox, ax, self.width);
-                            let dy = Self::toroidal_delta(oy, ay, self.height);
-                            let dist_sq = dx.mul_add(dx, dy * dy);
-                            if dist_sq <= radius_sq {
-                                visitor(other_idx, OrderedFloat(dist_sq));
+                        if let Some(indices) = b.get(lin) {
+                            for &other_idx in indices {
+                                if other_idx == agent_idx {
+                                    continue;
+                                }
+                                let (ox, oy) = self.positions[other_idx];
+                                let dx = Self::toroidal_delta(ox, ax, self.width);
+                                let dy = Self::toroidal_delta(oy, ay, self.height);
+                                let dist_sq = dx.mul_add(dx, dy * dy);
+                                if dist_sq <= radius_sq {
+                                    visitor(other_idx, OrderedFloat(dist_sq));
+                                }
                             }
                         }
                     }
@@ -371,9 +373,10 @@ impl NeighborhoodIndex for UniformGridIndex {
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
-                        let indices = &b[lin];
-                        if !indices.is_empty() {
-                            visitor(indices);
+                        if let Some(indices) = b.get(lin) {
+                            if !indices.is_empty() {
+                                visitor(indices);
+                            }
                         }
                     }
                     Buckets::Sparse(m) => {
