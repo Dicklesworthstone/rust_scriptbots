@@ -958,8 +958,11 @@ impl Brain for DwraonBrain {
 
         let mut outputs = [0.0; OUTPUT_SIZE];
         for (offset, output) in outputs.iter_mut().enumerate() {
-            let idx = self.state.len() - 1 - offset;
-            *output = self.state[idx].output.clamp(0.0, 1.0);
+            let idx = self.state.len().saturating_sub(1 + offset);
+            *output = self
+                .state
+                .get(idx)
+                .map_or(0.0, |node| node.output.clamp(0.0, 1.0));
         }
         outputs
     }

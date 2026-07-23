@@ -322,7 +322,7 @@ pub fn threshold_crossings(
     }
 
     let mut out = Vec::new();
-    for window in series.windows(2) {
+    for (i, window) in series.windows(2).enumerate() {
         let (previous, current) = (window[0], window[1]);
         for threshold in thresholds {
             let was_above = previous.value > threshold.level;
@@ -343,10 +343,7 @@ pub fn threshold_crossings(
             if !wanted {
                 continue;
             }
-            let index = series
-                .iter()
-                .position(|sample| sample.tick == current.tick)
-                .unwrap_or_default();
+            let index = i + 1;
             out.push(Crossing {
                 tick: current.tick,
                 index,

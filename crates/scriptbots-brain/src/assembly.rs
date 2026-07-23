@@ -77,6 +77,9 @@ impl AssemblyBrain {
     }
 
     fn clamp_index(value: f32) -> usize {
+        if !value.is_finite() {
+            return 0;
+        }
         let abs_value = value.abs();
         let fractional = abs_value - abs_value.floor();
         let idx = (fractional * BRAIN_SIZE as f32).floor() as isize;
