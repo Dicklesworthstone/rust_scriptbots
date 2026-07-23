@@ -190,12 +190,7 @@ pub fn merge_clips(
     }
 
     // Sort merged clips by max score descending, assigning 1-based ranks
-    merged.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.start.cmp(&b.start))
-    });
+    merged.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.start.cmp(&b.start)));
     for (idx, clip) in merged.iter_mut().enumerate() {
         clip.rank = idx + 1;
         // Sort internal events by tick

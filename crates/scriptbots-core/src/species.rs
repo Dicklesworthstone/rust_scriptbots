@@ -344,7 +344,7 @@ pub fn segment_species(
             if sim >= params.continuity_threshold {
                 match best_prev_match {
                     Some((_, best_sim)) => {
-                        if sim > best_sim {
+                        if sim.total_cmp(&best_sim).is_gt() {
                             best_prev_match = Some((prev_sp, sim));
                         }
                     }
