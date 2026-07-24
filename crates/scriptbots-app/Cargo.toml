@@ -11,7 +11,7 @@ axum = { version = "0.8.0", features = ["macros", "json", "ws"] }
 async-trait = "0.1"
 blake3 = { workspace = true }
 clap = { version = "4.6.1", features = ["derive", "env"] }
-fastmcp_rust = { package = "fastmcp-rust", path = "/dp/fastmcp_rust/crates/fastmcp" }
+fastmcp-rust = { workspace = true }
 ratatui = { version = "0.30.0-alpha.5" }
 # `default-features = false` is load-bearing: reqwest's default `default-tls` pulls
 # native-tls -> openssl-sys, so asking for rustls-tls alone still linked OpenSSL and
