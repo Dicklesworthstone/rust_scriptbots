@@ -217,7 +217,26 @@ pub fn empty_latest_summary() -> SharedLatestSummary {
     Arc::new(ArcSwapOption::empty())
 }
 
+/// Wire tag of `scriptbots_runtime::ApplicationState::Admitted`.
+///
+/// The legacy app-owned `CommandBus` can honestly report only this value: it hands a
+/// command an admission order and nothing on that path observes application.
+pub const APPLICATION_STATE_ADMITTED: &str = "admitted";
+
+/// Wire tag of `scriptbots_runtime::JournalState::NotRequired`.
+///
+/// That variant exists precisely "for non-runtime and historical producers", which is
+/// what the legacy bus is — it never writes a lifecycle record, so `pending` would be
+/// a promise nothing keeps.
+pub const JOURNAL_STATE_NOT_REQUIRED: &str = "not_required";
+
 /// Two-axis status representation returned by REST, MCP, and CLI interfaces for commands.
+///
+/// The two axes are independent by design: application tracks
+/// `admitted`/`applied`/`rejected`/`failed`, journal tracks
+/// `not_required`/`pending`/`committed_volatile`/`durable`. Commands issued through the
+/// legacy bus stay at `admitted`/`not_required` for their whole life; only the
+/// `HostCore` path can advance them (bd-f65w).
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandStatusDto {
     pub command_id: String,
@@ -687,11 +706,19 @@ impl ControlHandle {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let command_id = format!("cmd-{id_num}");
+        // Report what actually happened: the command took an admission order on the
+        // bounded bus. It has NOT been drained by the simulation driver, has not been
+        // applied to the world, and the legacy app-owned bus writes no journal record
+        // at any point. Claiming applied/durable here collapsed the two axes README
+        // documents as distinct and made /api/control/status/{id} answer "finished"
+        // forever, so a client could never tell an applied command from a dropped one
+        // (bd-f65w). Real applied/durable transitions arrive with the HostCore
+        // migration, which owns the tracking these strings pretended to have.
         let status = CommandStatusDto {
             command_id: command_id.clone(),
             admission_sequence: Some(id_num),
-            application_state: "applied".to_string(),
-            journal_state: "durable".to_string(),
+            application_state: APPLICATION_STATE_ADMITTED.to_string(),
+            journal_state: JOURNAL_STATE_NOT_REQUIRED.to_string(),
             control_revision: rev,
             scientific_revision: tick,
         };
@@ -1589,23 +1616,28 @@ mod tests {
         let (handle, receiver) = handle();
 
         let status_pause = handle.pause().expect("pause command");
-        assert_eq!(status_pause.application_state, "applied");
-        assert_eq!(status_pause.journal_state, "durable");
+        // Enqueueing proves admission order, nothing more: the driver has not drained
+        // this command and the legacy bus journals nothing (bd-f65w).
+        assert_eq!(status_pause.application_state, APPLICATION_STATE_ADMITTED);
+        assert_eq!(status_pause.journal_state, JOURNAL_STATE_NOT_REQUIRED);
         assert!(status_pause.command_id.starts_with("cmd-"));
 
         let status_resume = handle.resume().expect("resume command");
         assert_ne!(status_pause.command_id, status_resume.command_id);
 
         let status_step = handle.step().expect("step command");
-        assert_eq!(status_step.application_state, "applied");
+        assert_eq!(status_step.application_state, APPLICATION_STATE_ADMITTED);
 
         let status_speed = handle.set_speed(2.5).expect("speed command");
-        assert_eq!(status_speed.application_state, "applied");
+        assert_eq!(status_speed.application_state, APPLICATION_STATE_ADMITTED);
 
         while receiver.try_recv().is_ok() {}
 
         let status_shutdown = handle.shutdown().expect("shutdown command");
-        assert_eq!(status_shutdown.application_state, "applied");
+        assert_eq!(
+            status_shutdown.application_state,
+            APPLICATION_STATE_ADMITTED
+        );
 
         let looked_up = handle
             .command_status(&status_pause.command_id)
