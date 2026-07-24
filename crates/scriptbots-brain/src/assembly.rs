@@ -18,8 +18,8 @@ use crate::{Brain, BrainKind, into_runner};
 
 const BRAIN_SIZE: usize = 200;
 const ASSEMBLY_FAMILY_ID: &str = "assembly";
-const ADAPTER_SEMANTIC_VERSION: u32 = 1;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.assembly.adapter-semantics.v1";
+const ADAPTER_SEMANTIC_VERSION: u32 = 2;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.assembly.adapter-semantics.v2";
 const ASSEMBLY_GENOME_SCHEMA_VERSION: u32 = 1;
 const ASSEMBLY_GENOME_CODEC_VERSION: u16 = 1;
 const ASSEMBLY_STATE_SCHEMA_VERSION: u32 = 1;
@@ -88,11 +88,7 @@ impl AssemblyBrain {
 
     fn clamp_cells(cells: &mut [f32]) {
         for value in cells {
-            if value.is_nan() {
-                *value = 0.0;
-            } else {
-                *value = (*value).clamp(-10.0, 10.0);
-            }
+            *value = (*value).clamp(-10.0, 10.0);
         }
     }
 
@@ -708,14 +704,14 @@ mod tests {
     };
 
     #[test]
-    fn adapter_semantic_identity_v1_is_pinned() {
+    fn adapter_semantic_identity_v2_is_pinned() {
         let identity = AssemblyFamilyAdapter::new()
             .expect("canonical Assembly adapter")
             .adapter_identity();
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "f0f345102059ff017681acdc92998a4de7817a8ee1afe579bae300b6ccfe92b7",
+            "424ea6759de4b0c676bb7e37b0d8471d6c0ef8bc664078736ac425a31086622c",
             "update only after reviewing an intentional Assembly executable-semantics change"
         );
     }
@@ -1214,6 +1210,69 @@ mod tests {
                 .expect("checkpoint after interpreter overflow"),
             before_overflow,
             "an instruction-produced non-finite result must roll back byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn protocol_rejects_interpreter_nan_without_committing_working_state() {
+        let family = AssemblyFamilyAdapter::new().expect("canonical Assembly family");
+        let mut cells = [0.0; BRAIN_SIZE];
+
+        cells[INPUT_SIZE] = 2.25; // multiply cell 50 by cell 100 into cell 150
+        cells[INPUT_SIZE + 1] = 0.25;
+        cells[INPUT_SIZE + 2] = 0.50;
+        cells[INPUT_SIZE + 3] = 0.75;
+        cells[50] = f32::MAX;
+        cells[100] = f32::MAX;
+
+        cells[INPUT_SIZE + 4] = 2.25; // multiply the resulting infinity by zero
+        cells[INPUT_SIZE + 5] = 0.75; // cell 150
+        cells[INPUT_SIZE + 6] = 0.60; // cell 120
+        cells[INPUT_SIZE + 7] = 0.80; // cell 160
+
+        let mut arithmetic_probe =
+            AssemblyBrain::from_cells(cells).expect("finite arithmetic-overflow program");
+        arithmetic_probe.tick_with_budget(&[0.0; INPUT_SIZE]);
+        assert!(
+            arithmetic_probe.cells[160].is_nan(),
+            "the second multiply must produce Inf * 0 -> NaN before protocol validation"
+        );
+
+        let genome = family
+            .genome(&cells, fixture_provenance())
+            .expect("finite arithmetic-overflow program");
+        let mut rng = SmallRngStream::seed_from_u64(3);
+        let state = family
+            .initial_state(&genome, &mut rng)
+            .expect("overflow program initial state");
+        let mut evaluator = family
+            .evaluator(&genome, &state)
+            .expect("overflow evaluator");
+        let checkpoint_before = family
+            .checkpoint_evaluator(evaluator.as_ref())
+            .expect("checkpoint before rejected tick");
+
+        let error = evaluator
+            .evaluate(&[0.0; INPUT_SIZE])
+            .expect_err("interpreter-generated NaN must reject the tick");
+        match error {
+            BrainProtocolError::InvalidPayload {
+                kind,
+                family_id,
+                detail,
+            } => {
+                assert_eq!(kind, BrainEnvelopeKind::EvaluatorState);
+                assert_eq!(&family_id, family.family_id());
+                assert_eq!(detail, "Assembly cell 160 is non-finite (NaN)");
+            }
+            other => panic!("unexpected Assembly evaluation error: {other}"),
+        }
+        assert_eq!(
+            family
+                .checkpoint_evaluator(evaluator.as_ref())
+                .expect("checkpoint after rejected tick"),
+            checkpoint_before,
+            "Inf * 0 must reject without committing any working-state byte"
         );
     }
 

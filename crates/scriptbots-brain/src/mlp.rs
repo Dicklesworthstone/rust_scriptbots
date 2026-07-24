@@ -22,8 +22,8 @@ const CONNECTIONS: usize = 4;
 const BRAIN_SIZE_WIRE: u16 = 200;
 const CONNECTIONS_WIRE: u8 = 4;
 const MLP_FAMILY_ID: &str = "mlp-baseline";
-const ADAPTER_SEMANTIC_VERSION: u32 = 1;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.adapter-semantics.v1";
+const ADAPTER_SEMANTIC_VERSION: u32 = 2;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.adapter-semantics.v2";
 const GENOME_SCHEMA_VERSION: u32 = 1;
 const GENOME_CODEC_VERSION: u16 = 1;
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -180,8 +180,7 @@ impl MlpBrain {
     }
 
     fn logistic(value: f32) -> f32 {
-        let clean = if value.is_nan() { 0.0 } else { value };
-        1.0 / (1.0 + (-clean).exp())
+        1.0 / (1.0 + (-value).exp())
     }
 
     fn gaussian(rng: &mut dyn RandomStream) -> f32 {
@@ -1146,12 +1145,12 @@ mod tests {
     };
 
     #[test]
-    fn adapter_semantic_identity_v1_is_pinned() {
+    fn adapter_semantic_identity_v2_is_pinned() {
         let identity = MlpBrainFamily::new().adapter_identity();
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "85bac0571c8e9981b5bc3ffe599a5ada3dfed14b5150e419776d18d5b3882ee2",
+            "2bc16975eac2e80179564647f0009f912d28aa8fa454fb73569759991f7688f1",
             "update only after reviewing an intentional MLP executable-semantics change"
         );
     }
@@ -1540,6 +1539,78 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn protocol_rejects_sigmoid_nan_without_committing_working_state() {
+        let family = MlpBrainFamily::new();
+        let inert = NodeParams {
+            weights: [0.0; CONNECTIONS],
+            targets: [0; CONNECTIONS],
+            kinds: [SynapseKind::Regular; CONNECTIONS],
+            gain: 0.0,
+            damping: 1.0,
+            bias: 0.0,
+        };
+        let mut nodes = vec![inert; BRAIN_SIZE];
+        nodes[INPUT_SIZE].weights[0] = f32::MAX;
+        nodes[INPUT_SIZE].targets[0] = INPUT_SIZE;
+
+        let mut dynamic = vec![NodeState::default(); BRAIN_SIZE];
+        dynamic[INPUT_SIZE].output = f32::MAX;
+
+        let weighted = dynamic[INPUT_SIZE].output * nodes[INPUT_SIZE].weights[0];
+        assert!(
+            weighted.is_infinite(),
+            "finite recurrent state and weight must overflow before the gain is applied"
+        );
+        assert!(
+            (weighted * nodes[INPUT_SIZE].gain).is_nan(),
+            "the zero gain must generate Inf * 0 -> NaN before the sigmoid"
+        );
+
+        let mut arithmetic_probe = MlpBrain {
+            nodes: nodes.clone(),
+            state: dynamic.clone(),
+        };
+        arithmetic_probe.tick(&[0.0; INPUT_SIZE]);
+        assert!(
+            arithmetic_probe.state[INPUT_SIZE].target.is_nan(),
+            "the sigmoid must preserve the generated NaN for protocol validation"
+        );
+
+        let genome = family
+            .genome(&nodes, BrainProvenance::default())
+            .expect("finite arithmetic-overflow genome");
+        let state = family
+            .state(&genome, &dynamic)
+            .expect("finite arithmetic-overflow state");
+        let mut evaluator = family.evaluator(&genome, &state).expect("evaluator");
+        let checkpoint_before = evaluator.checkpoint_state().expect("checkpoint before");
+
+        let error = evaluator
+            .evaluate(&[0.0; INPUT_SIZE])
+            .expect_err("sigmoid-generated NaN must reject the tick");
+        match error {
+            BrainProtocolError::InvalidPayload {
+                kind,
+                family_id,
+                detail,
+            } => {
+                assert_eq!(kind, BrainEnvelopeKind::EvaluatorState);
+                assert_eq!(&family_id, family.family_id());
+                assert_eq!(
+                    detail,
+                    format!("node {INPUT_SIZE} dynamic state contains a non-finite value")
+                );
+            }
+            other => panic!("unexpected MLP evaluation error: {other}"),
+        }
+        assert_eq!(
+            evaluator.checkpoint_state().expect("checkpoint after"),
+            checkpoint_before,
+            "Inf * 0 must reject without committing any working-state byte"
+        );
     }
 
     #[test]
