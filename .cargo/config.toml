@@ -1,6 +1,17 @@
-[build]
-# Consolidated build config
-target = "x86_64-unknown-linux-gnu"
+# No global `[build] target`. Pinning one here forced every host to cross-compile to
+# Linux, so on macOS the settings below applied and the link died with
+# `clang: error: invalid linker name in argument '-fuse-ld=mold'` — breaking every
+# local `cargo test`/`build`/`bench` (`cargo check` survived only because it never
+# links). That is also what turned an rch fail-open into a link error rather than a
+# build (bd-h7v0).
+#
+# Nothing needs the global default. The rch workers are x86_64 Linux, so their host
+# build resolves the section below automatically — cargo applies `[target.<triple>]`
+# to a host build with no `--target`, so `linker`, mold, and `target-cpu=x86-64-v3`
+# are all preserved there. The DSR lane never relied on it either: perf_gate.sh
+# passes `--target "${HOST_TARGET}"` from `rustc -vV` (scripts/perf_gate.sh:162,192)
+# and DSR sets a caller-level `CARGO_BUILD_TARGET` for its pinned Apple Silicon
+# target (see ci/check_wasm_graph.sh:78).
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
