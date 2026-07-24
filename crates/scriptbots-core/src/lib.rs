@@ -9611,6 +9611,17 @@ pub enum ScientificStateError {
         /// Exact field or collection path rejected.
         path: String,
     },
+    /// A live agent handle had no stable `AgentUid`, so no scientific identity could be named.
+    ///
+    /// The dense arena and the identity map are meant to stay in lockstep, so this is an
+    /// invariant violation rather than ordinary input rejection. It is typed rather than
+    /// panicking because the release profile is `panic = "abort"`: a caller that can still
+    /// refuse a transaction should get the chance to, instead of taking the process down.
+    #[error("stable agent identity is missing at `{path}`")]
+    MissingAgentIdentity {
+        /// Exact field or collection path rejected.
+        path: String,
+    },
     /// Scientific mutation was attempted while the current persistence admission was unresolved.
     #[error(
         "persistence boundary for tick {tick} is unresolved at `{path}`; retry the exact retained persistence batch before advancing the world or mutating scientific state"
@@ -9689,6 +9700,7 @@ impl ScientificStateError {
             | Self::GenerationOverflow { path, .. }
             | Self::AgentRngCounterExhausted { path, .. }
             | Self::MissingAgentRngCounters { path }
+            | Self::MissingAgentIdentity { path }
             | Self::PersistenceBoundaryUnresolved { path, .. }
             | Self::PersistenceBoundarySealed { path, .. }
             | Self::SeededArrivalAfterBootstrap { path, .. }
@@ -19902,8 +19914,7 @@ impl WorldState {
                 .index_of(id)
                 .expect("live agent must have a dense row");
             let uid = self
-                .agent_uid(id)
-                .expect("live agent must have a stable identity");
+                .require_agent_uid(id, || "validate_live_generation_headroom.agent".to_owned())?;
             self.agents.columns().generations()[index]
                 .next_at(format!("agents[uid={}].generation", uid.get()))?;
         }
@@ -19991,9 +20002,8 @@ impl WorldState {
                 continue;
             }
 
-            let parent_uid = self
-                .agent_uid(*agent_id)
-                .expect("live birth parent must have stable identity");
+            let parent_uid =
+                self.require_agent_uid(*agent_id, || "stage_reproduction.parent".to_owned())?;
             let parent_rng_counters_before_attempt = self
                 .agent_rng_counters
                 .get(*agent_id)
@@ -20032,10 +20042,9 @@ impl WorldState {
             // for the one partner of an actual birth, not the whole population.
             let partner_runtime = partner_index.and_then(|j| self.runtime.get(handles[j]).cloned());
             let partner_id = partner_index.map(|j| handles[j]);
-            let partner_agent_uid = partner_id.map(|id| {
-                self.agent_uid(id)
-                    .expect("live birth partner must have stable identity")
-            });
+            let partner_agent_uid = partner_id
+                .map(|id| self.require_agent_uid(id, || "stage_reproduction.partner".to_owned()))
+                .transpose()?;
             let birth_ordinal = match self
                 .agent_rng_counters
                 .get_mut(*agent_id)
@@ -23113,6 +23122,22 @@ impl WorldState {
         self.agent_identity(id).map(|identity| identity.uid)
     }
 
+    /// Resolve a live handle's stable `AgentUid`, or name the exact path that lacked one.
+    ///
+    /// The arena and the identity map are kept in lockstep, so a miss is an invariant
+    /// violation. Callers that already return a `Result` should use this rather than
+    /// `expect`: the release profile is `panic = "abort"`, so an `expect` here is an
+    /// unrecoverable process abort in a simulator that threads typed errors everywhere
+    /// else, and it takes the whole run's unadmitted state with it (bd-cqja).
+    fn require_agent_uid(
+        &self,
+        id: AgentId,
+        path: impl FnOnce() -> String,
+    ) -> Result<AgentUid, ScientificStateError> {
+        self.agent_uid(id)
+            .ok_or_else(|| ScientificStateError::MissingAgentIdentity { path: path() })
+    }
+
     /// Return the exact next-unused keyed-RNG ordinals for one live agent.
     #[must_use]
     pub fn agent_rng_counters(&self, id: AgentId) -> Option<AgentRngCountersV1> {
@@ -23506,9 +23531,7 @@ impl WorldState {
         if !self.agents.contains(id) {
             return Ok(false);
         }
-        let uid = self
-            .agent_uid(id)
-            .expect("live agent must have a stable identity before brain binding");
+        let uid = self.require_agent_uid(id, || "bind_agent_brain.agent".to_owned())?;
         let counters_before = self.agent_rng_counters.get(id).copied().ok_or_else(|| {
             ScientificStateError::MissingAgentRngCounters {
                 path: format!("agents[uid={}].rng_counters", uid.get()),
@@ -41979,5 +42002,56 @@ mod tests {
         .world_digest_v1()
         .expect("styled digest");
         assert_eq!(plain, styled);
+    }
+
+    /// A live handle with no stable identity is an invariant violation, but the release
+    /// profile is `panic = "abort"`, so it must surface as a typed refusal the caller can
+    /// still act on rather than taking the process down mid-run (bd-cqja).
+    ///
+    /// White-box by necessity: the invariant holds through every public path, so the only
+    /// way to exercise the fail-closed branch is to break the arena/identity pairing
+    /// directly.
+    #[test]
+    fn a_handle_without_a_stable_identity_is_refused_not_aborted() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0xC0FF_EE01),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let id = world.try_spawn_agent(sample_agent(3)).expect("seed agent");
+
+        // The helper resolves a healthy handle.
+        let uid = world
+            .require_agent_uid(id, || "probe.healthy".to_owned())
+            .expect("a live agent resolves its stable uid");
+        assert_eq!(Some(uid), world.agent_uid(id));
+
+        // Desynchronize the identity map from the arena, then prove the typed refusal.
+        world.identities.remove(id);
+        let error = world
+            .require_agent_uid(id, || "probe.desynchronized".to_owned())
+            .expect_err("a handle without an identity must be refused");
+        assert!(
+            matches!(
+                &error,
+                ScientificStateError::MissingAgentIdentity { path } if path == "probe.desynchronized"
+            ),
+            "expected MissingAgentIdentity naming the exact path, got {error:?}"
+        );
+
+        // And the refusal travels through a real caller instead of aborting it.
+        let key = world
+            .brain_registry
+            .register("test.identity", |_rng| Ok(Box::new(StubBrain)));
+        let bound = world.bind_agent_brain(id, key);
+        assert!(
+            matches!(
+                bound,
+                Err(WorldStateError::InvalidState(
+                    ScientificStateError::MissingAgentIdentity { .. }
+                ))
+            ),
+            "bind_agent_brain must return the typed fault, got {bound:?}"
+        );
     }
 }
