@@ -319,20 +319,25 @@ impl TerminalRenderer {
             report.record(app.snapshot(), buffer);
         }
 
-        // Surface the final digest in the headless evidence logs.
-        {
-            let world = app.world.lock().expect("terminal world mutex poisoned");
-            let digest = world
-                .world_digest_v1()
-                .context("failed to capture the final headless WorldDigestV1")?;
-            tracing::info!(
-                tick = app.snapshot().tick,
-                world_digest = %digest.overall,
-                "captured final world digest for the replay stream"
-            );
-        }
+        let world_digest = match app.world.lock() {
+            Ok(world) => match world.world_digest_v1() {
+                Ok(digest) => {
+                    tracing::info!(
+                        tick = app.snapshot().tick,
+                        world_digest = %digest.overall,
+                        "captured final world digest for the replay stream"
+                    );
+                    Some(digest.overall)
+                }
+                Err(error) => {
+                    tracing::warn!("failed to capture final world digest: {error}");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
 
-        report.finalize();
+        report.finalize(world_digest);
 
         if let Some(path) = report_file_path_from_env() {
             report.write_json(&path).with_context(|| {
@@ -3749,8 +3754,8 @@ impl HeadlessReport {
             .push(FrameStats::from_snapshot(snapshot, Some(buffer)));
     }
 
-    fn finalize(&mut self) {
-        self.summary = ReportSummary::from(&self.initial, &self.frames);
+    fn finalize(&mut self, world_digest: Option<String>) {
+        self.summary = ReportSummary::from(&self.initial, &self.frames, world_digest);
     }
 
     fn write_json(&self, path: &Path) -> Result<()> {
@@ -3923,10 +3928,11 @@ struct ReportSummary {
     avg_energy_mean: f32,
     avg_energy_min: f32,
     avg_energy_max: f32,
+    world_digest: Option<String>,
 }
 
 impl ReportSummary {
-    fn from(initial: &FrameStats, frames: &[FrameStats]) -> Self {
+    fn from(initial: &FrameStats, frames: &[FrameStats], world_digest: Option<String>) -> Self {
         if frames.is_empty() {
             return Self {
                 frame_count: 0,
@@ -3940,6 +3946,7 @@ impl ReportSummary {
                 avg_energy_mean: initial.avg_energy,
                 avg_energy_min: initial.avg_energy,
                 avg_energy_max: initial.avg_energy,
+                world_digest,
             };
         }
 
@@ -3983,6 +3990,7 @@ impl ReportSummary {
             avg_energy_mean,
             avg_energy_min: min_energy,
             avg_energy_max: max_energy,
+            world_digest,
         }
     }
 }
