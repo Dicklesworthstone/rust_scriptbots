@@ -14598,6 +14598,7 @@ fn transform_color(color: Rgba, matrix: [[f32; 3]; 3]) -> Rgba {
 #[cfg(test)]
 mod command_characterization_tests {
     use super::*;
+    use scriptbots_core::{CharacterizationDigestV0, WorldDigestV1};
     use std::time::Duration;
 
     #[derive(Default)]
@@ -15146,6 +15147,122 @@ mod command_characterization_tests {
         assert_eq!(
             tick, 1,
             "two GPUI views must not independently advance one shared world"
+        );
+    }
+
+    fn seeded_digest_trace_after_snapshot_schedule(
+        snapshot_count: usize,
+    ) -> Vec<(CharacterizationDigestV0, WorldDigestV1)> {
+        assert!(
+            snapshot_count <= 2,
+            "the production GPUI shell has two views"
+        );
+        let config = ScriptBotsConfig {
+            world_width: 128,
+            world_height: 128,
+            food_cell_size: 16,
+            initial_food: 0.25,
+            food_respawn_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.0,
+            persistence_interval: 0,
+            chart_flush_interval: 0,
+            rng_seed: Some(0xD16E_57A7),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("seeded repaint-schedule world");
+        let mut focused_agent = None;
+        for position in [
+            Position::new(12.0, 18.0),
+            Position::new(64.0, 72.0),
+            Position::new(111.0, 103.0),
+        ] {
+            let agent_id = world
+                .try_spawn_agent(AgentData {
+                    position,
+                    ..AgentData::default()
+                })
+                .expect("seed deterministic repaint-schedule agent");
+            focused_agent.get_or_insert(agent_id);
+        }
+        let focused_agent = focused_agent.expect("seeded repaint-schedule agent");
+        let world = Arc::new(Mutex::new(world));
+
+        let pending_commands = Arc::new(Mutex::new(Vec::new()));
+        let drain_commands = Arc::clone(&pending_commands);
+        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
+            Arc::new(move || {
+                let mut commands = drain_commands
+                    .lock()
+                    .expect("repaint-schedule command queue");
+                std::mem::take(&mut *commands)
+            });
+        let driver = gui_simulation_driver(&world, command_drain);
+
+        let mut views = Vec::with_capacity(snapshot_count);
+        if snapshot_count > 0 {
+            let hud = simulation_view_with_driver(Arc::clone(&driver));
+            hud.inspector
+                .lock()
+                .expect("HUD inspector lock")
+                .focused_agent = Some(focused_agent);
+            views.push(hud);
+        }
+        if snapshot_count > 1 {
+            let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
+            canvas.set_minimal_canvas_mode();
+            views.push(canvas);
+        }
+
+        let now = Instant::now();
+        let mut digest_trace = Vec::with_capacity(240);
+        for expected_tick in 1..=240 {
+            pending_commands
+                .lock()
+                .expect("repaint-schedule command queue")
+                .push(ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: None,
+                    speed_multiplier: None,
+                    step_once: true,
+                }));
+            driver
+                .lock()
+                .expect("GUI simulation driver lock")
+                .drive_at(now);
+            for view in &mut views {
+                let _ = view.snapshot();
+            }
+            let world = world.lock().expect("repaint-schedule world");
+            assert_eq!(
+                world.tick().0,
+                expected_tick,
+                "every driver command must advance exactly one science tick"
+            );
+            digest_trace.push((
+                world
+                    .characterization_digest_v0()
+                    .expect("characterization digest"),
+                world.world_digest_v1().expect("canonical world digest"),
+            ));
+        }
+
+        digest_trace
+    }
+
+    #[test]
+    fn seeded_digest_trace_is_independent_of_gpui_snapshot_count() {
+        let zero_snapshots = seeded_digest_trace_after_snapshot_schedule(0);
+        let one_snapshot = seeded_digest_trace_after_snapshot_schedule(1);
+        let two_snapshots = seeded_digest_trace_after_snapshot_schedule(2);
+
+        assert_eq!(
+            one_snapshot, zero_snapshots,
+            "one GPUI snapshot per tick must not alter any science digest in the 240-tick trace"
+        );
+        assert_eq!(
+            two_snapshots, zero_snapshots,
+            "HUD plus canvas snapshots must not alter any science digest in the 240-tick trace"
         );
     }
 
