@@ -389,6 +389,7 @@ pub struct ChannelHostDriver {
     host: FixedDeadlineHost,
     port: LocalHostPort,
     receiver: Receiver<IngressMessage>,
+    pending_ingress: Option<IngressMessage>,
     statuses: Arc<RwLock<StatusBoard>>,
     protocol_events: Arc<RwLock<ProtocolEventBoard>>,
     tracked: VecDeque<CommandId>,
@@ -429,6 +430,7 @@ impl ChannelHostDriver {
             host,
             port: local,
             receiver,
+            pending_ingress: None,
             statuses,
             protocol_events,
             tracked: VecDeque::new(),
@@ -484,25 +486,34 @@ impl ChannelHostDriver {
         }
     }
 
+    fn process_ingress(&mut self, message: IngressMessage) -> usize {
+        match message {
+            IngressMessage::Command { envelope, reply } => {
+                let command_id = envelope.command_id;
+                let result = self.host.submit(envelope);
+                if let Ok(status) = &result {
+                    self.track(command_id);
+                    if let Ok(mut board) = self.statuses.write() {
+                        board.insert(status.clone(), self.status_board_capacity);
+                    }
+                }
+                // A client that timed out is unreachable; the admission
+                // remains authoritative and mirrored either way.
+                let _ = reply.send(result);
+                1
+            }
+            IngressMessage::Wake => 0,
+        }
+    }
+
     fn drain_ingress(&mut self) -> Result<usize, ChannelDriveError> {
         let mut admitted = 0;
+        if let Some(message) = self.pending_ingress.take() {
+            admitted += self.process_ingress(message);
+        }
         loop {
             match self.receiver.try_recv() {
-                Ok(IngressMessage::Command { envelope, reply }) => {
-                    let command_id = envelope.command_id;
-                    let result = self.host.submit(envelope);
-                    if let Ok(status) = &result {
-                        self.track(command_id);
-                        if let Ok(mut board) = self.statuses.write() {
-                            board.insert(status.clone(), self.status_board_capacity);
-                        }
-                    }
-                    // A client that timed out is unreachable; the admission
-                    // remains authoritative and mirrored either way.
-                    let _ = reply.send(result);
-                    admitted += 1;
-                }
-                Ok(IngressMessage::Wake) => {}
+                Ok(message) => admitted += self.process_ingress(message),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.controller_disconnected = true;
@@ -511,6 +522,16 @@ impl ChannelHostDriver {
             }
         }
         Ok(admitted)
+    }
+
+    fn retain_waited_ingress(&mut self, message: IngressMessage) -> Result<(), HostAccessError> {
+        if self.pending_ingress.is_some() {
+            return Err(ChannelHostPort::protocol_violation(
+                "driver tried to retain two waited ingress messages",
+            ));
+        }
+        self.pending_ingress = Some(message);
+        Ok(())
     }
 
     /// Drain ingress, drive the host when due, and mirror all boards once.
@@ -599,16 +620,18 @@ impl ChannelHostDriver {
                 }
                 HostDriveInterest::WakeOnly => {
                     // Quiescent: park until a client wakes us; no periodic timer.
-                    if self.receiver.recv().is_err() {
-                        self.controller_disconnected = true;
+                    match self.receiver.recv() {
+                        Ok(message) => self.retain_waited_ingress(message)?,
+                        Err(_) => self.controller_disconnected = true,
                     }
                 }
                 HostDriveInterest::Draining => {
-                    if matches!(
-                        self.receiver.recv_timeout(self.maintenance_period),
-                        Err(RecvTimeoutError::Disconnected)
-                    ) {
-                        self.controller_disconnected = true;
+                    match self.receiver.recv_timeout(self.maintenance_period) {
+                        Ok(message) => self.retain_waited_ingress(message)?,
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            self.controller_disconnected = true;
+                        }
                     }
                 }
                 HostDriveInterest::ReadyNow | HostDriveInterest::Deadline => {
@@ -625,11 +648,12 @@ impl ChannelHostDriver {
                         })
                         .unwrap_or(self.maintenance_period)
                         .min(self.maintenance_period.max(Duration::from_millis(1)));
-                    if matches!(
-                        self.receiver.recv_timeout(wait),
-                        Err(RecvTimeoutError::Disconnected)
-                    ) {
-                        self.controller_disconnected = true;
+                    match self.receiver.recv_timeout(wait) {
+                        Ok(message) => self.retain_waited_ingress(message)?,
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            self.controller_disconnected = true;
+                        }
                     }
                 }
             }
@@ -761,6 +785,30 @@ mod tests {
             .expect("post-exit status")
             .expect("shutdown status retained");
         assert!(matches!(status.application(), ApplicationState::Applied(_)));
+    }
+
+    #[test]
+    fn quiescent_driver_wait_preserves_the_command_that_wakes_it() {
+        let (worker, mut port) = spawn_driver(true);
+
+        // A paused host reports WakeOnly, so the owner is blocked in recv()
+        // until this exact command arrives. The wait path must retain the
+        // message for the next ordered ingress drain instead of consuming it
+        // merely as a wake notification.
+        std::thread::sleep(Duration::from_millis(20));
+        let step = port
+            .submit(CommandEnvelope::new(CommandId::new(13), HostCommand::Step))
+            .expect("wake command reaches authoritative admission");
+        assert!(matches!(step.application(), ApplicationState::Admitted));
+        let stepped = wait_resolved(&mut port, CommandId::new(13));
+        assert!(matches!(
+            stepped.application(),
+            ApplicationState::Applied(_)
+        ));
+
+        let receipt = shutdown_and_join(worker, &mut port);
+        assert_eq!(receipt.outcome, ChannelRunOutcome::Stopped);
+        assert!(receipt.commands_admitted >= 2);
     }
 
     #[test]
