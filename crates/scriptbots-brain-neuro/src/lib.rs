@@ -49,9 +49,16 @@ impl NeuroflowActivation {
     fn to_type(self) -> Type {
         match self {
             Self::Tanh => Type::Tanh,
-            Self::Sigmoid => Type::Sigmoid,
+            Self::Sigmoid => Type::Custom,
             Self::Relu => Type::Relu,
         }
+    }
+
+    fn matches_type(self, activation_type: &Type) -> bool {
+        matches!(
+            (self, activation_type),
+            (Self::Tanh, Type::Tanh) | (Self::Sigmoid, Type::Custom) | (Self::Relu, Type::Relu)
+        )
     }
 }
 
@@ -571,11 +578,40 @@ impl NeuroflowBrain {
             .map_err(|source| NeuroflowBrainError::SeedSerialization { source })?;
         let mut network: FeedForward = serde_json::from_value(value)
             .map_err(|source| NeuroflowBrainError::NetworkConstruction { source })?;
+        Self::configure_network(&mut network, config);
+        Ok(network)
+    }
+
+    fn logistic_sigmoid(value: f64) -> f64 {
+        if value >= 0.0 {
+            1.0 / (1.0 + (-value).exp())
+        } else {
+            let exponential = value.exp();
+            exponential / (1.0 + exponential)
+        }
+    }
+
+    fn logistic_sigmoid_derivative(value: f64) -> f64 {
+        let activated = Self::logistic_sigmoid(value);
+        activated * (1.0 - activated)
+    }
+
+    fn configure_network(network: &mut FeedForward, config: &NeuroflowBrainConfig) {
+        match config.activation {
+            NeuroflowActivation::Tanh => {
+                network.activation(Type::Tanh);
+            }
+            NeuroflowActivation::Sigmoid => {
+                network
+                    .custom_activation(Self::logistic_sigmoid, Self::logistic_sigmoid_derivative);
+            }
+            NeuroflowActivation::Relu => {
+                network.activation(Type::Relu);
+            }
+        }
         network
-            .activation(config.activation.to_type())
             .learning_rate(config.learning_rate)
             .momentum(config.momentum);
-        Ok(network)
     }
 
     fn decode_network_snapshot(
@@ -608,6 +644,12 @@ impl NeuroflowBrain {
             return Err(invalid(format!(
                 "expected {expected_layers} layers, found {}",
                 snapshot.layers.len()
+            )));
+        }
+        if !config.activation.matches_type(&snapshot.act_type) {
+            return Err(invalid(format!(
+                "serialized activation tag does not match configured {:?}",
+                config.activation
             )));
         }
         for (field, actual, expected) in [
@@ -696,10 +738,7 @@ impl NeuroflowBrain {
             .map_err(|source| NeuroflowBrainError::SeedSerialization { source })?;
         let mut network: FeedForward = serde_json::from_value(value)
             .map_err(|source| NeuroflowBrainError::NetworkConstruction { source })?;
-        network
-            .activation(config.activation.to_type())
-            .learning_rate(config.learning_rate)
-            .momentum(config.momentum);
+        Self::configure_network(&mut network, config);
         Ok(network)
     }
 
@@ -1120,6 +1159,62 @@ mod tests {
             .expect("finite inherited mutation must rebuild exactly");
         assert_ne!(inherited.tick(&inputs), baseline);
         assert_eq!(original.tick(&inputs), baseline);
+    }
+
+    #[test]
+    fn sigmoid_is_increasing_and_survives_snapshot_restore() {
+        let config = NeuroflowBrainConfig {
+            hidden_layers: Vec::new(),
+            activation: NeuroflowActivation::Sigmoid,
+            ..NeuroflowBrainConfig::default()
+        };
+        let mut rng = SmallRngStream::seed_from_u64(0x516D_01D0);
+        let mut brain =
+            NeuroflowBrain::new(config.clone(), &mut rng).expect("direct sigmoid brain");
+
+        let constructed_snapshot = brain
+            .network_snapshot()
+            .expect("decode constructed sigmoid network");
+        let constructed_bias = constructed_snapshot.layers[0].w[0][0];
+        let constructed_output = brain.tick(&[0.0; INPUT_SIZE])[0];
+        assert!(
+            (constructed_output - NeuroflowBrain::logistic_sigmoid(constructed_bias) as f32).abs()
+                < 1.0e-6,
+            "construction must install the corrected logistic activation"
+        );
+
+        let mut positive_snapshot = brain
+            .network_snapshot()
+            .expect("decode positive-bias snapshot");
+        for weights in &mut positive_snapshot.layers[0].w {
+            weights.fill(0.0);
+        }
+        positive_snapshot.layers[0].w[0][0] = 1.0;
+        brain.network = NeuroflowBrain::restore_network_snapshot(positive_snapshot, &config)
+            .expect("restore positive-bias sigmoid network");
+        let positive = brain.tick(&[0.0; INPUT_SIZE])[0];
+
+        let mut negative_snapshot = brain
+            .network_snapshot()
+            .expect("decode negative-bias snapshot");
+        negative_snapshot.layers[0].w[0][0] = -1.0;
+        brain.network = NeuroflowBrain::restore_network_snapshot(negative_snapshot, &config)
+            .expect("restore negative-bias sigmoid network");
+        let negative = brain.tick(&[0.0; INPUT_SIZE])[0];
+        let mut inherited = brain
+            .clone_box()
+            .expect("correct sigmoid must survive exact cloning");
+
+        assert!(positive > 0.5, "sigmoid(+1) must be above 0.5");
+        assert!(negative < 0.5, "sigmoid(-1) must be below 0.5");
+        assert!(positive > negative, "sigmoid must be increasing");
+        assert!((positive - 0.731_058_6).abs() < 1.0e-6);
+        assert!((negative - 0.268_941_43).abs() < 1.0e-6);
+        assert_eq!(
+            inherited.tick(&[0.0; INPUT_SIZE])[0],
+            negative,
+            "snapshot cloning must reinstall the corrected custom activation"
+        );
     }
 
     #[test]

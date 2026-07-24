@@ -1033,6 +1033,9 @@ pub struct SpeedRequestBody {
         get_hydrology_snapshot,
         stream_ticks_sse,
         stream_ticks_ws,
+        stream_ticks_ndjson,
+        screenshot_ascii,
+        screenshot_png,
         get_events_tail,
         get_narrative_search,
         get_scoreboard,
@@ -1046,7 +1049,12 @@ pub struct SpeedRequestBody {
         post_resume,
         post_step,
         post_speed,
+        post_control_pause,
+        post_control_resume,
+        post_control_step,
+        post_control_speed,
         post_control_shutdown,
+        get_control_status,
         get_status
     ),
     components(
@@ -1326,12 +1334,18 @@ async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, App
     Ok((StatusCode::OK, text).into_response())
 }
 
-/// Return a PNG screenshot placeholder for GPUI view (basic 1x1 pixel placeholder for now).
+/// Rasterize the current world offscreen and return it as a 1024x576 PNG.
+///
+/// Requires the `gui` application feature; a binary built without it answers
+/// `400 Bad Request` rather than pretending to render.
 #[utoipa::path(
     get,
     path = "/api/screenshot/png",
     tag = "control",
-    responses((status = 200, description = "PNG screenshot", content_type = "image/png"))
+    responses(
+        (status = 200, description = "1024x576 PNG render of the current world", content_type = "image/png"),
+        (status = 400, description = "binary was built without the `gui` feature", body = ErrorResponse)
+    )
 )]
 async fn screenshot_png(State(state): State<ApiState>) -> Result<Response, AppError> {
     // Rasterization is CPU-heavy on top of the lock acquisition, so the whole
@@ -2405,6 +2419,7 @@ mod tests {
     use scriptbots_core::{ScriptBotsConfig, WorldState};
     use serial_test::serial;
     use std::{
+        collections::BTreeSet,
         ffi::OsString,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -3062,45 +3077,79 @@ mod tests {
         assert_eq!(rendered["bootstrap_ticks"], 12);
     }
 
+    /// Collect the `/api/...` literal that follows each occurrence of `marker`.
+    ///
+    /// Used to read the router's route table and the `#[utoipa::path]` annotations
+    /// straight out of this file's implementation half, so the conformance test
+    /// below compares real registrations instead of a hand-copied list.
+    fn api_paths_following(source: &str, marker: &str) -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        let mut rest = source;
+        while let Some(offset) = rest.find(marker) {
+            rest = &rest[offset + marker.len()..];
+            let Some(open) = rest.find('"') else {
+                break;
+            };
+            // Only a literal that starts immediately after the marker (modulo
+            // whitespace) belongs to it; anything else is unrelated code.
+            if rest[..open].trim().is_empty() {
+                let literal = &rest[open + 1..];
+                if let Some(close) = literal.find('"') {
+                    let value = &literal[..close];
+                    if value.starts_with("/api/") {
+                        found.insert(value.to_owned());
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// The Swagger UI and `/api-docs/openapi.json` are the advertised control-API
+    /// contract, so a handler that is routed but missing from `ApiDoc`'s `paths(...)`
+    /// silently disappears from that contract (bd-01dg: eight endpoints, including the
+    /// README-documented `/api/screenshot/ascii`, `/api/screenshot/png`, and
+    /// `/api/ticks/ndjson`, had drifted out of the spec). Compare the three sets that
+    /// must agree — routed, annotated, and published — rather than spot-checking names.
     #[test]
     fn test_openapi_spec_conformance() {
-        let openapi = ApiDoc::openapi();
-        let json_spec = serde_json::to_string(&openapi).expect("OpenAPI spec serializes");
+        // The test module mentions paths in assertions and fixtures; only the
+        // implementation half of the file declares real routes.
+        let implementation = include_str!("servers.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split always yields the implementation prefix");
+
+        let routed = api_paths_following(implementation, ".route(");
+        let annotated = api_paths_following(implementation, "path = ");
         assert!(
-            json_spec.contains("/api/knobs"),
-            "spec must contain /api/knobs"
+            !routed.is_empty(),
+            "route extraction found nothing; the router shape must have changed"
         );
-        assert!(
-            json_spec.contains("/api/config"),
-            "spec must contain /api/config"
+
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec serializes");
+        let published: BTreeSet<String> = spec["paths"]
+            .as_object()
+            .expect("OpenAPI documents always carry a paths object")
+            .keys()
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            annotated,
+            routed,
+            "every `#[utoipa::path]` annotation must describe a registered route and vice versa; \
+             annotated-but-unrouted: {:?}, routed-but-unannotated: {:?}",
+            annotated.difference(&routed).collect::<Vec<_>>(),
+            routed.difference(&annotated).collect::<Vec<_>>()
         );
-        assert!(
-            json_spec.contains("/api/pause"),
-            "spec must contain /api/pause"
-        );
-        assert!(
-            json_spec.contains("/api/resume"),
-            "spec must contain /api/resume"
-        );
-        assert!(
-            json_spec.contains("/api/step"),
-            "spec must contain /api/step"
-        );
-        assert!(
-            json_spec.contains("/api/speed"),
-            "spec must contain /api/speed"
-        );
-        assert!(
-            json_spec.contains("/api/control/shutdown"),
-            "spec must contain /api/control/shutdown"
-        );
-        assert!(
-            json_spec.contains("/api/narrative/search"),
-            "spec must contain /api/narrative/search"
-        );
-        assert!(
-            json_spec.contains("/api/ws/stream"),
-            "spec must contain /api/ws/stream"
+        assert_eq!(
+            published,
+            routed,
+            "the published OpenAPI document must expose exactly the registered routes; \
+             missing from spec: {:?}, present only in spec: {:?}",
+            routed.difference(&published).collect::<Vec<_>>(),
+            published.difference(&routed).collect::<Vec<_>>()
         );
     }
 }

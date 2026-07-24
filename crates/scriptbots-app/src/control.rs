@@ -190,6 +190,20 @@ impl From<PoisonError<MutexGuard<'_, WorldState>>> for ControlError {
 
 type KnobsCache = std::sync::Arc<Mutex<Option<(u64, Vec<KnobEntry>)>>>;
 
+/// Lock a derived cache, adopting the contents even if a previous holder panicked.
+///
+/// The world mutex propagates poisoning as [`ControlError::Lock`] because a panic
+/// mid-tick can leave scientific state torn. The knob and command-status caches are
+/// different: both are pure projections whose only invariants are enforced on read
+/// (knobs are revalidated against `config_revision`, statuses are looked up by exact
+/// command ID), so a poisoned guard holds a structurally intact value. Unwrapping
+/// here instead panicked the axum worker on every later `/api/knobs`, `/api/config`,
+/// and `/api/status` request, turning one unrelated panic into a permanently dead
+/// control plane (bd-2t3k).
+fn lock_cache<T>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
+    cache.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Latest completed tick summary, published by the simulation step drivers
 /// outside the world mutex (bd-134).
 ///
@@ -362,7 +376,7 @@ impl ControlHandle {
             let world = self.lock_world()?;
             world.config_revision()
         };
-        if let Some((cached_rev, cached)) = self.knobs_cache.lock().unwrap().as_ref()
+        if let Some((cached_rev, cached)) = lock_cache(&self.knobs_cache).as_ref()
             && *cached_rev == rev
         {
             return Ok(cached.clone());
@@ -377,7 +391,7 @@ impl ControlHandle {
         let mut entries = Vec::with_capacity(256);
         let mut prefix = String::new();
         flatten_value(&mut prefix, &config_value, &mut entries);
-        *self.knobs_cache.lock().unwrap() = Some((rev2, entries.clone()));
+        *lock_cache(&self.knobs_cache) = Some((rev2, entries.clone()));
         Ok(entries)
     }
 
@@ -607,7 +621,7 @@ impl ControlHandle {
         let snapshot = ConfigSnapshot::from_config(new_config.clone(), current_tick)?;
         drop(world);
         self.enqueue(ControlCommand::UpdateConfig(Box::new(new_config)))?;
-        *self.knobs_cache.lock().unwrap() = None;
+        *lock_cache(&self.knobs_cache) = None;
         Ok(snapshot)
     }
 
@@ -655,7 +669,7 @@ impl ControlHandle {
         &self,
         command_id: &str,
     ) -> Result<Option<CommandStatusDto>, ControlError> {
-        let cache = self.status_cache.lock().unwrap();
+        let cache = lock_cache(&self.status_cache);
         Ok(cache.get(command_id).cloned())
     }
 
@@ -681,7 +695,7 @@ impl ControlHandle {
             control_revision: rev,
             scientific_revision: tick,
         };
-        let mut cache = self.status_cache.lock().unwrap();
+        let mut cache = lock_cache(&self.status_cache);
         cache.insert(command_id, status.clone());
         Ok(status)
     }
@@ -1124,6 +1138,58 @@ mod tests {
 
         // Endpoints that genuinely need the world still fail typed.
         assert!(matches!(handle.snapshot(), Err(ControlError::Lock)));
+    }
+
+    /// bd-2t3k: the derived caches are not scientific state, so one unrelated panic
+    /// while holding either of them must not permanently disable `/api/knobs`,
+    /// `/api/config`, or `/api/status`. Before the fix these call sites unwrapped the
+    /// guard, so every later request panicked its axum worker.
+    #[test]
+    fn poisoned_derived_caches_keep_serving_knobs_and_command_status() {
+        let (handle, _receiver) = handle();
+
+        let before = handle.list_knobs().expect("knobs list before poisoning");
+        assert!(!before.is_empty(), "config must flatten to some knobs");
+        let issued = handle.pause().expect("pause command accepted");
+
+        let knobs_poisoner = Arc::clone(&handle.knobs_cache);
+        let _ = std::thread::spawn(move || {
+            let _guard = knobs_poisoner.lock().expect("pre-poison knobs cache");
+            panic!("deliberate poison for the bd-2t3k knobs-cache test");
+        })
+        .join();
+        let status_poisoner = Arc::clone(&handle.status_cache);
+        let _ = std::thread::spawn(move || {
+            let _guard = status_poisoner.lock().expect("pre-poison status cache");
+            panic!("deliberate poison for the bd-2t3k status-cache test");
+        })
+        .join();
+        assert!(
+            handle.knobs_cache.lock().is_err() && handle.status_cache.lock().is_err(),
+            "both cache mutexes must actually be poisoned for this test to prove anything"
+        );
+
+        let after = handle
+            .list_knobs()
+            .expect("knobs still served from a poisoned cache");
+        assert_eq!(
+            serde_json::to_value(&after).expect("knobs serialize"),
+            serde_json::to_value(&before).expect("knobs serialize")
+        );
+        let looked_up = handle
+            .command_status(&issued.command_id)
+            .expect("status still served from a poisoned cache")
+            .expect("the issued command is cached");
+        assert_eq!(looked_up.command_id, issued.command_id);
+        // Writes recover too: a later command must still land in the status cache.
+        let next = handle.resume().expect("resume command accepted");
+        assert!(
+            handle
+                .command_status(&next.command_id)
+                .expect("lookup after a poisoned write")
+                .is_some(),
+            "a command issued after poisoning must still be recorded"
+        );
     }
 
     #[test]

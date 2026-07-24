@@ -13,7 +13,17 @@ blake3 = { workspace = true }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 fastmcp_rust = { package = "fastmcp-rust", path = "/dp/fastmcp_rust/crates/fastmcp" }
 ratatui = { version = "0.30.0-alpha.5" }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+# `default-features = false` is load-bearing: reqwest's default `default-tls` pulls
+# native-tls -> openssl-sys, so asking for rustls-tls alone still linked OpenSSL and
+# broke every build on a host without OpenSSL development headers (and every
+# cross-compile, since openssl-sys cannot configure through pkg-config). charset and
+# http2 are re-stated explicitly because they are the other defaults we actually use.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "charset",
+    "http2",
+] }
 scriptbots-brain = { path = "../scriptbots-brain" }
 scriptbots-brain-ml = { path = "../scriptbots-brain-ml", optional = true }
 scriptbots-brain-neuro = { path = "../scriptbots-brain-neuro", optional = true }
