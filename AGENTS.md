@@ -77,7 +77,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `tracing` | Structured logging and diagnostics |
 | `wasm-bindgen` | WebAssembly bindings for browser target |
 | `clap` | CLI argument parsing |
-| `mcp-protocol-sdk` | MCP server integration |
+| `fastmcp-rust` | MCP server integration |
 | `kira` | Audio engine (optional) |
 | `wide` | Portable SIMD for vectorized simulation math |
 

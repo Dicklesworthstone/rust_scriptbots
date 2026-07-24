@@ -88,7 +88,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
                                  │ - selects Renderer (CLI flag/env)                            │
                                  │ - seeds world, installs brains, primes history               │
                                  └───────────────┬───────────────────────────────┬──────────────┘
-                                                 │ REST (axum + Swagger UI)      │ MCP HTTP (mcp_protocol_sdk)
+                                                 │ REST (axum + Swagger UI)      │ MCP HTTP (fastmcp-rust)
                                                  │ /api/knobs /api/config        │ tools: list_knobs,get_config,
                                                  │ /api/knobs/apply PATCH config │ apply_updates,apply_patch
                                                  │                               │
@@ -771,6 +771,17 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - `GET /api/presets` → list scenario presets
   - `POST /api/presets/apply` → apply preset by name
   - `GET /api/config/audit` → recent config patches (audit ring buffer)
+  - `GET /api/scenario` → the launch scenario identity bound to this run
+  - `GET /api/ws/stream` → WebSocket stream of tick summaries
+  - `GET /api/narrative/search` → search the recent birth/death/combat narrative
+  - Playback (fire-and-forget acknowledgement): `POST /api/pause`, `POST /api/resume`,
+    `POST /api/step`, `POST /api/speed`, and `GET /api/status`
+  - Playback (two-axis command status): `POST /api/control/pause`, `POST /api/control/resume`,
+    `POST /api/control/step`, `POST /api/control/speed`, `POST /api/control/shutdown`,
+    and `GET /api/control/status/{command_id}`
+
+Every route above is registered in the published OpenAPI document, so `/docs` and
+`/api-docs/openapi.json` are the authoritative, machine-readable version of this list.
 
 Examples:
 ```bash
@@ -873,16 +884,19 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 500
 ### MCP HTTP server (Model Context Protocol)
 - Default: `127.0.0.1:8090` over HTTP; disable with `SCRIPTBOTS_CONTROL_MCP=disabled`.
 - Override bind address: `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR=127.0.0.1:9090`.
-- Tools exposed:
-  - `list_knobs` → returns array of knob entries
-  - `get_config` → returns full config snapshot
-  - `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`
-  - `apply_patch` → accepts `{ patch: { ... } }`
+- Implemented with `fastmcp-rust`; the server shares the same `ControlHandle` as REST.
+- Tools exposed (13):
+  - Configuration: `list_knobs` → array of knob entries; `get_config` → full config snapshot;
+    `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`; `apply_patch` → accepts `{ patch: { ... } }`
+  - Scenarios: `list_presets` → available scenario presets; `apply_preset` → accepts `{ name }`
+  - Playback: `pause`, `resume`, `step` (accepts `{ count }`), `set_speed`, `shutdown`
+  - Observation: `get_status` → current simulation status; `get_command_status` → two-axis status by command ID
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
 
 MCP quickstart:
 - Start the app; verify MCP binds on `127.0.0.1:8090` (override via `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR`).
-- Connect an MCP HTTP client to the endpoint; available tools: `list_knobs`, `get_config`, `apply_updates`, `apply_patch`.
+- Connect an MCP HTTP client to the endpoint and call `tools/list` for the authoritative roster
+  and JSON schemas; the list above is the same set the server registers at startup.
 - Each tool returns structured JSON; use your MCP-compatible agent to orchestrate parameter sweeps and log findings to FrankenSQLite.
 
 ## Configuration files & scenarios
