@@ -1620,6 +1620,192 @@ fn start_gui_health_monitor(
     .detach();
 }
 
+#[derive(Clone)]
+struct SimulationDriveSnapshot {
+    paused: bool,
+    speed_multiplier: f32,
+    simulation_fault: Option<String>,
+}
+
+struct GuiSimulationDriver {
+    world: Arc<Mutex<WorldState>>,
+    simulation_step: WorldStepDriver,
+    command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+    paused: bool,
+    speed_multiplier: f32,
+    sim_accumulator: f32,
+    last_sim_instant: Option<Instant>,
+    simulation_fault: Option<String>,
+}
+
+impl GuiSimulationDriver {
+    fn new(
+        world: Arc<Mutex<WorldState>>,
+        simulation_step: WorldStepDriver,
+        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+    ) -> Self {
+        Self {
+            world,
+            simulation_step,
+            command_drain,
+            paused: false,
+            speed_multiplier: 1.0,
+            sim_accumulator: 0.0,
+            last_sim_instant: None,
+            simulation_fault: None,
+        }
+    }
+
+    fn snapshot(&self) -> SimulationDriveSnapshot {
+        SimulationDriveSnapshot {
+            paused: self.paused,
+            speed_multiplier: self.speed_multiplier,
+            simulation_fault: self.simulation_fault.clone(),
+        }
+    }
+
+    fn pause_for_simulation_failure(&mut self, detail: String) {
+        self.paused = true;
+        self.sim_accumulator = 0.0;
+        self.simulation_fault = Some(detail.clone());
+        warn!(error = %detail, "Simulation paused after a terminal step failure");
+    }
+
+    #[allow(clippy::collapsible_if)]
+    fn drive_at(&mut self, now: Instant) {
+        let last = self.last_sim_instant.replace(now);
+
+        let mut playback = Vec::new();
+        let mut step_error = None;
+        if let Ok(mut world) = self.world.lock() {
+            if let Some(error) = world.latched_step_error() {
+                step_error = Some(error.to_string());
+            } else {
+                for command in (self.command_drain.as_ref())() {
+                    match apply_control_command(&mut world, command) {
+                        Ok(ControlDisposition::WorldApplied) => {}
+                        Ok(ControlDisposition::Playback(command)) => playback.push(command),
+                        Err(error) => warn!(%error, "GPUI rejected a drained control command"),
+                    }
+                }
+            }
+        }
+        if let Some(error) = step_error {
+            self.pause_for_simulation_failure(error);
+            return;
+        }
+
+        let mut force_step = false;
+        for command in playback {
+            if let Some(paused) = command.paused {
+                self.paused = paused;
+                if paused {
+                    self.sim_accumulator = 0.0;
+                }
+            }
+            if let Some(speed) = command.speed_multiplier {
+                self.speed_multiplier = speed;
+            }
+            if command.step_once {
+                force_step = true;
+                self.paused = true;
+                self.sim_accumulator = 0.0;
+            }
+        }
+
+        if !self.paused {
+            if let Ok(world) = self.world.lock() {
+                let control = world.config().control.clone();
+                let agent_count = world.agent_count();
+                let max_age = world.last_max_age();
+                let spike_hits = world.last_spike_hits();
+                drop(world);
+
+                let mut reason: Option<String> = None;
+                if control.auto_pause_on_spike_hit && spike_hits > 0 {
+                    reason = Some(format!("spike hits detected ({spike_hits})"));
+                } else if let Some(age_limit) = control.auto_pause_age_above {
+                    if max_age >= age_limit {
+                        reason = Some(format!("max age {max_age} ≥ {age_limit}"));
+                    }
+                } else if let Some(limit) = control.auto_pause_population_below {
+                    if agent_count as u32 <= limit {
+                        reason = Some(format!("population {agent_count} ≤ {limit}"));
+                    }
+                }
+
+                if let Some(reason) = reason {
+                    self.paused = true;
+                    info!(reason = %reason, "Auto-paused due to control settings");
+                }
+            }
+        }
+
+        if !force_step && (self.paused || self.speed_multiplier <= 0.0) {
+            self.sim_accumulator = 0.0;
+            return;
+        }
+
+        let steps = if force_step {
+            1
+        } else {
+            let Some(last) = last else {
+                return;
+            };
+            let delta = now.saturating_duration_since(last).as_secs_f32();
+            self.sim_accumulator += delta * self.speed_multiplier;
+            if self.sim_accumulator < SIM_TICK_INTERVAL {
+                return;
+            }
+
+            let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
+            self.sim_accumulator = self.sim_accumulator.min(max_accumulator).min(0.5);
+            let steps = (self.sim_accumulator / SIM_TICK_INTERVAL).floor() as usize;
+            if steps == 0 {
+                return;
+            }
+            let steps = steps.min(MAX_SIM_STEPS_PER_FRAME);
+            self.sim_accumulator -= SIM_TICK_INTERVAL * steps as f32;
+            steps
+        };
+
+        let mut step_error = self
+            .world
+            .lock()
+            .ok()
+            .and_then(|world| world.latched_step_error().map(|error| error.to_string()));
+        for _ in 0..steps {
+            if step_error.is_some() {
+                break;
+            }
+            if let Err(error) = (self.simulation_step)() {
+                step_error = Some(error.to_string());
+            }
+        }
+        if let Some(error) = step_error {
+            self.pause_for_simulation_failure(error);
+        }
+    }
+}
+
+fn start_gui_simulation_driver(app: &App, driver: Arc<Mutex<GuiSimulationDriver>>) {
+    app.spawn(async move |cx| {
+        loop {
+            {
+                let mut driver = match driver.lock() {
+                    Ok(driver) => driver,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                driver.drive_at(Instant::now());
+            }
+            cx.background_executor()
+                .timer(Duration::from_secs_f32(SIM_TICK_INTERVAL))
+                .await;
+        }
+    })
+    .detach();
+}
+
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
 pub fn run_demo(
     world: Arc<Mutex<WorldState>>,
@@ -1645,11 +1831,14 @@ pub fn run_demo(
     let window_title: SharedString = "ScriptBots HUD".into();
     let title_for_options = window_title.clone();
     let title_for_view = window_title.clone();
-    let world_for_view = Arc::clone(&world);
-    let simulation_step_for_view = Arc::clone(&simulation_step);
-    let drain_for_view = Arc::clone(&command_drain);
     let submit_for_view = Arc::clone(&command_submit);
     let analytics_for_view = analytics.clone();
+    let simulation_driver = Arc::new(Mutex::new(GuiSimulationDriver::new(
+        Arc::clone(&world),
+        simulation_step,
+        command_drain,
+    )));
+    let simulation_driver_for_app = Arc::clone(&simulation_driver);
     let run_error = Arc::new(Mutex::new(None));
     let run_error_for_app = Arc::clone(&run_error);
 
@@ -1666,20 +1855,16 @@ pub fn run_demo(
                 titlebar.title = Some(title_for_options.clone());
             }
 
-            let world_handle = Arc::clone(&world_for_view);
-            let simulation_step_for_hud = Arc::clone(&simulation_step_for_view);
             let view_title = title_for_view.clone();
-            let drain_for_hud = Arc::clone(&drain_for_view);
             let submit_for_hud = Arc::clone(&submit_for_view);
             let analytics_for_hud = analytics_for_view.clone();
+            let simulation_driver_for_hud = Arc::clone(&simulation_driver_for_app);
             if let Err(err) = app.open_window(hud_options, move |_window, cx| {
                 cx.new(|_| {
                     SimulationView::new(
-                        Arc::clone(&world_handle),
-                        Arc::clone(&simulation_step_for_hud),
+                        Arc::clone(&simulation_driver_for_hud),
                         analytics_for_hud.clone(),
                         view_title.clone(),
-                        Arc::clone(&drain_for_hud),
                         Arc::clone(&submit_for_hud),
                     )
                 })
@@ -1707,20 +1892,16 @@ pub fn run_demo(
                 titlebar.title = Some("ScriptBots World".into());
             }
 
-            let world_for_canvas = Arc::clone(&world_for_view);
-            let simulation_step_for_canvas = Arc::clone(&simulation_step_for_view);
             let analytics_for_canvas = analytics_for_view.clone();
-            let drain_for_canvas = Arc::clone(&drain_for_view);
             let submit_for_canvas = Arc::clone(&submit_for_view);
+            let simulation_driver_for_canvas = Arc::clone(&simulation_driver_for_app);
             if let Err(err) = app.open_window(sim_options, move |_window, cx| {
                 cx.new(|_| {
                     // Reuse SimulationView but render only the canvas section by enabling an overlay-only layout flag.
                     let mut view = SimulationView::new(
-                        Arc::clone(&world_for_canvas),
-                        Arc::clone(&simulation_step_for_canvas),
+                        Arc::clone(&simulation_driver_for_canvas),
                         analytics_for_canvas.clone(),
                         "World".into(),
-                        Arc::clone(&drain_for_canvas),
                         Arc::clone(&submit_for_canvas),
                     );
                     view.set_minimal_canvas_mode();
@@ -1739,11 +1920,11 @@ pub fn run_demo(
                 return;
             }
 
-            // Until HostCore owns the simulation clock, the HUD is the sole
-            // driver and the world window is a read-only projection. Keep the two
-            // windows in one lifetime so closing the driver cannot leave a frozen
-            // or independently-clocked viewport behind.
+            // One session-level task owns scientific time and command draining;
+            // both windows are presentation-only projections of that same world.
+            // Keep the pair in one lifetime so neither can outlive its driver.
             app.on_window_closed(|app, _window_id| app.quit()).detach();
+            start_gui_simulation_driver(app, Arc::clone(&simulation_driver_for_app));
             start_gui_health_monitor(app, health_probe, Arc::clone(&run_error_for_app));
             app.activate(true);
         });
@@ -1765,10 +1946,9 @@ static NEXT_BRAIN_INSPECTION_CLIENT: AtomicU64 = AtomicU64::new(1);
 
 struct SimulationView {
     world: Arc<Mutex<WorldState>>,
-    simulation_step: WorldStepDriver,
+    simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
     analytics_provider: AnalyticsSnapshotProvider,
     title: SharedString,
-    command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     camera: Arc<Mutex<Camera>>,
     inspector: Arc<Mutex<InspectorState>>,
@@ -1779,8 +1959,6 @@ struct SimulationView {
     debug: DebugOverlayState,
     selection_events: VecDeque<SelectionEvent>,
     controls: SimulationControls,
-    sim_accumulator: f32,
-    last_sim_instant: Option<Instant>,
     shift_inspect: bool,
     bindings: InputBindings,
     key_capture: Option<CommandAction>,
@@ -1788,13 +1966,10 @@ struct SimulationView {
     analytics_cache: Option<HudAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: StorageUiStatus,
-    simulation_fault: Option<String>,
     #[cfg(feature = "audio")]
     audio: Option<AudioState>,
     // When true, render a minimal canvas-focused layout (used in the dedicated world window).
     minimal_canvas_mode: bool,
-    // Temporary containment until HostCore owns the sole simulation clock.
-    drives_simulation: bool,
     // Per-agent short history of brain outputs for inspector sparklines
     brain_history: std::collections::HashMap<AgentId, OutputHistory>,
     brain_client_id: BrainInspectionClientId,
@@ -1820,13 +1995,18 @@ struct SimulationView {
 }
 impl SimulationView {
     fn new(
-        world: Arc<Mutex<WorldState>>,
-        simulation_step: WorldStepDriver,
+        simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
         analytics_provider: AnalyticsSnapshotProvider,
         title: SharedString,
-        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
         command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     ) -> Self {
+        let world = {
+            let driver = match simulation_driver.lock() {
+                Ok(driver) => driver,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            Arc::clone(&driver.world)
+        };
         let mut inspector_state = InspectorState::default();
         if let Ok(world_guard) = world.lock() {
             let interval = world_guard.config().persistence_interval;
@@ -1837,10 +2017,9 @@ impl SimulationView {
 
         Self {
             world,
-            simulation_step,
+            simulation_driver,
             analytics_provider,
             title,
-            command_drain,
             command_submit,
             camera: Arc::new(Mutex::new(Camera::default())),
             inspector: Arc::new(Mutex::new(inspector_state)),
@@ -1851,8 +2030,6 @@ impl SimulationView {
             debug: DebugOverlayState::default(),
             selection_events: VecDeque::with_capacity(MAX_SELECTION_EVENTS),
             controls: SimulationControls::default(),
-            sim_accumulator: 0.0,
-            last_sim_instant: Some(Instant::now()),
             shift_inspect: false,
             bindings: InputBindings::default(),
             settings_panel: SettingsPanelState::default(),
@@ -1860,7 +2037,6 @@ impl SimulationView {
             analytics_cache: None,
             analytics_revision: None,
             analytics_status: StorageUiStatus::default(),
-            simulation_fault: None,
             #[cfg(feature = "audio")]
             audio: AudioState::new()
                 .map_err(|err| {
@@ -1869,7 +2045,6 @@ impl SimulationView {
                 })
                 .ok(),
             minimal_canvas_mode: false,
-            drives_simulation: true,
             brain_history: std::collections::HashMap::new(),
             brain_client_id: BrainInspectionClientId::new(
                 NEXT_BRAIN_INSPECTION_CLIENT.fetch_add(1, AtomicOrdering::Relaxed),
@@ -1888,13 +2063,14 @@ impl SimulationView {
 
     fn set_minimal_canvas_mode(&mut self) {
         self.minimal_canvas_mode = true;
-        self.drives_simulation = false;
     }
 
-    fn submit_simulation_command(&self, command: SimulationCommand) {
-        if !(self.command_submit.as_ref())(ControlCommand::UpdateSimulation(command)) {
+    fn submit_simulation_command(&self, command: SimulationCommand) -> bool {
+        let accepted = (self.command_submit.as_ref())(ControlCommand::UpdateSimulation(command));
+        if !accepted {
             warn!("failed to enqueue simulation command from GPUI renderer");
         }
+        accepted
     }
 
     fn camera_snapshot(&self) -> CameraSnapshot {
@@ -1904,144 +2080,12 @@ impl SimulationView {
             .unwrap_or_default()
     }
 
-    fn pause_for_simulation_failure(&mut self, detail: String) {
-        self.controls.paused = true;
-        self.sim_accumulator = 0.0;
-        self.simulation_fault = Some(detail.clone());
-        warn!(error = %detail, "Simulation paused after a terminal step failure");
-    }
-
-    #[allow(clippy::collapsible_if)]
-    fn pump_simulation(&mut self) {
-        if !self.drives_simulation {
-            return;
-        }
-
-        let now = Instant::now();
-        let last = self.last_sim_instant.unwrap_or(now);
-        self.last_sim_instant = Some(now);
-
-        let mut playback = Vec::new();
-        let mut step_error = None;
-        if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.latched_step_error() {
-                step_error = Some(error.to_string());
-            } else {
-                for command in (self.command_drain.as_ref())() {
-                    match apply_control_command(&mut world, command) {
-                        Ok(ControlDisposition::WorldApplied) => {}
-                        Ok(ControlDisposition::Playback(command)) => playback.push(command),
-                        Err(error) => warn!(%error, "GPUI rejected a drained control command"),
-                    }
-                }
-            }
-        }
-        if let Some(error) = step_error {
-            self.pause_for_simulation_failure(error);
-            return;
-        }
-
-        let mut force_step = false;
-        for command in playback {
-            if let Some(paused) = command.paused {
-                self.controls.paused = paused;
-                if paused {
-                    self.sim_accumulator = 0.0;
-                }
-            }
-            if let Some(speed) = command.speed_multiplier {
-                self.controls.speed_multiplier = speed;
-            }
-            if command.step_once {
-                force_step = true;
-                self.controls.paused = true;
-                self.sim_accumulator = 0.0;
-            }
-        }
-
-        // Auto-pause: honor control config thresholds without mutating world state directly.
-        if !self.controls.paused {
-            if let Ok(world) = self.world.lock() {
-                let control = world.config().control.clone();
-                let agent_count = world.agent_count();
-                let max_age = world.last_max_age();
-                let spike_hits = world.last_spike_hits();
-                drop(world);
-
-                let mut reason: Option<String> = None;
-                if control.auto_pause_on_spike_hit && spike_hits > 0 {
-                    reason = Some(format!("spike hits detected ({})", spike_hits));
-                } else if let Some(age_limit) = control.auto_pause_age_above {
-                    if max_age >= age_limit {
-                        reason = Some(format!("max age {} ≥ {}", max_age, age_limit));
-                    }
-                } else if let Some(limit) = control.auto_pause_population_below {
-                    if agent_count as u32 <= limit {
-                        reason = Some(format!("population {} ≤ {}", agent_count, limit));
-                    }
-                }
-
-                if let Some(reason) = reason {
-                    self.controls.paused = true;
-                    info!(reason = %reason, "Auto-paused due to control settings");
-                }
-            }
-        }
-
-        if !force_step && (self.controls.paused || self.controls.speed_multiplier <= 0.0) {
-            self.sim_accumulator = 0.0;
-            return;
-        }
-
-        let step_interval = SIM_TICK_INTERVAL;
-        let steps = if force_step {
-            1
-        } else {
-            let delta = (now - last).as_secs_f32();
-            self.sim_accumulator += delta * self.controls.speed_multiplier;
-            if self.sim_accumulator < step_interval {
-                return;
-            }
-
-            // Clamp accumulator to avoid long-frame backlogs.
-            let max_accumulator = step_interval * MAX_SIM_STEPS_PER_FRAME as f32;
-            let hard_cap = 0.5f32;
-            self.sim_accumulator = self.sim_accumulator.min(max_accumulator).min(hard_cap);
-
-            let mut steps = (self.sim_accumulator / step_interval).floor() as usize;
-            if steps == 0 {
-                return;
-            }
-            let avg_ms = self.last_perf.average_ms.max(0.0);
-            let dynamic_cap = if avg_ms > 16.0 {
-                (MAX_SIM_STEPS_PER_FRAME / 2).max(1)
-            } else {
-                MAX_SIM_STEPS_PER_FRAME
-            };
-            if steps > dynamic_cap {
-                steps = dynamic_cap;
-            }
-            self.sim_accumulator -= step_interval * steps as f32;
-            steps
+    fn simulation_drive_snapshot(&self) -> SimulationDriveSnapshot {
+        let driver = match self.simulation_driver.lock() {
+            Ok(driver) => driver,
+            Err(poisoned) => poisoned.into_inner(),
         };
-
-        let mut step_error = self
-            .world
-            .lock()
-            .ok()
-            .and_then(|world| world.latched_step_error().map(|error| error.to_string()));
-        for _ in 0..steps {
-            if step_error.is_some() {
-                break;
-            }
-            if let Err(error) = (self.simulation_step)() {
-                step_error = Some(error.to_string());
-                break;
-            }
-        }
-        if let Some(error) = step_error {
-            self.pause_for_simulation_failure(error);
-        }
+        driver.snapshot()
     }
 
     fn submit_config_update<F>(&self, update: F)
@@ -2352,9 +2396,6 @@ impl SimulationView {
         selection_changed || inspector_changed
     }
     fn snapshot(&mut self) -> HudSnapshot {
-        if self.drives_simulation {
-            self.pump_simulation();
-        }
         let mut snapshot = HudSnapshot::default();
         let inspector_state = self
             .inspector
@@ -2429,12 +2470,15 @@ impl SimulationView {
 
         snapshot.analytics = self.analytics_cache.clone();
         snapshot.storage = self.analytics_status.clone();
-        snapshot.simulation_fault.clone_from(&self.simulation_fault);
+        let simulation = self.simulation_drive_snapshot();
+        snapshot.simulation_fault = simulation.simulation_fault;
 
         snapshot.perf = self.last_perf;
-        snapshot.controls = self.controls.snapshot();
+        snapshot.controls = self
+            .controls
+            .snapshot(simulation.paused, simulation.speed_multiplier);
 
-        self.playback.record(snapshot.clone());
+        self.playback.record(&snapshot);
 
         snapshot
     }
@@ -4022,7 +4066,7 @@ impl SimulationView {
             CommandAction::ToggleNarration => self.toggle_narration(cx),
             CommandAction::CyclePalette => self.cycle_palette(cx),
             CommandAction::ToggleSimulationPause => {
-                let paused = !self.controls.paused;
+                let paused = !self.simulation_drive_snapshot().paused;
                 self.set_simulation_paused(paused, cx);
             }
             CommandAction::ToggleAgentDraw => {
@@ -4671,18 +4715,18 @@ impl SimulationView {
     }
 
     fn set_simulation_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
-        if self.controls.paused == paused {
+        let simulation = self.simulation_drive_snapshot();
+        if simulation.paused == paused {
             return;
         }
-        self.controls.paused = paused;
-        self.sim_accumulator = 0.0;
-        self.last_sim_instant = Some(Instant::now());
-        info!(paused, "Simulation pause state updated");
-        self.submit_simulation_command(SimulationCommand {
+        if !self.submit_simulation_command(SimulationCommand {
             paused: Some(paused),
-            speed_multiplier: Some(self.controls.speed_multiplier),
+            speed_multiplier: Some(simulation.speed_multiplier),
             step_once: false,
-        });
+        }) {
+            return;
+        }
+        info!(paused, "Simulation pause command enqueued");
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
             audio.play(&audio.toggle_sound);
@@ -4729,18 +4773,18 @@ impl SimulationView {
         cx.notify();
     }
     fn adjust_simulation_speed(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let mut speed = self.controls.speed_multiplier + delta;
+        let simulation = self.simulation_drive_snapshot();
+        let mut speed = simulation.speed_multiplier + delta;
         speed = speed.clamp(0.25, 4.0);
         speed = (speed * 100.0).round() / 100.0;
-        if (speed - self.controls.speed_multiplier).abs() > f32::EPSILON {
-            self.controls.speed_multiplier = speed;
-            info!(speed = speed, "Adjusted simulation speed");
-            self.last_sim_instant = Some(Instant::now());
-            self.submit_simulation_command(SimulationCommand {
-                paused: Some(self.controls.paused),
+        if (speed - simulation.speed_multiplier).abs() > f32::EPSILON
+            && self.submit_simulation_command(SimulationCommand {
+                paused: Some(simulation.paused),
                 speed_multiplier: Some(speed),
                 step_once: false,
-            });
+            })
+        {
+            info!(speed, "Simulation speed command enqueued");
             #[cfg(feature = "audio")]
             if let Some(audio) = self.audio.as_mut() {
                 audio.play(&audio.toggle_sound);
@@ -9582,10 +9626,10 @@ impl Render for SimulationView {
                     content.child(self.render_narrative_rail(&snapshot, cx))
                 })
                 .child(self.render_footer(&snapshot))
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    this.handle_key_down(event, cx);
-                }))
         };
+        content = content.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            this.handle_key_down(event, cx);
+        }));
 
         let perf_snapshot = self.perf.end_frame();
         self.last_perf = perf_snapshot;
@@ -9602,9 +9646,8 @@ impl Render for SimulationView {
             content = content.child(self.render_settings_panel(cx));
         }
 
-        // Keep the simulation advancing: GPUI only redraws on notify/input,
-        // and `pump_simulation()` runs inside render, so without scheduling
-        // the next animation frame the world freezes when the user is idle.
+        // Keep the presentation current while the session-level driver advances
+        // scientific time independently of either window's paint cadence.
         window.request_animation_frame();
 
         content
@@ -10250,10 +10293,8 @@ impl FollowMode {
 
 #[derive(Clone)]
 struct SimulationControls {
-    paused: bool,
     draw_agents: bool,
     draw_food: bool,
-    speed_multiplier: f32,
     follow_mode: FollowMode,
     agent_outline: bool,
 }
@@ -10261,10 +10302,8 @@ struct SimulationControls {
 impl Default for SimulationControls {
     fn default() -> Self {
         Self {
-            paused: false,
             draw_agents: true,
             draw_food: true,
-            speed_multiplier: 1.0,
             follow_mode: FollowMode::Off,
             agent_outline: false,
         }
@@ -10272,12 +10311,12 @@ impl Default for SimulationControls {
 }
 
 impl SimulationControls {
-    fn snapshot(&self) -> ControlsSnapshot {
+    fn snapshot(&self, paused: bool, speed_multiplier: f32) -> ControlsSnapshot {
         ControlsSnapshot {
-            paused: self.paused,
+            paused,
             draw_agents: self.draw_agents,
             draw_food: self.draw_food,
-            speed_multiplier: self.speed_multiplier,
+            speed_multiplier,
             follow_mode: self.follow_mode,
             agent_outline: self.agent_outline,
         }
@@ -11524,20 +11563,20 @@ impl PlaybackState {
         self.mode
     }
 
-    fn record(&mut self, snapshot: HudSnapshot) {
+    fn record(&mut self, snapshot: &HudSnapshot) {
+        if !matches!(self.mode, PlaybackMode::Live)
+            || self
+                .timeline
+                .back()
+                .is_some_and(|latest| latest.tick == snapshot.tick)
+        {
+            return;
+        }
         if self.timeline.len() == self.max_frames {
             self.timeline.pop_front();
-            if self.pointer > 0 {
-                self.pointer -= 1;
-            }
         }
-        self.timeline.push_back(snapshot);
-        let last_index = self.timeline.len().saturating_sub(1);
-        if matches!(self.mode, PlaybackMode::Live) {
-            self.pointer = last_index;
-        } else {
-            self.pointer = self.pointer.min(last_index);
-        }
+        self.timeline.push_back(snapshot.clone());
+        self.pointer = self.timeline.len().saturating_sub(1);
     }
 
     fn snapshot_for_render(&mut self, live: HudSnapshot) -> HudSnapshot {
@@ -11633,6 +11672,102 @@ impl PlaybackState {
             total: self.timeline.len(),
             current_tick,
         }
+    }
+}
+
+#[cfg(test)]
+mod playback_state_tests {
+    use super::*;
+
+    fn snapshot(tick: u64) -> HudSnapshot {
+        HudSnapshot {
+            tick,
+            ..HudSnapshot::default()
+        }
+    }
+
+    fn paint(playback: &mut PlaybackState, live_tick: u64) -> HudSnapshot {
+        let live = snapshot(live_tick);
+        playback.record(&live);
+        playback.snapshot_for_render(live)
+    }
+
+    #[test]
+    fn full_playback_ring_advances_to_live() {
+        let mut playback = PlaybackState::new(3);
+        for tick in 0..3 {
+            playback.record(&snapshot(tick));
+        }
+        playback.toggle_play();
+
+        assert_eq!(paint(&mut playback, 3).tick, 0);
+        assert_eq!(paint(&mut playback, 4).tick, 1);
+        assert_eq!(paint(&mut playback, 5).tick, 2);
+        assert!(matches!(playback.mode(), PlaybackMode::Live));
+        assert_eq!(
+            playback
+                .timeline
+                .iter()
+                .map(|entry| entry.tick)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(paint(&mut playback, 6).tick, 6);
+    }
+
+    #[test]
+    fn paused_frame_is_stable_while_live_paints_arrive() {
+        let mut playback = PlaybackState::new(3);
+        for tick in 0..3 {
+            playback.record(&snapshot(tick));
+        }
+        playback.restart();
+
+        for live_tick in 3..12 {
+            assert_eq!(paint(&mut playback, live_tick).tick, 0);
+            assert!(matches!(playback.mode(), PlaybackMode::Paused));
+            let status = playback.status();
+            assert_eq!(status.index, 0);
+            assert_eq!(status.total, 3);
+        }
+        assert_eq!(playback.status().current_tick, Some(0));
+        assert_eq!(
+            playback
+                .timeline
+                .iter()
+                .map(|entry| entry.tick)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn duplicate_science_ticks_are_recorded_once() {
+        let mut playback = PlaybackState::new(3);
+        playback.record(&snapshot(7));
+        playback.record(&snapshot(7));
+        playback.record(&snapshot(7));
+
+        let status = playback.status();
+        assert_eq!(status.total, 1);
+        assert_eq!(status.current_tick, Some(7));
+    }
+
+    #[test]
+    fn live_recording_evicts_only_the_oldest_frame() {
+        let mut playback = PlaybackState::new(3);
+        for tick in 0..4 {
+            playback.record(&snapshot(tick));
+        }
+
+        assert_eq!(playback.timeline.len(), 3);
+        assert_eq!(playback.timeline.front().map(|entry| entry.tick), Some(1));
+        assert_eq!(playback.timeline.back().map(|entry| entry.tick), Some(3));
+        let status = playback.status();
+        assert!(matches!(status.mode, PlaybackMode::Live));
+        assert_eq!(status.index, 2);
+        assert_eq!(status.total, 3);
+        assert_eq!(status.current_tick, Some(3));
     }
 }
 
@@ -14637,23 +14772,39 @@ mod command_characterization_tests {
         world: Arc<Mutex<WorldState>>,
         command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
     ) -> SimulationView {
-        let simulation_step = disabled_persistence_step_driver(&world);
-        SimulationView::new(
-            world,
+        let simulation_driver = gui_simulation_driver(&world, command_drain);
+        simulation_view_with_driver(simulation_driver)
+    }
+
+    fn gui_simulation_driver(
+        world: &Arc<Mutex<WorldState>>,
+        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+    ) -> Arc<Mutex<GuiSimulationDriver>> {
+        let simulation_step = disabled_persistence_step_driver(world);
+        Arc::new(Mutex::new(GuiSimulationDriver::new(
+            Arc::clone(world),
             simulation_step,
+            command_drain,
+        )))
+    }
+
+    fn simulation_view_with_driver(
+        simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
+    ) -> SimulationView {
+        SimulationView::new(
+            simulation_driver,
             AnalyticsSnapshotProvider::empty(),
             "command characterization".into(),
-            command_drain,
             Arc::new(|_command: ControlCommand| true),
         )
     }
 
-    fn prime_exactly_one_view_step(view: &mut SimulationView) {
-        view.controls.paused = false;
-        view.controls.speed_multiplier = 1.0;
-        view.sim_accumulator = 0.0;
-        view.last_sim_instant =
-            Some(Instant::now() - Duration::from_secs_f32(SIM_TICK_INTERVAL * 1.25));
+    fn prime_exactly_one_driver_step(driver: &Arc<Mutex<GuiSimulationDriver>>, now: Instant) {
+        let mut driver = driver.lock().expect("GUI simulation driver lock");
+        driver.paused = false;
+        driver.speed_multiplier = 1.0;
+        driver.sim_accumulator = 0.0;
+        driver.last_sim_instant = Some(now - Duration::from_secs_f32(SIM_TICK_INTERVAL * 1.25));
     }
 
     /// Mirror of the TUI-side e2e fixture (bd-16g.2.4): forced boom/crash cycles
@@ -14743,7 +14894,6 @@ mod command_characterization_tests {
 
         let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
         let mut view = simulation_view(Arc::clone(&world), drain);
-        view.drives_simulation = false;
         let snapshot = view.snapshot();
         let snapshot_sequence: Vec<(u64, NarrativeEventKind)> = snapshot
             .narrative
@@ -14803,18 +14953,24 @@ mod command_characterization_tests {
     }
 
     #[test]
-    fn minimal_canvas_is_a_read_only_projection_until_hostcore_lands() {
+    fn minimal_canvas_is_a_presentation_only_projection() {
         let world = command_characterization_world();
         let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
-        let mut canvas = simulation_view(Arc::clone(&world), drain);
+        let driver = gui_simulation_driver(&world, drain);
+        let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
         canvas.set_minimal_canvas_mode();
-        prime_exactly_one_view_step(&mut canvas);
+        let now = Instant::now();
+        prime_exactly_one_driver_step(&driver, now);
 
         let _snapshot = canvas.snapshot();
 
         assert_eq!(world.lock().expect("world lock").tick().0, 0);
         assert!(canvas.minimal_canvas_mode);
-        assert!(!canvas.drives_simulation);
+        driver
+            .lock()
+            .expect("GUI simulation driver lock")
+            .drive_at(now);
+        assert_eq!(world.lock().expect("world lock").tick().0, 1);
     }
 
     #[test]
@@ -14899,7 +15055,6 @@ mod command_characterization_tests {
             .expect("pre-GPUI-inspection digest");
         let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
         let mut hud = simulation_view(Arc::clone(&world), Arc::clone(&drain));
-        hud.controls.paused = true;
         hud.inspector
             .lock()
             .expect("HUD inspector lock")
@@ -14926,7 +15081,6 @@ mod command_characterization_tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 
         let mut peer = simulation_view(Arc::clone(&world), Arc::clone(&drain));
-        peer.controls.paused = true;
         peer.inspector
             .lock()
             .expect("peer inspector lock")
@@ -14963,23 +15117,35 @@ mod command_characterization_tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "KNOWN DEFECT bd-2z0.4.1: two GPUI views independently advance one world"
-    )]
-    fn target_two_gpui_views_share_one_simulation_clock() {
+    fn two_gpui_views_share_one_simulation_clock() {
         let world = command_characterization_world();
         let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
-        let mut hud = simulation_view(Arc::clone(&world), Arc::clone(&drain));
-        let mut canvas = simulation_view(Arc::clone(&world), drain);
-        prime_exactly_one_view_step(&mut hud);
-        hud.pump_simulation();
-        prime_exactly_one_view_step(&mut canvas);
-        canvas.pump_simulation();
+        let driver = gui_simulation_driver(&world, drain);
+        let mut hud = simulation_view_with_driver(Arc::clone(&driver));
+        let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
+        canvas.set_minimal_canvas_mode();
+        let now = Instant::now();
+        prime_exactly_one_driver_step(&driver, now);
+
+        let _ = hud.snapshot();
+        let _ = canvas.snapshot();
+        assert_eq!(
+            world.lock().expect("world lock").tick().0,
+            0,
+            "neither GPUI paint callback may advance scientific time"
+        );
+
+        driver
+            .lock()
+            .expect("GUI simulation driver lock")
+            .drive_at(now);
+        let _ = hud.snapshot();
+        let _ = canvas.snapshot();
 
         let tick = world.lock().expect("world lock").tick().0;
         assert_eq!(
             tick, 1,
-            "KNOWN DEFECT bd-2z0.4.1: two GPUI views independently advance one world"
+            "two GPUI views must not independently advance one shared world"
         );
     }
 
@@ -14993,14 +15159,21 @@ mod command_characterization_tests {
                 step_once: false,
             })]
         });
-        let mut view = simulation_view(Arc::clone(&world), drain);
-        prime_exactly_one_view_step(&mut view);
-
-        view.pump_simulation();
+        let driver = gui_simulation_driver(&world, drain);
+        let now = Instant::now();
+        prime_exactly_one_driver_step(&driver, now);
+        driver
+            .lock()
+            .expect("GUI simulation driver lock")
+            .drive_at(now);
 
         assert_eq!(world.lock().expect("world lock").tick().0, 0);
-        assert!(view.controls.paused);
-        assert_eq!(view.controls.speed_multiplier, 0.0);
+        let state = driver
+            .lock()
+            .expect("GUI simulation driver lock")
+            .snapshot();
+        assert!(state.paused);
+        assert_eq!(state.speed_multiplier, 0.0);
     }
 
     #[test]
@@ -15018,24 +15191,35 @@ mod command_characterization_tests {
                 }),
             ]
         });
-        let mut view = simulation_view(Arc::clone(&world), drain);
-        view.controls.paused = true;
-        view.sim_accumulator = 0.0;
-        view.last_sim_instant = Some(Instant::now());
-
-        view.pump_simulation();
+        let driver = gui_simulation_driver(&world, drain);
+        let now = Instant::now();
+        {
+            let mut driver = driver.lock().expect("GUI simulation driver lock");
+            driver.paused = true;
+            driver.sim_accumulator = 0.0;
+            driver.last_sim_instant = Some(now);
+            driver.drive_at(now);
+        }
 
         assert!((world.lock().expect("world lock").config().food_max - 0.73).abs() < f32::EPSILON);
-        assert!(!view.controls.paused);
-        assert_eq!(view.controls.speed_multiplier, 1.0);
+        let state = driver
+            .lock()
+            .expect("GUI simulation driver lock")
+            .snapshot();
+        assert!(!state.paused);
+        assert_eq!(state.speed_multiplier, 1.0);
     }
 
     #[test]
     fn simulation_fault_survives_storage_health_refresh() {
         let world = command_characterization_world();
         let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
-        let mut view = simulation_view(world, drain);
-        view.pause_for_simulation_failure("deliberate brain construction failure".to_owned());
+        let driver = gui_simulation_driver(&world, drain);
+        let mut view = simulation_view_with_driver(Arc::clone(&driver));
+        driver
+            .lock()
+            .expect("GUI simulation driver lock")
+            .pause_for_simulation_failure("deliberate brain construction failure".to_owned());
 
         view.maybe_refresh_analytics(0, 0);
         let snapshot = view.snapshot();
@@ -15072,34 +15256,31 @@ mod command_characterization_tests {
     }
 
     #[test]
-    fn dual_window_does_not_double_step_simulation() {
+    fn dual_window_snapshots_share_pause_and_speed_state() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
-        let mut window1 = simulation_view(Arc::clone(&world), Arc::clone(&drain));
-        let mut window2 = simulation_view(Arc::clone(&world), drain);
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(|| {
+            vec![ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: Some(2.5),
+                step_once: false,
+            })]
+        });
+        let driver = gui_simulation_driver(&world, drain);
+        let mut hud = simulation_view_with_driver(Arc::clone(&driver));
+        let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
+        canvas.set_minimal_canvas_mode();
 
-        window1.drives_simulation = true;
-        window2.drives_simulation = false;
+        driver
+            .lock()
+            .expect("GUI simulation driver lock")
+            .drive_at(Instant::now());
 
+        let hud_snapshot = hud.snapshot();
+        let canvas_snapshot = canvas.snapshot();
+        assert!(hud_snapshot.controls.paused);
+        assert!(canvas_snapshot.controls.paused);
+        assert_eq!(hud_snapshot.controls.speed_multiplier, 2.5);
+        assert_eq!(canvas_snapshot.controls.speed_multiplier, 2.5);
         assert_eq!(world.lock().expect("world lock").tick().0, 0);
-
-        // Window 2 (secondary presentation window) does NOT step science ticks
-        window2.controls.paused = false;
-        window2.controls.speed_multiplier = 1.0;
-        window2.pump_simulation();
-        assert_eq!(
-            world.lock().expect("world lock").tick().0,
-            0,
-            "non-primary window must not advance science ticks"
-        );
-
-        // Window 1 (primary driver window) drives scientific time
-        window1.controls.paused = false;
-        window1.controls.speed_multiplier = 1.0;
-        let mut world_guard = world.lock().expect("world lock");
-        let step_res = world_guard.step();
-        drop(world_guard);
-        assert!(step_res.is_ok());
-        assert_eq!(world.lock().expect("world lock").tick().0, 1);
     }
 }
