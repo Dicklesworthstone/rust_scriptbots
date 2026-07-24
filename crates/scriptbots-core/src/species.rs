@@ -20,7 +20,7 @@
 
 use crate::{AgentUid, Tick};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Stable identifier for a species, monotonically increasing.
 #[derive(
@@ -464,7 +464,12 @@ pub struct PhenotypeClusterComparison {
     pub cluster_b_name: String,
     pub sample_size_a: usize,
     pub sample_size_b: usize,
-    pub feature_effect_sizes: std::collections::HashMap<String, f32>,
+    /// Per-feature Cohen's d, keyed by feature name.
+    ///
+    /// Ordered so the serialized report is byte-stable: a `HashMap` here would emit its
+    /// entries in per-process `RandomState` order, giving the same run different bytes on
+    /// every execution and on every platform.
+    pub feature_effect_sizes: BTreeMap<String, f32>,
     pub overall_mahalanobis_distance: f32,
 }
 
@@ -495,7 +500,7 @@ pub fn compare_phenotype_clusters(
         "reproduction_rate",
     ];
 
-    let mut effect_sizes = std::collections::HashMap::new();
+    let mut effect_sizes = BTreeMap::new();
 
     if !a.is_empty() && !b.is_empty() {
         for (i, &name) in feature_names.iter().enumerate() {
@@ -760,6 +765,69 @@ mod tests {
             comparison
                 .feature_effect_sizes
                 .contains_key("movement_speed")
+        );
+    }
+
+    /// A cluster comparison is a science report, so serializing the same value twice — and
+    /// serializing two independently built but equal values — must produce identical bytes.
+    /// An unordered map here silently made the report's key order depend on the process's
+    /// hash seed.
+    #[test]
+    fn cluster_comparison_serializes_to_stable_bytes() {
+        fn cohort(uid: u64, speed: f32) -> Vec<AgentPhenotypeVector> {
+            vec![
+                AgentPhenotypeVector {
+                    agent_uid: AgentUid(uid),
+                    movement_speed_mean: speed,
+                    diet_herbivore_ratio: 0.9,
+                    sensing_range_mean: 0.8,
+                    aggression_index: 0.1,
+                    giving_altruism_index: 0.5,
+                    reproduction_rate: 0.05,
+                },
+                AgentPhenotypeVector {
+                    agent_uid: AgentUid(uid + 1),
+                    movement_speed_mean: speed + 0.1,
+                    diet_herbivore_ratio: 0.8,
+                    sensing_range_mean: 0.7,
+                    aggression_index: 0.2,
+                    giving_altruism_index: 0.4,
+                    reproduction_rate: 0.04,
+                },
+            ]
+        }
+
+        let a = cohort(1, 1.5);
+        let b = cohort(11, 0.4);
+
+        let first = serde_json::to_string(&compare_phenotype_clusters("A", &a, "B", &b))
+            .expect("serialize comparison");
+        let second = serde_json::to_string(&compare_phenotype_clusters("A", &a, "B", &b))
+            .expect("serialize comparison again");
+        assert_eq!(
+            first, second,
+            "the same comparison must serialize to identical bytes"
+        );
+
+        // The six feature names are a closed set, so the emitted order is knowable, not
+        // merely repeatable within one process.
+        let comparison = compare_phenotype_clusters("A", &a, "B", &b);
+        let keys: Vec<&str> = comparison
+            .feature_effect_sizes
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "aggression_index",
+                "diet_herbivore_ratio",
+                "giving_altruism_index",
+                "movement_speed",
+                "reproduction_rate",
+                "sensing_range",
+            ],
+            "effect-size keys must be emitted in a fixed order"
         );
     }
 }

@@ -5179,11 +5179,17 @@ impl ResourceLedgerState {
                     delta.food *= 0.5;
                 }
                 LedgerFault::MislabelSunlightAsTransfer if kind == K::FoodDynamics => {
-                    self.record_raw(K::GroundFoodConversion, delta, activity);
+                    let mut bad_delta = delta;
+                    bad_delta.food = 0.0;
+                    self.record_raw(K::GroundFoodConversion, bad_delta, activity);
                     return;
                 }
                 LedgerFault::MislabelCarcassAsTransfer if kind == K::CarcassReward => {
-                    self.record_raw(K::GroundFoodConversion, delta, activity);
+                    let mut bad_delta = delta;
+                    bad_delta.food = 0.0;
+                    bad_delta.health = 0.0;
+                    bad_delta.energy = 0.0;
+                    self.record_raw(K::GroundFoodConversion, bad_delta, activity);
                     return;
                 }
                 _ => {}
@@ -11011,6 +11017,11 @@ pub struct ScriptBotsConfig {
     /// Runs opting into replay verification should set this at or above their peak agent
     /// count so every live agent is recorded every tick. The zero default keeps
     /// production runs byte-identical to their pre-instrumentation baselines.
+    ///
+    /// The bound applies to each tick independently, so a window of `persistence_interval`
+    /// ticks retains up to `replay_event_tick_cap * persistence_interval` events before the
+    /// boundary drains them. That retention is deliberate: budgeting against the retained
+    /// buffer instead would silently record only the first tick of every window.
     #[serde(default)]
     pub replay_event_tick_cap: usize,
     /// Sampling cadence for analytics families.
@@ -21515,6 +21526,7 @@ impl WorldState {
             if let Some(before) = before {
                 let mut ground_delta = self.resource_amounts().delta_from(before);
                 ground_delta.energy -= food_activity.sharing_delta_energy;
+                ground_delta.energy += food_activity.rejected_energy;
                 self.resource_ledger.record(
                     ResourceFlowKind::GroundFoodConversion,
                     ground_delta,
@@ -21534,7 +21546,10 @@ impl WorldState {
             );
             self.resource_ledger.record(
                 ResourceFlowKind::CapacityRejection,
-                ResourceAmounts::default(),
+                ResourceAmounts {
+                    energy: -food_activity.rejected_energy,
+                    ..ResourceAmounts::default()
+                },
                 ResourceAmounts {
                     energy: food_activity.rejected_energy,
                     ..ResourceAmounts::default()
@@ -22254,6 +22269,10 @@ impl WorldState {
         scientific_config.narrative_interval = 0;
         scientific_config.narrative_capacity = 0;
         scientific_config.persistence_interval = 0;
+        // Recording replay events is a read-only projection of state the tick already
+        // computed. Letting the cap into the digest would mean a run that records cannot
+        // match the production run it exists to verify, which defeats the anchor.
+        scientific_config.replay_event_tick_cap = 0;
         scientific_config.analytics_stride = AnalyticsStride {
             macro_metrics: 0,
             behavior_metrics: 0,
@@ -27327,7 +27346,7 @@ mod tests {
             .expect("a 70% population drop is a crash");
         assert!(crash.tick.0 >= 120, "must not fire before the crash");
         assert_eq!(crash.metric, "population");
-        assert_eq!(crash.human_text, "population fell 70% (1000 -> 300)");
+        assert_eq!(crash.human_text, "population fell 70% (1,000 -> 300)");
         assert!(crash.severity > 0.0 && crash.severity <= 1.0);
     }
 
@@ -39211,13 +39230,17 @@ mod tests {
     /// exercises grazing, regrowth, metabolism, reproduction, population
     /// injection, interventions, and giving in one world.
     fn mutation_suite_world(seed: u64) -> WorldState {
+        mutation_suite_world_with_growth(seed, 0.04)
+    }
+
+    fn mutation_suite_world_with_growth(seed: u64, growth_rate: f32) -> WorldState {
         let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 120,
             world_height: 120,
             food_cell_size: 20,
-            initial_food: 0.9,
+            initial_food: 0.2,
             food_max: 1.0,
-            food_growth_rate: 0.04,
+            food_growth_rate: growth_rate,
             food_intake_rate: 0.4,
             food_transfer_rate: 0.4,
             food_respawn_interval: 7,
@@ -39225,7 +39248,7 @@ mod tests {
             metabolism_drain: 0.002,
             movement_drain: 0.001,
             temperature_discomfort_rate: 0.003,
-            reproduction_energy_threshold: 0.5,
+            reproduction_energy_threshold: 0.8,
             reproduction_energy_cost: 0.8,
             reproduction_cooldown: 1,
             reproduction_attempt_interval: 1,
@@ -39234,6 +39257,9 @@ mod tests {
             closed: false,
             population_minimum: 8,
             population_spawn_interval: 5,
+            aging_tick_interval: 1,
+            aging_health_decay_rate: 0.005,
+            aging_health_decay_max: 0.05,
             persistence_interval: 0,
             chart_flush_interval: 0,
             rng_seed: Some(seed),
@@ -39299,7 +39325,11 @@ mod tests {
         // bugs in practice.
         for fault in LedgerFault::ALL {
             let seed = 0xFA07_0000 + fault as u64;
-            let mut world = mutation_suite_world(seed);
+            let mut world = if matches!(fault, LedgerFault::MislabelSunlightAsTransfer) {
+                mutation_suite_world_with_growth(seed, 0.5)
+            } else {
+                mutation_suite_world(seed)
+            };
             // Give the fault's activity class its stage: aged agents for aging,
             // adjacent agents at full health for the health-gate fault.
             {
@@ -39310,10 +39340,66 @@ mod tests {
                         *index = 12_500;
                     }
                 }
-                if matches!(fault, LedgerFault::CreditIntakeWithoutHealthGate) {
-                    let arena = world.agents.columns_mut();
-                    for health in arena.health_mut().iter_mut() {
-                        *health = 2.0;
+                if matches!(
+                    fault,
+                    LedgerFault::CreditIntakeWithoutHealthGate
+                        | LedgerFault::ForgetEnergyCapSpill
+                        | LedgerFault::ForgetHealthCapSpill
+                ) {
+                    world.food_mut().cells_mut().fill(1.0);
+                    if matches!(fault, LedgerFault::ForgetEnergyCapSpill) {
+                        world.config.metabolism_drain = 0.0;
+                        world.config.movement_drain = 0.0;
+                        world.config.temperature_discomfort_rate = 0.0;
+                        world.config.food_intake_rate = 1.0;
+                    }
+                    if matches!(
+                        fault,
+                        LedgerFault::CreditIntakeWithoutHealthGate
+                            | LedgerFault::ForgetHealthCapSpill
+                    ) {
+                        let arena = world.agents.columns_mut();
+                        for health in arena.health_mut().iter_mut() {
+                            *health = 2.0;
+                        }
+                    }
+                    for handle in world.agents().iter_handles().collect::<Vec<_>>() {
+                        let _ = world.try_update_agent_runtime(handle, |runtime| {
+                            runtime.energy = 1.99;
+                            runtime.herbivore_tendency = 1.0;
+                        });
+                    }
+                }
+                if matches!(fault, LedgerFault::MislabelCarcassAsTransfer) {
+                    if world.agents().len() >= 2 && world.runtime.values().all(|r| !r.spiked) {
+                        let victim = world.agents().iter_handles().next();
+                        if let Some(victim) = victim {
+                            let idx = world.agents().index_of(victim);
+                            if let Some(idx) = idx {
+                                let arena = world.agents.columns_mut();
+                                if let Some(health) = arena.health_mut().get_mut(idx) {
+                                    *health = 0.0;
+                                }
+                                if let Some(age) = arena.ages_mut().get_mut(idx) {
+                                    *age = 1000;
+                                }
+                            }
+                            if let Some(runtime) = world.runtime.get_mut(victim) {
+                                runtime.spiked = true;
+                                runtime.combat.was_spiked_by_carnivore = true;
+                            }
+                            for (id, runtime) in world.runtime.iter_mut() {
+                                if id != victim {
+                                    runtime.herbivore_tendency = 0.0;
+                                }
+                            }
+                        }
+                    }
+                }
+                if matches!(fault, LedgerFault::SkipDeathResidue) {
+                    let agent = world.agents().iter_handles().next();
+                    if let Some(agent) = agent {
+                        world.pending_deaths.push(agent);
                     }
                 }
                 let _ = handles;
