@@ -97,6 +97,10 @@ pub enum NeuroflowBrainError {
     },
     /// The validated deterministic seed could not be encoded.
     SeedSerialization { source: serde_json::Error },
+    /// A serialized live network no longer matched the pinned NeuroFlow snapshot schema.
+    NetworkSnapshot { source: serde_json::Error },
+    /// A decoded live network snapshot violated the configured architecture.
+    InvalidNetworkSnapshot { detail: String },
     /// NeuroFlow rejected the validated deterministic seed representation.
     NetworkConstruction { source: serde_json::Error },
 }
@@ -149,6 +153,15 @@ impl std::fmt::Display for NeuroflowBrainError {
             Self::SeedSerialization { source } => {
                 write!(f, "failed to serialize validated NeuroFlow seed: {source}")
             }
+            Self::NetworkSnapshot { source } => {
+                write!(
+                    f,
+                    "failed to decode pinned NeuroFlow network snapshot: {source}"
+                )
+            }
+            Self::InvalidNetworkSnapshot { detail } => {
+                write!(f, "invalid NeuroFlow network snapshot: {detail}")
+            }
             Self::NetworkConstruction { source } => {
                 write!(
                     f,
@@ -164,9 +177,9 @@ impl std::error::Error for NeuroflowBrainError {
         match self {
             Self::ScientificState(error) => Some(error),
             Self::Allocation { source, .. } => Some(source),
-            Self::SeedSerialization { source } | Self::NetworkConstruction { source } => {
-                Some(source)
-            }
+            Self::SeedSerialization { source }
+            | Self::NetworkSnapshot { source }
+            | Self::NetworkConstruction { source } => Some(source),
             _ => None,
         }
     }
@@ -355,7 +368,7 @@ pub struct NeuroflowBrain {
     inspection_json_conversions: AtomicUsize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct LayerSeed {
     v: Vec<f64>,
     y: Vec<f64>,
@@ -364,7 +377,7 @@ struct LayerSeed {
     w: Vec<Vec<f64>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct FeedForwardSeed {
     layers: Vec<LayerSeed>,
     learn_rate: f64,
@@ -565,6 +578,131 @@ impl NeuroflowBrain {
         Ok(network)
     }
 
+    fn decode_network_snapshot(
+        value: serde_json::Value,
+        config: &NeuroflowBrainConfig,
+    ) -> Result<FeedForwardSeed, NeuroflowBrainError> {
+        let snapshot = serde_json::from_value(value)
+            .map_err(|source| NeuroflowBrainError::NetworkSnapshot { source })?;
+        Self::validate_network_snapshot(&snapshot, config)?;
+        Ok(snapshot)
+    }
+
+    fn network_snapshot(&self) -> Result<FeedForwardSeed, NeuroflowBrainError> {
+        let value = serde_json::to_value(&self.network)
+            .map_err(|source| NeuroflowBrainError::SeedSerialization { source })?;
+        Self::decode_network_snapshot(value, &self.config)
+    }
+
+    fn validate_network_snapshot(
+        snapshot: &FeedForwardSeed,
+        config: &NeuroflowBrainConfig,
+    ) -> Result<(), NeuroflowBrainError> {
+        let invalid = |detail| NeuroflowBrainError::InvalidNetworkSnapshot { detail };
+        let expected_layers = config.hidden_layers.len().checked_add(1).ok_or(
+            NeuroflowBrainError::ArchitectureOverflow {
+                context: "snapshot layer count",
+            },
+        )?;
+        if snapshot.layers.len() != expected_layers {
+            return Err(invalid(format!(
+                "expected {expected_layers} layers, found {}",
+                snapshot.layers.len()
+            )));
+        }
+        for (field, actual, expected) in [
+            ("learn_rate", snapshot.learn_rate, config.learning_rate),
+            ("momentum", snapshot.momentum, config.momentum),
+        ] {
+            if actual.to_bits() != expected.to_bits() {
+                return Err(invalid(format!(
+                    "`{field}` must preserve configured value {expected}, found {actual}"
+                )));
+            }
+        }
+        if !snapshot.error.is_finite() {
+            return Err(invalid(format!(
+                "`error` must be finite, found {}",
+                snapshot.error
+            )));
+        }
+
+        let mut expected_inputs = INPUT_SIZE;
+        for (layer_index, (layer, expected_outputs)) in snapshot
+            .layers
+            .iter()
+            .zip(
+                config
+                    .hidden_layers
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(OUTPUT_SIZE)),
+            )
+            .enumerate()
+        {
+            for (field, values) in [
+                ("v", &layer.v),
+                ("y", &layer.y),
+                ("delta", &layer.delta),
+                ("prev_delta", &layer.prev_delta),
+            ] {
+                if values.len() != expected_outputs {
+                    return Err(invalid(format!(
+                        "`layers[{layer_index}].{field}` expected {expected_outputs} values, found {}",
+                        values.len()
+                    )));
+                }
+                if let Some(value_index) = values.iter().position(|value| !value.is_finite()) {
+                    return Err(invalid(format!(
+                        "`layers[{layer_index}].{field}[{value_index}]` must be finite"
+                    )));
+                }
+            }
+            if layer.w.len() != expected_outputs {
+                return Err(invalid(format!(
+                    "`layers[{layer_index}].w` expected {expected_outputs} rows, found {}",
+                    layer.w.len()
+                )));
+            }
+            let expected_weights = expected_inputs.checked_add(1).ok_or(
+                NeuroflowBrainError::ArchitectureOverflow {
+                    context: "snapshot weights per neuron",
+                },
+            )?;
+            for (neuron_index, weights) in layer.w.iter().enumerate() {
+                if weights.len() != expected_weights {
+                    return Err(invalid(format!(
+                        "`layers[{layer_index}].w[{neuron_index}]` expected {expected_weights} weights, found {}",
+                        weights.len()
+                    )));
+                }
+                if let Some(weight_index) = weights.iter().position(|weight| !weight.is_finite()) {
+                    return Err(invalid(format!(
+                        "`layers[{layer_index}].w[{neuron_index}][{weight_index}]` must be finite"
+                    )));
+                }
+            }
+            expected_inputs = expected_outputs;
+        }
+        Ok(())
+    }
+
+    fn restore_network_snapshot(
+        snapshot: FeedForwardSeed,
+        config: &NeuroflowBrainConfig,
+    ) -> Result<FeedForward, NeuroflowBrainError> {
+        Self::validate_network_snapshot(&snapshot, config)?;
+        let value = serde_json::to_value(snapshot)
+            .map_err(|source| NeuroflowBrainError::SeedSerialization { source })?;
+        let mut network: FeedForward = serde_json::from_value(value)
+            .map_err(|source| NeuroflowBrainError::NetworkConstruction { source })?;
+        network
+            .activation(config.activation.to_type())
+            .learning_rate(config.learning_rate)
+            .momentum(config.momentum);
+        Ok(network)
+    }
+
     fn gaussian(rng: &mut dyn RandomStream) -> f64 {
         let u1 = rng.random::<f64>().clamp(f64::MIN_POSITIVE, 1.0);
         let u2 = rng.random::<f64>();
@@ -743,67 +881,45 @@ impl Brain for NeuroflowBrain {
         // Perturb existing weights in place (per-weight coin at `rate`,
         // Gaussian step scaled by `scale`). Regenerating the whole network
         // would erase all inherited structure in one event.
-        let sigma = f64::from(scale.max(1e-5));
-        let mut value = serde_json::to_value(&self.network).map_err(|source| {
-            BrainMutationError::new(NeuroflowBrainError::SeedSerialization { source })
-        })?;
+        let sigma = f64::from(scale.max(0.0));
+        let mut snapshot = self.network_snapshot().map_err(BrainMutationError::new)?;
         let mut changed = false;
-        if let Some(layers) = value.get_mut("layers").and_then(|v| v.as_array_mut()) {
-            for (layer_index, layer) in layers.iter_mut().enumerate() {
-                if let Some(neurons) = layer.get_mut("w").and_then(|v| v.as_array_mut()) {
-                    for (neuron_index, weights) in neurons
-                        .iter_mut()
-                        .filter_map(|n| n.as_array_mut())
-                        .enumerate()
-                    {
-                        for (weight_index, weight) in weights.iter_mut().enumerate() {
-                            if rng.random::<f32>() < rate
-                                && let Some(current) = weight.as_f64()
-                            {
-                                let next = current + Self::gaussian(rng) * sigma;
-                                let number =
-                                    serde_json::Number::from_f64(next).ok_or_else(|| {
-                                        BrainMutationError::new(
-                                            NeuroflowBrainError::InvalidGeneratedWeight {
-                                                layer: layer_index,
-                                                neuron: neuron_index,
-                                                weight: weight_index,
-                                                value: next,
-                                            },
-                                        )
-                                    })?;
-                                *weight = serde_json::Value::Number(number);
-                                changed = true;
-                            }
+        for (layer_index, layer) in snapshot.layers.iter_mut().enumerate() {
+            for (neuron_index, weights) in layer.w.iter_mut().enumerate() {
+                for (weight_index, weight) in weights.iter_mut().enumerate() {
+                    if rng.random::<f32>() < rate {
+                        let gaussian = Self::gaussian(rng);
+                        if sigma == 0.0 {
+                            continue;
                         }
+                        let next = *weight + gaussian * sigma;
+                        if !next.is_finite() {
+                            return Err(BrainMutationError::new(
+                                NeuroflowBrainError::InvalidGeneratedWeight {
+                                    layer: layer_index,
+                                    neuron: neuron_index,
+                                    weight: weight_index,
+                                    value: next,
+                                },
+                            ));
+                        }
+                        *weight = next;
+                        changed = true;
                     }
                 }
             }
         }
         if changed {
-            let mut network = serde_json::from_value::<FeedForward>(value).map_err(|source| {
-                BrainMutationError::new(NeuroflowBrainError::NetworkConstruction { source })
-            })?;
-            network
-                .activation(self.config.activation.to_type())
-                .learning_rate(self.config.learning_rate)
-                .momentum(self.config.momentum);
-            self.network = network;
+            self.network = Self::restore_network_snapshot(snapshot, &self.config)
+                .map_err(BrainMutationError::new)?;
         }
         Ok(())
     }
 
     fn clone_box(&self) -> Result<Box<dyn Brain>, BrainCloneError> {
-        let value = serde_json::to_value(&self.network).map_err(|source| {
-            BrainCloneError::new(NeuroflowBrainError::SeedSerialization { source })
-        })?;
-        let mut network: FeedForward = serde_json::from_value(value).map_err(|source| {
-            BrainCloneError::new(NeuroflowBrainError::NetworkConstruction { source })
-        })?;
-        network
-            .activation(self.config.activation.to_type())
-            .learning_rate(self.config.learning_rate)
-            .momentum(self.config.momentum);
+        let snapshot = self.network_snapshot().map_err(BrainCloneError::new)?;
+        let network =
+            Self::restore_network_snapshot(snapshot, &self.config).map_err(BrainCloneError::new)?;
         Ok(Box::new(Self {
             network,
             config: self.config.clone(),
@@ -1004,6 +1120,81 @@ mod tests {
             .expect("finite inherited mutation must rebuild exactly");
         assert_ne!(inherited.tick(&inputs), baseline);
         assert_eq!(original.tick(&inputs), baseline);
+    }
+
+    #[test]
+    fn zero_scale_mutation_is_bit_exact_and_preserves_rng_draw_schedule() {
+        let config = NeuroflowBrainConfig {
+            hidden_layers: vec![1],
+            ..NeuroflowBrainConfig::default()
+        };
+        let mut founder_rng = SmallRngStream::seed_from_u64(0x5CA1_E000);
+        let mut brain =
+            NeuroflowBrain::new(config, &mut founder_rng).expect("small NeuroFlow brain");
+        let before = serde_json::to_vec(&brain.network).expect("serialize pre-mutation network");
+        let weight_count = brain
+            .network_snapshot()
+            .expect("decode pinned NeuroFlow snapshot")
+            .layers
+            .iter()
+            .map(|layer| layer.w.iter().map(Vec::len).sum::<usize>())
+            .sum::<usize>();
+
+        let mut actual_rng = SmallRngStream::seed_from_u64(0x5CA1_E001);
+        brain
+            .mutate(&mut actual_rng, 1.0, 0.0)
+            .expect("zero-scale mutation");
+
+        assert_eq!(
+            serde_json::to_vec(&brain.network).expect("serialize post-mutation network"),
+            before,
+            "zero mutation magnitude must preserve every NeuroFlow network bit"
+        );
+        let mut oracle_rng = SmallRngStream::seed_from_u64(0x5CA1_E001);
+        for _ in 0..weight_count {
+            let _probability = oracle_rng.random::<f32>();
+            let _gaussian = NeuroflowBrain::gaussian(&mut oracle_rng);
+        }
+        assert_eq!(
+            actual_rng.checkpoint(),
+            oracle_rng.checkpoint(),
+            "zero scale must not skip the deterministic per-weight mutation draw schedule"
+        );
+    }
+
+    #[test]
+    fn pinned_snapshot_decoder_rejects_schema_and_shape_drift() {
+        let config = NeuroflowBrainConfig {
+            hidden_layers: vec![2],
+            ..NeuroflowBrainConfig::default()
+        };
+        let mut rng = SmallRngStream::seed_from_u64(0x5C4E_A001);
+        let brain = NeuroflowBrain::new(config.clone(), &mut rng).expect("small NeuroFlow brain");
+
+        let mut missing_layers =
+            serde_json::to_value(&brain.network).expect("serialize NeuroFlow network");
+        missing_layers
+            .as_object_mut()
+            .expect("network object")
+            .remove("layers");
+        let error = NeuroflowBrain::decode_network_snapshot(missing_layers, &config)
+            .err()
+            .expect("missing pinned field must fail closed");
+        assert!(matches!(error, NeuroflowBrainError::NetworkSnapshot { .. }));
+
+        let mut malformed_weights =
+            serde_json::to_value(&brain.network).expect("serialize NeuroFlow network");
+        malformed_weights["layers"][0]["w"]
+            .as_array_mut()
+            .expect("weight rows")
+            .pop();
+        let error = NeuroflowBrain::decode_network_snapshot(malformed_weights, &config)
+            .err()
+            .expect("wrong weight-row count must fail closed");
+        assert!(matches!(
+            error,
+            NeuroflowBrainError::InvalidNetworkSnapshot { .. }
+        ));
     }
 
     #[test]
