@@ -1902,8 +1902,41 @@ async fn prepare_mcp_server(
     reserved: ReservedControlListener,
 ) -> Result<PreparedMcpServer> {
     info!(address = %reserved.address, "Preparing MCP HTTP server");
-    let mut builder =
-        fastmcp_rust::ServerBuilder::new("scriptbots-control", env!("CARGO_PKG_VERSION"));
+    let builder = register_control_tools(
+        fastmcp_rust::ServerBuilder::new("scriptbots-control", env!("CARGO_PKG_VERSION")),
+        handle,
+    );
+
+    let server = Arc::new(builder.build());
+
+    let router = Router::new()
+        .route("/mcp", post(handle_mcp_http_request))
+        .route("/mcp/notify", post(handle_mcp_http_notification))
+        .route("/mcp/events", get(handle_mcp_http_events))
+        .route("/health", get(handle_mcp_http_health))
+        .with_state(server);
+    let listener = tokio::net::TcpListener::from_std(reserved.listener)
+        .context("failed to adopt reserved MCP HTTP listener")?;
+
+    Ok(PreparedMcpServer {
+        address: reserved.address,
+        listener,
+        router,
+    })
+}
+
+/// Register the complete MCP control-tool roster onto `builder`.
+///
+/// Split out of [`prepare_mcp_server`] so the roster can be asserted without
+/// binding a socket: this list is hand-maintained beside `ControlToolKind`, and a
+/// variant that dispatches but is never registered here is simply an MCP tool that
+/// does not exist. That is the same silent drift that removed eight routes from the
+/// published OpenAPI document (bd-01dg), so `mcp_tool_roster_is_complete` pins it.
+fn register_control_tools(
+    builder: fastmcp_rust::ServerBuilder,
+    handle: ControlHandle,
+) -> fastmcp_rust::ServerBuilder {
+    let mut builder = builder;
 
     builder = register_tool(
         builder,
@@ -2072,22 +2105,7 @@ async fn prepare_mcp_server(
         handle,
     );
 
-    let server = Arc::new(builder.build());
-
-    let router = Router::new()
-        .route("/mcp", post(handle_mcp_http_request))
-        .route("/mcp/notify", post(handle_mcp_http_notification))
-        .route("/mcp/events", get(handle_mcp_http_events))
-        .route("/health", get(handle_mcp_http_health))
-        .with_state(server);
-    let listener = tokio::net::TcpListener::from_std(reserved.listener)
-        .context("failed to adopt reserved MCP HTTP listener")?;
-
-    Ok(PreparedMcpServer {
-        address: reserved.address,
-        listener,
-        router,
-    })
+    builder
 }
 
 fn register_tool(
@@ -3075,6 +3093,52 @@ mod tests {
         assert_eq!(rendered["id"], "fixture-equilibrium-study");
         assert_eq!(rendered["schema_version"], 1);
         assert_eq!(rendered["bootstrap_ticks"], 12);
+    }
+
+    /// The MCP roster README documents and that `ControlToolKind` dispatches.
+    ///
+    /// Registration is hand-written per tool, so a `ControlToolKind` variant can be
+    /// added and dispatched while never being registered — an MCP tool that simply
+    /// does not exist, invisible to `tools/list` and to every client. Asserting set
+    /// equality against the built server catches both directions: a variant that lost
+    /// its registration, and a tool registered under a name the docs do not claim.
+    #[test]
+    fn mcp_tool_roster_is_complete() {
+        let (control, _receiver) = handle();
+        let server = register_control_tools(
+            fastmcp_rust::ServerBuilder::new("scriptbots-control-test", "0.0.0"),
+            control,
+        )
+        .build();
+
+        let registered: BTreeSet<String> =
+            server.tools().into_iter().map(|tool| tool.name).collect();
+        let expected: BTreeSet<String> = [
+            "list_presets",
+            "apply_preset",
+            "list_knobs",
+            "get_config",
+            "apply_updates",
+            "apply_patch",
+            "pause",
+            "resume",
+            "step",
+            "set_speed",
+            "get_status",
+            "shutdown",
+            "get_command_status",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(
+            registered,
+            expected,
+            "MCP tool roster drifted; missing: {:?}, unexpected: {:?}",
+            expected.difference(&registered).collect::<Vec<_>>(),
+            registered.difference(&expected).collect::<Vec<_>>()
+        );
     }
 
     /// Collect the `/api/...` literal that follows each occurrence of `marker`.
