@@ -17,6 +17,12 @@
 //! * child-process durability: acknowledged data survives process exit and reopen;
 //! * a corrupt-header startup refusal that leaves database bytes untouched;
 //! * `PRAGMA integrity_check` asserted `ok` after every scenario that leaves a valid database.
+//!
+//! Beads `bd-r03d`, `bd-xbvz`, and `bd-h1ae` add the contract-conformance lane at the end of
+//! this file: the admitted/applied/durable triple is observed at every boundary of one
+//! lifecycle and proven ordered and componentwise non-decreasing; a refused conflicting
+//! payload is proven to leave no open write transaction behind; and repeated recovery of the
+//! same database is proven to be a fixed point that never duplicates scientific rows.
 
 use fsqlite::{
     Connection, FrankenError, SqliteValue,
@@ -24,8 +30,8 @@ use fsqlite::{
 };
 use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
 use scriptbots_storage::{
-    FailureCommitState, PersistenceWatermarks, Storage, StorageError, StoragePipeline,
-    StorageReader,
+    FailureCommitState, PersistenceBatchId, PersistenceWatermarks, Storage, StorageError,
+    StoragePipeline, StorageReader,
 };
 use std::{
     fs,
@@ -136,6 +142,7 @@ fn sample_batch(tick: u64, metric_value: f64) -> PersistenceBatch {
         births: Vec::new(),
         deaths: Vec::new(),
         replay_events: Vec::new(),
+        narrative_events: Vec::new(),
     }
 }
 
@@ -850,5 +857,447 @@ fn corrupt_header_startup_refusal_leaves_database_bytes_untouched() {
         bytes,
         "a refused startup mutated database bytes"
     );
+    cleanup(&path);
+}
+
+// ---------------------------------------------------------------------------
+// Contract conformance: watermark ordering/monotonicity (`bd-r03d`), the
+// transaction-free-after-failure clause (`bd-xbvz`), and repeated-recovery
+// idempotency (`bd-h1ae`).
+//
+// The three clauses under proof, quoted from the FrankenSQLite Storage Contract:
+//
+//   * "an identical tick/BLAKE3 identity reuses its stable batch ID while a
+//     changed payload is rejected";
+//   * "Startup replays admitted-but-unapplied batches in order and idempotently
+//     finalizes applied-but-not-durable batches";
+//   * "A persistence transaction either commits the entire accepted batch or
+//     rolls it back; a failed statement may not leave the connection in an
+//     active transaction."
+//
+// Existing coverage proves these at discrete endpoints. This lane observes every
+// boundary of one lifecycle and drives recovery to a fixed point.
+// ---------------------------------------------------------------------------
+
+/// Tick reserved for the independent-writer probe rows below. It is far above any
+/// tick a scenario in this file persists, so a leaked probe row is unambiguous.
+const WRITER_PROBE_TICK: i64 = 9_999_999;
+
+/// Records every watermark observation of one run and enforces both contract
+/// invariants at each step: `durable <= applied <= admitted` within an
+/// observation, and componentwise non-decrease between consecutive observations.
+#[derive(Default)]
+struct WatermarkWitness {
+    observations: Vec<(&'static str, PersistenceWatermarks)>,
+}
+
+impl WatermarkWitness {
+    fn raw(id: Option<PersistenceBatchId>) -> u64 {
+        id.map_or(0, PersistenceBatchId::get)
+    }
+
+    fn observe(&mut self, label: &'static str, watermarks: PersistenceWatermarks) {
+        let admitted = Self::raw(watermarks.admitted);
+        let applied = Self::raw(watermarks.applied);
+        let durable = Self::raw(watermarks.durable);
+        assert!(
+            durable <= applied && applied <= admitted,
+            "{label}: watermarks advanced out of order \
+             (durable={durable}, applied={applied}, admitted={admitted})"
+        );
+        if let Some((previous_label, previous)) = self.observations.last() {
+            for (component, before, after) in [
+                ("admitted", Self::raw(previous.admitted), admitted),
+                ("applied", Self::raw(previous.applied), applied),
+                ("durable", Self::raw(previous.durable), durable),
+            ] {
+                assert!(
+                    after >= before,
+                    "{previous_label} -> {label}: the {component} watermark regressed \
+                     from {before} to {after}"
+                );
+            }
+        }
+        self.observations.push((label, watermarks));
+    }
+
+    fn last(&self) -> PersistenceWatermarks {
+        self.observations
+            .last()
+            .expect("the witness recorded at least one observation")
+            .1
+    }
+}
+
+/// Read the single run identity an unattributed file-backed run created.
+fn run_id_of(path: &str) -> String {
+    let reader =
+        open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).expect("run-id probe reader opens");
+    let run_id = reader
+        .query_row_with_params("SELECT run_id FROM runs LIMIT 1", &[])
+        .expect("run id query runs")
+        .get_typed::<String>(0)
+        .expect("run id is TEXT");
+    reader.close().expect("run-id probe closes");
+    run_id
+}
+
+/// Prove that no ScriptBots writer is holding an open transaction on `path`.
+///
+/// This is the observable behind "a failed statement may not leave the connection
+/// in an active transaction". An independent connection must commit a probe row —
+/// and then commit its removal — on the first attempt each time. A residual open
+/// write transaction on the storage connection surfaces here as a commit conflict
+/// (the same conflict `storage_flush_under_real_contention_...` induces
+/// deliberately), so a clean pair of commits is direct evidence that the failed
+/// call released its transaction.
+///
+/// The probe leaves the database exactly as it found it, so callers may assert on
+/// scientific rows afterwards.
+fn assert_no_writer_transaction_is_open(path: &str, probe: &str) {
+    let run_id = run_id_of(path);
+    let prober = Connection::open(path).expect("probe writer opens the same database");
+
+    prober
+        .begin_transaction()
+        .expect("probe insert transaction begins");
+    prober
+        .execute_with_params(
+            "INSERT INTO metrics (run_id, tick, name, value) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                run_id.clone().into(),
+                WRITER_PROBE_TICK.into(),
+                probe.into(),
+                0.0_f64.into(),
+            ],
+        )
+        .expect("probe row stages");
+    let committed = prober.commit_transaction();
+    assert!(
+        committed.is_ok(),
+        "{probe}: an independent writer could not commit, so the ScriptBots writer is \
+         still inside an open transaction after its failure: {committed:?}"
+    );
+    assert_eq!(
+        read_only_count(
+            path,
+            "SELECT COUNT(*) FROM metrics WHERE name = ?1",
+            &[probe.into()],
+        ),
+        1,
+        "{probe}: the committed probe row is not visible to an independent reader"
+    );
+
+    prober
+        .begin_transaction()
+        .expect("probe cleanup transaction begins");
+    prober
+        .execute_with_params("DELETE FROM metrics WHERE name = ?1", &[probe.into()])
+        .expect("probe row deletion stages");
+    prober
+        .commit_transaction()
+        .expect("probe cleanup commits so scientific assertions stay exact");
+    prober.close().expect("probe writer closes");
+    assert_eq!(
+        read_only_count(
+            path,
+            "SELECT COUNT(*) FROM metrics WHERE name = ?1",
+            &[probe.into()],
+        ),
+        0,
+        "{probe}: the probe row survived its committed deletion"
+    );
+}
+
+#[test]
+fn watermarks_stay_ordered_and_never_regress_across_refusal_and_recovery() {
+    if !engine_capable_temp_dir() {
+        return;
+    }
+    let path = test_path("watermark-monotonicity");
+    let path_string = path.to_string_lossy().to_string();
+    let mut witness = WatermarkWitness::default();
+
+    // Thresholds far above the scenario keep every batch buffered until the
+    // explicit flushes below, so admission and application are separately visible.
+    let mut storage =
+        Storage::create_unattributed_file_with_thresholds(&path_string, 1_000, 1_000, 1_000, 1_000)
+            .expect("file-backed storage opens");
+    witness.observe(
+        "fresh",
+        storage
+            .persistence_watermarks()
+            .expect("fresh watermark query runs"),
+    );
+
+    for (tick, value) in [(1_u64, 1.5_f64), (2, 2.5), (3, 3.5)] {
+        storage
+            .persist(&sample_batch(tick, value))
+            .expect("batch admission stages the outbox payload");
+        witness.observe(
+            "admitted",
+            storage
+                .persistence_watermarks()
+                .expect("post-admission watermark query runs"),
+        );
+    }
+    let admitted = witness.last();
+    assert_eq!(
+        admitted.admitted.map(PersistenceBatchId::get),
+        Some(3),
+        "three admissions must advance the admitted prefix to batch 3"
+    );
+    assert_eq!(
+        admitted.applied, None,
+        "admission is not application: the applied prefix must stay empty"
+    );
+
+    storage.flush().expect("flush applies the buffered prefix");
+    witness.observe(
+        "applied",
+        storage
+            .persistence_watermarks()
+            .expect("post-flush watermark query runs"),
+    );
+    let applied = witness.last();
+    assert_eq!(
+        applied.applied.map(PersistenceBatchId::get),
+        Some(3),
+        "the applied prefix must cover every flushed batch"
+    );
+    assert_eq!(
+        applied.durable, None,
+        "the same-thread writer advances the durable marker only at finalization"
+    );
+
+    // An exact duplicate reuses its stable identity and advances nothing.
+    storage
+        .persist(&sample_batch(2, 2.5))
+        .expect("an exact duplicate retry is idempotent");
+    witness.observe(
+        "duplicate",
+        storage
+            .persistence_watermarks()
+            .expect("post-duplicate watermark query runs"),
+    );
+    assert_eq!(
+        witness.last(),
+        applied,
+        "an idempotent duplicate moved a watermark"
+    );
+
+    // A conflicting payload for the same already-admitted tick is refused by digest.
+    let refusal = storage
+        .persist(&sample_batch(2, 99.0))
+        .expect_err("a changed payload for an admitted tick must be rejected");
+    assert!(
+        matches!(
+            &refusal,
+            StorageError::InvalidData {
+                context: "storage_batch_ledger.payload_digest",
+                ..
+            }
+        ),
+        "expected a payload-digest refusal, got {refusal}"
+    );
+    witness.observe(
+        "after-refusal",
+        storage
+            .persistence_watermarks()
+            .expect("post-refusal watermark query runs"),
+    );
+    assert_eq!(
+        witness.last(),
+        applied,
+        "a refused conflicting payload moved a watermark"
+    );
+
+    // The refusal must not have left the writer inside an open transaction, and the
+    // same writer must still be usable for a fresh admit -> apply cycle.
+    assert_no_writer_transaction_is_open(&path_string, "refusal-probe");
+    storage
+        .persist(&sample_batch(4, 4.0))
+        .expect("the writer still admits after a refused conflicting payload");
+    witness.observe(
+        "post-refusal-admit",
+        storage
+            .persistence_watermarks()
+            .expect("post-refusal admission watermark query runs"),
+    );
+    storage
+        .flush()
+        .expect("the writer still applies after a refused conflicting payload");
+    witness.observe(
+        "post-refusal-apply",
+        storage
+            .persistence_watermarks()
+            .expect("post-refusal application watermark query runs"),
+    );
+    storage.close().expect("writer closes");
+
+    // Recovery finalizes the applied-but-not-durable prefix; the durable marker is
+    // the only component that may move, and it may only move forward.
+    let mut recovered =
+        StoragePipeline::recover_existing(&path_string).expect("recovery reopens the run");
+    let shutdown = recovered
+        .shutdown()
+        .expect("recovered pipeline shuts down cleanly");
+    witness.observe("recovered", shutdown.watermarks);
+
+    let reader = StorageReader::open(&path_string).expect("reader opens the recovered run");
+    witness.observe(
+        "reader",
+        reader
+            .persistence_watermarks()
+            .expect("reader watermark query runs"),
+    );
+    let converged = witness.last();
+    assert_eq!(
+        (
+            converged.admitted.map(PersistenceBatchId::get),
+            converged.applied.map(PersistenceBatchId::get),
+            converged.durable.map(PersistenceBatchId::get),
+        ),
+        (Some(4), Some(4), Some(4)),
+        "recovery must converge all three prefixes on the last admitted batch"
+    );
+    // Four distinct ticks were admitted; the duplicate and the refusal added none.
+    let energy_rows: Vec<_> = reader
+        .recent_metrics(16)
+        .expect("metrics query runs")
+        .into_iter()
+        .filter(|row| row.name == "energy")
+        .collect();
+    assert_eq!(
+        energy_rows.len(),
+        4,
+        "exactly one energy row per admitted tick must exist, got {energy_rows:?}"
+    );
+    assert_eq!(
+        reader.max_tick().expect("max tick query runs"),
+        Some(4),
+        "the refused payload must not have advanced the scientific tick ledger"
+    );
+    reader.close().expect("reader closes");
+
+    assert!(
+        witness.observations.len() >= 10,
+        "the witness must have observed every boundary, got {:?}",
+        witness.observations
+    );
+    assert_integrity_ok(&path_string);
+    cleanup(&path);
+}
+
+#[test]
+fn repeated_recovery_is_a_fixed_point_and_never_duplicates_rows() {
+    if !engine_capable_temp_dir() {
+        return;
+    }
+    let path = test_path("recovery-fixed-point");
+    let path_string = path.to_string_lossy().to_string();
+
+    // Admit several batches and abandon the writer without flushing: every batch is
+    // admitted-but-unapplied, which is exactly the state startup must replay in order.
+    const ADMITTED: [(u64, f64); 4] = [(11, 0.5), (12, 1.5), (13, 2.5), (14, 3.5)];
+    /// Batch identities are minted `1..=ADMITTED.len()` in admission order.
+    const BATCH_COUNT: u64 = 4;
+    let ticks: Vec<u64> = ADMITTED.iter().map(|(tick, _)| *tick).collect();
+    let mut storage =
+        Storage::create_unattributed_file_with_thresholds(&path_string, 1_000, 1_000, 1_000, 1_000)
+            .expect("file-backed storage opens");
+    for (tick, value) in ADMITTED {
+        storage
+            .persist(&sample_batch(tick, value))
+            .expect("batch admission stages the outbox payload");
+    }
+    let admitted = storage
+        .persistence_watermarks()
+        .expect("pre-drop watermark query runs");
+    assert_eq!(
+        admitted.admitted.map(PersistenceBatchId::get),
+        Some(BATCH_COUNT),
+        "every batch must be admitted before the writer is abandoned"
+    );
+    assert_eq!(
+        admitted.applied, None,
+        "no batch may be applied before the abandoned writer is recovered"
+    );
+    drop(storage);
+
+    // Recovering the same database repeatedly must be a fixed point: identical rows,
+    // identical ordering, identical converged watermarks after every pass.
+    let mut previous: Option<(Vec<(u64, u64)>, PersistenceWatermarks, Option<u64>)> = None;
+    for pass in 1..=3_u32 {
+        let mut recovered = StoragePipeline::recover_existing(&path_string)
+            .expect("every recovery pass must reopen the run");
+        let shutdown = recovered
+            .shutdown()
+            .expect("every recovered pipeline must shut down cleanly");
+        assert_eq!(
+            shutdown.watermarks.admitted.map(PersistenceBatchId::get),
+            Some(BATCH_COUNT),
+            "recovery pass {pass} changed the admitted prefix"
+        );
+        assert_eq!(
+            shutdown.watermarks.applied, shutdown.watermarks.admitted,
+            "recovery pass {pass} left an admitted batch unapplied"
+        );
+        assert_eq!(
+            shutdown.watermarks.durable, shutdown.watermarks.admitted,
+            "recovery pass {pass} left an applied batch unfinalized"
+        );
+
+        let reader =
+            StorageReader::open(&path_string).expect("the reader must open after every pass");
+        // Compare persisted values by bit pattern: replay must be byte-exact, and this
+        // keeps the fixed-point comparison free of float-equality ambiguity.
+        let mut rows: Vec<(u64, u64)> = reader
+            .recent_metrics(64)
+            .expect("metrics query runs")
+            .into_iter()
+            .filter(|row| row.name == "energy")
+            .map(|row| (row.tick, row.value.to_bits()))
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        let max_tick = reader.max_tick().expect("max tick query runs");
+        let watermarks = reader
+            .persistence_watermarks()
+            .expect("reader watermark query runs");
+        reader.close().expect("reader closes");
+
+        assert_eq!(
+            rows.len(),
+            ADMITTED.len(),
+            "recovery pass {pass} produced {} energy rows for {} admitted batches — \
+             replay is not exactly-once: {rows:?}",
+            rows.len(),
+            ADMITTED.len()
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            ticks,
+            "recovery pass {pass} did not replay the admitted batches in tick order"
+        );
+        assert_eq!(
+            max_tick,
+            ticks.last().copied(),
+            "recovery pass {pass} changed the scientific tick ledger"
+        );
+
+        let observed = (rows, watermarks, max_tick);
+        if let Some(expected) = previous.as_ref() {
+            assert_eq!(
+                &observed, expected,
+                "recovery pass {pass} is not a fixed point of the previous pass"
+            );
+        }
+        previous = Some(observed);
+
+        // Each finished pass must also leave no writer transaction behind.
+        assert_no_writer_transaction_is_open(&path_string, "recovery-probe");
+        assert_integrity_ok(&path_string);
+    }
+
     cleanup(&path);
 }

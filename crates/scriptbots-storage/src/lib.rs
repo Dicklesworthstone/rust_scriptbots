@@ -11657,11 +11657,22 @@ impl Storage {
         Ok(())
     }
 
+    /// Mint or reuse the stable batch identity for `tick` and durably admit its exact
+    /// payload to the outbox.
+    ///
+    /// This is the only method that advances `storage_progress.admitted_batch_id`, so it
+    /// carries the same fail-closed guard as `enqueue_staged`, `persist`, and `flush`: a
+    /// terminally failed writer can never append another identity to the ledger. The
+    /// storage worker calls this directly rather than through `persist`, so the guard has
+    /// to live here and not only at the public boundary (`bd-x8wf`).
     fn stage_outbox(
         &mut self,
         tick: u64,
         prepared: &StorageBuffer,
     ) -> Result<(AdmissionReceipt, bool), StorageError> {
+        if self.terminally_failed {
+            return Err(StorageError::TerminallyFailed);
+        }
         let tick_i64 = i64::try_from(tick).map_err(|error| StorageError::InvalidData {
             context: "storage_batch_ledger.tick",
             reason: error.to_string(),
@@ -19613,6 +19624,74 @@ mod tests {
         assert_eq!(tick_count, 1);
 
         reopened.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    /// `bd-x8wf`: `stage_outbox` is the only method that mints a batch identity and
+    /// CAS-advances the admitted watermark, and the storage worker calls it directly
+    /// rather than through `persist`. It must therefore carry the same fail-closed guard
+    /// as its siblings: after a terminal failure no caller — public or worker — can append
+    /// another identity to the ledger.
+    #[test]
+    fn a_terminally_failed_writer_refuses_to_admit_another_batch_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-terminal-admission-guard");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = create_file_storage(&path_string)?;
+        storage.persist(&sample_batch(61, 6.1))?;
+        let before = storage.persistence_watermarks()?;
+        assert!(before.admitted.is_some());
+
+        // Force a terminal, non-transient flush failure: the scientific table the buffered
+        // batch needs no longer exists, so the application transaction rolls back whole.
+        storage.connection()?.execute("DROP TABLE metrics")?;
+        let failure = storage
+            .flush()
+            .expect_err("a missing scientific table must fail the application transaction");
+        assert!(
+            matches!(
+                failure,
+                StorageError::Transaction {
+                    commit_state: FailureCommitState::RolledBack,
+                    ..
+                }
+            ),
+            "expected a rolled-back transaction failure, got {failure}"
+        );
+
+        // The worker's direct admission entry point is fail-closed, not only `persist`.
+        let next = Storage::prepare_batch(&sample_batch(62, 6.2))?;
+        assert!(
+            matches!(
+                storage.stage_outbox(62, &next),
+                Err(StorageError::TerminallyFailed)
+            ),
+            "stage_outbox admitted a batch on a terminally failed writer"
+        );
+        assert!(matches!(
+            storage.persist(&sample_batch(62, 6.2)),
+            Err(StorageError::TerminallyFailed)
+        ));
+        assert!(matches!(
+            storage.flush(),
+            Err(StorageError::TerminallyFailed)
+        ));
+
+        assert_eq!(
+            storage.persistence_watermarks()?,
+            before,
+            "a refused admission advanced a watermark"
+        );
+        let ledger_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        assert_eq!(
+            ledger_count, 1,
+            "a terminally failed writer minted another batch identity"
+        );
+        storage.abandon_after_error();
         let _ = fs::remove_file(path);
         Ok(())
     }
