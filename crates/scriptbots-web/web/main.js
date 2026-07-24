@@ -23,6 +23,7 @@ const metrics = {
     fps: 0,
     tps: 0,
     tick: 0,
+    statsTickAcc: 0,
 };
 
 const perfWindow = {
@@ -53,6 +54,20 @@ resetButton.addEventListener("click", () => {
 function appendLog(message) {
     const line = `[${new Date().toLocaleTimeString()}] ${message}`;
     logView.textContent = `${line}\n${logView.textContent}`.slice(0, 4096);
+}
+
+function resetPerformanceWindows() {
+    const now = performance.now();
+    metrics.lastFrameTs = now;
+    metrics.lastStatsTs = now;
+    metrics.previousTick = null;
+    metrics.fps = 0;
+    metrics.tps = 0;
+    metrics.tick = 0;
+    metrics.statsTickAcc = 0;
+    perfWindow.frameAcc = 0;
+    perfWindow.tickAcc = 0;
+    perfWindow.lastLog = now;
 }
 
 function scaleFactor(world) {
@@ -102,19 +117,21 @@ function updateStats(snapshot, now) {
     const deltaTicks = snapshot.tick - previousTick;
     metrics.previousTick = snapshot.tick;
     metrics.tick = snapshot.tick;
+    metrics.statsTickAcc += deltaTicks;
 
     if (statsDt >= 500) {
-        metrics.tps = deltaTicks * (1000 / statsDt);
+        metrics.tps = metrics.statsTickAcc * (1000 / statsDt);
+        metrics.statsTickAcc = 0;
         metrics.lastStatsTs = now;
 
         fpsEl.textContent = metrics.fps.toFixed(1);
         tpsEl.textContent = metrics.tps.toFixed(1);
         tickEl.textContent = snapshot.tick.toLocaleString();
-        popEl.textContent = snapshot.summary.agent_count.toLocaleString();
+        popEl.textContent = snapshot.summary.agentCount.toLocaleString();
         birthsEl.textContent = snapshot.summary.births.toLocaleString();
         deathsEl.textContent = snapshot.summary.deaths.toLocaleString();
-        energyEl.textContent = snapshot.summary.average_energy.toFixed(3);
-        healthEl.textContent = snapshot.summary.average_health.toFixed(3);
+        energyEl.textContent = snapshot.summary.averageEnergy.toFixed(3);
+        healthEl.textContent = snapshot.summary.averageHealth.toFixed(3);
     }
 
     perfWindow.frameAcc += 1;
@@ -125,7 +142,7 @@ function updateStats(snapshot, now) {
         const avgFps = perfWindow.frameAcc / durationSeconds;
         const avgTps = perfWindow.tickAcc / durationSeconds;
         appendLog(
-            `5s avg — FPS: ${avgFps.toFixed(1)} | TPS: ${avgTps.toFixed(1)} | Population: ${snapshot.summary.agent_count}`,
+            `5s avg — FPS: ${avgFps.toFixed(1)} | TPS: ${avgTps.toFixed(1)} | Population: ${snapshot.summary.agentCount}`,
         );
         perfWindow.frameAcc = 0;
         perfWindow.tickAcc = 0;
@@ -169,6 +186,7 @@ async function resetSimulation(populationOverride) {
     };
 
     simHandle = init_sim(options);
+    resetPerformanceWindows();
     appendLog(`Simulation reset (seed=${seed}, population=${populationOverride})`);
 }
 

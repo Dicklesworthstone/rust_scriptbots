@@ -602,6 +602,32 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_demo_consumes_the_camel_case_snapshot_contract() {
+        let source = include_str!("../web/main.js");
+        for access in [
+            "snapshot.summary.agentCount",
+            "snapshot.summary.averageEnergy",
+            "snapshot.summary.averageHealth",
+        ] {
+            assert!(
+                source.contains(access),
+                "browser demo must read the serialized camelCase access `{access}`"
+            );
+        }
+        for stale_access in [
+            "snapshot.summary.agent_count",
+            "snapshot.summary.average_energy",
+            "snapshot.summary.average_health",
+        ] {
+            assert!(
+                !source.contains(stale_access),
+                "browser demo still reads nonexistent snake_case access `{stale_access}`"
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn seeded_birth_records_capture_registry_and_runtime_brains_after_binding() {
         struct BirthCapture {
             batches: Arc<Mutex<Vec<scriptbots_core::PersistenceBatch>>>,

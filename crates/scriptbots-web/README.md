@@ -30,10 +30,10 @@ The crate exposes the following wasm-bindgen surface:
 - `SimHandle::registerBrain(kind: string)` — installs a brain preset for all agents (`"wander"`, `"mlp"`, or `"none"`).
 - `decode_snapshot_binary(bytes: &[u8]) -> JsValue` — helper exposed for JS callers to convert binary snapshots back into structured data.
 
-Snapshots are deterministic and include:
+Snapshots are deterministic and use camelCase field names at the JavaScript boundary. They include:
 
 - `tick`, `epoch`, and `world` metadata (dimensions, closed/open flag)
-- Per-tick summary metrics (`agent_count`, `births`, `deaths`, `average_energy`, `average_health`, etc.)
-- Per-agent state (`position`, `velocity`, `heading`, `energy`, `health`, `color`, `spike_length`, `boost` flag)
+- Per-tick summary metrics (`agentCount`, `births`, `deaths`, `averageEnergy`, `averageHealth`, etc.)
+- Per-agent state (`position`, `velocity`, `heading`, `energy`, `health`, `color`, `spikeLength`, `boost` flag)
 
 The wasm crate depends on `scriptbots-core` with `default-features = false`, disabling Rayon on wasm targets. Native builds can re-enable parallelism via the `parallel` feature if needed.
