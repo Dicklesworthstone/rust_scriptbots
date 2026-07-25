@@ -30,7 +30,7 @@ use scriptbots_core::{
     TerrainKind, TierFeatures, TraitModifiers, WorldState, WorldStepDriver, apply_control_command,
     initial_tier_for, tier_features,
     visual::{
-        self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainShadeInput, VisualSelection,
+        self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
     },
 };
 use slotmap::Key;
@@ -3456,14 +3456,6 @@ fn terrain_vertex_color(
     z: u32,
     palette: ColorPaletteMode,
 ) -> [f32; 4] {
-    const SPLAT_KINDS: [TerrainKind; visual::SPLAT_LAYERS] = [
-        TerrainKind::DeepWater,
-        TerrainKind::ShallowWater,
-        TerrainKind::Sand,
-        TerrainKind::Grass,
-        TerrainKind::Bloom,
-        TerrainKind::Rock,
-    ];
     let sample = terrain.sample_tile(x, z);
     let slope = compute_tile_slope(terrain, x, z);
     let weights = visual::splat_weights(&SplatInput {
@@ -3472,21 +3464,15 @@ fn terrain_vertex_color(
         slope,
         water_depth: sample.water_depth,
     });
-    let mut rgb = [0.0_f32; 3];
-    for (kind, weight) in SPLAT_KINDS.into_iter().zip(weights) {
-        let layer = visual::terrain_shaded_color(&TerrainShadeInput {
-            kind,
-            moisture: sample.moisture,
-            elevation: sample.elevation,
-            slope,
-            accent: sample.accent,
-            daylight: terrain.daylight,
-        });
-        rgb[0] += layer[0] * weight;
-        rgb[1] += layer[1] * weight;
-        rgb[2] += layer[2] * weight;
-    }
-    let mapped = visual::apply_accessibility_palette(rgb, palette.accessibility());
+    let mapped = visual::terrain_surface_srgb(&TerrainSurfaceInput {
+        splat_weights: weights,
+        moisture: sample.moisture,
+        elevation: sample.elevation,
+        slope,
+        accent: sample.accent,
+        daylight: terrain.daylight,
+        accessibility: palette.accessibility(),
+    });
     let linear = srgb_to_linear_rgb(mapped);
     [linear[0], linear[1], linear[2], 1.0]
 }
@@ -3667,41 +3653,6 @@ mod terrain_tests {
         }
     }
 
-    /// Test-only reference for the semantic sRGB value passed by GPUI's
-    /// `canonical_gpu_terrain_colors` into world-gfx. Production must migrate
-    /// to one final core helper; this independent projection detects Bevy
-    /// composition or color-transfer drift until that helper exists.
-    fn gpui_reference_terrain_srgb(
-        terrain: &TerrainHeightSnapshot,
-        x: u32,
-        z: u32,
-        palette: ColorPaletteMode,
-    ) -> [f32; 3] {
-        let sample = terrain.sample_tile(x, z);
-        let slope = compute_tile_slope(terrain, x, z);
-        let weights = visual::splat_weights(&SplatInput {
-            kind: sample.kind,
-            elevation: sample.elevation,
-            slope,
-            water_depth: sample.water_depth,
-        });
-        let mut rgb = [0.0_f32; 3];
-        for (kind, weight) in terrain_kinds().into_iter().zip(weights) {
-            let layer = visual::terrain_shaded_color(&TerrainShadeInput {
-                kind,
-                moisture: sample.moisture,
-                elevation: sample.elevation,
-                slope,
-                accent: sample.accent,
-                daylight: terrain.daylight,
-            });
-            rgb[0] += layer[0] * weight;
-            rgb[1] += layer[1] * weight;
-            rgb[2] += layer[2] * weight;
-        }
-        visual::apply_accessibility_palette(rgb, palette.accessibility())
-    }
-
     #[test]
     fn bevy_terrain_palette_matches_the_core_visual_authority() {
         for kind in terrain_kinds() {
@@ -3759,7 +3710,7 @@ mod terrain_tests {
     }
 
     #[test]
-    fn bevy_mesh_terrain_color_matches_gpui_reference_after_linear_transfer() {
+    fn bevy_mesh_terrain_color_matches_the_shared_oracle_for_every_palette() {
         let snapshot = backend_agreement_snapshot();
         let terrain = &snapshot.terrain_height;
         let expected_slope = 0.8_f32;
@@ -3768,54 +3719,78 @@ mod terrain_tests {
             "agreement fixture must independently pin its symmetric center slope"
         );
 
-        let expected_srgb = gpui_reference_terrain_srgb(terrain, 1, 1, ColorPaletteMode::Natural);
-        let expected_linear =
-            Color::srgb(expected_srgb[0], expected_srgb[1], expected_srgb[2]).to_linear();
-        let chunk = build_chunk_mesh(
-            &snapshot,
-            TerrainChunkBounds {
-                origin: UVec2::ZERO,
-                size: UVec2::splat(3),
-            },
-            TERRAIN_HEIGHT_SCALE,
+        let sample = terrain.sample_tile(1, 1);
+        let weights = visual::splat_weights(&SplatInput {
+            kind: sample.kind,
+            elevation: sample.elevation,
+            slope: expected_slope,
+            water_depth: sample.water_depth,
+        });
+        for palette in [
             ColorPaletteMode::Natural,
-        );
-        let VertexAttributeValues::Float32x4(colors) = chunk
-            .mesh
-            .attribute(Mesh::ATTRIBUTE_COLOR)
-            .expect("terrain mesh must carry vertex colors")
-        else {
-            panic!("terrain mesh colors must be Float32x4");
-        };
-        let actual = colors[5];
-        for (channel, (actual, expected)) in actual[..3]
-            .iter()
-            .copied()
-            .zip([
-                expected_linear.red,
-                expected_linear.green,
-                expected_linear.blue,
-            ])
-            .enumerate()
-        {
-            assert!(
-                (actual - expected).abs() <= 1.0e-6,
-                "linear terrain channel {channel}: expected {expected}, got {actual}"
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+        ] {
+            let expected_srgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
+                splat_weights: weights,
+                moisture: sample.moisture,
+                elevation: sample.elevation,
+                slope: expected_slope,
+                accent: sample.accent,
+                daylight: terrain.daylight,
+                accessibility: palette.accessibility(),
+            });
+            let expected_linear =
+                Color::srgb(expected_srgb[0], expected_srgb[1], expected_srgb[2]).to_linear();
+            let chunk = build_chunk_mesh(
+                &snapshot,
+                TerrainChunkBounds {
+                    origin: UVec2::ZERO,
+                    size: UVec2::splat(3),
+                },
+                TERRAIN_HEIGHT_SCALE,
+                palette,
             );
-        }
-        assert_eq!(
-            actual[3].to_bits(),
-            1.0_f32.to_bits(),
-            "terrain vertex alpha must stay opaque"
-        );
-        assert!(
-            actual[..3]
+            let VertexAttributeValues::Float32x4(colors) = chunk
+                .mesh
+                .attribute(Mesh::ATTRIBUTE_COLOR)
+                .expect("terrain mesh must carry vertex colors")
+            else {
+                panic!("terrain mesh colors must be Float32x4");
+            };
+            let actual = colors[5];
+            for (channel, (actual, expected)) in actual[..3]
                 .iter()
                 .copied()
-                .zip(expected_srgb)
-                .any(|(linear, srgb)| (linear - srgb).abs() > 1.0e-3),
-            "fixture must detect feeding semantic sRGB directly into linear PBR"
-        );
+                .zip([
+                    expected_linear.red,
+                    expected_linear.green,
+                    expected_linear.blue,
+                ])
+                .enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 1.0e-6,
+                    "{palette:?} linear terrain channel {channel}: expected {expected}, got \
+                     {actual}"
+                );
+            }
+            assert_eq!(
+                actual[3].to_bits(),
+                1.0_f32.to_bits(),
+                "{palette:?} terrain vertex alpha must stay opaque"
+            );
+            assert!(
+                actual[..3]
+                    .iter()
+                    .copied()
+                    .zip(expected_srgb)
+                    .any(|(linear, srgb)| (linear - srgb).abs() > 1.0e-3),
+                "fixture must detect feeding {palette:?} semantic sRGB directly into linear PBR"
+            );
+        }
         assert_eq!(
             terrain.fertility[4].to_bits(),
             0.0_f32.to_bits(),
@@ -4018,7 +3993,7 @@ mod terrain_tests {
         );
 
         assert!(built.stats.mean_moisture > 0.0);
-        assert!(built.stats.signature.max_height > 0.0);
+        assert!(built.stats.max_height > 0.0);
     }
 
     #[test]

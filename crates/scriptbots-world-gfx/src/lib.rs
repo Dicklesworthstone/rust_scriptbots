@@ -833,7 +833,10 @@ mod tests {
         validate_frame_token, validate_snapshot,
     };
     use bytemuck::Zeroable;
-    use scriptbots_core::visual;
+    use scriptbots_core::{
+        AccessibilityPalette, TerrainKind,
+        visual::{self, SplatInput, TerrainSurfaceInput},
+    };
 
     #[test]
     fn stride_alignment_is_multiple_of_256() {
@@ -907,6 +910,46 @@ mod tests {
             [0.0, 1.0, 0.04045 / 12.92, 0.25],
             "sRGB endpoints and alpha ownership must be exact"
         );
+    }
+
+    #[test]
+    fn shared_terrain_oracle_reaches_world_gfx_with_only_the_srgb_transfer() {
+        let weights = visual::splat_weights(&SplatInput {
+            kind: TerrainKind::Grass,
+            elevation: 0.91,
+            slope: 0.82,
+            water_depth: 1.5,
+        });
+        for accessibility in [
+            AccessibilityPalette::Natural,
+            AccessibilityPalette::Deuteranopia,
+            AccessibilityPalette::Protanopia,
+            AccessibilityPalette::Tritanopia,
+            AccessibilityPalette::HighContrast,
+        ] {
+            let semantic = visual::terrain_surface_srgb(&TerrainSurfaceInput {
+                splat_weights: weights,
+                moisture: 0.37,
+                elevation: 0.91,
+                slope: 0.82,
+                accent: 0.63,
+                daylight: 0.35,
+                accessibility,
+            });
+            let actual =
+                super::semantic_srgba_to_linear([semantic[0], semantic[1], semantic[2], 1.0]);
+            let expected = [
+                super::srgb_component_to_linear(semantic[0]),
+                super::srgb_component_to_linear(semantic[1]),
+                super::srgb_component_to_linear(semantic[2]),
+                1.0,
+            ];
+            assert_eq!(
+                actual.map(f32::to_bits),
+                expected.map(f32::to_bits),
+                "{accessibility:?} terrain color must not be reinterpreted by world-gfx"
+            );
+        }
     }
 
     #[test]
