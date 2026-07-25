@@ -7,10 +7,24 @@
 //! actuation stage already computed: it never mutates science state, so identical
 //! configurations produce identical streams and the world digest is unaffected.
 //!
-//! Emission is bounded by `ScriptBotsConfig::replay_event_tick_cap`; the default of zero
-//! keeps production runs byte-identical to their pre-instrumentation baselines. Runs that
-//! opt in (for example replay-verification fixtures) should set the cap at or above their
-//! peak agent count so every live agent is recorded every tick.
+//! Emission is bounded by `ScriptBotsConfig::replay_event_tick_cap`, which defaults to
+//! `DEFAULT_REPLAY_EVENT_TICK_CAP` (512). THE STREAM IS ON BY DEFAULT. Runs with larger
+//! populations should raise the cap to at or above their peak agent count so every live
+//! agent is recorded every tick; the reported drop count is how they learn they need to.
+//! Setting the cap to zero is an explicit opt-OUT, not the resting state.
+//!
+//! WHAT "BYTE-IDENTICAL" MEANS NOW, because this sentence used to promise something else.
+//! The old zero default was justified as keeping production runs byte-identical to their
+//! pre-instrumentation baselines. With the stream on, that is NO LONGER TRUE OF PERSISTED
+//! BYTES: runs now record replay events, so stored batches and the config hash both differ
+//! from a pre-instrumentation baseline, and that is a deliberate provenance move requiring
+//! a re-bless.
+//!
+//! The property that survives is the one that matters, and it never depended on the cap:
+//! SCIENCE IS UNAFFECTED. `replay_events` is excluded from `WorldDigestV1` (bd-zpoa), so
+//! emission cannot perturb simulation state at any cap value. That guarantee comes from the
+//! digest exclusion, not from recording nothing -- which is precisely why shipping the
+//! stream inert was protecting nothing the exclusion does not already protect.
 //!
 //! The cap bounds each tick's own contribution, not the retained buffer. `replay_events`
 //! drains only when a persistence boundary projects a batch, so a whole-buffer cap would
@@ -76,8 +90,9 @@ impl WorldState {
     /// projected batch (see [`ReplayEventKind::WorldDigest`]). Drivers call this before the
     /// final science tick of a recorded run; the projection consumes the request after that
     /// tick completes, so the digest covers the final post-tick state and rides the same
-    /// admitted batch as the tick's action events. The request is a no-op while emission is
-    /// disabled by `replay_event_tick_cap == 0`.
+    /// admitted batch as the tick's action events. The request is a no-op only when a run has
+    /// explicitly opted OUT by setting `replay_event_tick_cap` to zero; the default cap is
+    /// non-zero, so this is live unless a caller deliberately disabled it.
     pub const fn request_replay_world_digest(&mut self) {
         if self.config.replay_event_tick_cap > 0 {
             self.replay_world_digest_pending = true;
@@ -276,7 +291,10 @@ mod tests {
         );
     }
 
-    /// The zero default must leave the stream completely empty.
+    /// An explicit zero cap -- the opt-OUT, no longer the default -- must leave the stream
+    /// completely empty. This still matters after the default moved to 512: a run that
+    /// deliberately disables emission must actually get silence, or "opt out" would be as
+    /// hollow as the inert default it replaced.
     #[test]
     fn a_zero_cap_records_nothing() {
         const INTERVAL: u32 = 2;
