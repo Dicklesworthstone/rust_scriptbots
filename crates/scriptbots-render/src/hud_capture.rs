@@ -693,6 +693,96 @@ mod tests {
         hits
     }
 
+    /// bd-bacf AUDIT INSTRUMENT — drive every advertised shortcut and see if it does
+    /// anything.
+    ///
+    /// The owner's three reported defects were all findable in seconds of real use,
+    /// which means the UI had been verified by asserting functions return rather than
+    /// by looking at it. This looks at it: each shortcut in the README's generated
+    /// table is dispatched through the real input path and the resulting frame is
+    /// compared against an untouched baseline.
+    ///
+    /// A zero-delta result is a CANDIDATE, not a verdict. Some shortcuts are correctly
+    /// invisible in a single static frame (clearing an empty selection changes nothing,
+    /// and rightly so). The point is to produce a short reproducible list to examine,
+    /// not to file every one of them.
+    #[test]
+    #[ignore = "bd-bacf audit instrument; run explicitly with --ignored"]
+    fn audit_every_advertised_shortcut_changes_something() {
+        const SHORTCUTS: [(&str, &str); 27] = [
+            ("space", "Toggle playback"),
+            ("g", "Jump to live"),
+            ("b", "Toggle brush"),
+            ("n", "Toggle narration"),
+            ("ctrl-p", "Cycle palette"),
+            ("p", "Toggle simulation pause"),
+            ("s", "Step simulation once"),
+            ("d", "Toggle agent drawing"),
+            ("f", "Toggle food overlay"),
+            ("ctrl-shift-o", "Toggle agent outline"),
+            ("shift-=", "Increase speed"),
+            ("-", "Decrease speed"),
+            ("a", "Spawn crossover"),
+            ("q", "Spawn carnivore"),
+            ("h", "Spawn herbivore"),
+            ("c", "Toggle closed environment"),
+            ("shift-s", "Follow selected"),
+            ("o", "Follow oldest"),
+            ("shift-f", "Toggle debug overlay"),
+            ("escape", "Clear selection"),
+            ("ctrl-a", "Select all"),
+            ("ctrl-f", "Focus first selected"),
+            ("0", "Fit world"),
+            (",", "Toggle settings panel"),
+            ("1", "Toggle stats panel"),
+            ("2", "Toggle history panel"),
+            ("3", "Toggle performance panel"),
+        ];
+        let (w, h) = (
+            1280.0 * HEADLESS_DEVICE_SCALE,
+            720.0 * HEADLESS_DEVICE_SCALE,
+        );
+        // Pin the perf readout on BOTH sides. Without it the live FPS/timing text
+        // redraws between captures and every frame differs from baseline by ~12k px
+        // regardless of the keystroke — a noise floor that swallowed 21 of 27 results
+        // on the first run and would have let a dead control read as working.
+        let stable = || CaptureOverrides {
+            forced_fps: Some(60.0),
+            ..CaptureOverrides::default()
+        };
+        let base = capture_view_with_overrides(capture_world(), GuiViewRole::Hud, w, h, stable())
+            .expect("baseline");
+
+        let mut inert = Vec::new();
+        for (stroke, label) in SHORTCUTS {
+            let leaked: &'static [&'static str] = Box::leak(vec![stroke].into_boxed_slice());
+            let after = capture_view_with_overrides(
+                capture_world(),
+                GuiViewRole::Hud,
+                w,
+                h,
+                CaptureOverrides {
+                    keystrokes: leaked,
+                    ..CaptureOverrides::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("capture after {stroke:?} failed: {e:#}"));
+            let delta = base
+                .pixels()
+                .zip(after.pixels())
+                .filter(|(a, b)| a != b)
+                .count();
+            println!("  {stroke:<14} {label:<28} delta={delta}");
+            if delta == 0 {
+                inert.push((stroke, label));
+            }
+        }
+        println!("\n  ZERO-DELTA CANDIDATES ({}):", inert.len());
+        for (stroke, label) in &inert {
+            println!("    {stroke} -> {label}");
+        }
+    }
+
     /// DIFFERENTIAL layout proof (bd-v9cz / bd-f4x0).
     ///
     /// A single capture shows one arrangement and proves nothing about the policy. This
