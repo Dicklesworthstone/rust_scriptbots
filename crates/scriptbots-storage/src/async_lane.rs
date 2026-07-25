@@ -59,7 +59,14 @@ impl AsyncReadLane {
             })
     }
 
-    /// Latest metric rows, newest-first, mirroring `StorageReader::recent_metrics`.
+    /// The most recent `limit` metric rows, ordered oldest-first, exactly as
+    /// `StorageReader::recent_metrics` returns them.
+    ///
+    /// The `ORDER BY tick DESC, name DESC` below selects the newest window; the reversal
+    /// after decoding restores ascending order. The synchronous reader does the same thing
+    /// with its own `readings.reverse()`, and this lane is documented as a drop-in mirror
+    /// of it for GUI, TUI, and API consumers — omitting the reversal handed those callers
+    /// the same rows in the opposite direction.
     pub fn recent_metrics(
         &self,
         limit: usize,
@@ -93,6 +100,10 @@ impl AsyncReadLane {
                         })
                     })
                     .collect::<Result<Vec<_>, FrankenError>>()
+                    .map(|mut readings| {
+                        readings.reverse();
+                        readings
+                    })
             })
             .map_err(Into::into)
     }
