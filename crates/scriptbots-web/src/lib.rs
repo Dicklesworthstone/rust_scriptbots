@@ -1284,7 +1284,8 @@ mod tests {
     fn parity_regression_comparator_covers_every_exported_non_agent_field() {
         let spec = parity_spec(parity_cases()[0]);
         let expected =
-            SimulationSnapshot::from_world(&WorldState::new(spec.config()).expect("world"));
+            SimulationSnapshot::from_world(&WorldState::new(spec.config()).expect("world"))
+                .expect("fresh parity world has coherent agent companions");
 
         let mut actual = expected.clone();
         actual.epoch = actual.epoch.saturating_add(1);
@@ -1396,7 +1397,8 @@ mod tests {
                     .step()
                     .expect("reference world should accept each simulation step");
             }
-            let reference_snapshot = SimulationSnapshot::from_world(&reference_world);
+            let reference_snapshot = SimulationSnapshot::from_world(&reference_world)
+                .expect("seeded parity world has coherent agent companions");
 
             let mut sim = Simulation::new(spec).expect("sim");
             let harness_snapshot = sim
