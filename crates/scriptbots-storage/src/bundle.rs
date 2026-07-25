@@ -92,6 +92,67 @@ pub struct RunBundleVerificationResult {
     pub verified_at_utc: String,
 }
 
+/// Reject any artifact path that is not relative and contained by the bundle directory.
+///
+/// `verify_run_bundle` has always refused absolute and `..`-bearing entries on read.
+/// Applying the identical rule at write time is what makes it safe to accept
+/// caller-supplied relative paths in `create_run_bundle_from_artifacts`: without it a
+/// caller could name `../../elsewhere` and the assembler would happily write outside the
+/// bundle it claims to be building.
+fn validate_relative_path(relative_path: &str) -> Result<&Path, BundleError> {
+    let path = Path::new(relative_path);
+    let escapes = path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || relative_path.is_empty();
+    if escapes {
+        return Err(BundleError::NonPortablePath(path.to_path_buf()));
+    }
+    Ok(path)
+}
+
+/// Write one artifact into the bundle and return its manifest entry.
+///
+/// Every artifact in every bundle — database, JSON export, or caller-supplied payload —
+/// goes through this one function, so path validation, BLAKE3 hashing, and byte accounting
+/// cannot drift between the database-backed and database-free assemblers.
+fn stage_artifact(
+    bundle_dir: &Path,
+    relative_path: &str,
+    artifact_type: &str,
+    bytes: &[u8],
+) -> Result<RunBundleArtifactEntry, BundleError> {
+    let validated = validate_relative_path(relative_path)?;
+    let destination = bundle_dir.join(validated);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| BundleError::Io {
+            path: parent.to_path_buf(),
+            error,
+        })?;
+    }
+    fs::write(&destination, bytes).map_err(|error| BundleError::Io {
+        path: destination,
+        error,
+    })?;
+    Ok(RunBundleArtifactEntry {
+        relative_path: relative_path.to_owned(),
+        blake3_hex: hash_hex(bytes),
+        bytes_len: bytes.len() as u64,
+        artifact_type: artifact_type.to_owned(),
+    })
+}
+
+/// Serialize the assembled bundle to the canonical `bundle_manifest.json`.
+fn write_bundle_manifest(bundle_dir: &Path, bundle: &RunBundleV1) -> Result<(), BundleError> {
+    let manifest_path = bundle_dir.join("bundle_manifest.json");
+    let bundle_json = serde_json::to_string_pretty(bundle)?;
+    fs::write(&manifest_path, &bundle_json).map_err(|error| BundleError::Io {
+        path: manifest_path,
+        error,
+    })
+}
+
 /// Create a portable run bundle directory from an existing FrankenSQLite run database.
 pub fn create_run_bundle(
     run_db_path: &Path,
@@ -117,80 +178,96 @@ pub fn create_run_bundle(
     let run_id = manifest.run_id.to_string();
     reader.close()?;
 
-    // 1. Copy run.db into bundle
-    let db_dst = output_bundle_dir.join("run.db");
-    fs::copy(run_db_path, &db_dst).map_err(|error| BundleError::Io {
-        path: db_dst.clone(),
+    let db_bytes = fs::read(run_db_path).map_err(|error| BundleError::Io {
+        path: run_db_path.to_path_buf(),
         error,
     })?;
-
-    let db_bytes = fs::read(&db_dst).map_err(|error| BundleError::Io {
-        path: db_dst.clone(),
-        error,
-    })?;
-    let db_hash = hash_hex(&db_bytes);
-
-    let mut artifacts = vec![RunBundleArtifactEntry {
-        relative_path: "run.db".to_owned(),
-        blake3_hex: db_hash,
-        bytes_len: db_bytes.len() as u64,
-        artifact_type: "database".to_owned(),
-    }];
-
-    // 2. Export events.json
     let events_json = serde_json::to_string_pretty(&events)?;
-    let events_dst = output_bundle_dir.join("events.json");
-    fs::write(&events_dst, &events_json).map_err(|error| BundleError::Io {
-        path: events_dst.clone(),
-        error,
-    })?;
-    let events_hash = hash_hex(events_json.as_bytes());
-    artifacts.push(RunBundleArtifactEntry {
-        relative_path: "events.json".to_owned(),
-        blake3_hex: events_hash,
-        bytes_len: events_json.len() as u64,
-        artifact_type: "events".to_owned(),
-    });
-
-    // 3. Export checkpoints.json
     let checkpoints_json = serde_json::to_string_pretty(&checkpoints)?;
-    let cp_dst = output_bundle_dir.join("checkpoints.json");
-    fs::write(&cp_dst, &checkpoints_json).map_err(|error| BundleError::Io {
-        path: cp_dst.clone(),
-        error,
-    })?;
-    let cp_hash = hash_hex(checkpoints_json.as_bytes());
-    artifacts.push(RunBundleArtifactEntry {
-        relative_path: "checkpoints.json".to_owned(),
-        blake3_hex: cp_hash,
-        bytes_len: checkpoints_json.len() as u64,
-        artifact_type: "checkpoints".to_owned(),
-    });
 
-    let bundle_digests = RunBundleDigests {
-        source_revision: manifest.source_revision.clone(),
-        lockfile_digest: Some(manifest.cargo_lock_digest.clone()),
-        run_id: run_id.clone(),
-        max_tick,
-        event_count: events.len() as u64,
-        checkpoint_count: checkpoints.len() as u64,
-    };
+    let artifacts = vec![
+        stage_artifact(output_bundle_dir, "run.db", "database", &db_bytes)?,
+        stage_artifact(
+            output_bundle_dir,
+            "events.json",
+            "events",
+            events_json.as_bytes(),
+        )?,
+        stage_artifact(
+            output_bundle_dir,
+            "checkpoints.json",
+            "checkpoints",
+            checkpoints_json.as_bytes(),
+        )?,
+    ];
 
     let bundle = RunBundleV1 {
         bundle_version: RUN_BUNDLE_SCHEMA_VERSION.to_owned(),
         created_at_utc: current_timestamp(),
+        digests: RunBundleDigests {
+            source_revision: manifest.source_revision.clone(),
+            lockfile_digest: Some(manifest.cargo_lock_digest.clone()),
+            run_id,
+            max_tick,
+            event_count: events.len() as u64,
+            checkpoint_count: checkpoints.len() as u64,
+        },
         manifest,
-        digests: bundle_digests,
         artifacts,
     };
 
-    let manifest_dst = output_bundle_dir.join("bundle_manifest.json");
-    let bundle_json = serde_json::to_string_pretty(&bundle)?;
-    fs::write(&manifest_dst, &bundle_json).map_err(|error| BundleError::Io {
-        path: manifest_dst,
+    write_bundle_manifest(output_bundle_dir, &bundle)?;
+    Ok(bundle)
+}
+
+/// Create a portable run bundle from caller-supplied artifact bytes, with no run database.
+///
+/// This is the assembler for producers that never opened a `Storage` — the experiment
+/// runner steps a persistence-disabled world and has only in-memory exports to package.
+/// It emits the same `scriptbots.run-bundle.v1` `bundle_manifest.json` as
+/// `create_run_bundle` and is verified by the same `verify_run_bundle`, so a bundle's
+/// provenance does not depend on which producer built it.
+///
+/// `event_count` and `checkpoint_count` are recorded as zero because a database-free
+/// bundle genuinely has no persisted replay or checkpoint rows; the caller supplies the
+/// tick budget it actually ran.
+pub fn create_run_bundle_from_artifacts(
+    output_bundle_dir: &Path,
+    manifest: RunManifestRecord,
+    max_tick: u64,
+    artifact_files: &[(&str, &str, &[u8])],
+) -> Result<RunBundleV1, BundleError> {
+    fs::create_dir_all(output_bundle_dir).map_err(|error| BundleError::Io {
+        path: output_bundle_dir.to_path_buf(),
         error,
     })?;
 
+    let mut artifacts = Vec::with_capacity(artifact_files.len());
+    for (relative_path, artifact_type, bytes) in artifact_files {
+        artifacts.push(stage_artifact(
+            output_bundle_dir,
+            relative_path,
+            artifact_type,
+            bytes,
+        )?);
+    }
+
+    let bundle = RunBundleV1 {
+        bundle_version: RUN_BUNDLE_SCHEMA_VERSION.to_owned(),
+        created_at_utc: current_timestamp(),
+        digests: RunBundleDigests {
+            source_revision: manifest.source_revision.clone(),
+            lockfile_digest: Some(manifest.cargo_lock_digest.clone()),
+            run_id: manifest.run_id.to_string(),
+            max_tick,
+            event_count: 0,
+            checkpoint_count: 0,
+        },
+        manifest,
+        artifacts,
+    };
+
+    write_bundle_manifest(output_bundle_dir, &bundle)?;
     Ok(bundle)
 }
 
@@ -215,10 +292,8 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
     let mut total_bytes = 0u64;
 
     for entry in &bundle.artifacts {
-        let rel_path = Path::new(&entry.relative_path);
-        if rel_path.is_absolute() || entry.relative_path.contains("..") {
-            return Err(BundleError::NonPortablePath(rel_path.to_path_buf()));
-        }
+        // Exactly the rule the assembler applies, so read and write cannot disagree.
+        let rel_path = validate_relative_path(&entry.relative_path)?;
 
         let full_path = bundle_dir.join(rel_path);
         if !full_path.exists() {
@@ -281,27 +356,17 @@ mod tests {
     use crate::Storage;
 
     fn temp_db_path(name: &str) -> PathBuf {
-        let base = Path::new("/Volumes/USBNVME16TB/temp_agent_space");
-        let mut path = if base.exists() {
-            base.to_path_buf()
-        } else {
-            std::env::temp_dir()
-        };
+        let mut path = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        path.push(format!("scriptbots-{name}-{nanos}.db"));
+        path.push(format!("scriptbots-{name}-{nanos}.sqlite"));
         path
     }
 
     fn temp_bundle_dir(name: &str) -> PathBuf {
-        let base = Path::new("/Volumes/USBNVME16TB/temp_agent_space");
-        let mut path = if base.exists() {
-            base.to_path_buf()
-        } else {
-            std::env::temp_dir()
-        };
+        let mut path = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -316,8 +381,15 @@ mod tests {
         let bundle_dir = temp_bundle_dir("bundle-out");
         let db_path_str = db_path.to_string_lossy().to_string();
 
-        let mut storage =
-            Storage::create_unattributed_file_with_thresholds(&db_path_str, 64, 4096, 1024, 1024)?;
+        let manifest = crate::RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(1));
+        let mut storage = Storage::create_new_file_for_run_with_thresholds(
+            &db_path_str,
+            manifest,
+            64,
+            4096,
+            1024,
+            1024,
+        )?;
         storage.record_checkpoint(
             "cp-001",
             50,
@@ -350,6 +422,106 @@ mod tests {
         }
 
         let _ = fs::remove_file(db_path);
+        let _ = fs::remove_dir_all(bundle_dir);
+        Ok(())
+    }
+
+    /// `bd-4d9j`: the database-free assembler that replaced
+    /// `export_pipeline::DeterministicRunBundle` emits the same `scriptbots.run-bundle.v1`
+    /// manifest and is read back by the same verifier, including nested relative paths.
+    #[test]
+    fn artifact_bundle_round_trips_through_the_single_verifier()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bundle_dir = temp_bundle_dir("artifact-bundle");
+        let manifest = crate::RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(42));
+        let run_id = manifest.run_id.to_string();
+
+        let summary_csv = b"tick,metric,value\n1,pop,50\n2,pop,52\n";
+        let notes = b"free-form producer payload";
+        let bundle = create_run_bundle_from_artifacts(
+            &bundle_dir,
+            manifest,
+            1_000,
+            &[
+                ("exports/summary.csv", "export", summary_csv),
+                ("notes.txt", "export", notes),
+            ],
+        )?;
+
+        assert_eq!(bundle.bundle_version, RUN_BUNDLE_SCHEMA_VERSION);
+        assert_eq!(bundle.artifacts.len(), 2);
+        assert_eq!(bundle.artifacts[0].relative_path, "exports/summary.csv");
+        assert_eq!(bundle.digests.max_tick, 1_000);
+        assert_eq!(bundle.digests.run_id, run_id);
+        // A database-free bundle honestly reports no persisted replay or checkpoint rows.
+        assert_eq!(bundle.digests.event_count, 0);
+        assert_eq!(bundle.digests.checkpoint_count, 0);
+        assert!(bundle_dir.join("bundle_manifest.json").exists());
+        assert!(bundle_dir.join("exports/summary.csv").exists());
+
+        let verification = verify_run_bundle(&bundle_dir)?;
+        assert_eq!(verification.run_id, run_id);
+        assert_eq!(verification.total_artifacts_verified, 2);
+        assert_eq!(
+            verification.total_bytes_verified,
+            (summary_csv.len() + notes.len()) as u64
+        );
+
+        // Tampering with a nested artifact is caught by the same checksum loop.
+        fs::write(bundle_dir.join("exports/summary.csv"), b"tampered")?;
+        let tampered = verify_run_bundle(&bundle_dir);
+        assert!(
+            matches!(tampered, Err(BundleError::HashMismatch { .. })),
+            "expected a hash mismatch for the tampered artifact, got {tampered:?}"
+        );
+
+        let _ = fs::remove_dir_all(bundle_dir);
+        Ok(())
+    }
+
+    /// `bd-4d9j`: the replaced assembler accepted any caller-supplied relative path and
+    /// would write outside the bundle directory. Assembly now applies the same portability
+    /// rule the verifier always applied, and nothing is written before it is checked.
+    #[test]
+    fn an_escaping_artifact_path_is_refused_before_anything_is_written()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bundle_dir = temp_bundle_dir("escaping-artifact");
+        // Name the escape target after this bundle directory: its parent is the shared
+        // temp directory, so a fixed name could collide with a stale file from an earlier
+        // run and make the containment check pass or fail for the wrong reason.
+        let sibling = format!(
+            "{}-escaped.txt",
+            bundle_dir
+                .file_name()
+                .expect("the bundle directory has a file name")
+                .to_string_lossy()
+        );
+        for escaping in [format!("../{sibling}"), format!("nested/../../{sibling}")] {
+            let outcome = create_run_bundle_from_artifacts(
+                &bundle_dir,
+                crate::RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(7)),
+                0,
+                &[(escaping.as_str(), "export", b"payload")],
+            );
+            assert!(
+                matches!(outcome, Err(BundleError::NonPortablePath(_))),
+                "expected {escaping} to be refused, got {outcome:?}"
+            );
+        }
+        assert!(
+            !bundle_dir.join("bundle_manifest.json").exists(),
+            "a refused assembly still wrote a bundle manifest"
+        );
+        let escaped = bundle_dir
+            .parent()
+            .expect("the bundle directory has a parent")
+            .join(&sibling);
+        assert!(
+            !escaped.exists(),
+            "a refused assembly wrote outside its bundle directory to {}",
+            escaped.display()
+        );
+
         let _ = fs::remove_dir_all(bundle_dir);
         Ok(())
     }

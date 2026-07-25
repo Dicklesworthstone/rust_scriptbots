@@ -6572,9 +6572,7 @@ pub struct WorldStepTracer {
     latest: Option<WorldStepTrace>,
     death_cleanup_input_transition: Option<Result<String, WorldStepTraceError>>,
     population_input_transition: Option<Result<String, WorldStepTraceError>>,
-    #[cfg(test)]
     death_cleanup_input_pending_deaths: Option<usize>,
-    #[cfg(test)]
     population_input_pending_spawns: Option<usize>,
 }
 
@@ -6583,6 +6581,26 @@ impl WorldStepTracer {
     #[must_use]
     pub const fn latest(&self) -> Option<&WorldStepTrace> {
         self.latest.as_ref()
+    }
+
+    /// Queued death count observed at the moment the `DeathCleanup` trace point was captured,
+    /// before that stage consumed the queue. `None` if the point was not reached this step.
+    ///
+    /// This is ordinary diagnostic output of the trace point, not test scaffolding: the whole
+    /// contract of `DeathCleanup` and `Population` is that they retain the ordered queue state
+    /// immediately before consumption, and a first-divergence investigation wants the depth as
+    /// well as the digest. It was previously a `#[cfg(test)]` field, which made the traced type
+    /// a different struct under test than the one that ships (bd-dz37).
+    #[must_use]
+    pub const fn death_cleanup_input_pending_deaths(&self) -> Option<usize> {
+        self.death_cleanup_input_pending_deaths
+    }
+
+    /// Queued spawn count observed at the moment the `Population` trace point was captured,
+    /// before that stage consumed the queue. `None` if the point was not reached this step.
+    #[must_use]
+    pub const fn population_input_pending_spawns(&self) -> Option<usize> {
+        self.population_input_pending_spawns
     }
 }
 
@@ -6649,11 +6667,8 @@ impl WorldStepObserver for WorldStepTracer {
     fn begin_step(&mut self, tick: Tick) {
         self.death_cleanup_input_transition = None;
         self.population_input_transition = None;
-        #[cfg(test)]
-        {
-            self.death_cleanup_input_pending_deaths = None;
-            self.population_input_pending_spawns = None;
-        }
+        self.death_cleanup_input_pending_deaths = None;
+        self.population_input_pending_spawns = None;
         if let Some(latest) = self.latest.as_mut() {
             latest.reset(tick);
         } else {
@@ -6671,20 +6686,14 @@ impl WorldStepObserver for WorldStepTracer {
         };
 
         if stage == WorldStepStage::Combat {
-            #[cfg(test)]
-            {
-                self.death_cleanup_input_pending_deaths = Some(world.pending_deaths.len());
-            }
+            self.death_cleanup_input_pending_deaths = Some(world.pending_deaths.len());
             self.death_cleanup_input_transition = Some(
                 world
                     .world_step_transition_digest(tick, WorldStepTracePoint::DeathCleanup)
                     .map_err(Into::into),
             );
         } else if stage == WorldStepStage::Reproduction {
-            #[cfg(test)]
-            {
-                self.population_input_pending_spawns = Some(world.pending_spawns.len());
-            }
+            self.population_input_pending_spawns = Some(world.pending_spawns.len());
             self.population_input_transition = Some(
                 world
                     .world_step_transition_digest(tick, WorldStepTracePoint::Population)
@@ -40622,7 +40631,7 @@ mod tests {
             .step_traced(&mut tracer)
             .expect("combat traced transition");
         assert!(world.agent_uid(victim).is_none());
-        assert_eq!(tracer.death_cleanup_input_pending_deaths, Some(1));
+        assert_eq!(tracer.death_cleanup_input_pending_deaths(), Some(1));
         let trace = tracer.latest().expect("combat trace");
         assert!(trace.stages.iter().all(|stage| stage.capture.is_ok()));
         let captured = trace
@@ -40672,7 +40681,7 @@ mod tests {
             .expect("reproduction traced transition");
         assert_eq!(world.agent_count(), 2);
         assert!(world.pending_spawns.is_empty());
-        assert_eq!(tracer.population_input_pending_spawns, Some(1));
+        assert_eq!(tracer.population_input_pending_spawns(), Some(1));
         let trace = tracer.latest().expect("reproduction trace");
         assert!(trace.stages.iter().all(|stage| stage.capture.is_ok()));
         let captured = trace
@@ -40933,10 +40942,15 @@ mod tests {
         assert!(left_completion.outcome.resource_tick.is_some());
         let left_trace = left_tracer.latest().expect("left canonical trace");
         let right_trace = right_tracer.latest().expect("right canonical trace");
-        assert!(left_tracer.death_cleanup_input_pending_deaths.unwrap_or(0) > 0);
+        assert!(
+            left_tracer
+                .death_cleanup_input_pending_deaths()
+                .unwrap_or(0)
+                > 0
+        );
         assert_eq!(
-            left_tracer.death_cleanup_input_pending_deaths,
-            right_tracer.death_cleanup_input_pending_deaths
+            left_tracer.death_cleanup_input_pending_deaths(),
+            right_tracer.death_cleanup_input_pending_deaths()
         );
         assert!(left_trace.stages.iter().all(|stage| stage.capture.is_ok()));
         left_trace
@@ -41045,10 +41059,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(AgentUid(1)), Some(AgentUid(3))]
         );
-        assert!(left_tracer.population_input_pending_spawns.unwrap_or(0) > 0);
+        assert!(left_tracer.population_input_pending_spawns().unwrap_or(0) > 0);
         assert_eq!(
-            left_tracer.population_input_pending_spawns,
-            right_tracer.population_input_pending_spawns
+            left_tracer.population_input_pending_spawns(),
+            right_tracer.population_input_pending_spawns()
         );
         let left_trace = left_tracer.latest().expect("left reproduction trace");
         let right_trace = right_tracer.latest().expect("right reproduction trace");

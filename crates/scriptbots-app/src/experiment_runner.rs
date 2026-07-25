@@ -1,7 +1,8 @@
 //! Deterministic matched-seed experiment runner and batch execution engine (bd-2z0.5.5).
 
 use scriptbots_core::{ScriptBotsConfig, WorldState};
-use scriptbots_storage::export_pipeline::{DeterministicRunBundle, RunBundleManifest};
+use scriptbots_runtime::RunId;
+use scriptbots_storage::{RunManifestRecord, create_run_bundle_from_artifacts, verify_run_bundle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -152,6 +153,19 @@ impl MatchedSeedExperimentRunner {
         Ok(())
     }
 
+    /// Derive the bundle's stable `RunId` from the runner's human-readable run identity.
+    ///
+    /// The experiment runner keys runs by `<experiment>-<variant>-seed<N>`, while the run
+    /// bundle manifest is keyed by `RunId`. BLAKE3 over that exact string keeps the
+    /// mapping deterministic and collision-resistant, and the readable identity is still
+    /// carried in the manifest's `experiment_id`, `variant_id`, and `scenario_id`.
+    fn bundle_run_id(run_id: &str) -> RunId {
+        let digest = blake3::hash(run_id.as_bytes());
+        let mut leading = [0_u8; 16];
+        leading.copy_from_slice(&digest.as_bytes()[..16]);
+        RunId::new(u128::from_be_bytes(leading))
+    }
+
     /// Executes a single run deterministically, creating and verifying its run bundle.
     pub fn execute_single_run(
         &self,
@@ -199,21 +213,22 @@ impl MatchedSeedExperimentRunner {
         let digest_hex = digest.overall;
         let bundle_dir = self.output_dir.join(&run_id);
 
-        let manifest = RunBundleManifest {
-            schema_version: 1,
-            run_id: run_id.clone(),
-            seed,
-            created_at_utc: "2026-07-22T15:45:00Z".into(),
-            source_revision: "main".into(),
-            source_tree_digest: "clean".into(),
-            source_tree_dirty: false,
-            rust_toolchain: "nightly".into(),
-            cargo_lock_digest: "lock".into(),
-            target_triple: std::env::consts::ARCH.into(),
-            total_ticks: self.max_ticks,
-            final_agent_count: world.agents().len(),
-            config_hash: format!("{:016x}", world.config().rng_seed.unwrap_or(0)),
-        };
+        // bd-4d9j: one run-bundle schema for the whole product. This runner steps a
+        // persistence-disabled world and never opens a run database, so it uses the
+        // artifact assembler — but it writes the same `scriptbots.run-bundle.v1`
+        // manifest that `--create-bundle` writes and is read back by the same verifier.
+        //
+        // The provenance below records only what this runner actually knows. The fields
+        // it cannot know keep `unattributed`'s explicit markers and `reproducible` stays
+        // false, rather than the previous hardcoded "main"/"clean"/"nightly"/"lock"
+        // placeholders that described a source tree nobody had inspected.
+        let mut manifest = RunManifestRecord::unattributed(Self::bundle_run_id(&run_id));
+        manifest.experiment_id = Some(self.experiment_id.clone());
+        manifest.variant_id = Some(variant.variant_id.clone());
+        manifest.scenario_id = run_id.clone();
+        manifest.root_seed = seed;
+        manifest.target_triple = std::env::consts::ARCH.to_owned();
+        manifest.requested_tick_budget = Some(self.max_ticks);
 
         let summary_csv = format!(
             "tick,alive_agents,seed\n{},{},{}\n",
@@ -222,15 +237,15 @@ impl MatchedSeedExperimentRunner {
             seed
         );
 
-        DeterministicRunBundle::assemble_bundle(
+        create_run_bundle_from_artifacts(
             &bundle_dir,
             manifest,
-            &[("exports/summary.csv", summary_csv.as_bytes())],
+            self.max_ticks,
+            &[("exports/summary.csv", "export", summary_csv.as_bytes())],
         )
         .map_err(|e| format!("Failed to assemble bundle: {e}"))?;
 
-        DeterministicRunBundle::verify_bundle(&bundle_dir)
-            .map_err(|e| format!("Bundle verification failed: {e}"))?;
+        verify_run_bundle(&bundle_dir).map_err(|e| format!("Bundle verification failed: {e}"))?;
 
         Ok(RunRecord {
             run_id,

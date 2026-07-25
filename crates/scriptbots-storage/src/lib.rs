@@ -10,7 +10,8 @@ pub mod export_pipeline;
 
 pub use bundle::{
     BundleError, RUN_BUNDLE_SCHEMA_VERSION, RunBundleArtifactEntry, RunBundleDigests, RunBundleV1,
-    RunBundleVerificationResult, create_run_bundle, verify_run_bundle,
+    RunBundleVerificationResult, create_run_bundle, create_run_bundle_from_artifacts,
+    verify_run_bundle,
 };
 
 pub use journal::{
