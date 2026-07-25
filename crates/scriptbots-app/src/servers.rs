@@ -2433,7 +2433,9 @@ fn map_control_error(err: ControlError) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::empty_latest_summary;
+    use crate::control::{
+        APPLICATION_STATE_ADMITTED, JOURNAL_STATE_NOT_REQUIRED, empty_latest_summary,
+    };
     use scriptbots_core::{ScriptBotsConfig, WorldState};
     use serial_test::serial;
     use std::{
@@ -3093,6 +3095,68 @@ mod tests {
         assert_eq!(rendered["id"], "fixture-equilibrium-study");
         assert_eq!(rendered["schema_version"], 1);
         assert_eq!(rendered["bootstrap_ticks"], 12);
+    }
+
+    /// The two-axis status must stay honest all the way out to JSON.
+    ///
+    /// `bd-f65w` fixed the values at the `ControlHandle` boundary, where they had been
+    /// hardcoded to `applied`/`durable` the instant a command was enqueued. Nothing
+    /// asserted they survive serialization, so a future DTO or handler change could
+    /// reintroduce the fabricated pair without a single test failing. These two routes
+    /// are also part of the eight that had drifted out of the OpenAPI document
+    /// (bd-01dg) and had no coverage at all.
+    #[tokio::test]
+    async fn control_routes_report_admitted_and_unjournaled_status_as_json() {
+        let (control, _receiver) = handle();
+        let state = ApiState {
+            handle: control,
+            scenario: None,
+        };
+
+        // `AppError` is deliberately not `Debug` (it carries a client-facing message),
+        // so surface `message` explicitly rather than reaching for `expect`.
+        let pause = match post_control_pause(State(state.clone())).await {
+            Ok(Json(status)) => status,
+            Err(error) => panic!("pause must be accepted: {}", error.message),
+        };
+        let body = serde_json::to_value(&pause).expect("status serializes");
+        assert_eq!(
+            body["application_state"], APPLICATION_STATE_ADMITTED,
+            "enqueueing proves admission order, never application: {body}"
+        );
+        assert_eq!(
+            body["journal_state"], JOURNAL_STATE_NOT_REQUIRED,
+            "the legacy bus writes no lifecycle record, so no journal state may be claimed: {body}"
+        );
+        assert_eq!(body["admission_sequence"], 1);
+
+        // The lookup route must return the same record rather than inventing progress:
+        // nothing on this path can advance either axis.
+        let looked_up = match get_control_status(
+            State(state.clone()),
+            axum::extract::Path(pause.command_id.clone()),
+        )
+        .await
+        {
+            Ok(Json(status)) => status.expect("the issued command is cached"),
+            Err(error) => panic!("status lookup must succeed: {}", error.message),
+        };
+        assert_eq!(
+            serde_json::to_value(&looked_up).expect("status serializes"),
+            body
+        );
+
+        // An unknown ID is absent, not a fabricated terminal status.
+        let missing = match get_control_status(
+            State(state),
+            axum::extract::Path("cmd-does-not-exist".to_owned()),
+        )
+        .await
+        {
+            Ok(Json(status)) => status,
+            Err(error) => panic!("status lookup must succeed: {}", error.message),
+        };
+        assert!(missing.is_none());
     }
 
     /// The MCP roster README documents and that `ControlToolKind` dispatches.
