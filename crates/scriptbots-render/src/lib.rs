@@ -16,7 +16,6 @@ use gpui::{
     linear_gradient, point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
-use rand::Rng;
 use scriptbots_core::PresetKind;
 use scriptbots_core::attribution::{
     AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs,
@@ -24,14 +23,13 @@ use scriptbots_core::attribution::{
 use scriptbots_core::narrative::{
     EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord,
 };
-use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::visual::{
     self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
     WorldVisualEvent,
 };
 use scriptbots_core::{
-    AccessibilityPalette, ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId,
-    AgentRuntime, AgentUid, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
+    AccessibilityPalette, ActivationEdge, ActivationLayer, AgentColumns, AgentId, AgentRuntime,
+    AgentUid, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
     BrainInspectionRevision, BrainInspectionUnavailable, ControlCommand, ControlDisposition,
     FoodGrid, Generation, IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt,
     Position, RenderFogMode, RenderQuality, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
@@ -4856,27 +4854,25 @@ impl SimulationView {
         delta_secondary: f32,
         cx: &mut Context<Self>,
     ) {
-        if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.latched_step_error() {
-                warn!(error = %error, "Mutation-rate edit blocked by terminal simulation failure");
-                return;
-            }
-            match world.try_update_agent_runtime(agent_id, |runtime| {
-                runtime.mutation_rates.primary =
-                    (runtime.mutation_rates.primary + delta_primary).max(0.0001);
-                runtime.mutation_rates.secondary =
-                    (runtime.mutation_rates.secondary + delta_secondary).max(0.0);
-            }) {
-                Ok(true) => {}
-                Ok(false) => return,
-                Err(error) => {
-                    warn!(%error, "Rejected non-finite agent mutation-rate edit");
-                    return;
-                }
-            }
+        let Some(agent_uid) = self
+            .world
+            .lock()
+            .ok()
+            .and_then(|world| world.agent_uid(agent_id))
+        else {
+            warn!(
+                agent = agent_id.raw(),
+                "Mutation-rate edit target is no longer live"
+            );
+            return;
+        };
+        if self.submit_control_command(ControlCommand::AdjustAgentMutationRates {
+            agent_uid,
+            delta_primary,
+            delta_secondary,
+        }) {
+            cx.notify();
         }
-
-        cx.notify();
     }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -5670,150 +5666,56 @@ impl SimulationView {
     }
 
     fn spawn_agent_with_tendency(&mut self, herbivore_bias: f32, cx: &mut Context<Self>) {
-        let mut spawned = false;
-        if let Ok(mut world) = self.world.lock() {
-            spawned = self.spawn_agent_with_bias_internal(&mut world, herbivore_bias);
-        }
-        if spawned {
+        if self.submit_control_command(ControlCommand::SpawnAgent {
+            herbivore_tendency: herbivore_bias,
+        }) {
             cx.notify();
         }
     }
-    fn spawn_agent_with_bias_internal(&self, world: &mut WorldState, herbivore_bias: f32) -> bool {
-        if let Err(error) = world.validate_external_arrival_boundary() {
-            warn!(error = %error, "Agent injection rejected before RNG sampling");
-            return false;
-        }
-        if let Some(error) = world.latched_step_error() {
-            warn!(error = %error, "Agent spawn blocked by terminal simulation failure");
-            return false;
-        }
-        let width = world.config().world_width as f32;
-        let height = world.config().world_height as f32;
-        if width <= 0.0 || height <= 0.0 {
-            return false;
-        }
-
-        let (pos_x, pos_y, color) = {
-            let rng = match world.rng(RngDomain::Population) {
-                Ok(rng) => rng,
-                Err(error) => {
-                    warn!(error = %error, "Agent injection rejected before RNG sampling");
-                    return false;
-                }
-            };
-            let x = rng.random_range(0.0..width);
-            let y = rng.random_range(0.0..height);
-            let color = [
-                rng.random_range(0.15..0.95),
-                rng.random_range(0.15..0.95),
-                rng.random_range(0.15..0.95),
-            ];
-            (x, y, color)
-        };
-
-        let agent = AgentData {
-            position: Position::new(pos_x, pos_y),
-            velocity: Velocity::new(0.0, 0.0),
-            color,
-            ..AgentData::default()
-        };
-        let agent_id = match world.try_inject_agent_with(agent, |runtime| {
-            runtime.herbivore_tendency = herbivore_bias.clamp(0.0, 1.0);
-            runtime.energy = runtime.energy.max(1.0);
-        }) {
-            Ok(agent_id) => agent_id,
-            Err(error) => {
-                warn!(error = %error, "Agent injection rejected");
-                return false;
-            }
-        };
-        info!(agent = ?agent_id, bias = herbivore_bias, "Spawned agent");
-        true
-    }
 
     fn spawn_crossover_agent(&mut self, cx: &mut Context<Self>) {
-        let mut spawned = false;
-        if let Ok(mut world) = self.world.lock() {
-            if let Err(error) = world.validate_external_arrival_boundary() {
-                warn!(error = %error, "Crossover injection rejected at persistence boundary");
-                return;
-            }
-            if let Some(error) = world.latched_step_error() {
-                warn!(error = %error, "Crossover spawn blocked by terminal simulation failure");
-                return;
-            }
-            let selected: Vec<AgentId> = {
-                let runtime = world.runtime();
-                runtime
+        let submission = Arc::clone(&self.selection_submission);
+        let Ok(_submission_guard) = submission.lock() else {
+            warn!("failed to acquire selection submission lock for crossover command");
+            return;
+        };
+        let (canonical_selection, live_agents, live_uids) = match self.world.lock() {
+            Ok(world) => {
+                let canonical_selection = world
+                    .runtime()
                     .iter()
-                    .filter_map(|(id, entry)| {
-                        matches!(entry.selection, SelectionState::Selected).then_some(id)
-                    })
-                    .collect()
-            };
-
-            if selected.len() >= 2
-                && let (Some(parent_a), Some(parent_b)) = (
-                    world.snapshot_agent(selected[0]),
-                    world.snapshot_agent(selected[1]),
-                )
-            {
-                let child = AgentData {
-                    position: Position::new(
-                        (parent_a.data.position.x + parent_b.data.position.x) * 0.5,
-                        (parent_a.data.position.y + parent_b.data.position.y) * 0.5,
-                    ),
-                    velocity: Velocity::new(0.0, 0.0),
-                    heading: (parent_a.data.heading + parent_b.data.heading) * 0.5,
-                    health: ((parent_a.data.health + parent_b.data.health) * 0.5).clamp(0.5, 2.0),
-                    color: [
-                        (parent_a.data.color[0] + parent_b.data.color[0]) * 0.5,
-                        (parent_a.data.color[1] + parent_b.data.color[1]) * 0.5,
-                        (parent_a.data.color[2] + parent_b.data.color[2]) * 0.5,
-                    ],
-                    spike_length: (parent_a.data.spike_length + parent_b.data.spike_length) * 0.5,
-                    ..AgentData::default()
-                };
-
-                let child_id = match world.try_inject_crossover_agent_with(
-                    selected[0],
-                    selected[1],
-                    child,
-                    |_child, runtime| {
-                        runtime.herbivore_tendency = (parent_a.runtime.herbivore_tendency
-                            + parent_b.runtime.herbivore_tendency)
-                            * 0.5;
-                        runtime.mutation_rates.primary = (parent_a.runtime.mutation_rates.primary
-                            + parent_b.runtime.mutation_rates.primary)
-                            * 0.5;
-                        runtime.mutation_rates.secondary =
-                            (parent_a.runtime.mutation_rates.secondary
-                                + parent_b.runtime.mutation_rates.secondary)
-                                * 0.5;
-                        runtime.indicator.intensity = 0.6;
-                        runtime.indicator.color = [0.2, 0.8, 0.9];
-                    },
-                ) {
-                    Ok(Some(child_id)) => child_id,
-                    Ok(None) => {
-                        warn!("Crossover agent injection rejected stale or identical parents");
-                        return;
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "Crossover agent injection rejected");
-                        return;
-                    }
-                };
-                info!(child = ?child_id, "Spawned crossover agent");
-                spawned = true;
+                    .filter(|(_, runtime)| matches!(runtime.selection, SelectionState::Selected))
+                    .map(|(agent_id, _)| agent_id)
+                    .collect::<Vec<_>>();
+                let live_agents = world.agents().iter_handles().collect::<Vec<_>>();
+                let live_uids = live_agents
+                    .iter()
+                    .filter_map(|agent_id| world.agent_uid(*agent_id).map(|uid| (*agent_id, uid)))
+                    .collect::<HashMap<_, _>>();
+                (canonical_selection, live_agents, live_uids)
             }
-
-            if !spawned {
-                spawned = self.spawn_agent_with_bias_internal(&mut world, 0.5);
+            Err(_) => {
+                warn!("failed to acquire world lock for crossover command");
+                return;
             }
-        }
-
-        if spawned {
+        };
+        let mut selected = self
+            .effective_selected_agents(&canonical_selection, &live_agents)
+            .into_iter()
+            .filter_map(|agent_id| live_uids.get(&agent_id).copied())
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        let command = if let [parent_a, parent_b, ..] = selected.as_slice() {
+            ControlCommand::SpawnCrossover {
+                parent_a: *parent_a,
+                parent_b: *parent_b,
+            }
+        } else {
+            ControlCommand::SpawnAgent {
+                herbivore_tendency: 0.5,
+            }
+        };
+        if self.submit_control_command(command) {
             cx.notify();
         }
     }
@@ -16766,7 +16668,7 @@ fn transform_color(color: Rgba, matrix: [[f32; 3]; 3]) -> Rgba {
 #[cfg(test)]
 mod command_characterization_tests {
     use super::*;
-    use scriptbots_core::{CharacterizationDigestV0, WorldDigestV1};
+    use scriptbots_core::{AgentData, CharacterizationDigestV0, WorldDigestV1};
     use std::time::Duration;
 
     #[test]
@@ -16791,10 +16693,9 @@ mod command_characterization_tests {
         );
     }
 
-    /// bd-37m transition guard: un-ignore once spawn, crossover, mutation-rate edits, and
-    /// scientific RNG consumption are all owned by the `ControlCommand` application path.
+    /// bd-37m acceptance guard: the driver command drain is the sole renderer-owned path that may
+    /// borrow scientific world state mutably.
     #[test]
-    #[ignore = "bd-37m: remaining GPUI agent-science writes are not yet routed through ControlCommand"]
     fn production_renderer_has_no_direct_agent_science_writes_or_rng() {
         let (production, _) = include_str!("lib.rs")
             .split_once("#[cfg(test)]\nmod command_characterization_tests")
@@ -17302,8 +17203,14 @@ mod command_characterization_tests {
             .expect("seal the first persistence boundary");
         assert_eq!(world.tick().0, 1);
         let world = Arc::new(Mutex::new(world));
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
-        let view = simulation_view(Arc::clone(&world), drain);
+        let drain = one_shot_command_drain(vec![ControlCommand::SpawnAgent {
+            herbivore_tendency: 0.5,
+        }]);
+        let driver = gui_simulation_driver_with_step(
+            &world,
+            disabled_persistence_step_driver(&world),
+            drain,
+        );
 
         let (agent_count_before, rng_before, identity_before) = {
             let world = world.lock().expect("world lock");
@@ -17313,11 +17220,10 @@ mod command_characterization_tests {
                 world.identity_sequence_state(),
             )
         };
-        let injected = {
-            let mut world = world.lock().expect("world lock");
-            view.spawn_agent_with_bias_internal(&mut world, 0.5)
-        };
-        assert!(!injected, "manual ingress must surface the typed rejection");
+        driver
+            .lock()
+            .expect("GUI simulation driver lock")
+            .drive_at(Instant::now());
         assert_eq!(
             world.lock().expect("world lock").agent_count(),
             agent_count_before,
