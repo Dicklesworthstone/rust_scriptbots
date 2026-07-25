@@ -1824,6 +1824,7 @@ struct GuiSimulationDriver {
     world: Arc<Mutex<WorldState>>,
     simulation_step: WorldStepDriver,
     command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+    pending_playback: VecDeque<SimulationCommand>,
     paused: bool,
     speed_multiplier: f32,
     sim_accumulator: f32,
@@ -1841,6 +1842,7 @@ impl GuiSimulationDriver {
             world,
             simulation_step,
             command_drain,
+            pending_playback: VecDeque::new(),
             paused: false,
             speed_multiplier: 1.0,
             sim_accumulator: 0.0,
@@ -1864,9 +1866,94 @@ impl GuiSimulationDriver {
         warn!(error = %detail, "Simulation paused after a terminal step failure");
     }
 
+    fn apply_playback_state(&mut self, command: &SimulationCommand) {
+        if let Some(paused) = command.paused {
+            self.paused = paused;
+            if paused {
+                self.sim_accumulator = 0.0;
+            }
+        }
+        if let Some(speed) = command.speed_multiplier {
+            self.speed_multiplier = speed;
+        }
+        if command.step_once {
+            self.paused = true;
+            self.sim_accumulator = 0.0;
+        }
+    }
+
+    fn world_tick_for_step_accounting(&self) -> Result<u64, String> {
+        self.world.lock().map(|world| world.tick().0).map_err(|_| {
+            "simulation world mutex poisoned while accounting for an admitted Step".to_owned()
+        })
+    }
+
+    fn service_pending_playback(&mut self) -> bool {
+        let mut attempted_steps = 0;
+        while attempted_steps < MAX_SIM_STEPS_PER_FRAME {
+            let Some(command) = self.pending_playback.front().cloned() else {
+                break;
+            };
+            self.apply_playback_state(&command);
+            if !command.step_once {
+                self.pending_playback.pop_front();
+                continue;
+            }
+            attempted_steps += 1;
+
+            let before_tick = match self.world_tick_for_step_accounting() {
+                Ok(tick) => tick,
+                Err(error) => {
+                    self.pause_for_simulation_failure(error);
+                    break;
+                }
+            };
+            let step_result = (self.simulation_step)();
+            let after_tick = match self.world_tick_for_step_accounting() {
+                Ok(tick) => tick,
+                Err(error) => {
+                    self.pause_for_simulation_failure(error);
+                    break;
+                }
+            };
+
+            let expected_after_tick = before_tick.checked_add(1);
+            let advanced_exactly_once = expected_after_tick == Some(after_tick);
+            if advanced_exactly_once {
+                self.pending_playback.pop_front();
+            }
+
+            match step_result {
+                Ok(_) if advanced_exactly_once => {}
+                Ok(_) => {
+                    self.pause_for_simulation_failure(format!(
+                        "simulation step driver violated its one-tick contract: tick changed from \
+                         {before_tick} to {after_tick}"
+                    ));
+                    break;
+                }
+                Err(error) if advanced_exactly_once => {
+                    self.pause_for_simulation_failure(error.to_string());
+                    break;
+                }
+                Err(error) => {
+                    self.pause_for_simulation_failure(format!(
+                        "{error}; admitted Step did not complete exactly one tick \
+                         (before={before_tick}, after={after_tick})"
+                    ));
+                    break;
+                }
+            }
+        }
+        attempted_steps > 0
+    }
+
     #[allow(clippy::collapsible_if)]
     fn drive_at(&mut self, now: Instant) {
         let last = self.last_sim_instant.replace(now);
+        if self.simulation_fault.is_some() {
+            return;
+        }
 
         let mut playback = Vec::new();
         let mut step_error = None;
@@ -1888,22 +1975,10 @@ impl GuiSimulationDriver {
             return;
         }
 
-        let mut force_step = false;
-        for command in playback {
-            if let Some(paused) = command.paused {
-                self.paused = paused;
-                if paused {
-                    self.sim_accumulator = 0.0;
-                }
-            }
-            if let Some(speed) = command.speed_multiplier {
-                self.speed_multiplier = speed;
-            }
-            if command.step_once {
-                force_step = true;
-                self.paused = true;
-                self.sim_accumulator = 0.0;
-            }
+        self.pending_playback.extend(playback);
+        let attempted_manual_step = self.service_pending_playback();
+        if self.simulation_fault.is_some() || attempted_manual_step {
+            return;
         }
 
         if !self.paused {
@@ -1934,33 +2009,28 @@ impl GuiSimulationDriver {
             }
         }
 
-        if !force_step && (self.paused || self.speed_multiplier <= 0.0) {
+        if self.paused || self.speed_multiplier <= 0.0 {
             self.sim_accumulator = 0.0;
             return;
         }
 
-        let steps = if force_step {
-            1
-        } else {
-            let Some(last) = last else {
-                return;
-            };
-            let delta = now.saturating_duration_since(last).as_secs_f32();
-            self.sim_accumulator += delta * self.speed_multiplier;
-            if self.sim_accumulator < SIM_TICK_INTERVAL {
-                return;
-            }
-
-            let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
-            self.sim_accumulator = self.sim_accumulator.min(max_accumulator).min(0.5);
-            let steps = (self.sim_accumulator / SIM_TICK_INTERVAL).floor() as usize;
-            if steps == 0 {
-                return;
-            }
-            let steps = steps.min(MAX_SIM_STEPS_PER_FRAME);
-            self.sim_accumulator -= SIM_TICK_INTERVAL * steps as f32;
-            steps
+        let Some(last) = last else {
+            return;
         };
+        let delta = now.saturating_duration_since(last).as_secs_f32();
+        self.sim_accumulator += delta * self.speed_multiplier;
+        if self.sim_accumulator < SIM_TICK_INTERVAL {
+            return;
+        }
+
+        let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
+        self.sim_accumulator = self.sim_accumulator.min(max_accumulator).min(0.5);
+        let steps = (self.sim_accumulator / SIM_TICK_INTERVAL).floor() as usize;
+        if steps == 0 {
+            return;
+        }
+        let steps = steps.min(MAX_SIM_STEPS_PER_FRAME);
+        self.sim_accumulator -= SIM_TICK_INTERVAL * steps as f32;
 
         let mut step_error = self
             .world
@@ -15135,11 +15205,39 @@ mod command_characterization_tests {
         command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
     ) -> Arc<Mutex<GuiSimulationDriver>> {
         let simulation_step = disabled_persistence_step_driver(world);
+        gui_simulation_driver_with_step(world, simulation_step, command_drain)
+    }
+
+    fn gui_simulation_driver_with_step(
+        world: &Arc<Mutex<WorldState>>,
+        simulation_step: WorldStepDriver,
+        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+    ) -> Arc<Mutex<GuiSimulationDriver>> {
         Arc::new(Mutex::new(GuiSimulationDriver::new(
             Arc::clone(world),
             simulation_step,
             command_drain,
         )))
+    }
+
+    fn one_shot_command_drain(
+        commands: Vec<ControlCommand>,
+    ) -> Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static> {
+        let commands = Mutex::new(Some(commands));
+        Arc::new(move || {
+            commands
+                .lock()
+                .expect("one-shot command drain lock")
+                .take()
+                .unwrap_or_default()
+        })
+    }
+
+    fn injected_step_error(detail: &str) -> scriptbots_core::WorldStepError {
+        scriptbots_core::PersistenceSessionError::Unavailable {
+            detail: detail.to_owned(),
+        }
+        .into()
     }
 
     fn simulation_view_with_driver(
@@ -16047,6 +16145,237 @@ mod command_characterization_tests {
             both_repaint, zero_repaints,
             "240 real HUD plus canvas Render::render calls must not alter any science digest"
         );
+    }
+
+    #[test]
+    fn gpui_pending_playback_executes_every_admitted_step_in_one_driver_wake() {
+        let world = command_characterization_world();
+        let drain = one_shot_command_drain(vec![ControlCommand::Step, ControlCommand::Step]);
+        let driver = gui_simulation_driver(&world, drain);
+        let now = Instant::now();
+        {
+            let mut driver = driver.lock().expect("GUI simulation driver lock");
+            driver.paused = true;
+            driver.last_sim_instant = Some(now);
+            driver.drive_at(now);
+        }
+
+        assert_eq!(
+            world.lock().expect("world lock").tick().0,
+            2,
+            "every admitted Step command must advance one distinct scientific tick"
+        );
+        let driver = driver.lock().expect("GUI simulation driver lock");
+        assert!(
+            driver.snapshot().paused,
+            "a Step burst must leave the session paused"
+        );
+        assert!(
+            driver.pending_playback.is_empty(),
+            "every successfully completed Step obligation must be consumed"
+        );
+    }
+
+    #[test]
+    fn gpui_pending_playback_preserves_order_without_an_automatic_extra_tick() {
+        for (label, commands, expected_paused) in [
+            (
+                "step then resume",
+                vec![ControlCommand::Step, ControlCommand::Resume],
+                false,
+            ),
+            (
+                "resume then step",
+                vec![ControlCommand::Resume, ControlCommand::Step],
+                true,
+            ),
+        ] {
+            let world = command_characterization_world();
+            let driver = gui_simulation_driver(&world, one_shot_command_drain(commands));
+            let now = Instant::now();
+            prime_exactly_one_driver_step(&driver, now);
+            driver
+                .lock()
+                .expect("GUI simulation driver lock")
+                .drive_at(now);
+
+            assert_eq!(
+                world.lock().expect("world lock").tick().0,
+                1,
+                "{label} must execute the admitted manual Step without also falling through to \
+                 an accumulated wall-clock tick"
+            );
+            let driver = driver.lock().expect("GUI simulation driver lock");
+            assert_eq!(
+                driver.snapshot().paused,
+                expected_paused,
+                "{label} must preserve playback command order"
+            );
+            assert!(
+                driver.pending_playback.is_empty(),
+                "{label} must consume every successful playback command"
+            );
+        }
+    }
+
+    #[test]
+    fn gpui_pending_playback_retains_first_failed_step_and_blocks_implicit_retry() {
+        let world = command_characterization_world();
+        let step_calls = Arc::new(AtomicU64::new(0));
+        let observed_step_calls = Arc::clone(&step_calls);
+        let simulation_step: WorldStepDriver = Arc::new(move || {
+            observed_step_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(injected_step_error("injected failure before science"))
+        });
+        let driver = gui_simulation_driver_with_step(
+            &world,
+            simulation_step,
+            one_shot_command_drain(vec![ControlCommand::Step, ControlCommand::Step]),
+        );
+        let now = Instant::now();
+        {
+            let mut driver = driver.lock().expect("GUI simulation driver lock");
+            driver.paused = true;
+            driver.last_sim_instant = Some(now);
+            driver.drive_at(now);
+            assert_eq!(
+                driver.pending_playback.len(),
+                2,
+                "a pre-transition failure must retain its own Step and every later obligation"
+            );
+            assert!(driver.simulation_fault.is_some());
+
+            driver.drive_at(now + Duration::from_secs_f32(SIM_TICK_INTERVAL));
+            assert_eq!(
+                driver.pending_playback.len(),
+                2,
+                "a terminal driver fault must leave retained playback dormant"
+            );
+        }
+
+        assert_eq!(world.lock().expect("world lock").tick().0, 0);
+        assert_eq!(
+            step_calls.load(AtomicOrdering::Relaxed),
+            1,
+            "a retained failed Step must not retry on the next timer wake"
+        );
+    }
+
+    #[test]
+    fn gpui_pending_playback_retains_failed_second_step_and_later_commands() {
+        let world = command_characterization_world();
+        let step_world = Arc::clone(&world);
+        let step_calls = Arc::new(AtomicU64::new(0));
+        let observed_step_calls = Arc::clone(&step_calls);
+        let simulation_step: WorldStepDriver = Arc::new(move || {
+            if observed_step_calls.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                step_world
+                    .lock()
+                    .expect("world lock for successful first step")
+                    .step()
+            } else {
+                Err(injected_step_error(
+                    "injected failure before second science tick",
+                ))
+            }
+        });
+        let driver = gui_simulation_driver_with_step(
+            &world,
+            simulation_step,
+            one_shot_command_drain(vec![
+                ControlCommand::Step,
+                ControlCommand::Step,
+                ControlCommand::Resume,
+            ]),
+        );
+        let now = Instant::now();
+        {
+            let mut driver = driver.lock().expect("GUI simulation driver lock");
+            driver.paused = true;
+            driver.last_sim_instant = Some(now);
+            driver.drive_at(now);
+            assert_eq!(
+                driver.pending_playback.len(),
+                2,
+                "the failed second Step and trailing Resume must remain ordered and pending"
+            );
+            assert!(
+                driver
+                    .pending_playback
+                    .front()
+                    .is_some_and(|command| command.step_once)
+            );
+            assert_eq!(
+                driver
+                    .pending_playback
+                    .back()
+                    .and_then(|command| command.paused),
+                Some(false),
+                "the trailing Resume must not overtake the failed Step"
+            );
+
+            driver.drive_at(now + Duration::from_secs_f32(SIM_TICK_INTERVAL));
+            assert_eq!(driver.pending_playback.len(), 2);
+        }
+
+        assert_eq!(world.lock().expect("world lock").tick().0, 1);
+        assert_eq!(
+            step_calls.load(AtomicOrdering::Relaxed),
+            2,
+            "the driver must stop at the second failure and must not retry implicitly"
+        );
+    }
+
+    #[test]
+    fn gpui_pending_playback_consumes_step_after_completed_boundary_fault() {
+        let world = command_characterization_world();
+        let step_world = Arc::clone(&world);
+        let step_calls = Arc::new(AtomicU64::new(0));
+        let observed_step_calls = Arc::clone(&step_calls);
+        let simulation_step: WorldStepDriver = Arc::new(move || {
+            observed_step_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            step_world
+                .lock()
+                .expect("world lock for completed-boundary step")
+                .step()?;
+            Err(injected_step_error(
+                "injected admission failure after completed science",
+            ))
+        });
+        let driver = gui_simulation_driver_with_step(
+            &world,
+            simulation_step,
+            one_shot_command_drain(vec![ControlCommand::Step, ControlCommand::Resume]),
+        );
+        let now = Instant::now();
+        {
+            let mut driver = driver.lock().expect("GUI simulation driver lock");
+            driver.paused = true;
+            driver.last_sim_instant = Some(now);
+            driver.drive_at(now);
+
+            assert_eq!(
+                driver.pending_playback.len(),
+                1,
+                "a Step that advanced science is consumed even when its callback returns an error"
+            );
+            let pending = driver
+                .pending_playback
+                .front()
+                .expect("trailing Resume remains pending");
+            assert!(!pending.step_once);
+            assert_eq!(pending.paused, Some(false));
+
+            driver.drive_at(now + Duration::from_secs_f32(SIM_TICK_INTERVAL));
+            assert_eq!(
+                driver.pending_playback.len(),
+                1,
+                "the later Resume must remain dormant behind the terminal fault"
+            );
+        }
+
+        assert_eq!(world.lock().expect("world lock").tick().0, 1);
+        assert_eq!(step_calls.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]
