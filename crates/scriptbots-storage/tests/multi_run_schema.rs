@@ -331,6 +331,7 @@ fn overlapping_batch(epoch: u64, energy: f32) -> PersistenceBatch {
         births: vec![founder],
         deaths: Vec::new(),
         replay_events: Vec::new(),
+        narrative_events: Vec::new(),
     }
 }
 

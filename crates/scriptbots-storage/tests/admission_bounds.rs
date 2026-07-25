@@ -54,6 +54,7 @@ fn batch(tick: u64, metrics: usize) -> PersistenceBatch {
         births: Vec::new(),
         deaths: Vec::new(),
         replay_events: Vec::new(),
+        narrative_events: Vec::new(),
     }
 }
 

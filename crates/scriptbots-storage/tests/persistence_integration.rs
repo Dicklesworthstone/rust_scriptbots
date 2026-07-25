@@ -51,6 +51,7 @@ fn storage_persists_metrics_roundtrip() {
                     outputs: vec![0.25, 0.75],
                 },
             }],
+            narrative_events: Vec::new(),
         })
         .expect("explicit replay fixture should enter the bounded queue");
 
@@ -127,7 +128,20 @@ fn storage_persists_metrics_roundtrip() {
 }
 
 #[test]
-fn online_offline_narrative_event_parity_test() {
+/// Narrative events reach the persistence boundary, but nothing reads them back yet.
+///
+/// This test was written as an online/offline parity proof. It cannot be one: storage
+/// counts `PersistenceBatch.narrative_events` against the bounded admission budget and
+/// then discards it — there is no narrative row type, no insert in the batch transaction,
+/// and no reader accessor — so there is no offline side to compare against. The recovered
+/// prior-session edit replaced a call to the nonexistent `StorageReader::search_narrative`
+/// with a `max_tick` probe, which made the file compile while leaving the parity claim in
+/// the name.
+///
+/// Renamed to state what it actually proves: a run that generates narrative events online
+/// still drives the pipeline to a durable tick. Restoring a real parity assertion is
+/// `bd-erff`, together with actually persisting the events.
+fn narrative_events_are_generated_online_and_the_run_still_commits() {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
@@ -182,11 +196,8 @@ fn online_offline_narrative_event_parity_test() {
     pipeline.shutdown().expect("clean shutdown");
 
     let storage = StorageReader::open(path_str).expect("open storage");
-    let (offline_hits, total) = storage
-        .search_narrative("", None, 100)
-        .expect("search narrative hits");
-
-    assert!(total >= offline_hits.len());
+    let max_tick = storage.max_tick().expect("read max tick");
+    assert!(max_tick.is_some());
     assert!(
         !online_events.is_empty(),
         "expected online events generated during run"
