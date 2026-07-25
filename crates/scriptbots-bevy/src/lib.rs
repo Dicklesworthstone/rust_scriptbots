@@ -3624,6 +3624,84 @@ mod terrain_tests {
         }
     }
 
+    fn backend_agreement_snapshot() -> WorldSnapshot {
+        let mut tiles = vec![
+            TerrainTile {
+                kind: TerrainKind::Grass,
+                elevation: 0.1,
+                moisture: 0.2,
+                accent: 0.1,
+                fertility_bias: 0.0,
+                temperature_bias: 0.0,
+                palette_index: 0,
+            };
+            9
+        ];
+        tiles[4] = TerrainTile {
+            kind: TerrainKind::Grass,
+            elevation: 0.9,
+            moisture: 0.37,
+            accent: 0.63,
+            fertility_bias: 0.0,
+            temperature_bias: 0.0,
+            palette_index: 0,
+        };
+        let layer =
+            TerrainLayer::from_tiles(3, 3, 50, tiles).expect("backend agreement terrain layer");
+        let mut water_depth = vec![0.0; 9];
+        water_depth[4] = 1.5;
+        let height = TerrainHeightSnapshot::new(&layer, Some(&water_depth), 0.35)
+            .expect("backend agreement height snapshot");
+        WorldSnapshot {
+            revision: 1,
+            tick: 42,
+            world_size: Vec2::splat(150.0),
+            agent_radius: 12.0,
+            terrain_color: TerrainColorMap {
+                width: 3,
+                height: 3,
+                pixels: vec![0; 3 * 3 * 4],
+            },
+            terrain_height: height,
+            agents: Vec::new(),
+        }
+    }
+
+    /// Test-only reference for the semantic sRGB value passed by GPUI's
+    /// `canonical_gpu_terrain_colors` into world-gfx. Production must migrate
+    /// to one final core helper; this independent projection detects Bevy
+    /// composition or color-transfer drift until that helper exists.
+    fn gpui_reference_terrain_srgb(
+        terrain: &TerrainHeightSnapshot,
+        x: u32,
+        z: u32,
+        palette: ColorPaletteMode,
+    ) -> [f32; 3] {
+        let sample = terrain.sample_tile(x, z);
+        let slope = compute_tile_slope(terrain, x, z);
+        let weights = visual::splat_weights(&SplatInput {
+            kind: sample.kind,
+            elevation: sample.elevation,
+            slope,
+            water_depth: sample.water_depth,
+        });
+        let mut rgb = [0.0_f32; 3];
+        for (kind, weight) in terrain_kinds().into_iter().zip(weights) {
+            let layer = visual::terrain_shaded_color(&TerrainShadeInput {
+                kind,
+                moisture: sample.moisture,
+                elevation: sample.elevation,
+                slope,
+                accent: sample.accent,
+                daylight: terrain.daylight,
+            });
+            rgb[0] += layer[0] * weight;
+            rgb[1] += layer[1] * weight;
+            rgb[2] += layer[2] * weight;
+        }
+        visual::apply_accessibility_palette(rgb, palette.accessibility())
+    }
+
     #[test]
     fn bevy_terrain_palette_matches_the_core_visual_authority() {
         for kind in terrain_kinds() {
@@ -3677,6 +3755,81 @@ mod terrain_tests {
             dry_color.map(f32::to_bits),
             night_color.map(f32::to_bits),
             "tick-derived daylight must feed the same shading authority as GPUI/wgpu"
+        );
+    }
+
+    #[test]
+    fn bevy_mesh_terrain_color_matches_gpui_reference_after_linear_transfer() {
+        let snapshot = backend_agreement_snapshot();
+        let terrain = &snapshot.terrain_height;
+        let expected_slope = 0.8_f32;
+        assert!(
+            (compute_tile_slope(terrain, 1, 1) - expected_slope).abs() <= 1.0e-6,
+            "agreement fixture must independently pin its symmetric center slope"
+        );
+
+        let expected_srgb = gpui_reference_terrain_srgb(terrain, 1, 1, ColorPaletteMode::Natural);
+        let expected_linear =
+            Color::srgb(expected_srgb[0], expected_srgb[1], expected_srgb[2]).to_linear();
+        let chunk = build_chunk_mesh(
+            &snapshot,
+            TerrainChunkBounds {
+                origin: UVec2::ZERO,
+                size: UVec2::splat(3),
+            },
+            TERRAIN_HEIGHT_SCALE,
+            ColorPaletteMode::Natural,
+        );
+        let VertexAttributeValues::Float32x4(colors) = chunk
+            .mesh
+            .attribute(Mesh::ATTRIBUTE_COLOR)
+            .expect("terrain mesh must carry vertex colors")
+        else {
+            panic!("terrain mesh colors must be Float32x4");
+        };
+        let actual = colors[5];
+        for (channel, (actual, expected)) in actual[..3]
+            .iter()
+            .copied()
+            .zip([
+                expected_linear.red,
+                expected_linear.green,
+                expected_linear.blue,
+            ])
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 1.0e-6,
+                "linear terrain channel {channel}: expected {expected}, got {actual}"
+            );
+        }
+        assert_eq!(
+            actual[3].to_bits(),
+            1.0_f32.to_bits(),
+            "terrain vertex alpha must stay opaque"
+        );
+        assert!(
+            actual[..3]
+                .iter()
+                .copied()
+                .zip(expected_srgb)
+                .any(|(linear, srgb)| (linear - srgb).abs() > 1.0e-3),
+            "fixture must detect feeding semantic sRGB directly into linear PBR"
+        );
+        assert_eq!(
+            terrain.fertility[4].to_bits(),
+            0.0_f32.to_bits(),
+            "agreement fixture deliberately avoids blessing the shared unwired fertility input"
+        );
+        assert_eq!(
+            terrain.daylight.to_bits(),
+            0.35_f32.to_bits(),
+            "agreement fixture must exercise non-default daylight"
+        );
+        assert_eq!(
+            terrain.water_depth[4].to_bits(),
+            1.5_f32.to_bits(),
+            "agreement fixture must exercise hydrology-driven splat weights"
         );
     }
 
