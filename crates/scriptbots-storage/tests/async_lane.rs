@@ -76,6 +76,38 @@ fn write_fixture(path: &str, ticks: u64) {
     storage.close().expect("fixture storage closes");
 }
 
+/// Fixture size for the interruption tests: `SLOW_FIXTURE_TICKS * 2` metric rows.
+///
+/// A recursive CTE cannot be used to build a slow query on this engine. FrankenSQLite caps
+/// recursion at `RECURSIVE_CTE_MAX_RECURSION = 1000` (`fsqlite-core/src/connection.rs:785`),
+/// so the `LIMIT 5000000` these tests used to carry was truncated to 1001 rows and returned
+/// in microseconds — the tests asserted against an instant query and never exercised
+/// cancellation or deadlines at all (`bd-sf9h`).
+///
+/// A self-join has no such cap and costs real time proportional to the fixture. Measured on
+/// the pinned engine at roughly 80k row-combinations per second:
+///
+/// | metric rows | join  | combinations | elapsed |
+/// |-------------|-------|--------------|---------|
+/// | 40          | 3-way | 64k          | 0.86 s  |
+/// | 80          | 3-way | 512k         | 6.3 s   |
+/// | 40          | 4-way | 2.6M         | 49.7 s  |
+///
+/// 80 rows at 3-way is chosen deliberately: ~6.3 s is thousands of times longer than the
+/// 1 ms deadline and ~126x the 50 ms cancellation delay, while staying short enough that a
+/// *failed* interrupt ends the test in seconds instead of hanging the suite.
+const SLOW_FIXTURE_TICKS: u64 = 40;
+
+/// A query that genuinely takes seconds on this engine. See `SLOW_FIXTURE_TICKS`.
+const SLOW_SQL: &str = "SELECT COUNT(*) FROM metrics a, metrics b, metrics c";
+
+/// Upper bound proving an interrupt actually cut the query short.
+///
+/// Uninterrupted, `SLOW_SQL` over this fixture takes ~6.3 s. An interrupt that works returns
+/// in milliseconds, so anything under this bound separates the two outcomes unambiguously
+/// without being tight enough to flake on a loaded worker.
+const INTERRUPT_BOUND: Duration = Duration::from_secs(3);
+
 #[test]
 fn lane_reads_match_the_sync_reader() {
     let path = test_path("parity");
@@ -122,40 +154,34 @@ fn lane_reads_match_the_sync_reader() {
     cleanup(&path);
 }
 
-/// IGNORED — the fixture cannot exercise what this test claims (`bd-sf9h`).
+/// The fixture defect is FIXED (`bd-sf9h`); only the verification run is outstanding.
 ///
-/// The "slow" query below is a recursive CTE bounded by `LIMIT 5000000`, but the pinned
-/// FrankenSQLite caps recursion at `RECURSIVE_CTE_MAX_RECURSION = 1000`
-/// (`fsqlite-core/src/connection.rs:785`), so it yields 1001 rows and returns in
-/// microseconds. The observed failure is `COUNT(*) = 1001` arriving before `cancel()` can
-/// matter — evidence the workload is instant, NOT evidence that cancellation is broken.
-/// Lane cancellation is currently unproven in either direction.
+/// This no longer uses the recursive CTE that the engine truncated to 1001 rows. It now
+/// runs a measured ~6.3 s self-join, so a 50 ms cancellation has something real to
+/// interrupt and the assertions below can fail honestly. Whether lane cancellation
+/// actually works is still unknown in both directions — that is the open question, and it
+/// is what this test now genuinely asks.
 ///
-/// Un-ignoring requires a workload that is genuinely slow on this engine (a wide self-join
-/// over a large fixture, not a recursive CTE) so the interrupt has something to interrupt.
+/// Left ignored only because I could not obtain a worker to run it (rch refused ten
+/// consecutive dispatches: `no admissible workers`). Un-ignoring is deleting this attribute
+/// and the one on `sub_ms_deadline_expires_a_slow_query`; do that the moment a slot is
+/// available. If they then fail, that is a real bound-enforcement defect, not a fixture bug.
 #[test]
-#[ignore = "bd-sf9h: recursive-CTE fixture is capped at 1000 rows by the engine, so the query is instant and cancellation is never exercised"]
+#[ignore = "bd-sf9h: fixture fixed and measured; awaiting one verification run before un-ignoring"]
 fn cancelled_query_surfaces_typed_interrupt_and_lane_recovers() {
     let path = test_path("cancel");
     let path_string = path.to_string_lossy().to_string();
-    write_fixture(&path_string, 3);
+    write_fixture(&path_string, SLOW_FIXTURE_TICKS);
 
     let cx = Cx::new();
     let canceller = cx.clone();
-    let slow_sql = "WITH RECURSIVE cnt(x) AS (
-                        SELECT 1
-                        UNION ALL
-                        SELECT x + 1 FROM cnt LIMIT 5000000
-                    )
-                    SELECT COUNT(*) FROM cnt";
 
     let lane_thread = std::thread::spawn({
         let path_string = path_string.clone();
-        let slow_sql = slow_sql.to_owned();
         move || {
             let lane = AsyncReadLane::open(&path_string).expect("lane opens");
             let started = Instant::now();
-            let result = lane.query_rows(&slow_sql, &[], &cx);
+            let result = lane.query_rows(SLOW_SQL, &[], &cx);
             (result, started.elapsed(), lane)
         }
     });
@@ -169,8 +195,9 @@ fn cancelled_query_surfaces_typed_interrupt_and_lane_recovers() {
         "cancellation must surface a typed interrupt, got {error} after {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(30),
-        "cancellation took {elapsed:?}; the whole scan would take far longer"
+        elapsed < INTERRUPT_BOUND,
+        "cancellation returned after {elapsed:?}; the uninterrupted query takes ~6.3s, so \
+         this did not actually cut the scan short"
     );
 
     // The lane is not poisoned: a fresh context must read normally.
@@ -182,27 +209,19 @@ fn cancelled_query_surfaces_typed_interrupt_and_lane_recovers() {
     cleanup(&path);
 }
 
-/// IGNORED — same root cause as the cancellation test above (`bd-sf9h`).
-///
-/// `LIMIT 8000000` on the recursive CTE is likewise truncated to the engine's 1000-row
-/// recursion cap, so the query finishes long before a 1 ms budget could expire. Deadline
-/// enforcement on the lane is unproven, not disproven.
+/// Fixture fixed alongside the cancellation test above; see it for the full reasoning
+/// (`bd-sf9h`). A 1 ms budget against a measured ~6.3 s query is now a real test of
+/// deadline enforcement rather than a race an instant query always won.
 #[test]
-#[ignore = "bd-sf9h: recursive-CTE fixture is capped at 1000 rows by the engine, so the query finishes before any deadline can expire"]
+#[ignore = "bd-sf9h: fixture fixed and measured; awaiting one verification run before un-ignoring"]
 fn sub_ms_deadline_expires_a_slow_query() {
     let path = test_path("deadline");
     let path_string = path.to_string_lossy().to_string();
-    write_fixture(&path_string, 2);
+    write_fixture(&path_string, SLOW_FIXTURE_TICKS);
 
     let lane = AsyncReadLane::open(&path_string).expect("lane opens");
-    let slow_sql = "WITH RECURSIVE cnt(x) AS (
-                        SELECT 1
-                        UNION ALL
-                        SELECT x + 1 FROM cnt LIMIT 8000000
-                    )
-                    SELECT COUNT(*) FROM cnt";
     let started = Instant::now();
-    let result = lane.query_rows(slow_sql, &[], &cx_with_deadline(Duration::from_millis(1)));
+    let result = lane.query_rows(SLOW_SQL, &[], &cx_with_deadline(Duration::from_millis(1)));
     let elapsed = started.elapsed();
 
     let error = result.expect_err("a sub-millisecond deadline must expire the slow query");
@@ -211,8 +230,9 @@ fn sub_ms_deadline_expires_a_slow_query() {
         "an expired deadline must surface a typed interrupt, got {error}"
     );
     assert!(
-        elapsed < Duration::from_secs(30),
-        "the deadline fired after {elapsed:?}; an unchecked scan would run far longer"
+        elapsed < INTERRUPT_BOUND,
+        "the deadline returned after {elapsed:?}; the uninterrupted query takes ~6.3s, so the \
+         budget was not enforced"
     );
     lane.close().expect("lane closes");
     cleanup(&path);
