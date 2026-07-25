@@ -8,7 +8,7 @@ use super::{
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use scriptbots_core::{
-    AgentUid, BirthRecord, DeathRecord, ScriptBotsConfig, Tick, TickCombatSummary,
+    AgentUid, BirthRecord, DeathRecord, ScriptBotsConfig, SelectionUpdate, Tick, TickCombatSummary,
 };
 use scriptbots_runtime::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand,
@@ -672,6 +672,21 @@ enum HostCommandPostcardV1 {
     Step,
     UpdateConfig(Box<ScriptBotsConfig>),
     Shutdown,
+    // The durable discriminant order is append-only. New command kinds belong
+    // after the original six variants so existing V1 archives remain decodable.
+    UpdateSelection(SelectionUpdate),
+    AdjustAgentMutationRates {
+        agent_uid: u64,
+        delta_primary_bits: u32,
+        delta_secondary_bits: u32,
+    },
+    SpawnAgent {
+        herbivore_tendency_bits: u32,
+    },
+    SpawnCrossover {
+        parent_a: u64,
+        parent_b: u64,
+    },
 }
 
 impl HostCommandPostcardV1 {
@@ -683,6 +698,23 @@ impl HostCommandPostcardV1 {
             HostCommand::Step => Self::Step,
             HostCommand::UpdateConfig(config) => Self::UpdateConfig(config.clone()),
             HostCommand::Shutdown => Self::Shutdown,
+            HostCommand::UpdateSelection(update) => Self::UpdateSelection(update.clone()),
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid,
+                delta_primary,
+                delta_secondary,
+            } => Self::AdjustAgentMutationRates {
+                agent_uid: agent_uid.get(),
+                delta_primary_bits: delta_primary.to_bits(),
+                delta_secondary_bits: delta_secondary.to_bits(),
+            },
+            HostCommand::SpawnAgent { herbivore_tendency } => Self::SpawnAgent {
+                herbivore_tendency_bits: herbivore_tendency.to_bits(),
+            },
+            HostCommand::SpawnCrossover { parent_a, parent_b } => Self::SpawnCrossover {
+                parent_a: parent_a.get(),
+                parent_b: parent_b.get(),
+            },
         }
     }
 
@@ -694,6 +726,25 @@ impl HostCommandPostcardV1 {
             Self::Step => HostCommand::Step,
             Self::UpdateConfig(config) => HostCommand::UpdateConfig(config),
             Self::Shutdown => HostCommand::Shutdown,
+            Self::UpdateSelection(update) => HostCommand::UpdateSelection(update),
+            Self::AdjustAgentMutationRates {
+                agent_uid,
+                delta_primary_bits,
+                delta_secondary_bits,
+            } => HostCommand::AdjustAgentMutationRates {
+                agent_uid: AgentUid(agent_uid),
+                delta_primary: f32::from_bits(delta_primary_bits),
+                delta_secondary: f32::from_bits(delta_secondary_bits),
+            },
+            Self::SpawnAgent {
+                herbivore_tendency_bits,
+            } => HostCommand::SpawnAgent {
+                herbivore_tendency: f32::from_bits(herbivore_tendency_bits),
+            },
+            Self::SpawnCrossover { parent_a, parent_b } => HostCommand::SpawnCrossover {
+                parent_a: AgentUid(parent_a),
+                parent_b: AgentUid(parent_b),
+            },
         }
     }
 }
@@ -1392,6 +1443,19 @@ fn validate_scientific_archive_boundary(
                             context: "host_journal_archive.command_lifecycle",
                             reason: "an applied update-config command must be command-only"
                                 .to_owned(),
+                        });
+                    }
+                    HostCommand::UpdateSelection(_)
+                    | HostCommand::AdjustAgentMutationRates { .. }
+                    | HostCommand::SpawnAgent { .. }
+                    | HostCommand::SpawnCrossover { .. }
+                        if scientific.is_some() || event_sequence.is_some() || has_persistence =>
+                    {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_archive.command_lifecycle",
+                            reason:
+                                "an applied selection or agent-edit command must be command-only"
+                                    .to_owned(),
                         });
                     }
                     HostCommand::Shutdown if scientific.is_some() || event_sequence.is_some() => {
@@ -3619,6 +3683,49 @@ mod tests {
             CommandEnvelope::new(CommandId::new(4), HostCommand::Pause),
             applied,
         );
+        let world_edits = [
+            applied_lifecycle(
+                CommandEnvelope::new(
+                    CommandId::new(8),
+                    HostCommand::UpdateSelection(SelectionUpdate {
+                        mode: scriptbots_core::SelectionMode::Clear,
+                        agent_ids: Vec::new(),
+                        state: scriptbots_core::SelectionState::Selected,
+                    }),
+                ),
+                applied,
+            ),
+            applied_lifecycle(
+                CommandEnvelope::new(
+                    CommandId::new(9),
+                    HostCommand::AdjustAgentMutationRates {
+                        agent_uid: AgentUid(1),
+                        delta_primary: 0.002,
+                        delta_secondary: -0.01,
+                    },
+                ),
+                applied,
+            ),
+            applied_lifecycle(
+                CommandEnvelope::new(
+                    CommandId::new(10),
+                    HostCommand::SpawnAgent {
+                        herbivore_tendency: 1.0,
+                    },
+                ),
+                applied,
+            ),
+            applied_lifecycle(
+                CommandEnvelope::new(
+                    CommandId::new(11),
+                    HostCommand::SpawnCrossover {
+                        parent_a: AgentUid(1),
+                        parent_b: AgentUid(2),
+                    },
+                ),
+                applied,
+            ),
+        ];
         let rejected_step = rejected_lifecycle(
             CommandEnvelope::new(CommandId::new(5), HostCommand::Step),
             applied,
@@ -3666,6 +3773,20 @@ mod tests {
             validate_scientific_archive_boundary(1, None, applied, None, Some(&control), false,)
                 .is_ok()
         );
+        for world_edit in &world_edits {
+            assert!(
+                validate_scientific_archive_boundary(
+                    1,
+                    None,
+                    applied,
+                    None,
+                    Some(world_edit),
+                    false,
+                )
+                .is_ok(),
+                "an applied GUI world edit is a terminal command-only lifecycle"
+            );
+        }
         assert!(
             validate_scientific_archive_boundary(
                 1,
@@ -3731,6 +3852,32 @@ mod tests {
             validate_scientific_archive_boundary(1, None, applied, None, Some(&update), true,)
                 .is_err()
         );
+        for world_edit in &world_edits {
+            assert!(
+                validate_scientific_archive_boundary(
+                    1,
+                    Some(EventSequence::new(1)),
+                    applied,
+                    Some(&scientific),
+                    Some(world_edit),
+                    false,
+                )
+                .is_err(),
+                "a GUI world edit cannot claim a scientific boundary/event payload"
+            );
+            assert!(
+                validate_scientific_archive_boundary(
+                    1,
+                    None,
+                    applied,
+                    None,
+                    Some(world_edit),
+                    true,
+                )
+                .is_err(),
+                "a GUI world edit cannot claim a persistence payload"
+            );
+        }
         assert!(
             validate_scientific_archive_boundary(
                 1,
@@ -3823,6 +3970,83 @@ mod tests {
             )
             .expect("encode original rejected command")
         );
+    }
+
+    #[test]
+    fn gui_world_command_postcard_round_trips_exact_payloads() {
+        let primary_bits = 0x8000_0000_u32;
+        let secondary_bits = 0x7fc0_37a1_u32;
+        let mutation = HostCommand::AdjustAgentMutationRates {
+            agent_uid: AgentUid(0x37),
+            delta_primary: f32::from_bits(primary_bits),
+            delta_secondary: f32::from_bits(secondary_bits),
+        };
+        let mutation_hex = encode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &mutation,
+        )
+        .expect("encode exact mutation command");
+        let decoded_mutation = decode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &mutation_hex,
+        )
+        .expect("decode exact mutation command");
+        let HostCommand::AdjustAgentMutationRates {
+            agent_uid,
+            delta_primary,
+            delta_secondary,
+        } = decoded_mutation
+        else {
+            panic!("mutation command changed durable kind");
+        };
+        assert_eq!(agent_uid, AgentUid(0x37));
+        assert_eq!(delta_primary.to_bits(), primary_bits);
+        assert_eq!(delta_secondary.to_bits(), secondary_bits);
+
+        let tendency_bits = 0x7fc0_37b2_u32;
+        let spawn = HostCommand::SpawnAgent {
+            herbivore_tendency: f32::from_bits(tendency_bits),
+        };
+        let spawn_hex = encode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &spawn,
+        )
+        .expect("encode exact spawn command");
+        let decoded_spawn = decode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &spawn_hex,
+        )
+        .expect("decode exact spawn command");
+        let HostCommand::SpawnAgent { herbivore_tendency } = decoded_spawn else {
+            panic!("spawn command changed durable kind");
+        };
+        assert_eq!(herbivore_tendency.to_bits(), tendency_bits);
+
+        for command in [
+            HostCommand::UpdateSelection(SelectionUpdate {
+                mode: scriptbots_core::SelectionMode::Replace,
+                agent_ids: vec![7, 11],
+                state: scriptbots_core::SelectionState::Selected,
+            }),
+            HostCommand::SpawnCrossover {
+                parent_a: AgentUid(7),
+                parent_b: AgentUid(11),
+            },
+        ] {
+            let encoded = encode_host_command_postcard_hex(
+                "host_command_records.command_payload_postcard_hex",
+                &command,
+            )
+            .expect("encode GUI world command");
+            assert_eq!(
+                decode_host_command_postcard_hex(
+                    "host_command_records.command_payload_postcard_hex",
+                    &encoded,
+                )
+                .expect("decode GUI world command"),
+                command
+            );
+        }
     }
 
     #[test]

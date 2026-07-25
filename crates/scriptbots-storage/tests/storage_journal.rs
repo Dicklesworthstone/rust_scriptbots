@@ -2,8 +2,9 @@
 
 use fsqlite::Connection;
 use scriptbots_core::{
-    AgentData, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, Tick, WorldState,
-    channels::OutputChannel,
+    AgentData, AgentUid, BrainRunner, ControlCommand, INPUT_SIZE, OUTPUT_SIZE, Position,
+    ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, Tick, WorldDigestV1,
+    WorldState, channels::OutputChannel,
 };
 use scriptbots_runtime::{
     ApplicationState, CommandEnvelope, CommandId, CommandStatus, ControlRevision, EventCatchUp,
@@ -39,6 +40,23 @@ fn compact_world() -> WorldState {
         ..ScriptBotsConfig::default()
     })
     .expect("compact deterministic journal world")
+}
+
+fn command_replay_world() -> WorldState {
+    WorldState::new(ScriptBotsConfig {
+        world_width: 100,
+        world_height: 100,
+        food_cell_size: 20,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        reproduction_attempt_chance: 0.0,
+        persistence_interval: 1,
+        rng_seed: Some(0x37C0_1100),
+        closed: false,
+        history_capacity: 8,
+        ..ScriptBotsConfig::default()
+    })
+    .expect("deterministic GUI command replay world")
 }
 
 #[derive(Debug)]
@@ -185,6 +203,57 @@ fn drive_until_journal_state(
         "command {command_id:?} did not reach journal state {expected:?}"
     );
     status
+}
+
+fn submit_envelope_durably(
+    frontend: &mut NullFrontend<LocalHostPort>,
+    core: &mut HostCore,
+    envelope: &CommandEnvelope,
+    next_nanos: &mut u64,
+) -> (CommandStatus, WorldDigestV1) {
+    let submitted = frontend
+        .submit_envelope(envelope.clone())
+        .expect("GUI-equivalent envelope enters the production host boundary");
+    assert_eq!(submitted.command_id(), envelope.command_id);
+    let status = drive_until_journal_state(
+        frontend,
+        core,
+        envelope.command_id,
+        &JournalState::Durable,
+        next_nanos,
+    );
+    assert!(
+        matches!(status.application(), ApplicationState::Applied(_)),
+        "command {:?} must apply before its durable journal receipt",
+        envelope.command_id
+    );
+    let digest = core
+        .world()
+        .world_digest_v1()
+        .expect("command leaves a canonical world digest");
+    (status, digest)
+}
+
+fn sorted_agent_identities(core: &HostCore) -> Vec<(AgentUid, u64)> {
+    let mut identities = core
+        .world()
+        .agents()
+        .iter_handles()
+        .map(|agent_id| {
+            (
+                core.world()
+                    .agent_uid(agent_id)
+                    .expect("live agent has a stable UID"),
+                agent_id.raw(),
+            )
+        })
+        .collect::<Vec<_>>();
+    identities.sort_unstable_by_key(|(uid, _)| *uid);
+    identities
+}
+
+fn map_gui_command(command: ControlCommand) -> HostCommand {
+    HostCommand::try_from(command).expect("GUI ControlCommand maps to one atomic HostCommand")
 }
 
 #[test]
@@ -789,6 +858,300 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
         .expect("close the immutable finished-run conformance reader");
 
     // The uniquely named database is intentionally retained; this test performs no file deletion.
+}
+
+#[test]
+#[allow(
+    clippy::drop_non_drop,
+    clippy::too_many_lines,
+    reason = "the mock-free two-run proof keeps command order, durable readback, replay, and per-boundary science digests visible in one audit"
+)]
+fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
+    const GUI_CLIENT_NAMESPACE: u64 = 0x37_6f_70_75_69;
+    const FIRST_SESSION: HostSessionId = HostSessionId::new(0x37_01);
+    const REPLAY_SESSION: HostSessionId = HostSessionId::new(0x37_02);
+
+    let first_path = unique_database_path("gui_world_edits_first");
+    let replay_path = unique_database_path("gui_world_edits_replay");
+    let options = StorageJournalOptions::default();
+    let mut first_pipeline = StoragePipeline::create_unattributed_file(&first_path)
+        .expect("new file-backed GUI command journal");
+    let first_run_id = first_pipeline.run_id();
+    let first_journal = first_pipeline
+        .journal_port(FIRST_SESSION, options)
+        .expect("first durable GUI command journal port");
+    let mut first_core = HostCore::with_journal(
+        FIRST_SESSION,
+        command_replay_world(),
+        host_options(8),
+        Box::new(first_journal),
+    )
+    .expect("first production HostCore boundary");
+    let mut first_frontend = NullFrontend::new(first_core.local_port(), GUI_CLIENT_NAMESPACE);
+    let mut first_next_nanos = 0;
+    let mut original_envelopes = Vec::new();
+    let mut original_statuses = Vec::new();
+    let mut original_digests = Vec::new();
+
+    for (sequence, command) in [
+        (
+            1,
+            ControlCommand::SpawnAgent {
+                herbivore_tendency: 1.0,
+            },
+        ),
+        (
+            2,
+            ControlCommand::SpawnAgent {
+                herbivore_tendency: 0.0,
+            },
+        ),
+        (3, ControlCommand::Step),
+    ] {
+        let envelope = CommandEnvelope::new(
+            CommandId::from_client_sequence(GUI_CLIENT_NAMESPACE, sequence),
+            map_gui_command(command),
+        );
+        let (status, digest) = submit_envelope_durably(
+            &mut first_frontend,
+            &mut first_core,
+            &envelope,
+            &mut first_next_nanos,
+        );
+        original_envelopes.push(envelope);
+        original_statuses.push(status);
+        original_digests.push(digest);
+    }
+
+    let parents = sorted_agent_identities(&first_core);
+    assert_eq!(
+        parents.len(),
+        2,
+        "the controlled fixture must expose exactly the two injected parents"
+    );
+    let selection = SelectionUpdate {
+        mode: SelectionMode::Replace,
+        agent_ids: parents.iter().map(|(_, raw_id)| *raw_id).collect(),
+        state: SelectionState::Selected,
+    };
+    let mut closed_config = first_core.world().config().clone();
+    closed_config.closed = true;
+    for (sequence, command) in [
+        (4, ControlCommand::UpdateSelection(selection)),
+        (
+            5,
+            ControlCommand::AdjustAgentMutationRates {
+                agent_uid: parents[0].0,
+                delta_primary: 0.002,
+                delta_secondary: -0.01,
+            },
+        ),
+        (6, ControlCommand::UpdateConfig(Box::new(closed_config))),
+        (
+            7,
+            ControlCommand::SpawnCrossover {
+                parent_a: parents[0].0,
+                parent_b: parents[1].0,
+            },
+        ),
+        (8, ControlCommand::Step),
+        (9, ControlCommand::Shutdown),
+    ] {
+        let envelope = CommandEnvelope::new(
+            CommandId::from_client_sequence(GUI_CLIENT_NAMESPACE, sequence),
+            map_gui_command(command),
+        );
+        let (status, digest) = submit_envelope_durably(
+            &mut first_frontend,
+            &mut first_core,
+            &envelope,
+            &mut first_next_nanos,
+        );
+        original_envelopes.push(envelope);
+        original_statuses.push(status);
+        original_digests.push(digest);
+    }
+    assert_eq!(
+        first_core.latest_snapshot().lifecycle,
+        HostLifecycle::Stopped
+    );
+    assert_eq!(
+        first_core.world().agent_count(),
+        3,
+        "the crossover command must add exactly one child"
+    );
+    assert!(
+        first_core.world().config().closed,
+        "the GUI-equivalent closed-world config command must survive the interleaved step"
+    );
+    let first_final_digest = first_core
+        .world()
+        .world_digest_v1()
+        .expect("first final world digest");
+    let first_shutdown_receipt = first_pipeline
+        .shutdown()
+        .expect("first file-backed pipeline shuts down cleanly");
+    assert_eq!(
+        first_shutdown_receipt.guarantee,
+        PersistenceGuarantee::Durable
+    );
+    drop(first_frontend);
+    drop(first_core);
+    drop(first_pipeline);
+
+    let first_reader = StorageReader::open_finished_for_run(&first_path, first_run_id)
+        .expect("open immutable first command journal");
+    let command_count =
+        u64::try_from(original_envelopes.len()).expect("bounded command count fits u64");
+    let first_evidence = first_reader
+        .command_journal_evidence(FIRST_SESSION)
+        .expect("first run has complete command evidence");
+    assert_eq!(first_evidence.command_count, command_count);
+    assert_eq!(
+        first_evidence.application_transition_count,
+        command_count * 2
+    );
+    assert_eq!(first_evidence.storage_transition_count, command_count * 2);
+    let first_page = first_reader
+        .command_journal_page(
+            FIRST_SESSION,
+            None,
+            original_envelopes.len() + 1,
+            options.max_event_page_bytes,
+        )
+        .expect("read all first-run GUI commands in journal order");
+    assert_eq!(first_page.next_after, None);
+    assert_eq!(first_page.commands.len(), original_envelopes.len());
+    assert_eq!(first_page.evidence, first_evidence);
+    let readback_envelopes = first_page
+        .commands
+        .iter()
+        .map(|record| record.lifecycle.envelope().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        readback_envelopes, original_envelopes,
+        "durable decoding must preserve exact GUI envelope order and payloads"
+    );
+    for (index, record) in first_page.commands.iter().enumerate() {
+        assert_eq!(
+            record.batch_id.sequence(),
+            u64::try_from(index + 1).expect("bounded journal sequence")
+        );
+        assert_eq!(
+            record.lifecycle.admission_sequence(),
+            original_statuses[index].admission_sequence()
+        );
+        assert_eq!(record.lifecycle.transitions().len(), 2);
+        assert_eq!(
+            record
+                .lifecycle
+                .terminal()
+                .map(|transition| transition.application()),
+            Some(original_statuses[index].application())
+        );
+        assert_eq!(record.storage_transitions.len(), 2);
+        assert_eq!(record.storage_transitions[0].ordinal, 0);
+        assert_eq!(
+            record.storage_transitions[0].kind,
+            CommandStorageTransitionKind::CommittedVolatile
+        );
+        assert_eq!(record.storage_transitions[1].ordinal, 1);
+        assert_eq!(
+            record.storage_transitions[1].kind,
+            CommandStorageTransitionKind::Durable
+        );
+        assert_eq!(record.archive_payload_digest.len(), 64);
+    }
+    first_reader
+        .close()
+        .expect("close immutable first command journal");
+
+    let mut replay_pipeline = StoragePipeline::create_unattributed_file(&replay_path)
+        .expect("new file-backed replay command journal");
+    let replay_run_id = replay_pipeline.run_id();
+    let replay_journal = replay_pipeline
+        .journal_port(REPLAY_SESSION, options)
+        .expect("replay durable GUI command journal port");
+    let mut replay_core = HostCore::with_journal(
+        REPLAY_SESSION,
+        command_replay_world(),
+        host_options(8),
+        Box::new(replay_journal),
+    )
+    .expect("replay production HostCore boundary");
+    let mut replay_frontend = NullFrontend::new(replay_core.local_port(), GUI_CLIENT_NAMESPACE);
+    let mut replay_next_nanos = 0;
+    let mut replay_statuses = Vec::with_capacity(readback_envelopes.len());
+    let mut replay_digests = Vec::with_capacity(readback_envelopes.len());
+    for envelope in &readback_envelopes {
+        let (status, digest) = submit_envelope_durably(
+            &mut replay_frontend,
+            &mut replay_core,
+            envelope,
+            &mut replay_next_nanos,
+        );
+        replay_statuses.push(status);
+        replay_digests.push(digest);
+    }
+    assert_eq!(
+        replay_statuses, original_statuses,
+        "replayed envelopes must retain exact admission and terminal boundaries"
+    );
+    assert_eq!(
+        replay_digests, original_digests,
+        "every replayed command boundary must retain WorldDigestV1"
+    );
+    assert_eq!(
+        replay_core
+            .world()
+            .world_digest_v1()
+            .expect("replay final world digest"),
+        first_final_digest
+    );
+    assert_eq!(
+        replay_core.latest_snapshot().lifecycle,
+        HostLifecycle::Stopped
+    );
+    let replay_shutdown_receipt = replay_pipeline
+        .shutdown()
+        .expect("replay file-backed pipeline shuts down cleanly");
+    assert_eq!(
+        replay_shutdown_receipt, first_shutdown_receipt,
+        "identical command/science work must produce identical persistence receipts"
+    );
+    drop(replay_frontend);
+    drop(replay_core);
+    drop(replay_pipeline);
+
+    let replay_reader = StorageReader::open_finished_for_run(&replay_path, replay_run_id)
+        .expect("open immutable replay command journal");
+    let replay_page = replay_reader
+        .command_journal_page(
+            REPLAY_SESSION,
+            None,
+            readback_envelopes.len() + 1,
+            options.max_event_page_bytes,
+        )
+        .expect("read all replayed GUI commands in journal order");
+    assert_eq!(replay_page.next_after, None);
+    assert_eq!(replay_page.evidence, first_evidence);
+    assert_eq!(replay_page.commands.len(), first_page.commands.len());
+    for (first, replayed) in first_page.commands.iter().zip(&replay_page.commands) {
+        assert_eq!(replayed.batch_id.sequence(), first.batch_id.sequence());
+        assert_eq!(replayed.lifecycle, first.lifecycle);
+        assert_eq!(replayed.terminal_boundary, first.terminal_boundary);
+        assert_eq!(
+            replayed.scientific_event_sequence,
+            first.scientific_event_sequence
+        );
+        assert_eq!(replayed.storage_transitions, first.storage_transitions);
+        assert_eq!(replayed.archive_payload_digest.len(), 64);
+    }
+    replay_reader
+        .close()
+        .expect("close immutable replay command journal");
+
+    // The uniquely named databases are intentionally retained; this test performs no file deletion.
 }
 
 #[test]
