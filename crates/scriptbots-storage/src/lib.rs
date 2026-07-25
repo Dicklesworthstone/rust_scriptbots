@@ -19200,12 +19200,18 @@ mod tests {
         v6_connection.close()?;
         assert_recovery_refused_without_database_mutation(&v6_only, migration_count_fragment)?;
 
+        // The FOURTH version-pinned literal in this one test, and the one that survived a sweep
+        // for the other three: they said "through v9" and "exactly four", this said "ledger is
+        // v9". Grepping for the symptom found three of four; the class is "an assertion that
+        // restates a schema version in English", so this now derives it like the rest.
         let mismatched_user_version = temp_db_path("storage-recovery-user-version-mismatch");
         create_valid_database(&mismatched_user_version)?;
         add_schema_object(&mismatched_user_version, "PRAGMA user_version = 5")?;
         assert_recovery_refused_without_database_mutation(
             &mismatched_user_version,
-            "migration ledger is v9, but PRAGMA user_version is 5",
+            &format!(
+                "migration ledger is v{SCRIPTBOTS_SCHEMA_VERSION}, but PRAGMA user_version is 5"
+            ),
         )?;
         Ok(())
     }
