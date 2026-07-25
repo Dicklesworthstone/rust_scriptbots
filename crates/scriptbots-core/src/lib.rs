@@ -21559,6 +21559,34 @@ impl WorldState {
         let positions = columns.positions();
         let generations = columns.generations();
 
+        // bd-mv2j: resolve each agent's food delta BEFORE the aggregation pass.
+        //
+        // This is the single place where a persistence concept crosses into the science
+        // aggregation. When a partial batch is forced, the retained runtime tail holds the
+        // value AS OF THE COMPLETED BOUNDARY while live runtime has already moved on, so the
+        // metric must read the tail or it describes a different tick than the batch it rides
+        // in. That is the same reason `project_agent_states` takes `force_partial_batch`.
+        //
+        // Hoisting it here makes the boundary one visible line instead of a conditional buried
+        // in a hot loop, and leaves the loop itself reading science state only -- which is the
+        // test for whether the science/storage seam is in the right place.
+        let resolved_food_deltas: Vec<f32> = handles
+            .iter()
+            .map(|agent_id| {
+                let live = self
+                    .runtime
+                    .get(*agent_id)
+                    .map_or(0.0, |runtime| runtime.food_delta);
+                if force_partial_batch {
+                    self.pending_persistence_runtime_tail
+                        .get(*agent_id)
+                        .map_or(live, |tail| tail.food_delta)
+                } else {
+                    live
+                }
+            })
+            .collect();
+
         let mut generation_sum = 0.0f64;
         let mut generation_max = 0u32;
         let mut temperature_discomfort_stats = RunningStats::default();
@@ -21640,14 +21668,8 @@ impl WorldState {
                 }
 
                 if behavior_enabled || macro_enabled {
-                    let food_delta = if force_partial_batch {
-                        self.pending_persistence_runtime_tail
-                            .get(*agent_id)
-                            .map_or(runtime.food_delta, |tail| tail.food_delta)
-                    } else {
-                        runtime.food_delta
-                    };
-                    let delta = f64::from(food_delta);
+                    // bd-mv2j: resolved before the loop so this pass reads science state only.
+                    let delta = f64::from(resolved_food_deltas[idx]);
                     food_delta_sum += delta;
                     food_delta_abs_sum += delta.abs();
                 }
