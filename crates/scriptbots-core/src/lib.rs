@@ -11379,6 +11379,11 @@ pub struct ScriptBotsConfig {
     pub render: RenderSettings,
 }
 
+// `f32::cos` is supplied by each target's math runtime and may round the last bit
+// differently. Pin the nearest f32 to cos(π/8) so the default scientific config
+// and its serialized identity are identical in native and browser runtimes.
+const DEFAULT_SPIKE_ALIGNMENT_COSINE: f32 = 0.923_879_5;
+
 impl Default for ScriptBotsConfig {
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
@@ -11467,7 +11472,7 @@ impl Default for ScriptBotsConfig {
             spike_damage: 0.25,
             spike_energy_cost: 0.02,
             spike_min_length: 0.2,
-            spike_alignment_cosine: (std::f32::consts::FRAC_PI_8).cos(),
+            spike_alignment_cosine: DEFAULT_SPIKE_ALIGNMENT_COSINE,
             spike_speed_damage_bonus: 0.6,
             spike_length_damage_bonus: 0.75,
             carnivore_threshold: 0.5,
@@ -15860,6 +15865,109 @@ struct TickAggregates {
     generation_max: u32,
     brain_map: BTreeMap<String, (usize, f64)>,
 }
+
+/// Everything the macro metric family projects from, with no path back to world state (bd-mv2j).
+///
+/// The food-grid and hydrology summaries are reduced here rather than read from `self` inside the
+/// projection, which is what lets the projection stop being a method.
+#[derive(Default)]
+struct MacroProjection {
+    aggregates: TickAggregates,
+    /// `summarize_food_grid` output: `(total, mean, variance, max)`. Variance rather than
+    /// stddev, so the projection performs the same `sqrt` on the same value it always did.
+    food_grid: Option<(f64, f64, f64, f32)>,
+    hydrology: Option<HydrologyProjection>,
+}
+
+/// Hydrology scalars reduced at the boundary for the macro metric family (bd-mv2j).
+struct HydrologyProjection {
+    total_water: f32,
+    flooded_shallow: usize,
+    flooded_deep: usize,
+    /// Already `telemetry_count_f64(cell_count.max(1))`, so the projection divides by the
+    /// identical f64 the method computed.
+    cell_count: f64,
+}
+
+/// The six signal accumulators the behaviour metric family projects from (bd-mv2j).
+#[derive(Default)]
+struct BehaviorProjection {
+    sensor_mean: RunningStats,
+    sensor_max: RunningStats,
+    sensor_entropy: RunningStats,
+    output_mean: RunningStats,
+    output_max: RunningStats,
+    output_entropy: RunningStats,
+}
+
+/// Death causes tallied at the boundary, so the projection never sees a `DeathRecord` (bd-mv2j).
+#[derive(Default)]
+struct MortalityCounts {
+    combat_carnivore: usize,
+    combat_herbivore: usize,
+    starvation: usize,
+    aging: usize,
+    unknown: usize,
+}
+
+/// Birth composition tallied at the boundary, so the projection never sees a `BirthRecord`
+/// for metric purposes (bd-mv2j). The typed record stream still rides the batch untouched.
+#[derive(Default)]
+struct BirthComposition {
+    total: usize,
+    hybrid: usize,
+}
+
+/// The owned result of draining a completed boundary, ready for batch assembly (bd-mv2j).
+///
+/// This is the seam. Every field is plain owned data or a neutral record type that crosses the
+/// boundary by design; nothing here borrows `WorldState` or can reach back into it. The
+/// projection that consumes it is a free function precisely because there is nothing left to
+/// reach for.
+struct BoundaryReady {
+    tick: Tick,
+    epoch: u64,
+    closed: bool,
+    agent_count: usize,
+    births: usize,
+    deaths: usize,
+    spike_attempts: u32,
+    spike_hits: u32,
+    total_energy: f32,
+    average_energy: f32,
+    average_health: f32,
+    max_age: u32,
+    carcass_health_distributed: f32,
+    carcass_reproduction_bonus: f32,
+    /// `Some` exactly when the macro cadence selected this tick.
+    macro_metrics: Option<MacroProjection>,
+    /// `Some` exactly when the behaviour cadence selected this tick.
+    behavior_metrics: Option<BehaviorProjection>,
+    /// `Some` when the lifecycle cadence selected this tick AND deaths were recorded.
+    mortality: Option<MortalityCounts>,
+    /// `Some` when the lifecycle cadence selected this tick AND births were recorded.
+    birth_composition: Option<BirthComposition>,
+    agents: Vec<AgentState>,
+    birth_records: Vec<BirthRecord>,
+    death_records: Vec<DeathRecord>,
+    replay_events: Vec<ReplayEvent>,
+    narrative_events: Vec<narrative::EventRecord>,
+}
+
+/// The boundary decision plus, when a batch is owed, the drained data to build it from (bd-mv2j).
+///
+/// The three outcomes are decided entirely world-side. Carrying the decision as a variant is what
+/// keeps the projection from re-testing `persistence_interval` or `analytics_stride`: it maps
+/// variant to status and never inspects configuration.
+enum BoundaryDrain {
+    /// Persistence is disabled; the completed boundary was deliberately discarded.
+    Disabled,
+    /// The configured cadence retained this boundary for a later aggregate batch.
+    Deferred,
+    /// A batch is owed, and this is everything needed to assemble it.
+    Ready(Box<BoundaryReady>),
+}
+
 /// Append the four behaviour metrics that summarise one signal channel (bd-mv2j).
 ///
 /// Sensors and outputs were two textually duplicated blocks differing only in the metric names
@@ -15893,6 +16001,433 @@ struct SignalMetricNames {
     stddev: &'static str,
     max: &'static str,
     entropy: &'static str,
+}
+
+/// Append mortality-breakdown metrics for the ticks that recorded deaths (bd-mv2j).
+///
+/// Takes causes already tallied at the boundary, so this cannot reach world state. `None`
+/// means the cadence was off or no deaths were recorded, so an absent row means "not sampled"
+/// rather than "zero deaths" — the ratios in particular would be meaningless against a zero
+/// denominator.
+fn project_mortality_metrics(counts: Option<&MortalityCounts>, metrics: &mut Vec<MetricSample>) {
+    let Some(counts) = counts else {
+        return;
+    };
+    let combat_carnivore = counts.combat_carnivore;
+    let combat_herbivore = counts.combat_herbivore;
+    let starvation = counts.starvation;
+    let aging = counts.aging;
+    let unknown = counts.unknown;
+    let total = combat_carnivore + combat_herbivore + starvation + aging + unknown;
+    if total == 0 {
+        return;
+    }
+    metrics.push(MetricSample::new(
+        "mortality.combat_carnivore.count",
+        telemetry_count_f64(combat_carnivore),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.combat_herbivore.count",
+        telemetry_count_f64(combat_herbivore),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.starvation.count",
+        telemetry_count_f64(starvation),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.aging.count",
+        telemetry_count_f64(aging),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.unknown.count",
+        telemetry_count_f64(unknown),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.total.count",
+        telemetry_count_f64(total),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.combat_carnivore.ratio",
+        telemetry_count_f64(combat_carnivore) / telemetry_count_f64(total),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.combat_herbivore.ratio",
+        telemetry_count_f64(combat_herbivore) / telemetry_count_f64(total),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.starvation.ratio",
+        telemetry_count_f64(starvation) / telemetry_count_f64(total),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.aging.ratio",
+        telemetry_count_f64(aging) / telemetry_count_f64(total),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.unknown.ratio",
+        telemetry_count_f64(unknown) / telemetry_count_f64(total),
+    ));
+}
+
+/// Append birth-composition metrics for the ticks that recorded births (bd-mv2j).
+///
+/// The hybrid ratio is guarded on a nonzero denominator rather than emitted as NaN.
+fn project_birth_metrics(composition: Option<&BirthComposition>, metrics: &mut Vec<MetricSample>) {
+    let Some(composition) = composition else {
+        return;
+    };
+    let total = composition.total;
+    let hybrid = composition.hybrid;
+    metrics.push(MetricSample::new(
+        "births.total.count",
+        telemetry_count_f64(total),
+    ));
+    metrics.push(MetricSample::new(
+        "births.hybrid.count",
+        telemetry_count_f64(hybrid),
+    ));
+    if total > 0 {
+        metrics.push(MetricSample::new(
+            "births.hybrid.ratio",
+            telemetry_count_f64(hybrid) / telemetry_count_f64(total),
+        ));
+    }
+}
+
+/// Project the macro analytics family from one tick's population aggregates (bd-mv2j).
+///
+/// Emitted only when the macro cadence selects this tick; the caller gates on that, so an
+/// absent family means "not sampled" rather than "all zero".
+// bd-mv2j: reviewed as a unit. This is one flat sequence of metric pushes and its LENGTH is
+// its emission ORDER, which is load-bearing -- serde_json runs with preserve_order
+// workspace-wide, so splitting this into sub-projections to satisfy a line count would put the
+// sequence in the call order of the pieces and change serialized bytes without changing a
+// value. `a_projected_batch_carries_every_metric_family` pins all 46 names in exact order.
+#[allow(clippy::too_many_lines)]
+fn project_macro_metrics(projection: &MacroProjection, metrics: &mut Vec<MetricSample>) {
+    let agg = &projection.aggregates;
+    metrics.push(MetricSample::new(
+        "population.carnivore.count",
+        telemetry_count_f64(agg.carnivores),
+    ));
+    metrics.push(MetricSample::new(
+        "population.herbivore.count",
+        telemetry_count_f64(agg.herbivores),
+    ));
+    metrics.push(MetricSample::new(
+        "population.hybrid.count",
+        telemetry_count_f64(agg.hybrids),
+    ));
+
+    if agg.carnivores > 0 {
+        metrics.push(MetricSample::new(
+            "population.carnivore.avg_energy",
+            agg.carnivore_energy / telemetry_count_f64(agg.carnivores),
+        ));
+    }
+    if agg.herbivores > 0 {
+        metrics.push(MetricSample::new(
+            "population.herbivore.avg_energy",
+            agg.herbivore_energy / telemetry_count_f64(agg.herbivores),
+        ));
+    }
+    if agg.hybrids > 0 {
+        metrics.push(MetricSample::new(
+            "population.hybrid.avg_energy",
+            agg.hybrid_energy / telemetry_count_f64(agg.hybrids),
+        ));
+    }
+
+    metrics.push(MetricSample::new(
+        "mutation.primary.mean",
+        agg.mutation_primary.mean(),
+    ));
+    metrics.push(MetricSample::new(
+        "mutation.primary.stddev",
+        agg.mutation_primary.stddev(),
+    ));
+    metrics.push(MetricSample::new(
+        "mutation.secondary.mean",
+        agg.mutation_secondary.mean(),
+    ));
+    metrics.push(MetricSample::new(
+        "mutation.secondary.stddev",
+        agg.mutation_secondary.stddev(),
+    ));
+    metrics.push(MetricSample::new(
+        "traits.smell.mean",
+        agg.trait_smell.mean(),
+    ));
+    metrics.push(MetricSample::new(
+        "traits.sound.mean",
+        agg.trait_sound.mean(),
+    ));
+    metrics.push(MetricSample::new(
+        "traits.hearing.mean",
+        agg.trait_hearing.mean(),
+    ));
+    metrics.push(MetricSample::new("traits.eye.mean", agg.trait_eye.mean()));
+    metrics.push(MetricSample::new(
+        "traits.blood.mean",
+        agg.trait_blood.mean(),
+    ));
+    metrics.push(MetricSample::new(
+        "herbivore_tendency.mean",
+        agg.herbivore_tendency_stats.mean(),
+    ));
+    metrics.push(MetricSample::new(
+        "herbivore_tendency.stddev",
+        agg.herbivore_tendency_stats.stddev(),
+    ));
+
+    if agg.agent_count > 0 {
+        metrics.push(MetricSample::new(
+            "food_delta.mean",
+            agg.food_delta_sum / telemetry_count_f64(agg.agent_count),
+        ));
+        metrics.push(MetricSample::new(
+            "food_delta.mean_abs",
+            agg.food_delta_abs_sum / telemetry_count_f64(agg.agent_count),
+        ));
+        metrics.push(MetricSample::new(
+            "population.age.mean",
+            agg.age_sum / telemetry_count_f64(agg.agent_count),
+        ));
+        metrics.push(MetricSample::new(
+            "population.age.max",
+            f64::from(agg.age_max),
+        ));
+        metrics.push(MetricSample::new(
+            "behavior.boost.count",
+            telemetry_count_f64(agg.boost_count),
+        ));
+        metrics.push(MetricSample::new(
+            "behavior.boost.ratio",
+            if agg.agent_count > 0 {
+                telemetry_count_f64(agg.boost_count) / telemetry_count_f64(agg.agent_count)
+            } else {
+                0.0
+            },
+        ));
+        metrics.push(MetricSample::new(
+            "reproduction.counter.mean",
+            agg.reproduction_counter_stats.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "temperature.preference.mean",
+            agg.temperature_pref_stats.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "temperature.preference.stddev",
+            agg.temperature_pref_stats.stddev(),
+        ));
+        metrics.push(MetricSample::new(
+            "population.generation.mean",
+            agg.generation_sum / telemetry_count_f64(agg.agent_count),
+        ));
+        metrics.push(MetricSample::new(
+            "population.generation.max",
+            f64::from(agg.generation_max),
+        ));
+        metrics.push(MetricSample::new(
+            "temperature.discomfort.mean",
+            agg.temperature_discomfort_stats.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "temperature.discomfort.stddev",
+            agg.temperature_discomfort_stats.stddev(),
+        ));
+    }
+
+    if let Some((total, mean, variance, max)) = projection.food_grid {
+        metrics.push(MetricSample::new("food.total", total));
+        metrics.push(MetricSample::new("food.mean", mean));
+        metrics.push(MetricSample::new("food.stddev", variance.sqrt()));
+        metrics.push(MetricSample::from_f32("food.max", max));
+    }
+
+    if let Some(hydrology) = projection.hydrology.as_ref() {
+        let total_water = hydrology.total_water;
+        let flooded = (hydrology.flooded_shallow, hydrology.flooded_deep);
+        let cell_count = hydrology.cell_count;
+        metrics.push(MetricSample::new(
+            "hydrology.water.total_depth",
+            f64::from(total_water),
+        ));
+        metrics.push(MetricSample::new(
+            "hydrology.water.mean_depth",
+            f64::from(total_water) / cell_count,
+        ));
+        metrics.push(MetricSample::new(
+            "hydrology.water.flooded.shallow.count",
+            telemetry_count_f64(flooded.0),
+        ));
+        metrics.push(MetricSample::new(
+            "hydrology.water.flooded.deep.count",
+            telemetry_count_f64(flooded.1),
+        ));
+        metrics.push(MetricSample::new(
+            "hydrology.water.flooded.shallow.ratio",
+            telemetry_count_f64(flooded.0) / cell_count,
+        ));
+        metrics.push(MetricSample::new(
+            "hydrology.water.flooded.deep.ratio",
+            telemetry_count_f64(flooded.1) / cell_count,
+        ));
+    }
+
+    for (label, (count, energy_sum)) in &agg.brain_map {
+        let (count, energy_sum) = (*count, *energy_sum);
+        let key = sanitize_metric_key(label);
+        metrics.push(MetricSample::new(
+            format!("brain.population.{key}.count"),
+            telemetry_count_f64(count),
+        ));
+        if count > 0 {
+            metrics.push(MetricSample::new(
+                format!("brain.population.{key}.avg_energy"),
+                energy_sum / telemetry_count_f64(count),
+            ));
+        }
+    }
+}
+/// Project the tick's countable events into the batch's event rows (bd-mv2j).
+///
+/// Takes the spike counters as values rather than reading them from the world: an event row is
+/// emitted only for a nonzero count, so an honest zero stays absent rather than being recorded
+/// as a zero-valued row.
+fn project_persistence_events(
+    summary: &TickSummary,
+    spike_attempts: u32,
+    spike_hits: u32,
+) -> Vec<PersistenceEvent> {
+    let mut events = Vec::with_capacity(4);
+    if summary.births > 0 {
+        events.push(PersistenceEvent::new(
+            PersistenceEventKind::Births,
+            summary.births,
+        ));
+    }
+    if summary.deaths > 0 {
+        events.push(PersistenceEvent::new(
+            PersistenceEventKind::Deaths,
+            summary.deaths,
+        ));
+    }
+    if spike_attempts > 0 {
+        events.push(PersistenceEvent::new(
+            PersistenceEventKind::Custom(Cow::Borrowed("spike_attempts")),
+            spike_attempts as usize,
+        ));
+    }
+    if spike_hits > 0 {
+        events.push(PersistenceEvent::new(
+            PersistenceEventKind::Custom(Cow::Borrowed("spike_hits")),
+            spike_hits as usize,
+        ));
+    }
+    events
+}
+
+/// Assemble a persistence batch from a drained boundary (bd-mv2j).
+///
+/// The storage side of the science/storage seam. It takes no `self` and no world state: every
+/// value it needs was reduced to owned data by `WorldState::drain_persistence_boundary`, so
+/// there is nothing here to reach back through. `WorldState`, `self.config`, `self.agents`,
+/// `self.runtime`, and the `pending_*` buffers do not appear below, which is the test for
+/// whether the seam is in the right place.
+///
+/// The boundary decision is read off the [`BoundaryDrain`] variant. Configuration is never
+/// re-tested here: if this function had to look at `persistence_interval` or `analytics_stride`
+/// to decide what to emit, the cut would be in the wrong place.
+///
+/// Metric EMISSION ORDER is load-bearing and is preserved exactly as the single function
+/// emitted it. `serde_json` is built with `preserve_order` workspace-wide, so insertion order
+/// reaches serialized output: reordering these pushes would change bytes downstream without
+/// changing a single value. `a_projected_batch_carries_every_metric_family` pins the sequence.
+fn project_persistence_batch(drain: BoundaryDrain) -> PersistenceProjection {
+    let ready = match drain {
+        BoundaryDrain::Disabled => return PersistenceProjection::disabled(),
+        BoundaryDrain::Deferred => return PersistenceProjection::deferred(),
+        BoundaryDrain::Ready(ready) => *ready,
+    };
+
+    let summary = TickSummary {
+        tick: ready.tick,
+        agent_count: ready.agent_count,
+        births: ready.births,
+        deaths: ready.deaths,
+        total_energy: ready.total_energy,
+        average_energy: ready.average_energy,
+        average_health: ready.average_health,
+        max_age: ready.max_age,
+        spike_hits: ready.spike_hits,
+    };
+    let mut metrics = vec![
+        MetricSample::from_f32("total_energy", summary.total_energy),
+        MetricSample::from_f32("average_energy", summary.average_energy),
+        MetricSample::from_f32("average_health", summary.average_health),
+    ];
+    if ready.carcass_health_distributed > 0.0 {
+        metrics.push(MetricSample::from_f32(
+            "carcass_health_distributed",
+            ready.carcass_health_distributed,
+        ));
+    }
+    if ready.carcass_reproduction_bonus > 0.0 {
+        metrics.push(MetricSample::from_f32(
+            "carcass_reproduction_bonus",
+            ready.carcass_reproduction_bonus,
+        ));
+    }
+
+    if let Some(macro_metrics) = ready.macro_metrics.as_ref() {
+        project_macro_metrics(macro_metrics, &mut metrics);
+    }
+
+    if let Some(behavior) = ready.behavior_metrics.as_ref() {
+        project_signal_metrics(
+            SignalMetricNames {
+                mean: "behavior.sensors.mean",
+                stddev: "behavior.sensors.stddev",
+                max: "behavior.sensors.max",
+                entropy: "behavior.sensors.entropy",
+            },
+            &behavior.sensor_mean,
+            &behavior.sensor_max,
+            &behavior.sensor_entropy,
+            &mut metrics,
+        );
+        project_signal_metrics(
+            SignalMetricNames {
+                mean: "behavior.outputs.mean",
+                stddev: "behavior.outputs.stddev",
+                max: "behavior.outputs.max",
+                entropy: "behavior.outputs.entropy",
+            },
+            &behavior.output_mean,
+            &behavior.output_max,
+            &behavior.output_entropy,
+            &mut metrics,
+        );
+    }
+
+    let events = project_persistence_events(&summary, ready.spike_attempts, ready.spike_hits);
+
+    project_mortality_metrics(ready.mortality.as_ref(), &mut metrics);
+    project_birth_metrics(ready.birth_composition.as_ref(), &mut metrics);
+
+    PersistenceProjection::ready(PersistenceBatch {
+        summary,
+        epoch: ready.epoch,
+        closed: ready.closed,
+        metrics,
+        events,
+        agents: ready.agents,
+        births: ready.birth_records,
+        deaths: ready.death_records,
+        replay_events: ready.replay_events,
+        narrative_events: ready.narrative_events,
+    })
 }
 
 // bd-9zq2: no numeric lint is allowed across this implementation. Validated geometry and
@@ -21366,331 +21901,6 @@ impl WorldState {
             value.clamp(min, max)
         }
     }
-    /// Append mortality-breakdown metrics for the ticks that recorded deaths (bd-mv2j).
-    ///
-    /// Read-only over `self`. Nothing is emitted when the cadence is off or no deaths were
-    /// recorded, so an absent row means "not sampled" rather than "zero deaths" — the ratios
-    /// in particular would be meaningless against a zero denominator.
-    fn project_mortality_metrics(&self, lifecycle_enabled: bool, metrics: &mut Vec<MetricSample>) {
-        if !lifecycle_enabled || self.pending_lifecycle_death_metrics.is_empty() {
-            return;
-        }
-        let mut combat_carnivore = 0usize;
-        let mut combat_herbivore = 0usize;
-        let mut starvation = 0usize;
-        let mut aging = 0usize;
-        let mut unknown = 0usize;
-        for record in &self.pending_lifecycle_death_metrics {
-            match record.cause {
-                DeathCause::CombatCarnivore => combat_carnivore += 1,
-                DeathCause::CombatHerbivore => combat_herbivore += 1,
-                DeathCause::Starvation => starvation += 1,
-                DeathCause::Aging => aging += 1,
-                DeathCause::Unknown => unknown += 1,
-            }
-        }
-        let total = combat_carnivore + combat_herbivore + starvation + aging + unknown;
-        if total == 0 {
-            return;
-        }
-        metrics.push(MetricSample::new(
-            "mortality.combat_carnivore.count",
-            telemetry_count_f64(combat_carnivore),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.combat_herbivore.count",
-            telemetry_count_f64(combat_herbivore),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.starvation.count",
-            telemetry_count_f64(starvation),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.aging.count",
-            telemetry_count_f64(aging),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.unknown.count",
-            telemetry_count_f64(unknown),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.total.count",
-            telemetry_count_f64(total),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.combat_carnivore.ratio",
-            telemetry_count_f64(combat_carnivore) / telemetry_count_f64(total),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.combat_herbivore.ratio",
-            telemetry_count_f64(combat_herbivore) / telemetry_count_f64(total),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.starvation.ratio",
-            telemetry_count_f64(starvation) / telemetry_count_f64(total),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.aging.ratio",
-            telemetry_count_f64(aging) / telemetry_count_f64(total),
-        ));
-        metrics.push(MetricSample::new(
-            "mortality.unknown.ratio",
-            telemetry_count_f64(unknown) / telemetry_count_f64(total),
-        ));
-    }
-
-    /// Append birth-composition metrics for the ticks that recorded births (bd-mv2j).
-    ///
-    /// The hybrid ratio is guarded on a nonzero denominator rather than emitted as NaN.
-    fn project_birth_metrics(&self, lifecycle_enabled: bool, metrics: &mut Vec<MetricSample>) {
-        if !lifecycle_enabled || self.pending_lifecycle_birth_metrics.is_empty() {
-            return;
-        }
-        let total = self.pending_lifecycle_birth_metrics.len();
-        let hybrid = self
-            .pending_lifecycle_birth_metrics
-            .iter()
-            .filter(|record| record.is_hybrid)
-            .count();
-        metrics.push(MetricSample::new(
-            "births.total.count",
-            telemetry_count_f64(total),
-        ));
-        metrics.push(MetricSample::new(
-            "births.hybrid.count",
-            telemetry_count_f64(hybrid),
-        ));
-        if total > 0 {
-            metrics.push(MetricSample::new(
-                "births.hybrid.ratio",
-                telemetry_count_f64(hybrid) / telemetry_count_f64(total),
-            ));
-        }
-    }
-
-    /// Project the macro analytics family from one tick's population aggregates (bd-mv2j).
-    ///
-    /// Emitted only when the macro cadence selects this tick; the caller gates on that, so an
-    /// absent family means "not sampled" rather than "all zero".
-    fn project_macro_metrics(&self, agg: &TickAggregates, metrics: &mut Vec<MetricSample>) {
-        metrics.push(MetricSample::new(
-            "population.carnivore.count",
-            telemetry_count_f64(agg.carnivores),
-        ));
-        metrics.push(MetricSample::new(
-            "population.herbivore.count",
-            telemetry_count_f64(agg.herbivores),
-        ));
-        metrics.push(MetricSample::new(
-            "population.hybrid.count",
-            telemetry_count_f64(agg.hybrids),
-        ));
-
-        if agg.carnivores > 0 {
-            metrics.push(MetricSample::new(
-                "population.carnivore.avg_energy",
-                agg.carnivore_energy / telemetry_count_f64(agg.carnivores),
-            ));
-        }
-        if agg.herbivores > 0 {
-            metrics.push(MetricSample::new(
-                "population.herbivore.avg_energy",
-                agg.herbivore_energy / telemetry_count_f64(agg.herbivores),
-            ));
-        }
-        if agg.hybrids > 0 {
-            metrics.push(MetricSample::new(
-                "population.hybrid.avg_energy",
-                agg.hybrid_energy / telemetry_count_f64(agg.hybrids),
-            ));
-        }
-
-        metrics.push(MetricSample::new(
-            "mutation.primary.mean",
-            agg.mutation_primary.mean(),
-        ));
-        metrics.push(MetricSample::new(
-            "mutation.primary.stddev",
-            agg.mutation_primary.stddev(),
-        ));
-        metrics.push(MetricSample::new(
-            "mutation.secondary.mean",
-            agg.mutation_secondary.mean(),
-        ));
-        metrics.push(MetricSample::new(
-            "mutation.secondary.stddev",
-            agg.mutation_secondary.stddev(),
-        ));
-        metrics.push(MetricSample::new(
-            "traits.smell.mean",
-            agg.trait_smell.mean(),
-        ));
-        metrics.push(MetricSample::new(
-            "traits.sound.mean",
-            agg.trait_sound.mean(),
-        ));
-        metrics.push(MetricSample::new(
-            "traits.hearing.mean",
-            agg.trait_hearing.mean(),
-        ));
-        metrics.push(MetricSample::new("traits.eye.mean", agg.trait_eye.mean()));
-        metrics.push(MetricSample::new(
-            "traits.blood.mean",
-            agg.trait_blood.mean(),
-        ));
-        metrics.push(MetricSample::new(
-            "herbivore_tendency.mean",
-            agg.herbivore_tendency_stats.mean(),
-        ));
-        metrics.push(MetricSample::new(
-            "herbivore_tendency.stddev",
-            agg.herbivore_tendency_stats.stddev(),
-        ));
-
-        if agg.agent_count > 0 {
-            metrics.push(MetricSample::new(
-                "food_delta.mean",
-                agg.food_delta_sum / telemetry_count_f64(agg.agent_count),
-            ));
-            metrics.push(MetricSample::new(
-                "food_delta.mean_abs",
-                agg.food_delta_abs_sum / telemetry_count_f64(agg.agent_count),
-            ));
-            metrics.push(MetricSample::new(
-                "population.age.mean",
-                agg.age_sum / telemetry_count_f64(agg.agent_count),
-            ));
-            metrics.push(MetricSample::new(
-                "population.age.max",
-                f64::from(agg.age_max),
-            ));
-            metrics.push(MetricSample::new(
-                "behavior.boost.count",
-                telemetry_count_f64(agg.boost_count),
-            ));
-            metrics.push(MetricSample::new(
-                "behavior.boost.ratio",
-                if agg.agent_count > 0 {
-                    telemetry_count_f64(agg.boost_count) / telemetry_count_f64(agg.agent_count)
-                } else {
-                    0.0
-                },
-            ));
-            metrics.push(MetricSample::new(
-                "reproduction.counter.mean",
-                agg.reproduction_counter_stats.mean(),
-            ));
-            metrics.push(MetricSample::new(
-                "temperature.preference.mean",
-                agg.temperature_pref_stats.mean(),
-            ));
-            metrics.push(MetricSample::new(
-                "temperature.preference.stddev",
-                agg.temperature_pref_stats.stddev(),
-            ));
-            metrics.push(MetricSample::new(
-                "population.generation.mean",
-                agg.generation_sum / telemetry_count_f64(agg.agent_count),
-            ));
-            metrics.push(MetricSample::new(
-                "population.generation.max",
-                f64::from(agg.generation_max),
-            ));
-            metrics.push(MetricSample::new(
-                "temperature.discomfort.mean",
-                agg.temperature_discomfort_stats.mean(),
-            ));
-            metrics.push(MetricSample::new(
-                "temperature.discomfort.stddev",
-                agg.temperature_discomfort_stats.stddev(),
-            ));
-        }
-
-        if let Some((total, mean, variance, max)) = summarize_food_grid(self.food.cells()) {
-            metrics.push(MetricSample::new("food.total", total));
-            metrics.push(MetricSample::new("food.mean", mean));
-            metrics.push(MetricSample::new("food.stddev", variance.sqrt()));
-            metrics.push(MetricSample::from_f32("food.max", max));
-        }
-
-        if let Some(hydrology) = self.hydrology.as_ref() {
-            let total_water = hydrology.total_water_depth();
-            let flooded = hydrology.flooded_cell_counts(0.05, 0.2);
-            let cell_count = telemetry_count_f64(hydrology.cell_count().max(1));
-            metrics.push(MetricSample::new(
-                "hydrology.water.total_depth",
-                f64::from(total_water),
-            ));
-            metrics.push(MetricSample::new(
-                "hydrology.water.mean_depth",
-                f64::from(total_water) / cell_count,
-            ));
-            metrics.push(MetricSample::new(
-                "hydrology.water.flooded.shallow.count",
-                telemetry_count_f64(flooded.0),
-            ));
-            metrics.push(MetricSample::new(
-                "hydrology.water.flooded.deep.count",
-                telemetry_count_f64(flooded.1),
-            ));
-            metrics.push(MetricSample::new(
-                "hydrology.water.flooded.shallow.ratio",
-                telemetry_count_f64(flooded.0) / cell_count,
-            ));
-            metrics.push(MetricSample::new(
-                "hydrology.water.flooded.deep.ratio",
-                telemetry_count_f64(flooded.1) / cell_count,
-            ));
-        }
-
-        for (label, (count, energy_sum)) in &agg.brain_map {
-            let (count, energy_sum) = (*count, *energy_sum);
-            let key = sanitize_metric_key(label);
-            metrics.push(MetricSample::new(
-                format!("brain.population.{key}.count"),
-                telemetry_count_f64(count),
-            ));
-            if count > 0 {
-                metrics.push(MetricSample::new(
-                    format!("brain.population.{key}.avg_energy"),
-                    energy_sum / telemetry_count_f64(count),
-                ));
-            }
-        }
-    }
-    /// Project the tick's countable events into the batch's event rows (bd-mv2j).
-    ///
-    /// Read-only over `self`: an event row is emitted only for a nonzero count, so an
-    /// honest zero stays absent rather than being recorded as a zero-valued row.
-    fn project_persistence_events(&self, summary: &TickSummary) -> Vec<PersistenceEvent> {
-        let mut events = Vec::with_capacity(4);
-        if summary.births > 0 {
-            events.push(PersistenceEvent::new(
-                PersistenceEventKind::Births,
-                summary.births,
-            ));
-        }
-        if summary.deaths > 0 {
-            events.push(PersistenceEvent::new(
-                PersistenceEventKind::Deaths,
-                summary.deaths,
-            ));
-        }
-        if self.pending_spike_attempt_events > 0 {
-            events.push(PersistenceEvent::new(
-                PersistenceEventKind::Custom(Cow::Borrowed("spike_attempts")),
-                self.pending_spike_attempt_events as usize,
-            ));
-        }
-        if self.pending_spike_hit_events > 0 {
-            events.push(PersistenceEvent::new(
-                PersistenceEventKind::Custom(Cow::Borrowed("spike_hits")),
-                self.pending_spike_hit_events as usize,
-            ));
-        }
-        events
-    }
-
     /// Project live agents into the batch's agent rows, ordered by stable `AgentUid` (bd-mv2j).
     ///
     /// The ordering is not cosmetic: persistence rows are compared across runs, so they must
@@ -21739,15 +21949,26 @@ impl WorldState {
         agents
     }
 
-    // bd-tqpj: cadence batch assembly; reviewed as a unit per lint policy.
-    // bd-mv2j: event and agent-row projection extracted above; the aggregation pass and
-    // metric assembly remain inline pending their own reviewed change.
+    // bd-tqpj: cadence boundary drain; reviewed as a unit per lint policy.
+    /// Drain a completed boundary into owned data plus the persistence decision (bd-mv2j).
+    ///
+    /// The world side of the science/storage seam. It performs every mutation the boundary
+    /// owes -- draining the pending record buffers, clearing the runtime tail, zeroing the
+    /// tick counters -- and reduces every world-derived scalar the metric families need. It
+    /// constructs no batch type at all: `PersistenceBatch`, `TickSummary`, `MetricSample`,
+    /// and `PersistenceEvent` do not appear below, which is the test for whether the seam is
+    /// in the right place.
+    ///
+    /// All three outcomes are decided here, because all three are world-side bookkeeping that
+    /// never builds a batch. Carrying the decision as a [`BoundaryDrain`] variant is what lets
+    /// the projection map outcome to status without re-testing `persistence_interval` or
+    /// `analytics_stride`.
     #[allow(clippy::too_many_lines)]
-    fn prepare_persistence(
+    fn drain_persistence_boundary(
         &mut self,
         next_tick: Tick,
         force_partial_batch: bool,
-    ) -> PersistenceProjection {
+    ) -> BoundaryDrain {
         debug_assert!(
             !matches!(
                 self.persistence_boundary,
@@ -21774,7 +21995,7 @@ impl WorldState {
             self.pending_spike_attempt_events = 0;
             self.pending_spike_hit_events = 0;
             self.pending_persistence_runtime_tail.clear();
-            return PersistenceProjection::disabled();
+            return BoundaryDrain::Disabled;
         }
 
         let analytics = self.config.analytics_stride;
@@ -21787,7 +22008,7 @@ impl WorldState {
                 self.pending_lifecycle_birth_metrics.clear();
                 self.pending_lifecycle_death_metrics.clear();
             }
-            return PersistenceProjection::deferred();
+            return BoundaryDrain::Deferred;
         }
 
         let macro_enabled = analytics.macro_metrics != 0
@@ -21974,35 +22195,6 @@ impl WorldState {
         let (total_energy, average_energy) = energy_sum.finish();
         let (_, average_health) = health_sum.finish();
 
-        let summary = TickSummary {
-            tick: next_tick,
-            agent_count,
-            births: self.pending_birth_events,
-            deaths: self.pending_death_events,
-            total_energy,
-            average_energy,
-            average_health,
-            max_age: age_max,
-            spike_hits: self.pending_spike_hit_events,
-        };
-        let mut metrics = vec![
-            MetricSample::from_f32("total_energy", summary.total_energy),
-            MetricSample::from_f32("average_energy", summary.average_energy),
-            MetricSample::from_f32("average_health", summary.average_health),
-        ];
-        if self.carcass_health_distributed > 0.0 {
-            metrics.push(MetricSample::from_f32(
-                "carcass_health_distributed",
-                self.carcass_health_distributed,
-            ));
-        }
-        if self.carcass_reproduction_bonus > 0.0 {
-            metrics.push(MetricSample::from_f32(
-                "carcass_reproduction_bonus",
-                self.carcass_reproduction_bonus,
-            ));
-        }
-
         let agg = TickAggregates {
             agent_count,
             carnivores,
@@ -22031,63 +22223,98 @@ impl WorldState {
             generation_max,
             brain_map,
         };
-        if macro_enabled {
-            self.project_macro_metrics(&agg, &mut metrics);
-        }
 
-        if behavior_enabled {
-            project_signal_metrics(
-                SignalMetricNames {
-                    mean: "behavior.sensors.mean",
-                    stddev: "behavior.sensors.stddev",
-                    max: "behavior.sensors.max",
-                    entropy: "behavior.sensors.entropy",
-                },
-                &sensor_mean,
-                &sensor_max,
-                &sensor_entropy,
-                &mut metrics,
-            );
-            project_signal_metrics(
-                SignalMetricNames {
-                    mean: "behavior.outputs.mean",
-                    stddev: "behavior.outputs.stddev",
-                    max: "behavior.outputs.max",
-                    entropy: "behavior.outputs.entropy",
-                },
-                &output_mean,
-                &output_max,
-                &output_entropy,
-                &mut metrics,
-            );
-        }
+        // The world-derived scalars the macro family projects from are reduced HERE, at the
+        // boundary, rather than read from `self` inside the projection. That is the whole
+        // reason the projection can stop being a method on WorldState.
+        let macro_metrics = macro_enabled.then(|| MacroProjection {
+            aggregates: agg,
+            food_grid: summarize_food_grid(self.food.cells()),
+            hydrology: self.hydrology.as_ref().map(|hydrology| {
+                let flooded = hydrology.flooded_cell_counts(0.05, 0.2);
+                HydrologyProjection {
+                    total_water: hydrology.total_water_depth(),
+                    flooded_shallow: flooded.0,
+                    flooded_deep: flooded.1,
+                    cell_count: telemetry_count_f64(hydrology.cell_count().max(1)),
+                }
+            }),
+        });
 
-        let events = self.project_persistence_events(&summary);
+        let behavior_metrics = behavior_enabled.then_some(BehaviorProjection {
+            sensor_mean,
+            sensor_max,
+            sensor_entropy,
+            output_mean,
+            output_max,
+            output_entropy,
+        });
+
         let agents = self.project_agent_states(&handles, force_partial_batch);
 
-        self.project_mortality_metrics(lifecycle_enabled, &mut metrics);
-        self.project_birth_metrics(lifecycle_enabled, &mut metrics);
+        // Tally the lifecycle causes here so the projection never sees a DeathRecord or a
+        // BirthRecord for metric purposes. `None` carries "not sampled", which is the
+        // distinction the projection needs and the only one it is allowed to know about --
+        // it must not re-test `analytics_stride` to rediscover it.
+        let mortality = (lifecycle_enabled && !self.pending_lifecycle_death_metrics.is_empty())
+            .then(|| {
+                let mut counts = MortalityCounts::default();
+                for record in &self.pending_lifecycle_death_metrics {
+                    match record.cause {
+                        DeathCause::CombatCarnivore => counts.combat_carnivore += 1,
+                        DeathCause::CombatHerbivore => counts.combat_herbivore += 1,
+                        DeathCause::Starvation => counts.starvation += 1,
+                        DeathCause::Aging => counts.aging += 1,
+                        DeathCause::Unknown => counts.unknown += 1,
+                    }
+                }
+                counts
+            });
+        let birth_composition = (lifecycle_enabled
+            && !self.pending_lifecycle_birth_metrics.is_empty())
+        .then(|| BirthComposition {
+            total: self.pending_lifecycle_birth_metrics.len(),
+            hybrid: self
+                .pending_lifecycle_birth_metrics
+                .iter()
+                .filter(|record| record.is_hybrid)
+                .count(),
+        });
 
-        let births = std::mem::take(&mut self.pending_birth_records);
-        let deaths = std::mem::take(&mut self.pending_death_records);
+        let birth_records = std::mem::take(&mut self.pending_birth_records);
+        let death_records = std::mem::take(&mut self.pending_death_records);
         if lifecycle_enabled || analytics.lifecycle_events == 0 {
             self.pending_lifecycle_birth_metrics.clear();
             self.pending_lifecycle_death_metrics.clear();
         }
 
         // A driver-requested world digest rides this boundary's batch so the digest covers
-        // the completed post-tick state and the verifying driver sees the same shape.
+        // the completed post-tick state and the verifying driver sees the same shape. This
+        // must stay ahead of the replay-event take below or the digest misses its own tick.
         self.append_requested_replay_world_digest();
 
-        let batch = PersistenceBatch {
-            summary,
+        let ready = BoundaryReady {
+            tick: next_tick,
             epoch: self.epoch,
             closed: self.config.closed,
-            metrics,
-            events,
+            agent_count,
+            births: self.pending_birth_events,
+            deaths: self.pending_death_events,
+            spike_attempts: self.pending_spike_attempt_events,
+            spike_hits: self.pending_spike_hit_events,
+            total_energy,
+            average_energy,
+            average_health,
+            max_age: age_max,
+            carcass_health_distributed: self.carcass_health_distributed,
+            carcass_reproduction_bonus: self.carcass_reproduction_bonus,
+            macro_metrics,
+            behavior_metrics,
+            mortality,
+            birth_composition,
             agents,
-            births,
-            deaths,
+            birth_records,
+            death_records,
             replay_events: std::mem::take(&mut self.replay_events),
             narrative_events: self.narrative.drain_pending_persistence(),
         };
@@ -22098,7 +22325,21 @@ impl WorldState {
         self.pending_spike_hit_events = 0;
         self.carcass_health_distributed = 0.0;
         self.carcass_reproduction_bonus = 0.0;
-        PersistenceProjection::ready(batch)
+        BoundaryDrain::Ready(Box::new(ready))
+    }
+
+    /// Evaluate persistence policy at a completed boundary and project the owed batch.
+    ///
+    /// bd-mv2j: the two halves below are the science/storage seam. Everything that reads or
+    /// mutates world state lives in `drain_persistence_boundary`; everything that builds a
+    /// batch lives in `project_persistence_batch`, which takes no `self` and cannot reach
+    /// world state even by accident. The name and signature are unchanged so no caller moves.
+    fn prepare_persistence(
+        &mut self,
+        next_tick: Tick,
+        force_partial_batch: bool,
+    ) -> PersistenceProjection {
+        project_persistence_batch(self.drain_persistence_boundary(next_tick, force_partial_batch))
     }
 
     /// Execute one persistence-disabled simulation tick and return its emitted events.
@@ -26379,6 +26620,15 @@ mod tests {
     fn default_config_constructs_world() {
         let config = ScriptBotsConfig::default();
         WorldState::new(config).expect("default config should be valid");
+    }
+
+    #[test]
+    fn default_spike_alignment_cosine_has_target_independent_bits() {
+        assert_eq!(
+            ScriptBotsConfig::default().spike_alignment_cosine.to_bits(),
+            0x3f6c_835e,
+            "the default scientific config must not depend on a target-local cos implementation"
+        );
     }
 
     #[test]
@@ -37619,7 +37869,22 @@ mod tests {
         assert_eq!(tail.summary.deaths, 1);
         assert_eq!(tail.births, vec![lifecycle_birth(4)]);
         assert_eq!(tail.deaths, vec![lifecycle_death(4)]);
-        assert_eq!(tail.replay_events, vec![replay_marker(0.4)]);
+        // de0a24bfe turned the replay stream on by default (cap 512, previously 0), so the live
+        // agent's own positioned Action row now legitimately rides this tail alongside the
+        // marker the test pushed. The old assertion pinned the marker as the ONLY event, which
+        // held only while the stream was off -- it fails precisely when the feature WORKS.
+        //
+        // This test is about the partial tail being admitted exactly once, so it pins the
+        // marker's presence and multiplicity and leaves the stream's full contents to the
+        // replay tests, which own that surface.
+        assert_eq!(
+            tail.replay_events
+                .iter()
+                .filter(|event| **event == replay_marker(0.4))
+                .count(),
+            1,
+            "the partial tail must carry its replay marker exactly once"
+        );
         assert!((tail.agents[0].runtime.food_delta - 0.4).abs() < 1e-6);
         assert!(tail.metrics.iter().any(|metric| {
             metric.name == "food_delta.mean" && (metric.value - 0.4).abs() < 1e-6
@@ -41634,6 +41899,220 @@ mod tests {
             "brain population family missing from {} emitted metrics",
             names.len()
         );
+    }
+
+    /// bd-mv2j: byte-level capture of every projected batch over a deterministic run.
+    ///
+    /// Ignored by default because this is a REFACTOR PROOF, not an invariant. It renders whole
+    /// `PersistenceBatch` values, so any legitimate field added anywhere in the batch's types
+    /// changes its output. Pinning that in the tree would fail for every agent who adds a field
+    /// to `AgentData`, `BirthRecord`, or `ReplayEvent`. Instead it is run twice by hand around a
+    /// refactor that claims to preserve behaviour:
+    ///
+    /// ```text
+    /// SB_SEAM_DUMP=/tmp/before cargo test -p scriptbots-core -- --ignored a_seam_batch_dump
+    /// # apply the refactor
+    /// SB_SEAM_DUMP=/tmp/after  cargo test -p scriptbots-core -- --ignored a_seam_batch_dump
+    /// cmp /tmp/before /tmp/after
+    /// ```
+    ///
+    /// Why BYTES and not values: `serde_json` is built with `preserve_order` workspace-wide, so
+    /// insertion order reaches serialized output. A reordering changes bytes without changing a
+    /// single value, and no value-level assertion catches it -- which is exactly why metric
+    /// emission order is pinned in `a_projected_batch_carries_every_metric_family`. `Debug`
+    /// renders sequences in order, so a diff here catches the class of defect that a
+    /// metric-value assertion is blind to.
+    ///
+    /// The metric, summary, and event streams are rendered in full because they are what a
+    /// projection refactor restructures. The bulk streams are reduced to digests so the dump
+    /// stays diffable; a digest still fails loudly, it just does not say which row moved.
+    #[test]
+    #[ignore = "bd-mv2j refactor proof; set SB_SEAM_DUMP=<path> and run before and after"]
+    fn a_seam_batch_dump() {
+        let dump_path = std::env::var("SB_SEAM_DUMP")
+            .expect("set SB_SEAM_DUMP=<path> to capture the projected batch rendering");
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let (mut world, mut session) = world_with_session(
+            ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                persistence_interval: 1,
+                analytics_stride: AnalyticsStride {
+                    macro_metrics: 1,
+                    behavior_metrics: 1,
+                    lifecycle_events: 1,
+                },
+                rng_seed: Some(0x4D56_324A),
+                ..ScriptBotsConfig::default()
+            },
+            SpyPersistence {
+                logs: Arc::clone(&logs),
+            },
+        );
+        for seed in 0..24u32 {
+            let _ = world.try_spawn_agent(sample_agent(seed));
+        }
+        for _ in 0..120 {
+            session.step(&mut world).expect("projected tick");
+        }
+
+        let batches = logs.lock().expect("spy logs");
+        let mut rendered = String::new();
+        for batch in batches.iter() {
+            render_projected_batch(&mut rendered, batch);
+        }
+        assert!(
+            !batches.is_empty(),
+            "the proof harness must project at least one batch or it proves nothing"
+        );
+
+        // A simulated run does not reach every projection branch. Measured on the run above:
+        // `births.*` never fires (no reproduction), `hydrology.*` never fires (default config
+        // imports no hydrology), and `population.hybrid.avg_energy` never fires (no hybrids).
+        // Those are branches this refactor restructures, so a dump that skips them would prove
+        // nothing about them. Drive them directly instead of tuning the simulation until they
+        // happen by luck.
+        rendered.push_str("== synthetic branch coverage\n");
+        render_projected_batch(&mut rendered, &synthetic_full_coverage_batch());
+
+        std::fs::write(&dump_path, rendered.as_bytes()).expect("write seam dump");
+    }
+
+    /// Render one projected batch for the bd-mv2j seam proof.
+    ///
+    /// Summary, metrics, and events are rendered in full because they are what a projection
+    /// refactor restructures and their ORDER is what a value assertion cannot see. The bulk
+    /// row streams are reduced to digests so the dump stays diffable; a digest still fails
+    /// loudly, it just does not say which row moved.
+    fn render_projected_batch(out: &mut String, batch: &PersistenceBatch) {
+        let digest = |value: String| blake3::hash(value.as_bytes()).to_hex().to_string();
+        out.push_str(&format!(
+            "== tick {} epoch {} closed {}\n",
+            batch.summary.tick.0, batch.epoch, batch.closed
+        ));
+        out.push_str(&format!("summary {:?}\n", batch.summary));
+        out.push_str(&format!("metrics {:?}\n", batch.metrics));
+        out.push_str(&format!("events {:?}\n", batch.events));
+        out.push_str(&format!("agents {}\n", digest(format!("{:?}", batch.agents))));
+        out.push_str(&format!("births {}\n", digest(format!("{:?}", batch.births))));
+        out.push_str(&format!("deaths {}\n", digest(format!("{:?}", batch.deaths))));
+        out.push_str(&format!(
+            "replay {}\n",
+            digest(format!("{:?}", batch.replay_events))
+        ));
+        out.push_str(&format!(
+            "narrative {}\n",
+            digest(format!("{:?}", batch.narrative_events))
+        ));
+    }
+
+    /// Project one batch with every metric family forced on, for the bd-mv2j seam proof.
+    ///
+    /// Seeds the pending buffers and world state directly rather than waiting for a simulation
+    /// to reach these states, so the dump covers the hydrology, birth-composition, mortality,
+    /// hybrid-population, and carcass branches deterministically.
+    fn synthetic_full_coverage_batch() -> PersistenceBatch {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            persistence_interval: 1,
+            analytics_stride: AnalyticsStride {
+                macro_metrics: 1,
+                behavior_metrics: 1,
+                lifecycle_events: 1,
+            },
+            rng_seed: Some(0x5EA3_0001),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("synthetic world");
+
+        for seed in 0..6u32 {
+            let _ = world.try_spawn_agent(sample_agent(seed));
+        }
+        // Half hybrid, so the hybrid population and avg_energy branches both emit.
+        let handles: Vec<AgentId> = world.agents.iter_handles().collect();
+        for (index, id) in handles.iter().enumerate() {
+            if index.is_multiple_of(2)
+                && let Some(runtime) = world.runtime.get_mut(*id)
+            {
+                runtime.hybrid = true;
+            }
+        }
+
+        let tile = HydrologyTile {
+            permeability: 0.5,
+            runoff_bias: 0.0,
+            basin_rank: 0.25,
+            channel_priority: 0.5,
+            swim_cost: 1.0,
+        };
+        let tiles = HydrologyTileLayer::new(2, 2, vec![tile; 4]).expect("hydrology tiles");
+        let field = HydrologyField::new(
+            2,
+            2,
+            vec![HydrologyFlowDirection::None; 4],
+            vec![0.0; 4],
+            vec![0.0; 4],
+            vec![0; 4],
+            // Straddles both flood thresholds (0.05 shallow, 0.2 deep) so all four
+            // flooded-cell metrics carry a nonzero count.
+            vec![0.0, 0.1, 0.3, 0.5],
+        )
+        .expect("hydrology field");
+        world.hydrology = Some(HydrologyState::new(tiles, field).expect("hydrology state"));
+
+        let death = |uid: u64, cause: DeathCause| DeathRecord {
+            tick: Tick(1),
+            agent_uid: AgentUid(uid),
+            age: 42,
+            generation: Generation(3),
+            herbivore_tendency: 0.5,
+            brain_kind: None,
+            brain_key: None,
+            energy: 0.25,
+            food_balance_total: 1.5,
+            cause,
+            was_hybrid: false,
+            combat_flags: CombatEventFlags::default(),
+        };
+        world.pending_lifecycle_death_metrics = vec![
+            death(1, DeathCause::CombatCarnivore),
+            death(2, DeathCause::CombatHerbivore),
+            death(3, DeathCause::Starvation),
+            death(4, DeathCause::Aging),
+            death(5, DeathCause::Unknown),
+        ];
+
+        let birth = |uid: u64, is_hybrid: bool| BirthRecord {
+            tick: Tick(1),
+            agent_uid: AgentUid(uid),
+            spawn_ordinal: uid,
+            birth_ordinal: Some(uid),
+            origin: BirthOrigin::Born,
+            parent_a: Some(AgentUid(100)),
+            parent_b: Some(AgentUid(101)),
+            brain_kind: None,
+            brain_key: None,
+            herbivore_tendency: 0.5,
+            generation: Generation(2),
+            position: Position { x: 10.0, y: 20.0 },
+            is_hybrid,
+        };
+        world.pending_lifecycle_birth_metrics =
+            vec![birth(10, true), birth(11, false), birth(12, true)];
+
+        world.carcass_health_distributed = 1.5;
+        world.carcass_reproduction_bonus = 0.75;
+        world.pending_spike_attempt_events = 3;
+        world.pending_spike_hit_events = 2;
+        world.pending_birth_events = 3;
+        world.pending_death_events = 5;
+
+        let projection = world.prepare_persistence(Tick(1), false);
+        projection
+            .batch()
+            .expect("synthetic projection must be ready")
+            .clone()
     }
 
     fn quiet_trace_config(seed: u64, persistence_interval: u32) -> ScriptBotsConfig {
