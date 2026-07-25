@@ -18,7 +18,9 @@ The crate exposes the following wasm-bindgen surface:
 - `default_init_options() -> JsValue` — returns the JSON-serialisable `InitOptions` structure with defaults applied.
 - `init_sim(options: JsValue) -> SimHandle` — constructs a simulation using the supplied options. Recognised fields include:
   - `population` (usize): initial spawn count (defaults to 64).
-  - `seed` (u64): RNG seed; when omitted a random seed is selected on the JS side.
+  - `seed` (u64): explicit RNG seed. It overrides `config.rng_seed`; when omitted,
+    the nested config seed is preserved. If both are omitted, core seeds the world
+    from entropy.
   - `world_width` / `world_height`: override the world dimensions (pixels).
   - `config`: optional full `ScriptBotsConfig` override (rarely needed; defaults are usually sufficient).
   - `snapshot_format`: `"json"` (default) or `"binary"` (Postcard-encoded `Uint8Array`).
@@ -26,7 +28,9 @@ The crate exposes the following wasm-bindgen surface:
   - `default_brain`: `"mlp"` to pre-bind agents to the baseline MLP implementation during seeding.
 - `SimHandle::tick(steps: u32) -> JsValue` — advances the simulation and returns either JSON or a `Uint8Array` depending on `snapshot_format`.
 - `SimHandle::snapshot() -> JsValue` — builds a snapshot without ticking (uses the same format toggle).
-- `SimHandle::reset(seed?: number)` — rebuilds the world with an optional seed.
+- `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
+  overrides the nested config for that reset; omitting it falls back to the
+  original `config.rng_seed` (or entropy when the nested seed is also absent).
 - `SimHandle::registerBrain(kind: string)` — installs a brain preset for all agents (`"wander"`, `"mlp"`, or `"none"`).
 - `decode_snapshot_binary(bytes: &[u8]) -> JsValue` — helper exposed for JS callers to convert binary snapshots back into structured data.
 

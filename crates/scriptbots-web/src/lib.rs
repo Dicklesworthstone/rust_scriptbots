@@ -97,9 +97,13 @@ impl SimSpec {
         }
     }
 
+    fn effective_seed(&self) -> Option<u64> {
+        self.seed.or(self.base_config.rng_seed)
+    }
+
     fn config(&self) -> ScriptBotsConfig {
         let mut config = self.base_config.clone();
-        config.rng_seed = self.seed;
+        config.rng_seed = self.effective_seed();
         config.population_minimum = 0;
         config.population_spawn_interval = 0;
         config
@@ -118,7 +122,7 @@ impl Simulation {
             spec.default_brain,
             &mut mlp_key,
         )?;
-        let session_id = HostSessionId::new(spec.seed.unwrap_or(0));
+        let session_id = HostSessionId::new(spec.effective_seed().unwrap_or(0));
         let options = HostCoreOptions {
             initial_playback: PlaybackSnapshot {
                 paused: false,
@@ -148,7 +152,7 @@ impl Simulation {
             spec.default_brain,
             &mut self.mlp_key,
         )?;
-        let session_id = HostSessionId::new(seed.unwrap_or(0));
+        let session_id = HostSessionId::new(spec.effective_seed().unwrap_or(0));
         let options = HostCoreOptions {
             initial_playback: PlaybackSnapshot {
                 paused: false,
@@ -721,6 +725,118 @@ mod tests {
         assert_eq!(
             wander_random_streams, unbound_random_streams,
             "installing per-agent wander runners and refreshing their seeded origin records must not consume any world RNG domain"
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn nested_config_seed_controls_world_and_host_session_when_top_level_is_omitted() {
+        let simulation = Simulation::new(
+            InitOptions {
+                population: 0,
+                config: Some(ScriptBotsConfig {
+                    rng_seed: Some(11),
+                    ..ScriptBotsConfig::default()
+                }),
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .expect("nested-seeded web simulation");
+
+        assert_eq!(simulation.core.world().config().rng_seed, Some(11));
+        assert_eq!(
+            simulation.core.latest_snapshot().session_id,
+            HostSessionId::new(11)
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn top_level_seed_overrides_nested_config_for_world_and_host_session() {
+        let simulation = Simulation::new(
+            InitOptions {
+                seed: Some(22),
+                population: 0,
+                config: Some(ScriptBotsConfig {
+                    rng_seed: Some(11),
+                    ..ScriptBotsConfig::default()
+                }),
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .expect("top-level-seeded web simulation");
+
+        assert_eq!(simulation.core.world().config().rng_seed, Some(22));
+        assert_eq!(
+            simulation.core.latest_snapshot().session_id,
+            HostSessionId::new(22)
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn omitted_seeds_keep_entropy_config_with_zero_host_session_sentinel() {
+        let simulation = Simulation::new(
+            InitOptions {
+                population: 0,
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .expect("entropy-seeded web simulation");
+
+        assert_eq!(simulation.core.world().config().rng_seed, None);
+        assert_eq!(
+            simulation.core.latest_snapshot().session_id,
+            HostSessionId::new(0)
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn reset_uses_explicit_seed_then_falls_back_to_nested_config_seed() {
+        let mut simulation = Simulation::new(
+            InitOptions {
+                population: 3,
+                config: Some(ScriptBotsConfig {
+                    rng_seed: Some(11),
+                    ..ScriptBotsConfig::default()
+                }),
+                seed_strategy: Some(SeedStrategy::None),
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .expect("nested-seeded web simulation");
+        let nested_seed_digest = simulation
+            .core
+            .world()
+            .world_digest_v1()
+            .expect("nested-seed digest");
+
+        simulation.reset(Some(22)).expect("explicit-seed web reset");
+        assert_eq!(simulation.core.world().config().rng_seed, Some(22));
+        assert_eq!(
+            simulation.core.latest_snapshot().session_id,
+            HostSessionId::new(22)
+        );
+
+        simulation.reset(None).expect("nested-seed web reset");
+        assert_eq!(simulation.core.world().config().rng_seed, Some(11));
+        assert_eq!(
+            simulation.core.latest_snapshot().session_id,
+            HostSessionId::new(11)
+        );
+        assert_eq!(
+            simulation
+                .core
+                .world()
+                .world_digest_v1()
+                .expect("repeated nested-seed digest"),
+            nested_seed_digest,
+            "reset without an explicit seed must reproduce the nested seeded world"
         );
     }
 
