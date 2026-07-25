@@ -13197,16 +13197,8 @@ impl RenderFrame {
                 .hydrology()
                 .map(scriptbots_core::HydrologyState::water_depth),
         );
-        let (day_night_cycle_ticks, day_night_start_phase) = config
-            .render
-            .day_night
-            .as_ref()
-            .map_or((0, 0.25), |settings| {
-                (
-                    settings.cycle_ticks.unwrap_or(0),
-                    settings.start_phase.unwrap_or(0.25),
-                )
-            });
+        let (day_night_cycle_ticks, day_night_start_phase) =
+            config.render.resolved_day_night();
 
         Some(Self {
             tick: world.tick().0,
