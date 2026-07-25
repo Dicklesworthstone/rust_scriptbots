@@ -853,17 +853,23 @@ mod asupersync_runner {
             self.metrics
         }
 
-        /// Exact bounded envelopes retained when panic or terminal protocol
-        /// failure made truthful host status reconciliation impossible.
+        /// Exact bounded envelopes retained when panic, failed host admission,
+        /// terminal protocol failure, or runner extraction left caller-owned
+        /// work without a truthful host status.
         #[must_use]
         pub fn unresolved_envelopes(&self) -> &[CommandEnvelope] {
             &self.unresolved_envelopes
         }
 
-        /// Consume the runner and recover the exact retained host together
-        /// with every envelope whose terminal status could not be reconciled.
+        /// Consume the runner, close producer ingress, and recover the exact
+        /// retained host together with every unresolved envelope.
+        ///
+        /// Buffered command messages are drained in receiver FIFO order
+        /// without submitting them to the returned host. Payload-free wake
+        /// tokens are consumed while closing the runner.
         #[must_use]
-        pub fn into_parts(self) -> (FixedDeadlineHost, Vec<CommandEnvelope>) {
+        pub fn into_parts(mut self) -> (FixedDeadlineHost, Vec<CommandEnvelope>) {
+            self.close_runner_after_failure();
             (self.host, self.unresolved_envelopes)
         }
 
@@ -3414,6 +3420,46 @@ mod tests {
         assert!(runner.metrics().drive_calls <= 4);
         assert_eq!(runner.metrics().owned_tasks_started, 0);
         assert_eq!(runner.metrics().owned_tasks_joined, 0);
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn into_parts_retains_queued_commands_in_fifo_and_closes_ingress() {
+        let (core, _) = captured_host(60, true, ReceiptMode::Immediate);
+        let (runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("recoverable native runner");
+        let first = envelope(1, HostCommand::Step);
+        let second = envelope(2, HostCommand::Pause);
+        control
+            .try_submit(first.clone())
+            .expect("first queued command");
+        assert_eq!(control.wake(), NativeWakeResult::Enqueued);
+        control
+            .try_submit(second.clone())
+            .expect("second queued command");
+        assert_eq!(control.journal_ready(), NativeWakeResult::Enqueued);
+
+        let (host, unresolved) = runner.into_parts();
+
+        assert_eq!(unresolved, vec![first.clone(), second.clone()]);
+        let mut port = host.local_port();
+        for command in [&first, &second] {
+            assert!(
+                port.command_status(command.command_id)
+                    .expect("queued command status query")
+                    .is_none(),
+                "an envelope that never reached HostCore must remain caller-owned"
+            );
+        }
+        let after_close = envelope(3, HostCommand::Resume);
+        let returned = control
+            .try_submit(after_close.clone())
+            .expect_err("into_parts must seal producer ingress")
+            .into_envelope();
+        assert_eq!(returned, after_close);
+        assert_eq!(control.wake(), NativeWakeResult::Closed);
+        assert_eq!(control.journal_ready(), NativeWakeResult::Closed);
     }
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
