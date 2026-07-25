@@ -15600,6 +15600,42 @@ const fn legacy_clock_counter(next_tick: u64) -> u64 {
     next_tick % LEGACY_EPOCH_TICKS
 }
 
+/// Population aggregates accumulated by `prepare_persistence`'s single pass over live
+/// agents, carried to the metric projection so that pass and the ~170 lines of metric
+/// assembly are no longer one function (bd-mv2j).
+///
+/// A plain carrier: no logic, no invariants. Every field is written exactly once by the
+/// aggregation loop and read only by `project_macro_metrics`, so the struct exists to name
+/// the seam rather than to add behaviour. `RunningStats` has no `Debug`, hence `Default` only.
+#[derive(Default)]
+struct TickAggregates {
+    agent_count: usize,
+    carnivores: usize,
+    herbivores: usize,
+    hybrids: usize,
+    carnivore_energy: f64,
+    herbivore_energy: f64,
+    hybrid_energy: f64,
+    mutation_primary: RunningStats,
+    mutation_secondary: RunningStats,
+    trait_smell: RunningStats,
+    trait_sound: RunningStats,
+    trait_hearing: RunningStats,
+    trait_eye: RunningStats,
+    trait_blood: RunningStats,
+    herbivore_tendency_stats: RunningStats,
+    reproduction_counter_stats: RunningStats,
+    temperature_pref_stats: RunningStats,
+    temperature_discomfort_stats: RunningStats,
+    age_sum: f64,
+    age_max: u32,
+    boost_count: usize,
+    food_delta_sum: f64,
+    food_delta_abs_sum: f64,
+    generation_sum: f64,
+    generation_max: u32,
+    brain_map: BTreeMap<String, (usize, f64)>,
+}
 /// Append the four behaviour metrics that summarise one signal channel (bd-mv2j).
 ///
 /// Sensors and outputs were two textually duplicated blocks differing only in the metric names
@@ -21136,6 +21172,197 @@ impl WorldState {
         }
     }
 
+    /// Project the macro analytics family from one tick's population aggregates (bd-mv2j).
+    ///
+    /// Emitted only when the macro cadence selects this tick; the caller gates on that, so an
+    /// absent family means "not sampled" rather than "all zero".
+    fn project_macro_metrics(&self, agg: &TickAggregates, metrics: &mut Vec<MetricSample>) {
+        let as_f64 = |value: usize| value as f64;
+        metrics.push(MetricSample::new(
+            "population.carnivore.count",
+            as_f64(agg.carnivores),
+        ));
+        metrics.push(MetricSample::new(
+            "population.herbivore.count",
+            as_f64(agg.herbivores),
+        ));
+        metrics.push(MetricSample::new(
+            "population.hybrid.count",
+            as_f64(agg.hybrids),
+        ));
+
+        if agg.carnivores > 0 {
+            metrics.push(MetricSample::new(
+                "population.carnivore.avg_energy",
+                agg.carnivore_energy / as_f64(agg.carnivores),
+            ));
+        }
+        if agg.herbivores > 0 {
+            metrics.push(MetricSample::new(
+                "population.herbivore.avg_energy",
+                agg.herbivore_energy / as_f64(agg.herbivores),
+            ));
+        }
+        if agg.hybrids > 0 {
+            metrics.push(MetricSample::new(
+                "population.hybrid.avg_energy",
+                agg.hybrid_energy / as_f64(agg.hybrids),
+            ));
+        }
+
+        metrics.push(MetricSample::new(
+            "mutation.primary.mean",
+            agg.mutation_primary.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "mutation.primary.stddev",
+            agg.mutation_primary.stddev(),
+        ));
+        metrics.push(MetricSample::new(
+            "mutation.secondary.mean",
+            agg.mutation_secondary.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "mutation.secondary.stddev",
+            agg.mutation_secondary.stddev(),
+        ));
+        metrics.push(MetricSample::new(
+            "traits.smell.mean",
+            agg.trait_smell.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "traits.sound.mean",
+            agg.trait_sound.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "traits.hearing.mean",
+            agg.trait_hearing.mean(),
+        ));
+        metrics.push(MetricSample::new("traits.eye.mean", agg.trait_eye.mean()));
+        metrics.push(MetricSample::new(
+            "traits.blood.mean",
+            agg.trait_blood.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "herbivore_tendency.mean",
+            agg.herbivore_tendency_stats.mean(),
+        ));
+        metrics.push(MetricSample::new(
+            "herbivore_tendency.stddev",
+            agg.herbivore_tendency_stats.stddev(),
+        ));
+
+        if agg.agent_count > 0 {
+            metrics.push(MetricSample::new(
+                "food_delta.mean",
+                agg.food_delta_sum / agg.agent_count as f64,
+            ));
+            metrics.push(MetricSample::new(
+                "food_delta.mean_abs",
+                agg.food_delta_abs_sum / agg.agent_count as f64,
+            ));
+            metrics.push(MetricSample::new(
+                "population.age.mean",
+                agg.age_sum / agg.agent_count as f64,
+            ));
+            metrics.push(MetricSample::new(
+                "population.age.max",
+                f64::from(agg.age_max),
+            ));
+            metrics.push(MetricSample::new(
+                "behavior.boost.count",
+                agg.boost_count as f64,
+            ));
+            metrics.push(MetricSample::new(
+                "behavior.boost.ratio",
+                if agg.agent_count > 0 {
+                    agg.boost_count as f64 / agg.agent_count as f64
+                } else {
+                    0.0
+                },
+            ));
+            metrics.push(MetricSample::new(
+                "reproduction.counter.mean",
+                agg.reproduction_counter_stats.mean(),
+            ));
+            metrics.push(MetricSample::new(
+                "temperature.preference.mean",
+                agg.temperature_pref_stats.mean(),
+            ));
+            metrics.push(MetricSample::new(
+                "temperature.preference.stddev",
+                agg.temperature_pref_stats.stddev(),
+            ));
+            metrics.push(MetricSample::new(
+                "population.generation.mean",
+                agg.generation_sum / agg.agent_count as f64,
+            ));
+            metrics.push(MetricSample::new(
+                "population.generation.max",
+                f64::from(agg.generation_max),
+            ));
+            metrics.push(MetricSample::new(
+                "temperature.discomfort.mean",
+                agg.temperature_discomfort_stats.mean(),
+            ));
+            metrics.push(MetricSample::new(
+                "temperature.discomfort.stddev",
+                agg.temperature_discomfort_stats.stddev(),
+            ));
+        }
+
+        if let Some((total, mean, variance, max)) = summarize_food_grid(self.food.cells()) {
+            metrics.push(MetricSample::new("food.total", total));
+            metrics.push(MetricSample::new("food.mean", mean));
+            metrics.push(MetricSample::new("food.stddev", variance.sqrt()));
+            metrics.push(MetricSample::from_f32("food.max", max));
+        }
+
+        if let Some(hydrology) = self.hydrology.as_ref() {
+            let total_water = hydrology.total_water_depth();
+            let flooded = hydrology.flooded_cell_counts(0.05, 0.2);
+            let cell_count = hydrology.cell_count().max(1) as f64;
+            metrics.push(MetricSample::new(
+                "hydrology.water.total_depth",
+                f64::from(total_water),
+            ));
+            metrics.push(MetricSample::new(
+                "hydrology.water.mean_depth",
+                f64::from(total_water) / cell_count,
+            ));
+            metrics.push(MetricSample::new(
+                "hydrology.water.flooded.shallow.count",
+                flooded.0 as f64,
+            ));
+            metrics.push(MetricSample::new(
+                "hydrology.water.flooded.deep.count",
+                flooded.1 as f64,
+            ));
+            metrics.push(MetricSample::new(
+                "hydrology.water.flooded.shallow.ratio",
+                flooded.0 as f64 / cell_count,
+            ));
+            metrics.push(MetricSample::new(
+                "hydrology.water.flooded.deep.ratio",
+                flooded.1 as f64 / cell_count,
+            ));
+        }
+
+        for (label, (count, energy_sum)) in &agg.brain_map {
+            let (count, energy_sum) = (*count, *energy_sum);
+            let key = sanitize_metric_key(label);
+            metrics.push(MetricSample::new(
+                format!("brain.population.{key}.count"),
+                count as f64,
+            ));
+            if count > 0 {
+                metrics.push(MetricSample::new(
+                    format!("brain.population.{key}.avg_energy"),
+                    energy_sum / count as f64,
+                ));
+            }
+        }
+    }
     /// Project the tick's countable events into the batch's event rows (bd-mv2j).
     ///
     /// Read-only over `self`: an event row is emitted only for a nonzero count, so an
@@ -21467,179 +21694,36 @@ impl WorldState {
             ));
         }
 
+        let agg = TickAggregates {
+            agent_count,
+            carnivores,
+            herbivores,
+            hybrids,
+            carnivore_energy,
+            herbivore_energy,
+            hybrid_energy,
+            mutation_primary,
+            mutation_secondary,
+            trait_smell,
+            trait_sound,
+            trait_hearing,
+            trait_eye,
+            trait_blood,
+            herbivore_tendency_stats,
+            reproduction_counter_stats,
+            temperature_pref_stats,
+            temperature_discomfort_stats,
+            age_sum,
+            age_max,
+            boost_count,
+            food_delta_sum,
+            food_delta_abs_sum,
+            generation_sum,
+            generation_max,
+            brain_map,
+        };
         if macro_enabled {
-            let as_f64 = |value: usize| value as f64;
-            metrics.push(MetricSample::new(
-                "population.carnivore.count",
-                as_f64(carnivores),
-            ));
-            metrics.push(MetricSample::new(
-                "population.herbivore.count",
-                as_f64(herbivores),
-            ));
-            metrics.push(MetricSample::new(
-                "population.hybrid.count",
-                as_f64(hybrids),
-            ));
-
-            if carnivores > 0 {
-                metrics.push(MetricSample::new(
-                    "population.carnivore.avg_energy",
-                    carnivore_energy / as_f64(carnivores),
-                ));
-            }
-            if herbivores > 0 {
-                metrics.push(MetricSample::new(
-                    "population.herbivore.avg_energy",
-                    herbivore_energy / as_f64(herbivores),
-                ));
-            }
-            if hybrids > 0 {
-                metrics.push(MetricSample::new(
-                    "population.hybrid.avg_energy",
-                    hybrid_energy / as_f64(hybrids),
-                ));
-            }
-
-            metrics.push(MetricSample::new(
-                "mutation.primary.mean",
-                mutation_primary.mean(),
-            ));
-            metrics.push(MetricSample::new(
-                "mutation.primary.stddev",
-                mutation_primary.stddev(),
-            ));
-            metrics.push(MetricSample::new(
-                "mutation.secondary.mean",
-                mutation_secondary.mean(),
-            ));
-            metrics.push(MetricSample::new(
-                "mutation.secondary.stddev",
-                mutation_secondary.stddev(),
-            ));
-            metrics.push(MetricSample::new("traits.smell.mean", trait_smell.mean()));
-            metrics.push(MetricSample::new("traits.sound.mean", trait_sound.mean()));
-            metrics.push(MetricSample::new(
-                "traits.hearing.mean",
-                trait_hearing.mean(),
-            ));
-            metrics.push(MetricSample::new("traits.eye.mean", trait_eye.mean()));
-            metrics.push(MetricSample::new("traits.blood.mean", trait_blood.mean()));
-            metrics.push(MetricSample::new(
-                "herbivore_tendency.mean",
-                herbivore_tendency_stats.mean(),
-            ));
-            metrics.push(MetricSample::new(
-                "herbivore_tendency.stddev",
-                herbivore_tendency_stats.stddev(),
-            ));
-
-            if agent_count > 0 {
-                metrics.push(MetricSample::new(
-                    "food_delta.mean",
-                    food_delta_sum / agent_count as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "food_delta.mean_abs",
-                    food_delta_abs_sum / agent_count as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "population.age.mean",
-                    age_sum / agent_count as f64,
-                ));
-                metrics.push(MetricSample::new("population.age.max", f64::from(age_max)));
-                metrics.push(MetricSample::new(
-                    "behavior.boost.count",
-                    boost_count as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "behavior.boost.ratio",
-                    if agent_count > 0 {
-                        boost_count as f64 / agent_count as f64
-                    } else {
-                        0.0
-                    },
-                ));
-                metrics.push(MetricSample::new(
-                    "reproduction.counter.mean",
-                    reproduction_counter_stats.mean(),
-                ));
-                metrics.push(MetricSample::new(
-                    "temperature.preference.mean",
-                    temperature_pref_stats.mean(),
-                ));
-                metrics.push(MetricSample::new(
-                    "temperature.preference.stddev",
-                    temperature_pref_stats.stddev(),
-                ));
-                metrics.push(MetricSample::new(
-                    "population.generation.mean",
-                    generation_sum / agent_count as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "population.generation.max",
-                    f64::from(generation_max),
-                ));
-                metrics.push(MetricSample::new(
-                    "temperature.discomfort.mean",
-                    temperature_discomfort_stats.mean(),
-                ));
-                metrics.push(MetricSample::new(
-                    "temperature.discomfort.stddev",
-                    temperature_discomfort_stats.stddev(),
-                ));
-            }
-
-            if let Some((total, mean, variance, max)) = summarize_food_grid(self.food.cells()) {
-                metrics.push(MetricSample::new("food.total", total));
-                metrics.push(MetricSample::new("food.mean", mean));
-                metrics.push(MetricSample::new("food.stddev", variance.sqrt()));
-                metrics.push(MetricSample::from_f32("food.max", max));
-            }
-
-            if let Some(hydrology) = self.hydrology.as_ref() {
-                let total_water = hydrology.total_water_depth();
-                let flooded = hydrology.flooded_cell_counts(0.05, 0.2);
-                let cell_count = hydrology.cell_count().max(1) as f64;
-                metrics.push(MetricSample::new(
-                    "hydrology.water.total_depth",
-                    f64::from(total_water),
-                ));
-                metrics.push(MetricSample::new(
-                    "hydrology.water.mean_depth",
-                    f64::from(total_water) / cell_count,
-                ));
-                metrics.push(MetricSample::new(
-                    "hydrology.water.flooded.shallow.count",
-                    flooded.0 as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "hydrology.water.flooded.deep.count",
-                    flooded.1 as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "hydrology.water.flooded.shallow.ratio",
-                    flooded.0 as f64 / cell_count,
-                ));
-                metrics.push(MetricSample::new(
-                    "hydrology.water.flooded.deep.ratio",
-                    flooded.1 as f64 / cell_count,
-                ));
-            }
-
-            for (label, (count, energy_sum)) in brain_map {
-                let key = sanitize_metric_key(&label);
-                metrics.push(MetricSample::new(
-                    format!("brain.population.{key}.count"),
-                    count as f64,
-                ));
-                if count > 0 {
-                    metrics.push(MetricSample::new(
-                        format!("brain.population.{key}.avg_energy"),
-                        energy_sum / count as f64,
-                    ));
-                }
-            }
+            self.project_macro_metrics(&agg, &mut metrics);
         }
 
         if behavior_enabled {
@@ -40828,6 +40912,82 @@ mod tests {
         for tick in [1u64, 12_345, 999_999, u64::MAX] {
             assert!(legacy_clock_counter(tick) < LEGACY_EPOCH_TICKS);
         }
+    }
+
+    /// bd-mv2j: the metric projection must keep emitting every analytics family.
+    ///
+    /// `prepare_persistence` was decomposed by moving the aggregation pass's ~30 accumulators
+    /// into `TickAggregates` and lifting ~170 lines of metric assembly into
+    /// `project_macro_metrics`. A mechanical move like that fails silently: drop one push and
+    /// the batch is still well-formed, still admits, and simply carries one fewer metric
+    /// forever. Targeted tests that assert a specific metric cannot catch a family that
+    /// vanishes wholesale.
+    ///
+    /// This pins the FAMILIES rather than exact float values, so it survives legitimate tuning
+    /// while still failing loudly if a block stops being projected. If you deliberately add or
+    /// remove a family, update this list in the same commit.
+    #[test]
+    fn a_projected_batch_carries_every_metric_family() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let (mut world, mut session) = world_with_session(
+            ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                persistence_interval: 1,
+                analytics_stride: AnalyticsStride {
+                    macro_metrics: 1,
+                    behavior_metrics: 1,
+                    lifecycle_events: 1,
+                },
+                rng_seed: Some(0x4D56_324A),
+                ..ScriptBotsConfig::default()
+            },
+            SpyPersistence {
+                logs: Arc::clone(&logs),
+            },
+        );
+        for seed in 0..8u32 {
+            let _ = world.try_spawn_agent(sample_agent(seed));
+        }
+        session.step(&mut world).expect("projected tick");
+
+        let batches = logs.lock().expect("spy logs");
+        let batch = batches.last().expect("one projected batch");
+        let names: Vec<&str> = batch.metrics.iter().map(|m| m.name.as_ref()).collect();
+
+        // One representative from each family the projection is responsible for.
+        for expected in [
+            "total_energy", // summary scalars
+            "average_energy",
+            "population.carnivore.count", // diet composition
+            "population.herbivore.avg_energy",
+            "mutation.primary.mean", // mutation stats
+            "traits.smell.mean",     // trait stats
+            "herbivore_tendency.mean",
+            "food_delta.mean",     // food flux
+            "population.age.mean", // age / boost
+            "behavior.boost.ratio",
+            "reproduction.counter.mean",
+            "temperature.preference.mean", // temperature
+            "temperature.discomfort.mean",
+            "population.generation.mean", // lineage
+            "food.total",                 // food grid summary
+            "behavior.sensors.mean",      // behaviour signals
+            "behavior.outputs.entropy",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "metric family lost in projection: {expected} missing from {} emitted metrics",
+                names.len()
+            );
+        }
+
+        // Brain-population metrics are emitted per registered kind; at least one must appear.
+        assert!(
+            names.iter().any(|n| n.starts_with("brain.population.")),
+            "brain population family missing from {} emitted metrics",
+            names.len()
+        );
     }
 
     fn quiet_trace_config(seed: u64, persistence_interval: u32) -> ScriptBotsConfig {
