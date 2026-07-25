@@ -15712,12 +15712,14 @@ struct SignalMetricNames {
 // produce an arbitrarily wrong value, and those are exactly the accidents that must not
 // be able to hide in ~8,500 lines. They are allowed per-site with a stated reason
 // instead, so a NEW narrowing cast anywhere in this impl fails the lint.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::suboptimal_flops,
-    clippy::imprecise_flops,
-    clippy::float_cmp
-)]
+// bd-9zq2 (measured 2026-07-25): `float_cmp` and `imprecise_flops` were also allowed here
+// and were suppressing NOTHING -- `--force-warn` on this impl (lines 15721..24514, 8,793
+// lines) reports 0 of each. They are removed rather than kept "just in case": an allow that
+// suppresses nothing cannot be justified by what it currently permits, only by what it would
+// permit later, which is precisely the property that makes a blanket allow unfalsifiable.
+// Measuring a suppression does NOT require deleting it -- `cargo clippy -- --force-warn
+// clippy::<lint>` overrides `#[allow]`, so the count is obtainable without touching source.
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
 impl WorldState {
     /// Instantiate a new world using the supplied configuration.
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
