@@ -1391,21 +1391,22 @@ mod tests {
             .step(ManualInstant::from_nanos(3))
             .expect("retained command applies");
         assert!(report.drove);
+        let authoritative = driver
+            .port
+            .command_status(retained_id)
+            .expect("authoritative lookup")
+            .expect("authoritative status retained");
         assert!(matches!(
-            driver
-                .port
-                .command_status(retained_id)
-                .expect("authoritative lookup")
-                .expect("authoritative status retained")
-                .application(),
+            authoritative.application(),
             ApplicationState::Applied(_)
         ));
-        let mirrored = port.command_status(retained_id).expect("mirrored lookup");
-        assert!(
-            !mirrored
-                .as_ref()
-                .is_some_and(|status| matches!(status.application(), ApplicationState::Admitted)),
-            "a board-retained status must not stay admitted after its authoritative application"
+        let mirrored = port
+            .command_status(retained_id)
+            .expect("mirrored lookup")
+            .expect("board-retained status must remain available");
+        assert_eq!(
+            mirrored, authoritative,
+            "the board must mirror the exact authoritative terminal status"
         );
     }
 
