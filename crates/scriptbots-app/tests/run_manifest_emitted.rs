@@ -790,6 +790,102 @@ fn a_scenario_document_binds_identity_bootstrap_and_config_into_the_manifest() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// bd-alvk: thread-count invariance IS the reproducibility claim.
+///
+/// README promises runs can be "re-run bit-for-bit". If the science-bearing manifest
+/// fields varied with the Rayon budget, every such assertion would be silently
+/// conditional on a thread count that no reproduction instruction records.
+///
+/// bd-2z0.1.11 closed claiming an "invariant 1/2/4/8-thread and repeated-suite proof"
+/// that did not exist; its fixture instead hardcodes `rayon_threads`, which makes the
+/// golden constant by REMOVING the variable rather than by proving invariance. This is
+/// that missing proof, and it deliberately asserts the narrower, correct invariant.
+///
+/// What must be invariant: the seed, the RNG stream state, the tick-zero
+/// `WorldDigestV1` (which binds every agent's placement), the normalized config, and
+/// the ordered config-layer digests.
+///
+/// What must NOT be: `build.scriptbots_max_threads` and `identity.run_id`. The manifest
+/// is provenance and is *supposed* to record the thread policy a run actually resolved
+/// (bd-2z0.1.10), so a whole-manifest digest comparison would be wrong here — it would
+/// fail for a legitimate reason and teach the next reader to weaken the test. The
+/// differing-fields assertions below are the negative control that proves this test can
+/// see thread configuration at all.
+#[test]
+fn the_manifest_science_is_invariant_across_thread_budgets() {
+    let scenario_dir = run_dir("threads_scenario");
+    let scenario_path = write_scenario(&scenario_dir, FIXTURE_SCENARIO);
+    let scenario_arg = scenario_path.to_str().expect("utf-8 scenario path");
+
+    // Each budget is a separate process, because the Rayon pool is global and
+    // initialised once — varying it inside one test binary would prove nothing.
+    let budgets = ["1", "2", "4", "8"];
+    let mut runs: Vec<(&str, PathBuf, serde_json::Value)> = Vec::new();
+    for threads in budgets {
+        let dir = run_dir(&format!("threads_{threads}"));
+        let output = launch_with(
+            &dir,
+            &[("SCRIPTBOTS_MAX_THREADS", threads)],
+            &["--scenario", scenario_arg],
+        );
+        assert!(
+            output.status.success(),
+            "the {threads}-thread run must complete\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let manifest = manifest_of(&output, &dir);
+        runs.push((threads, dir, manifest));
+    }
+
+    let (base_threads, _, base) = &runs[0];
+    for (threads, _, manifest) in &runs[1..] {
+        for field in ["random_streams", "normalized_config", "config_overrides"] {
+            assert_eq!(
+                manifest[field], base[field],
+                "`{field}` differs between the {base_threads}-thread and {threads}-thread runs, \
+                 so the same scenario and seed do not reproduce across thread budgets"
+            );
+        }
+        assert_eq!(
+            manifest["bootstrap_evidence"]["start"]["overall"],
+            base["bootstrap_evidence"]["start"]["overall"],
+            "the tick-zero WorldDigestV1 differs between the {base_threads}-thread and \
+             {threads}-thread runs; that digest binds every agent's placement, so agent \
+             placement is thread-dependent and no run is reproducible without also \
+             pinning the thread budget"
+        );
+        assert_eq!(
+            manifest["scenario"]["ordered_config_layer_digests"],
+            base["scenario"]["ordered_config_layer_digests"],
+            "the ordered config-layer digests differ between {base_threads} and {threads} threads"
+        );
+    }
+
+    // Negative control: the thread budget must actually have reached the app, and the
+    // manifest must record it. Without this, every assertion above could pass simply
+    // because SCRIPTBOTS_MAX_THREADS was ignored.
+    let first_threads = base["build"]["scriptbots_max_threads"].clone();
+    let last_threads = runs[runs.len() - 1].2["build"]["scriptbots_max_threads"].clone();
+    assert_eq!(first_threads, serde_json::json!("1"));
+    assert_eq!(last_threads, serde_json::json!("8"));
+    assert_ne!(
+        first_threads, last_threads,
+        "the manifest must record the differing thread budgets it actually resolved; if these \
+         match, the invariance assertions above proved nothing because the budget never varied"
+    );
+
+    // Run identity is per-run by construction and must NOT be invariant.
+    assert_ne!(
+        base["identity"]["run_id"], runs[1].2["identity"]["run_id"],
+        "each run must carry its own run_id"
+    );
+
+    for (_, dir, _) in runs {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let _ = std::fs::remove_dir_all(&scenario_dir);
+}
+
 #[test]
 fn the_same_scenario_and_seed_produce_identical_placement_and_digests() {
     // THE acceptance row: starting the same scenario/seed produces identical
