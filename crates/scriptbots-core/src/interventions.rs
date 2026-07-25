@@ -1,6 +1,6 @@
 //! Replayable, toroidal-exact intervention toolkit (bd-16g.10).
 
-use crate::{Position as Vec2, Tick};
+use crate::{Position as Vec2, Tick, toroidal_delta};
 use serde::{Deserialize, Serialize};
 
 /// Toroidal-aware spatial region specification.
@@ -16,10 +16,8 @@ impl ToroidalRegion {
         match self {
             Self::All => true,
             Self::Disc { center, radius } => {
-                let dx = (point.x - center.x).abs();
-                let dx = dx.min(world_size.x - dx);
-                let dy = (point.y - center.y).abs();
-                let dy = dy.min(world_size.y - dy);
+                let dx = toroidal_delta(point.x, center.x, world_size.x);
+                let dy = toroidal_delta(point.y, center.y, world_size.y);
                 (dx * dx + dy * dy) <= (radius * radius)
             }
             Self::Rect { min, max } => {
@@ -103,6 +101,25 @@ mod tests {
         assert!(disc.contains(Vec2::new(995.0, 500.0), world_size));
         // Point far away (500, 500)
         assert!(!disc.contains(Vec2::new(500.0, 500.0), world_size));
+    }
+
+    #[test]
+    fn toroidal_disc_membership_accepts_arbitrary_point_representatives() {
+        let world_size = Vec2::new(100.0, 100.0);
+        let disc = ToroidalRegion::Disc {
+            center: Vec2::new(1.0, 1.0),
+            radius: 3.0,
+        };
+
+        assert!(disc.contains(Vec2::new(2.0, 3.0), world_size));
+        assert!(
+            disc.contains(Vec2::new(202.0, -397.0), world_size),
+            "whole-extent translations on both axes must not change intervention membership"
+        );
+        assert!(
+            !disc.contains(Vec2::new(250.0, -350.0), world_size),
+            "an antipodal point must remain outside the small disc"
+        );
     }
 
     #[test]

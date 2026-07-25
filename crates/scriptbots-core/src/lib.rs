@@ -1144,42 +1144,51 @@ const fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
-/// Minimum-image separation `a - b` on a torus of the given extent (bd-b09u).
+/// Returns the canonical minimum-image separation `a - b` on a toroidal axis.
 ///
-/// The previous form applied at most ONE correction, so any pair more than one extent apart
-/// came back with the wrong magnitude and, worse, the wrong SIGN — flipping which side of an
-/// agent a neighbour appears on. That silently corrupted sense, combat and reproduction, and
-/// did so deterministically, so an affected run reproduced its own wrong answer forever.
-/// bd-p095 fixed the same defect in `scriptbots-index`; this is the second site.
+/// For a finite positive `extent`, the result lies in `(-extent / 2, extent / 2]`: every exact
+/// antipodal tie uses the positive half-extent representative, matching [`UniformGridIndex`].
+/// Finite coordinates may be arbitrary whole-extent translations of canonical world positions.
+/// Invalid geometry preserves the legacy fallback and returns the direct subtraction.
 ///
-/// The in-range path is deliberately left byte-identical. Coordinates are wrapped into
-/// `[0, extent)` before this is reached in normal operation, so every existing run takes the
-/// `abs() <= extent` branch and performs exactly the same f32 operations in the same order as
-/// before. Canonicalizing unconditionally through `rem_euclid` would have been tidier and
-/// would have moved world digests by a last-bit rounding difference — a science change
-/// smuggled in as a bug fix. Only the previously-wrong branch behaves differently.
-fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
-    let delta = a - b;
-    if !(extent > 0.0) || !delta.is_finite() {
-        return delta;
+/// Ordinary canonical, non-antipodal inputs retain the established f32 operation sequence so
+/// existing scientific traces stay bit-exact. Noncanonical inputs use the index's f64,
+/// per-coordinate reduction; this also prevents finite operands whose f32 subtraction overflows
+/// from escaping the minimum-image interval.
+#[must_use]
+#[inline]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the f64 minimum image is bounded by an extent that originated as f32"
+)]
+pub fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
+    let raw = a - b;
+    if !(extent > 0.0) || !extent.is_finite() || !a.is_finite() || !b.is_finite() {
+        return raw;
     }
+
     let half = extent * 0.5;
-    if delta.abs() > extent {
-        // Previously wrong: one correction could not bring this back into range.
-        let folded = delta.rem_euclid(extent);
-        return if folded > half {
-            folded - extent
-        } else {
-            folded
-        };
+    if (0.0..extent).contains(&a) && (0.0..extent).contains(&b) {
+        let mut delta = raw;
+        if delta > half {
+            delta -= extent;
+        } else if delta <= -half {
+            delta += extent;
+        }
+        return if delta == 0.0 { 0.0 } else { delta };
     }
-    let mut delta = delta;
-    if delta > half {
-        delta -= extent;
-    } else if delta < -half {
-        delta += extent;
-    }
-    delta
+
+    let extent = f64::from(extent);
+    let a = f64::from(a).rem_euclid(extent);
+    let b = f64::from(b).rem_euclid(extent);
+    let folded = (a - b).rem_euclid(extent);
+    let minimum = if folded > extent * 0.5 {
+        folded - extent
+    } else {
+        folded
+    };
+    let minimum = minimum as f32;
+    if minimum == 0.0 { 0.0 } else { minimum }
 }
 
 fn angle_to(dx: f32, dy: f32) -> f32 {
@@ -30108,6 +30117,201 @@ mod tests {
         }
     }
 
+    /// bd-b09u: public founding positions may use any finite representative of the same
+    /// toroidal point. The spatial index canonicalizes those representatives before selecting
+    /// candidate buckets, so production sensing must use the same minimum-image contract after
+    /// the candidate is found.
+    #[test]
+    fn production_sensing_is_invariant_to_independent_whole_extent_translations() {
+        const NEIGHBOUR_CHANNELS: [usize; 20] = [
+            0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 18, 19, 21, 22, 23, 24,
+        ];
+
+        let sense_fixture = |observer_position: Position, neighbour_position: Position| {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                sense_radius: 30.0,
+                rng_seed: Some(0xB09_0001),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("multi-extent sensing world");
+            let observer = world
+                .try_spawn_agent_with(
+                    AgentData {
+                        position: observer_position,
+                        heading: 0.0,
+                        health: 1.0,
+                        ..AgentData::default()
+                    },
+                    |runtime| {
+                        runtime.eye_direction = [0.0; NUM_EYES];
+                        runtime.eye_fov = [HALF_TURN; NUM_EYES];
+                        runtime.trait_modifiers = TraitModifiers {
+                            smell: 1.0,
+                            sound: 1.0,
+                            hearing: 1.0,
+                            eye: 1.0,
+                            blood: 1.0,
+                        };
+                    },
+                )
+                .expect("observer");
+            world
+                .try_spawn_agent(AgentData {
+                    position: neighbour_position,
+                    heading: 0.0,
+                    health: 0.5,
+                    color: [0.8, 0.3, 0.6],
+                    ..AgentData::default()
+                })
+                .expect("neighbour");
+
+            world.stage_sense();
+            let sensors = world
+                .agent_runtime(observer)
+                .expect("observer runtime")
+                .sensors
+                .map(f32::to_bits);
+            let attribution = world
+                .explain_sensors(observer, 1)
+                .expect("observer attribution");
+            let contribution = attribution
+                .contributions
+                .first()
+                .expect("nearby neighbour contributes");
+            let geometry = (
+                contribution.bearing.to_bits(),
+                contribution.distance.to_bits(),
+            );
+            (sensors, geometry)
+        };
+
+        let canonical = sense_fixture(Position::new(1.0, 1.0), Position::new(2.0, 3.0));
+        // Same physical points. Observer and neighbour have each been translated by different
+        // whole extents on BOTH axes, so the raw separation is (+501, -898) rather than (+1, +2).
+        let translated = sense_fixture(Position::new(-299.0, 501.0), Position::new(202.0, -397.0));
+
+        assert!(
+            f32::from_bits(canonical.0[10]) > 0.0,
+            "the canonical fixture must actually sense its neighbour"
+        );
+        assert_eq!(
+            canonical.1, translated.1,
+            "attribution geometry changed under whole-extent translations"
+        );
+        for index in NEIGHBOUR_CHANNELS {
+            assert_eq!(
+                canonical.0[index], translated.0[index],
+                "production neighbour-derived sensor {index} changed under whole-extent translations"
+            );
+        }
+    }
+
+    /// bd-b09u: the two representatives below describe the same antipodal scene, translated
+    /// sixty units around a 100-wide torus. A minimum-image tie must choose one documented side
+    /// independent of representation; otherwise the target jumps from the rear eye to the
+    /// forward eye even though no physical relationship changed.
+    #[test]
+    fn production_sensing_keeps_antipodal_vision_stable_under_translation() {
+        const NEIGHBOUR_CHANNELS: [usize; 20] = [
+            0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 18, 19, 21, 22, 23, 24,
+        ];
+
+        let sense_fixture = |observer_x: f32, neighbour_x: f32| {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                sense_radius: 100.0,
+                rng_seed: Some(0xB09_0002),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("antipodal sensing world");
+            let observer = world
+                .try_spawn_agent_with(
+                    AgentData {
+                        position: Position::new(observer_x, 50.0),
+                        heading: 0.0,
+                        health: 1.0,
+                        ..AgentData::default()
+                    },
+                    |runtime| {
+                        runtime.eye_direction = [0.0, HALF_TURN, 0.0, 0.0];
+                        runtime.eye_fov = [0.25, 0.25, 0.0, 0.0];
+                        runtime.trait_modifiers = TraitModifiers {
+                            smell: 0.0,
+                            sound: 0.0,
+                            hearing: 0.0,
+                            eye: 1.0,
+                            blood: 0.0,
+                        };
+                    },
+                )
+                .expect("observer");
+            world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(neighbour_x, 50.0),
+                    heading: 0.0,
+                    health: 1.0,
+                    color: [1.0, 0.0, 0.0],
+                    ..AgentData::default()
+                })
+                .expect("antipodal neighbour");
+
+            let bearing = world
+                .explain_sensors(observer, 1)
+                .expect("observer attribution")
+                .contributions
+                .first()
+                .expect("antipodal neighbour contributes")
+                .bearing
+                .to_bits();
+            world.stage_sense();
+            let sensors = world
+                .agent_runtime(observer)
+                .expect("observer runtime")
+                .sensors
+                .map(f32::to_bits);
+            (sensors, bearing)
+        };
+
+        let canonical = sense_fixture(50.0, 0.0);
+        let translated = sense_fixture(10.0, 60.0);
+
+        assert_eq!(
+            f32::from_bits(canonical.1),
+            0.0,
+            "the index contract represents an exact half-extent tie as +half"
+        );
+        assert_eq!(
+            canonical.1, translated.1,
+            "antipodal attribution bearing flipped under a physical translation"
+        );
+        for index in NEIGHBOUR_CHANNELS {
+            assert_eq!(
+                canonical.0[index], translated.0[index],
+                "antipodal production sensor {index} changed under translation"
+            );
+        }
+        assert!(
+            canonical.0[0] == 0.25_f32.to_bits() && canonical.0[1] == 0.5_f32.to_bits(),
+            "the +x eye must see the red antipodal neighbour at the exact expected intensity"
+        );
+        for index in 5..=8 {
+            assert_eq!(
+                canonical.0[index],
+                0.0_f32.to_bits(),
+                "the -x eye must stay blind at channel {index}"
+            );
+        }
+    }
+
     #[test]
     fn production_fixed_sense_tracks_saturation_and_matches_legacy_single_neighbour() {
         let mut world = WorldState::new(ScriptBotsConfig {
@@ -40868,13 +41072,13 @@ mod tests {
         assert_eq!(toroidal_delta(1.0, -299.0, EXTENT), 0.0);
         assert_eq!(toroidal_delta(-98.0, 501.0, EXTENT), 1.0);
 
-        // The result is always within the half-extent envelope.
+        // The result is always in the index contract's (-half, +half] interval.
         for a in [-350.0f32, -1.0, 0.0, 49.0, 51.0, 250.0, 1000.0] {
             for b in [-275.0f32, 0.0, 3.0, 99.0, 404.0] {
                 let delta = toroidal_delta(a, b, EXTENT);
                 assert!(
-                    delta.abs() <= EXTENT * 0.5,
-                    "delta({a}, {b}) = {delta} escaped the half-extent envelope"
+                    delta > -EXTENT * 0.5 && delta <= EXTENT * 0.5,
+                    "delta({a}, {b}) = {delta} escaped the canonical half-extent interval"
                 );
             }
         }
@@ -40885,6 +41089,30 @@ mod tests {
         assert_eq!(toroidal_delta(10.0, 30.0, EXTENT), -20.0);
         assert_eq!(toroidal_delta(5.0, 95.0, EXTENT), 10.0);
         assert_eq!(toroidal_delta(95.0, 5.0, EXTENT), -10.0);
+
+        // Exact half-extent ties use the index contract's positive representative. Equivalent
+        // translated pairs must therefore agree instead of flipping sign at the vision seam.
+        assert_eq!(toroidal_delta(0.0, 50.0, EXTENT), 50.0);
+        assert_eq!(toroidal_delta(50.0, 0.0, EXTENT), 50.0);
+        assert_eq!(toroidal_delta(60.0, 10.0, EXTENT), 50.0);
+        assert_eq!(toroidal_delta(10.0, 60.0, EXTENT), 50.0);
+        assert_eq!(toroidal_delta(-200.0, 350.0, EXTENT), 50.0);
+        assert_eq!(toroidal_delta(350.0, -200.0, EXTENT), 50.0);
+
+        // Canonical zero is representation-independent even when the source subtraction carried
+        // a negative zero, and finite inputs cannot escape via f32 subtraction overflow.
+        assert_eq!(
+            toroidal_delta(-0.0, 0.0, EXTENT).to_bits(),
+            0.0_f32.to_bits()
+        );
+        assert_eq!(
+            toroidal_delta(f32::MAX, -f32::MAX, 64.0).to_bits(),
+            0.0_f32.to_bits()
+        );
+        assert_eq!(
+            toroidal_delta(-f32::MAX, f32::MAX, 64.0).to_bits(),
+            0.0_f32.to_bits()
+        );
     }
 
     /// bd-b09u: combat's wrap_delta had the same one-correction defect as `toroidal_delta`,

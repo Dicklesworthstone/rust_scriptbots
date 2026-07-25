@@ -13,7 +13,7 @@ use scriptbots_core::{
     AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, DeathRecord,
     DynamicAgentSnapshot, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
     PersistenceBatch, ResourceLedgerTick, ScriptBotsConfig, TerrainKind, Tick, TickCombatSummary,
-    TickEvents, TickSummary,
+    TickEvents, TickSummary, toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1054,16 +1054,10 @@ const fn projection_source_key(snapshot: &RenderSnapshot) -> ProjectionSourceKey
     }
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "the wrapped delta is bounded to one f32 world extent before conversion"
-)]
 fn nearest_wrapped_delta(position: f32, center: f32, extent: f32) -> (f32, f64) {
     let raw = f64::from(position) - f64::from(center);
-    let extent = f64::from(extent);
-    let half = extent * 0.5;
-    let wrapped = (raw + half).rem_euclid(extent) - half;
-    (wrapped as f32, canonical_f64(wrapped - raw))
+    let wrapped = toroidal_delta(position, center, extent);
+    (wrapped, canonical_f64(f64::from(wrapped) - raw))
 }
 
 const fn canonical_f64(value: f64) -> f64 {
@@ -5076,6 +5070,54 @@ mod tests {
         assert_eq!(broker.hits(), 1);
         assert_eq!(broker.misses(), 2);
         assert_eq!(broker.len(), 2);
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the antipodal fixture and projection scale are exactly representable"
+    )]
+    fn projection_keeps_the_positive_antipode_across_whole_extent_translations() {
+        let mut canonical_snapshot = projection_snapshot();
+        canonical_snapshot.world.agents[0].position[0] = 0.0;
+        let mut canonical_request = projection_request(1);
+        canonical_request.camera.center[0] = 50.0;
+        let canonical = project_snapshot(
+            &canonical_snapshot,
+            &canonical_request,
+            ProjectionLimits::default(),
+        )
+        .expect("canonical antipodal projection");
+        let canonical_agent = canonical
+            .focused_agent
+            .expect("canonical focused antipodal agent");
+
+        let mut translated_snapshot = projection_snapshot();
+        translated_snapshot.world.agents[0].position[0] = 60.0;
+        let mut translated_request = projection_request(1);
+        translated_request.camera.center[0] = 10.0;
+        let translated = project_snapshot(
+            &translated_snapshot,
+            &translated_request,
+            ProjectionLimits::default(),
+        )
+        .expect("translated antipodal projection");
+        let translated_agent = translated
+            .focused_agent
+            .expect("translated focused antipodal agent");
+
+        let expected_positive_image = f64::from(50.0_f32).mul_add(
+            f64::from(canonical.transform.scale),
+            f64::from(canonical.transform.viewport.width) * 0.5,
+        );
+        assert_eq!(
+            canonical_agent.canvas_position[0], expected_positive_image,
+            "the core/index contract chooses the positive half-extent image"
+        );
+        assert_eq!(
+            canonical_agent.canvas_position[0], translated_agent.canvas_position[0],
+            "equivalent antipodal representatives must project to the same side of the camera"
+        );
     }
 
     #[test]
