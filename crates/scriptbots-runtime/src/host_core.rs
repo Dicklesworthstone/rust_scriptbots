@@ -1225,6 +1225,7 @@ pub struct HostCore {
     next_journal_sequence: u64,
     next_lifecycle_command_sequence: u64,
     active_command: Option<AdmittedEnvelope>,
+    active_command_started: bool,
     active_journal_batch: Option<Arc<JournalBatch>>,
     indeterminate_journal_batch: Option<Arc<JournalBatch>>,
     retained_journal: Option<Arc<JournalBatch>>,
@@ -1366,6 +1367,7 @@ impl HostCore {
             next_journal_sequence: 1,
             next_lifecycle_command_sequence: session_id.get(),
             active_command: None,
+            active_command_started: false,
             active_journal_batch: None,
             indeterminate_journal_batch: None,
             retained_journal: None,
@@ -1552,6 +1554,9 @@ impl HostCore {
         }
         if self.event_pressure.is_some() {
             return HostDriveInterest::Draining;
+        }
+        if self.active_command_is_retryable() {
+            return HostDriveInterest::ReadyNow;
         }
         let shared = self.shared.borrow();
         if shared.pending_audit_count != 0 || !shared.queue.is_empty() {
@@ -2061,7 +2066,51 @@ impl HostCore {
     }
 
     fn pop_command(&self) -> Option<AdmittedEnvelope> {
+        if let Some(active) = &self.active_command {
+            return self.active_command_is_retryable().then(|| active.clone());
+        }
         self.shared.borrow_mut().queue.pop_front()
+    }
+
+    fn active_command_is_retryable(&self) -> bool {
+        !self.active_command_started && self.active_command_has_admitted_authority()
+    }
+
+    fn active_command_has_admitted_authority(&self) -> bool {
+        let Some(active) = self.active_command.as_ref() else {
+            return false;
+        };
+        self.shared
+            .borrow()
+            .commands
+            .get(&active.envelope.command_id)
+            .is_some_and(|authority| {
+                authority.status.admission_sequence() == Some(active.admission)
+                    && matches!(authority.status.application(), ApplicationState::Admitted)
+            })
+    }
+
+    fn active_command_is_unresolved(&self) -> bool {
+        self.active_command.is_some() && !self.active_command_is_retryable()
+    }
+
+    fn fault_unresolved_active_command(&mut self, error: &HostAccessError) {
+        let Some(active) = &self.active_command else {
+            return;
+        };
+        let message = format!(
+            "command {:?} at admission {:?} returned after application began or its authority became terminal or unavailable: {error}",
+            active.envelope.command_id, active.admission
+        );
+        // Preserve an earlier scientific or journal cause. Health synchronization
+        // updates the queryable state before its fallible protocol-event emission,
+        // so the original boundary error remains primary even when that emission
+        // fails for the same exhausted sequence.
+        let _health_evidence = if self.latched_fault.is_none() {
+            self.latch_protocol_fault("command_boundary_indeterminate", message)
+        } else {
+            self.synchronize_health().map(|_| ())
+        };
     }
 
     fn drain_pending_command_audits(&mut self) -> Result<bool, HostAccessError> {
@@ -2081,6 +2130,10 @@ impl HostCore {
     }
 
     fn next_command_requires_scientific_event(&self) -> bool {
+        if let Some(active) = &self.active_command {
+            return self.active_command_is_retryable()
+                && matches!(&active.envelope.command, HostCommand::Step);
+        }
         self.shared
             .borrow()
             .queue
@@ -2110,6 +2163,10 @@ impl HostCore {
             envelope,
         } = admitted;
         self.ensure_journal_sequence_available()?;
+        // Journal-sequence availability is the sole retryable application
+        // preflight. Once crossed, any later error may follow command-visible
+        // mutation and must retain this boundary as indeterminate.
+        self.active_command_started = true;
         let revision_conflict = if let Some(expected) = envelope.expected_control_revision
             && expected != self.revisions.control
         {
@@ -2727,7 +2784,9 @@ impl ManualHostDriver for HostCore {
         let mut automatic_steps_skipped = 0;
         let mut explicit_step_applied = false;
 
-        let audit_blocked = if self.retained_journal.is_none() {
+        let audit_blocked = if self.active_command_is_unresolved() {
+            true
+        } else if self.retained_journal.is_none() {
             self.drain_pending_command_audits()?
         } else {
             true
@@ -2742,6 +2801,9 @@ impl ManualHostDriver for HostCore {
                 let Some(admitted) = self.pop_command() else {
                     break;
                 };
+                if self.active_command.is_none() {
+                    self.active_command_started = false;
+                }
                 self.active_command = Some(admitted.clone());
                 let result = self.apply_command(admitted);
                 let reservation_unused = result
@@ -2750,8 +2812,14 @@ impl ManualHostDriver for HostCore {
                 if reservation_unused {
                     self.events.cancel_publish_reservation();
                 }
+                if let Err(error) = &result
+                    && self.active_command_is_unresolved()
+                {
+                    self.fault_unresolved_active_command(error);
+                }
                 if result.is_ok() {
                     self.active_command = None;
+                    self.active_command_started = false;
                 }
                 let result = result?;
                 commands_completed += usize::from(result.command_completed);
@@ -6285,6 +6353,285 @@ mod tests {
             step_digest_before
         );
         assert_eq!(step_core.events.published_total(), 0);
+    }
+
+    #[test]
+    fn journal_sequence_failure_retries_config_before_later_shutdown() {
+        let (mut core, mut port) = host(true);
+        let mut changed_config = core.world.config().clone();
+        changed_config.food_growth_rate = 0.03125;
+        let expected_config = changed_config.clone();
+        core.next_journal_sequence = u64::MAX;
+        submit(
+            &mut port,
+            1,
+            HostCommand::UpdateConfig(Box::new(changed_config)),
+        );
+
+        assert!(matches!(
+            core.drive(ManualInstant::from_nanos(0)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            status(&mut port, 1).application(),
+            ApplicationState::Admitted
+        ));
+        assert_eq!(port.queue_depth(), 0);
+        assert_eq!(
+            core.panicked_command().map(|command| command.command_id),
+            Some(CommandId::new(1))
+        );
+        let stranded_interest = core.drive_interest();
+
+        core.next_journal_sequence = 1;
+        let shutdown = core.request_shutdown().expect("later shutdown admission");
+        assert_eq!(
+            shutdown.admission_sequence(),
+            Some(AdmissionSequence::new(2))
+        );
+        let retried = core
+            .drive(ManualInstant::from_nanos(1))
+            .expect("retained config then shutdown");
+
+        assert_eq!(stranded_interest, HostDriveInterest::ReadyNow);
+        assert_eq!(retried.commands_completed, 2);
+        assert_eq!(core.world.config(), &expected_config);
+        assert_eq!(
+            applied(&status(&mut port, 1)).revisions.control,
+            ControlRevision::new(1)
+        );
+        let shutdown_status = port
+            .command_status(shutdown.command_id())
+            .expect("shutdown status query")
+            .expect("shutdown status retained");
+        assert_eq!(
+            applied(&shutdown_status).revisions.control,
+            ControlRevision::new(2)
+        );
+        assert!(core.panicked_command().is_none());
+    }
+
+    #[test]
+    fn journal_sequence_failure_retries_step_once_before_later_shutdown() {
+        let (mut core, mut port) = host(true);
+        core.next_journal_sequence = u64::MAX;
+        submit(&mut port, 1, HostCommand::Step);
+
+        assert!(matches!(
+            core.drive(ManualInstant::from_nanos(0)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            status(&mut port, 1).application(),
+            ApplicationState::Admitted
+        ));
+        assert_eq!(port.queue_depth(), 0);
+        assert_eq!(
+            core.panicked_command().map(|command| command.command_id),
+            Some(CommandId::new(1))
+        );
+        let stranded_interest = core.drive_interest();
+
+        core.next_journal_sequence = 1;
+        let shutdown = core.request_shutdown().expect("later shutdown admission");
+        assert_eq!(
+            shutdown.admission_sequence(),
+            Some(AdmissionSequence::new(2))
+        );
+        let retried = core
+            .drive(ManualInstant::from_nanos(1))
+            .expect("retained step then shutdown");
+
+        assert_eq!(stranded_interest, HostDriveInterest::ReadyNow);
+        assert_eq!(retried.commands_completed, 2);
+        assert_eq!(retried.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(1));
+        let step_applied = applied(&status(&mut port, 1));
+        assert_eq!(step_applied.tick, Tick(1));
+        assert_eq!(step_applied.revisions.control, ControlRevision::new(1));
+        assert_eq!(
+            step_applied.revisions.scientific,
+            ScientificRevision::new(1)
+        );
+        let shutdown_status = port
+            .command_status(shutdown.command_id())
+            .expect("shutdown status query")
+            .expect("shutdown status retained");
+        let shutdown_applied = applied(&shutdown_status);
+        assert_eq!(shutdown_applied.tick, Tick(1));
+        assert_eq!(shutdown_applied.revisions.control, ControlRevision::new(2));
+        assert_eq!(
+            shutdown_applied.revisions.scientific,
+            ScientificRevision::new(1)
+        );
+        assert!(core.panicked_command().is_none());
+
+        let drained = core
+            .drive(ManualInstant::from_nanos(2))
+            .expect("drain shutdown commitment");
+        assert_eq!(drained.scientific_steps, 0);
+        assert_eq!(core.world_tick(), Tick(1));
+    }
+
+    #[test]
+    fn terminal_active_error_faults_closed_without_overtaking() {
+        let (mut core, mut port) = host(true);
+        submit(&mut port, 1, HostCommand::Pause);
+        let next_event = core.shared.borrow().next_event;
+        core.shared.borrow_mut().next_event = ProtocolEventSequence::new(u64::MAX);
+
+        assert!(matches!(
+            core.drive(ManualInstant::from_nanos(0)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        let pause_status = status(&mut port, 1);
+        let pause_applied = applied(&pause_status);
+        assert_eq!(pause_applied.revisions.control, ControlRevision::new(1));
+        assert_eq!(pause_status.journal(), &JournalState::Pending);
+        assert_eq!(
+            core.panicked_command().map(|command| command.command_id),
+            Some(CommandId::new(1))
+        );
+
+        core.shared.borrow_mut().next_event = next_event;
+        let shutdown = core.request_shutdown().expect("later shutdown admission");
+        assert_eq!(
+            shutdown.admission_sequence(),
+            Some(AdmissionSequence::new(2))
+        );
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Protocol { code, .. })
+                if code == "command_boundary_indeterminate"
+        ));
+        assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+
+        let stalled = core
+            .drive(ManualInstant::from_nanos(1))
+            .expect("faulted host must remain inspectable");
+        assert_eq!(stalled.commands_completed, 0);
+        assert_eq!(stalled.scientific_steps, 0);
+        assert_eq!(port.queue_depth(), 1);
+        assert!(matches!(
+            port.command_status(shutdown.command_id())
+                .expect("shutdown status query")
+                .expect("shutdown status retained")
+                .application(),
+            ApplicationState::Admitted
+        ));
+        assert_eq!(
+            core.panicked_command().map(|command| command.command_id),
+            Some(CommandId::new(1))
+        );
+        assert_eq!(
+            core.latest_snapshot().revisions.control,
+            ControlRevision::new(1)
+        );
+        assert_eq!(core.world_tick(), Tick(0));
+    }
+
+    #[test]
+    fn terminal_active_error_preserves_an_earlier_scientific_fault() {
+        let (mut core, mut port) = host(true);
+        core.latched_fault = Some(HostFault::Scientific {
+            tick: Tick(0),
+            code: "original_science".to_owned(),
+            message: "earlier scientific failure".to_owned(),
+        });
+        core.synchronize_health()
+            .expect("publish original scientific fault");
+        submit(&mut port, 1, HostCommand::Pause);
+        let next_event = core.shared.borrow().next_event;
+        core.shared.borrow_mut().next_event = ProtocolEventSequence::new(u64::MAX);
+
+        assert!(matches!(
+            core.drive(ManualInstant::from_nanos(0)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Scientific { code, .. })
+                if code == "original_science"
+        ));
+        assert!(matches!(
+            status(&mut port, 1).application(),
+            ApplicationState::Applied(_)
+        ));
+        assert_eq!(
+            core.panicked_command().map(|command| command.command_id),
+            Some(CommandId::new(1))
+        );
+
+        core.shared.borrow_mut().next_event = next_event;
+        let shutdown = core.request_shutdown().expect("later shutdown admission");
+        let stalled = core
+            .drive(ManualInstant::from_nanos(1))
+            .expect("faulted host must remain inspectable");
+
+        assert_eq!(stalled.commands_completed, 0);
+        assert_eq!(port.queue_depth(), 1);
+        assert!(matches!(
+            port.command_status(shutdown.command_id())
+                .expect("shutdown status query")
+                .expect("shutdown status retained")
+                .application(),
+            ApplicationState::Admitted
+        ));
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Scientific { code, .. })
+                if code == "original_science"
+        ));
+    }
+
+    #[test]
+    fn shutdown_lifecycle_event_failure_does_not_retry_partial_shutdown() {
+        let (mut core, mut port) = host(true);
+        let shutdown = core.request_shutdown().expect("shutdown admission");
+        let next_event = core.shared.borrow().next_event;
+        core.shared.borrow_mut().next_event = ProtocolEventSequence::new(u64::MAX);
+
+        assert!(matches!(
+            core.drive(ManualInstant::from_nanos(0)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert_eq!(core.lifecycle, HostLifecycle::Stopping);
+        assert!(matches!(
+            port.command_status(shutdown.command_id())
+                .expect("shutdown status query")
+                .expect("shutdown status retained")
+                .application(),
+            ApplicationState::Admitted
+        ));
+        assert_eq!(
+            core.panicked_command().map(|command| command.command_id),
+            Some(shutdown.command_id())
+        );
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Protocol { code, .. })
+                if code == "command_boundary_indeterminate"
+        ));
+
+        core.shared.borrow_mut().next_event = next_event;
+        let stalled = core
+            .drive(ManualInstant::from_nanos(1))
+            .expect("faulted partial shutdown must remain inspectable");
+
+        assert_eq!(stalled.commands_completed, 0);
+        assert_eq!(stalled.scientific_steps, 0);
+        assert_eq!(core.revisions.control, ControlRevision::new(0));
+        assert!(matches!(
+            port.command_status(shutdown.command_id())
+                .expect("shutdown status query")
+                .expect("shutdown status retained")
+                .application(),
+            ApplicationState::Admitted
+        ));
+        assert_eq!(
+            core.panicked_command().map(|command| command.command_id),
+            Some(shutdown.command_id())
+        );
     }
 
     #[test]
