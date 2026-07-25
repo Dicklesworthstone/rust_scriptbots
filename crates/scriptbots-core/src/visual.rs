@@ -20,18 +20,10 @@
 //! [`apply_accessibility_palette`] as the FINAL stage before display so every
 //! surface (3D PBR, terminal truecolor, ASCII fallback) transforms identically.
 
-// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
-// order and fixed-width casts are part of the science contract; fma fusion,
-// reassociation, or width changes alter world digests. Function lengths mirror
-// the legacy C++ parity layout and are reviewed as units.
-#![allow(clippy::suboptimal_flops, clippy::imprecise_flops)]
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-#![allow(clippy::float_cmp, clippy::while_float)]
+// Exact floating-point equality is used only where the visual contract defines
+// an exact identity value; deterministic arithmetic and casts are justified at
+// their narrow call sites so new numerical operations remain lint-visible.
+#![allow(clippy::float_cmp)]
 #![allow(clippy::too_many_lines)]
 
 use crate::{AccessibilityPalette, BirthOrigin, DeathCause, TerrainKind};
@@ -669,6 +661,10 @@ pub const fn health_factor(health: f32) -> f32 {
 /// floor (frontends pass the observed maximum or a scenario constant); age
 /// beyond it simply stays at the floor. Pure and deterministic.
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "visual age ratios intentionally resolve into the renderer's f32 color contract"
+)]
 pub const fn age_factor(age_ticks: u64, reference_age: u64) -> f32 {
     if reference_age == 0 {
         return 1.0;
@@ -695,6 +691,10 @@ pub const fn apply_saturation(rgb: [f32; 3], factor: f32) -> [f32; 3] {
 /// Pure, total, and allocation-free. Colors are in the natural palette;
 /// frontends apply [`apply_accessibility_palette`] at display time.
 #[must_use]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "pinned visual composition order is shared by every renderer and its goldens"
+)]
 pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
     let genome_rgb = [
         clamp01(input.genome_color[0]),
@@ -855,6 +855,10 @@ pub const DAYLIGHT_NIGHT_FLOOR: f32 = 0.15;
 /// returned [`DAYLIGHT_STATIC`] for every tick of every run: the curve was live on the
 /// interactive canvas and structurally incapable of moving. See
 /// `tests/day_night_default_probe.rs`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "LEGACY_EPOCH_TICKS is the fixed 10,000-tick visual and sensor epoch"
+)]
 pub const DEFAULT_DAY_NIGHT_CYCLE_TICKS: u32 = crate::LEGACY_EPOCH_TICKS as u32;
 
 /// Default starting phase: noon, so a fresh run opens at full light rather than mid-dusk.
@@ -887,6 +891,11 @@ pub fn resolve_day_night(cycle_ticks: Option<u32>, start_phase: Option<f32>) -> 
 /// cosine between [`DAYLIGHT_NIGHT_FLOOR`] at midnight and `1.0` at noon, so
 /// the Bevy sun and the terminal tint can never disagree about time of day.
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "the renderer consumes an f32 phase and the established curve order is golden-pinned"
+)]
 pub fn daylight_factor(tick: u64, cycle_ticks: u32, start_phase: f32) -> f32 {
     if cycle_ticks == 0 {
         return DAYLIGHT_STATIC;
@@ -1028,6 +1037,10 @@ pub const TERRAIN_LIGHT_FACTOR_RANGE: (f32, f32) = (0.72, 1.28);
 /// Every constant it depends on lives in this module (bd-1lls): the renderer supplies geometry
 /// and gets appearance back, and there is exactly one definition of what a lit slope looks like.
 #[must_use]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "normal-light evaluation order is shared renderer output, not an FMA optimization site"
+)]
 pub fn terrain_normal_light_factor(kind: TerrainKind, gradient: [f32; 2], daylight: f32) -> f32 {
     let (gx, gy) = match (gradient[0].is_finite(), gradient[1].is_finite()) {
         (true, true) => (gradient[0], gradient[1]),
@@ -1119,6 +1132,11 @@ pub const SHIMMER_PERIOD_TICKS: u64 = 120;
 /// TUI and the 3D water/food shaders call this same function so a given cell
 /// pulses in lockstep on every surface and in every replay.
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "coordinate bytes and the hash modulo are explicitly bounded by the stable phase codec"
+)]
 pub fn cell_phase(cell_x: u32, cell_y: u32) -> f32 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in [
@@ -1143,6 +1161,11 @@ pub fn cell_phase(cell_x: u32, cell_y: u32) -> f32 {
 /// frozen when the simulation is paused (tick stops advancing), identical on
 /// every renderer.
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "both modulo operands are at most 120 and the replay-stable sine order is pinned"
+)]
 pub fn shimmer(tick: u64, cell_x: u32, cell_y: u32) -> f32 {
     let t = (tick % SHIMMER_PERIOD_TICKS) as f32 / SHIMMER_PERIOD_TICKS as f32;
     let phase = t + cell_phase(cell_x, cell_y);
@@ -1257,6 +1280,10 @@ const fn normalized_event_gain(style: EventCueStyle) -> f32 {
 /// colors/durations from the art bible (bd-2z0.14.3.6); intensity is scaled
 /// by caller-measured magnitudes where applicable.
 #[must_use]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "event cue arithmetic is renderer-neutral golden output with pinned evaluation order"
+)]
 pub fn visual_cue_for_event(event: &WorldVisualEvent) -> VisualCue {
     match *event {
         WorldVisualEvent::Birth { origin } => {
@@ -1451,6 +1478,10 @@ impl TerrainFieldView<'_> {
     /// Uses `rem_euclid` rather than a single add/subtract correction. bd-b09u and bd-p095 both
     /// proved this codebase gets minimum-image arithmetic wrong whenever a site rolls its own,
     /// and a sampler is exactly such a site.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "rem_euclid bounds the result below the u32 extent before conversion to usize"
+    )]
     fn wrap_cell(coordinate: i64, extent: u32) -> usize {
         if extent == 0 {
             return 0;
@@ -1466,6 +1497,10 @@ impl TerrainFieldView<'_> {
     /// This is OPTION B of bd-grbc and the HOT path: the caller receives indices and weights and
     /// does the blend itself, which is what a fragment shader wants. Prefer it per-pixel.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "finite floor coordinates intentionally enter the integer torus-wrap boundary"
+    )]
     pub fn sample_corners(&self, x: f32, y: f32) -> TerrainSampleCorners {
         if self.cell_count() == 0 || self.cell_size <= 0.0 || !x.is_finite() || !y.is_finite() {
             return TerrainSampleCorners {
@@ -1655,6 +1690,10 @@ pub fn splat_weights(input: &SplatInput) -> [f32; SPLAT_LAYERS] {
 
 /// Blend `amount` of total weight into `layer`, taking proportionally from
 /// all other layers so the sum stays 1.
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "splat interpolation order is shared shader-reference output and remains bit-pinned"
+)]
 fn blend_toward(w: &mut [f32; SPLAT_LAYERS], layer: usize, amount: f32) {
     let amount = amount.clamp(0.0, 1.0);
     if amount <= 0.0 {
@@ -1686,6 +1725,13 @@ fn blend_toward(w: &mut [f32; SPLAT_LAYERS], layer: usize, amount: f32) {
 /// bilinear smoothstep interpolation, two octaves at fixed weights. The seed
 /// domain-separates biomes so no two layers share a pattern.
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::suboptimal_flops,
+    reason = "the stable lattice codec and interpolation order are covered by byte-hash goldens"
+)]
 pub fn value_noise_2d(seed: u64, x: f32, y: f32) -> f32 {
     fn lattice(seed: u64, ix: i64, iy: i64) -> f32 {
         let mut h = seed ^ (ix as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -1766,6 +1812,12 @@ pub const fn biome_texture_specs() -> [BiomeTextureSpec; SPLAT_LAYERS] {
 /// Identical `(kind, seed, size)` inputs produce byte-identical output on
 /// every platform (integer hash lattice; no transcendental float inputs).
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "bounded texture coordinates and clamped RGBA channels intentionally narrow to the output codec"
+)]
 pub fn bake_biome_texture(kind: TerrainKind, seed: u64, size: u32) -> Vec<u8> {
     let index = match kind {
         TerrainKind::DeepWater => 0,
@@ -1801,6 +1853,10 @@ pub fn bake_biome_texture(kind: TerrainKind, seed: u64, size: u32) -> Vec<u8> {
 /// Bake the full six-layer biome albedo atlas side by side
 /// (`size * 6 x size` RGBA8), the layout the splat shader samples.
 #[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the retained u32 texture size is round-tripped only for the existing atlas codec"
+)]
 pub fn bake_biome_atlas(seed: u64, size: u32) -> Vec<u8> {
     let kinds = [
         TerrainKind::DeepWater,

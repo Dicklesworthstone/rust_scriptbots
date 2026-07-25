@@ -10,17 +10,10 @@
 //! Keeping that boundary explicit prevents a core round trip from being advertised as a storage
 //! or application recovery feature.
 
-// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
-// order and fixed-width casts are part of the science contract; fma fusion,
-// reassociation, or width changes alter world digests. Function lengths mirror
-// the legacy C++ parity layout and are reviewed as units.
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-#![allow(clippy::float_cmp, clippy::while_float)]
+// Exact floating-point equality is used only by checkpoint conformance checks.
+// Numeric conversions are justified at the restore boundary so new casts stay
+// lint-visible throughout the rest of this module.
+#![allow(clippy::float_cmp)]
 #![allow(clippy::too_many_lines)]
 
 use crate::rng_domains::{
@@ -938,6 +931,10 @@ impl WorldState {
     /// family-authored semantic attestation rather than executable-byte authentication: authors
     /// must change it whenever construction or evaluation behavior changes, and must additionally
     /// bump their family schema/codec whenever serialized payload interpretation changes.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "checkpoint restore reconstructs the same f32 grid geometry as WorldState::build"
+    )]
     pub fn restore_checkpoint_v1(
         checkpoint: &WorldCheckpointV1,
         brain_registry: BrainRegistry,
