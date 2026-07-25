@@ -1434,6 +1434,27 @@ pub enum ControlCommand {
     UpdateConfig(Box<ScriptBotsConfig>),
     /// Apply a selection change.
     UpdateSelection(SelectionUpdate),
+    /// Adjust one live agent's mutation-rate controls by stable run identity.
+    AdjustAgentMutationRates {
+        /// Stable target identity; stale or missing targets are accepted no-ops.
+        agent_uid: AgentUid,
+        /// Delta applied to the primary mutation probability.
+        delta_primary: f32,
+        /// Delta applied to the secondary mutation probability.
+        delta_secondary: f32,
+    },
+    /// Inject one randomly positioned agent using the world-owned Population RNG stream.
+    SpawnAgent {
+        /// Herbivore tendency assigned to the injected runtime.
+        herbivore_tendency: f32,
+    },
+    /// Inject a crossover child from two explicitly named stable parents.
+    SpawnCrossover {
+        /// First stable parent identity.
+        parent_a: AgentUid,
+        /// Second stable parent identity.
+        parent_b: AgentUid,
+    },
     /// Playback control for the external simulation driver.
     UpdateSimulation(SimulationCommand),
     /// Pause simulation playback.
@@ -1497,6 +1518,37 @@ impl ControlCommand {
         match self {
             Self::UpdateConfig(config) => config.validate(),
             Self::UpdateSelection(_) => Ok(()),
+            Self::AdjustAgentMutationRates {
+                delta_primary,
+                delta_secondary,
+                ..
+            } => {
+                if !delta_primary.is_finite() || !delta_secondary.is_finite() {
+                    Err(WorldStateError::InvalidConfig(
+                        "agent mutation-rate deltas must be finite",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::SpawnAgent { herbivore_tendency } => {
+                if !herbivore_tendency.is_finite() {
+                    Err(WorldStateError::InvalidConfig(
+                        "agent herbivore tendency must be finite",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::SpawnCrossover { parent_a, parent_b } => {
+                if parent_a == parent_b {
+                    Err(WorldStateError::InvalidConfig(
+                        "crossover parents must be distinct",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
             Self::UpdateSimulation(command) => command.validate(),
             Self::Pause | Self::Resume | Self::Step | Self::Shutdown => Ok(()),
             Self::SetSpeed(speed) => {
@@ -1525,6 +1577,26 @@ pub fn apply_control_command(
         }
         ControlCommand::UpdateSelection(update) => {
             let _ = world.apply_selection_update(update);
+            Ok(ControlDisposition::WorldApplied)
+        }
+        ControlCommand::AdjustAgentMutationRates {
+            agent_uid,
+            delta_primary,
+            delta_secondary,
+        } => {
+            let _ = world.apply_agent_mutation_rate_command(
+                agent_uid,
+                delta_primary,
+                delta_secondary,
+            )?;
+            Ok(ControlDisposition::WorldApplied)
+        }
+        ControlCommand::SpawnAgent { herbivore_tendency } => {
+            let _ = world.try_inject_control_agent(herbivore_tendency)?;
+            Ok(ControlDisposition::WorldApplied)
+        }
+        ControlCommand::SpawnCrossover { parent_a, parent_b } => {
+            let _ = world.try_inject_control_crossover(parent_a, parent_b)?;
             Ok(ControlDisposition::WorldApplied)
         }
         ControlCommand::UpdateSimulation(update) => {
@@ -24257,6 +24329,125 @@ impl WorldState {
         self.try_insert_agent_with_origin(agent, update_runtime, BirthOrigin::Injected)
     }
 
+    fn agent_id_for_control_uid(&self, uid: AgentUid) -> Option<AgentId> {
+        self.agents.iter_handles().find(|id| {
+            self.identities
+                .get(*id)
+                .is_some_and(|identity| identity.uid == uid)
+        })
+    }
+
+    fn apply_agent_mutation_rate_command(
+        &mut self,
+        agent_uid: AgentUid,
+        delta_primary: f32,
+        delta_secondary: f32,
+    ) -> Result<bool, ScientificStateError> {
+        let Some(agent_id) = self.agent_id_for_control_uid(agent_uid) else {
+            return Ok(false);
+        };
+        self.try_update_agent_runtime(agent_id, |runtime| {
+            runtime.mutation_rates.primary =
+                (runtime.mutation_rates.primary + delta_primary).max(0.0001);
+            runtime.mutation_rates.secondary =
+                (runtime.mutation_rates.secondary + delta_secondary).max(0.0);
+        })
+    }
+
+    fn try_inject_control_agent(
+        &mut self,
+        herbivore_tendency: f32,
+    ) -> Result<AgentId, WorldStateError> {
+        self.validate_external_arrival_boundary()?;
+        let width = self.config.world_width as f32;
+        let height = self.config.world_height as f32;
+        if width <= 0.0 || height <= 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "world dimensions must be positive before agent injection",
+            ));
+        }
+
+        let rng_before = self.rng.clone();
+        let result = {
+            let rng = self.rng.stream(RngDomain::Population);
+            let agent = AgentData {
+                position: Position::new(
+                    rng.random_range(0.0..width),
+                    rng.random_range(0.0..height),
+                ),
+                velocity: Velocity::new(0.0, 0.0),
+                color: [
+                    rng.random_range(0.15..0.95),
+                    rng.random_range(0.15..0.95),
+                    rng.random_range(0.15..0.95),
+                ],
+                ..AgentData::default()
+            };
+            self.try_inject_agent_with(agent, |runtime| {
+                runtime.herbivore_tendency = herbivore_tendency.clamp(0.0, 1.0);
+                runtime.energy = runtime.energy.max(1.0);
+            })
+            .map_err(WorldStateError::from)
+        };
+        if result.is_err() {
+            self.rng = rng_before;
+        }
+        result
+    }
+
+    fn try_inject_control_crossover(
+        &mut self,
+        parent_a: AgentUid,
+        parent_b: AgentUid,
+    ) -> Result<Option<AgentId>, WorldStateError> {
+        self.validate_external_arrival_boundary()?;
+        let Some(parent_a_id) = self.agent_id_for_control_uid(parent_a) else {
+            return Ok(None);
+        };
+        let Some(parent_b_id) = self.agent_id_for_control_uid(parent_b) else {
+            return Ok(None);
+        };
+        let Some(parent_a_state) = self.snapshot_agent(parent_a_id) else {
+            return Ok(None);
+        };
+        let Some(parent_b_state) = self.snapshot_agent(parent_b_id) else {
+            return Ok(None);
+        };
+
+        let child = AgentData {
+            position: Position::new(
+                (parent_a_state.data.position.x + parent_b_state.data.position.x) * 0.5,
+                (parent_a_state.data.position.y + parent_b_state.data.position.y) * 0.5,
+            ),
+            velocity: Velocity::new(0.0, 0.0),
+            heading: (parent_a_state.data.heading + parent_b_state.data.heading) * 0.5,
+            health: ((parent_a_state.data.health + parent_b_state.data.health) * 0.5)
+                .clamp(0.5, 2.0),
+            color: [
+                (parent_a_state.data.color[0] + parent_b_state.data.color[0]) * 0.5,
+                (parent_a_state.data.color[1] + parent_b_state.data.color[1]) * 0.5,
+                (parent_a_state.data.color[2] + parent_b_state.data.color[2]) * 0.5,
+            ],
+            spike_length: (parent_a_state.data.spike_length + parent_b_state.data.spike_length)
+                * 0.5,
+            ..AgentData::default()
+        };
+        self.try_inject_crossover_agent_with(parent_a_id, parent_b_id, child, |_child, runtime| {
+            runtime.herbivore_tendency = (parent_a_state.runtime.herbivore_tendency
+                + parent_b_state.runtime.herbivore_tendency)
+                * 0.5;
+            runtime.mutation_rates.primary = (parent_a_state.runtime.mutation_rates.primary
+                + parent_b_state.runtime.mutation_rates.primary)
+                * 0.5;
+            runtime.mutation_rates.secondary = (parent_a_state.runtime.mutation_rates.secondary
+                + parent_b_state.runtime.mutation_rates.secondary)
+                * 0.5;
+            runtime.indicator.intensity = 0.6;
+            runtime.indicator.color = [0.2, 0.8, 0.9];
+        })
+        .map_err(WorldStateError::from)
+    }
+
     fn pending_current_origin_record(&self, id: AgentId) -> Option<&BirthRecord> {
         let uid = self.identities.get(id)?.uid;
         self.pending_birth_records
@@ -40688,6 +40879,141 @@ mod tests {
                 .expect("normalization leaves world quiescent"),
             before
         );
+    }
+
+    #[test]
+    fn agent_control_commands_are_replay_deterministic_and_world_owned() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 20,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(0x37C0_1100),
+            ..ScriptBotsConfig::default()
+        };
+        let mut left = WorldState::new(config.clone()).expect("left command world");
+        let mut right = WorldState::new(config).expect("right command world");
+
+        for command in [
+            ControlCommand::SpawnAgent {
+                herbivore_tendency: 1.0,
+            },
+            ControlCommand::SpawnAgent {
+                herbivore_tendency: 0.0,
+            },
+        ] {
+            assert_eq!(
+                apply_control_command(&mut left, command.clone())
+                    .expect("apply left spawn command"),
+                ControlDisposition::WorldApplied
+            );
+            assert_eq!(
+                apply_control_command(&mut right, command).expect("apply right spawn command"),
+                ControlDisposition::WorldApplied
+            );
+            assert_eq!(
+                left.world_digest_v1().expect("left spawn digest"),
+                right.world_digest_v1().expect("right spawn digest"),
+                "the same admitted command must consume the same world RNG and identity state"
+            );
+        }
+
+        let mut parent_uids = left
+            .agents()
+            .iter_handles()
+            .map(|id| left.agent_uid(id).expect("left parent UID"))
+            .collect::<Vec<_>>();
+        parent_uids.sort_unstable();
+        let mutation = ControlCommand::AdjustAgentMutationRates {
+            agent_uid: parent_uids[0],
+            delta_primary: 0.002,
+            delta_secondary: -0.01,
+        };
+        apply_control_command(&mut left, mutation.clone()).expect("apply left mutation command");
+        apply_control_command(&mut right, mutation).expect("apply right mutation command");
+        assert_eq!(
+            left.world_digest_v1().expect("left mutation digest"),
+            right.world_digest_v1().expect("right mutation digest")
+        );
+
+        left.advance_tick();
+        right.advance_tick();
+        let crossover = ControlCommand::SpawnCrossover {
+            parent_a: parent_uids[0],
+            parent_b: parent_uids[1],
+        };
+        apply_control_command(&mut left, crossover.clone()).expect("apply left crossover command");
+        apply_control_command(&mut right, crossover).expect("apply right crossover command");
+        assert_eq!(
+            left.world_digest_v1().expect("left crossover digest"),
+            right.world_digest_v1().expect("right crossover digest")
+        );
+        assert_eq!(left.agent_count(), 3);
+        let birth = left
+            .pending_birth_records
+            .last()
+            .expect("crossover command birth record");
+        assert_eq!(birth.parent_a, Some(parent_uids[0]));
+        assert_eq!(birth.parent_b, Some(parent_uids[1]));
+        assert!(birth.is_hybrid);
+    }
+
+    #[test]
+    fn rejected_or_stale_agent_control_commands_are_atomic() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(0x37A7_0C00),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("atomic command world");
+        let before = world.world_digest_v1().expect("pre-command digest");
+        let rng_before = world.random_streams_checkpoint();
+        let identity_before = world.identity_sequence_state();
+
+        assert_eq!(
+            apply_control_command(
+                &mut world,
+                ControlCommand::AdjustAgentMutationRates {
+                    agent_uid: AgentUid(u64::MAX),
+                    delta_primary: 0.001,
+                    delta_secondary: 0.01,
+                },
+            )
+            .expect("a stale stable UID is an accepted no-op"),
+            ControlDisposition::WorldApplied
+        );
+        for command in [
+            ControlCommand::SpawnAgent {
+                herbivore_tendency: f32::NAN,
+            },
+            ControlCommand::AdjustAgentMutationRates {
+                agent_uid: AgentUid(1),
+                delta_primary: f32::INFINITY,
+                delta_secondary: 0.0,
+            },
+            ControlCommand::SpawnCrossover {
+                parent_a: AgentUid(7),
+                parent_b: AgentUid(7),
+            },
+        ] {
+            assert!(
+                matches!(
+                    apply_control_command(&mut world, command),
+                    Err(WorldStateError::InvalidConfig(_))
+                ),
+                "invalid agent commands must fail validation before touching world state"
+            );
+        }
+        assert_eq!(
+            world.world_digest_v1().expect("post-command digest"),
+            before
+        );
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
+        assert_eq!(world.identity_sequence_state(), identity_before);
     }
 
     fn ledger_flow(world: &WorldState, kind: ResourceFlowKind) -> ResourceFlow {
