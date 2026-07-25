@@ -1707,6 +1707,45 @@ loosens that threshold nor blesses the current output.
 - [Implemented] GPUI treats its two-window launch as one transaction, returns window-open failures, uses `QuitMode::LastWindowClosed`, closes the paired session when either window closes, and contains double-driving by making the HUD the sole interim driver while the world window is read-only;
 - [Open proof] record the complete startup matrix across default, GUI-enabled, Bevy-enabled, and unavailable-feature builds; terminal, headless, control-server, and launch-failure paths; and real supported macOS, Linux, and Windows sessions. The current targeted unit/integration tests are not yet that full cross-feature/platform acceptance matrix.
 
+Native macOS proof on 2026-07-12 used the pinned `nightly-2026-07-09`
+toolchain on Apple Silicon macOS 26.2, a logged-in WindowServer/Quartz session,
+and a unique target under `/Volumes/USB_NVME/temp_agent_space`. The default
+binary's seven subprocess smoke tests passed, including headless rendering,
+occupied REST/MCP preflight with no config/storage/tuning artifacts, and an
+uncompiled-GPUI refusal. After installing Xcode's previously missing Metal
+Toolchain 17B54, the GUI-enabled main binary passed all 35 tests. An explicit
+GPUI launch and a console-session Auto launch each produced two real, on-screen
+layer-zero CoreGraphics windows owned by the ScriptBots PID at `1600x932` and
+`1280x752`; Auto selected `gui`, while the same binary in an SSH session selected
+`terminal` and completed at the exact requested tick budget. Screen Recording
+and Accessibility permission were not weakened: exact-window `screencapture`
+was refused, so no GPUI screenshot is claimed. An actual PTY terminal run also
+served live REST config/tick JSON and exited on `q`; its 1200x800 H.264 capture
+has SHA-256 `c11f567dc664cbec23023cb5be00d162c19346990c703b14ae964f8b0006dca3`
+and the inspected PNG frame has SHA-256
+`478e7452f3c5de3090d525f95657596f602988444cd70601b3596ccbf3fb1150`.
+An unavailable Bevy request likewise failed before its unique database, writer
+lock, or requested config file existed.
+
+Windows remains an honest external acceptance blocker. The repository has no
+self-hosted Windows runner and this machine has no Windows VM; GitHub-hosted
+`windows-2022` runners execute non-interactively and cannot prove a visible
+User32 window launch. The matrix now calls the production
+`GetProcessWindowStation`/`GetUserObjectInformationW(UOI_FLAGS)` path on that
+runner, prints flags/query/visibility/selection evidence, and checks that Auto
+uses the result. That is real Session-0/headless evidence, not a claim about a
+visible desktop. The Windows-target app unit-test binary also cross-compiles
+and links against User32; this is compile/link evidence only. Phase 0.4 stays in
+progress until an interactive Windows runner proves the visible station and
+current-version window launch/failure path.
+
+The macOS PTY frame also records deferred TUI product baseline, owned by the
+FrankenTUI frontend work rather than this startup bead: dense terrain emoji
+overwhelm agent legibility; charts lack axes and labels; the focus readout uses
+agent `#0` while lists expose raw large handles; storage reads `committed
+pending / lag unknown`; brain metrics are unavailable; and recent events are
+sparse. None of those visual/product issues is changed by this startup proof.
+
 **Exit:** startup matrix passes for compiled/uncompiled GUI, terminal, headless, server, and launch failure.
 
 Phase 0.4 therefore remains in progress. This slice hardens renderer selection, process startup, window lifetime, and control-server supervision. GPUI's HUD-only driver is interim containment, not the architectural double-driver fix: scientific time still belongs to a renderer, GPUI's inner command queue remains incorrect, and Bevy still owns a simulation worker. Permanent exactly-one-driver and command authority remain assigned to the `HostCore` migration.
