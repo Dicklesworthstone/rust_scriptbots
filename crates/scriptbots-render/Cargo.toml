@@ -17,6 +17,7 @@ pollster = { version = "0.4", optional = true }
 naga = { version = "27", features = ["termcolor"] }
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 scriptbots-brain = { path = "../scriptbots-brain" }
 
 [features]

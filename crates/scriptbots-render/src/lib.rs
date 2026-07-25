@@ -1806,6 +1806,133 @@ fn start_gui_simulation_driver(app: &App, driver: Arc<Mutex<GuiSimulationDriver>
     .detach();
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuiViewRole {
+    Hud,
+    WorldCanvas,
+}
+
+impl GuiViewRole {
+    fn window_options(self, app: &App) -> WindowOptions {
+        let (title, width, height) = match self {
+            Self::Hud => ("ScriptBots HUD", 1280.0, 720.0),
+            Self::WorldCanvas => ("ScriptBots World", 1600.0, 900.0),
+        };
+        let bounds = Bounds::centered(None, size(px(width), px(height)), app);
+        let mut options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            ..Default::default()
+        };
+        if let Some(titlebar) = options.titlebar.as_mut() {
+            titlebar.title = Some(title.into());
+        }
+        options
+    }
+
+    fn view_title(self) -> SharedString {
+        match self {
+            Self::Hud => "ScriptBots HUD".into(),
+            Self::WorldCanvas => "World".into(),
+        }
+    }
+
+    fn launch_label(self) -> &'static str {
+        match self {
+            Self::Hud => "HUD",
+            Self::WorldCanvas => "simulation",
+        }
+    }
+}
+
+struct GuiSession {
+    simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
+    analytics: AnalyticsSnapshotProvider,
+    command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+}
+
+impl GuiSession {
+    fn new(
+        world: Arc<Mutex<WorldState>>,
+        simulation_step: WorldStepDriver,
+        analytics: AnalyticsSnapshotProvider,
+        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+        command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+    ) -> Self {
+        Self {
+            simulation_driver: Arc::new(Mutex::new(GuiSimulationDriver::new(
+                world,
+                simulation_step,
+                command_drain,
+            ))),
+            analytics,
+            command_submit,
+        }
+    }
+
+    fn new_view(&self, role: GuiViewRole) -> SimulationView {
+        let mut view = SimulationView::new(
+            Arc::clone(&self.simulation_driver),
+            self.analytics.clone(),
+            role.view_title(),
+            Arc::clone(&self.command_submit),
+        );
+        if role == GuiViewRole::WorldCanvas {
+            view.set_minimal_canvas_mode();
+        }
+        view
+    }
+
+    fn install(
+        self: &Arc<Self>,
+        app: &mut App,
+    ) -> std::result::Result<GuiWindowHandles, GuiWindowLaunchFailure> {
+        let windows = open_gui_session_windows(app, self)?;
+        app.on_window_closed(|app, _window_id| app.quit()).detach();
+        start_gui_simulation_driver(app, Arc::clone(&self.simulation_driver));
+        Ok(windows)
+    }
+}
+
+struct GuiWindowHandles {
+    hud: gpui::WindowHandle<SimulationView>,
+    canvas: gpui::WindowHandle<SimulationView>,
+}
+
+#[derive(Debug)]
+struct GuiWindowLaunchFailure {
+    role: GuiViewRole,
+    detail: String,
+}
+
+fn open_gui_session_windows(
+    app: &mut App,
+    session: &Arc<GuiSession>,
+) -> std::result::Result<GuiWindowHandles, GuiWindowLaunchFailure> {
+    let hud_options = GuiViewRole::Hud.window_options(app);
+    let session_for_hud = Arc::clone(session);
+    let hud = app
+        .open_window(hud_options, move |_window, cx| {
+            cx.new(|_| session_for_hud.new_view(GuiViewRole::Hud))
+        })
+        .map_err(|error| GuiWindowLaunchFailure {
+            role: GuiViewRole::Hud,
+            detail: format!("{error:?}"),
+        })?;
+
+    let canvas_options = GuiViewRole::WorldCanvas.window_options(app);
+    let session_for_canvas = Arc::clone(session);
+    let canvas = app
+        .open_window(canvas_options, move |_window, cx| {
+            cx.new(|_| session_for_canvas.new_view(GuiViewRole::WorldCanvas))
+        })
+        .map_err(|error| GuiWindowLaunchFailure {
+            role: GuiViewRole::WorldCanvas,
+            detail: format!("{error:?}"),
+        })?;
+
+    Ok(GuiWindowHandles { hud, canvas })
+}
+
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
 pub fn run_demo(
     world: Arc<Mutex<WorldState>>,
@@ -1828,103 +1955,43 @@ pub fn run_demo(
         );
     }
 
-    let window_title: SharedString = "ScriptBots HUD".into();
-    let title_for_options = window_title.clone();
-    let title_for_view = window_title.clone();
-    let submit_for_view = Arc::clone(&command_submit);
-    let analytics_for_view = analytics.clone();
-    let simulation_driver = Arc::new(Mutex::new(GuiSimulationDriver::new(
+    let session = Arc::new(GuiSession::new(
         Arc::clone(&world),
         simulation_step,
+        analytics,
         command_drain,
-    )));
-    let simulation_driver_for_app = Arc::clone(&simulation_driver);
+        command_submit,
+    ));
+    let session_for_app = Arc::clone(&session);
     let run_error = Arc::new(Mutex::new(None));
     let run_error_for_app = Arc::clone(&run_error);
 
     application()
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |app: &mut App| {
-            // Window A: HUD
-            let hud_bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), app);
-            let mut hud_options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(hud_bounds)),
-                ..Default::default()
-            };
-            if let Some(titlebar) = hud_options.titlebar.as_mut() {
-                titlebar.title = Some(title_for_options.clone());
-            }
-
-            let view_title = title_for_view.clone();
-            let submit_for_hud = Arc::clone(&submit_for_view);
-            let analytics_for_hud = analytics_for_view.clone();
-            let simulation_driver_for_hud = Arc::clone(&simulation_driver_for_app);
-            if let Err(err) = app.open_window(hud_options, move |_window, cx| {
-                cx.new(|_| {
-                    SimulationView::new(
-                        Arc::clone(&simulation_driver_for_hud),
-                        analytics_for_hud.clone(),
-                        view_title.clone(),
-                        Arc::clone(&submit_for_hud),
-                    )
-                })
-            }) {
-                error!(error = ?err, "failed to open HUD window");
-                abort_gui_launch(
-                    app,
-                    &run_error_for_app,
-                    format!("could not open HUD window: {err:?}"),
-                );
-                // GPUI uses explicit application-lifetime quitting on macOS. Merely
-                // returning from this launch callback can otherwise leave a
-                // zero-window event loop alive forever, hiding the launch error
-                // from the caller.
-                return;
-            }
-
-            // Window B: Dedicated simulation viewport (minimal chrome)
-            let sim_bounds = Bounds::centered(None, size(px(1600.0), px(900.0)), app);
-            let mut sim_options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(sim_bounds)),
-                ..Default::default()
-            };
-            if let Some(titlebar) = sim_options.titlebar.as_mut() {
-                titlebar.title = Some("ScriptBots World".into());
-            }
-
-            let analytics_for_canvas = analytics_for_view.clone();
-            let submit_for_canvas = Arc::clone(&submit_for_view);
-            let simulation_driver_for_canvas = Arc::clone(&simulation_driver_for_app);
-            if let Err(err) = app.open_window(sim_options, move |_window, cx| {
-                cx.new(|_| {
-                    // Reuse SimulationView but render only the canvas section by enabling an overlay-only layout flag.
-                    let mut view = SimulationView::new(
-                        Arc::clone(&simulation_driver_for_canvas),
-                        analytics_for_canvas.clone(),
-                        "World".into(),
-                        Arc::clone(&submit_for_canvas),
+            let GuiWindowHandles { hud, canvas } = match session_for_app.install(app) {
+                Ok(windows) => windows,
+                Err(failure) => {
+                    let label = failure.role.launch_label();
+                    error!(
+                        window = label,
+                        error = %failure.detail,
+                        "failed to open GPUI window"
                     );
-                    view.set_minimal_canvas_mode();
-                    view
-                })
-            }) {
-                error!(error = ?err, "failed to open simulation window");
-                abort_gui_launch(
-                    app,
-                    &run_error_for_app,
-                    format!("could not open simulation window: {err:?}"),
-                );
-                // The HUD may already exist here. Quit the whole application so a
-                // two-window launch is transactional from the caller's point of
-                // view and the recorded error is returned promptly.
-                return;
-            }
+                    abort_gui_launch(
+                        app,
+                        &run_error_for_app,
+                        format!("could not open {label} window: {}", failure.detail),
+                    );
+                    // GPUI uses explicit application-lifetime quitting on macOS. Merely
+                    // returning from this launch callback can otherwise leave a
+                    // zero-window event loop alive forever, hiding the launch error
+                    // from the caller.
+                    return;
+                }
+            };
+            let _ = (hud, canvas);
 
-            // One session-level task owns scientific time and command draining;
-            // both windows are presentation-only projections of that same world.
-            // Keep the pair in one lifetime so neither can outlive its driver.
-            app.on_window_closed(|app, _window_id| app.quit()).detach();
-            start_gui_simulation_driver(app, Arc::clone(&simulation_driver_for_app));
             start_gui_health_monitor(app, health_probe, Arc::clone(&run_error_for_app));
             app.activate(true);
         });
@@ -15263,6 +15330,316 @@ mod command_characterization_tests {
         assert_eq!(
             two_snapshots, zero_snapshots,
             "HUD plus canvas snapshots must not alter any science digest in the 240-tick trace"
+        );
+    }
+
+    fn force_production_repaint(
+        app: &mut gpui::TestApp,
+        handle: gpui::WindowHandle<SimulationView>,
+    ) {
+        app.update(|app| {
+            app.update_window(handle.into(), |_, window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+            .expect("draw production GPUI test window");
+        });
+    }
+
+    fn seeded_digest_trace_after_production_repaints(
+        repaint_count: usize,
+    ) -> Vec<(CharacterizationDigestV0, WorldDigestV1)> {
+        assert!(
+            repaint_count <= 2,
+            "the production GPUI shell has two views"
+        );
+        let config = ScriptBotsConfig {
+            world_width: 128,
+            world_height: 128,
+            food_cell_size: 16,
+            initial_food: 0.25,
+            food_respawn_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.0,
+            persistence_interval: 0,
+            chart_flush_interval: 0,
+            rng_seed: Some(0xD16E_57A7),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("seeded production-repaint world");
+        let mut focused_agent = None;
+        for position in [
+            Position::new(12.0, 18.0),
+            Position::new(64.0, 72.0),
+            Position::new(111.0, 103.0),
+        ] {
+            let agent_id = world
+                .try_spawn_agent(AgentData {
+                    position,
+                    ..AgentData::default()
+                })
+                .expect("seed production-repaint agent");
+            focused_agent.get_or_insert(agent_id);
+        }
+        let focused_agent = focused_agent.expect("seeded production-repaint agent");
+        let world = Arc::new(Mutex::new(world));
+
+        let drain_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pending_commands = Arc::new(Mutex::new(Vec::new()));
+        let drain_commands = Arc::clone(&pending_commands);
+        let counted_drains = Arc::clone(&drain_calls);
+        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
+            Arc::new(move || {
+                counted_drains.fetch_add(1, AtomicOrdering::Relaxed);
+                let mut commands = drain_commands
+                    .lock()
+                    .expect("production-repaint command queue");
+                std::mem::take(&mut *commands)
+            });
+        let submit_commands = Arc::clone(&pending_commands);
+        let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+            Arc::new(move |command| {
+                submit_commands
+                    .lock()
+                    .expect("production-repaint command queue")
+                    .push(command);
+                true
+            });
+        let step_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_steps = Arc::clone(&step_calls);
+        let step_world = Arc::clone(&world);
+        let simulation_step: WorldStepDriver = Arc::new(move || {
+            counted_steps.fetch_add(1, AtomicOrdering::Relaxed);
+            step_world
+                .lock()
+                .expect("production-repaint world lock")
+                .step()
+        });
+        let session = Arc::new(GuiSession::new(
+            Arc::clone(&world),
+            simulation_step,
+            AnalyticsSnapshotProvider::empty(),
+            command_drain,
+            command_submit,
+        ));
+
+        let digest_before_install = {
+            let world = world.lock().expect("pre-install production world");
+            (
+                world
+                    .characterization_digest_v0()
+                    .expect("pre-install characterization digest"),
+                world
+                    .world_digest_v1()
+                    .expect("pre-install canonical world digest"),
+            )
+        };
+        let mut app = gpui::TestApp::new();
+        let windows = app
+            .update(|app| session.install(app))
+            .expect("install production GPUI test session");
+        assert_eq!(
+            app.windows().len(),
+            2,
+            "the production GPUI session must install exactly two windows"
+        );
+        assert_eq!(
+            drain_calls.load(AtomicOrdering::Relaxed),
+            1,
+            "one production driver task must perform one startup drain"
+        );
+        assert_eq!(
+            step_calls.load(AtomicOrdering::Relaxed),
+            0,
+            "session installation must not advance scientific time"
+        );
+        let digest_after_install = {
+            let world = world.lock().expect("post-install production world");
+            (
+                world
+                    .characterization_digest_v0()
+                    .expect("post-install characterization digest"),
+                world
+                    .world_digest_v1()
+                    .expect("post-install canonical world digest"),
+            )
+        };
+        assert_eq!(
+            digest_after_install, digest_before_install,
+            "production window installation and initial renders must be science-neutral"
+        );
+
+        let hud = app
+            .update(|app| windows.hud.root(app))
+            .expect("production HUD root");
+        let canvas = app
+            .update(|app| windows.canvas.root(app))
+            .expect("production canvas root");
+        app.update_entity(&hud, |view, _| {
+            assert!(
+                Arc::ptr_eq(&view.simulation_driver, &session.simulation_driver),
+                "the production HUD must use the session-level simulation driver"
+            );
+            assert!(
+                !view.minimal_canvas_mode,
+                "the production HUD must use its full inspector render branch"
+            );
+            view.inspector
+                .lock()
+                .expect("HUD inspector lock")
+                .focused_agent = Some(focused_agent);
+        });
+        app.read_entity(&canvas, |view, _| {
+            assert!(
+                Arc::ptr_eq(&view.simulation_driver, &session.simulation_driver),
+                "the production canvas must use the session-level simulation driver"
+            );
+            assert!(
+                view.minimal_canvas_mode,
+                "the production world window must use its minimal canvas render branch"
+            );
+        });
+
+        let mut digest_trace = Vec::with_capacity(240);
+        for expected_tick in 1..=240 {
+            assert!(
+                (session.command_submit.as_ref())(ControlCommand::UpdateSimulation(
+                    SimulationCommand {
+                        paused: None,
+                        speed_multiplier: None,
+                        step_once: true,
+                    }
+                )),
+                "production GPUI step command must be admitted"
+            );
+            app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
+            app.run_until_parked();
+            assert_eq!(
+                drain_calls.load(AtomicOrdering::Relaxed),
+                expected_tick as usize + 1,
+                "exactly one production driver task must drain once per timer wake"
+            );
+            assert_eq!(
+                step_calls.load(AtomicOrdering::Relaxed),
+                expected_tick as usize,
+                "each admitted step-once command must execute exactly one science step"
+            );
+
+            let digest_before_repaint = {
+                let world = world.lock().expect("production-repaint world");
+                assert_eq!(
+                    world.tick().0,
+                    expected_tick,
+                    "one session driver wake must advance exactly one science tick"
+                );
+                (
+                    world
+                        .characterization_digest_v0()
+                        .expect("characterization digest"),
+                    world.world_digest_v1().expect("canonical world digest"),
+                )
+            };
+            if repaint_count > 0 {
+                force_production_repaint(&mut app, windows.hud);
+                let rendered_tick = app.read_entity(&hud, |view, _| {
+                    view.playback.timeline.back().map(|snapshot| snapshot.tick)
+                });
+                assert_eq!(
+                    rendered_tick,
+                    Some(expected_tick),
+                    "HUD draw must execute the real production Render::render path"
+                );
+                let digest_after_hud = {
+                    let world = world.lock().expect("post-HUD production world");
+                    (
+                        world
+                            .characterization_digest_v0()
+                            .expect("post-HUD characterization digest"),
+                        world
+                            .world_digest_v1()
+                            .expect("post-HUD canonical world digest"),
+                    )
+                };
+                assert_eq!(
+                    digest_after_hud, digest_before_repaint,
+                    "the full production HUD render path must be science-neutral"
+                );
+            }
+            if repaint_count > 1 {
+                force_production_repaint(&mut app, windows.canvas);
+                let rendered_tick = app.read_entity(&canvas, |view, _| {
+                    view.playback.timeline.back().map(|snapshot| snapshot.tick)
+                });
+                assert_eq!(
+                    rendered_tick,
+                    Some(expected_tick),
+                    "canvas draw must execute the real production Render::render path"
+                );
+                let digest_after_canvas = {
+                    let world = world.lock().expect("post-canvas production world");
+                    (
+                        world
+                            .characterization_digest_v0()
+                            .expect("post-canvas characterization digest"),
+                        world
+                            .world_digest_v1()
+                            .expect("post-canvas canonical world digest"),
+                    )
+                };
+                assert_eq!(
+                    digest_after_canvas, digest_before_repaint,
+                    "the full production canvas render path must be science-neutral"
+                );
+            }
+
+            digest_trace.push(digest_before_repaint);
+        }
+
+        let expected_hud_tick = Some(if repaint_count > 0 { 240 } else { 0 });
+        let expected_canvas_tick = Some(if repaint_count > 1 { 240 } else { 0 });
+        assert_eq!(
+            app.read_entity(&hud, |view, _| {
+                view.playback.timeline.back().map(|snapshot| snapshot.tick)
+            }),
+            expected_hud_tick,
+            "HUD playback history must expose the requested repaint schedule"
+        );
+        assert_eq!(
+            app.read_entity(&canvas, |view, _| {
+                view.playback.timeline.back().map(|snapshot| snapshot.tick)
+            }),
+            expected_canvas_tick,
+            "canvas playback history must expose the requested repaint schedule"
+        );
+        assert_eq!(
+            drain_calls.load(AtomicOrdering::Relaxed),
+            241,
+            "one startup drain plus 240 timer wakes proves one session-level driver task"
+        );
+        assert_eq!(
+            step_calls.load(AtomicOrdering::Relaxed),
+            240,
+            "the production session must execute exactly 240 science ticks"
+        );
+        app.update(|app| app.shutdown());
+
+        digest_trace
+    }
+
+    #[test]
+    fn production_gpui_repaint_trace_is_independent_of_window_schedule() {
+        let zero_repaints = seeded_digest_trace_after_production_repaints(0);
+        let hud_repaints = seeded_digest_trace_after_production_repaints(1);
+        let both_repaint = seeded_digest_trace_after_production_repaints(2);
+
+        assert_eq!(
+            hud_repaints, zero_repaints,
+            "240 real HUD Render::render calls must not alter any science digest"
+        );
+        assert_eq!(
+            both_repaint, zero_repaints,
+            "240 real HUD plus canvas Render::render calls must not alter any science digest"
         );
     }
 
