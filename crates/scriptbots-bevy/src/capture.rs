@@ -35,7 +35,7 @@ use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
 use bevy::prelude::*;
 use bevy::render::RenderApp;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy::render::renderer::RenderDevice;
+use bevy::render::renderer::{RenderAdapterInfo, RenderDevice};
 use bevy::window::{ExitCondition, WindowPlugin};
 use scriptbots_core::{RenderQuality, RenderSettings, WorldState};
 use std::sync::{LazyLock, Mutex};
@@ -43,7 +43,7 @@ use tracing::{debug, info};
 
 use crate::{
     AccessibilityState, AgentMeshes, AgentRegistry, ReflectionProbeAssets, SnapshotState,
-    TerrainChunkRegistry, WorldSnapshot, resolve_effective_render_settings, sync_world,
+    TerrainChunkRegistry, WorldSnapshot, sync_world,
 };
 
 // ---------------------------------------------------------------------------
@@ -243,6 +243,29 @@ pub fn unpad_readback(data: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+/// Return true when an RGBA8 buffer contains no visible RGB evidence.
+///
+/// Alpha is deliberately ignored: the render target's initial fill is opaque
+/// black, so counting its `255` alpha byte as content would turn a dead
+/// pipeline into a successful capture. A uniform clear color is likewise not
+/// framebuffer evidence; at least two RGB values must differ.
+#[must_use]
+pub fn rgba8_is_visually_blank(bytes: &[u8]) -> bool {
+    let mut pixels = bytes.as_chunks::<4>().0.iter();
+    let Some(first) = pixels.next() else {
+        return true;
+    };
+    let first_rgb = [first[0], first[1], first[2]];
+    let mut has_nonzero_rgb = first_rgb.iter().any(|channel| *channel != 0);
+    let mut varied_rgb = false;
+    for pixel in pixels {
+        let rgb = [pixel[0], pixel[1], pixel[2]];
+        has_nonzero_rgb |= rgb.iter().any(|channel| *channel != 0);
+        varied_rgb |= rgb != first_rgb;
+    }
+    !has_nonzero_rgb || !varied_rgb
+}
+
 /// Encode tightly packed RGBA8 pixels as PNG bytes.
 ///
 /// # Errors
@@ -340,7 +363,11 @@ pub struct OffscreenCapture<'a> {
     target: Handle<Image>,
     viewport: (u32, u32),
     effective: crate::EffectiveRenderSettings,
+    adapter_name: String,
+    backend: String,
+    device_type: String,
     corrupt: bool,
+    next_snapshot_revision: u64,
 }
 
 impl<'a> OffscreenCapture<'a> {
@@ -363,6 +390,12 @@ impl<'a> OffscreenCapture<'a> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return Err(anyhow!(
                 "capture viewport {width}x{height} outside 1..=8192"
+            ));
+        }
+        if crate::probe_gpu_capability().is_none() {
+            return Err(anyhow!(
+                "no GPU adapter available for offscreen capture (software lane requires \
+                 llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)"
             ));
         }
         let mut guard = CAPTURE_APP.lock().unwrap_or_else(|e| e.into_inner());
@@ -405,16 +438,15 @@ impl<'a> OffscreenCapture<'a> {
     /// Provenance block for one capture (pixel hash lives in the scene log).
     #[must_use]
     pub fn provenance(&self, scene: &str, seed: u64, tick: u64) -> CaptureProvenance {
-        let gpu = self.effective.gpu.as_ref();
         CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
             scene: scene.to_string(),
             seed,
             tick,
             frontend: "bevy_offscreen".to_string(),
-            adapter_name: gpu.map_or_else(|| "unknown".to_string(), |g| g.name.clone()),
-            backend: gpu.map_or_else(|| "unknown".to_string(), |g| g.backend.clone()),
-            device_type: gpu.map_or_else(|| "unknown".to_string(), |g| format!("{:?}", g.class)),
+            adapter_name: self.adapter_name.clone(),
+            backend: self.backend.clone(),
+            device_type: self.device_type.clone(),
             quality_tier: format!("{:?}", self.effective.tier),
             viewport: [self.viewport.0, self.viewport.1],
             colorspace: "rgba8-srgb".to_string(),
@@ -457,8 +489,15 @@ impl<'a> OffscreenCapture<'a> {
         seed: u64,
         tick: u64,
     ) -> Result<CapturedFrame> {
-        let snapshot = WorldSnapshot::from_world(world)
+        let mut snapshot = WorldSnapshot::from_world(world)
             .ok_or_else(|| anyhow!("world snapshot unavailable at tick {tick}"))?;
+        validate_capture_tick(snapshot.tick, tick)?;
+        validate_capture_seed(world.agent_substream_protocol_v1().root_seed(), seed)?;
+        snapshot.revision = self.next_snapshot_revision;
+        self.next_snapshot_revision = self
+            .next_snapshot_revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("offscreen capture snapshot revision overflow"))?;
         self.app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
         self.set_camera_active(true);
         // Frame 1: sync_world applies the snapshot; pipelines compile.
@@ -578,8 +617,9 @@ impl<'a> OffscreenCapture<'a> {
         // `Readback` component's completion depends on extraction/plugin
         // wiring, while this path drives the copy, submission, and device
         // poll directly and fails loudly at each step.
-        let data = self.readback_target()?;
+        let data = self.readback_target();
         self.set_camera_active(false);
+        let data = data?;
         let (width, height) = self.viewport;
         let rgba8 = unpad_readback(&data, width, height);
         let expected = width as usize * height as usize * 4;
@@ -587,6 +627,11 @@ impl<'a> OffscreenCapture<'a> {
             return Err(anyhow!(
                 "readback shape drift: expected {expected} bytes after unpad, got {}",
                 rgba8.len()
+            ));
+        }
+        if rgba8_is_visually_blank(&rgba8) {
+            return Err(anyhow!(
+                "offscreen capture produced a blank or uniform RGB frame"
             ));
         }
         Ok(CapturedFrame {
@@ -682,6 +727,26 @@ impl<'a> OffscreenCapture<'a> {
     }
 }
 
+fn validate_capture_tick(snapshot_tick: u64, requested_tick: u64) -> Result<()> {
+    if snapshot_tick != requested_tick {
+        return Err(anyhow!(
+            "capture tick attribution mismatch: snapshot is tick {snapshot_tick}, \
+             caller requested tick {requested_tick}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capture_seed(world_seed: u64, requested_seed: u64) -> Result<()> {
+    if world_seed != requested_seed {
+        return Err(anyhow!(
+            "capture seed attribution mismatch: world root is {world_seed}, \
+             caller requested seed {requested_seed}"
+        ));
+    }
+    Ok(())
+}
+
 /// Build the process-wide render app (once). No window, no winit (macOS
 /// demands EventLoop creation on the main thread; captures run on
 /// test/worker threads), fixed exposure (no AutoExposure) for determinism.
@@ -772,13 +837,31 @@ fn configure_session<'a>(
     app: &'a mut App,
     config: &OffscreenCaptureConfig,
 ) -> Result<OffscreenCapture<'a>> {
-    let effective = resolve_effective_render_settings(&config.render_settings);
-    if effective.gpu.is_none() {
-        return Err(anyhow!(
-            "no GPU adapter available for offscreen capture (software lane requires \
-             llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)"
-        ));
-    }
+    let (actual_gpu, actual_device_type) = {
+        let render_app = app
+            .get_sub_app_mut(RenderApp)
+            .ok_or_else(|| anyhow!("capture render sub-app unavailable"))?;
+        let world = render_app.world();
+        let info = world
+            .get_resource::<RenderAdapterInfo>()
+            .ok_or_else(|| anyhow!("actual Bevy render adapter identity unavailable"))?;
+        let device = world
+            .get_resource::<RenderDevice>()
+            .ok_or_else(|| anyhow!("actual Bevy render device unavailable"))?;
+        (
+            scriptbots_core::GpuInfo {
+                name: info.name.clone(),
+                backend: format!("{:?}", info.backend),
+                class: crate::gpu_class_from_device_type(info.device_type),
+                vram_bytes: None,
+                max_texture_2d: Some(device.limits().max_texture_dimension_2d),
+                timestamp_queries: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+            },
+            format!("{:?}", info.device_type),
+        )
+    };
+    let effective =
+        crate::resolve_effective_render_settings_for_gpu(&config.render_settings, Some(actual_gpu));
     // Wipe scene content only. A blanket wipe of every entity kills
     // plugin-owned startup entities the render path depends on (the wiped
     // app then produces no ViewTargets and every capture reads back as the
@@ -837,9 +920,17 @@ fn configure_session<'a>(
     // outside the evidence path.
     app.update();
     app.update();
+    let actual_gpu = effective
+        .gpu
+        .as_ref()
+        .ok_or_else(|| anyhow!("resolved Bevy render adapter identity unavailable"))?;
+    let adapter_name = actual_gpu.name.clone();
+    let backend = actual_gpu.backend.clone();
     info!(
         viewport = ?config.viewport,
         tier = ?effective.tier,
+        adapter = %adapter_name,
+        backend = %backend,
         corrupt = config.corrupt,
         "offscreen capture session configured"
     );
@@ -848,7 +939,11 @@ fn configure_session<'a>(
         target,
         viewport: config.viewport,
         effective,
+        adapter_name,
+        backend,
+        device_type: actual_device_type,
         corrupt: config.corrupt,
+        next_snapshot_revision: 1,
     })
 }
 
@@ -966,6 +1061,62 @@ mod tests {
         world
     }
 
+    #[test]
+    fn repeated_live_capture_is_byte_identical_and_science_digest_neutral() {
+        if crate::probe_gpu_capability().is_none() {
+            eprintln!("no GPU adapter; skipping live repeatability test");
+            return;
+        }
+        let world = seeded_world(0xD37E_2A11);
+        let digest_before = world.world_digest_v1().expect("pre-render science digest");
+        let config = OffscreenCaptureConfig {
+            viewport: (160, 120),
+            render_settings: RenderSettings::default(),
+            corrupt: false,
+        };
+        let first = OffscreenCapture::run(&config, |session| {
+            session.render(&world, "repeatability", 0xD37E_2A11, 1)
+        })
+        .expect("first live capture");
+        assert_eq!(
+            world.world_digest_v1().expect("digest after first render"),
+            digest_before,
+            "the first render must not advance or mutate scientific state"
+        );
+        let second = OffscreenCapture::run(&config, |session| {
+            session.render(&world, "repeatability", 0xD37E_2A11, 1)
+        })
+        .expect("second live capture after a fresh session reset");
+
+        assert_eq!(
+            first.rgba8, second.rgba8,
+            "the same frozen world across fresh sessions must produce identical RGBA bytes"
+        );
+        assert_eq!(
+            world.world_digest_v1().expect("post-render science digest"),
+            digest_before,
+            "rendering must not advance or mutate scientific state"
+        );
+    }
+
+    #[test]
+    fn capture_tick_attribution_rejects_a_caller_mismatch() {
+        let error = validate_capture_tick(41, 42).expect_err("mismatched tick must fail");
+        assert!(
+            error.to_string().contains("snapshot is tick 41"),
+            "error must name the rendered snapshot tick: {error}"
+        );
+    }
+
+    #[test]
+    fn capture_seed_attribution_rejects_a_caller_mismatch() {
+        let error = validate_capture_seed(41, 42).expect_err("mismatched seed must fail");
+        assert!(
+            error.to_string().contains("world root is 41"),
+            "error must name the world root seed: {error}"
+        );
+    }
+
     /// The C4 alarm contract: a deliberately corrupted render (blackout sun +
     /// crushed exposure) MUST fail the golden comparison against the honest
     /// capture — if it passes, the harness cannot see a broken pipeline.
@@ -975,7 +1126,8 @@ mod tests {
             eprintln!("no GPU adapter; skipping live corruption alarm test");
             return;
         }
-        let world = seeded_world(0xA14A2);
+        const ROOT_SEED: u64 = 0xA14A2;
+        let world = seeded_world(ROOT_SEED);
         let honest_config = OffscreenCaptureConfig {
             viewport: (160, 120),
             render_settings: RenderSettings::default(),
@@ -986,11 +1138,11 @@ mod tests {
             ..honest_config.clone()
         };
         let honest = OffscreenCapture::run(&honest_config, |session| {
-            session.render(&world, "alarm-honest", 42, 1)
+            session.render(&world, "alarm-honest", ROOT_SEED, 1)
         })
         .expect("honest capture");
         let corrupted = OffscreenCapture::run(&corrupt_config, |session| {
-            session.render(&world, "alarm-corrupt", 42, 1)
+            session.render(&world, "alarm-corrupt", ROOT_SEED, 1)
         })
         .expect("corrupted capture");
         let stats = compare_frames(
@@ -1096,6 +1248,15 @@ mod tests {
     }
 
     #[test]
+    fn blank_detection_ignores_opaque_alpha_and_requires_rgb_variation() {
+        assert!(rgba8_is_visually_blank(&[0, 0, 0, 255, 0, 0, 0, 255]));
+        assert!(rgba8_is_visually_blank(&[20, 30, 40, 255, 20, 30, 40, 255]));
+        assert!(!rgba8_is_visually_blank(&[
+            20, 30, 40, 255, 21, 30, 40, 255
+        ]));
+    }
+
+    #[test]
     fn provenance_serializes_with_required_fields() {
         let provenance = CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
@@ -1105,7 +1266,7 @@ mod tests {
             frontend: "bevy_offscreen".to_string(),
             adapter_name: "test-adapter".to_string(),
             backend: "Metal".to_string(),
-            device_type: "Integrated".to_string(),
+            device_type: "IntegratedGpu".to_string(),
             quality_tier: "Medium".to_string(),
             viewport: [256, 256],
             colorspace: "rgba8-srgb".to_string(),

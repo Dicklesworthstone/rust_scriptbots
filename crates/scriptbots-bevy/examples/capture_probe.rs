@@ -15,8 +15,7 @@ fn main() {
         a.spike_length = 10.0;
         world.try_spawn_agent(a).expect("spawn");
     }
-    // Tick 0 == SnapshotState::default().last_applied_tick, so sync_world
-    // skips a never-stepped world; step once so the scene actually syncs.
+    // Step once so the probe exercises a completed science boundary.
     world.step().expect("step once");
     let config = OffscreenCaptureConfig {
         viewport: (320, 240),
@@ -26,7 +25,7 @@ fn main() {
     let (w, h, len, adapter, backend, spread, first, center) =
         OffscreenCapture::run(&config, |session| {
             eprintln!("session tier = {:?}", session.tier());
-            let frame = session.render(&world, "probe", 42, 0)?;
+            let frame = session.render(&world, "probe", 42, 1)?;
             let mut min = [255u8; 3];
             let mut max = [0u8; 3];
             for px in frame.rgba8.as_chunks::<4>().0 {

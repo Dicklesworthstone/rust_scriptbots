@@ -24,10 +24,14 @@ use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AgentId, ControlCommand, ControlDisposition, GpuClass, GpuInfo, IndicatorState, NUM_EYES,
-    OutputChannel, OutputsExt, RenderQuality, RenderSettings, RenderTonemapMode, SelectionMode,
-    SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TierFeatures, TraitModifiers,
-    WorldState, WorldStepDriver, apply_control_command, initial_tier_for, tier_features,
+    AccessibilityPalette, AgentId, ControlCommand, ControlDisposition, GpuClass, GpuInfo,
+    IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderQuality, RenderSettings,
+    RenderTonemapMode, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
+    TerrainKind, TierFeatures, TraitModifiers, WorldState, WorldStepDriver, apply_control_command,
+    initial_tier_for, tier_features,
+    visual::{
+        self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainShadeInput, VisualSelection,
+    },
 };
 use slotmap::Key;
 use std::{
@@ -253,11 +257,11 @@ pub struct EffectiveRenderSettings {
 
 /// Probe the default high-performance GPU adapter and classify it.
 ///
-/// Returns `None` when no adapter is available (headless/software-only
-/// environments); callers must treat that as the software/Potato path, never
-/// as an error. VRAM is not reliably exposed by the bevy-pinned wgpu 26 line,
-/// so `vram_bytes` stays `None` until a backend-specific lane proves otherwise
-/// (documented in bd-2z0.14.3.3).
+/// Returns `None` when no adapter is available. GPU frontends must surface
+/// that as an unavailable-backend error; they must not silently claim that a
+/// software path rendered a frame. VRAM is not reliably exposed by the
+/// bevy-pinned wgpu 26 line, so `vram_bytes` stays `None` until a
+/// backend-specific lane proves otherwise (documented in bd-2z0.14.3.3).
 #[must_use]
 pub fn probe_gpu_capability() -> Option<GpuInfo> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -268,13 +272,7 @@ pub fn probe_gpu_capability() -> Option<GpuInfo> {
     }))
     .ok()?;
     let info = adapter.get_info();
-    let class = match info.device_type {
-        wgpu::DeviceType::DiscreteGpu => GpuClass::Discrete,
-        wgpu::DeviceType::IntegratedGpu => GpuClass::Integrated,
-        wgpu::DeviceType::VirtualGpu => GpuClass::Virtual,
-        wgpu::DeviceType::Cpu => GpuClass::Software,
-        _ => GpuClass::Unknown,
-    };
+    let class = gpu_class_from_device_type(info.device_type);
     let limits = adapter.limits();
     let features = adapter.features();
     Some(GpuInfo {
@@ -287,6 +285,16 @@ pub fn probe_gpu_capability() -> Option<GpuInfo> {
     })
 }
 
+pub(crate) const fn gpu_class_from_device_type(device_type: wgpu::DeviceType) -> GpuClass {
+    match device_type {
+        wgpu::DeviceType::DiscreteGpu => GpuClass::Discrete,
+        wgpu::DeviceType::IntegratedGpu => GpuClass::Integrated,
+        wgpu::DeviceType::VirtualGpu => GpuClass::Virtual,
+        wgpu::DeviceType::Cpu => GpuClass::Software,
+        _ => GpuClass::Unknown,
+    }
+}
+
 /// Resolve the effective render settings for a launch: probe the adapter,
 /// map `Auto` onto the canonical initial tier, and emit the structured
 /// capability report the C3 acceptance requires (one startup INFO block,
@@ -294,6 +302,13 @@ pub fn probe_gpu_capability() -> Option<GpuInfo> {
 #[must_use]
 pub fn resolve_effective_render_settings(settings: &RenderSettings) -> EffectiveRenderSettings {
     let gpu = probe_gpu_capability();
+    resolve_effective_render_settings_for_gpu(settings, gpu)
+}
+
+pub(crate) fn resolve_effective_render_settings_for_gpu(
+    settings: &RenderSettings,
+    gpu: Option<GpuInfo>,
+) -> EffectiveRenderSettings {
     let requested = settings.requested_quality();
     let tier = match requested {
         RenderQuality::Auto => gpu
@@ -315,7 +330,7 @@ pub fn resolve_effective_render_settings(settings: &RenderSettings) -> Effective
             );
         }
         None => {
-            warn!("no GPU adapter detected; running the software/Potato visual path");
+            warn!("no GPU adapter detected; the Bevy renderer is unavailable");
         }
     }
     info!(
@@ -353,6 +368,12 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         })?;
         guard.config().render.clone()
     };
+    let effective_render_settings = resolve_effective_render_settings(&initial_render_settings);
+    if effective_render_settings.gpu.is_none() {
+        return Err(anyhow!(
+            "no GPU adapter is available for the Bevy renderer; choose a non-GPU frontend"
+        ));
+    }
 
     let (tx, rx) = mpsc::channel::<WorldSnapshot>();
     let (failure_tx, failure_rx) = mpsc::channel::<BevyLifecycleFailure>();
@@ -374,19 +395,27 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         .name("scriptbots-bevy-snapshot".into())
         .spawn(move || {
             run_reported_worker("snapshot worker", &snapshot_failures, &worker_flag, || {
-                let mut last_tick = 0u64;
+                let mut last_snapshot: Option<WorldSnapshot> = None;
+                let mut next_revision = 1_u64;
                 while worker_flag.load(Ordering::Acquire) {
-                    let snapshot = {
+                    let mut snapshot = {
                         let guard = world_for_worker.lock().map_err(|error| {
                             anyhow!("world mutex poisoned in Bevy snapshot worker: {error}")
                         })?;
                         WorldSnapshot::from_world(&guard)
-                    };
+                    }
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Bevy snapshot worker rejected non-positive or invalid world dimensions"
+                        )
+                    })?;
 
-                    if let Some(snapshot) = snapshot
-                        && snapshot.tick != last_tick
-                    {
-                        last_tick = snapshot.tick;
+                    if assign_presentation_revision(
+                        &mut snapshot,
+                        last_snapshot.as_ref(),
+                        &mut next_revision,
+                    )? {
+                        last_snapshot = Some(snapshot.clone());
                         if tx.send(snapshot).is_err() {
                             break;
                         }
@@ -430,7 +459,6 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     // bd-2z0.14.3.3: probe the adapter and resolve the effective quality tier
     // BEFORE the render app exists so the capability report is honest even
     // when plugin init later fails.
-    let effective_render_settings = resolve_effective_render_settings(&initial_render_settings);
     app.insert_resource(AmbientLight {
         color: Color::srgb(0.45, 0.52, 0.65),
         brightness: 800.0,
@@ -549,7 +577,9 @@ struct SnapshotInbox {
 #[derive(Default, Resource)]
 pub(crate) struct SnapshotState {
     latest: Option<WorldSnapshot>,
+    last_applied_revision: u64,
     last_applied_tick: u64,
+    last_applied_palette: Option<ColorPaletteMode>,
     last_reported_tick: u64,
     focus_point: Vec2,
     world_size: Vec2,
@@ -642,6 +672,16 @@ impl ColorPaletteMode {
             Self::Protanopia => "Palette: Protanopia",
             Self::Tritanopia => "Palette: Tritanopia",
             Self::HighContrast => "Palette: High Contrast",
+        }
+    }
+
+    const fn accessibility(self) -> AccessibilityPalette {
+        match self {
+            Self::Natural => AccessibilityPalette::Natural,
+            Self::Deuteranopia => AccessibilityPalette::Deuteranopia,
+            Self::Protanopia => AccessibilityPalette::Protanopia,
+            Self::Tritanopia => AccessibilityPalette::Tritanopia,
+            Self::HighContrast => AccessibilityPalette::HighContrast,
         }
     }
 }
@@ -749,45 +789,10 @@ fn set_part_visibility(commands: &mut Commands, part: &PartRef, visible: bool) {
 }
 
 fn apply_palette_rgb(rgb: Vec3, palette: ColorPaletteMode) -> Vec3 {
-    match palette {
-        ColorPaletteMode::Natural => rgb,
-        ColorPaletteMode::HighContrast => {
-            let luminance = 0.2126 * rgb.x + 0.7152 * rgb.y + 0.0722 * rgb.z;
-            if luminance > 0.5 {
-                Vec3::new(
-                    (rgb.x + 0.15).min(1.0),
-                    (rgb.y + 0.15).min(1.0),
-                    (rgb.z + 0.15).min(1.0),
-                )
-            } else {
-                Vec3::new(
-                    (rgb.x * 0.6).clamp(0.0, 1.0),
-                    (rgb.y * 0.6).clamp(0.0, 1.0),
-                    (rgb.z * 0.6).clamp(0.0, 1.0),
-                )
-            }
-        }
-        ColorPaletteMode::Deuteranopia => transform_palette(
-            rgb,
-            [[0.43, 0.72, -0.15], [0.34, 0.57, 0.09], [-0.02, 0.03, 0.97]],
-        ),
-        ColorPaletteMode::Protanopia => transform_palette(
-            rgb,
-            [[0.20, 0.99, -0.19], [0.16, 0.79, 0.04], [0.01, -0.01, 1.00]],
-        ),
-        ColorPaletteMode::Tritanopia => transform_palette(
-            rgb,
-            [[0.95, 0.05, 0.00], [0.00, 0.43, 0.56], [0.00, 0.47, 0.53]],
-        ),
-    }
-}
-
-fn transform_palette(rgb: Vec3, matrix: [[f32; 3]; 3]) -> Vec3 {
-    Vec3::new(
-        (rgb.x * matrix[0][0] + rgb.y * matrix[0][1] + rgb.z * matrix[0][2]).clamp(0.0, 1.0),
-        (rgb.x * matrix[1][0] + rgb.y * matrix[1][1] + rgb.z * matrix[1][2]).clamp(0.0, 1.0),
-        (rgb.x * matrix[2][0] + rgb.y * matrix[2][1] + rgb.z * matrix[2][2]).clamp(0.0, 1.0),
-    )
+    Vec3::from_array(visual::apply_accessibility_palette(
+        rgb.to_array(),
+        palette.accessibility(),
+    ))
 }
 
 fn srgb_from_vec_with_palette(rgb: Vec3, alpha: f32, palette: ColorPaletteMode) -> Color {
@@ -798,6 +803,12 @@ fn srgb_from_vec_with_palette(rgb: Vec3, alpha: f32, palette: ColorPaletteMode) 
 fn palette_emissive_from_vec(rgb: Vec3, palette: ColorPaletteMode) -> Color {
     let mapped = apply_palette_rgb(rgb, palette);
     Color::linear_rgb(mapped.x, mapped.y, mapped.z)
+}
+
+fn palette_hdr_emissive_from_srgb(rgb: [f32; 3], gain: f32, palette: ColorPaletteMode) -> Color {
+    let mapped = apply_palette_rgb(Vec3::from_array(rgb), palette);
+    let linear = srgb_to_linear_rgb(mapped.to_array());
+    Color::linear_rgb(linear[0] * gain, linear[1] * gain, linear[2] * gain)
 }
 
 fn clamp01(value: f32) -> f32 {
@@ -907,7 +918,7 @@ const MAX_SPEED: f32 = 8.0;
 struct SimControlData {
     paused: bool,
     speed_multiplier: f32,
-    step_requested: bool,
+    pending_steps: u64,
     auto_pause_reason: Option<String>,
 }
 
@@ -916,7 +927,7 @@ impl Default for SimControlData {
         Self {
             paused: false,
             speed_multiplier: 1.0,
-            step_requested: false,
+            pending_steps: 0,
             auto_pause_reason: None,
         }
     }
@@ -938,7 +949,17 @@ impl SimulationControl {
     }
 
     fn snapshot(&self) -> SimControlSnapshot {
-        let data = self.0.lock().expect("simulation control poisoned").clone();
+        let data = match self.0.lock() {
+            Ok(data) => data.clone(),
+            Err(poisoned) => {
+                let mut data = poisoned.into_inner();
+                apply_auto_pause_to_state(
+                    &mut data,
+                    "Bevy simulation control mutex poisoned; science driver stopped",
+                );
+                data.clone()
+            }
+        };
         SimControlSnapshot {
             paused: data.paused,
             speed_multiplier: data.speed_multiplier,
@@ -946,12 +967,23 @@ impl SimulationControl {
         }
     }
 
-    fn update<F>(&self, f: F)
+    fn update<F>(&self, f: F) -> bool
     where
         F: FnOnce(&mut SimControlData),
     {
-        if let Ok(mut data) = self.0.lock() {
-            f(&mut data);
+        match self.0.lock() {
+            Ok(mut data) => {
+                f(&mut data);
+                true
+            }
+            Err(poisoned) => {
+                let mut data = poisoned.into_inner();
+                apply_auto_pause_to_state(
+                    &mut data,
+                    "Bevy simulation control mutex poisoned; science driver stopped",
+                );
+                false
+            }
         }
     }
 }
@@ -976,21 +1008,32 @@ fn apply_simulation_command_to_state(state: &mut SimControlData, command: &Simul
         }
     }
     if command.step_once {
-        state.step_requested = true;
+        enqueue_step_request(state);
         state.paused = true;
+    }
+}
+
+fn enqueue_step_request(state: &mut SimControlData) {
+    if let Some(pending_steps) = state.pending_steps.checked_add(1) {
+        state.pending_steps = pending_steps;
+    } else {
+        state.paused = true;
+        state.auto_pause_reason = Some("Bevy step queue exhausted its u64 capacity".to_owned());
     }
 }
 
 fn apply_auto_pause_to_state(state: &mut SimControlData, reason: &str) {
     state.paused = true;
     state.auto_pause_reason = Some(reason.to_owned());
-    state.step_requested = false;
+    state.pending_steps = 0;
 }
 
-fn submit_simulation_command(submitter: &CommandSubmitter, command: SimulationCommand) {
-    if !(submitter.submit)(ControlCommand::UpdateSimulation(command)) {
+fn submit_simulation_command(submitter: &CommandSubmitter, command: SimulationCommand) -> bool {
+    let accepted = (submitter.submit)(ControlCommand::UpdateSimulation(command));
+    if !accepted {
         warn!("failed to enqueue simulation control command");
     }
+    accepted
 }
 
 const DIAGNOSTIC_REPORT_INTERVAL: u32 = 300;
@@ -1311,29 +1354,41 @@ struct ExposureAdjustButton {
 
 type ChangedButtonFilter = (Changed<Interaction>, With<Button>);
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct TerrainColorMap {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct TerrainHeightSnapshot {
     dims: UVec2,
     cell_size: u32,
     elevation: Vec<f32>,
     moisture: Vec<f32>,
     accent: Vec<f32>,
+    water_depth: Vec<f32>,
     fertility: Vec<f32>,
     temperature: Vec<f32>,
     kinds: Vec<TerrainKind>,
+    daylight: f32,
 }
 
 impl TerrainHeightSnapshot {
-    fn new(layer: &scriptbots_core::TerrainLayer) -> Self {
+    fn new(
+        layer: &scriptbots_core::TerrainLayer,
+        water_depth: Option<&[f32]>,
+        daylight: f32,
+    ) -> Option<Self> {
         let dims = UVec2::new(layer.width(), layer.height());
         let total = (dims.x as usize) * (dims.y as usize);
+        if layer.tiles().len() != total
+            || water_depth.is_some_and(|depth| depth.len() != total)
+            || !daylight.is_finite()
+        {
+            return None;
+        }
         let mut elevation = Vec::with_capacity(total);
         let mut moisture = Vec::with_capacity(total);
         let mut accent = Vec::with_capacity(total);
@@ -1348,16 +1403,18 @@ impl TerrainHeightSnapshot {
             temperature.push(tile.temperature_bias);
             kinds.push(tile.kind);
         }
-        Self {
+        Some(Self {
             dims,
             cell_size: layer.cell_size(),
             elevation,
             moisture,
             accent,
+            water_depth: water_depth.map_or_else(|| vec![0.0; total], |depth| depth.to_vec()),
             fertility,
             temperature,
             kinds,
-        }
+            daylight,
+        })
     }
 
     fn index(&self, x: u32, y: u32) -> usize {
@@ -1373,6 +1430,7 @@ impl TerrainHeightSnapshot {
             elevation: self.elevation[idx],
             moisture: self.moisture[idx],
             accent: self.accent[idx],
+            water_depth: self.water_depth[idx],
             _fertility: self.fertility[idx],
             _temperature: self.temperature[idx],
         }
@@ -1385,6 +1443,7 @@ struct TerrainTileSample {
     elevation: f32,
     moisture: f32,
     accent: f32,
+    water_depth: f32,
     _fertility: f32,
     _temperature: f32,
 }
@@ -1411,6 +1470,7 @@ struct TerrainChunkRecord {
     last_tick: u64,
     probe: Option<Entity>,
     stats: TerrainChunkStats,
+    palette: ColorPaletteMode,
 }
 
 #[derive(Clone, Copy)]
@@ -1419,34 +1479,40 @@ struct TerrainChunkBounds {
     size: UVec2,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct TerrainChunkSignature {
-    sum_height: f64,
-    sum_moisture: f64,
-    sum_accent: f64,
-    max_height: f32,
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerrainChunkSignature([u8; 32]);
 
 impl TerrainChunkSignature {
-    fn new(sum_height: f64, sum_moisture: f64, sum_accent: f64, max_height: f32) -> Self {
-        Self {
-            sum_height,
-            sum_moisture,
-            sum_accent,
-            max_height,
+    fn from_render_inputs(
+        positions: &[[f32; 3]],
+        colors: &[[f32; 4]],
+        material_inputs: &[f32],
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"scriptbots.bevy-terrain-chunk.v1");
+        hasher.update(&(positions.len() as u64).to_le_bytes());
+        for position in positions {
+            for channel in position {
+                hasher.update(&channel.to_bits().to_le_bytes());
+            }
         }
-    }
-
-    fn is_close(&self, other: &Self) -> bool {
-        (self.sum_height - other.sum_height).abs() < 1e-3
-            && (self.sum_moisture - other.sum_moisture).abs() < 1e-3
-            && (self.sum_accent - other.sum_accent).abs() < 1e-3
-            && (self.max_height - other.max_height).abs() < 0.5
+        hasher.update(&(colors.len() as u64).to_le_bytes());
+        for color in colors {
+            for channel in color {
+                hasher.update(&channel.to_bits().to_le_bytes());
+            }
+        }
+        hasher.update(&(material_inputs.len() as u64).to_le_bytes());
+        for input in material_inputs {
+            hasher.update(&input.to_bits().to_le_bytes());
+        }
+        Self(*hasher.finalize().as_bytes())
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct WorldSnapshot {
+    revision: u64,
     tick: u64,
     world_size: Vec2,
     agent_radius: f32,
@@ -1455,7 +1521,7 @@ pub(crate) struct WorldSnapshot {
     agents: Vec<AgentVisual>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct AgentVisual {
     id: AgentId,
     position: Vec2,
@@ -1464,6 +1530,7 @@ struct AgentVisual {
     selection: SelectionState,
     health: f32,
     age: u32,
+    reference_age_ticks: u64,
     spike_length: f32,
     boost: f32,
     wheel_left: f32,
@@ -1483,6 +1550,15 @@ struct AgentVisual {
 }
 
 impl WorldSnapshot {
+    fn same_render_content(&self, other: &Self) -> bool {
+        self.tick == other.tick
+            && self.world_size == other.world_size
+            && self.agent_radius == other.agent_radius
+            && self.terrain_color == other.terrain_color
+            && self.terrain_height == other.terrain_height
+            && self.agents == other.agents
+    }
+
     fn from_world(world: &WorldState) -> Option<Self> {
         let config = world.config();
         let width = config.world_width as f32;
@@ -1494,7 +1570,15 @@ impl WorldSnapshot {
         let terrain_layer = world.terrain();
         let terrain_w = terrain_layer.width();
         let terrain_h = terrain_layer.height();
-        let terrain_height = TerrainHeightSnapshot::new(terrain_layer);
+        let (cycle_ticks, start_phase) = config.render.resolved_day_night();
+        let daylight = visual::daylight_factor(world.tick().0, cycle_ticks, start_phase);
+        let terrain_height = TerrainHeightSnapshot::new(
+            terrain_layer,
+            world
+                .hydrology()
+                .map(scriptbots_core::HydrologyState::water_depth),
+            daylight,
+        )?;
 
         let arena = world.agents();
         let columns = arena.columns();
@@ -1596,6 +1680,7 @@ impl WorldSnapshot {
                 selection,
                 health: healths[idx],
                 age: ages[idx],
+                reference_age_ticks: u64::from(config.aging_health_decay_start.max(1)),
                 indicator,
                 reproduction_intent,
                 spiked,
@@ -1612,6 +1697,7 @@ impl WorldSnapshot {
         }
 
         Some(Self {
+            revision: 1,
             tick: world.tick().0,
             world_size: Vec2::new(width, height),
             agent_radius: config.bot_radius.max(1.0),
@@ -1624,6 +1710,21 @@ impl WorldSnapshot {
             agents,
         })
     }
+}
+
+fn assign_presentation_revision(
+    snapshot: &mut WorldSnapshot,
+    previous: Option<&WorldSnapshot>,
+    next_revision: &mut u64,
+) -> Result<bool> {
+    if previous.is_some_and(|last| snapshot.same_render_content(last)) {
+        return Ok(false);
+    }
+    snapshot.revision = *next_revision;
+    *next_revision = next_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Bevy presentation revision overflow"))?;
+    Ok(true)
 }
 
 fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
@@ -2012,10 +2113,14 @@ pub(crate) fn sync_world(
         return;
     };
 
-    if state.last_applied_tick == snapshot.tick {
+    let palette = accessibility.palette();
+    if state.last_applied_revision == snapshot.revision
+        && state.last_applied_palette == Some(palette)
+    {
         return;
     }
 
+    let snapshot_revision = snapshot.revision;
     let snapshot_tick = snapshot.tick;
     let world_size = snapshot.world_size;
     let world_center = Vec2::new(world_size.x * 0.5, world_size.y * 0.5);
@@ -2053,6 +2158,7 @@ pub(crate) fn sync_world(
         meshes.as_mut(),
         materials.as_mut(),
         probe_assets.as_ref(),
+        palette,
     );
     sync_agents(
         snapshot,
@@ -2060,10 +2166,12 @@ pub(crate) fn sync_world(
         &mut registry,
         agent_meshes.as_ref(),
         materials.as_mut(),
-        accessibility.palette(),
+        palette,
     );
 
+    state.last_applied_revision = snapshot_revision;
     state.last_applied_tick = snapshot_tick;
+    state.last_applied_palette = Some(palette);
     state.focus_point = focus_point;
     state.world_size = world_size;
     state.world_center = world_center;
@@ -2363,6 +2471,7 @@ fn handle_playback_buttons(
     submitter: Option<Res<CommandSubmitter>>,
     mut query: Query<(&PlaybackButton, &Interaction), ChangedButtonFilter>,
 ) {
+    let command_is_authoritative = submitter.is_some();
     for (button, interaction) in query.iter_mut() {
         if *interaction != Interaction::Pressed {
             continue;
@@ -2376,7 +2485,7 @@ fn handle_playback_buttons(
                     if state.speed_multiplier <= MIN_SPEED {
                         state.speed_multiplier = 1.0;
                     }
-                    state.step_requested = false;
+                    state.pending_steps = 0;
                     state.auto_pause_reason = None;
                     command.paused = Some(false);
                     command.speed_multiplier = Some(state.speed_multiplier);
@@ -2384,12 +2493,17 @@ fn handle_playback_buttons(
                 }
                 PlaybackAction::Pause => {
                     state.paused = true;
-                    state.step_requested = false;
+                    state.pending_steps = 0;
                     command.paused = Some(true);
                     info!("Bevy playback: pause");
                 }
                 PlaybackAction::Step => {
-                    state.step_requested = true;
+                    // With a submitter, the drained command is the sole science
+                    // authority. Also setting the local edge made Step advance
+                    // once or twice depending on queue/driver interleaving.
+                    if !command_is_authoritative {
+                        enqueue_step_request(state);
+                    }
                     state.auto_pause_reason = None;
                     state.paused = true;
                     command.paused = Some(true);
@@ -2430,7 +2544,12 @@ fn handle_playback_buttons(
         });
 
         if let (Some(submitter), Some(command)) = (submitter.as_ref(), command_to_send) {
-            submit_simulation_command(submitter, command);
+            let step_once = command.step_once;
+            if !submit_simulation_command(submitter, command) && step_once {
+                // A rejected command cannot disappear. Fall back to the local
+                // driver edge, while preserving any pending unconsumed step.
+                controls.update(enqueue_step_request);
+            }
         }
     }
 }
@@ -2440,6 +2559,7 @@ fn handle_playback_shortcuts(
     controls: Res<SimulationControl>,
     submitter: Option<Res<CommandSubmitter>>,
 ) {
+    let command_is_authoritative = submitter.is_some();
     if keys.just_pressed(KeyCode::Space) {
         let mut command = SimulationCommand::default();
         controls.update(|state| {
@@ -2447,21 +2567,23 @@ fn handle_playback_shortcuts(
             if !state.paused && state.speed_multiplier <= MIN_SPEED {
                 state.speed_multiplier = 1.0;
             }
-            state.step_requested = false;
+            state.pending_steps = 0;
             state.auto_pause_reason = None;
             info!(paused = state.paused, "Bevy playback toggled via Space");
             command.paused = Some(state.paused);
             command.speed_multiplier = Some(state.speed_multiplier);
         });
         if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
-            submit_simulation_command(submitter, command);
+            let _ = submit_simulation_command(submitter, command);
         }
     }
 
     if keys.just_pressed(KeyCode::KeyN) {
         let mut command = SimulationCommand::default();
         controls.update(|state| {
-            state.step_requested = true;
+            if !command_is_authoritative {
+                enqueue_step_request(state);
+            }
             state.paused = true;
             state.auto_pause_reason = None;
             info!("Bevy playback: step requested via keyboard");
@@ -2469,7 +2591,9 @@ fn handle_playback_shortcuts(
             command.step_once = true;
         });
         if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
-            submit_simulation_command(submitter, command);
+            if !submit_simulation_command(submitter, command) {
+                controls.update(enqueue_step_request);
+            }
         }
     }
 
@@ -2488,7 +2612,7 @@ fn handle_playback_shortcuts(
             command.paused = Some(false);
         });
         if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
-            submit_simulation_command(submitter, command);
+            let _ = submit_simulation_command(submitter, command);
         }
     }
 
@@ -2512,7 +2636,7 @@ fn handle_playback_shortcuts(
             command.paused = Some(state.paused);
         });
         if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
-            submit_simulation_command(submitter, command);
+            let _ = submit_simulation_command(submitter, command);
         }
     }
 }
@@ -2919,6 +3043,7 @@ fn sync_terrain(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     probe_assets: &ReflectionProbeAssets,
+    palette: ColorPaletteMode,
 ) {
     let dims = snapshot.terrain_height.dims;
     if dims.x == 0 || dims.y == 0 {
@@ -2952,11 +3077,11 @@ fn sync_terrain(
 
             seen.insert(key);
 
-            let built = build_chunk_mesh(snapshot, bounds, registry.height_scale);
+            let built = build_chunk_mesh(snapshot, bounds, registry.height_scale, palette);
 
             match registry.chunks.get_mut(&key) {
                 Some(record) => {
-                    if !record.signature.is_close(&built.stats.signature) {
+                    if record.palette != palette || record.signature != built.stats.signature {
                         if let Some(existing) = meshes.get_mut(&record.mesh) {
                             *existing = built.mesh;
                         } else {
@@ -2970,6 +3095,7 @@ fn sync_terrain(
                         record.signature = built.stats.signature;
                         record.bounds = bounds;
                         record.stats = built.stats;
+                        record.palette = palette;
                     }
                     sync_reflection_probe(
                         commands,
@@ -3012,6 +3138,7 @@ fn sync_terrain(
                             last_tick: snapshot.tick,
                             probe: Some(probe),
                             stats: built.stats,
+                            palette,
                         },
                     );
                 }
@@ -3165,6 +3292,7 @@ fn build_chunk_mesh(
     snapshot: &WorldSnapshot,
     bounds: TerrainChunkBounds,
     height_scale: f32,
+    palette: ColorPaletteMode,
 ) -> BuiltChunk {
     let terrain = &snapshot.terrain_height;
     let cell_size = terrain.cell_size as f32;
@@ -3180,8 +3308,6 @@ fn build_chunk_mesh(
     let mut colors = Vec::with_capacity(vertex_count);
     let mut sum_moisture = 0.0f64;
     let mut sum_slope = 0.0f64;
-    let mut sum_height = 0.0f64;
-    let mut sum_accent = 0.0f64;
     let mut max_height = f32::MIN;
 
     for vz in 0..verts_z {
@@ -3193,21 +3319,19 @@ fn build_chunk_mesh(
             let world_x = global_x as f32 * cell_size - half.x;
             let world_z = half.y - global_z as f32 * cell_size;
             positions.push([world_x, height, world_z]);
-            sum_height += height as f64;
             max_height = max_height.max(height);
 
             let uv_x = global_x as f32 / terrain.dims.x.max(1) as f32;
             let uv_z = global_z as f32 / terrain.dims.y.max(1) as f32;
             uvs.push([uv_x, uv_z]);
 
-            let color = terrain_vertex_color(terrain, global_x, global_z);
+            let color = terrain_vertex_color(terrain, global_x, global_z, palette);
             colors.push(color);
 
             let sample = terrain.sample_tile(global_x, global_z);
             sum_moisture += sample.moisture as f64;
             let slope = compute_tile_slope(terrain, global_x, global_z);
             sum_slope += slope as f64;
-            sum_accent += sample.accent as f64;
         }
     }
 
@@ -3248,6 +3372,26 @@ fn build_chunk_mesh(
         })
         .collect();
 
+    let vertex_total = vertex_count as f64;
+    let mean_moisture = (sum_moisture / vertex_total) as f32;
+    let mean_slope = (sum_slope / vertex_total) as f32;
+    let height_factor = (max_height / height_scale).clamp(0.0, 1.0);
+    let world_extent = Vec2::new(
+        bounds.size.x.max(1) as f32 * cell_size,
+        bounds.size.y.max(1) as f32 * cell_size,
+    );
+    let signature = TerrainChunkSignature::from_render_inputs(
+        &positions,
+        &colors,
+        &[
+            mean_moisture,
+            mean_slope,
+            height_factor,
+            max_height,
+            world_extent.x,
+            world_extent.y,
+        ],
+    );
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
@@ -3258,17 +3402,13 @@ fn build_chunk_mesh(
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
 
-    let vertex_total = vertex_count as f64;
     let stats = TerrainChunkStats {
-        mean_moisture: (sum_moisture / vertex_total) as f32,
-        mean_slope: (sum_slope / vertex_total) as f32,
-        height_factor: (max_height / height_scale).clamp(0.0, 1.0),
+        mean_moisture,
+        mean_slope,
+        height_factor,
         max_height,
-        world_extent: Vec2::new(
-            bounds.size.x.max(1) as f32 * cell_size,
-            bounds.size.y.max(1) as f32 * cell_size,
-        ),
-        signature: TerrainChunkSignature::new(sum_height, sum_moisture, sum_accent, max_height),
+        world_extent,
+        signature,
     };
 
     BuiltChunk { mesh, stats }
@@ -3310,57 +3450,44 @@ fn sample_height_world(terrain: &TerrainHeightSnapshot, position: Vec2, height_s
     sample_height_linear(terrain, grid_x, grid_z, height_scale)
 }
 
-fn terrain_vertex_color(terrain: &TerrainHeightSnapshot, x: u32, z: u32) -> [f32; 4] {
+fn terrain_vertex_color(
+    terrain: &TerrainHeightSnapshot,
+    x: u32,
+    z: u32,
+    palette: ColorPaletteMode,
+) -> [f32; 4] {
+    const SPLAT_KINDS: [TerrainKind; visual::SPLAT_LAYERS] = [
+        TerrainKind::DeepWater,
+        TerrainKind::ShallowWater,
+        TerrainKind::Sand,
+        TerrainKind::Grass,
+        TerrainKind::Bloom,
+        TerrainKind::Rock,
+    ];
     let sample = terrain.sample_tile(x, z);
     let slope = compute_tile_slope(terrain, x, z);
-    let daylight = 0.65;
-    let mut rgb = terrain_kind_color(sample.kind);
-
-    let brightness = match sample.kind {
-        TerrainKind::DeepWater => {
-            (0.42 + daylight * 0.25 + sample.moisture * 0.2).clamp(0.25, 1.05)
-        }
-        TerrainKind::ShallowWater => {
-            (0.55 + daylight * 0.35 + sample.moisture * 0.3).clamp(0.4, 1.25)
-        }
-        TerrainKind::Sand => (0.72 + daylight * 0.18 + sample.elevation * 0.35).clamp(0.45, 1.35),
-        TerrainKind::Grass => (0.62 + daylight * 0.28 + sample.moisture * 0.4).clamp(0.4, 1.35),
-        TerrainKind::Bloom => (0.68 + daylight * 0.35 + sample.moisture * 0.5).clamp(0.45, 1.45),
-        TerrainKind::Rock => (0.60 + daylight * 0.22 + slope * 0.45).clamp(0.35, 1.25),
-    };
-
-    rgb[0] *= brightness;
-    rgb[1] *= brightness;
-    rgb[2] *= brightness;
-
-    match sample.kind {
-        TerrainKind::Bloom | TerrainKind::Grass => {
-            let factor = (0.9 + sample.moisture * 0.3 + sample.accent * 0.05).clamp(0.6, 1.4);
-            rgb[0] *= factor;
-            rgb[1] *= factor;
-            rgb[2] *= factor;
-        }
-        TerrainKind::Sand => {
-            let factor = (0.9 + sample.accent * 0.08).clamp(0.6, 1.3);
-            rgb[0] *= factor;
-            rgb[1] *= factor;
-            rgb[2] *= factor;
-        }
-        TerrainKind::Rock => {
-            let factor = (0.85 + slope * 0.3).clamp(0.6, 1.2);
-            rgb[0] *= factor;
-            rgb[1] *= factor;
-            rgb[2] *= factor;
-        }
-        _ => {}
+    let weights = visual::splat_weights(&SplatInput {
+        kind: sample.kind,
+        elevation: sample.elevation,
+        slope,
+        water_depth: sample.water_depth,
+    });
+    let mut rgb = [0.0_f32; 3];
+    for (kind, weight) in SPLAT_KINDS.into_iter().zip(weights) {
+        let layer = visual::terrain_shaded_color(&TerrainShadeInput {
+            kind,
+            moisture: sample.moisture,
+            elevation: sample.elevation,
+            slope,
+            accent: sample.accent,
+            daylight: terrain.daylight,
+        });
+        rgb[0] += layer[0] * weight;
+        rgb[1] += layer[1] * weight;
+        rgb[2] += layer[2] * weight;
     }
-
-    let clamped = [
-        rgb[0].clamp(0.0, 1.0),
-        rgb[1].clamp(0.0, 1.0),
-        rgb[2].clamp(0.0, 1.0),
-    ];
-    let linear = srgb_to_linear_rgb(clamped);
+    let mapped = visual::apply_accessibility_palette(rgb, palette.accessibility());
+    let linear = srgb_to_linear_rgb(mapped);
     [linear[0], linear[1], linear[2], 1.0]
 }
 
@@ -3384,8 +3511,53 @@ fn srgb_to_linear_component(value: f32) -> f32 {
 mod terrain_tests {
     use super::*;
     use bevy_mesh::VertexAttributeValues;
-    use scriptbots_core::{TerrainKind, TerrainLayer, TerrainTile};
+    use scriptbots_core::{
+        TerrainKind, TerrainLayer, TerrainTile,
+        visual::{self, AgentVisualInput, VisualSelection},
+    };
     use slotmap::KeyData;
+
+    const TEST_REFERENCE_AGE_TICKS: u64 = 500;
+
+    fn terrain_kinds() -> [TerrainKind; 6] {
+        [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ]
+    }
+
+    fn sample_agent_visual() -> AgentVisual {
+        AgentVisual {
+            id: AgentId::from(KeyData::from_ffi(1)),
+            position: Vec2::new(50.0, 50.0),
+            heading: 0.75,
+            color: [0.2, 0.4, 0.7],
+            selection: SelectionState::Selected,
+            health: 1.4,
+            age: 120,
+            reference_age_ticks: TEST_REFERENCE_AGE_TICKS,
+            spike_length: 4.0,
+            boost: 1.0,
+            wheel_left: 0.25,
+            wheel_right: -0.5,
+            herbivore_tendency: 0.8,
+            temperature_preference: 0.3,
+            food_delta: 0.4,
+            sound_level: 0.2,
+            sound_output: 0.6,
+            sound_multiplier: 1.1,
+            trait_modifiers: TraitModifiers::default(),
+            eye_dirs: [0.0; NUM_EYES],
+            eye_fov: [1.0; NUM_EYES],
+            indicator: IndicatorState::default(),
+            reproduction_intent: 0.0,
+            spiked: true,
+        }
+    }
 
     fn sample_layer() -> TerrainLayer {
         let tiles = vec![
@@ -3431,7 +3603,8 @@ mod terrain_tests {
 
     fn sample_world_snapshot() -> WorldSnapshot {
         let layer = sample_layer();
-        let height = TerrainHeightSnapshot::new(&layer);
+        let height =
+            TerrainHeightSnapshot::new(&layer, None, visual::DAYLIGHT_STATIC).expect("snapshot");
         let dims = height.dims;
         let cell = layer.cell_size() as f32;
         let world_size = Vec2::new(dims.x as f32 * cell, dims.y as f32 * cell);
@@ -3441,6 +3614,7 @@ mod terrain_tests {
             pixels: vec![255; (dims.x * dims.y * 4) as usize],
         };
         WorldSnapshot {
+            revision: 1,
             tick: 42,
             world_size,
             agent_radius: 12.0,
@@ -3451,13 +3625,190 @@ mod terrain_tests {
     }
 
     #[test]
+    fn bevy_terrain_palette_matches_the_core_visual_authority() {
+        for kind in terrain_kinds() {
+            assert_eq!(
+                terrain_kind_color(kind),
+                visual::terrain_kind_base_color(kind),
+                "Bevy must not own a competing {kind:?} base color"
+            );
+        }
+    }
+
+    #[test]
+    fn terrain_accessibility_palette_is_applied_by_the_core_authority() {
+        let snapshot = sample_world_snapshot();
+        let natural =
+            terrain_vertex_color(&snapshot.terrain_height, 0, 0, ColorPaletteMode::Natural);
+        let high_contrast = terrain_vertex_color(
+            &snapshot.terrain_height,
+            0,
+            0,
+            ColorPaletteMode::HighContrast,
+        );
+        assert_ne!(
+            natural.map(f32::to_bits),
+            high_contrast.map(f32::to_bits),
+            "palette cycling must recolor terrain as well as agents and HUD labels"
+        );
+    }
+
+    #[test]
+    fn terrain_projection_consumes_canonical_hydrology_and_daylight_inputs() {
+        let dry_noon = sample_world_snapshot();
+        let dry_color =
+            terrain_vertex_color(&dry_noon.terrain_height, 0, 0, ColorPaletteMode::Natural);
+
+        let mut flooded = dry_noon.clone();
+        flooded.terrain_height.water_depth[0] = 1.0;
+        let flooded_color =
+            terrain_vertex_color(&flooded.terrain_height, 0, 0, ColorPaletteMode::Natural);
+        assert_ne!(
+            dry_color.map(f32::to_bits),
+            flooded_color.map(f32::to_bits),
+            "hydrology must feed the same splat-weight authority as GPUI/wgpu"
+        );
+
+        let mut night = dry_noon;
+        night.terrain_height.daylight = visual::DAYLIGHT_NIGHT_FLOOR;
+        let night_color =
+            terrain_vertex_color(&night.terrain_height, 0, 0, ColorPaletteMode::Natural);
+        assert_ne!(
+            dry_color.map(f32::to_bits),
+            night_color.map(f32::to_bits),
+            "tick-derived daylight must feed the same shading authority as GPUI/wgpu"
+        );
+    }
+
+    #[test]
+    fn duplicate_outer_vertex_reuses_the_canonical_boundary_cell_color() {
+        let snapshot = sample_world_snapshot();
+        let terrain = &snapshot.terrain_height;
+        let boundary = terrain_vertex_color(
+            terrain,
+            terrain.dims.x - 1,
+            terrain.dims.y - 1,
+            ColorPaletteMode::Natural,
+        );
+        let duplicate = terrain_vertex_color(
+            terrain,
+            terrain.dims.x,
+            terrain.dims.y,
+            ColorPaletteMode::Natural,
+        );
+        assert_eq!(
+            duplicate.map(f32::to_bits),
+            boundary.map(f32::to_bits),
+            "the mesh-closing duplicate vertex must not invent a non-canonical edge slope"
+        );
+    }
+
+    #[test]
+    fn terrain_chunk_signature_rejects_equal_aggregate_spatial_rearrangements() {
+        let positions_a = [[0.0, 1.0, 0.0], [1.0, 3.0, 0.0]];
+        let positions_b = [[0.0, 3.0, 0.0], [1.0, 1.0, 0.0]];
+        let colors_a = [[0.1, 0.8, 0.2, 1.0], [0.8, 0.7, 0.2, 1.0]];
+        let colors_b = [colors_a[1], colors_a[0]];
+
+        assert_ne!(
+            TerrainChunkSignature::from_render_inputs(&positions_a, &colors_a, &[0.2]),
+            TerrainChunkSignature::from_render_inputs(&positions_b, &colors_b, &[0.2]),
+            "equal height/color aggregates must not preserve a stale spatial mesh"
+        );
+    }
+
+    #[test]
+    fn terrain_chunk_signature_covers_material_only_changes() {
+        let positions = [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
+        let colors = [[0.8, 0.7, 0.2, 1.0]; 2];
+        assert_ne!(
+            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.1, 0.0]),
+            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.9, 0.0]),
+            "moisture/slope material changes must not preserve a stale PBR material"
+        );
+    }
+
+    #[test]
+    fn bevy_agent_base_color_matches_the_core_visual_authority() {
+        let agent = sample_agent_visual();
+        let expected = visual::agent_visual_params(&AgentVisualInput {
+            genome_color: agent.color,
+            health: agent.health,
+            age_ticks: u64::from(agent.age),
+            reference_age_ticks: agent.reference_age_ticks,
+            herbivore_tendency: agent.herbivore_tendency,
+            temperature_preference: agent.temperature_preference,
+            wheel_left: agent.wheel_left,
+            wheel_right: agent.wheel_right,
+            heading: agent.heading,
+            spike_extended: agent.spiked,
+            spike_length: agent.spike_length,
+            boosting: agent.boost > 0.05,
+            sound_output: agent.sound_output,
+            sound_multiplier: agent.sound_multiplier,
+            sound_level: agent.sound_level,
+            food_delta: agent.food_delta,
+            trait_smell: agent.trait_modifiers.smell,
+            trait_hearing: agent.trait_modifiers.hearing,
+            selection: VisualSelection::Selected,
+        });
+        let (base, _) = agent_colors(&agent, ColorPaletteMode::Natural);
+        let actual = base.to_srgba();
+        for (channel, (actual, expected)) in [
+            ("red", (actual.red, expected.body_color[0])),
+            ("green", (actual.green, expected.body_color[1])),
+            ("blue", (actual.blue, expected.body_color[2])),
+        ] {
+            assert!(
+                (actual - expected).abs() < 1.0e-6,
+                "Bevy {channel} channel {actual} disagrees with core authority {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn presentation_revision_covers_tick_zero_and_same_tick_visual_changes() {
+        let mut next_revision = 1;
+        let mut initial = sample_world_snapshot();
+        initial.tick = 0;
+        initial.agents.push(sample_agent_visual());
+        assert!(
+            assign_presentation_revision(&mut initial, None, &mut next_revision)
+                .expect("initial revision")
+        );
+        assert_eq!(initial.revision, 1, "tick zero must publish");
+
+        let previous = initial.clone();
+        let mut unchanged = initial.clone();
+        assert!(
+            !assign_presentation_revision(&mut unchanged, Some(&previous), &mut next_revision,)
+                .expect("unchanged revision check"),
+            "an identical snapshot must not produce presentation churn"
+        );
+
+        let mut selection_changed = initial;
+        selection_changed.agents[0].selection = SelectionState::Hovered;
+        assert!(
+            assign_presentation_revision(
+                &mut selection_changed,
+                Some(&previous),
+                &mut next_revision,
+            )
+            .expect("same-tick selection revision"),
+            "same-tick presentation changes must not be dropped"
+        );
+        assert_eq!(selection_changed.tick, 0);
+        assert_eq!(selection_changed.revision, 2);
+    }
+
+    #[test]
     fn chunk_mesh_positions_match_heightfield() {
         let snapshot = sample_world_snapshot();
         let bounds = TerrainChunkBounds {
             origin: UVec2::ZERO,
             size: snapshot.terrain_height.dims,
         };
-        let built = build_chunk_mesh(&snapshot, bounds, 100.0);
+        let built = build_chunk_mesh(&snapshot, bounds, 100.0, ColorPaletteMode::Natural);
 
         let positions = match built.mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
             Some(VertexAttributeValues::Float32x3(values)) => values.clone(),
@@ -3520,31 +3871,7 @@ mod terrain_tests {
     #[test]
     fn agent_translation_respects_terrain_height() {
         let mut snapshot = sample_world_snapshot();
-        snapshot.agents.push(AgentVisual {
-            id: AgentId::from(KeyData::from_ffi(1)),
-            position: Vec2::new(50.0, 50.0),
-            heading: 0.0,
-            color: [0.5, 0.5, 0.5],
-            selection: SelectionState::Selected,
-            health: 80.0,
-            age: 10,
-            spike_length: 0.0,
-            boost: 0.0,
-            wheel_left: 0.0,
-            wheel_right: 0.0,
-            herbivore_tendency: 0.5,
-            temperature_preference: 0.5,
-            food_delta: 0.0,
-            sound_level: 0.0,
-            sound_output: 0.0,
-            sound_multiplier: 1.0,
-            trait_modifiers: TraitModifiers::default(),
-            eye_dirs: [0.0; NUM_EYES],
-            eye_fov: [1.0; NUM_EYES],
-            indicator: IndicatorState::default(),
-            reproduction_intent: 0.0,
-            spiked: false,
-        });
+        snapshot.agents.push(sample_agent_visual());
 
         let translation = agent_translation(&snapshot, &snapshot.agents[0]);
         let terrain_height = sample_height_world(
@@ -3558,6 +3885,15 @@ mod terrain_tests {
 }
 
 fn compute_tile_slope(terrain: &TerrainHeightSnapshot, x: u32, z: u32) -> f32 {
+    if terrain.dims.x == 0 || terrain.dims.y == 0 {
+        return 0.0;
+    }
+    // Chunk meshes duplicate the last tile at their outer vertex. Clamp the
+    // coordinate before choosing neighbours so that duplicate inherits the
+    // exact boundary-cell color instead of acquiring a one-sided slope that
+    // no canonical terrain cell has.
+    let x = x.min(terrain.dims.x - 1);
+    let z = z.min(terrain.dims.y - 1);
     let center = terrain.sample_tile(x, z).elevation;
     let left = terrain.sample_tile(x.saturating_sub(1), z).elevation;
     let right = terrain
@@ -3852,6 +4188,7 @@ fn apply_agent_visuals(
 ) {
     use std::f32::consts::FRAC_PI_2;
 
+    let visuals = canonical_agent_visual_params(agent);
     let translation = agent_translation(snapshot, agent);
     let rotation = Quat::from_rotation_y(agent.heading);
     commands
@@ -3871,28 +4208,17 @@ fn apply_agent_visuals(
             body_radius.max(0.1),
         ),
     };
-    let (body_color, body_emissive) = agent_colors(agent, palette);
+    let (body_color, body_emissive) = agent_colors_from_params(&visuals, palette);
     update_part_transform(commands, &record.body, body_transform);
     update_part_colors(materials, &record.body, body_color, body_emissive);
 
-    let herbivore = clamp01(agent.herbivore_tendency);
-    let herbivore_rgb = Vec3::new(0.18, 0.84, 0.36);
-    let carnivore_rgb = Vec3::new(0.86, 0.22, 0.2);
-    let mut stripe_rgb = mix_vec3(carnivore_rgb, herbivore_rgb, herbivore);
-    let temp_pref = clamp01(agent.temperature_preference);
-    let temp_accent = mix_vec3(
-        Vec3::new(0.2, 0.45, 1.0),
-        Vec3::new(1.0, 0.52, 0.24),
-        temp_pref,
-    );
-    stripe_rgb = mix_vec3(stripe_rgb, temp_accent, 0.18);
+    let stripe_rgb = Vec3::from_array(visuals.stripe_color);
     let stripe_color = srgb_from_vec_with_palette(stripe_rgb, 0.9, palette);
-    let stripe_emissive_rgb = Vec3::new(
-        stripe_rgb.x * 0.45,
-        stripe_rgb.y * 0.45,
-        stripe_rgb.z * 0.45,
+    let stripe_emissive = palette_hdr_emissive_from_srgb(
+        visuals.stripe_emissive,
+        visuals.body_emissive_gain,
+        palette,
     );
-    let stripe_emissive = palette_emissive_from_vec(stripe_emissive_rgb, palette);
     let stripe_transform = Transform {
         translation: Vec3::new(0.0, body_radius * 0.16, 0.0),
         rotation: Quat::from_rotation_y(FRAC_PI_2) * Quat::from_rotation_z(FRAC_PI_2),
@@ -3925,35 +4251,17 @@ fn apply_agent_visuals(
     update_part_transform(commands, &record.wheel_left, left_wheel_transform);
     update_part_transform(commands, &record.wheel_right, right_wheel_transform);
 
-    let wheel_base = Vec3::new(0.14, 0.16, 0.22);
-    let left_speed = clamp01(agent.wheel_left.abs());
-    let right_speed = clamp01(agent.wheel_right.abs());
-    let left_rgb = wheel_base * (0.65 + left_speed * 0.55);
-    let right_rgb = wheel_base * (0.65 + right_speed * 0.55);
+    let left_rgb = Vec3::from_array(visuals.wheel_colors[0]);
+    let right_rgb = Vec3::from_array(visuals.wheel_colors[1]);
     let left_color = srgb_from_vec_with_palette(left_rgb, 1.0, palette);
     let right_color = srgb_from_vec_with_palette(right_rgb, 1.0, palette);
-    let left_emissive = palette_emissive_from_vec(
-        Vec3::new(
-            left_rgb.x * left_speed * 0.8,
-            left_rgb.y * left_speed * 0.7,
-            left_rgb.z * left_speed * 1.1,
-        ),
-        palette,
-    );
-    let right_emissive = palette_emissive_from_vec(
-        Vec3::new(
-            right_rgb.x * right_speed * 0.8,
-            right_rgb.y * right_speed * 0.7,
-            right_rgb.z * right_speed * 1.1,
-        ),
-        palette,
-    );
+    let left_emissive = palette_hdr_emissive_from_srgb(visuals.wheel_emissives[0], 1.0, palette);
+    let right_emissive = palette_hdr_emissive_from_srgb(visuals.wheel_emissives[1], 1.0, palette);
     update_part_colors(materials, &record.wheel_left, left_color, left_emissive);
     update_part_colors(materials, &record.wheel_right, right_color, right_emissive);
 
     let vocal_energy = clamp01(agent.sound_output.abs() * agent.sound_multiplier.max(0.1));
-    let mouth_activity =
-        clamp01(agent.food_delta.abs() * 0.75 + vocal_energy * 0.9 + agent.sound_level * 0.35);
+    let mouth_activity = visuals.mouth_activity;
     let mouth_height = scale_factor * (0.25 + 0.6 * mouth_activity);
     let mouth_depth = scale_factor * 0.12;
     let mouth_width = body_radius * 0.95;
@@ -3967,11 +4275,7 @@ fn apply_agent_visuals(
         ),
     };
     update_part_transform(commands, &record.mouth, mouth_transform);
-    let mouth_rgb = Vec3::new(
-        0.58 + mouth_activity * 0.3,
-        0.1 + mouth_activity * 0.12,
-        0.12 + mouth_activity * 0.08,
-    );
+    let mouth_rgb = Vec3::from_array(visuals.mouth_color);
     let mouth_color = srgb_from_vec_with_palette(mouth_rgb, 0.9, palette);
     let mouth_emissive = palette_emissive_from_vec(
         Vec3::new(
@@ -3989,11 +4293,7 @@ fn apply_agent_visuals(
         scale: Vec3::splat((scale_factor * 0.34).max(0.05)),
     };
     update_part_transform(commands, &record.nose, nose_transform);
-    let nose_rgb = mix_vec3(
-        Vec3::new(0.94, 0.84, 0.66),
-        Vec3::new(0.98, 0.92, 0.78),
-        clamp01(agent.trait_modifiers.smell * 0.4),
-    );
+    let nose_rgb = Vec3::from_array(visuals.nose_color);
     let nose_color = srgb_from_vec_with_palette(nose_rgb, 1.0, palette);
     let nose_emissive = palette_emissive_from_vec(
         Vec3::new(nose_rgb.x * 0.25, nose_rgb.y * 0.2, nose_rgb.z * 0.15),
@@ -4001,11 +4301,7 @@ fn apply_agent_visuals(
     );
     update_part_colors(materials, &record.nose, nose_color, nose_emissive);
 
-    let spike_ready = if agent.spiked {
-        1.0
-    } else {
-        clamp01(agent.spike_length)
-    };
+    let spike_ready = visuals.spike_readiness;
     let spike_length = scale_factor * (0.65 + agent.spike_length.max(0.0));
     let spike_transform = Transform {
         translation: Vec3::new(
@@ -4021,18 +4317,11 @@ fn apply_agent_visuals(
         ),
     };
     update_part_transform(commands, &record.spike, spike_transform);
-    let spike_rgb = Vec3::new(
-        0.74 + spike_ready * 0.22,
-        0.52 - spike_ready * 0.38,
-        0.24 + spike_ready * 0.14,
-    );
+    let spike_rgb = Vec3::from_array(visuals.spike_color);
     let spike_color = srgb_from_vec_with_palette(spike_rgb, 1.0, palette);
-    let spike_emissive = palette_emissive_from_vec(
-        Vec3::new(
-            spike_rgb.x * spike_ready * 0.7,
-            spike_rgb.y * spike_ready * 0.25,
-            spike_rgb.z * spike_ready * 0.25,
-        ),
+    let spike_emissive = palette_hdr_emissive_from_srgb(
+        visuals.spike_color,
+        visuals.spike_emissive_gain * spike_ready,
         palette,
     );
     update_part_colors(materials, &record.spike, spike_color, spike_emissive);
@@ -4101,11 +4390,12 @@ fn apply_agent_visuals(
         scale: ring_radius_scale,
     };
     update_part_transform(commands, &record.selection, ring_transform);
-    let (ring_alpha, ring_rgb, ring_emissive_scale) = match agent.selection {
-        SelectionState::None => (0.0, Vec3::new(0.18, 0.3, 0.46), 0.0),
-        SelectionState::Hovered => (0.35, Vec3::new(0.24, 0.62, 1.0), 0.65),
-        SelectionState::Selected => (0.65, Vec3::new(0.42, 0.9, 1.2), 0.95),
+    let (ring_alpha, ring_emissive_scale) = match agent.selection {
+        SelectionState::None => (0.0, 0.0),
+        SelectionState::Hovered => (0.35, 0.65),
+        SelectionState::Selected => (0.65, 0.95),
     };
+    let ring_rgb = Vec3::from_array(visuals.selection_rim_color);
     let ring_color = srgb_from_vec_with_palette(ring_rgb, ring_alpha, palette);
     let ring_emissive = palette_emissive_from_vec(
         Vec3::new(
@@ -4324,56 +4614,54 @@ fn agent_translation(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Vec3 {
     let z = half.y - agent.position.y;
     Vec3::new(x, terrain_height + snapshot.agent_radius * 0.35, z)
 }
-const TERRAIN_BASE_COLORS: [[f32; 3]; 6] = [
-    [0.117_647, 0.247_059, 0.400_000], // Deep water
-    [0.184_314, 0.450_980, 0.701_961], // Shallow water
-    [0.694_118, 0.305_882, 0.027_451], // Sand
-    [0.313_725, 0.662_745, 0.074_510], // Grass
-    [0.474_510, 0.831_373, 0.427_451], // Bloom
-    [0.662_745, 0.694_118, 0.729_412], // Rock
-];
-
 fn terrain_kind_color(kind: TerrainKind) -> [f32; 3] {
-    TERRAIN_BASE_COLORS[terrain_kind_index(kind)]
+    visual::terrain_kind_base_color(kind)
 }
 
-fn terrain_kind_index(kind: TerrainKind) -> usize {
-    match kind {
-        TerrainKind::DeepWater => 0,
-        TerrainKind::ShallowWater => 1,
-        TerrainKind::Sand => 2,
-        TerrainKind::Grass => 3,
-        TerrainKind::Bloom => 4,
-        TerrainKind::Rock => 5,
+const fn visual_selection(selection: SelectionState) -> VisualSelection {
+    match selection {
+        SelectionState::None => VisualSelection::None,
+        SelectionState::Hovered => VisualSelection::Hovered,
+        SelectionState::Selected => VisualSelection::Selected,
     }
 }
 
-fn agent_colors(agent: &AgentVisual, palette: ColorPaletteMode) -> (Color, Color) {
-    let mut rgb = Vec3::from_array(agent.color);
-    rgb.x = rgb.x.clamp(0.0, 1.0);
-    rgb.y = rgb.y.clamp(0.0, 1.0);
-    rgb.z = rgb.z.clamp(0.0, 1.0);
+fn canonical_agent_visual_params(agent: &AgentVisual) -> AgentVisualParams {
+    visual::agent_visual_params(&AgentVisualInput {
+        genome_color: agent.color,
+        health: agent.health,
+        age_ticks: u64::from(agent.age),
+        reference_age_ticks: agent.reference_age_ticks,
+        herbivore_tendency: agent.herbivore_tendency,
+        temperature_preference: agent.temperature_preference,
+        wheel_left: agent.wheel_left,
+        wheel_right: agent.wheel_right,
+        heading: agent.heading,
+        spike_extended: agent.spiked,
+        spike_length: agent.spike_length,
+        boosting: agent.boost > 0.05,
+        sound_output: agent.sound_output,
+        sound_multiplier: agent.sound_multiplier,
+        sound_level: agent.sound_level,
+        food_delta: agent.food_delta,
+        trait_smell: agent.trait_modifiers.smell,
+        trait_hearing: agent.trait_modifiers.hearing,
+        selection: visual_selection(agent.selection),
+    })
+}
 
-    let health_factor = (agent.health / 2.0).clamp(0.45, 1.0);
-    let base_rgb = Vec3::new(
-        rgb.x * health_factor,
-        rgb.y * health_factor,
-        rgb.z * health_factor,
-    );
-    let base = srgb_from_vec_with_palette(base_rgb, 1.0, palette);
-
-    let highlight = match agent.selection {
-        SelectionState::None => 0.12,
-        SelectionState::Hovered => 0.28,
-        SelectionState::Selected => 0.48,
-    };
-    let emissive_rgb = Vec3::new(
-        (rgb.x + highlight * 0.8).min(1.0),
-        (rgb.y + highlight * 0.6).min(1.0),
-        (rgb.z + highlight).min(1.0),
-    );
-    let emissive = palette_emissive_from_vec(emissive_rgb, palette);
+fn agent_colors_from_params(
+    params: &AgentVisualParams,
+    palette: ColorPaletteMode,
+) -> (Color, Color) {
+    let base = srgb_from_vec_with_palette(Vec3::from_array(params.body_color), 1.0, palette);
+    let emissive =
+        palette_hdr_emissive_from_srgb(params.body_emissive, params.body_emissive_gain, palette);
     (base, emissive)
+}
+
+fn agent_colors(agent: &AgentVisual, palette: ColorPaletteMode) -> (Color, Color) {
+    agent_colors_from_params(&canonical_agent_visual_params(agent), palette)
 }
 
 fn close_on_esc(
@@ -4392,10 +4680,13 @@ fn close_on_esc(
 }
 
 pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err(anyhow!(
+            "zero-sized Bevy CPU projection {width}x{height} is rejected"
+        ));
+    }
     let snapshot = WorldSnapshot::from_world(world)
         .ok_or_else(|| anyhow!("unable to build world snapshot for Bevy render"))?;
-    let width = width.max(1);
-    let height = height.max(1);
 
     let mut image = ImageBuffer::<ImgRgba<u8>, Vec<u8>>::new(width, height);
 
@@ -4521,16 +4812,21 @@ fn spawn_simulation_driver(
                         let mut paused = false;
                         let mut speed = 1.0;
                         let mut step_once = false;
-                        controls.update(|state| {
+                        let control_available = controls.update(|state| {
                             paused = state.paused;
                             speed = state.speed_multiplier.clamp(MIN_SPEED, MAX_SPEED);
-                            if state.step_requested {
+                            if state.pending_steps > 0 {
                                 step_once = true;
-                                state.step_requested = false;
+                                state.pending_steps -= 1;
                                 state.paused = true;
                                 state.auto_pause_reason = None;
                             }
                         });
+                        if !control_available {
+                            paused = true;
+                            speed = 0.0;
+                            step_once = false;
+                        }
                         (paused, speed, step_once)
                     };
 
@@ -5014,11 +5310,51 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_simulation_controls_latch_a_fail_closed_pause() {
+        let controls = SimulationControl::new();
+        let poison_target = controls.clone();
+        let panic = std::panic::catch_unwind(move || {
+            let _guard = poison_target
+                .0
+                .lock()
+                .expect("control mutex starts healthy");
+            panic!("deliberately poison the simulation-control mutex");
+        });
+        assert!(panic.is_err(), "test must actually poison the mutex");
+
+        let updated = controls.update(|state| {
+            state.paused = false;
+            state.pending_steps = 1;
+        });
+        assert!(
+            !updated,
+            "a poisoned control plane must reject updates instead of silently losing them"
+        );
+        let snapshot = controls.snapshot();
+        assert!(
+            snapshot.paused,
+            "the science driver must fail closed after control-plane poisoning"
+        );
+        assert_eq!(
+            snapshot.auto_pause_reason.as_deref(),
+            Some("Bevy simulation control mutex poisoned; science driver stopped")
+        );
+    }
+
+    #[test]
+    fn cpu_projection_rejects_zero_dimensions() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let error = render_png_offscreen(&world, 0, 64)
+            .expect_err("zero-width projection must not be silently widened to one pixel");
+        assert!(error.to_string().contains("zero-sized"));
+    }
+
+    #[test]
     fn auto_pause_preserves_speed_and_records_the_trigger() {
         let mut state = SimControlData {
             paused: false,
             speed_multiplier: 3.5,
-            step_requested: true,
+            pending_steps: 1,
             auto_pause_reason: Some("stale reason".to_owned()),
         };
 
@@ -5026,7 +5362,7 @@ mod tests {
 
         assert!(state.paused);
         assert_eq!(state.speed_multiplier, 3.5);
-        assert!(!state.step_requested);
+        assert_eq!(state.pending_steps, 0);
         assert_eq!(
             state.auto_pause_reason.as_deref(),
             Some("Spike hits detected (2)")
@@ -5034,8 +5370,8 @@ mod tests {
     }
 
     fn consume_driver_step_request(state: &mut SimControlData) -> usize {
-        if state.step_requested {
-            state.step_requested = false;
+        if state.pending_steps > 0 {
+            state.pending_steps -= 1;
             state.paused = true;
             state.auto_pause_reason = None;
             1
@@ -5047,11 +5383,11 @@ mod tests {
     fn current_bevy_step_count(queued_command_arrives_before_driver: bool) -> usize {
         let mut state = SimControlData {
             paused: true,
-            step_requested: true,
+            // Production has a CommandSubmitter, so the UI does not also set
+            // the local edge. The drained command is the single authority.
+            pending_steps: 0,
             ..SimControlData::default()
         };
-        // Both Bevy playback handlers optimistically set local state before submitting the same
-        // request through CommandSubmitter.
         let queued = SimulationCommand {
             paused: Some(true),
             speed_multiplier: None,
@@ -5070,9 +5406,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "KNOWN DEFECT bd-2z0.4.1: Bevy step advances once or twice by interleaving"
-    )]
     fn target_bevy_step_is_exactly_once_for_every_queue_interleaving() {
         let observed = [
             current_bevy_step_count(true),
@@ -5081,8 +5414,78 @@ mod tests {
         assert_eq!(
             observed,
             [1, 1],
-            "KNOWN DEFECT bd-2z0.4.1: Bevy step advances once or twice by interleaving"
+            "the queued step command must be the sole authority for every interleaving"
         );
+    }
+
+    fn run_step_button_with_submitter(accepted: bool, pending_steps: u64) -> SimControlData {
+        let mut app = App::new();
+        app.add_systems(Update, handle_playback_buttons);
+        let controls = SimulationControl::new();
+        controls.update(|state| {
+            state.paused = true;
+            state.pending_steps = pending_steps;
+        });
+        app.insert_resource(controls.clone());
+        app.insert_resource(CommandSubmitter {
+            submit: Arc::new(move |command| {
+                let ControlCommand::UpdateSimulation(command) = command else {
+                    panic!("step button submitted the wrong command kind");
+                };
+                assert!(command.step_once, "step command lost its edge");
+                accepted
+            }),
+        });
+        app.world_mut().spawn((
+            Button,
+            PlaybackButton {
+                action: PlaybackAction::Step,
+            },
+            Interaction::Pressed,
+        ));
+        app.update();
+        let state = controls.0.lock().expect("simulation controls").clone();
+        state
+    }
+
+    #[test]
+    fn step_button_preserves_pending_work_and_falls_back_on_enqueue_rejection() {
+        let accepted = run_step_button_with_submitter(true, 0);
+        assert_eq!(
+            accepted.pending_steps, 0,
+            "an accepted queued step must remain the sole local authority"
+        );
+
+        let pending = run_step_button_with_submitter(true, 1);
+        assert_eq!(
+            pending.pending_steps, 1,
+            "submitting another step must not erase a drained but unconsumed step"
+        );
+
+        let rejected = run_step_button_with_submitter(false, 0);
+        assert_eq!(
+            rejected.pending_steps, 1,
+            "a rejected queued step must fall back to the local driver edge"
+        );
+    }
+
+    #[test]
+    fn two_queued_step_edges_produce_two_driver_steps() {
+        let mut state = SimControlData {
+            paused: true,
+            ..SimControlData::default()
+        };
+        let queued = SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: None,
+            step_once: true,
+        };
+        apply_simulation_command_to_state(&mut state, &queued);
+        apply_simulation_command_to_state(&mut state, &queued);
+        assert_eq!(state.pending_steps, 2, "step edges must not coalesce");
+        assert_eq!(consume_driver_step_request(&mut state), 1);
+        assert_eq!(consume_driver_step_request(&mut state), 1);
+        assert_eq!(consume_driver_step_request(&mut state), 0);
     }
 
     #[test]
@@ -5113,7 +5516,9 @@ mod tests {
 
         let state = SnapshotState {
             latest: Some(snapshot.clone()),
+            last_applied_revision: snapshot.revision,
             last_applied_tick: snapshot.tick,
+            last_applied_palette: Some(ColorPaletteMode::Natural),
             last_reported_tick: 0,
             focus_point: Vec2::new(snapshot.world_size.x * 0.5, snapshot.world_size.y * 0.5),
             world_size: snapshot.world_size,
@@ -5293,7 +5698,9 @@ mod tests {
 
         app.insert_resource(SnapshotState {
             latest: Some(snapshot.clone()),
+            last_applied_revision: snapshot.revision,
             last_applied_tick: snapshot.tick,
+            last_applied_palette: Some(ColorPaletteMode::Natural),
             last_reported_tick: snapshot.tick,
             focus_point: selection_center,
             world_size: snapshot.world_size,
@@ -5391,15 +5798,31 @@ mod tests {
         // First presentation frame update
         app.update();
         let state = app.world().resource::<SnapshotState>();
+        assert_eq!(state.last_applied_revision, 1);
         assert_eq!(state.last_applied_tick, 42);
 
         // Multiple presentation repaints on unchanged snapshot tick do not advance tick
         app.update();
         app.update();
         let state = app.world().resource::<SnapshotState>();
+        assert_eq!(state.last_applied_revision, 1);
         assert_eq!(
             state.last_applied_tick, 42,
             "presentation repaints must not alter scientific tick count"
+        );
+
+        app.world_mut().resource_mut::<AccessibilityState>().cycle();
+        app.update();
+        let state = app.world().resource::<SnapshotState>();
+        assert_eq!(state.last_applied_revision, 1);
+        assert_eq!(
+            state.last_applied_palette,
+            Some(ColorPaletteMode::Deuteranopia),
+            "a paused scene must be re-projected when its presentation palette changes"
+        );
+        assert_eq!(
+            state.last_applied_tick, 42,
+            "presentation-only palette changes must not advance science"
         );
 
         Ok(())
