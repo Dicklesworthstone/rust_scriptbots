@@ -24,7 +24,10 @@ use gpui::{AppContext as _, HeadlessAppContext, px, size};
 use image::RgbaImage;
 use scriptbots_core::{ScriptBotsConfig, WorldState};
 
-use crate::{AnalyticsSnapshotProvider, ControlCommand, GuiSession, GuiViewRole, WorldStepDriver};
+use crate::{
+    AnalyticsSnapshotProvider, ControlCommand, GuiSession, GuiViewRole, HUD_RAIL_WIDTH,
+    WorldStepDriver,
+};
 
 // GPUI's test window reports a fixed 2× device scale. `HeadlessAppContext::open_window`
 // accepts logical pixels, while `capture_screenshot` returns device pixels, so divide
@@ -121,6 +124,10 @@ mod tests {
     /// the stats card's `0x0b1120`, which is also the root container background and so
     /// cannot distinguish chrome from backdrop.
     const HISTORY_PANEL_BG: [u8; 3] = [0x0a, 0x16, 0x29];
+
+    /// Border drawn by every docked panel (`render_overlay`, `render_perf_overlay`).
+    /// Unlike the panel fills, this is not shared with the root container background.
+    const PANEL_BORDER: [u8; 3] = [0x1e, 0x29, 0x3b];
 
     /// The two viewports the production windows actually open at
     /// (`GuiViewRole::window_options`).
@@ -262,14 +269,22 @@ mod tests {
                 "capture must match the requested viewport"
             );
 
-            // Centre band: the middle third horizontally. This is "the world centre" in
-            // the owner's complaint, and the region that must stay clear of chrome.
+            // Marker is the PANEL BORDER, not the history-panel background.
+            //
+            // The history background was the original marker and it was the wrong
+            // choice: it encoded an assumption — that stats AND history are both
+            // visible by default — which the first real captures disproved. At 720
+            // logical the HUD's canvas row is only ~207 logical px tall, so the rail
+            // fits one panel and the history chart legitimately does not appear. A
+            // marker that can never be satisfied does not test the policy, it just
+            // fails. The border is what every docked panel actually draws.
             let centre_lo = w / 3;
             let centre_hi = w - w / 3;
-            let centre_hits = count_color(&image, HISTORY_PANEL_BG, centre_lo, centre_hi);
+            let centre_hits = count_color(&image, PANEL_BORDER, centre_lo, centre_hi);
 
-            // Right band: where the docked rail lives.
-            let right_hits = count_color(&image, HISTORY_PANEL_BG, centre_hi, w);
+            // Right band: the rightmost rail-width strip, where the docked rail lives.
+            let rail_band = (HUD_RAIL_WIDTH * HEADLESS_DEVICE_SCALE) as u32;
+            let right_hits = count_color(&image, PANEL_BORDER, w.saturating_sub(rail_band), w);
 
             // Named by LOGICAL viewport so the evidence matches the window size a user
             // actually has; the file itself is a 2x HiDPI buffer, as a Retina screenshot
@@ -282,15 +297,15 @@ mod tests {
 
             assert!(
                 right_hits > 0,
-                "no history-panel pixels found in the right band at {w}x{h}; the rail did \
-                 not render, so the centre assertion below would be vacuous. Probe: {}",
+                "no docked-panel border found in the rightmost rail band at {w}x{h}; the rail \
+                 did not render, so the centre assertion below would be vacuous. Probe: {}",
                 path.display()
             );
             assert_eq!(
                 centre_hits,
                 0,
                 "HUD chrome is covering the world centre at {w}x{h}: {centre_hits} \
-                 history-panel pixels between x={centre_lo} and x={centre_hi}. bd-v9cz's \
+                 docked-panel border pixels between x={centre_lo} and x={centre_hi}. bd-v9cz's \
                  one non-negotiable is that nothing sits over the world centre by \
                  default. Probe: {}",
                 path.display()
