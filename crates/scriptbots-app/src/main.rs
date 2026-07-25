@@ -4844,6 +4844,7 @@ mod tests {
             births: Vec::new(),
             deaths: Vec::new(),
             replay_events: Vec::new(),
+            narrative_events: Vec::new(),
         }
     }
 
@@ -5072,6 +5073,7 @@ mod tests {
                 births: Vec::new(),
                 deaths: Vec::new(),
                 replay_events: Vec::new(),
+                narrative_events: Vec::new(),
             })
             .expect("admit recovery fixture");
         pipeline.shutdown().expect("finalize recovery fixture");
