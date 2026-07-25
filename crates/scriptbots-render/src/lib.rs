@@ -19,12 +19,13 @@ use scriptbots_core::narrative::{
     EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord,
 };
 use scriptbots_core::rng_domains::RngDomain;
+use scriptbots_core::visual::{self, SplatInput, TerrainShadeInput};
 use scriptbots_core::{
-    ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime, AgentUid,
-    BrainActivations, BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision,
-    BrainInspectionUnavailable, ControlCommand, ControlDisposition, FoodGrid, Generation,
-    IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position,
-    RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig, SelectedBrainTelemetryOutcome,
+    AccessibilityPalette, ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId,
+    AgentRuntime, AgentUid, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
+    BrainInspectionRevision, BrainInspectionUnavailable, ControlCommand, ControlDisposition,
+    FoodGrid, Generation, IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt,
+    Position, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig, SelectedBrainTelemetryOutcome,
     SelectionMode, SelectionState, SelectionUpdate, SensorAttribution, SensorKind,
     SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers,
     Velocity, WorldState, WorldStepDriver, apply_control_command,
@@ -12486,6 +12487,8 @@ fn color_swatch(color: [f32; 3]) -> Div {
 struct RenderFrame {
     tick: u64,
     tonemap_mode: Option<RenderTonemapMode>,
+    day_night_cycle_ticks: u32,
+    day_night_start_phase: f32,
     world_size: (f32, f32),
     terrain: TerrainFrame,
     food_dimensions: (u32, u32),
@@ -12493,6 +12496,7 @@ struct RenderFrame {
     food_cells: Vec<f32>,
     food_max: f32,
     agents: Vec<AgentRenderData>,
+    agent_reference_age: u64,
     agent_base_radius: f32,
     sense_radius: f32,
     post_stack: PostProcessStack,
@@ -12513,6 +12517,7 @@ struct TerrainTileVisual {
     moisture: f32,
     accent: f32,
     slope: f32,
+    water_depth: f32,
 }
 
 #[derive(Clone)]
@@ -12668,6 +12673,7 @@ impl RenderFrame {
         let headings = columns.headings();
         let boosts = columns.boosts();
         let ages = columns.ages();
+        let agent_reference_age = u64::from(config.aging_health_decay_start.max(1));
 
         let estimated_agents = arena.len();
         let mut agents = Vec::with_capacity(estimated_agents);
@@ -12771,11 +12777,28 @@ impl RenderFrame {
         }
 
         let food_cells = food.cells().to_vec();
-        let terrain = build_terrain_frame(world.terrain());
+        let terrain = build_terrain_frame(
+            world.terrain(),
+            world
+                .hydrology()
+                .map(scriptbots_core::HydrologyState::water_depth),
+        );
+        let (day_night_cycle_ticks, day_night_start_phase) = config
+            .render
+            .day_night
+            .as_ref()
+            .map_or((0, 0.25), |settings| {
+                (
+                    settings.cycle_ticks.unwrap_or(0),
+                    settings.start_phase.unwrap_or(0.25),
+                )
+            });
 
         Some(Self {
             tick: world.tick().0,
             tonemap_mode: config.render.tonemap_mode,
+            day_night_cycle_ticks,
+            day_night_start_phase,
             world_size: (config.world_width as f32, config.world_height as f32),
             terrain,
             food_dimensions: (width, height),
@@ -12783,6 +12806,7 @@ impl RenderFrame {
             food_cells,
             food_max: config.food_max,
             agents,
+            agent_reference_age,
             agent_base_radius: config.bot_radius.max(1.0),
             sense_radius: config.sense_radius,
             post_stack: build_post_process_stack(world, palette),
@@ -12806,7 +12830,7 @@ fn layout_camera_for_frame(
     )
 }
 
-fn build_terrain_frame(layer: &TerrainLayer) -> TerrainFrame {
+fn build_terrain_frame(layer: &TerrainLayer, water_depth: Option<&[f32]>) -> TerrainFrame {
     let width = layer.width();
     let height = layer.height();
     let mut tiles = Vec::with_capacity((width as usize) * (height as usize));
@@ -12856,6 +12880,10 @@ fn build_terrain_frame(layer: &TerrainLayer) -> TerrainFrame {
                 moisture: tile.moisture,
                 accent: tile.accent,
                 slope,
+                water_depth: water_depth
+                    .and_then(|depths| depths.get(idx))
+                    .copied()
+                    .unwrap_or(0.0),
             });
         }
     }
@@ -13819,22 +13847,25 @@ fn paint_terrain_layer(
     }
 }
 
-const LEGACY_TERRAIN_BASE: [[f32; 3]; 6] = [
-    [0.117_647, 0.247_059, 0.400_000], // Deep water (#1E3F66)
-    [0.184_314, 0.450_980, 0.701_961], // Shallow water (#2F73B3)
-    [0.694_118, 0.305_882, 0.027_451], // Sand (#B14E07)
-    [0.313_725, 0.662_745, 0.074_510], // Grass (#50A913)
-    [0.474_510, 0.831_373, 0.427_451], // Bloom (#79D46D)
-    [0.662_745, 0.694_118, 0.729_412], // Rock (#A9B1BA)
+// Kept as literal-free compatibility aliases while the old helper names are
+// retired call-site by call-site. Core visual semantics own every value.
+const LEGACY_TERRAIN_BASE: [[f32; 3]; 6] = visual::TERRAIN_BASE_COLORS;
+const LEGACY_TERRAIN_ACCENT: [[f32; 3]; 6] = [
+    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[0].emissive_srgb,
+    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[1].emissive_srgb,
+    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[2].emissive_srgb,
+    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[3].emissive_srgb,
+    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[4].emissive_srgb,
+    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[5].emissive_srgb,
 ];
 
-const LEGACY_TERRAIN_ACCENT: [[f32; 3]; 6] = [
-    [0.211_765, 0.462_745, 0.650_980], // Deep water caustics (#3676A6)
-    [0.345_098, 0.658_824, 0.878_431], // Shallow water shimmer (#58A8E0)
-    [0.823_529, 0.490_196, 0.184_314], // Sand highlights (#D27D2F)
-    [0.423_529, 0.890_196, 0.223_529], // Grass fertility glow (#6CE339)
-    [0.615_686, 0.960_784, 0.627_451], // Bloom energy (#9DF5A0)
-    [0.823_529, 0.854_902, 0.898_039], // Rock snowcaps (#D2DAE5)
+const TERRAIN_SPLAT_KINDS: [TerrainKind; visual::SPLAT_LAYERS] = [
+    TerrainKind::DeepWater,
+    TerrainKind::ShallowWater,
+    TerrainKind::Sand,
+    TerrainKind::Grass,
+    TerrainKind::Bloom,
+    TerrainKind::Rock,
 ];
 
 #[inline]
@@ -13850,6 +13881,7 @@ fn terrain_kind_index(kind: TerrainKind) -> usize {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn terrain_base_color(kind: TerrainKind) -> [f32; 3] {
     LEGACY_TERRAIN_BASE[terrain_kind_index(kind)]
 }
@@ -13864,30 +13896,27 @@ fn terrain_surface_color(
     daylight: f32,
     palette: ColorPaletteMode,
 ) -> Rgba {
-    let base = terrain_base_color(tile.kind);
-
-    let mut color = rgba_from_triplet_with_alpha(base, 1.0);
-    let brightness = match tile.kind {
-        TerrainKind::DeepWater => (0.42 + daylight * 0.25 + tile.moisture * 0.2).clamp(0.25, 1.05),
-        TerrainKind::ShallowWater => {
-            (0.55 + daylight * 0.35 + tile.moisture * 0.3).clamp(0.4, 1.25)
-        }
-        TerrainKind::Sand => (0.72 + daylight * 0.18 + tile.elevation * 0.35).clamp(0.45, 1.35),
-        TerrainKind::Grass => (0.62 + daylight * 0.28 + tile.moisture * 0.4).clamp(0.4, 1.35),
-        TerrainKind::Bloom => (0.68 + daylight * 0.35 + tile.moisture * 0.5).clamp(0.45, 1.45),
-        TerrainKind::Rock => (0.60 + daylight * 0.22 + tile.slope * 0.45).clamp(0.35, 1.25),
-    };
-    color = scale_rgb(color, brightness);
-
-    if matches!(tile.kind, TerrainKind::Bloom | TerrainKind::Grass) {
-        color = scale_rgb(color, 0.9 + tile.moisture * 0.3 + tile.accent * 0.05);
-    } else if matches!(tile.kind, TerrainKind::Sand) {
-        color = scale_rgb(color, 0.9 + tile.accent * 0.08);
-    } else if matches!(tile.kind, TerrainKind::Rock) {
-        color = scale_rgb(color, 0.85 + tile.slope * 0.3);
+    let weights = visual::splat_weights(&SplatInput {
+        kind: tile.kind,
+        elevation: tile.elevation,
+        slope: tile.slope,
+        water_depth: tile.water_depth,
+    });
+    let mut blended = [0.0_f32; 3];
+    for (layer, weight) in TERRAIN_SPLAT_KINDS.into_iter().zip(weights) {
+        let shaded = visual::terrain_shaded_color(&TerrainShadeInput {
+            kind: layer,
+            moisture: tile.moisture,
+            elevation: tile.elevation,
+            slope: tile.slope,
+            accent: tile.accent,
+            daylight,
+        });
+        blended[0] += shaded[0] * weight;
+        blended[1] += shaded[1] * weight;
+        blended[2] += shaded[2] * weight;
     }
-
-    apply_palette(color, palette)
+    apply_palette(rgba_from_triplet_with_alpha(blended, 1.0), palette)
 }
 
 fn terrain_slope_accent_color(
@@ -13895,18 +13924,20 @@ fn terrain_slope_accent_color(
     highlight_shift: f32,
     palette: ColorPaletteMode,
 ) -> Rgba {
+    let material = visual::terrain_material(tile.kind);
     let accent = terrain_accent_color(tile.kind);
-    let alpha = (0.09 + tile.slope * highlight_shift).clamp(0.04, 0.42);
+    let alpha = (0.06 + tile.slope * highlight_shift * material.normal_strength).clamp(0.03, 0.36);
     let mut color = rgba_from_triplet_with_alpha(accent, alpha);
-    color = scale_rgb(color, 0.85 + tile.accent * 0.4);
+    color = scale_rgb(color, 1.0 + material.emissive_gain + tile.accent * 0.25);
     apply_palette(color, palette)
 }
 
 fn terrain_bloom_color(tile: TerrainTileVisual, palette: ColorPaletteMode) -> Rgba {
+    let material = visual::terrain_material(TerrainKind::Bloom);
     let strength = ((tile.accent - 0.66) * 1.6).clamp(0.0, 1.0);
     let alpha = (0.12 + strength * 0.28).clamp(0.08, 0.35);
-    let mut color = rgba_from_triplet_with_alpha([0.96, 0.62, 0.84], alpha);
-    color = scale_rgb(color, 0.85 + tile.moisture * 0.35);
+    let mut color = rgba_from_triplet_with_alpha(material.emissive_srgb, alpha);
+    color = scale_rgb(color, 1.0 + material.emissive_gain + tile.moisture * 0.25);
     apply_palette(color, palette)
 }
 
@@ -13915,14 +13946,11 @@ fn terrain_water_caustic_color(
     daylight: f32,
     palette: ColorPaletteMode,
 ) -> Rgba {
-    let base = if matches!(tile.kind, TerrainKind::DeepWater) {
-        [0.36, 0.74, 0.96]
-    } else {
-        [0.54, 0.90, 1.0]
-    };
-    let alpha = (0.10 + daylight * 0.12 + tile.accent * 0.18).clamp(0.05, 0.32);
-    let mut color = rgba_from_triplet_with_alpha(base, alpha);
-    color = scale_rgb(color, 0.9 + tile.moisture * 0.2);
+    let material = visual::terrain_material(tile.kind);
+    let alpha = (0.05 + daylight * 0.08 + tile.accent * 0.12 + material.reflectance * 0.10)
+        .clamp(0.04, 0.26);
+    let mut color = rgba_from_triplet_with_alpha(material.emissive_srgb, alpha);
+    color = scale_rgb(color, 1.0 + material.emissive_gain + tile.moisture * 0.15);
     apply_palette(color, palette)
 }
 fn paint_sparkline(bounds: Bounds<Pixels>, state: SparklineState, window: &mut Window) {
@@ -14586,25 +14614,29 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     drop(camera_guard);
 
     let day_phase = frame.tick as f32 * 0.00025;
-    let phase_sin = day_phase.sin();
-    let daylight = phase_sin * 0.5 + 0.5;
+    let daylight = visual::daylight_factor(
+        frame.tick,
+        frame.day_night_cycle_ticks,
+        frame.day_night_start_phase,
+    );
+    let style = visual::visual_style();
 
     if safe_mode_enabled() {
         // Conservative background fill (bypass gradient blending that could expose format issues)
-        window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1120, 1.0))));
+        let background = apply_palette(
+            rgba_from_triplet_with_alpha(style.substrate.abyss_srgb, 1.0),
+            frame.palette,
+        );
+        window.paint_quad(fill(bounds, Background::from(background)));
     } else {
         let sky_base = lerp_rgba(
-            rgba_from_hex(0x050b16, 1.0),
-            rgba_from_hex(0x173f6a, 1.0),
-            daylight,
+            rgba_from_triplet_with_alpha(style.substrate.abyss_srgb, 1.0),
+            rgba_from_triplet_with_alpha(style.substrate.depth_violet_srgb, 1.0),
+            daylight * 0.65,
         );
         window.paint_quad(fill(
             bounds,
-            Background::from(if palette_is_natural {
-                sky_base
-            } else {
-                apply_palette(sky_base, frame.palette)
-            }),
+            Background::from(apply_palette(sky_base, frame.palette)),
         ));
     }
 
@@ -14614,12 +14646,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             point(px(origin_x), px(origin_y + height_px - horizon_height)),
             size(px(width_px), px(horizon_height)),
         );
-        let horizon_base = rgba_from_hex(0xffa94d, (0.12 + 0.25 * daylight).clamp(0.0, 0.3));
-        let horizon_color = if palette_is_natural {
-            horizon_base
-        } else {
-            apply_palette(horizon_base, frame.palette)
-        };
+        let horizon_base = rgba_from_triplet_with_alpha(
+            style.substrate.distant_haze_srgb,
+            (0.06 + 0.16 * daylight).clamp(0.0, 0.22),
+        );
+        let horizon_color = apply_palette(horizon_base, frame.palette);
         window.paint_quad(fill(horizon_bounds, Background::from(horizon_color)));
     }
 
@@ -14629,12 +14660,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             point(px(origin_x), px(origin_y)),
             size(px(width_px), px(height_px * 0.25)),
         );
-        let aurora_base = rgba_from_hex(0x2fd3ff, 0.18 * aurora_strength);
-        let aurora_color = if palette_is_natural {
-            aurora_base
-        } else {
-            apply_palette(aurora_base, frame.palette)
-        };
+        let aurora_base =
+            rgba_from_triplet_with_alpha(style.substrate.base_srgb, 0.18 * aurora_strength);
+        let aurora_color = apply_palette(aurora_base, frame.palette);
         window.paint_quad(fill(aurora_bounds, Background::from(aurora_color)));
     }
 
@@ -15262,41 +15290,29 @@ fn build_gpu_agent_instance(
 }
 
 fn apply_palette(color: Rgba, palette: ColorPaletteMode) -> Rgba {
-    match palette {
-        ColorPaletteMode::Natural => color,
-        ColorPaletteMode::Deuteranopia => transform_color(
-            color,
-            [[0.43, 0.72, -0.15], [0.34, 0.57, 0.09], [-0.02, 0.03, 0.97]],
-        ),
-        ColorPaletteMode::Protanopia => transform_color(
-            color,
-            [[0.20, 0.99, -0.19], [0.16, 0.79, 0.04], [0.01, -0.01, 1.00]],
-        ),
-        ColorPaletteMode::Tritanopia => transform_color(
-            color,
-            [[0.95, 0.05, 0.00], [0.00, 0.43, 0.56], [0.00, 0.47, 0.53]],
-        ),
-        ColorPaletteMode::HighContrast => {
-            let luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-            if luminance > 0.5 {
-                Rgba {
-                    r: (color.r + 0.15).min(1.0),
-                    g: (color.g + 0.15).min(1.0),
-                    b: (color.b + 0.15).min(1.0),
-                    a: color.a,
-                }
-            } else {
-                Rgba {
-                    r: (color.r * 0.6).clamp(0.0, 1.0),
-                    g: (color.g * 0.6).clamp(0.0, 1.0),
-                    b: (color.b * 0.6).clamp(0.0, 1.0),
-                    a: color.a,
-                }
-            }
-        }
+    let [r, g, b] = visual::apply_accessibility_palette(
+        [color.r, color.g, color.b],
+        accessibility_palette(palette),
+    );
+    Rgba {
+        r,
+        g,
+        b,
+        a: color.a,
     }
 }
 
+const fn accessibility_palette(palette: ColorPaletteMode) -> AccessibilityPalette {
+    match palette {
+        ColorPaletteMode::Natural => AccessibilityPalette::Natural,
+        ColorPaletteMode::Deuteranopia => AccessibilityPalette::Deuteranopia,
+        ColorPaletteMode::Protanopia => AccessibilityPalette::Protanopia,
+        ColorPaletteMode::Tritanopia => AccessibilityPalette::Tritanopia,
+        ColorPaletteMode::HighContrast => AccessibilityPalette::HighContrast,
+    }
+}
+
+#[allow(dead_code)]
 fn transform_color(color: Rgba, matrix: [[f32; 3]; 3]) -> Rgba {
     let r =
         (color.r * matrix[0][0] + color.g * matrix[0][1] + color.b * matrix[0][2]).clamp(0.0, 1.0);
