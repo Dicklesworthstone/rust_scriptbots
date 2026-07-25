@@ -73,6 +73,43 @@ pub struct Effect {
     pub underpowered: bool,
 }
 
+/// Two-sided paired permutation p-value for the mean difference (bd-h189).
+///
+/// Replaces a hardcoded `p_value: 0.05`. The sign-flip permutation is the exact test for
+/// paired differences under the null "the pairing carries no signal": if it does not, the
+/// sign of each difference is exchangeable, so resampling signs builds the null directly
+/// from the observed data with no distributional assumption and no new dependency.
+///
+/// Deterministic by construction. The generator is an inline xorshift64 seeded by the
+/// caller, so the same cohorts always yield the same p-value — this module's other
+/// randomised routine, `bootstrap_ci`, is deterministic for the same reason.
+///
+/// Uses the `(count + 1) / (iterations + 1)` correction, so the result is never exactly
+/// zero: a permutation test can bound a p-value from above but cannot prove it is zero, and
+/// reporting 0.0 would claim more than the procedure supports.
+fn paired_permutation_p_value(diffs: &[f64], iterations: u32, seed: u64) -> f64 {
+    debug_assert!(!diffs.is_empty(), "caller rejects empty cohorts before this point");
+    let n = diffs.len() as f64;
+    let observed = (diffs.iter().sum::<f64>() / n).abs();
+
+    // Never zero: xorshift64 has a fixed point at zero and would emit a constant stream.
+    let mut state = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+    let mut at_least_as_extreme = 0u32;
+    for _ in 0..iterations {
+        let mut sum = 0.0;
+        for diff in diffs {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            sum += if state & 1 == 0 { *diff } else { -*diff };
+        }
+        if (sum / n).abs() >= observed {
+            at_least_as_extreme += 1;
+        }
+    }
+    f64::from(at_least_as_extreme + 1) / f64::from(iterations + 1)
+}
+
 /// Computes paired difference effect sizes strictly matched by seed across cohorts.
 pub fn paired_diff(
     a: &[RunSummary],
@@ -147,7 +184,7 @@ pub fn paired_diff(
         cohens_dz,
         ci_95,
         test: TestName::PairedDifference,
-        p_value: 0.05,
+        p_value: paired_permutation_p_value(&diffs, 1000, 42),
     })
 }
 
@@ -351,6 +388,104 @@ mod tests {
              effect size exists; reporting 0.0 would claim no effect for a perfectly \
              consistent one"
         );
+    }
+
+    /// bd-h189: the p-value must be COMPUTED FROM THE DATA, never a constant.
+    ///
+    /// This is the anti-recurrence assertion, and it is the reusable part of the fix. The
+    /// defect was `p_value: 0.05` returned on every call — a plausible number sitting exactly
+    /// on the conventional significance threshold, indistinguishable from a computed one at
+    /// every call site. Fixing the value alone would not stop it coming back.
+    ///
+    /// The property asserted is RESPONSIVENESS, not any particular number: two cohorts whose
+    /// effects differ in strength must produce DIFFERENT p-values, and the more consistent
+    /// effect must produce the SMALLER one. Any constant fails both halves, whatever constant
+    /// someone picks — which is what a test pinning a specific p-value would not achieve.
+    ///
+    /// Deliberately does NOT assert `p_value != 0.05`. That would guard only the one literal
+    /// that happened to be there and would pass for any other hardcoded value.
+    #[test]
+    fn p_value_is_computed_from_the_data_and_not_a_constant() {
+        let cohort = |ids: [u64; 4], values: [f64; 4]| -> Vec<RunSummary> {
+            ids.iter()
+                .zip(values.iter())
+                .enumerate()
+                .map(|(index, (run_id, value))| {
+                    let mut metrics = BTreeMap::new();
+                    metrics.insert("pop".to_string(), *value);
+                    RunSummary {
+                        run_id: *run_id,
+                        arm_id: 0,
+                        seed: 100 + index as u64,
+                        config_hash: [0; 32],
+                        digest: [0; 32],
+                        ticks: 100,
+                        metrics,
+                    }
+                })
+                .collect()
+        };
+
+        let control = cohort([1, 2, 3, 4], [100.0, 100.0, 100.0, 100.0]);
+        // Strong: every pair moves the same way by a large, near-consistent amount.
+        let strong = cohort([5, 6, 7, 8], [140.0, 141.0, 139.0, 140.0]);
+        // Weak: the pairs disagree in sign, so the mean difference is near zero.
+        let weak = cohort([9, 10, 11, 12], [101.0, 99.0, 102.0, 98.0]);
+
+        let p_strong = paired_diff(&control, &strong, "pop")
+            .expect("strong cohort has nonzero spread")
+            .p_value;
+        let p_weak = paired_diff(&control, &weak, "pop")
+            .expect("weak cohort has nonzero spread")
+            .p_value;
+
+        assert!(
+            (p_strong - p_weak).abs() > f64::EPSILON,
+            "identical p-values ({p_strong}) for cohorts with different effects means the \
+             value is not computed from the data — this is exactly the bd-h189 defect"
+        );
+        assert!(
+            p_strong < p_weak,
+            "a large consistent effect must be MORE significant than a near-zero one, got \
+             strong={p_strong} weak={p_weak}"
+        );
+        for p in [p_strong, p_weak] {
+            assert!(
+                p > 0.0 && p <= 1.0,
+                "a permutation p-value must lie in (0, 1], got {p}"
+            );
+        }
+    }
+
+    /// bd-h189: the same cohorts must always yield the same p-value.
+    ///
+    /// A permutation test resamples, so it would be easy to make it irreproducible. This
+    /// module's other randomised routine is deterministic for the same reason.
+    #[test]
+    fn p_value_is_deterministic_across_repeated_calls() {
+        let mut metrics_a = BTreeMap::new();
+        metrics_a.insert("pop".to_string(), 100.0);
+        let mut metrics_b = BTreeMap::new();
+        metrics_b.insert("pop".to_string(), 130.0);
+        let mut metrics_c = BTreeMap::new();
+        metrics_c.insert("pop".to_string(), 100.0);
+        let mut metrics_d = BTreeMap::new();
+        metrics_d.insert("pop".to_string(), 120.0);
+        let run = |run_id: u64, seed: u64, metrics: BTreeMap<String, f64>| RunSummary {
+            run_id,
+            arm_id: 0,
+            seed,
+            config_hash: [0; 32],
+            digest: [0; 32],
+            ticks: 100,
+            metrics,
+        };
+        let control = [run(1, 7, metrics_a), run(2, 8, metrics_c)];
+        let treatment = [run(3, 7, metrics_b), run(4, 8, metrics_d)];
+
+        let first = paired_diff(&control, &treatment, "pop").expect("effect").p_value;
+        let second = paired_diff(&control, &treatment, "pop").expect("effect").p_value;
+        assert_eq!(first, second, "permutation p-value must be reproducible");
     }
 
     /// bd-7453: one pair cannot support a standardized effect size either.
