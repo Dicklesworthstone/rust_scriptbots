@@ -130,8 +130,10 @@ impl Simulation {
             },
             ..Default::default()
         };
-        let core = HostCore::new(session_id, world, options)
+        let mut core = HostCore::new(session_id, world, options)
             .map_err(|e| anyhow::anyhow!("failed to build HostCore for web: {e}"))?;
+        core.drive(ManualInstant::from_nanos(0))
+            .context("failed to establish the initial ScriptBots web time boundary")?;
         Ok(Self {
             core,
             spec,
@@ -160,8 +162,10 @@ impl Simulation {
             },
             ..Default::default()
         };
-        let core = HostCore::new(session_id, world, options)
+        let mut core = HostCore::new(session_id, world, options)
             .map_err(|e| anyhow::anyhow!("failed to rebuild HostCore for web: {e}"))?;
+        core.drive(ManualInstant::from_nanos(0))
+            .context("failed to establish the reset ScriptBots web time boundary")?;
         self.core = core;
         self.spec = spec;
         self.now_nanos = 0;
@@ -172,7 +176,8 @@ impl Simulation {
         let period = self.core.tick_period_nanos();
         for step_index in 0..steps {
             self.now_nanos = self.now_nanos.saturating_add(period);
-            self.core
+            let receipt = self
+                .core
                 .drive(ManualInstant::from_nanos(self.now_nanos))
                 .with_context(|| {
                     format!(
@@ -180,6 +185,12 @@ impl Simulation {
                         step_index + 1
                     )
                 })?;
+            ensure!(
+                receipt.scientific_steps == 1,
+                "HostCore completed {} scientific steps during requested WASM step {} of {steps}",
+                receipt.scientific_steps,
+                step_index + 1
+            );
         }
         Ok(self.core.latest_snapshot().world.clone())
     }
@@ -505,7 +516,7 @@ fn clamp01(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{BirthOrigin, ScriptBotsConfig};
+    use scriptbots_core::{BirthOrigin, DYNAMIC_WORLD_SNAPSHOT_SCHEMA, ScriptBotsConfig};
     use std::sync::{Arc, Mutex};
     use wasm_bindgen_test::*;
 
@@ -842,6 +853,33 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn parity_regression_tick_advances_every_requested_science_step() {
+        let mut simulation = Simulation::new(
+            InitOptions {
+                population: 0,
+                seed: Some(91),
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .expect("seeded web simulation");
+
+        assert_eq!(simulation.tick(0).expect("zero-step snapshot").tick, 0);
+        assert_eq!(simulation.tick(1).expect("first requested step").tick, 1);
+        assert_eq!(
+            simulation
+                .tick(2)
+                .expect("two additional requested steps")
+                .tick,
+            3
+        );
+
+        simulation.reset(None).expect("reset web simulation");
+        assert_eq!(simulation.tick(1).expect("first step after reset").tick, 1);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn reset_replaces_the_matching_persistence_session_and_remains_step_capable() {
         let mut simulation = Simulation::new(SimSpec::new(
             ScriptBotsConfig {
@@ -903,7 +941,6 @@ mod tests {
     }
 
     /// Cumulative checkpoint ticks captured in the committed fixture.
-    #[cfg(not(target_arch = "wasm32"))]
     const PARITY_CHECKPOINT_TICKS: [u32; 4] = [1, 8, 64, 150];
     /// Per-field float tolerance for parity comparison. A genuine libm divergence
     /// (native vs wasm sin/cos/atan2/powf) becomes a DOCUMENTED per-field policy in
@@ -983,6 +1020,47 @@ mod tests {
     /// Compare two snapshots field by field; `Err` carries the FIRST divergence with
     /// tick, agent index, field name, both values, absolute delta, and the config
     /// hash — enough to diagnose from CI output alone.
+    fn assert_snapshot_projection_is_exhaustively_named(snapshot: &SimulationSnapshot) {
+        let SimulationSnapshot {
+            tick: _,
+            epoch: _,
+            world,
+            summary,
+            agents,
+        } = snapshot;
+        let SnapshotWorld {
+            width: _,
+            height: _,
+            closed: _,
+        } = world;
+        let SnapshotSummary {
+            agent_count: _,
+            births: _,
+            deaths: _,
+            total_energy: _,
+            average_energy: _,
+            average_health: _,
+        } = summary;
+        for agent in agents {
+            let AgentSnapshot {
+                id: _,
+                uid: _,
+                position: _,
+                velocity: _,
+                heading: _,
+                health: _,
+                energy: _,
+                color: _,
+                spike_length: _,
+                boost: _,
+                age: _,
+                generation: _,
+                herbivore_tendency: _,
+                brain_key: _,
+            } = agent;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn compare_snapshots(
         config_hash: u64,
@@ -990,6 +1068,8 @@ mod tests {
         expected: &SimulationSnapshot,
         actual: &SimulationSnapshot,
     ) -> std::result::Result<(), String> {
+        assert_snapshot_projection_is_exhaustively_named(expected);
+        assert_snapshot_projection_is_exhaustively_named(actual);
         let report = |subject: &str, field: &str, expected: f64, actual: f64| {
             format!(
                 "first divergence at tick {tick}, {subject}, field `{field}`: \
@@ -1028,8 +1108,44 @@ mod tests {
         exact(
             "summary",
             "tick",
-            expected.tick == actual.tick,
-            format!("expected {}, actual {}", expected.tick, actual.tick),
+            expected.tick == u64::from(tick) && actual.tick == u64::from(tick),
+            format!(
+                "checkpoint {tick}, expected snapshot {}, actual snapshot {}",
+                expected.tick, actual.tick
+            ),
+        )?;
+        exact(
+            "summary",
+            "epoch",
+            expected.epoch == actual.epoch,
+            format!("expected {}, actual {}", expected.epoch, actual.epoch),
+        )?;
+        exact(
+            "summary",
+            "world.width",
+            expected.world.width == actual.world.width,
+            format!(
+                "expected {}, actual {}",
+                expected.world.width, actual.world.width
+            ),
+        )?;
+        exact(
+            "summary",
+            "world.height",
+            expected.world.height == actual.world.height,
+            format!(
+                "expected {}, actual {}",
+                expected.world.height, actual.world.height
+            ),
+        )?;
+        exact(
+            "summary",
+            "world.closed",
+            expected.world.closed == actual.world.closed,
+            format!(
+                "expected {}, actual {}",
+                expected.world.closed, actual.world.closed
+            ),
         )?;
         exact(
             "summary",
@@ -1048,6 +1164,24 @@ mod tests {
                 "expected {}, actual {}",
                 expected.agents.len(),
                 actual.agents.len()
+            ),
+        )?;
+        exact(
+            "summary",
+            "births",
+            expected.summary.births == actual.summary.births,
+            format!(
+                "expected {}, actual {}",
+                expected.summary.births, actual.summary.births
+            ),
+        )?;
+        exact(
+            "summary",
+            "deaths",
+            expected.summary.deaths == actual.summary.deaths,
+            format!(
+                "expected {}, actual {}",
+                expected.summary.deaths, actual.summary.deaths
             ),
         )?;
         float_field(
@@ -1139,6 +1273,92 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn parity_regression_comparator_covers_every_exported_non_agent_field() {
+        let spec = parity_spec(parity_cases()[0]);
+        let expected =
+            SimulationSnapshot::from_world(&WorldState::new(spec.config()).expect("world"));
+
+        let mut actual = expected.clone();
+        actual.epoch = actual.epoch.saturating_add(1);
+        assert!(
+            compare_snapshots(0xABCD, 0, &expected, &actual)
+                .expect_err("epoch divergence must be rejected")
+                .contains("epoch")
+        );
+
+        let mut actual = expected.clone();
+        actual.world.width = actual.world.width.saturating_add(1);
+        assert!(
+            compare_snapshots(0xABCD, 0, &expected, &actual)
+                .expect_err("world width divergence must be rejected")
+                .contains("world.width")
+        );
+
+        let mut actual = expected.clone();
+        actual.world.height = actual.world.height.saturating_add(1);
+        assert!(
+            compare_snapshots(0xABCD, 0, &expected, &actual)
+                .expect_err("world height divergence must be rejected")
+                .contains("world.height")
+        );
+
+        let mut actual = expected.clone();
+        actual.world.closed = !actual.world.closed;
+        assert!(
+            compare_snapshots(0xABCD, 0, &expected, &actual)
+                .expect_err("closed-world divergence must be rejected")
+                .contains("world.closed")
+        );
+
+        let mut actual = expected.clone();
+        actual.summary.births = actual.summary.births.saturating_add(1);
+        assert!(
+            compare_snapshots(0xABCD, 0, &expected, &actual)
+                .expect_err("birth-count divergence must be rejected")
+                .contains("births")
+        );
+
+        let mut actual = expected.clone();
+        actual.summary.deaths = actual.summary.deaths.saturating_add(1);
+        assert!(
+            compare_snapshots(0xABCD, 0, &expected, &actual)
+                .expect_err("death-count divergence must be rejected")
+                .contains("deaths")
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn parity_regression_divergence_report_identifies_the_first_agent_field() {
+        let case = parity_cases()[0];
+        let spec = parity_spec(case);
+        let config_hash = parity_config_hash(&spec.config());
+        let simulation = Simulation::new(spec).expect("seeded parity simulation");
+        let expected = simulation.snapshot();
+        let mut actual = expected.clone();
+        actual.agents[0].position[0] += PARITY_TOLERANCE * 2.0;
+
+        let error = compare_snapshots(config_hash, 0, &expected, &actual)
+            .expect_err("injected position divergence must fail");
+        let hash_fragment = format!("config_hash={config_hash:#018x}");
+        for fragment in [
+            "first divergence at tick 0",
+            "agent[0]",
+            "field `position.x`",
+            "expected ",
+            "actual ",
+            "|delta|=",
+            hash_fragment.as_str(),
+        ] {
+            assert!(
+                error.contains(fragment),
+                "diagnostic must include {fragment:?}: {error}"
+            );
+        }
+    }
+
     /// Same-runtime determinism of the harness wrapper: a reference world built from
     /// the IDENTICAL effective config must match the wrapped simulation step for
     /// step. This is NOT cross-architecture parity — both sides execute in whatever
@@ -1197,15 +1417,16 @@ mod tests {
     /// regenerate as `native_parity_v2.postcard` with a bumped schema string rather
     /// than mutating v1 in place.
     #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Serialize, Deserialize)]
     struct ParityFixtureV1 {
         schema: String,
+        snapshot_schema: String,
         tolerance: f32,
         cases: Vec<ParityFixtureCase>,
     }
 
     #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Serialize, Deserialize)]
     struct ParityFixtureCase {
         width: u32,
         height: u32,
@@ -1218,10 +1439,99 @@ mod tests {
     }
 
     #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Serialize, Deserialize)]
     struct ParityCheckpoint {
         tick: u32,
         snapshot: SimulationSnapshot,
+    }
+
+    #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
+    fn validate_parity_fixture(fixture: &ParityFixtureV1) -> std::result::Result<(), String> {
+        if fixture.schema != PARITY_FIXTURE_SCHEMA {
+            return Err(format!(
+                "fixture schema mismatch: expected {PARITY_FIXTURE_SCHEMA}, actual {}",
+                fixture.schema
+            ));
+        }
+        if fixture.snapshot_schema != DYNAMIC_WORLD_SNAPSHOT_SCHEMA {
+            return Err(format!(
+                "snapshot schema mismatch: expected {DYNAMIC_WORLD_SNAPSHOT_SCHEMA}, actual {}",
+                fixture.snapshot_schema
+            ));
+        }
+        if fixture.tolerance.to_bits() != PARITY_TOLERANCE.to_bits() {
+            return Err(format!(
+                "fixture tolerance mismatch: expected {PARITY_TOLERANCE}, actual {}",
+                fixture.tolerance
+            ));
+        }
+
+        let cases = parity_cases();
+        if fixture.cases.len() != cases.len() {
+            return Err(format!(
+                "fixture case count mismatch: expected {}, actual {}",
+                cases.len(),
+                fixture.cases.len()
+            ));
+        }
+
+        for (case_index, (case, fixed)) in cases.into_iter().zip(fixture.cases.iter()).enumerate() {
+            let expected_population =
+                u32::try_from(case.population).expect("parity population fits u32");
+            let expected_metadata = (
+                case.width,
+                case.height,
+                expected_population,
+                case.seed,
+                case.strategy,
+                case.default_brain,
+            );
+            let actual_metadata = (
+                fixed.width,
+                fixed.height,
+                fixed.population,
+                fixed.seed,
+                fixed.strategy,
+                fixed.default_brain,
+            );
+            if actual_metadata != expected_metadata {
+                return Err(format!(
+                    "fixture case {case_index} scenario mismatch: expected \
+                     {expected_metadata:?}, actual {actual_metadata:?}"
+                ));
+            }
+
+            let config_hash = parity_config_hash(&parity_spec(case).config());
+            if fixed.config_hash != config_hash {
+                return Err(format!(
+                    "fixture case {case_index} config hash mismatch: expected \
+                     {config_hash:#018x}, actual {:#018x}",
+                    fixed.config_hash
+                ));
+            }
+
+            let checkpoint_ticks = fixed
+                .checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.tick)
+                .collect::<Vec<_>>();
+            if checkpoint_ticks.as_slice() != PARITY_CHECKPOINT_TICKS.as_slice() {
+                return Err(format!(
+                    "fixture case {case_index} checkpoint schedule mismatch: expected \
+                     {PARITY_CHECKPOINT_TICKS:?}, actual {checkpoint_ticks:?}"
+                ));
+            }
+            for (checkpoint_index, checkpoint) in fixed.checkpoints.iter().enumerate() {
+                if checkpoint.snapshot.tick != u64::from(checkpoint.tick) {
+                    return Err(format!(
+                        "fixture case {case_index} checkpoint {checkpoint_index} is mislabeled: \
+                         declared tick {}, embedded snapshot tick {}",
+                        checkpoint.tick, checkpoint.snapshot.tick
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1238,6 +1548,11 @@ mod tests {
                     let snapshot = sim
                         .tick(target - current_tick)
                         .expect("fixture simulation should accept each step");
+                    assert_eq!(
+                        snapshot.tick,
+                        u64::from(target),
+                        "fixture checkpoint must name the completed scientific tick"
+                    );
                     current_tick = target;
                     checkpoints.push(ParityCheckpoint {
                         tick: target,
@@ -1258,9 +1573,72 @@ mod tests {
             .collect();
         ParityFixtureV1 {
             schema: PARITY_FIXTURE_SCHEMA.to_owned(),
+            snapshot_schema: DYNAMIC_WORLD_SNAPSHOT_SCHEMA.to_owned(),
             tolerance: PARITY_TOLERANCE,
             cases,
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parity_fixture_validation_rejects_ceremonial_or_stale_payloads() {
+        let valid = build_parity_fixture();
+        validate_parity_fixture(&valid).expect("fresh native fixture must validate");
+
+        let mut empty = valid.clone();
+        empty.cases[0].checkpoints.clear();
+        assert!(
+            validate_parity_fixture(&empty)
+                .expect_err("empty checkpoint schedule must fail closed")
+                .contains("checkpoint schedule")
+        );
+
+        let mut mislabeled = valid.clone();
+        mislabeled.cases[0].checkpoints[0].snapshot.tick = 0;
+        assert!(
+            validate_parity_fixture(&mislabeled)
+                .expect_err("mislabeled checkpoint must fail closed")
+                .contains("mislabeled")
+        );
+
+        let mut scenario_drift = valid.clone();
+        scenario_drift.cases[0].population = scenario_drift.cases[0].population.saturating_add(1);
+        assert!(
+            validate_parity_fixture(&scenario_drift)
+                .expect_err("scenario metadata drift must fail closed")
+                .contains("scenario mismatch")
+        );
+
+        let mut schema_drift = valid;
+        schema_drift.snapshot_schema = "scriptbots.dynamic-world-snapshot.stale".to_owned();
+        assert!(
+            validate_parity_fixture(&schema_drift)
+                .expect_err("snapshot schema drift must fail closed")
+                .contains("snapshot schema mismatch")
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn committed_native_parity_fixture_matches_fresh_generation() {
+        let committed: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/native_parity_v1.postcard"
+        ));
+        let decoded: ParityFixtureV1 =
+            postcard::from_bytes(committed).expect("decode committed native fixture");
+        validate_parity_fixture(&decoded)
+            .expect("committed native fixture must satisfy the full fixture contract");
+
+        let regenerated =
+            to_allocvec(&build_parity_fixture()).expect("encode freshly generated fixture");
+        assert!(
+            committed == regenerated.as_slice(),
+            "committed native parity fixture is stale (committed {} bytes, regenerated {} bytes); \
+             regenerate it deliberately with the guarded native_parity_fixture_generator",
+            committed.len(),
+            regenerated.len()
+        );
     }
 
     /// Regenerate the committed cross-architecture fixture. NATIVE ONLY. Legitimate
@@ -1277,17 +1655,20 @@ mod tests {
     #[test]
     #[ignore = "fixture writer; run explicitly with SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE=1"]
     fn native_parity_fixture_generator() {
-        if std::env::var("SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE").as_deref() != Ok("1") {
-            eprintln!(
-                "native_parity_fixture_generator: SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE!=1; \
-                 refusing to touch the committed fixture"
-            );
-            return;
-        }
+        assert_eq!(
+            std::env::var("SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE").as_deref(),
+            Ok("1"),
+            "fixture generation requires SCRIPTBOTS_WEB_WRITE_PARITY_FIXTURE=1"
+        );
         // Determinism proof before anything is written: two independent builds of
         // the fixture must be byte-identical, or the fixture would encode luck.
-        let first = to_allocvec(&build_parity_fixture()).expect("encode fixture");
-        let second = to_allocvec(&build_parity_fixture()).expect("encode fixture again");
+        let first_fixture = build_parity_fixture();
+        validate_parity_fixture(&first_fixture).expect("generated fixture must validate");
+        let first = to_allocvec(&first_fixture).expect("encode fixture");
+        let second_fixture = build_parity_fixture();
+        validate_parity_fixture(&second_fixture)
+            .expect("independently generated fixture must validate");
+        let second = to_allocvec(&second_fixture).expect("encode fixture again");
         assert_eq!(
             first, second,
             "fixture generation is not deterministic; refusing to write"
@@ -1305,13 +1686,12 @@ mod tests {
     }
 
     /// TRUE cross-architecture parity: wasm-computed snapshots against the committed
-    /// NATIVE-generated fixture. Gated behind the `native-parity-fixture` feature
-    /// only because `include_bytes!` needs the fixture to exist at compile time;
-    /// enable the feature (and eventually make it default) once the generator's
-    /// output is committed. If a genuine libm divergence appears, the deliverable is
-    /// a documented per-field tolerance policy recorded in the fixture header — not
-    /// a silent loosening.
-    #[cfg(feature = "native-parity-fixture")]
+    /// NATIVE-generated fixture. The authoritative browser lane enables the
+    /// `native-parity-fixture` feature explicitly; ordinary library builds do not
+    /// carry test-only fixture bytes. If a genuine libm divergence appears, the
+    /// deliverable is a documented per-field tolerance policy recorded in the
+    /// fixture header — not a silent loosening.
+    #[cfg(all(target_arch = "wasm32", feature = "native-parity-fixture"))]
     #[wasm_bindgen_test]
     fn wasm_matches_committed_native_fixture() {
         let bytes: &[u8] = include_bytes!(concat!(
@@ -1320,39 +1700,22 @@ mod tests {
         ));
         let fixture: ParityFixtureV1 =
             postcard::from_bytes(bytes).expect("decode committed native fixture");
-        assert_eq!(
-            fixture.schema, PARITY_FIXTURE_SCHEMA,
-            "fixture schema mismatch; regenerate as a new versioned file"
-        );
-        assert_eq!(
-            fixture.tolerance, PARITY_TOLERANCE,
-            "fixture tolerance no longer matches the compiled policy"
-        );
+        validate_parity_fixture(&fixture)
+            .expect("committed native parity fixture must satisfy the full contract");
         let cases = parity_cases();
-        assert_eq!(
-            fixture.cases.len(),
-            cases.len(),
-            "fixture case count no longer matches the shared parity table"
-        );
 
         for (case, fixed) in cases.into_iter().zip(fixture.cases.iter()) {
-            assert_eq!(
-                (case.width, case.height, case.seed),
-                (fixed.width, fixed.height, fixed.seed),
-                "fixture scenario drifted from the shared parity table; regenerate"
-            );
             let spec = parity_spec(case);
             let config_hash = parity_config_hash(&spec.config());
-            assert_eq!(
-                config_hash, fixed.config_hash,
-                "effective config no longer matches the fixture's; the scenario \
-                 changed semantically — regenerate the fixture in the same commit"
-            );
             let mut sim = Simulation::new(spec).expect("wasm parity simulation");
             let mut current_tick = 0_u32;
             for checkpoint in &fixed.checkpoints {
+                let steps = checkpoint
+                    .tick
+                    .checked_sub(current_tick)
+                    .expect("validated parity checkpoints are strictly increasing");
                 let snapshot = sim
-                    .tick(checkpoint.tick - current_tick)
+                    .tick(steps)
                     .expect("wasm parity simulation should accept each step");
                 current_tick = checkpoint.tick;
                 let parity = compare_snapshots(

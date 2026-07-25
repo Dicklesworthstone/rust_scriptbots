@@ -34,7 +34,11 @@ The log pane (bottom of the sidebar) captures bootstrap and performance events s
 For determinism validation, run the accompanying WASM parity test:
 
 ```bash
-wasm-pack test --headless --chrome crates/scriptbots-web
+wasm-pack test --headless --chrome crates/scriptbots-web \
+  --locked --features native-parity-fixture
 ```
 
-The test compares snapshots produced by the WASM harness with native `WorldState` execution to ensure the exported bindings preserve simulation state exactly.
+The cross-architecture test compares WASM-computed snapshots at ticks 1, 8, 64,
+and 150 against the committed native-generated fixture. Exact structural fields
+must match, while documented floating-point fields use the fixture's pinned
+tolerance policy.

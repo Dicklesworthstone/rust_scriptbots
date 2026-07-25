@@ -406,14 +406,30 @@ jobs:
           printf 'chromedriver=%s\n' "$CHROMEDRIVER_PATH" >> "$GITHUB_OUTPUT"
           printf 'webdriver_json=%s\n' "$WEBDRIVER_JSON" >> "$GITHUB_OUTPUT"
 
+      - name: Verify committed native parity fixture
+        run: test -s crates/scriptbots-web/tests/fixtures/native_parity_v1.postcard
+
       - name: wasm-pack build (web target)
-        run: wasm-pack build crates/scriptbots-web --target web --out-dir web/pkg -- --locked
+        run: >-
+          wasm-pack build crates/scriptbots-web
+          --target web
+          --out-dir web/pkg
+          --
+          --locked
+          --features native-parity-fixture
 
       - name: wasm-pack test (headless Chrome)
         env:
           CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver }}
           WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ steps.chrome.outputs.webdriver_json }}
-        run: wasm-pack test --headless --chrome --chromedriver "$CHROMEDRIVER" crates/scriptbots-web
+        run: >-
+          wasm-pack test
+          --headless
+          --chrome
+          --chromedriver "$CHROMEDRIVER"
+          crates/scriptbots-web
+          --locked
+          --features native-parity-fixture
 
   replay:
     name: Replay Contract (ubuntu)

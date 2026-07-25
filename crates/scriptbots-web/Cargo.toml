@@ -24,8 +24,8 @@ js-sys = "0.3.73"
 [features]
 # Enables the cross-architecture parity test that compares wasm execution against
 # the committed native-generated fixture (tests/fixtures/native_parity_v1.postcard).
-# Off by default only because the fixture file must exist before the test can be
-# compiled (include_bytes!); enable once the generator has produced and committed it.
+# The authoritative CI browser lane and the documented local parity command enable
+# this explicitly so ordinary library builds do not embed test-only fixture bytes.
 native-parity-fixture = []
 
 [dev-dependencies]
