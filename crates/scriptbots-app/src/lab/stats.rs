@@ -120,11 +120,22 @@ pub fn paired_diff(
     let var_diff = diffs.iter().map(|d| (d - mean_diff).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
     let sd_diff = var_diff.sqrt();
 
-    let cohens_dz = if sd_diff > 1e-12 {
-        mean_diff / sd_diff
-    } else {
-        0.0
-    };
+    // bd-7453: a degenerate spread has no standardized effect size, and reporting one is
+    // worse than refusing. This previously fell back to `cohens_dz = 0.0`, which reads as
+    // "no effect" — the strongest possible WRONG answer, because zero variance with a
+    // nonzero mean difference is a PERFECTLY CONSISTENT difference, i.e. an unbounded
+    // effect rather than an absent one.
+    //
+    // `StatsError::ZeroVariance` already existed for exactly this case and was constructed
+    // nowhere. The variant was right and this caller was wrong; the fix is to construct it,
+    // not to delete it.
+    //
+    // Note this also refuses a single pair, where `(n - 1).max(1.0)` makes the variance
+    // structurally zero: one pair cannot support a standardized effect size either.
+    if sd_diff <= 1e-12 {
+        return Err(StatsError::ZeroVariance);
+    }
+    let cohens_dz = mean_diff / sd_diff;
 
     let ci_95 = bootstrap_ci(&diffs, 1000, 42);
 
@@ -273,9 +284,95 @@ mod tests {
             metrics: m2,
         };
 
-        let effect = paired_diff(&[run_a], &[run_b], "pop").unwrap();
-        assert_eq!(effect.n_pairs, 1);
-        assert_eq!(effect.mean_diff, -10.0);
+        // bd-7453: a SECOND pair with a different difference. The original single pair had
+        // structurally zero variance -- `(n - 1).max(1.0)` -- so it now returns
+        // ZeroVariance. Widened rather than inverted, to keep this test's actual subject:
+        // that matched seeds pair up and produce the right mean difference.
+        let mut m3 = BTreeMap::new();
+        m3.insert("pop".to_string(), 100.0);
+        let mut m4 = BTreeMap::new();
+        m4.insert("pop".to_string(), 120.0);
+
+        let run_c = RunSummary {
+            run_id: 3,
+            arm_id: 0,
+            seed: 43,
+            config_hash: [0; 32],
+            digest: [0; 32],
+            ticks: 100,
+            metrics: m3,
+        };
+        let run_d = RunSummary {
+            run_id: 4,
+            arm_id: 1,
+            seed: 43,
+            config_hash: [0; 32],
+            digest: [0; 32],
+            ticks: 100,
+            metrics: m4,
+        };
+
+        let effect = paired_diff(&[run_a, run_c], &[run_b, run_d], "pop").unwrap();
+        assert_eq!(effect.n_pairs, 2);
+        assert_eq!(effect.mean_diff, -15.0);
+        // The standardized effect must be a real quotient now, never the old 0.0 fallback.
+        assert!(effect.cohens_dz.is_finite() && effect.cohens_dz != 0.0);
+    }
+
+    /// bd-7453: a degenerate spread must be REFUSED, not reported as "no effect".
+    ///
+    /// Two matched pairs whose differences are identical: the mean difference is a large
+    /// -10.0 and the spread is exactly zero. Under the old fallback this returned
+    /// `cohens_dz = 0.0` — "no effect" for a perfectly consistent one. It must now return
+    /// the error variant that was written for this case and never constructed.
+    #[test]
+    fn paired_diff_refuses_a_degenerate_spread_instead_of_reporting_no_effect() {
+        let summary = |run_id: u64, seed: u64, value: f64| {
+            let mut metrics = BTreeMap::new();
+            metrics.insert("pop".to_string(), value);
+            RunSummary {
+                run_id,
+                arm_id: 0,
+                seed,
+                config_hash: [0; 32],
+                digest: [0; 32],
+                ticks: 100,
+                metrics,
+            }
+        };
+
+        let control = [summary(1, 42, 100.0), summary(2, 43, 200.0)];
+        let treatment = [summary(3, 42, 110.0), summary(4, 43, 210.0)];
+
+        assert_eq!(
+            paired_diff(&control, &treatment, "pop"),
+            Err(StatsError::ZeroVariance),
+            "every pair differs by exactly -10.0, so the spread is zero and no standardized \
+             effect size exists; reporting 0.0 would claim no effect for a perfectly \
+             consistent one"
+        );
+    }
+
+    /// bd-7453: one pair cannot support a standardized effect size either.
+    #[test]
+    fn paired_diff_refuses_a_single_pair() {
+        let mut metrics_a = BTreeMap::new();
+        metrics_a.insert("pop".to_string(), 100.0);
+        let mut metrics_b = BTreeMap::new();
+        metrics_b.insert("pop".to_string(), 110.0);
+        let one = |run_id: u64, metrics: BTreeMap<String, f64>| RunSummary {
+            run_id,
+            arm_id: 0,
+            seed: 42,
+            config_hash: [0; 32],
+            digest: [0; 32],
+            ticks: 100,
+            metrics,
+        };
+        assert_eq!(
+            paired_diff(&[one(1, metrics_a)], &[one(2, metrics_b)], "pop"),
+            Err(StatsError::ZeroVariance)
+        );
     }
 
     #[test]
