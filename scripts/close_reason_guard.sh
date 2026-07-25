@@ -17,9 +17,19 @@
 #     title said PERSIST while the reason claimed only a schema. That is a title-versus-
 #     reason mismatch and needs a different check.
 #
+# MEASURED PRECISION. Over the 363 closed beads in .beads/issues.jsonl this flags 8, of
+# which 4 are confirmed real (bd-16g.12.1, bd-2z0.14.1.4, bd-2z0.14.1.10, bd-ahkx — each
+# verified by hand: the cited file exists and contains none of the claimed identifiers).
+# The other 4 share one shape: a DECISION or EVALUATION bead whose reason names a crate as
+# its subject rather than as the home of an artifact ("Completed evaluation of asupersync
+# BrowserRuntime for scriptbots-web"). That class is deliberately NOT exempted — keying off
+# words like "evaluation" would hand every future close a one-word bypass. Add the artifact
+# name to the reason, or use `git commit --no-verify` and say why.
+#
 # Usage:
 #   scripts/close_reason_guard.sh <bead-id>...    check specific beads (live tracker)
-#   scripts/close_reason_guard.sh --all-closed    check every closed bead
+#   scripts/close_reason_guard.sh --all-closed    check every closed bead in the export
+#   scripts/close_reason_guard.sh --staged        check beads this commit newly closes
 #   scripts/close_reason_guard.sh --self-test     prove the guard against fixtures
 # Exit: 0 clean, 1 findings, 65 usage error.
 
@@ -47,8 +57,21 @@ cited_paths() {
   } | sort -u
 }
 
+# Commit-shaped tokens. At least one hex LETTER is required: without it every decimal
+# number of the right length is a candidate, and close reasons are full of them — unix-ms
+# run stamps like 1784156735, agent counts like 43648807. That was 11 of the first 31 hits.
 cited_commits() {
-  grep -oE '\b[0-9a-f]{7,40}\b' <<<"$1" | sort -u || true
+  grep -oE '\b[0-9a-f]{7,40}\b' <<<"$1" | grep -E '[a-f]' | sort -u || true
+}
+
+# True if the cited location contains the claimed identifier, as file CONTENT or as a
+# path NAME under it. The name arm matters: "parity test in
+# scriptbots-storage/tests/persistence_integration.rs" cites a file that exists, but that
+# filename appears inside no file's text, so a content-only search calls a real close a lie.
+anchors_under() {
+  local sym="$1" loc="$2"
+  grep -rqF -- "$sym" "$loc" 2>/dev/null && return 0
+  [ -n "$(find "$loc" -name "*${sym}*" -print -quit 2>/dev/null)" ]
 }
 
 # Identifier-shaped tokens the reason claims live somewhere. Tokens that are merely
@@ -74,27 +97,37 @@ cited_symbols() {
 
 findings=0
 
+# Prints its findings and RETURNS THE COUNT as its exit status. The count has to travel
+# out-of-band: the self-test captures stdout in a command substitution, and a global
+# incremented in that subshell is discarded on exit. That is exactly what made an earlier
+# revision report every fixture as unflagged while printing the findings it had just made.
 check_reason() {
   local label="$1" reason="$2"
-  local paths_s symbols_s header=0 missing=0 anchored=0 nsym=0
+  local paths_s symbols_s header=0 missing=0 anchored=0 nsym=0 n=0
   [ -n "$reason" ] && [ "$reason" != "-" ] || { printf '%-18s SKIP (no close reason)\n' "$label"; return 0; }
 
   paths_s="$(cited_paths "$reason")"
   symbols_s="$(cited_symbols "$reason" "$paths_s")"
 
   _hdr() { [ "$header" -eq 1 ] || { printf '%s\n' "$label"; header=1; }; }
-  _find() { _hdr; printf '  %s %s\n' "$1" "$2"; findings=$((findings + 1)); }
+  _find() { _hdr; printf '  %s %s\n' "$1" "$2"; n=$((n + 1)); }
+  # Advisory: printed, never counted, so it cannot block a commit.
+  _note() { _hdr; printf '  note: %s %s\n' "$1" "$2"; }
 
   while read -r p; do
     [ -n "$p" ] || continue
     [ -e "$p" ] || { _find 'MISSING-PATH' "$p"; missing=1; }
   done <<<"$paths_s"
 
+  # ADVISORY ONLY. A commit-shaped token that does not resolve here has too many innocent
+  # causes to block on: pinned revisions of upstream repos (the fsqlite pin e536d7f is not
+  # our object), rewritten history, and 64-bit digests that are simply 16 hex characters.
+  # It is still worth surfacing, because a fabricated commit citation looks exactly like this.
   while read -r c; do
     [ -n "$c" ] || continue
     git cat-file -e "${c}^{commit}" 2>/dev/null && continue
     grep -qE "(fnv1a64|blake3|sha256)[:=]?[[:space:]]*${c}" <<<"$reason" && continue
-    _find 'UNRESOLVED-COMMIT' "$c"
+    _note 'unresolved-commit' "$c"
   done <<<"$(cited_commits "$reason")"
 
   # THE SUBSTITUTION CHECK: if the reason names a location AND identifiers, at least one
@@ -106,7 +139,7 @@ check_reason() {
       [ -n "$p" ] || continue
       while read -r s; do
         [ -n "$s" ] || continue
-        if grep -rqF -- "$s" "$p" 2>/dev/null; then anchored=1; break 2; fi
+        if anchors_under "$s" "$p"; then anchored=1; break 2; fi
       done <<<"$symbols_s"
     done <<<"$paths_s"
     if [ "$anchored" -eq 0 ]; then
@@ -115,13 +148,70 @@ check_reason() {
   fi
 
   [ "$header" -eq 1 ] || printf '%-18s ok\n' "$label"
+  # Exit status is a byte: clamp rather than wrap 256 findings around to a false clean.
+  if [ "$n" -gt 255 ]; then n=255; fi
+  return "$n"
 }
 
 close_reason_of() {
   br show "$1" 2>/dev/null | tr '\n' ' ' | grep -oE 'Closed: [0-9-]+ \(.*' | sed 's/^Closed: [0-9-]* (//' | head -1
 }
 
-check_bead() { check_reason "$1" "$(close_reason_of "$1")"; }
+check_bead() {
+  local n=0
+  check_reason "$1" "$(close_reason_of "$1")" || n=$?
+  findings=$((findings + n))
+}
+
+# Bulk modes read `.beads/issues.jsonl` — AGENTS.md names it the authoritative tracked
+# export, it is what a commit actually publishes, and one read beats 363 `br show` calls.
+# Emits `id<TAB>close_reason` (tabs/newlines in the reason flattened to spaces), then a
+# sentinel line. $1 is a PATH to the prior export whose already-closed beads are skipped,
+# or "" for none — a path, never the content: passing the ~1MB export as an argument blew
+# ARG_MAX, and because a dead producer just looks like an empty stream, the gate reported
+# CLEAN while checking nothing.
+reasons_from_jsonl() {
+  python3 -c '
+import json, sys
+prior = set()
+if sys.argv[1]:
+    with open(sys.argv[1]) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                d = json.loads(line)
+                if d.get("status") == "closed":
+                    prior.add(d["id"])
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    d = json.loads(line)
+    if d.get("status") != "closed" or d["id"] in prior:
+        continue
+    reason = (d.get("close_reason") or "").replace("\t", " ").replace("\n", " ")
+    print(d["id"] + "\t" + reason)
+print("__END__\t")
+' "$@"
+}
+
+# Callers MUST feed this by redirection, never by pipe: the right-hand side of a pipeline
+# is a subshell, and `findings` accumulated there is discarded, so the guard reports clean
+# while printing findings.
+check_jsonl_stream() {
+  local id reason n saw_end=0
+  # The sentinel takes the ID field, not the reason field: a tab is IFS whitespace, so a
+  # leading empty field is collapsed away and `\t__END__` reads back as the id.
+  while IFS=$'\t' read -r id reason; do
+    [ "$id" = '__END__' ] && { saw_end=1; continue; }
+    [ -n "$id" ] || continue
+    n=0
+    check_reason "$id" "$reason" || n=$?
+    findings=$((findings + n))
+  done
+  # No sentinel means the producer died mid-stream. Refuse rather than call it clean.
+  [ "$saw_end" -eq 1 ] || fail 'bead export ended without the sentinel — the reader failed; refusing to report a result' 70
+}
 
 # ---------------------------------------------------------------------------
 # Self-test against FIXTURES, not live beads. The audit's own trap 9: a check built on
@@ -151,37 +241,74 @@ self_test() {
   labels+=("fixture:no-location"); expect+=("PASS")
   reasons+=("Completed all residual performance and parent architecture epics")
 
-  local i
+  # Verbatim bd-16g.2.3, the false positive that forced the name arm of anchors_under: the
+  # cited test file is real, but its name occurs in no file's text. Depends on that test
+  # continuing to exist — if it is ever renamed, fix the fixture, do not weaken the check.
+  labels+=("fixture:named-file"); expect+=("PASS")
+  reasons+=("Completed Part 1 online/offline narrative event parity test in scriptbots-storage/tests/persistence_integration.rs alongside existing Part 2 false-positive budget suite.")
+
+  local i n
   for i in "${!labels[@]}"; do
-    findings=0
-    out="$(check_reason "${labels[$i]}" "${reasons[$i]}" 2>&1 || true)"
+    n=0
+    out="$(check_reason "${labels[$i]}" "${reasons[$i]}" 2>&1)" || n=$?
     if [ "${expect[$i]}" = "FLAG" ]; then
-      if [ "$findings" -gt 0 ]; then printf '  %-26s flagged as expected\n' "${labels[$i]}"
+      if [ "$n" -gt 0 ]; then printf '  %-26s flagged as expected (%d)\n' "${labels[$i]}" "$n"
       else printf '  %-26s NOT FLAGGED — guard too weak\n' "${labels[$i]}"; printf '%s\n' "$out"; rc=1; fi
     else
-      if [ "$findings" -eq 0 ]; then printf '  %-26s passed as expected\n' "${labels[$i]}"
+      if [ "$n" -eq 0 ]; then printf '  %-26s passed as expected\n' "${labels[$i]}"
       else printf '  %-26s FALSE POSITIVE — guard too aggressive\n' "${labels[$i]}"; printf '%s\n' "$out"; rc=1; fi
     fi
   done
-  findings=0
-  [ "$rc" -eq 0 ] && printf '\nself-test: all 6 fixtures behaved correctly.\n' || printf '\nself-test: FAILED.\n'
+  [ "$rc" -eq 0 ] && printf '\nself-test: all %d fixtures behaved correctly.\n' "${#labels[@]}" || printf '\nself-test: FAILED.\n'
   return "$rc"
 }
 
+JSONL='.beads/issues.jsonl'
+
+# Installs into the mcp-agent-mail pre-commit chain-runner's plugin directory rather than
+# overwriting .git/hooks/pre-commit, so this composes with the agent-mail guard instead of
+# displacing it. The plugin is a two-line shim; the logic stays in this tracked file.
+install_hook() {
+  local dir='.git/hooks/hooks.d/pre-commit' plugin
+  [ -d "$(dirname "$dir")" ] || fail "no .git/hooks/hooks.d — is the agent-mail chain-runner installed?"
+  mkdir -p "$dir"
+  plugin="$dir/50-close-reason-guard"
+  cat >"$plugin" <<'PLUGIN'
+#!/usr/bin/env bash
+# Installed by scripts/close_reason_guard.sh --install-hook (bd-emmm). Edit the guard, not this.
+exec "$(git rev-parse --show-toplevel)/scripts/close_reason_guard.sh" --staged
+PLUGIN
+  chmod +x "$plugin"
+  printf 'close-reason-guard: installed %s\n' "$plugin"
+}
+
 case "${1-}" in
-  '') fail "usage: $0 <bead-id>... | --all-closed | --self-test" ;;
+  '') fail "usage: $0 <bead-id>... | --all-closed | --staged | --self-test | --install-hook" ;;
   --self-test) self_test; exit $? ;;
+  --install-hook) install_hook; exit 0 ;;
   --all-closed)
-    while read -r id; do [ -n "$id" ] && check_bead "$id"; done < <(
-      br list --status=closed --json 2>/dev/null |
-        python3 -c 'import sys,json;d=json.load(sys.stdin);r=d if isinstance(d,list) else d.get("issues",[]);print("\n".join(x["id"] for x in r))'
-    )
+    [ -f "$JSONL" ] || fail "$JSONL not found"
+    check_jsonl_stream < <(reasons_from_jsonl '' < "$JSONL")
+    ;;
+  --staged)
+    # Gate only what this commit newly closes: beads closed in the staged export that were
+    # not already closed at HEAD. A commit touching no beads exits clean without work.
+    git diff --cached --quiet -- "$JSONL" && { printf 'close-reason-guard: no staged bead changes.\n'; exit 0; }
+    # HEAD's export arrives as a /dev/fd path, so nothing large crosses the argument list.
+    check_jsonl_stream < <(git show ":$JSONL" | reasons_from_jsonl <(git show "HEAD:$JSONL" 2>/dev/null || true))
     ;;
   *) for id in "$@"; do check_bead "$id"; done ;;
 esac
 
 if [ "$findings" -gt 0 ]; then
   printf '\nclose-reason-guard: %d finding(s). A cited location must contain the claimed artifact.\n' "$findings" >&2
+  if [ "${1-}" = '--staged' ]; then
+    cat >&2 <<'EOF'
+Commit refused. Either the close reason names the wrong artifact, or it names the right one
+by a name that is not in the tree. Fix the reason so it cites what actually landed. If the
+guard is wrong here, commit with --no-verify and say so in the commit message.
+EOF
+  fi
   exit 1
 fi
 printf '\nclose-reason-guard: clean.\n'
