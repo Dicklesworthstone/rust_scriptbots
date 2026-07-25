@@ -13597,7 +13597,7 @@ fn palette_color(color: Rgba, palette: ColorPaletteMode, palette_is_natural: boo
 const DETAIL_MIN_PX: f32 = 18.0;
 
 const AGENT_LOD_DIET_BINS: usize = 8;
-const AGENT_LOD_LUMA_BINS: usize = 4;
+const AGENT_LOD_LUMA_BINS: usize = 8;
 const AGENT_LOD_BODY_BINS: usize = AGENT_LOD_DIET_BINS * AGENT_LOD_LUMA_BINS;
 const AGENT_LOD_SPIKE_BINS: usize = 4;
 
@@ -13629,7 +13629,11 @@ fn agent_silhouette(
 
     let spike_base = body_radius * 0.65;
     let base_offset = body_half_length - body_radius * 0.2;
-    let spike_front_offset = body_half_length + body_radius * 0.7 + 2.0;
+    // Core's physical tip offset remains authoritative below, while readiness
+    // provides a screen-space minimum so the production 0..=1 growth range does
+    // not collapse to a sub-pixel difference at overview zoom.
+    let spike_front_offset =
+        body_half_length + body_radius * (0.7 + visuals.spike_readiness * 2.0) + 2.0;
     let spike = [
         (
             position.0 + forward.0 * base_offset - right.0 * spike_base,
@@ -14083,11 +14087,16 @@ fn project_agent_lod(
         agent.boost,
         agent.sound_multiplier,
     );
+    let cull_extent = if agent.spike_struck {
+        silhouette.extent.max(marker_radius * 2.2)
+    } else {
+        silhouette.extent
+    };
     let (view_left, view_top, view_right, view_bottom) = view.bounds;
-    if center.0 + silhouette.extent < view_left
-        || center.0 - silhouette.extent > view_right
-        || center.1 + silhouette.extent < view_top
-        || center.1 - silhouette.extent > view_bottom
+    if center.0 + cull_extent < view_left
+        || center.0 - cull_extent > view_right
+        || center.1 + cull_extent < view_top
+        || center.1 - cull_extent > view_bottom
     {
         return None;
     }
@@ -14096,12 +14105,13 @@ fn project_agent_lod(
     if !palette_is_natural {
         body_color = apply_palette(body_color, frame.palette);
     }
-    let luma =
-        (0.2126 * body_color.r + 0.7152 * body_color.g + 0.0722 * body_color.b).clamp(0.0, 1.0);
+    let semantic_luma = visual::health_factor(agent.health)
+        * visual::age_factor(u64::from(agent.age), frame.agent_reference_age);
     let diet_bin = ((agent.herbivore_tendency.clamp(0.0, 1.0) * AGENT_LOD_DIET_BINS as f32)
         as usize)
         .min(AGENT_LOD_DIET_BINS - 1);
-    let luma_bin = ((luma * AGENT_LOD_LUMA_BINS as f32) as usize).min(AGENT_LOD_LUMA_BINS - 1);
+    let luma_bin =
+        ((semantic_luma * AGENT_LOD_LUMA_BINS as f32) as usize).min(AGENT_LOD_LUMA_BINS - 1);
     let body_bin = diet_bin * AGENT_LOD_LUMA_BINS + luma_bin;
     let spike_bin = ((visuals.spike_readiness * AGENT_LOD_SPIKE_BINS as f32) as usize)
         .min(AGENT_LOD_SPIKE_BINS - 1);
@@ -14202,6 +14212,8 @@ fn paint_agent_lod_batches(
         std::array::from_fn(|_| Some(PathBuilder::fill()));
     let mut boost_sums = [[0.0; 4]; AGENT_LOD_DIET_BINS];
     let mut boost_counts = [0_u32; AGENT_LOD_DIET_BINS];
+    let mut strike_builder = PathBuilder::fill();
+    let mut has_strikes = false;
     let mut marker_builders: [Option<PathBuilder>; 3] = [
         Some(PathBuilder::stroke(px(2.4))),
         Some(PathBuilder::stroke(px(1.8))),
@@ -14254,6 +14266,16 @@ fn paint_agent_lod_batches(
             );
         }
 
+        if agent.spike_struck {
+            append_circle_polygon(
+                &mut strike_builder,
+                silhouette.center.0,
+                silhouette.center.1,
+                projection.marker_radius * 2.2,
+            );
+            has_strikes = true;
+        }
+
         let marker = match projection.selection {
             SelectionState::Selected => Some((0, 1.85)),
             SelectionState::Hovered => Some((1, 1.45)),
@@ -14291,8 +14313,17 @@ fn paint_agent_lod_batches(
         }
     }
 
-    // Motion trails sit behind bodies; spike and selection marks remain above them.
+    // Motion trails and strike flashes sit behind bodies; spikes and selection marks stay above.
     paint_color_buckets(boost_builders, boost_sums, boost_counts, window);
+    if has_strikes && let Ok(path) = strike_builder.build() {
+        let cue = visual::visual_cue_for_event(&WorldVisualEvent::SpikeExtend);
+        let color = palette_color(
+            rgba_from_triplet_with_alpha(cue.color, 0.28),
+            frame.palette,
+            palette_is_natural,
+        );
+        window.paint_path(path, color);
+    }
     paint_color_buckets(body_builders, body_sums, body_counts, window);
     paint_color_buckets(spike_builders, spike_sums, spike_counts, window);
     paint_color_buckets(marker_builders, marker_sums, marker_counts, window);
@@ -16713,9 +16744,31 @@ mod command_characterization_tests {
             scale: 1.0,
             bounds: (0.0, 0.0, 2_400.0, 1_200.0),
         };
+        let semantic_body_bin = |health: f32, age: u32| {
+            let mut agent = template.clone();
+            agent.health = health;
+            agent.age = age;
+            project_agent_lod(&frame, &agent, view, None, true)
+                .expect("semantic compact projection")
+                .body_bin
+        };
+        let full_health_bin = semantic_body_bin(2.0, 0);
+        let mid_health_bin = semantic_body_bin(1.2, 0);
+        let floor_health_bin = semantic_body_bin(0.05, 0);
+        let old_mid_health_bin = semantic_body_bin(1.2, frame.agent_reference_age as u32);
+        assert!(
+            full_health_bin > mid_health_bin && mid_health_bin > floor_health_bin,
+            "compact LOD must preserve full > mid > floor health ordering: \
+             full={full_health_bin}, mid={mid_health_bin}, floor={floor_health_bin}"
+        );
+        assert!(
+            mid_health_bin > old_mid_health_bin,
+            "compact LOD must preserve age weathering at fixed health and diet: \
+             young={mid_health_bin}, old={old_mid_health_bin}"
+        );
 
         let mut agents = Vec::with_capacity(5_000);
-        for index in 0..5_000 {
+        for index in 0_usize..5_000 {
             let mut agent = template.clone();
             agent.position = Position::new(
                 12.0 + (index % 100) as f32 * 23.5,
