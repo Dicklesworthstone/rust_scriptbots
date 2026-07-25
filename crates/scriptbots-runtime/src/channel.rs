@@ -23,10 +23,11 @@
 //! - Snapshot and scientific-event reads delegate to the thread-safe
 //!   [`SnapshotHub`] and [`EventHub`] handles already published by the host.
 //! - [`ChannelHostDriver`] owns the [`FixedDeadlineHost`] on the owner thread:
-//!   it drains ingress, drives at fixed cadence deadlines with bounded
-//!   catch-up, parks without a periodic timer while the world is quiescent,
-//!   converts a full client disconnect into one ordered shutdown, and returns
-//!   an explicit receipt when the host lifecycle terminates.
+//!   it processes at most the configured ingress budget before each drive,
+//!   drives at fixed cadence deadlines with bounded catch-up, parks without a
+//!   periodic timer while the world is quiescent, converts a full client
+//!   disconnect into one ordered shutdown, and returns an explicit receipt
+//!   when the host lifecycle terminates.
 
 use crate::{
     CommandEnvelope, CommandId, CommandStatus, EventCatchUp, EventCatchUpLocator, EventCursor,
@@ -42,6 +43,8 @@ use thiserror::Error;
 
 /// Default bound for the pre-admission ingress channel.
 pub const DEFAULT_CHANNEL_INGRESS_CAPACITY: usize = 64;
+/// Default maximum ingress messages processed before one host drive boundary.
+pub const DEFAULT_CHANNEL_INGRESS_DRAIN_BUDGET: usize = 64;
 /// Default bound for mirrored command statuses and protocol events.
 pub const DEFAULT_CHANNEL_BOARD_CAPACITY: usize = 4_096;
 /// Default worst-case wait for ingress space or an admission reply.
@@ -54,6 +57,8 @@ pub const DEFAULT_CHANNEL_MAINTENANCE_PERIOD: Duration = Duration::from_millis(2
 pub struct ChannelHostOptions {
     /// Bounded pre-admission ingress channel capacity.
     pub ingress_capacity: usize,
+    /// Maximum ingress messages processed before one host drive boundary.
+    pub ingress_drain_budget: usize,
     /// Maximum mirrored command statuses retained for cross-thread lookup.
     pub status_board_capacity: usize,
     /// Maximum mirrored ordered protocol events retained for cross-thread catch-up.
@@ -68,6 +73,7 @@ impl Default for ChannelHostOptions {
     fn default() -> Self {
         Self {
             ingress_capacity: DEFAULT_CHANNEL_INGRESS_CAPACITY,
+            ingress_drain_budget: DEFAULT_CHANNEL_INGRESS_DRAIN_BUDGET,
             status_board_capacity: DEFAULT_CHANNEL_BOARD_CAPACITY,
             protocol_event_capacity: DEFAULT_CHANNEL_BOARD_CAPACITY,
             submit_deadline: DEFAULT_CHANNEL_SUBMIT_DEADLINE,
@@ -80,6 +86,9 @@ impl ChannelHostOptions {
     const fn validate(self) -> Result<Self, ChannelHostOptionsError> {
         if self.ingress_capacity == 0 {
             return Err(ChannelHostOptionsError::EmptyIngress);
+        }
+        if self.ingress_drain_budget == 0 {
+            return Err(ChannelHostOptionsError::EmptyIngressDrainBudget);
         }
         if self.status_board_capacity == 0 {
             return Err(ChannelHostOptionsError::EmptyStatusBoard);
@@ -103,6 +112,9 @@ pub enum ChannelHostOptionsError {
     /// Bounded ingress must retain at least one envelope.
     #[error("channel ingress_capacity must be nonzero")]
     EmptyIngress,
+    /// Each boundary must process at least one ingress message.
+    #[error("channel ingress_drain_budget must be nonzero")]
+    EmptyIngressDrainBudget,
     /// The mirrored status board must retain at least one status.
     #[error("channel status_board_capacity must be nonzero")]
     EmptyStatusBoard,
@@ -394,6 +406,7 @@ pub struct ChannelHostDriver {
     protocol_events: Arc<RwLock<ProtocolEventBoard>>,
     tracked: VecDeque<CommandId>,
     last_protocol_event: ProtocolEventSequence,
+    ingress_drain_budget: usize,
     status_board_capacity: usize,
     protocol_event_capacity: usize,
     maintenance_period: Duration,
@@ -435,6 +448,7 @@ impl ChannelHostDriver {
             protocol_events,
             tracked: VecDeque::new(),
             last_protocol_event,
+            ingress_drain_budget: options.ingress_drain_budget,
             status_board_capacity: options.status_board_capacity,
             protocol_event_capacity: options.protocol_event_capacity,
             maintenance_period: options.maintenance_period,
@@ -508,12 +522,17 @@ impl ChannelHostDriver {
 
     fn drain_ingress(&mut self) -> Result<usize, ChannelDriveError> {
         let mut admitted = 0;
+        let mut processed = 0;
         if let Some(message) = self.pending_ingress.take() {
+            processed += 1;
             admitted += self.process_ingress(message);
         }
-        loop {
+        while processed < self.ingress_drain_budget {
             match self.receiver.try_recv() {
-                Ok(message) => admitted += self.process_ingress(message),
+                Ok(message) => {
+                    processed += 1;
+                    admitted += self.process_ingress(message);
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.controller_disconnected = true;
@@ -534,7 +553,8 @@ impl ChannelHostDriver {
         Ok(())
     }
 
-    /// Drain ingress, drive the host when due, and mirror all boards once.
+    /// Process at most the configured ingress budget, drive the host when due,
+    /// and mirror all boards once.
     ///
     /// # Errors
     ///
@@ -1112,6 +1132,164 @@ mod tests {
             .submit(CommandEnvelope::new(CommandId::new(61), HostCommand::Pause))
             .expect_err("stalled owner must fail truthfully");
         assert!(matches!(error, HostAccessError::ProtocolViolation { .. }));
+    }
+
+    #[test]
+    fn zero_ingress_drain_budget_is_rejected() {
+        let result = ChannelHostDriver::new(
+            test_host(false),
+            ChannelHostOptions {
+                ingress_drain_budget: 0,
+                ..ChannelHostOptions::default()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ChannelHostOptionsError::EmptyIngressDrainBudget)
+        ));
+    }
+
+    #[test]
+    fn retained_wake_consumes_budget_before_newer_ingress() {
+        let (mut driver, port) = ChannelHostDriver::new(
+            test_host(false),
+            ChannelHostOptions {
+                ingress_capacity: 1,
+                ingress_drain_budget: 1,
+                ..ChannelHostOptions::default()
+            },
+        )
+        .expect("driver");
+        driver
+            .retain_waited_ingress(IngressMessage::Wake)
+            .expect("one retained wake");
+
+        let (reply, receipt) = std::sync::mpsc::channel();
+        assert!(
+            port.sender
+                .try_send(IngressMessage::Command {
+                    envelope: CommandEnvelope::new(
+                        CommandId::new(9_999),
+                        HostCommand::SetSpeed(-1.0),
+                    ),
+                    reply,
+                })
+                .is_ok()
+        );
+
+        let first = driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("retained-wake boundary");
+        assert_eq!(first.admitted, 0);
+        assert!(first.drove);
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let next_due = driver.host.next_deadline().expect("next running deadline");
+        let second = driver.step(next_due).expect("queued-command boundary");
+        assert_eq!(second.admitted, 1);
+        let status = receipt
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued command reply")
+            .expect("authoritative validation rejection");
+        assert_eq!(status.command_id(), CommandId::new(9_999));
+    }
+
+    #[test]
+    fn producer_refill_cannot_starve_a_due_drive_boundary() {
+        let (mut driver, port) =
+            ChannelHostDriver::new(test_host(false), ChannelHostOptions::default())
+                .expect("driver");
+        let primed = driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("prime fixed cadence");
+        assert!(primed.drove);
+        let due = driver.host.next_deadline().expect("armed fixed deadline");
+        let deadlines_before = driver.host.total_scheduled_deadlines();
+
+        for offset in 0..DEFAULT_CHANNEL_INGRESS_CAPACITY {
+            let (reply, _receipt) = std::sync::mpsc::channel();
+            let command_id =
+                CommandId::new(10_000 + u128::try_from(offset).expect("test offset fits u128"));
+            assert!(
+                port.sender
+                    .try_send(IngressMessage::Command {
+                        envelope: CommandEnvelope::new(command_id, HostCommand::SetSpeed(-1.0),),
+                        reply,
+                    })
+                    .is_ok(),
+                "the initial ingress fill must fit exactly"
+            );
+        }
+
+        // Hold the first mirrored-status write until a producer has refilled
+        // the slot freed by the first receive. This makes the sustained refill
+        // deterministic without an infinite producer or timing assumptions.
+        let statuses = Arc::clone(&port.statuses);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (refilled_tx, refilled_rx) = std::sync::mpsc::channel();
+        let status_lock = std::thread::spawn(move || {
+            let guard = statuses.read().expect("status board lock");
+            locked_tx.send(()).expect("lock acquisition signal");
+            refilled_rx.recv().expect("producer refill signal");
+            drop(guard);
+        });
+        locked_rx.recv().expect("status board lock acquired");
+
+        let sender = port.sender.clone();
+        let (last_reply, last_receipt) = std::sync::mpsc::channel();
+        let refill = std::thread::spawn(move || {
+            assert!(
+                sender
+                    .send(IngressMessage::Command {
+                        envelope: CommandEnvelope::new(
+                            CommandId::new(20_000),
+                            HostCommand::SetSpeed(-1.0),
+                        ),
+                        reply: last_reply,
+                    })
+                    .is_ok(),
+                "owner must remain connected"
+            );
+            refilled_tx.send(()).expect("producer refill signal");
+        });
+
+        let first = driver.step(due).expect("first bounded boundary");
+        refill.join().expect("refill producer");
+        status_lock.join().expect("status lock holder");
+
+        assert_eq!(
+            first.admitted, DEFAULT_CHANNEL_INGRESS_DRAIN_BUDGET,
+            "producer refill must remain queued after the explicit boundary budget"
+        );
+        assert!(first.drove, "the due host deadline must still advance");
+        assert_eq!(
+            driver.host.total_scheduled_deadlines(),
+            deadlines_before + 1,
+            "the refilled ingress queue must not hide the elapsed cadence deadline"
+        );
+        assert!(
+            driver.host.next_deadline().is_some_and(|next| next > due),
+            "the fixed deadline must advance beyond the flooded boundary"
+        );
+        assert!(
+            matches!(
+                last_receipt.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "the refilled command must preserve FIFO for the next boundary"
+        );
+
+        let next_due = driver.host.next_deadline().expect("next running deadline");
+        let second = driver.step(next_due).expect("second bounded boundary");
+        assert_eq!(second.admitted, 1);
+        let status = last_receipt
+            .recv_timeout(Duration::from_secs(1))
+            .expect("refilled command reply")
+            .expect("authoritative validation rejection");
+        assert_eq!(status.command_id(), CommandId::new(20_000));
     }
 
     #[test]
