@@ -4,10 +4,10 @@ mod camera;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
-    AlignItems, App, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, QuitMode, Rgba,
-    ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement, Window, WindowBounds,
-    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    AlignItems, App, Background, Bounds, Context, Div, FocusHandle, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    QuitMode, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement, Window,
+    WindowBounds, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use rand::Rng;
@@ -2062,13 +2062,14 @@ impl GuiSession {
         }
     }
 
-    fn new_view(&self, role: GuiViewRole) -> SimulationView {
+    fn new_view(&self, role: GuiViewRole, focus_handle: FocusHandle) -> SimulationView {
         let mut view = SimulationView::new(
             Arc::clone(&self.simulation_driver),
             self.analytics.clone(),
             role.view_title(),
             Arc::clone(&self.command_submit),
         );
+        view.focus_handle = Some(focus_handle);
         if role == GuiViewRole::WorldCanvas {
             view.set_minimal_canvas_mode();
         }
@@ -2104,8 +2105,12 @@ fn open_gui_session_windows(
     let hud_options = GuiViewRole::Hud.window_options(app);
     let session_for_hud = Arc::clone(session);
     let hud = app
-        .open_window(hud_options, move |_window, cx| {
-            cx.new(|_| session_for_hud.new_view(GuiViewRole::Hud))
+        .open_window(hud_options, move |window, cx| {
+            cx.new(|cx| {
+                let focus_handle = cx.focus_handle();
+                focus_handle.focus(window, cx);
+                session_for_hud.new_view(GuiViewRole::Hud, focus_handle)
+            })
         })
         .map_err(|error| GuiWindowLaunchFailure {
             role: GuiViewRole::Hud,
@@ -2115,8 +2120,12 @@ fn open_gui_session_windows(
     let canvas_options = GuiViewRole::WorldCanvas.window_options(app);
     let session_for_canvas = Arc::clone(session);
     let canvas = app
-        .open_window(canvas_options, move |_window, cx| {
-            cx.new(|_| session_for_canvas.new_view(GuiViewRole::WorldCanvas))
+        .open_window(canvas_options, move |window, cx| {
+            cx.new(|cx| {
+                let focus_handle = cx.focus_handle();
+                focus_handle.focus(window, cx);
+                session_for_canvas.new_view(GuiViewRole::WorldCanvas, focus_handle)
+            })
         })
         .map_err(|error| GuiWindowLaunchFailure {
             role: GuiViewRole::WorldCanvas,
@@ -2221,6 +2230,7 @@ struct SimulationView {
     controls: SimulationControls,
     shift_inspect: bool,
     bindings: InputBindings,
+    focus_handle: Option<FocusHandle>,
     key_capture: Option<CommandAction>,
     settings_panel: SettingsPanelState,
     analytics_cache: Option<HudAnalytics>,
@@ -2292,6 +2302,7 @@ impl SimulationView {
             controls: SimulationControls::default(),
             shift_inspect: false,
             bindings: InputBindings::default(),
+            focus_handle: None,
             settings_panel: SettingsPanelState::default(),
             key_capture: None,
             analytics_cache: None,
@@ -4329,6 +4340,7 @@ impl SimulationView {
                 let paused = !self.simulation_drive_snapshot().paused;
                 self.set_simulation_paused(paused, cx);
             }
+            CommandAction::StepSimulation => self.step_simulation_once(cx),
             CommandAction::ToggleAgentDraw => {
                 self.controls.draw_agents = !self.controls.draw_agents;
                 cx.notify();
@@ -4991,6 +5003,16 @@ impl SimulationView {
         if let Some(audio) = self.audio.as_mut() {
             audio.play(&audio.toggle_sound);
         }
+        cx.notify();
+    }
+
+    fn step_simulation_once(&mut self, cx: &mut Context<Self>) {
+        if !(self.command_submit.as_ref())(ControlCommand::Step) {
+            warn!("failed to enqueue single-step command from GPUI renderer");
+            return;
+        }
+        self.playback.go_live();
+        info!("Simulation single-step command enqueued");
         cx.notify();
     }
 
@@ -9887,6 +9909,9 @@ impl Render for SimulationView {
                 })
                 .child(self.render_footer(&snapshot))
         };
+        if let Some(focus_handle) = &self.focus_handle {
+            content = content.track_focus(focus_handle);
+        }
         content = content.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
             this.handle_key_down(event, cx);
         }));
@@ -11148,6 +11173,7 @@ enum CommandAction {
     ToggleNarration,
     CyclePalette,
     ToggleSimulationPause,
+    StepSimulation,
     ToggleAgentDraw,
     ToggleFoodOverlay,
     ToggleAgentOutline,
@@ -11175,6 +11201,7 @@ impl CommandAction {
             CommandAction::ToggleNarration => "Toggle narration",
             CommandAction::CyclePalette => "Cycle palette",
             CommandAction::ToggleSimulationPause => "Toggle simulation pause",
+            CommandAction::StepSimulation => "Step simulation once",
             CommandAction::ToggleAgentDraw => "Toggle agent drawing",
             CommandAction::ToggleFoodOverlay => "Toggle food overlay",
             CommandAction::ToggleAgentOutline => "Toggle agent outline",
@@ -11228,6 +11255,10 @@ impl Default for InputBindings {
             Keystroke::parse("p").unwrap_or_default(),
         );
         map.insert(
+            CommandAction::StepSimulation,
+            Keystroke::parse("s").unwrap_or_default(),
+        );
+        map.insert(
             CommandAction::ToggleAgentDraw,
             Keystroke::parse("d").unwrap_or_default(),
         );
@@ -11265,7 +11296,7 @@ impl Default for InputBindings {
         );
         map.insert(
             CommandAction::FollowSelected,
-            Keystroke::parse("s").unwrap_or_default(),
+            Keystroke::parse("shift+s").unwrap_or_default(),
         );
         map.insert(
             CommandAction::FollowOldest,
@@ -14861,6 +14892,68 @@ mod command_characterization_tests {
     use scriptbots_core::{CharacterizationDigestV0, WorldDigestV1};
     use std::time::Duration;
 
+    #[test]
+    fn readme_gui_shortcuts_match_production_bindings() {
+        let bindings = InputBindings::default();
+        let entries = bindings.iter();
+        for (index, (action, stroke)) in entries.iter().enumerate() {
+            assert!(
+                !stroke.key.is_empty(),
+                "default action `{}` must have a shortcut",
+                action.label()
+            );
+            for (other_action, other_stroke) in entries.iter().skip(index + 1) {
+                assert!(
+                    !keystrokes_equal(stroke, other_stroke),
+                    "default actions `{}` and `{}` must not share `{}`",
+                    action.label(),
+                    other_action.label(),
+                    format_keystroke(stroke)
+                );
+            }
+        }
+
+        for (binding, action) in [
+            ("s", CommandAction::StepSimulation),
+            ("shift+s", CommandAction::FollowSelected),
+            ("space", CommandAction::TogglePlayback),
+            ("g", CommandAction::GoLive),
+            ("p", CommandAction::ToggleSimulationPause),
+            ("ctrl+p", CommandAction::CyclePalette),
+        ] {
+            let stroke = Keystroke::parse(binding).expect("valid production shortcut");
+            assert_eq!(
+                bindings.action_for(&stroke),
+                Some(action),
+                "{binding} must invoke `{}`",
+                action.label()
+            );
+        }
+
+        let mut expected_table = String::from("| Action | Default shortcut |\n| --- | --- |\n");
+        for (action, stroke) in entries {
+            expected_table.push_str(&format!(
+                "| {} | `{}` |\n",
+                action.label(),
+                format_keystroke(&stroke)
+            ));
+        }
+
+        let readme = include_str!("../../../README.md");
+        let (_, after_start) = readme
+            .split_once("<!-- BEGIN GENERATED GPUI DEFAULT SHORTCUTS -->")
+            .expect("README must start the generated GPUI shortcut table");
+        let (documented_table, _) = after_start
+            .split_once("<!-- END GENERATED GPUI DEFAULT SHORTCUTS -->")
+            .expect("README must end the generated GPUI shortcut table");
+        let documented_table = documented_table.replace("\r\n", "\n");
+        assert_eq!(
+            documented_table.trim(),
+            expected_table.trim(),
+            "README GPUI shortcuts must be rendered from the production default binding registry"
+        );
+    }
+
     #[derive(Default)]
     struct FakeGuiLifecycle {
         quit_requested: bool,
@@ -15537,6 +15630,126 @@ mod command_characterization_tests {
             })
             .expect("draw production GPUI test window");
         });
+    }
+
+    #[test]
+    fn gpui_s_shortcut_submits_one_step_and_leaves_simulation_paused() {
+        let world = command_characterization_world();
+        let pending_commands = Arc::new(Mutex::new(vec![ControlCommand::Pause]));
+        let drain_commands = Arc::clone(&pending_commands);
+        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
+            Arc::new(move || {
+                let mut commands = drain_commands.lock().expect("single-step command queue");
+                std::mem::take(&mut *commands)
+            });
+        let submit_commands = Arc::clone(&pending_commands);
+        let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+            Arc::new(move |command| {
+                submit_commands
+                    .lock()
+                    .expect("single-step command queue")
+                    .push(command);
+                true
+            });
+        let step_world = Arc::clone(&world);
+        let simulation_step: WorldStepDriver =
+            Arc::new(move || step_world.lock().expect("single-step world lock").step());
+        let session = Arc::new(GuiSession::new(
+            Arc::clone(&world),
+            simulation_step,
+            AnalyticsSnapshotProvider::empty(),
+            command_drain,
+            command_submit,
+        ));
+
+        let mut app = gpui::TestApp::new();
+        let windows = app
+            .update(|app| session.install(app))
+            .expect("install production GPUI single-step session");
+        assert!(
+            session
+                .simulation_driver
+                .lock()
+                .expect("single-step driver lock")
+                .snapshot()
+                .paused,
+            "the fixture must start scientifically paused"
+        );
+        assert_eq!(
+            world.lock().expect("single-step world lock").tick().0,
+            0,
+            "installing the windows must not advance science"
+        );
+        assert!(
+            pending_commands
+                .lock()
+                .expect("single-step command queue")
+                .is_empty(),
+            "the startup pause command must be drained before keyboard input"
+        );
+
+        force_production_repaint(&mut app, windows.hud);
+        let hud = app
+            .update(|app| windows.hud.root(app))
+            .expect("production HUD root");
+        app.update_entity(&hud, |view, _| {
+            assert!(
+                !view.playback.timeline.is_empty(),
+                "the production render must record a frame before rewinding"
+            );
+            view.playback.restart();
+            assert!(matches!(view.playback.mode(), PlaybackMode::Paused));
+        });
+
+        app.update(|app| {
+            app.update_window(windows.hud.into(), |_, window, app| {
+                window.dispatch_keystroke(
+                    Keystroke::parse("s").expect("valid single-step shortcut"),
+                    app,
+                );
+            })
+            .expect("dispatch production HUD single-step shortcut");
+        });
+        assert_eq!(
+            pending_commands
+                .lock()
+                .expect("single-step command queue")
+                .as_slice(),
+            &[ControlCommand::Step],
+            "one S keypress must enqueue exactly one canonical step command"
+        );
+        app.read_entity(&hud, |view, _| {
+            assert!(
+                matches!(view.playback.mode(), PlaybackMode::Live),
+                "single-step must return the invoking view to the live frame"
+            );
+        });
+
+        app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
+        app.run_until_parked();
+        assert_eq!(
+            world.lock().expect("single-step world lock").tick().0,
+            1,
+            "one S keypress must advance science by exactly one tick"
+        );
+        assert!(
+            session
+                .simulation_driver
+                .lock()
+                .expect("single-step driver lock")
+                .snapshot()
+                .paused,
+            "single-step must leave the simulation paused"
+        );
+
+        app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL * 2.0));
+        app.run_until_parked();
+        assert_eq!(
+            world.lock().expect("single-step world lock").tick().0,
+            1,
+            "a single-step must not schedule a second scientific tick"
+        );
+        app.update(|app| app.shutdown());
     }
 
     fn seeded_digest_trace_after_production_repaints(

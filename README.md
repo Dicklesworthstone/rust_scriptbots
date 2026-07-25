@@ -587,12 +587,40 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features). Every frontend consumes the same world and immutable analytics snapshots.
 
 ### Keyboard shortcuts (GUI)
-- Playback: `space` pause/resume, `+`/`-` speed up/down, `s` single-step
-- Views: `d` toggle drawing, `f` toggle food overlay, `Ctrl+Shift+O` toggle agent outlines
-- Spawning: `a` add crossover agents, `q`/`h` spawn carnivore/herbivore
+
+Simulation controls and retained-history playback are separate. The unmodified `S` shortcut returns the invoking view to live and queues one scientific step; when that isolated step succeeds, it advances exactly once and leaves the simulation paused. `space` only toggles timeline playback. These are the defaults shown by the in-app binding registry and can be rebound in settings.
+
+<!-- BEGIN GENERATED GPUI DEFAULT SHORTCUTS -->
+
+| Action | Default shortcut |
+| --- | --- |
+| Toggle playback | `space` |
+| Jump to live | `G` |
+| Toggle brush | `B` |
+| Toggle narration | `N` |
+| Cycle palette | `Ctrl + P` |
+| Toggle simulation pause | `P` |
+| Step simulation once | `S` |
+| Toggle agent drawing | `D` |
+| Toggle food overlay | `F` |
+| Toggle agent outline | `Ctrl + Shift + O` |
+| Increase simulation speed | `Shift + =` |
+| Decrease simulation speed | `-` |
+| Spawn crossover agent | `A` |
+| Spawn carnivore | `Q` |
+| Spawn herbivore | `H` |
+| Toggle closed environment | `C` |
+| Follow selected agent | `Shift + S` |
+| Follow oldest agent | `O` |
+| Toggle debug overlay | `Shift + F` |
+| Clear selection | `escape` |
+| Select all agents | `Ctrl + A` |
+| Focus first selected agent | `Ctrl + F` |
+| Toggle settings panel | `,` |
+
+<!-- END GENERATED GPUI DEFAULT SHORTCUTS -->
+
 - Persistence safety: a spawn shortcut is refused after the current tick is admitted under the selected storage guarantee; advance to the next open tick boundary before spawning. An unresolved admission is reported separately and must be resolved by retrying the exact retained batch before either the world or an external arrival can advance. Both typed reasons are logged without consuming simulation RNG.
-- World: `c` toggle closed environment, `o` follow oldest, `s` follow selected
-- Accessibility: `p` cycle color palettes (with keyboard rebinding support)
 
 ### Audio system
 - Optional `kira`-backed mixer (feature `audio`) with event-driven cues (births, deaths, spikes) and accessibility toggles.
