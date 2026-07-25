@@ -516,7 +516,7 @@ pub struct AgentVisualInput {
     /// Requested right wheel effort; same sign/magnitude convention as
     /// `wheel_left`.
     pub wheel_right: f32,
-    /// Facing angle in radians (bd-grbc, PROVISIONAL -- see `AgentVisualParams::facing`).
+    /// Facing angle in radians (bd-grbc).
     ///
     /// Zero points along +X and the angle increases toward +Y, matching the convention the
     /// locomotion model pinned under bd-2i1. Core states it here so GPUI, Bevy, the TUI and
@@ -575,20 +575,26 @@ pub struct AgentVisualParams {
     pub spike_color: [f32; 3],
     /// Canonical spike HDR emissive gain.
     pub spike_emissive_gain: f32,
-    /// Unit vector the agent faces (bd-grbc, PROVISIONAL).
+    /// Unit vector the agent faces (bd-grbc).
     ///
-    /// PROVISIONAL SHAPE -- a proposal, not a settled contract. bd-grbc exists because nothing
-    /// could orient an agent from these params, so a renderer could not draw a directional
-    /// body, place the spike, or put the wheels on the correct sides. If the draw path would
-    /// rather have a 2x2 rotation matrix, precomputed corner offsets, or a different spike
-    /// composition, say so on bd-grbc and this changes -- do NOT recompute orientation in the
-    /// renderer, because one authority for appearance is the point of bd-ikts.
+    /// SETTLED CONTRACT, confirmed by a real consumer. `scriptbots-world-gfx::AgentInstance`
+    /// declares `heading: [f32; 2]` and the GPUI path assigns this value straight into it
+    /// (`scriptbots-render/src/lib.rs`, `resolve_agent_visual` -> `AgentInstance`), so the
+    /// vector is uploaded directly into a GPU instance buffer.
+    ///
+    /// KEEP IT A VECTOR. Returning radians instead would force every renderer to call
+    /// `sin_cos` per agent per frame and to re-pick a zero-angle and winding direction, which
+    /// is how four frontends end up disagreeing about which way an agent points. A 2x2 rotation
+    /// matrix was the other candidate and is strictly more work for a consumer that only needs
+    /// the axis. This is why the shape looks redundant with `AgentVisualInput::heading` and
+    /// should stay that way: scalar in, vector out, computed once in core.
     pub facing: [f32; 2],
     /// Unit vector 90 degrees clockwise from `facing`, i.e. the agent's right-hand side
-    /// (bd-grbc, PROVISIONAL). Supplied so wheel placement does not depend on each renderer
-    /// getting the perpendicular's sign right.
+    /// (bd-grbc). Supplied so wheel placement does not depend on each renderer getting the
+    /// perpendicular's sign right -- a mirrored agent is a bug nobody notices until the wheels
+    /// disagree with the spike.
     pub right: [f32; 2],
-    /// Offset from body centre to spike tip in world units (bd-grbc, PROVISIONAL).
+    /// Offset from body centre to spike tip in world units (bd-grbc).
     ///
     /// `facing` scaled by the spike length, composed here so the length/direction pairing has
     /// a single definition.
