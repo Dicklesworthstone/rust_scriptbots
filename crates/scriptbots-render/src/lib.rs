@@ -16585,6 +16585,67 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn production_renderer_has_no_direct_agent_science_writes_or_rng() {
+        let (production, _) = include_str!("lib.rs")
+            .split_once("#[cfg(test)]\nmod command_characterization_tests")
+            .expect("command characterization test boundary");
+        for (forbidden, reason) in [
+            (
+                "&mut WorldState",
+                "production rendering must not accept mutable scientific world access",
+            ),
+            (
+                ".try_update_agent(",
+                "agent edits must be admitted through ControlCommand",
+            ),
+            (
+                ".try_update_agent_runtime(",
+                "agent mutation-rate edits must be admitted through ControlCommand",
+            ),
+            (
+                ".agent_runtime_mut(",
+                "production rendering must not borrow scientific runtime state mutably",
+            ),
+            (
+                ".try_spawn_agent(",
+                "agent creation must be admitted through ControlCommand",
+            ),
+            (
+                ".try_spawn_agent_with(",
+                "agent creation must be admitted through ControlCommand",
+            ),
+            (
+                ".try_inject_agent(",
+                "agent injection must be admitted through ControlCommand",
+            ),
+            (
+                ".try_inject_agent_with(",
+                "agent injection must be admitted through ControlCommand",
+            ),
+            (
+                ".try_inject_crossover_agent_with(",
+                "crossover injection must be admitted through ControlCommand",
+            ),
+            (
+                ".rng(RngDomain::",
+                "only the world-owned command application path may consume scientific RNG",
+            ),
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "{reason}; production renderer still contains `{forbidden}`"
+            );
+        }
+        assert_eq!(
+            production
+                .matches("if let Ok(mut world) = self.world.lock()")
+                .count(),
+            1,
+            "the simulation driver command drain must be the sole mutable WorldState lock in production rendering"
+        );
+    }
+
+    #[test]
     fn readme_gui_shortcuts_match_production_bindings() {
         let bindings = InputBindings::default();
         let entries = bindings.iter();
@@ -17085,6 +17146,59 @@ mod command_characterization_tests {
     ) -> Arc<Mutex<GuiSimulationDriver>> {
         let simulation_step = disabled_persistence_step_driver(world);
         gui_simulation_driver_with_step(world, simulation_step, command_drain)
+    }
+
+    /// bd-jw6f: the speed control must change the OBSERVED TICK RATE, not merely assign
+    /// a multiplier field.
+    ///
+    /// The failure mode this codebase keeps producing is a control wired to something
+    /// nothing consumes, and a test asserting `speed_multiplier == 2.0` would pass for
+    /// exactly that defect. So this drives the real consumer — GuiSimulationDriver's
+    /// accumulator path — and counts ticks the world actually executed.
+    ///
+    /// Asserts the RATIO, not absolute rates. `drive_at` takes `now` as a parameter, so
+    /// the clock is fabricated rather than slept on: the result is identical on an idle
+    /// machine and on one running six agents. An intermittent test gets ignored, and an
+    /// ignored test is the same as no coverage.
+    #[test]
+    fn simulation_speed_multiplier_changes_the_observed_tick_rate() {
+        fn ticks_after(speed: f32, advance: Duration) -> u64 {
+            let world = command_characterization_world();
+            let driver = gui_simulation_driver_with_step(
+                &world,
+                disabled_persistence_step_driver(&world),
+                Arc::new(Vec::new),
+            );
+            let mut driver = driver.lock().expect("driver lock");
+            driver.apply_playback_state(&SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: Some(speed),
+                step_once: false,
+            });
+            let start = Instant::now();
+            // Prime `last` without advancing; the first call establishes the baseline.
+            driver.drive_at(start);
+            let before = world.lock().expect("world lock").tick().0;
+            driver.drive_at(start + advance);
+            world.lock().expect("world lock").tick().0 - before
+        }
+
+        // 12 tick-intervals of clock: well under MAX_SIM_STEPS_PER_FRAME (240) and under
+        // the 0.5s accumulator clamp, so neither limiter distorts the ratio.
+        let advance = Duration::from_secs_f32(SIM_TICK_INTERVAL * 12.0);
+        let single = ticks_after(1.0, advance);
+        let double = ticks_after(2.0, advance);
+
+        assert!(
+            single > 0,
+            "1x produced no ticks over {advance:?}; the speed control has no consumer"
+        );
+        assert_eq!(
+            double,
+            single * 2,
+            "2x must execute exactly twice the ticks of 1x over the same clock advance \
+             (1x={single}, 2x={double}); the multiplier is not reaching the accumulator"
+        );
     }
 
     fn gui_simulation_driver_with_step(
