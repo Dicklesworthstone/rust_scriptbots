@@ -17329,6 +17329,45 @@ mod command_characterization_tests {
         );
     }
 
+    /// bd-jw6f: the spawn shortcuts must CHANGE POPULATION, not merely enqueue.
+    ///
+    /// Population is the right assertion because population drives every downstream
+    /// metric: a spawn control that silently did nothing would look identical to a
+    /// simulation that is simply not reproducing, and the debugger would go hunting in
+    /// evolution or energy and find nothing wrong, because nothing is.
+    ///
+    /// This asserts the END of the chain - keystroke, ControlCommand::SpawnAgent,
+    /// apply_control_command, world agent count - rather than that a command was
+    /// enqueued. Enqueueing is what the old direct-mutation path could fake.
+    #[test]
+    fn spawn_shortcut_increases_population_through_the_control_path() {
+        for (bias, label) in [(1.0_f32, "herbivore"), (0.0_f32, "carnivore")] {
+            let world = command_characterization_world();
+            let before = world.lock().expect("world lock").agent_count();
+
+            let disposition = apply_control_command(
+                &mut world.lock().expect("world lock"),
+                ControlCommand::SpawnAgent {
+                    herbivore_tendency: bias,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{label} spawn rejected: {error}"));
+
+            let after = world.lock().expect("world lock").agent_count();
+            assert!(
+                matches!(disposition, ControlDisposition::WorldApplied),
+                "{label} spawn must apply to the world, got {disposition:?}"
+            );
+            assert_eq!(
+                after,
+                before + 1,
+                "{label} spawn must add exactly one agent (before={before}, after={after}); \
+                 a control that enqueues but does not change population is indistinguishable \
+                 from a simulation that is not reproducing"
+            );
+        }
+    }
+
     fn gui_simulation_driver_with_step(
         world: &Arc<Mutex<WorldState>>,
         simulation_step: WorldStepDriver,
