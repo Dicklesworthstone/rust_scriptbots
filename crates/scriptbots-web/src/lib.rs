@@ -1009,12 +1009,17 @@ mod tests {
         )
     }
 
-    /// FNV-1a64 over the postcard encoding of the effective config, so a divergence
+    /// FNV-1a64 over the JSON encoding of the effective config, so a divergence
     /// report identifies WHICH scenario diverged from CI output alone.
+    ///
+    /// JSON is deliberate here: the hash crosses a native/WASM boundary and must
+    /// describe the config's values rather than a binary codec implementation.
+    /// The serialized struct field order is fixed, while numeric values have a
+    /// target-independent textual representation.
     fn parity_config_hash(config: &ScriptBotsConfig) -> u64 {
         const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
         const PRIME: u64 = 0x0000_0100_0000_01b3;
-        let bytes = to_allocvec(config).expect("config postcard-encodes");
+        let bytes = serde_json::to_vec(config).expect("config JSON-encodes");
         let mut hash = OFFSET_BASIS;
         for byte in bytes {
             hash ^= u64::from(byte);
@@ -1190,25 +1195,6 @@ mod tests {
                 expected.summary.deaths, actual.summary.deaths
             ),
         )?;
-        float_field(
-            "summary",
-            "total_energy",
-            expected.summary.total_energy,
-            actual.summary.total_energy,
-        )?;
-        float_field(
-            "summary",
-            "average_energy",
-            expected.summary.average_energy,
-            actual.summary.average_energy,
-        )?;
-        float_field(
-            "summary",
-            "average_health",
-            expected.summary.average_health,
-            actual.summary.average_health,
-        )?;
-
         for (index, (want, got)) in expected.agents.iter().zip(actual.agents.iter()).enumerate() {
             let subject = format!("agent[{index}] (uid {:?})", want.uid);
             exact(
@@ -1276,6 +1262,28 @@ mod tests {
                 format!("expected {:?}, actual {:?}", want.brain_key, got.brain_key),
             )?;
         }
+
+        // Aggregates are downstream consequences of the per-agent state above.
+        // Check them last so the diagnostic names the causal agent field rather
+        // than stopping at a less-actionable total or average.
+        float_field(
+            "summary",
+            "total_energy",
+            expected.summary.total_energy,
+            actual.summary.total_energy,
+        )?;
+        float_field(
+            "summary",
+            "average_energy",
+            expected.summary.average_energy,
+            actual.summary.average_energy,
+        )?;
+        float_field(
+            "summary",
+            "average_health",
+            expected.summary.average_health,
+            actual.summary.average_health,
+        )?;
         Ok(())
     }
 
@@ -1837,7 +1845,11 @@ mod tests {
                 let snapshot = {
                     let mut perturbed = snapshot;
                     if checkpoint.tick == PARITY_CHECKPOINT_TICKS[0] {
-                        perturbed.agents[0].position[0] += PARITY_TOLERANCE * 2.0;
+                        // Anchor the negative control to the native value so a
+                        // pre-existing cross-runtime divergence cannot mask the
+                        // deliberate two-tolerance perturbation.
+                        perturbed.agents[0].position[0] =
+                            checkpoint.snapshot.agents[0].position[0] + PARITY_TOLERANCE * 2.0;
                     }
                     perturbed
                 };

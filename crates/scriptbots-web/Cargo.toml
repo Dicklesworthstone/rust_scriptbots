@@ -40,6 +40,7 @@ native-parity-fixture = []
 native-parity-fault-injection = ["native-parity-fixture"]
 
 [dev-dependencies]
+serde_json = { workspace = true }
 wasm-bindgen-test = "0.3.54"
 
 [package.metadata.wasm-pack.profile.dev]
