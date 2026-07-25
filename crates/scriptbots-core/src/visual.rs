@@ -37,6 +37,348 @@
 use crate::{AccessibilityPalette, BirthOrigin, DeathCause, TerrainKind};
 
 // ---------------------------------------------------------------------------
+// Art direction (bd-9pqz / bd-l4gu).
+// ---------------------------------------------------------------------------
+
+/// Renderer-neutral sRGB triplet.
+pub type Srgb = [f32; 3];
+
+/// Physical material response shared by every renderer.
+///
+/// Colors remain bounded sRGB values while `emissive_gain` is an independent
+/// HDR multiplier. Accessibility transforms therefore change chroma without
+/// accidentally clamping bloom energy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaterialStyle {
+    /// Base surface color.
+    pub albedo_srgb: Srgb,
+    /// Emissive surface color before HDR gain.
+    pub emissive_srgb: Srgb,
+    /// HDR multiplier applied after color-space/accessibility conversion.
+    pub emissive_gain: f32,
+    /// Perceptual roughness in `[0, 1]`.
+    pub perceptual_roughness: f32,
+    /// Specular reflectance in `[0, 1]`.
+    pub reflectance: f32,
+    /// Relative normal-map strength in `[0, 1]`.
+    pub normal_strength: f32,
+}
+
+/// Terrain material alias documenting the canonical six-layer array.
+pub type TerrainMaterialStyle = MaterialStyle;
+
+/// Dark-field world substrate colors.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubstrateStyle {
+    /// Near-black outer field.
+    pub abyss_srgb: Srgb,
+    /// Primary world substrate.
+    pub base_srgb: Srgb,
+    /// Deeper blue-violet depth cue.
+    pub depth_violet_srgb: Srgb,
+    /// Distant atmospheric haze.
+    pub distant_haze_srgb: Srgb,
+}
+
+/// Agent palette and visibility response.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgentStyle {
+    /// Pure-herbivore end of the diet ramp.
+    pub herbivore_srgb: Srgb,
+    /// Pure-carnivore end of the diet ramp.
+    pub carnivore_srgb: Srgb,
+    /// Lowest health-driven luminance multiplier.
+    pub health_luminance_floor: f32,
+    /// Lowest age-driven saturation/luminance multiplier.
+    pub age_luminance_floor: f32,
+    /// Baseline HDR emissive gain.
+    pub base_emissive_gain: f32,
+    /// Hovered HDR emissive gain.
+    pub hover_emissive_gain: f32,
+    /// Selected HDR emissive gain.
+    pub selected_emissive_gain: f32,
+    /// Boosting HDR emissive gain.
+    pub boost_emissive_gain: f32,
+    /// Wheel material color.
+    pub wheel_srgb: Srgb,
+    /// Selected-agent rim color.
+    pub selection_rim_srgb: Srgb,
+    /// Extended-spike core color.
+    pub spike_srgb: Srgb,
+    /// Extended-spike HDR emissive gain.
+    pub spike_emissive_gain: f32,
+}
+
+/// Stable-hue food mote response.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FoodStyle {
+    /// Bright mote core.
+    pub core_srgb: Srgb,
+    /// Soft outer halo.
+    pub halo_srgb: Srgb,
+    /// Sparse-cell HDR gain.
+    pub sparse_emissive_gain: f32,
+    /// Dense-cell HDR gain.
+    pub dense_emissive_gain: f32,
+    /// Sparse-cell alpha.
+    pub sparse_alpha: f32,
+    /// Dense-cell alpha.
+    pub dense_alpha: f32,
+    /// Sparse-cell radius relative to a cell.
+    pub sparse_radius: f32,
+    /// Dense-cell radius relative to a cell.
+    pub dense_radius: f32,
+}
+
+/// One event's two-tone HDR cue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EventCueStyle {
+    /// Primary cue color.
+    pub core_srgb: Srgb,
+    /// Secondary cue color.
+    pub accent_srgb: Srgb,
+    /// HDR emissive gain.
+    pub emissive_gain: f32,
+    /// Deterministic lifetime in science ticks.
+    pub duration_ticks: u32,
+}
+
+/// Complete world-event palette.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EventStyle {
+    /// Spike impact flash.
+    pub combat: EventCueStyle,
+    /// New-agent bloom.
+    pub birth: EventCueStyle,
+    /// Fading death ember.
+    pub death: EventCueStyle,
+    /// Food-colored eating fleck.
+    pub eat: EventCueStyle,
+    /// Reproduction pulse.
+    pub reproduce: EventCueStyle,
+    /// Extended-spike flash.
+    pub spike: EventCueStyle,
+}
+
+/// Shared application chrome tokens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InterfaceStyle {
+    /// Base panel surface.
+    pub surface_srgb: Srgb,
+    /// Raised panel surface.
+    pub elevated_srgb: Srgb,
+    /// Panel/control border.
+    pub border_srgb: Srgb,
+    /// Primary text.
+    pub primary_text_srgb: Srgb,
+    /// Secondary text.
+    pub muted_text_srgb: Srgb,
+    /// Cool data accent.
+    pub accent_cyan_srgb: Srgb,
+    /// Hot data accent.
+    pub accent_magenta_srgb: Srgb,
+    /// Warning state.
+    pub warning_srgb: Srgb,
+    /// Danger state.
+    pub danger_srgb: Srgb,
+}
+
+/// Shared atmospheric/post-processing defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AtmosphereStyle {
+    /// Fog color.
+    pub fog_srgb: Srgb,
+    /// Linear HDR bloom threshold.
+    pub bloom_threshold: f32,
+    /// Bloom blend intensity.
+    pub bloom_intensity: f32,
+    /// Vignette strength.
+    pub vignette: f32,
+    /// Scene exposure.
+    pub exposure: f32,
+}
+
+/// Versioned, renderer-neutral appearance contract.
+///
+/// This value is the sole literal authority for application colors. Renderers
+/// may convert these values into backend-specific types, but may not author a
+/// competing world palette.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualStyleV1 {
+    /// World substrate.
+    pub substrate: SubstrateStyle,
+    /// Terrain materials in `TerrainKind` canonical order.
+    pub terrain: [TerrainMaterialStyle; 6],
+    /// Agent visual response.
+    pub agents: AgentStyle,
+    /// Food mote response.
+    pub food: FoodStyle,
+    /// Typed world-event response.
+    pub events: EventStyle,
+    /// Application chrome.
+    pub chrome: InterfaceStyle,
+    /// Atmosphere and post-processing defaults.
+    pub atmosphere: AtmosphereStyle,
+}
+
+/// Bioluminescent dark-field microscopy art direction.
+///
+/// Terrain stays inside one blue-violet family and differentiates biomes by
+/// value and material response. Agents and food carry scene luminance.
+pub const BIOLUMINESCENT_DARK_FIELD_V1: VisualStyleV1 = {
+    let herbivore = [0.18, 0.86, 1.00];
+    let carnivore = [1.00, 0.60, 0.92];
+    let food_core = [0.55, 1.00, 0.82];
+    let food_halo = [0.18, 0.88, 0.70];
+    let combat_core = [1.00, 0.22, 0.45];
+    let spike_core = [1.00, 0.82, 0.96];
+    VisualStyleV1 {
+        substrate: SubstrateStyle {
+            abyss_srgb: [0.010, 0.012, 0.028],
+            base_srgb: [0.022, 0.028, 0.070],
+            depth_violet_srgb: [0.045, 0.035, 0.110],
+            distant_haze_srgb: [0.095, 0.075, 0.180],
+        },
+        terrain: [
+            MaterialStyle {
+                albedo_srgb: [0.018, 0.028, 0.075],
+                emissive_srgb: [0.006, 0.014, 0.045],
+                emissive_gain: 0.04,
+                perceptual_roughness: 0.16,
+                reflectance: 0.72,
+                normal_strength: 0.45,
+            },
+            MaterialStyle {
+                albedo_srgb: [0.028, 0.055, 0.115],
+                emissive_srgb: [0.010, 0.025, 0.075],
+                emissive_gain: 0.08,
+                perceptual_roughness: 0.22,
+                reflectance: 0.62,
+                normal_strength: 0.55,
+            },
+            MaterialStyle {
+                albedo_srgb: [0.105, 0.095, 0.145],
+                emissive_srgb: [0.015, 0.012, 0.030],
+                emissive_gain: 0.02,
+                perceptual_roughness: 0.78,
+                reflectance: 0.18,
+                normal_strength: 0.60,
+            },
+            MaterialStyle {
+                albedo_srgb: [0.070, 0.090, 0.130],
+                emissive_srgb: [0.010, 0.018, 0.030],
+                emissive_gain: 0.03,
+                perceptual_roughness: 0.62,
+                reflectance: 0.24,
+                normal_strength: 0.72,
+            },
+            MaterialStyle {
+                albedo_srgb: [0.095, 0.075, 0.150],
+                emissive_srgb: [0.040, 0.025, 0.095],
+                emissive_gain: 0.16,
+                perceptual_roughness: 0.48,
+                reflectance: 0.30,
+                normal_strength: 0.80,
+            },
+            MaterialStyle {
+                albedo_srgb: [0.060, 0.065, 0.095],
+                emissive_srgb: [0.006, 0.006, 0.012],
+                emissive_gain: 0.00,
+                perceptual_roughness: 0.86,
+                reflectance: 0.20,
+                normal_strength: 1.00,
+            },
+        ],
+        agents: AgentStyle {
+            herbivore_srgb: herbivore,
+            carnivore_srgb: carnivore,
+            health_luminance_floor: 0.42,
+            age_luminance_floor: 0.78,
+            base_emissive_gain: 2.40,
+            hover_emissive_gain: 3.20,
+            selected_emissive_gain: 4.40,
+            boost_emissive_gain: 5.20,
+            wheel_srgb: [0.09, 0.12, 0.22],
+            selection_rim_srgb: [0.72, 0.94, 1.00],
+            spike_srgb: spike_core,
+            spike_emissive_gain: 6.00,
+        },
+        food: FoodStyle {
+            core_srgb: food_core,
+            halo_srgb: food_halo,
+            sparse_emissive_gain: 0.80,
+            dense_emissive_gain: 2.80,
+            sparse_alpha: 0.28,
+            dense_alpha: 0.92,
+            sparse_radius: 0.35,
+            dense_radius: 1.15,
+        },
+        events: EventStyle {
+            combat: EventCueStyle {
+                core_srgb: combat_core,
+                accent_srgb: [1.00, 0.78, 0.34],
+                emissive_gain: 6.0,
+                duration_ticks: 8,
+            },
+            birth: EventCueStyle {
+                core_srgb: [0.55, 0.92, 1.00],
+                accent_srgb: [0.86, 0.62, 1.00],
+                emissive_gain: 3.5,
+                duration_ticks: 24,
+            },
+            death: EventCueStyle {
+                core_srgb: [1.00, 0.32, 0.12],
+                accent_srgb: [0.24, 0.12, 0.22],
+                emissive_gain: 2.2,
+                duration_ticks: 36,
+            },
+            eat: EventCueStyle {
+                core_srgb: food_core,
+                accent_srgb: food_halo,
+                emissive_gain: 1.8,
+                duration_ticks: 12,
+            },
+            reproduce: EventCueStyle {
+                core_srgb: [0.72, 0.70, 1.00],
+                accent_srgb: [0.40, 0.92, 1.00],
+                emissive_gain: 3.0,
+                duration_ticks: 28,
+            },
+            spike: EventCueStyle {
+                core_srgb: [1.00, 1.00, 1.00],
+                accent_srgb: spike_core,
+                emissive_gain: 5.5,
+                duration_ticks: 6,
+            },
+        },
+        chrome: InterfaceStyle {
+            surface_srgb: [0.025, 0.030, 0.070],
+            elevated_srgb: [0.045, 0.050, 0.105],
+            border_srgb: [0.16, 0.20, 0.32],
+            primary_text_srgb: [0.88, 0.92, 1.00],
+            muted_text_srgb: [0.52, 0.59, 0.72],
+            accent_cyan_srgb: herbivore,
+            accent_magenta_srgb: carnivore,
+            warning_srgb: [1.00, 0.72, 0.28],
+            danger_srgb: combat_core,
+        },
+        atmosphere: AtmosphereStyle {
+            fog_srgb: [0.025, 0.030, 0.080],
+            bloom_threshold: 0.70,
+            bloom_intensity: 0.55,
+            vignette: 0.35,
+            exposure: 1.0,
+        },
+    }
+};
+
+/// Return the canonical visual style.
+#[must_use]
+pub const fn visual_style() -> &'static VisualStyleV1 {
+    &BIOLUMINESCENT_DARK_FIELD_V1
+}
+
+// ---------------------------------------------------------------------------
 // Accessibility palette transform (exact lift from the GPUI and Bevy
 // implementations, which already used byte-identical matrices).
 // ---------------------------------------------------------------------------
@@ -106,38 +448,43 @@ pub const fn apply_accessibility_palette(rgb: [f32; 3], palette: AccessibilityPa
 // ---------------------------------------------------------------------------
 
 /// Herbivore end of the diet stripe ramp.
-pub const HERBIVORE_RGB: [f32; 3] = [0.18, 0.84, 0.36];
+pub const HERBIVORE_RGB: Srgb = BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb;
 /// Carnivore end of the diet stripe ramp.
-pub const CARNIVORE_RGB: [f32; 3] = [0.86, 0.22, 0.2];
-/// Cold-preference temperature accent.
-pub const TEMP_COLD_RGB: [f32; 3] = [0.2, 0.45, 1.0];
-/// Warm-preference temperature accent.
-pub const TEMP_WARM_RGB: [f32; 3] = [1.0, 0.52, 0.24];
+pub const CARNIVORE_RGB: Srgb = BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb;
+/// Legacy cold-accent alias; temperature no longer changes agent hue.
+pub const TEMP_COLD_RGB: Srgb = BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb;
+/// Legacy warm-accent alias; temperature no longer changes agent hue.
+pub const TEMP_WARM_RGB: Srgb = BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb;
 /// Neutral wheel body color.
-pub const WHEEL_BASE_RGB: [f32; 3] = [0.14, 0.16, 0.22];
+pub const WHEEL_BASE_RGB: Srgb = BIOLUMINESCENT_DARK_FIELD_V1.agents.wheel_srgb;
 
 /// Selection/hover state shared by every frontend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VisualSelection {
-    /// Neither hovered nor selected: the baseline emissive level (0.12).
+    /// Neither hovered nor selected: baseline HDR gain (2.40).
     #[default]
     None,
-    /// Pointer is over the agent: mid-level emissive highlight (0.28).
+    /// Pointer is over the agent: hover HDR gain (3.20).
     Hovered,
-    /// Agent is the active selection: strongest emissive highlight (0.48).
+    /// Agent is the active selection: selected HDR gain (4.40).
     Selected,
 }
 
 impl VisualSelection {
-    /// Emissive highlight ramp: 0.12 unselected, 0.28 hovered, 0.48 selected
-    /// (the exact legacy values).
+    /// Canonical HDR emissive gain for this selection state.
+    #[must_use]
+    pub const fn emissive_gain(self) -> f32 {
+        match self {
+            Self::None => BIOLUMINESCENT_DARK_FIELD_V1.agents.base_emissive_gain,
+            Self::Hovered => BIOLUMINESCENT_DARK_FIELD_V1.agents.hover_emissive_gain,
+            Self::Selected => BIOLUMINESCENT_DARK_FIELD_V1.agents.selected_emissive_gain,
+        }
+    }
+
+    /// Legacy name for [`Self::emissive_gain`].
     #[must_use]
     pub const fn highlight(self) -> f32 {
-        match self {
-            Self::None => 0.12,
-            Self::Hovered => 0.28,
-            Self::Selected => 0.48,
-        }
+        self.emissive_gain()
     }
 }
 
@@ -151,13 +498,18 @@ impl VisualSelection {
 /// calling frontend, never silently trusted.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AgentVisualInput {
-    /// Genome-inherited body color (lineage hue).
+    /// Genome-inherited color, retained only as a restrained lineage accent.
     pub genome_color: [f32; 3],
     /// Current health on the simulation's `0..=2` scale.
     pub health: f32,
+    /// Current age in completed science ticks.
+    pub age_ticks: u64,
+    /// Age at which the canonical weathering floor is reached.
+    pub reference_age_ticks: u64,
     /// Diet axis: 0 = pure carnivore, 1 = pure herbivore.
     pub herbivore_tendency: f32,
-    /// Temperature preference axis: 0 = cold-loving, 1 = heat-loving.
+    /// Temperature preference axis. Retained as semantic input but does not
+    /// change hue; diet is the sole body-color axis.
     pub temperature_preference: f32,
     /// Requested left/right wheel efforts (sign = direction).
     pub wheel_left: f32,
@@ -195,13 +547,15 @@ pub struct AgentVisualInput {
 /// Renderer-neutral outputs of the agent visual mapping.
 #[derive(Debug, Clone, Copy)]
 pub struct AgentVisualParams {
-    /// Body base color after the health factor (natural palette).
+    /// Diet-led body color after health and age response (natural palette).
     pub body_color: [f32; 3],
-    /// Body emissive color including the selection highlight ramp.
+    /// Body emissive chroma; selection changes gain/rim, not body hue.
     pub body_emissive: [f32; 3],
-    /// Diet/temperature stripe color.
+    /// HDR emissive gain, kept separate from clamped sRGB.
+    pub body_emissive_gain: f32,
+    /// Diet stripe color after age desaturation.
     pub stripe_color: [f32; 3],
-    /// Stripe emissive (45% of stripe color, the legacy ratio).
+    /// Stripe emissive chroma, with HDR energy carried separately.
     pub stripe_emissive: [f32; 3],
     /// Wheel base colors after speed brightening.
     pub wheel_colors: [[f32; 3]; 2],
@@ -209,12 +563,18 @@ pub struct AgentVisualParams {
     pub wheel_emissives: [[f32; 3]; 2],
     /// Mouth activity in `[0, 1]` (eat/yell/sound composite).
     pub mouth_activity: f32,
-    /// Mouth base color (red deepens with activity).
+    /// Mouth color interpolated inside the canonical hot-event palette.
     pub mouth_color: [f32; 3],
     /// Nose tint from the smell trait.
     pub nose_color: [f32; 3],
     /// Spike readiness in `[0, 1]`: 1.0 when extended, else fractional growth.
     pub spike_readiness: f32,
+    /// Canonical selected-agent rim color.
+    pub selection_rim_color: [f32; 3],
+    /// Canonical spike core color.
+    pub spike_color: [f32; 3],
+    /// Canonical spike HDR emissive gain.
+    pub spike_emissive_gain: f32,
     /// Unit vector the agent faces (bd-grbc, PROVISIONAL).
     ///
     /// PROVISIONAL SHAPE -- a proposal, not a settled contract. bd-grbc exists because nothing
@@ -255,20 +615,17 @@ const fn clamp01(v: f32) -> f32 {
 
 /// The diet stripe color for a tendency/preference pair.
 ///
-/// Exact legacy formula: carnivore-red ↔ herbivore-green mixed by tendency,
-/// then an 18% blend toward the temperature accent so climate preference
-/// reads as a warm/cool tint on the same stripe.
+/// Carnivore hot-magenta ↔ herbivore cool-cyan, mixed only by diet.
+///
+/// Temperature deliberately does not change hue: diet is the sole chromatic
+/// semantic, while health and age carry luminance/saturation.
 #[must_use]
-pub const fn diet_stripe_color(herbivore_tendency: f32, temperature_preference: f32) -> [f32; 3] {
+pub const fn diet_stripe_color(herbivore_tendency: f32, _temperature_preference: f32) -> [f32; 3] {
     let herbivore = clamp01(herbivore_tendency);
-    let temp_pref = clamp01(temperature_preference);
-    let mut stripe = mix_vec3(CARNIVORE_RGB, HERBIVORE_RGB, herbivore);
-    let temp_accent = mix_vec3(TEMP_COLD_RGB, TEMP_WARM_RGB, temp_pref);
-    stripe = mix_vec3(stripe, temp_accent, 0.18);
-    stripe
+    mix_vec3(CARNIVORE_RGB, HERBIVORE_RGB, herbivore)
 }
 
-/// The body health factor: `health/2` clamped into `[0.45, 1.0]`.
+/// The body health factor: `health/2` clamped to the style's visibility floor.
 ///
 /// The floor keeps even dying agents visible; the divisor is the simulation's
 /// canonical `0..=2` health scale (a legacy Bevy HUD path once normalized
@@ -277,13 +634,16 @@ pub const fn diet_stripe_color(herbivore_tendency: f32, temperature_preference: 
 #[must_use]
 pub const fn health_factor(health: f32) -> f32 {
     if health.is_finite() {
-        (health / 2.0).clamp(0.45, 1.0)
+        (health / 2.0).clamp(
+            BIOLUMINESCENT_DARK_FIELD_V1.agents.health_luminance_floor,
+            1.0,
+        )
     } else {
-        0.45
+        BIOLUMINESCENT_DARK_FIELD_V1.agents.health_luminance_floor
     }
 }
 
-/// Age desaturation/weathering factor in `[0.82, 1.0]`.
+/// Age desaturation/weathering factor from the style floor through `1.0`.
 ///
 /// Multiplies body saturation so elders read as seasoned rather than freshly
 /// spawned; the floor keeps ancient agents colorful enough to stay
@@ -296,7 +656,7 @@ pub const fn age_factor(age_ticks: u64, reference_age: u64) -> f32 {
         return 1.0;
     }
     let t = (age_ticks as f32 / reference_age as f32).min(1.0);
-    1.0 - 0.18 * t
+    1.0 - (1.0 - BIOLUMINESCENT_DARK_FIELD_V1.agents.age_luminance_floor) * t
 }
 
 /// Apply a saturation factor (e.g. [`age_factor`]) to a color, preserving hue
@@ -318,23 +678,34 @@ pub const fn apply_saturation(rgb: [f32; 3], factor: f32) -> [f32; 3] {
 /// frontends apply [`apply_accessibility_palette`] at display time.
 #[must_use]
 pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
-    let rgb = [
+    let genome_rgb = [
         clamp01(input.genome_color[0]),
         clamp01(input.genome_color[1]),
         clamp01(input.genome_color[2]),
     ];
     let hf = health_factor(input.health);
-    let body_color = [rgb[0] * hf, rgb[1] * hf, rgb[2] * hf];
-
-    let highlight = input.selection.highlight();
-    let body_emissive = [
-        (rgb[0] + highlight * 0.8).min(1.0),
-        (rgb[1] + highlight * 0.6).min(1.0),
-        (rgb[2] + highlight).min(1.0),
+    let age = age_factor(input.age_ticks, input.reference_age_ticks);
+    let diet = diet_stripe_color(input.herbivore_tendency, input.temperature_preference);
+    let aged_diet = apply_saturation(diet, age);
+    // Diet is the body authority. Genome color survives only as a restrained
+    // lineage accent so it cannot erase the cyan-to-magenta semantic.
+    let body_base = mix_vec3(aged_diet, genome_rgb, 0.08);
+    let luminance = hf * age;
+    let body_color = [
+        body_base[0] * luminance,
+        body_base[1] * luminance,
+        body_base[2] * luminance,
     ];
 
-    let stripe = diet_stripe_color(input.herbivore_tendency, input.temperature_preference);
-    let stripe_emissive = [stripe[0] * 0.45, stripe[1] * 0.45, stripe[2] * 0.45];
+    let body_emissive_gain = if input.boosting {
+        BIOLUMINESCENT_DARK_FIELD_V1.agents.boost_emissive_gain
+    } else {
+        input.selection.emissive_gain()
+    };
+    let body_emissive = body_color;
+
+    let stripe = aged_diet;
+    let stripe_emissive = stripe;
 
     let left_speed = clamp01(input.wheel_left.abs());
     let right_speed = clamp01(input.wheel_right.abs());
@@ -362,15 +733,14 @@ pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
     let vocal_energy = clamp01(input.sound_output.abs() * input.sound_multiplier.max(0.1));
     let mouth_activity =
         clamp01(input.food_delta.abs() * 0.75 + vocal_energy * 0.9 + input.sound_level * 0.35);
-    let mouth_color = [
-        0.58 + mouth_activity * 0.3,
-        0.1 + mouth_activity * 0.12,
-        0.12 + mouth_activity * 0.08,
-    ];
-
+    let mouth_color = mix_vec3(
+        BIOLUMINESCENT_DARK_FIELD_V1.events.death.core_srgb,
+        BIOLUMINESCENT_DARK_FIELD_V1.events.combat.core_srgb,
+        mouth_activity,
+    );
     let nose_color = mix_vec3(
-        [0.94, 0.84, 0.66],
-        [0.98, 0.92, 0.78],
+        BIOLUMINESCENT_DARK_FIELD_V1.food.halo_srgb,
+        BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb,
         clamp01(input.trait_smell * 0.4),
     );
 
@@ -393,6 +763,7 @@ pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
     AgentVisualParams {
         body_color,
         body_emissive,
+        body_emissive_gain,
         stripe_color: stripe,
         stripe_emissive,
         wheel_colors: [left_rgb, right_rgb],
@@ -401,6 +772,9 @@ pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
         mouth_color,
         nose_color,
         spike_readiness,
+        selection_rim_color: BIOLUMINESCENT_DARK_FIELD_V1.agents.selection_rim_srgb,
+        spike_color: BIOLUMINESCENT_DARK_FIELD_V1.agents.spike_srgb,
+        spike_emissive_gain: BIOLUMINESCENT_DARK_FIELD_V1.agents.spike_emissive_gain,
         facing,
         right,
         spike_tip_offset,
@@ -413,27 +787,36 @@ pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
 // ---------------------------------------------------------------------------
 
 /// Base color per terrain kind (natural palette, `sRGB` bytes as floats).
-pub const TERRAIN_BASE_COLORS: [[f32; 3]; 6] = [
-    [0.117_647, 0.247_059, 0.400_000], // Deep water
-    [0.184_314, 0.450_980, 0.701_961], // Shallow water
-    [0.694_118, 0.305_882, 0.027_451], // Sand
-    [0.313_725, 0.662_745, 0.074_510], // Grass
-    [0.474_510, 0.831_373, 0.427_451], // Bloom
-    [0.662_745, 0.694_118, 0.729_412], // Rock
+pub const TERRAIN_BASE_COLORS: [Srgb; 6] = [
+    BIOLUMINESCENT_DARK_FIELD_V1.terrain[0].albedo_srgb,
+    BIOLUMINESCENT_DARK_FIELD_V1.terrain[1].albedo_srgb,
+    BIOLUMINESCENT_DARK_FIELD_V1.terrain[2].albedo_srgb,
+    BIOLUMINESCENT_DARK_FIELD_V1.terrain[3].albedo_srgb,
+    BIOLUMINESCENT_DARK_FIELD_V1.terrain[4].albedo_srgb,
+    BIOLUMINESCENT_DARK_FIELD_V1.terrain[5].albedo_srgb,
 ];
 
-/// Base color for a terrain kind.
-#[must_use]
-pub const fn terrain_kind_base_color(kind: TerrainKind) -> [f32; 3] {
-    let index = match kind {
+const fn terrain_kind_index(kind: TerrainKind) -> usize {
+    match kind {
         TerrainKind::DeepWater => 0,
         TerrainKind::ShallowWater => 1,
         TerrainKind::Sand => 2,
         TerrainKind::Grass => 3,
         TerrainKind::Bloom => 4,
         TerrainKind::Rock => 5,
-    };
-    TERRAIN_BASE_COLORS[index]
+    }
+}
+
+/// Canonical physical material for a terrain kind.
+#[must_use]
+pub const fn terrain_material(kind: TerrainKind) -> TerrainMaterialStyle {
+    BIOLUMINESCENT_DARK_FIELD_V1.terrain[terrain_kind_index(kind)]
+}
+
+/// Base color for a terrain kind.
+#[must_use]
+pub const fn terrain_kind_base_color(kind: TerrainKind) -> [f32; 3] {
+    terrain_material(kind).albedo_srgb
 }
 
 /// The daylight level used when the day/night cycle is off (the historical
@@ -532,26 +915,51 @@ pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
 // Food semantics: density ramp + deterministic shimmer phase.
 // ---------------------------------------------------------------------------
 
-/// Food density ramp endpoints (natural palette).
-pub const FOOD_SPARSE_RGB: [f32; 3] = [0.10, 0.35, 0.12];
-/// Mid-density green.
-pub const FOOD_MID_RGB: [f32; 3] = [0.35, 0.80, 0.25];
-/// Dense, ready-to-eat gold.
-pub const FOOD_DENSE_RGB: [f32; 3] = [0.95, 0.85, 0.30];
+/// Legacy sparse-color alias; density changes visibility, not hue.
+pub const FOOD_SPARSE_RGB: Srgb = BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb;
+/// Legacy midpoint-color alias; density changes visibility, not hue.
+pub const FOOD_MID_RGB: Srgb = BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb;
+/// Legacy dense-color alias; density changes visibility, not hue.
+pub const FOOD_DENSE_RGB: Srgb = BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb;
 
-/// Food density color ramp: sparse dark green -> vibrant green -> ripe gold.
+/// Fully resolved food-mote presentation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FoodVisualParams {
+    /// Stable mint-cyan core.
+    pub core_srgb: Srgb,
+    /// Stable mint-cyan halo.
+    pub halo_srgb: Srgb,
+    /// HDR emissive gain.
+    pub emissive_gain: f32,
+    /// Display alpha.
+    pub alpha: f32,
+    /// Radius relative to one terrain cell.
+    pub relative_radius: f32,
+}
+
+/// Resolve food visibility from normalized density without changing its hue.
+#[must_use]
+pub const fn food_visual_params(density: f32) -> FoodVisualParams {
+    let d = clamp01(density);
+    let food = BIOLUMINESCENT_DARK_FIELD_V1.food;
+    FoodVisualParams {
+        core_srgb: food.core_srgb,
+        halo_srgb: food.halo_srgb,
+        emissive_gain: food.sparse_emissive_gain
+            + (food.dense_emissive_gain - food.sparse_emissive_gain) * d,
+        alpha: food.sparse_alpha + (food.dense_alpha - food.sparse_alpha) * d,
+        relative_radius: food.sparse_radius + (food.dense_radius - food.sparse_radius) * d,
+    }
+}
+
+/// Canonical food core color.
 ///
-/// Two-segment ramp over `density` in `[0, 1]` (clamped). This is the
-/// canonical food color answer; previously each frontend picked its own
-/// greens (or encoded food only as brightness modifiers).
+/// The parameter remains part of this established API, but density now drives
+/// alpha, radius, and HDR energy through [`food_visual_params`] rather than
+/// changing hue from green to gold.
 #[must_use]
 pub const fn food_density_color(density: f32) -> [f32; 3] {
-    let d = clamp01(density);
-    if d < 0.5 {
-        mix_vec3(FOOD_SPARSE_RGB, FOOD_MID_RGB, d * 2.0)
-    } else {
-        mix_vec3(FOOD_MID_RGB, FOOD_DENSE_RGB, (d - 0.5) * 2.0)
-    }
+    food_visual_params(density).core_srgb
 }
 
 /// Shimmer period for food/water pulse animations, in ticks.
@@ -675,6 +1083,10 @@ pub struct VisualCue {
 /// Maximum combat damage used to normalize hit intensity.
 pub const COMBAT_DAMAGE_REFERENCE: f32 = 2.0;
 
+const fn normalized_event_gain(style: EventCueStyle) -> f32 {
+    (style.emissive_gain / BIOLUMINESCENT_DARK_FIELD_V1.events.combat.emissive_gain).clamp(0.0, 1.0)
+}
+
 /// Resolve a world event to its visual cue.
 ///
 /// Pure table: same event, same cue, on every renderer. Returns the canonical
@@ -684,84 +1096,89 @@ pub const COMBAT_DAMAGE_REFERENCE: f32 = 2.0;
 pub fn visual_cue_for_event(event: &WorldVisualEvent) -> VisualCue {
     match *event {
         WorldVisualEvent::Birth { origin } => {
+            let style = BIOLUMINESCENT_DARK_FIELD_V1.events.birth;
             let (color, intensity) = match origin {
-                BirthOrigin::Born => ([1.0, 0.9, 0.55], 0.9),
-                BirthOrigin::Seeded => ([0.75, 0.85, 1.0], 0.6),
-                BirthOrigin::Injected => ([0.8, 0.6, 1.0], 0.75),
+                BirthOrigin::Born => (style.core_srgb, normalized_event_gain(style)),
+                BirthOrigin::Seeded => (
+                    mix_vec3(style.core_srgb, style.accent_srgb, 0.45),
+                    normalized_event_gain(style) * 0.75,
+                ),
+                BirthOrigin::Injected => (style.accent_srgb, normalized_event_gain(style) * 0.9),
             };
             VisualCue {
                 kind: VisualCueKind::Sparkle,
                 color,
-                accent_color: color,
+                accent_color: style.accent_srgb,
                 intensity,
                 radius: 6.0,
-                duration_ticks: 24,
+                duration_ticks: style.duration_ticks,
             }
         }
-        WorldVisualEvent::Death { cause } => match cause {
-            DeathCause::CombatCarnivore | DeathCause::CombatHerbivore => VisualCue {
-                kind: VisualCueKind::Shards,
-                color: [1.0, 0.35, 0.15],
-                accent_color: [1.0, 0.8, 0.2],
-                intensity: 1.0,
-                radius: 8.0,
-                duration_ticks: 20,
-            },
-            DeathCause::Starvation => VisualCue {
-                kind: VisualCueKind::Wilt,
-                color: [0.45, 0.45, 0.5],
-                accent_color: [0.3, 0.3, 0.35],
-                intensity: 0.5,
-                radius: 5.0,
-                duration_ticks: 36,
-            },
-            DeathCause::Aging | DeathCause::Unknown => VisualCue {
-                kind: VisualCueKind::Wilt,
-                color: [0.55, 0.6, 0.75],
-                accent_color: [0.4, 0.45, 0.6],
-                intensity: 0.55,
-                radius: 5.0,
-                duration_ticks: 36,
-            },
-        },
+        WorldVisualEvent::Death { cause } => {
+            let style = BIOLUMINESCENT_DARK_FIELD_V1.events.death;
+            let combat = matches!(
+                cause,
+                DeathCause::CombatCarnivore | DeathCause::CombatHerbivore
+            );
+            VisualCue {
+                kind: if combat {
+                    VisualCueKind::Shards
+                } else {
+                    VisualCueKind::Wilt
+                },
+                color: style.core_srgb,
+                accent_color: style.accent_srgb,
+                intensity: normalized_event_gain(style) * if combat { 1.0 } else { 0.75 },
+                radius: if combat { 8.0 } else { 5.0 },
+                duration_ticks: style.duration_ticks,
+            }
+        }
         WorldVisualEvent::CombatHit { damage } => {
+            let style = BIOLUMINESCENT_DARK_FIELD_V1.events.combat;
             let normalized = clamp01(damage / COMBAT_DAMAGE_REFERENCE);
             VisualCue {
                 kind: VisualCueKind::SparkCone,
-                color: [1.0, 0.95, 0.6],
-                accent_color: [1.0, 0.7, 0.25],
+                color: style.core_srgb,
+                accent_color: style.accent_srgb,
                 intensity: 0.5 + 0.5 * normalized,
                 radius: 4.0 + 4.0 * normalized,
-                duration_ticks: 8,
+                duration_ticks: style.duration_ticks,
             }
         }
         WorldVisualEvent::Eat { amount } => {
+            let style = BIOLUMINESCENT_DARK_FIELD_V1.events.eat;
             let normalized = clamp01(amount.abs());
             VisualCue {
                 kind: VisualCueKind::Nibble,
-                color: [0.5, 0.9, 0.4],
-                accent_color: [0.8, 1.0, 0.5],
-                intensity: 0.3 + 0.3 * normalized,
+                color: style.core_srgb,
+                accent_color: style.accent_srgb,
+                intensity: normalized_event_gain(style) * (0.75 + 0.25 * normalized),
                 radius: 2.0,
-                duration_ticks: 12,
+                duration_ticks: style.duration_ticks,
             }
         }
-        WorldVisualEvent::Reproduce => VisualCue {
-            kind: VisualCueKind::PulseRing,
-            color: [1.0, 0.75, 0.4],
-            accent_color: [0.6, 0.9, 1.0],
-            intensity: 0.8,
-            radius: 10.0,
-            duration_ticks: 28,
-        },
-        WorldVisualEvent::SpikeExtend => VisualCue {
-            kind: VisualCueKind::Flash,
-            color: [1.0, 1.0, 1.0],
-            accent_color: [1.0, 0.9, 0.6],
-            intensity: 0.7,
-            radius: 3.0,
-            duration_ticks: 6,
-        },
+        WorldVisualEvent::Reproduce => {
+            let style = BIOLUMINESCENT_DARK_FIELD_V1.events.reproduce;
+            VisualCue {
+                kind: VisualCueKind::PulseRing,
+                color: style.core_srgb,
+                accent_color: style.accent_srgb,
+                intensity: normalized_event_gain(style),
+                radius: 10.0,
+                duration_ticks: style.duration_ticks,
+            }
+        }
+        WorldVisualEvent::SpikeExtend => {
+            let style = BIOLUMINESCENT_DARK_FIELD_V1.events.spike;
+            VisualCue {
+                kind: VisualCueKind::Flash,
+                color: style.core_srgb,
+                accent_color: style.accent_srgb,
+                intensity: normalized_event_gain(style),
+                radius: 3.0,
+                duration_ticks: style.duration_ticks,
+            }
+        }
     }
 }
 
@@ -1238,6 +1655,176 @@ mod tests {
         }
     }
 
+    fn luminance(rgb: [f32; 3]) -> f32 {
+        0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    }
+
+    #[test]
+    fn dark_field_style_is_finite_in_gamut_and_materially_coherent() {
+        let style = visual_style();
+        let colors = [
+            style.substrate.abyss_srgb,
+            style.substrate.base_srgb,
+            style.substrate.depth_violet_srgb,
+            style.substrate.distant_haze_srgb,
+            style.food.core_srgb,
+            style.food.halo_srgb,
+            style.agents.herbivore_srgb,
+            style.agents.carnivore_srgb,
+            style.agents.wheel_srgb,
+            style.agents.selection_rim_srgb,
+            style.agents.spike_srgb,
+            style.chrome.surface_srgb,
+            style.chrome.elevated_srgb,
+            style.chrome.border_srgb,
+            style.chrome.primary_text_srgb,
+            style.chrome.muted_text_srgb,
+            style.chrome.accent_cyan_srgb,
+            style.chrome.accent_magenta_srgb,
+            style.chrome.warning_srgb,
+            style.chrome.danger_srgb,
+            style.atmosphere.fog_srgb,
+        ];
+        for rgb in colors {
+            for channel in rgb {
+                assert!(
+                    channel.is_finite() && (0.0..=1.0).contains(&channel),
+                    "style channel must be finite sRGB: {rgb:?}"
+                );
+            }
+        }
+        for material in style.terrain {
+            for channel in material
+                .albedo_srgb
+                .into_iter()
+                .chain(material.emissive_srgb)
+            {
+                assert!(channel.is_finite() && (0.0..=1.0).contains(&channel));
+            }
+            assert!(material.emissive_gain.is_finite() && material.emissive_gain >= 0.0);
+            assert!((0.0..=1.0).contains(&material.perceptual_roughness));
+            assert!((0.0..=1.0).contains(&material.reflectance));
+            assert!((0.0..=1.0).contains(&material.normal_strength));
+        }
+
+        let deep_water = terrain_material(TerrainKind::DeepWater);
+        let shallow_water = terrain_material(TerrainKind::ShallowWater);
+        let land = [
+            terrain_material(TerrainKind::Sand),
+            terrain_material(TerrainKind::Grass),
+            terrain_material(TerrainKind::Bloom),
+            terrain_material(TerrainKind::Rock),
+        ];
+        let darkest_land = land
+            .iter()
+            .map(|material| luminance(material.albedo_srgb))
+            .fold(f32::INFINITY, f32::min);
+        let smoothest_land = land
+            .iter()
+            .map(|material| material.perceptual_roughness)
+            .fold(f32::INFINITY, f32::min);
+        let most_reflective_land = land
+            .iter()
+            .map(|material| material.reflectance)
+            .fold(f32::NEG_INFINITY, f32::max);
+        for water in [deep_water, shallow_water] {
+            assert!(
+                luminance(water.albedo_srgb) < darkest_land,
+                "water must remain darker than land"
+            );
+            assert!(
+                water.perceptual_roughness < smoothest_land,
+                "water must remain smoother than land"
+            );
+            assert!(
+                water.reflectance > most_reflective_land,
+                "water must remain more reflective than land"
+            );
+        }
+
+        let event_styles = [
+            style.events.combat,
+            style.events.birth,
+            style.events.death,
+            style.events.eat,
+            style.events.reproduce,
+            style.events.spike,
+        ];
+        for event in event_styles {
+            for channel in event.core_srgb.into_iter().chain(event.accent_srgb) {
+                assert!(channel.is_finite() && (0.0..=1.0).contains(&channel));
+            }
+            assert!(event.emissive_gain.is_finite() && event.emissive_gain >= 0.0);
+            assert!(event.duration_ticks > 0);
+        }
+
+        let food = style.food;
+        assert!(food.sparse_emissive_gain.is_finite() && food.sparse_emissive_gain >= 0.0);
+        assert!(food.dense_emissive_gain >= food.sparse_emissive_gain);
+        assert!((0.0..=1.0).contains(&food.sparse_alpha));
+        assert!((food.sparse_alpha..=1.0).contains(&food.dense_alpha));
+        assert!(food.sparse_radius.is_finite() && food.sparse_radius > 0.0);
+        assert!(food.dense_radius >= food.sparse_radius);
+
+        let agent_gains = [
+            style.agents.base_emissive_gain,
+            style.agents.hover_emissive_gain,
+            style.agents.selected_emissive_gain,
+            style.agents.boost_emissive_gain,
+            style.agents.spike_emissive_gain,
+        ];
+        assert!(
+            agent_gains
+                .iter()
+                .all(|gain| gain.is_finite() && *gain >= 0.0)
+        );
+        assert!(agent_gains.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let atmosphere = style.atmosphere;
+        for scalar in [
+            atmosphere.bloom_threshold,
+            atmosphere.bloom_intensity,
+            atmosphere.vignette,
+            atmosphere.exposure,
+        ] {
+            assert!(scalar.is_finite() && scalar >= 0.0);
+        }
+    }
+
+    #[test]
+    fn terrain_material_and_splat_layer_orders_are_identical() {
+        let kinds = [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ];
+        for (expected_index, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(
+                terrain_material(kind),
+                BIOLUMINESCENT_DARK_FIELD_V1.terrain[expected_index]
+            );
+            let weights = splat_weights(&SplatInput {
+                kind,
+                elevation: 0.5,
+                slope: 0.1,
+                water_depth: 0.0,
+            });
+            let dominant = weights
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index)
+                .expect("six canonical terrain layers");
+            assert_eq!(
+                dominant, expected_index,
+                "{kind:?} material and splat slots must stay aligned"
+            );
+        }
+    }
+
     #[test]
     fn natural_palette_is_identity_and_clamps() {
         let rgb = [0.2, 0.5, 0.9];
@@ -1310,7 +1897,8 @@ mod tests {
     #[test]
     fn health_factor_uses_canonical_scale_with_visibility_floor() {
         assert!(
-            (health_factor(0.0) - 0.45).abs() < EPS,
+            (health_factor(0.0) - BIOLUMINESCENT_DARK_FIELD_V1.agents.health_luminance_floor).abs()
+                < EPS,
             "dying stays visible"
         );
         assert!((health_factor(2.0) - 1.0).abs() < EPS, "full health");
@@ -1318,7 +1906,12 @@ mod tests {
             (health_factor(100.0) - 1.0).abs() < EPS,
             "legacy /100 bug class"
         );
-        assert!((health_factor(-3.0) - 0.45).abs() < EPS, "negative clamps");
+        assert!(
+            (health_factor(-3.0) - BIOLUMINESCENT_DARK_FIELD_V1.agents.health_luminance_floor)
+                .abs()
+                < EPS,
+            "negative clamps"
+        );
     }
 
     #[test]
@@ -1328,11 +1921,15 @@ mod tests {
             "newborns full color"
         );
         assert!(
-            (age_factor(10_000, 10_000) - 0.82).abs() < 1.0e-4,
+            (age_factor(10_000, 10_000) - BIOLUMINESCENT_DARK_FIELD_V1.agents.age_luminance_floor)
+                .abs()
+                < 1.0e-4,
             "reference age reaches the floor"
         );
         assert!(
-            (age_factor(99_999, 10_000) - 0.82).abs() < 1.0e-4,
+            (age_factor(99_999, 10_000) - BIOLUMINESCENT_DARK_FIELD_V1.agents.age_luminance_floor)
+                .abs()
+                < 1.0e-4,
             "ancient agents stay at the floor"
         );
         assert!(
@@ -1350,25 +1947,18 @@ mod tests {
     }
 
     #[test]
-    fn diet_stripe_endpoints_and_temperature_blend() {
+    fn diet_endpoints_are_luminance_matched_and_temperature_neutral() {
         let carn = diet_stripe_color(0.0, 0.5);
         let herb = diet_stripe_color(1.0, 0.5);
+        assert_rgb_close(carn, CARNIVORE_RGB, "carnivore endpoint");
+        assert_rgb_close(herb, HERBIVORE_RGB, "herbivore endpoint");
         assert!(
-            carn[0] > carn[1] && herb[1] > herb[0],
-            "carnivore reads red, herbivore reads green: {carn:?} vs {herb:?}"
+            (luminance(carn) - luminance(herb)).abs() <= 0.03,
+            "diet must change hue rather than implied health: {carn:?} vs {herb:?}"
         );
-        // Exact legacy value at herbivore endpoint with neutral temperature:
-        // stripe = mix(CARNIVORE, HERBIVORE, 1) then 18% toward temp accent at 0.5.
-        let temp_accent = mix_vec3(TEMP_COLD_RGB, TEMP_WARM_RGB, 0.5);
-        let expected = mix_vec3(HERBIVORE_RGB, temp_accent, 0.18);
-        assert_rgb_close(herb, expected, "herbivore endpoint");
-        // Temperature extremes shift the stripe measurably.
         let cold = diet_stripe_color(0.5, 0.0);
         let warm = diet_stripe_color(0.5, 1.0);
-        assert!(
-            (cold[2] - warm[2]).abs() > 0.05,
-            "temperature preference must tint the stripe: {cold:?} vs {warm:?}"
-        );
+        assert_rgb_close(cold, warm, "temperature-neutral diet hue");
     }
 
     #[test]
@@ -1388,9 +1978,17 @@ mod tests {
             ..base
         });
         assert!(
-            none.body_emissive[2] < hovered.body_emissive[2]
-                && hovered.body_emissive[2] < selected.body_emissive[2],
-            "selection ramp increases emissive"
+            none.body_emissive_gain < hovered.body_emissive_gain
+                && hovered.body_emissive_gain < selected.body_emissive_gain,
+            "selection ramp increases HDR emissive gain"
+        );
+        let boosted = agent_visual_params(&AgentVisualInput {
+            boosting: true,
+            ..base
+        });
+        assert_eq!(
+            boosted.body_emissive_gain,
+            BIOLUMINESCENT_DARK_FIELD_V1.agents.boost_emissive_gain
         );
         // Degenerate inputs never escape [0, 1].
         let wild = agent_visual_params(&AgentVisualInput {
@@ -1431,6 +2029,46 @@ mod tests {
     }
 
     #[test]
+    fn health_and_age_change_luminance_without_reordering_diet_hues() {
+        let params = |health, age_ticks, herbivore_tendency| {
+            agent_visual_params(&AgentVisualInput {
+                genome_color: diet_stripe_color(herbivore_tendency, 0.5),
+                health,
+                age_ticks,
+                reference_age_ticks: 10_000,
+                herbivore_tendency,
+                ..AgentVisualInput::default()
+            })
+        };
+
+        let dying = params(0.0, 0, 0.5);
+        let recovering = params(1.0, 0, 0.5);
+        let healthy = params(2.0, 0, 0.5);
+        assert!(luminance(dying.body_color) < luminance(recovering.body_color));
+        assert!(luminance(recovering.body_color) < luminance(healthy.body_color));
+
+        let newborn = params(2.0, 0, 0.5);
+        let middle_aged = params(2.0, 5_000, 0.5);
+        let old = params(2.0, 10_000, 0.5);
+        assert!(luminance(newborn.body_color) > luminance(middle_aged.body_color));
+        assert!(luminance(middle_aged.body_color) > luminance(old.body_color));
+        let chroma = |rgb: Srgb| {
+            rgb.into_iter().fold(f32::NEG_INFINITY, f32::max)
+                - rgb.into_iter().fold(f32::INFINITY, f32::min)
+        };
+        assert!(chroma(newborn.body_color) > chroma(old.body_color));
+
+        for age_ticks in [0, 5_000, 10_000] {
+            for health in [0.0, 1.0, 2.0] {
+                let carnivore = params(health, age_ticks, 0.0);
+                let herbivore = params(health, age_ticks, 1.0);
+                assert!(carnivore.body_color[0] > herbivore.body_color[0]);
+                assert!(herbivore.body_color[1] > carnivore.body_color[1]);
+            }
+        }
+    }
+
+    #[test]
     fn spike_readiness_tracks_extension_and_fractional_growth() {
         let mut input = AgentVisualInput {
             spike_length: 0.3,
@@ -1443,14 +2081,14 @@ mod tests {
     }
 
     #[test]
-    fn terrain_base_colors_match_legacy_table() {
+    fn terrain_base_colors_are_aliases_into_the_style() {
         assert_eq!(
             terrain_kind_base_color(TerrainKind::DeepWater),
-            [0.117_647, 0.247_059, 0.4]
+            BIOLUMINESCENT_DARK_FIELD_V1.terrain[0].albedo_srgb
         );
         assert_eq!(
             terrain_kind_base_color(TerrainKind::Rock),
-            [0.662_745, 0.694_118, 0.729_412]
+            BIOLUMINESCENT_DARK_FIELD_V1.terrain[5].albedo_srgb
         );
     }
 
@@ -1531,25 +2169,72 @@ mod tests {
     }
 
     #[test]
-    fn food_ramp_endpoints_and_monotonic_green_channel() {
+    fn food_keeps_one_hue_while_visibility_and_energy_rise() {
         assert_rgb_close(food_density_color(0.0), FOOD_SPARSE_RGB, "sparse");
         assert_rgb_close(food_density_color(1.0), FOOD_DENSE_RGB, "dense");
         assert_rgb_close(food_density_color(0.5), FOOD_MID_RGB, "mid");
-        let mut prev = food_density_color(0.0)[2] + food_density_color(0.0)[0];
+        let mut previous = food_visual_params(0.0);
         for i in 1..=10 {
             let d = i as f32 / 10.0;
-            let c = food_density_color(d);
-            // Overall brightness rises with density.
-            let lum = c[0] + c[1] + c[2];
-            let prev_color = food_density_color((i - 1) as f32 / 10.0);
-            let prev_lum = prev_color[0] + prev_color[1] + prev_color[2];
-            assert!(lum >= prev_lum - EPS, "ramp brightens with density at {d}");
-            prev = lum;
+            let current = food_visual_params(d);
+            assert_eq!(
+                current.core_srgb, previous.core_srgb,
+                "density must not change food hue"
+            );
+            assert!(current.alpha >= previous.alpha);
+            assert!(current.emissive_gain >= previous.emissive_gain);
+            assert!(current.relative_radius >= previous.relative_radius);
+            previous = current;
         }
-        let _ = prev;
-        // Clamps.
         assert_rgb_close(food_density_color(-1.0), FOOD_SPARSE_RGB, "clamp low");
         assert_rgb_close(food_density_color(2.0), FOOD_DENSE_RGB, "clamp high");
+    }
+
+    #[test]
+    fn weakest_agent_remains_brighter_than_the_brightest_resolved_terrain() {
+        let weak = agent_visual_params(&AgentVisualInput {
+            genome_color: [0.0; 3],
+            health: 0.0,
+            age_ticks: 10_000,
+            reference_age_ticks: 10_000,
+            herbivore_tendency: 0.5,
+            ..AgentVisualInput::default()
+        });
+        let mut brightest_terrain = f32::NEG_INFINITY;
+        for kind in [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ] {
+            for moisture in [0.0, 1.0] {
+                for elevation in [0.0, 1.0] {
+                    for slope in [0.0, 1.0] {
+                        for accent in [0.0, 1.0] {
+                            for daylight in [0.0, 1.0] {
+                                brightest_terrain = brightest_terrain.max(luminance(
+                                    terrain_shaded_color(&TerrainShadeInput {
+                                        kind,
+                                        moisture,
+                                        elevation,
+                                        slope,
+                                        accent,
+                                        daylight,
+                                    }),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            luminance(weak.body_color) > brightest_terrain,
+            "figure/ground invariant: {:?} vs {brightest_terrain}",
+            weak.body_color
+        );
     }
 
     #[test]
