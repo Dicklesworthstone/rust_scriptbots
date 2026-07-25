@@ -249,11 +249,11 @@ fn accept_manifest(record: RunManifestRecord) {
         .expect("accepted manifest storage shuts down cleanly");
 }
 
-fn attach_zero_tick_v35_evidence(record: &mut RunManifestRecord) {
+fn attach_zero_tick_v36_evidence(record: &mut RunManifestRecord) {
     let digest = launch_continuation_fixture(record.root_seed).world_digest;
     record.brain_roster_json = "[]".to_owned();
     mutate_manifest(record, |value| {
-        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.5");
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.6");
         value["brain_roster"] = serde_json::json!([]);
         value["bootstrap_evidence"] = serde_json::json!({
             "requested": 0,
@@ -738,10 +738,10 @@ fn v3_config_overrides_accept_omission_empty_and_structured_json_values() {
 
     let mut bootstrap = manifest(
         RunId::from_namespace_sequence(0xc011_1de0, 120),
-        "overrides-v35",
+        "overrides-v36",
         1_700_000_000_120,
     );
-    attach_zero_tick_v35_evidence(&mut bootstrap);
+    attach_zero_tick_v36_evidence(&mut bootstrap);
     mutate_manifest(&mut bootstrap, |value| {
         value["config_overrides"] = serde_json::json!([config_override(
             "file",
@@ -1278,7 +1278,7 @@ fn continuation_incomplete_v3_and_v32_manifests_are_refused() {
     assert!(
         error.contains("continuation-incomplete")
             && error.contains("scriptbots.run-manifest.v3.3")
-            && error.contains("scriptbots.run-manifest.v3.5"),
+            && error.contains("scriptbots.run-manifest.v3.6"),
         "unexpected error: {error}"
     );
 
@@ -1290,7 +1290,7 @@ fn continuation_incomplete_v3_and_v32_manifests_are_refused() {
     assert!(
         error.contains("continuation-incomplete")
             && error.contains("scriptbots.run-manifest.v3.3")
-            && error.contains("scriptbots.run-manifest.v3.5"),
+            && error.contains("scriptbots.run-manifest.v3.6"),
         "unexpected error: {error}"
     );
 }
@@ -1305,13 +1305,28 @@ fn v34_bootstrap_manifest_is_rejected_as_a_superseded_digest_contract() {
     let error = manifest_validation_error(legacy_v34);
     assert!(
         error.contains("superseded WorldDigestV1.5 contract")
-            && error.contains("scriptbots.run-manifest.v3.5"),
+            && error.contains("scriptbots.run-manifest.v3.6"),
         "unexpected error: {error}"
     );
 }
 
 #[test]
-fn v35_manifest_requires_explicit_world_digest_v1_6_bootstrap_evidence() {
+fn v35_bootstrap_manifest_is_rejected_as_a_superseded_digest_contract() {
+    let run_id = RunId::from_namespace_sequence(0xc011_1de0, 5);
+    let mut legacy_v35 = manifest(run_id, "legacy-v35", 1_700_000_000_025);
+    mutate_manifest(&mut legacy_v35, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.5");
+    });
+    let error = manifest_validation_error(legacy_v35);
+    assert!(
+        error.contains("superseded WorldDigestV1.6 contract")
+            && error.contains("scriptbots.run-manifest.v3.6"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn v36_manifest_requires_explicit_world_digest_v1_7_bootstrap_evidence() {
     let run_id = RunId::from_namespace_sequence(0xc011_1de0, 6);
     let mut unsupported = manifest(run_id, "v31-adapter-blind", 1_700_000_000_025);
     mutate_manifest(&mut unsupported, |value| {
@@ -1323,9 +1338,9 @@ fn v35_manifest_requires_explicit_world_digest_v1_6_bootstrap_evidence() {
         "unexpected error: {error}"
     );
 
-    let mut missing_evidence = manifest(run_id, "v35-missing-evidence", 1_700_000_000_026);
+    let mut missing_evidence = manifest(run_id, "v36-missing-evidence", 1_700_000_000_026);
     mutate_manifest(&mut missing_evidence, |value| {
-        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.5");
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.6");
     });
     let error = manifest_validation_error(missing_evidence);
     assert!(
@@ -1333,20 +1348,20 @@ fn v35_manifest_requires_explicit_world_digest_v1_6_bootstrap_evidence() {
         "unexpected error: {error}"
     );
 
-    let mut valid = manifest(run_id, "v35-valid-evidence", 1_700_000_000_027);
-    attach_zero_tick_v35_evidence(&mut valid);
+    let mut valid = manifest(run_id, "v36-valid-evidence", 1_700_000_000_027);
+    attach_zero_tick_v36_evidence(&mut valid);
     let mut accepted = StoragePipeline::memory_for_run(valid)
-        .expect("storage accepts complete WorldDigestV1.6 V3.5 bootstrap evidence");
+        .expect("storage accepts complete WorldDigestV1.7 V3.6 bootstrap evidence");
     accepted
         .shutdown()
-        .expect("accepted V3.5 fixture shuts down cleanly");
+        .expect("accepted V3.6 fixture shuts down cleanly");
 
     let mut foreign_digest_schema = manifest(
         RunId::from_namespace_sequence(0xc011_1de0, 7),
-        "v35-foreign-digest-schema",
+        "v36-foreign-digest-schema",
         1_700_000_000_028,
     );
-    attach_zero_tick_v35_evidence(&mut foreign_digest_schema);
+    attach_zero_tick_v36_evidence(&mut foreign_digest_schema);
     mutate_manifest(&mut foreign_digest_schema, |value| {
         value["bootstrap_evidence"]["start"]["schema"] =
             serde_json::json!("scriptbots.world-digest.v1.3");
@@ -1360,10 +1375,10 @@ fn v35_manifest_requires_explicit_world_digest_v1_6_bootstrap_evidence() {
 
     let mut invalid_registry_lane = manifest(
         RunId::from_namespace_sequence(0xc011_1de0, 8),
-        "v35-invalid-registry-lane",
+        "v36-invalid-registry-lane",
         1_700_000_000_029,
     );
-    attach_zero_tick_v35_evidence(&mut invalid_registry_lane);
+    attach_zero_tick_v36_evidence(&mut invalid_registry_lane);
     mutate_manifest(&mut invalid_registry_lane, |value| {
         let registry_lane = value["bootstrap_evidence"]["start"]["brain_registry"]
             .as_str()
@@ -1467,11 +1482,31 @@ fn legacy_v5_database_is_refused_before_its_primary_file_is_mutated()
             return Err("a legacy v5 database must not be upgraded implicitly".into());
         }
     };
+    // Assert the refusal's identity, not its prose.
+    //
+    // This previously matched the literal string "expected exactly two ScriptBots
+    // migrations through v7, found 3". That was accurate while the chain ended at v7, and
+    // went stale the moment V8 and V9 were added — production now says "four ... through
+    // v9". The failure was not a v5-refusal regression at all, but it fired *before* the
+    // byte-identity check below, so a test named for "refused before its primary file is
+    // mutated" stopped verifying that entirely.
+    //
+    // The expected-count phrasing is coupled to the length of the migration chain and will
+    // go stale again at v10. What is actually invariant here is the typed context and the
+    // count this fixture *supplies* — three legacy migrations — so pin those instead.
+    // The refusal arrives as `StorageError::Worker(StorageWorkerError::…)` wrapping the
+    // inner `InvalidData`, so matching the typed variant means reaching through two enums
+    // whose shapes are themselves churn-prone. Assert the two parts of the message that are
+    // genuinely invariant instead: the stable `&'static str` context identifying schema
+    // validation as the refusing stage, and the migration count this fixture supplies.
+    let rendered = error.to_string();
     assert!(
-        error
-            .to_string()
-            .contains("expected exactly two ScriptBots migrations through v7, found 3"),
-        "unexpected legacy-schema refusal: {error}"
+        rendered.contains("storage.recovery_schema"),
+        "a legacy schema must be refused by schema validation, got {rendered}"
+    );
+    assert!(
+        rendered.contains("found 3"),
+        "the refusal must name the three legacy migrations this fixture supplies: {rendered}"
     );
     let after = fs::read(&path)?;
     assert_eq!(

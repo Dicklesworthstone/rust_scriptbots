@@ -581,6 +581,7 @@ pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
     CREATE INDEX interactions_run_actor_tick_index
+        ON interactions (run_id, actor_agent_uid, tick, seq);
     CREATE INDEX interactions_run_target_tick_index
         ON interactions (run_id, target_agent_uid, tick, seq);
 
@@ -1236,8 +1237,18 @@ const MAX_CONFIG_OVERRIDES: usize = 1_024;
 const MAX_CONFIG_OVERRIDE_VALUE_BYTES: usize = 64 * 1024;
 const MAX_RUN_AGENT_RNG_COUNTERS: usize = 1_000_000;
 const CONFIG_DIGEST_ENCODING_V1: &str = "blake3-canonical-json-v1";
-const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
-const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.5";
+/// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
+///
+/// This crate is the single definition of both manifest schema tags (`bd-k0wj`).
+/// `scriptbots-app` re-exports them rather than declaring its own — it already depends on
+/// this crate, and the previous arrangement had each crate declaring its own copy, which
+/// silently diverged: `ff937dec6` bumped the bootstrap tag in the app while storage kept
+/// validating the older one, so the writer emitted manifests the reader refused.
+pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
+
+/// Compatible V3 minor schema used when a manifest carries `WorldDigestV1.7` bootstrap
+/// evidence. See [`RUN_MANIFEST_V3_SCHEMA`] for why this lives here and not in the app.
+pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.6";
 
 /// Queryable provenance registered atomically before a run may persist tick zero.
 ///
@@ -1527,6 +1538,27 @@ impl RunManifestRecord {
     }
 }
 
+/// The digest contract a superseded bootstrap manifest tag embeds, if it is superseded.
+///
+/// One table, consulted both by manifest validation and by the cross-crate guard test, so
+/// "which tags are stale" cannot drift the way the tag constants themselves did (`bd-k0wj`).
+/// Each entry names the exact `WorldDigest` contract that tag froze, so a refusal reports
+/// which contract is out of date rather than only that the tag is unrecognized.
+#[must_use]
+pub fn superseded_bootstrap_world_digest(schema: &str) -> Option<&'static str> {
+    match schema {
+        "scriptbots.run-manifest.v3.4" => Some("WorldDigestV1.5"),
+        "scriptbots.run-manifest.v3.5" => Some("WorldDigestV1.6"),
+        _ => None,
+    }
+}
+
+/// Whether storage treats this manifest schema tag as superseded.
+#[must_use]
+pub fn manifest_schema_is_superseded(schema: &str) -> bool {
+    superseded_bootstrap_world_digest(schema).is_some()
+}
+
 fn validate_v3_manifest_projection(
     record: &RunManifestRecord,
     manifest: &Value,
@@ -1534,9 +1566,9 @@ fn validate_v3_manifest_projection(
     brain_roster: &Value,
 ) -> Result<(), StorageError> {
     let schema = manifest_required_bounded_string(manifest, "/schema", MAX_RUN_LABEL_BYTES)?;
-    if schema == "scriptbots.run-manifest.v3.4" {
+    if let Some(embedded_world_digest) = superseded_bootstrap_world_digest(schema) {
         return Err(manifest_projection_error(format!(
-            "/schema is {schema:?}, but that bootstrap schema embeds the superseded WorldDigestV1.5 contract; expected {RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA:?}"
+            "/schema is {schema:?}, but that bootstrap schema embeds the superseded {embedded_world_digest} contract; expected {RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA:?}"
         )));
     }
     if matches!(
@@ -16882,9 +16914,17 @@ mod tests {
                 "events",
                 "genomes",
                 "interactions",
+                "islands",
                 "lineage_edges",
                 "metrics",
+                "migrations",
                 "replay_events",
+                "run_events",
+                "run_events_fts",
+                "run_events_fts_config",
+                "run_events_fts_data",
+                "run_events_fts_docsize",
+                "run_events_fts_idx",
                 "run_features",
                 "runs",
                 "state_digests",

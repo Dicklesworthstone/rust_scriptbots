@@ -23,10 +23,12 @@ pub mod lab_assistant;
 pub mod montage;
 pub mod tournament;
 
-/// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
-pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
-/// Compatible V3 minor schema used when a manifest carries WorldDigestV1.7 bootstrap evidence.
-pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.6";
+// The manifest schema tags are defined once, in `scriptbots-storage`, and re-exported here
+// (`bd-k0wj`). Each crate previously declared its own copy, and they diverged: `ff937dec6`
+// bumped the bootstrap tag here to v3.6 while storage kept validating v3.5, so this crate
+// emitted manifests storage refused. The writer and the reader of a wire contract cannot
+// hold separate constants for it.
+pub use scriptbots_storage::{RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA, RUN_MANIFEST_V3_SCHEMA};
 /// Schema identifier for a sequence of V2 world characterization points.
 pub const CHARACTERIZATION_TRACE_V2_SCHEMA: &str = "scriptbots.characterization-trace.v2";
 /// Safety bound for the temporary characterization runner.
