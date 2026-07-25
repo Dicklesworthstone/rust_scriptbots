@@ -66,7 +66,11 @@ fn the_default_configuration_actually_varies_daylight_over_a_day() {
 
     // Sample across whatever cycle the default selects; fall back to a day's worth of ticks so
     // the zero case still samples widely instead of trivially reading one tick.
-    let span = if cycle_ticks == 0 { 10_000 } else { cycle_ticks };
+    let span = if cycle_ticks == 0 {
+        10_000
+    } else {
+        cycle_ticks
+    };
     let mut minimum = f32::INFINITY;
     let mut maximum = f32::NEG_INFINITY;
     for step in 0..64u64 {
