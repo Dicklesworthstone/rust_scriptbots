@@ -15449,13 +15449,18 @@ impl fmt::Debug for WorldState {
     }
 }
 // bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
-// order and fixed-width casts are part of the science contract; fma fusion,
+// order and widening int→float casts are part of the science contract; fma fusion,
 // reassociation, or width changes alter world digests.
+//
+// bd-9zq2: the three NARROWING lints (cast_possible_truncation, cast_sign_loss,
+// cast_possible_wrap) are deliberately NOT allowed here. Widening a u32 into an f32
+// loses precision in a bounded, intended way, so blanket-allowing it across this impl
+// is defensible. Truncating an f32 into an i32, wrapping a u32, or dropping a sign can
+// produce an arbitrarily wrong value, and those are exactly the accidents that must not
+// be able to hide in ~8,500 lines. They are allowed per-site with a stated reason
+// instead, so a NEW narrowing cast anywhere in this impl fails the lint.
 #[allow(
     clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
     clippy::suboptimal_flops,
     clippy::imprecise_flops,
     clippy::float_cmp
@@ -16342,8 +16347,13 @@ impl WorldState {
                 let hearing_channel = channels.hearing;
                 let blood = channels.blood;
 
+                // bd-9zq2: legacy toroidal grid contract. `.floor()` makes the f32→i32
+                // truncation the intent, `rem_euclid` then folds negatives back into range,
+                // and grid dimensions are far below i32::MAX so the u32→i32 cast cannot wrap.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 let cell_x =
                     ((position.x / cell_size).floor() as i32).rem_euclid(food_width as i32) as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 let cell_y =
                     ((position.y / cell_size).floor() as i32).rem_euclid(food_height as i32) as u32;
                 let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
@@ -16527,7 +16537,10 @@ impl WorldState {
         let food_width = self.food.width();
         let food_height = self.food.height();
         let food_max = self.config.food_max;
+        // bd-9zq2: same legacy toroidal grid contract as the batched sense path above.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let cell_x = ((position.x / cell_size).floor() as i32).rem_euclid(food_width as i32) as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let cell_y =
             ((position.y / cell_size).floor() as i32).rem_euclid(food_height as i32) as u32;
         let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
@@ -18283,7 +18296,14 @@ impl WorldState {
                 #[cfg(not(any(test, feature = "economy-faults")))]
                 let health_gate = healths[idx] < 2.0;
                 if (intake_rate > 0.0 || waste_rate > 0.0) && health_gate {
+                    // bd-9zq2: positions are wrapped into [0, extent) by the toroidal
+                    // geometry before this stage, so the value floored here is non-negative
+                    // and in range. NOTE: unlike the two sense paths, this one relies on that
+                    // invariant instead of `rem_euclid` — a negative x would saturate to 0
+                    // rather than wrap. Recorded on bd-9zq2 as a divergence worth converging.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
                     let profile_index = (cell_y as usize) * food_width + cell_x as usize;
                     let profile =
@@ -19604,10 +19624,14 @@ impl WorldState {
             }
         }
 
+        // bd-9zq2: both counts are bounded by the live agent population, which is itself
+        // bounded by config.max_agents (a u32-range knob), so neither can exceed u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         let attempts = results
             .iter()
             .filter(|result| !result.hits.is_empty())
             .count() as u32;
+        #[allow(clippy::cast_possible_truncation)]
         let hits = results
             .iter()
             .map(|result| result.hits.len() as u32)
