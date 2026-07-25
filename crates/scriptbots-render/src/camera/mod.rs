@@ -3,6 +3,7 @@ use scriptbots_core::Position;
 
 const SCROLL_LINE_HEIGHT_PX: f32 = 20.0;
 const ZOOM_PER_SCROLL_LINE: f32 = 1.1;
+const INITIAL_AGENT_DIAMETERS_ACROSS: f32 = 120.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CameraConfig {
@@ -32,6 +33,7 @@ struct CameraState {
     last_scale: f32,
     last_base_scale: f32,
     centered_once: bool,
+    initial_population_view_resolved: bool,
 }
 
 #[allow(dead_code)]
@@ -132,6 +134,11 @@ impl Camera {
     }
 
     #[inline]
+    pub fn cancel_initial_population_view(&mut self) {
+        self.state.initial_population_view_resolved = true;
+    }
+
+    #[inline]
     pub fn ensure_default_zoom(&mut self, base_scale: f32) {
         if self.state.zoom_initialized || base_scale <= 0.0 {
             return;
@@ -195,6 +202,7 @@ impl Camera {
     }
 
     pub fn start_pan(&mut self, cursor: Point<Pixels>) {
+        self.cancel_initial_population_view();
         self.panning = true;
         self.pan_anchor = Some(cursor);
     }
@@ -230,6 +238,7 @@ impl Camera {
         if !scroll_lines.is_finite() || scroll_lines.abs() < 0.01 {
             return false;
         }
+        self.cancel_initial_population_view();
 
         let old_zoom = self.state.zoom;
         let base_scale = self.state.last_base_scale;
@@ -427,6 +436,78 @@ impl Camera {
         }
     }
 
+    pub fn layout_with_initial_population<I>(
+        &mut self,
+        canvas_origin: (f32, f32),
+        canvas_size: (f32, f32),
+        world_size: (f32, f32),
+        agent_radius: f32,
+        positions: I,
+    ) -> ViewLayout
+    where
+        I: IntoIterator<Item = Position>,
+    {
+        self.try_initialize_population_view(
+            canvas_origin,
+            canvas_size,
+            world_size,
+            agent_radius,
+            positions,
+        );
+        self.layout(canvas_origin, canvas_size, world_size)
+    }
+
+    fn try_initialize_population_view<I>(
+        &mut self,
+        canvas_origin: (f32, f32),
+        canvas_size: (f32, f32),
+        world_size: (f32, f32),
+        agent_radius: f32,
+        positions: I,
+    ) -> bool
+    where
+        I: IntoIterator<Item = Position>,
+    {
+        if self.state.initial_population_view_resolved
+            || !canvas_size.0.is_finite()
+            || !canvas_size.1.is_finite()
+            || canvas_size.0 <= f32::EPSILON
+            || canvas_size.1 <= f32::EPSILON
+            || !world_size.0.is_finite()
+            || !world_size.1.is_finite()
+            || world_size.0 <= f32::EPSILON
+            || world_size.1 <= f32::EPSILON
+            || !agent_radius.is_finite()
+            || agent_radius <= f32::EPSILON
+        {
+            return false;
+        }
+
+        let Some(center) = population_density_center(positions, world_size) else {
+            return false;
+        };
+
+        let base_scale = (canvas_size.0 / world_size.0)
+            .min(canvas_size.1 / world_size.1)
+            .max(0.0001);
+        let target_world_span = INITIAL_AGENT_DIAMETERS_ACROSS * agent_radius * 2.0;
+        let target_scale = canvas_size.0 / target_world_span;
+        let target_zoom =
+            (target_scale / base_scale).clamp(self.config.min_zoom, self.config.max_zoom);
+        if !target_zoom.is_finite() || target_zoom <= f32::EPSILON {
+            return false;
+        }
+
+        self.state.zoom = target_zoom;
+        self.state.zoom_initialized = true;
+        self.state.offset_px = (0.0, 0.0);
+        self.record_render_metrics(canvas_origin, canvas_size, world_size, base_scale);
+        self.center_on(center);
+        self.state.centered_once = true;
+        self.state.initial_population_view_resolved = true;
+        true
+    }
+
     fn compute_layout(
         &self,
         canvas_origin: (f32, f32),
@@ -462,6 +543,65 @@ impl Camera {
             fully_offscreen,
         }
     }
+}
+
+fn population_density_center<I>(positions: I, world_size: (f32, f32)) -> Option<Position>
+where
+    I: IntoIterator<Item = Position>,
+{
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for position in positions {
+        if position.x.is_finite() && position.y.is_finite() {
+            xs.push(position.x.rem_euclid(world_size.0));
+            ys.push(position.y.rem_euclid(world_size.1));
+        }
+    }
+
+    Some(Position::new(
+        toroidal_median(&mut xs, world_size.0)?,
+        toroidal_median(&mut ys, world_size.1)?,
+    ))
+}
+
+fn toroidal_median(values: &mut [f32], extent: f32) -> Option<f32> {
+    if values.is_empty() || !extent.is_finite() || extent <= f32::EPSILON {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+
+    let mut largest_gap = f32::NEG_INFINITY;
+    let mut unwrap_origin = values[0];
+    for index in 0..values.len() {
+        let current = values[index];
+        let next = if index + 1 < values.len() {
+            values[index + 1]
+        } else {
+            values[0] + extent
+        };
+        let gap = next - current;
+        if gap > largest_gap {
+            largest_gap = gap;
+            unwrap_origin = if index + 1 < values.len() {
+                values[index + 1]
+            } else {
+                values[0]
+            };
+        }
+    }
+
+    for value in values.iter_mut() {
+        *value = (*value - unwrap_origin).rem_euclid(extent);
+    }
+    values.sort_by(f32::total_cmp);
+    let midpoint = values.len() / 2;
+    let median = if values.len() % 2 == 0 {
+        let lower = values[midpoint - 1];
+        lower + (values[midpoint] - lower) * 0.5
+    } else {
+        values[midpoint]
+    };
+    Some((unwrap_origin + median).rem_euclid(extent))
 }
 
 struct LayoutComputation {
@@ -745,5 +885,215 @@ mod tests {
             world_point,
             recovered
         );
+    }
+
+    fn clustered_population_with_one_outlier() -> Vec<Position> {
+        let mut positions = Vec::new();
+        for x in [120.0, 240.0, 360.0] {
+            for y in [120.0, 240.0, 360.0] {
+                positions.push(Position::new(x, y));
+            }
+        }
+        positions.push(Position::new(5_900.0, 2_900.0));
+        positions
+    }
+
+    #[test]
+    fn initial_population_frame_is_density_centered_and_viewport_independent() {
+        let agent_radius = ScriptBotsConfig::default().bot_radius;
+        let positions = clustered_population_with_one_outlier();
+
+        for viewport in [(1280.0, 720.0), (1600.0, 900.0)] {
+            let mut camera = Camera::default();
+            let layout = camera.layout_with_initial_population(
+                (0.0, 0.0),
+                viewport,
+                WORLD,
+                agent_radius,
+                positions.iter().copied(),
+            );
+
+            let visible_agent_diameters = viewport.0 / (layout.scale * agent_radius * 2.0);
+            assert!(
+                approx_eq(visible_agent_diameters, 120.0, 1e-3),
+                "{viewport:?} must show 120 agent diameters across, got {visible_agent_diameters}"
+            );
+            assert!(
+                layout.scale * agent_radius >= 5.0,
+                "{viewport:?} must make agents legible, got radius {} px",
+                layout.scale * agent_radius
+            );
+
+            let population_center = camera
+                .world_to_screen((240.0, 240.0))
+                .expect("population median is inside the world");
+            assert!(
+                approx_eq(population_center.0, viewport.0 * 0.5, 1e-3)
+                    && approx_eq(population_center.1, viewport.1 * 0.5, 1e-3),
+                "coordinate median must be centered despite the distant outlier: {population_center:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn population_center_respects_the_toroidal_seam() {
+        let center = population_density_center(
+            [
+                Position::new(5_980.0, 1_490.0),
+                Position::new(10.0, 1_500.0),
+                Position::new(30.0, 1_510.0),
+            ],
+            WORLD,
+        )
+        .expect("non-empty finite population has a center");
+
+        assert!(
+            center.x < 50.0 || center.x > WORLD.0 - 50.0,
+            "a seam cluster must not be centered in empty mid-world space: {}",
+            center.x
+        );
+        assert!(approx_eq(center.y, 1_500.0, 1e-3));
+    }
+
+    #[test]
+    fn successful_population_frame_is_one_shot() {
+        let mut camera = Camera::default();
+        let agent_radius = ScriptBotsConfig::default().bot_radius;
+        camera.layout_with_initial_population(
+            (0.0, 0.0),
+            VIEWPORT,
+            WORLD,
+            agent_radius,
+            clustered_population_with_one_outlier(),
+        );
+        let initialized = camera.snapshot();
+
+        camera.layout_with_initial_population(
+            (0.0, 0.0),
+            VIEWPORT,
+            WORLD,
+            agent_radius,
+            [Position::new(5_500.0, 2_500.0)],
+        );
+        let second_frame = camera.snapshot();
+
+        assert_eq!(second_frame.zoom.to_bits(), initialized.zoom.to_bits());
+        assert_eq!(
+            second_frame.offset_px.0.to_bits(),
+            initialized.offset_px.0.to_bits()
+        );
+        assert_eq!(
+            second_frame.offset_px.1.to_bits(),
+            initialized.offset_px.1.to_bits()
+        );
+    }
+
+    #[test]
+    fn empty_frame_stays_eligible_for_population_framing() {
+        let mut camera = Camera::default();
+        let agent_radius = ScriptBotsConfig::default().bot_radius;
+
+        camera.layout_with_initial_population(
+            (0.0, 0.0),
+            VIEWPORT,
+            WORLD,
+            agent_radius,
+            std::iter::empty(),
+        );
+        camera.layout_with_initial_population(
+            (0.0, 0.0),
+            VIEWPORT,
+            WORLD,
+            agent_radius,
+            clustered_population_with_one_outlier(),
+        );
+
+        let population_center = camera
+            .world_to_screen((240.0, 240.0))
+            .expect("population median is inside the world");
+        assert!(
+            approx_eq(population_center.0, VIEWPORT.0 * 0.5, 1e-3)
+                && approx_eq(population_center.1, VIEWPORT.1 * 0.5, 1e-3),
+            "an empty first render must not consume the one-shot population frame"
+        );
+    }
+
+    #[test]
+    fn camera_input_before_population_cancels_pending_auto_frame() {
+        let mut camera = Camera::default();
+        let agent_radius = ScriptBotsConfig::default().bot_radius;
+
+        camera.layout_with_initial_population(
+            (0.0, 0.0),
+            VIEWPORT,
+            WORLD,
+            agent_radius,
+            std::iter::empty(),
+        );
+        camera.start_pan(Point {
+            x: px(400.0),
+            y: px(300.0),
+        });
+        assert!(camera.update_pan(Point {
+            x: px(475.0),
+            y: px(340.0),
+        }));
+        camera.end_pan();
+        let after_input = camera.snapshot();
+
+        let layout = camera.layout_with_initial_population(
+            (0.0, 0.0),
+            VIEWPORT,
+            WORLD,
+            agent_radius,
+            clustered_population_with_one_outlier(),
+        );
+        let after_population = camera.snapshot();
+
+        assert_eq!(
+            after_population.offset_px.0.to_bits(),
+            after_input.offset_px.0.to_bits()
+        );
+        assert_eq!(
+            after_population.offset_px.1.to_bits(),
+            after_input.offset_px.1.to_bits()
+        );
+        assert!(
+            approx_eq(layout.scale, CameraConfig::default().legacy_scale, 1e-6),
+            "user camera input must preserve the legacy wide scale instead of being overwritten"
+        );
+    }
+
+    #[test]
+    fn fit_world_restores_the_legacy_geometric_view_after_population_frame() {
+        let agent_radius = ScriptBotsConfig::default().bot_radius;
+
+        for viewport in [(1280.0, 720.0), (1600.0, 900.0)] {
+            let mut camera = Camera::default();
+            camera.layout_with_initial_population(
+                (0.0, 0.0),
+                viewport,
+                WORLD,
+                agent_radius,
+                clustered_population_with_one_outlier(),
+            );
+
+            camera.fit_world();
+            let layout = camera.layout((0.0, 0.0), viewport, WORLD);
+            let snapshot = camera.snapshot();
+            let world_center = camera
+                .world_to_screen((WORLD.0 * 0.5, WORLD.1 * 0.5))
+                .expect("geometric world center is visible");
+
+            assert!(approx_eq(
+                layout.scale,
+                CameraConfig::default().legacy_scale,
+                1e-6
+            ));
+            assert_eq!(snapshot.offset_px.0.to_bits(), 0.0_f32.to_bits());
+            assert_eq!(snapshot.offset_px.1.to_bits(), 0.0_f32.to_bits());
+            assert!(approx_eq(world_center.0, viewport.0 * 0.5, 1e-3));
+            assert!(approx_eq(world_center.1, viewport.1 * 0.5, 1e-3));
+        }
     }
 }
