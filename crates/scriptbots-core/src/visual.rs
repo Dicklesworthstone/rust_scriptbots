@@ -1420,6 +1420,30 @@ pub struct SplatInput {
     pub water_depth: f32,
 }
 
+/// Final renderer-neutral terrain-color inputs for one sample.
+///
+/// `splat_weights` may be the direct result of [`splat_weights`] for a cell, or a
+/// convex interpolation of neighbouring cell weights for a continuous fragment
+/// sample. Keeping those weights explicit lets a smooth renderer preserve
+/// biome-boundary interpolation without reimplementing the color composition.
+#[derive(Debug, Clone, Copy)]
+pub struct TerrainSurfaceInput {
+    /// Weights over [`TERRAIN_BASE_COLORS`] order.
+    pub splat_weights: [f32; SPLAT_LAYERS],
+    /// Combined moisture/fertility channel in `[0, 1]`.
+    pub moisture: f32,
+    /// Normalized elevation channel in `[0, 1]`.
+    pub elevation: f32,
+    /// Local slope magnitude in `[0, 1]`.
+    pub slope: f32,
+    /// Deterministic per-sample accent.
+    pub accent: f32,
+    /// Tick-derived daylight level.
+    pub daylight: f32,
+    /// Final display accessibility transform.
+    pub accessibility: AccessibilityPalette,
+}
+
 // ---------------------------------------------------------------------------
 // Per-pixel terrain sampling (bd-grbc, settled)
 // ---------------------------------------------------------------------------
@@ -1686,6 +1710,39 @@ pub fn splat_weights(input: &SplatInput) -> [f32; SPLAT_LAYERS] {
         w[kind_index] = 1.0;
     }
     w
+}
+
+/// Compose the final semantic terrain color in display-referred sRGB.
+///
+/// This is the shared color boundary for GPUI, Bevy, and world-gfx. Renderers
+/// may rasterize, light, and post-process differently, but none may own a
+/// competing six-layer blend or accessibility transform.
+#[must_use]
+pub fn terrain_surface_srgb(input: &TerrainSurfaceInput) -> [f32; 3] {
+    const KINDS: [TerrainKind; SPLAT_LAYERS] = [
+        TerrainKind::DeepWater,
+        TerrainKind::ShallowWater,
+        TerrainKind::Sand,
+        TerrainKind::Grass,
+        TerrainKind::Bloom,
+        TerrainKind::Rock,
+    ];
+
+    let mut rgb = [0.0_f32; 3];
+    for (kind, weight) in KINDS.into_iter().zip(input.splat_weights) {
+        let shaded = terrain_shaded_color(&TerrainShadeInput {
+            kind,
+            moisture: input.moisture,
+            elevation: input.elevation,
+            slope: input.slope,
+            accent: input.accent,
+            daylight: input.daylight,
+        });
+        rgb[0] += shaded[0] * weight;
+        rgb[1] += shaded[1] * weight;
+        rgb[2] += shaded[2] * weight;
+    }
+    apply_accessibility_palette(rgb, input.accessibility)
 }
 
 /// Blend `amount` of total weight into `layer`, taking proportionally from
