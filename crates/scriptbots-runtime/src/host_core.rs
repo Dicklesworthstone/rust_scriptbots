@@ -21,9 +21,9 @@ use arc_swap::ArcSwap;
 use scriptbots_core::{
     ACTIVATION_CAPTURE_BUDGET, BrainInspectionClientId, BrainInspectionError,
     BrainInspectionRequest, BrainInspectionRevision, CharacterizationError, CompletedStepFault,
-    DynamicAgentSnapshot, DynamicWorldSnapshot, NullPersistence, PersistenceAdmissionSession,
-    PersistenceSessionError, ScientificStateError, ScriptBotsConfig, Tick, TickSummary,
-    WorldDigestV1, WorldState,
+    ControlCommand, ControlDisposition, DynamicAgentSnapshot, DynamicWorldSnapshot,
+    NullPersistence, PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError,
+    ScriptBotsConfig, Tick, TickSummary, WorldDigestV1, WorldState, apply_control_command,
 };
 use std::{
     cell::RefCell,
@@ -2255,7 +2255,11 @@ impl HostCore {
         if self.latched_fault.is_some()
             && matches!(
                 &envelope.command,
-                HostCommand::Step | HostCommand::UpdateConfig(_)
+                HostCommand::Step
+                    | HostCommand::UpdateConfig(_)
+                    | HostCommand::AdjustAgentMutationRates { .. }
+                    | HostCommand::SpawnAgent { .. }
+                    | HostCommand::SpawnCrossover { .. }
             )
         {
             let blocked = self.complete_failed(
@@ -2298,6 +2302,42 @@ impl HostCore {
             HostCommand::UpdateConfig(config) => {
                 self.apply_config_command(admission, &retry_envelope, config, next_control)
             }
+            HostCommand::UpdateSelection(update) => self.apply_world_control_command(
+                admission,
+                &retry_envelope,
+                ControlCommand::UpdateSelection(update),
+                next_control,
+                false,
+            ),
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid,
+                delta_primary,
+                delta_secondary,
+            } => self.apply_world_control_command(
+                admission,
+                &retry_envelope,
+                ControlCommand::AdjustAgentMutationRates {
+                    agent_uid,
+                    delta_primary,
+                    delta_secondary,
+                },
+                next_control,
+                true,
+            ),
+            HostCommand::SpawnAgent { herbivore_tendency } => self.apply_world_control_command(
+                admission,
+                &retry_envelope,
+                ControlCommand::SpawnAgent { herbivore_tendency },
+                next_control,
+                true,
+            ),
+            HostCommand::SpawnCrossover { parent_a, parent_b } => self.apply_world_control_command(
+                admission,
+                &retry_envelope,
+                ControlCommand::SpawnCrossover { parent_a, parent_b },
+                next_control,
+                true,
+            ),
             HostCommand::Step => self.apply_step_command(admission, &retry_envelope, next_control),
             HostCommand::Shutdown => {
                 self.apply_shutdown_command(admission, &retry_envelope, next_control)
@@ -2323,6 +2363,49 @@ impl HostCore {
         }
         self.revisions.control = next_control;
         self.revisions.config = ConfigRevision::new(self.world.config_revision());
+        let applied = self.applied_boundary();
+        self.complete_applied_with(envelope.command_id, admission, applied)?;
+        let blocked = self.offer_journal(envelope, applied, None, None)?;
+        Ok(ApplyResult::completed(blocked))
+    }
+
+    fn apply_world_control_command(
+        &mut self,
+        admission: AdmissionSequence,
+        envelope: &CommandEnvelope,
+        command: ControlCommand,
+        next_control: ControlRevision,
+        advances_scientific: bool,
+    ) -> Result<ApplyResult, HostAccessError> {
+        let next_scientific = advances_scientific
+            .then(|| {
+                self.revisions
+                    .scientific
+                    .checked_next()
+                    .ok_or_else(|| protocol_violation("scientific revision exhausted"))
+            })
+            .transpose()?;
+        match apply_control_command(&mut self.world, command) {
+            Ok(ControlDisposition::WorldApplied) => {}
+            Ok(ControlDisposition::Playback(_)) => {
+                return Err(protocol_violation(
+                    "world HostCommand mapped to a playback-only core command",
+                ));
+            }
+            Err(error) => {
+                let blocked = self.complete_failed(
+                    envelope.command_id,
+                    admission,
+                    "world_control_application",
+                    error.to_string(),
+                )?;
+                return Ok(ApplyResult::completed(blocked));
+            }
+        }
+        self.revisions.control = next_control;
+        if let Some(next_scientific) = next_scientific {
+            self.revisions.scientific = next_scientific;
+        }
         let applied = self.applied_boundary();
         self.complete_applied_with(envelope.command_id, admission, applied)?;
         let blocked = self.offer_journal(envelope, applied, None, None)?;
@@ -3088,7 +3171,8 @@ mod tests {
         BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner, Generation, HydrologyField,
         HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer, INPUT_SIZE, MapArtifact,
         MapArtifactMetadata, MapGeneratorKind, OUTPUT_SIZE, Position, ScriptBotsConfig,
-        TerrainLayer, Velocity, bound_brain_inspection,
+        SelectionMode, SelectionState, SelectionUpdate, TerrainLayer, Velocity,
+        bound_brain_inspection,
     };
     use std::{hint::black_box, time::Instant};
 
@@ -4842,6 +4926,189 @@ mod tests {
             .expect("step then config");
         assert_eq!(applied(&status(&mut after_port, 1)).tick, Tick(1));
         assert_eq!(applied(&status(&mut after_port, 2)).tick, Tick(1));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered scenario proves all four typed world-command revision domains"
+    )]
+    fn typed_world_commands_use_canonical_application_and_revision_domains() {
+        let mut seeded_world = world(0);
+        seeded_world
+            .try_spawn_agent(AgentData::default())
+            .expect("seed first typed-command parent");
+        seeded_world
+            .try_spawn_agent(AgentData::default())
+            .expect("seed second typed-command parent");
+        seeded_world
+            .step()
+            .expect("finalize seeded parent origins before crossover");
+        let mut core = HostCore::new(HostSessionId::new(7), seeded_world, options(true))
+            .expect("typed-command host construction");
+        let mut port = core.local_port();
+        let initial_tick = core.world_tick();
+        let initial_revisions = core.latest_snapshot().revisions;
+        let handles = core
+            .world
+            .agents()
+            .iter_handles()
+            .take(2)
+            .collect::<Vec<_>>();
+        let [target, second_parent] = handles.as_slice() else {
+            panic!("deterministic host needs two live agents");
+        };
+        let target = *target;
+        let second_parent = *second_parent;
+        let target_uid = core.world.agent_uid(target).expect("target uid");
+        let second_parent_uid = core
+            .world
+            .agent_uid(second_parent)
+            .expect("second parent uid");
+        let digest_before = core
+            .scientific_digest_v1()
+            .expect("digest before world commands");
+        let agent_count_before = core.world.agent_count();
+
+        submit(
+            &mut port,
+            1,
+            HostCommand::UpdateSelection(SelectionUpdate {
+                mode: SelectionMode::Replace,
+                agent_ids: vec![target.raw()],
+                state: SelectionState::Selected,
+            }),
+        );
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("selection boundary");
+        let selected = applied(&status(&mut port, 1));
+        assert_eq!(selected.tick, initial_tick);
+        assert_eq!(
+            selected.revisions.control,
+            ControlRevision::new(initial_revisions.control.get() + 1)
+        );
+        assert_eq!(selected.revisions.scientific, initial_revisions.scientific);
+        assert_eq!(
+            core.world
+                .agent_runtime(target)
+                .expect("selected runtime")
+                .selection,
+            SelectionState::Selected
+        );
+        assert_eq!(
+            core.scientific_digest_v1()
+                .expect("selection-neutral digest"),
+            digest_before
+        );
+
+        submit(
+            &mut port,
+            2,
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid: target_uid,
+                delta_primary: 0.125,
+                delta_secondary: 0.25,
+            },
+        );
+        submit(
+            &mut port,
+            3,
+            HostCommand::SpawnAgent {
+                herbivore_tendency: 0.75,
+            },
+        );
+        submit(
+            &mut port,
+            4,
+            HostCommand::SpawnCrossover {
+                parent_a: target_uid,
+                parent_b: second_parent_uid,
+            },
+        );
+        let receipt = core
+            .drive(ManualInstant::from_nanos(1))
+            .expect("typed world-command boundary");
+        assert_eq!(receipt.commands_completed, 3);
+        assert_eq!(receipt.scientific_steps, 0);
+        assert_eq!(core.world_tick(), initial_tick);
+        assert_eq!(core.world.agent_count(), agent_count_before + 2);
+        for (command_id, control, scientific) in [(2, 2, 1), (3, 3, 2), (4, 4, 3)] {
+            let applied = applied(&status(&mut port, command_id));
+            assert_eq!(applied.tick, initial_tick);
+            assert_eq!(
+                applied.revisions.control,
+                ControlRevision::new(initial_revisions.control.get() + control)
+            );
+            assert_eq!(
+                applied.revisions.scientific,
+                ScientificRevision::new(initial_revisions.scientific.get() + scientific)
+            );
+            assert_eq!(
+                status(&mut port, command_id).journal(),
+                &JournalState::Pending
+            );
+        }
+        assert_ne!(
+            core.scientific_digest_v1()
+                .expect("digest after scientific commands"),
+            digest_before
+        );
+
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("volatile journal receipts");
+        for command_id in 1..=4 {
+            assert_eq!(
+                status(&mut port, command_id).journal(),
+                &JournalState::CommittedVolatile
+            );
+        }
+    }
+
+    #[test]
+    fn typed_world_mutations_and_step_apply_at_true_fifo_boundaries() {
+        let (mut core, mut port) = host(true);
+
+        submit(
+            &mut port,
+            1,
+            HostCommand::SpawnAgent {
+                herbivore_tendency: 0.25,
+            },
+        );
+        submit(&mut port, 2, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("spawn then step");
+        assert_eq!(applied(&status(&mut port, 1)).tick, Tick(0));
+        assert_eq!(
+            applied(&status(&mut port, 1)).revisions.scientific,
+            ScientificRevision::new(1)
+        );
+        assert_eq!(applied(&status(&mut port, 2)).tick, Tick(1));
+        assert_eq!(
+            applied(&status(&mut port, 2)).revisions.scientific,
+            ScientificRevision::new(2)
+        );
+
+        submit(&mut port, 3, HostCommand::Step);
+        submit(
+            &mut port,
+            4,
+            HostCommand::SpawnAgent {
+                herbivore_tendency: 0.75,
+            },
+        );
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("step then spawn");
+        assert_eq!(applied(&status(&mut port, 3)).tick, Tick(2));
+        assert_eq!(
+            applied(&status(&mut port, 3)).revisions.scientific,
+            ScientificRevision::new(3)
+        );
+        assert_eq!(applied(&status(&mut port, 4)).tick, Tick(2));
+        assert_eq!(
+            applied(&status(&mut port, 4)).revisions.scientific,
+            ScientificRevision::new(4)
+        );
     }
 
     #[test]

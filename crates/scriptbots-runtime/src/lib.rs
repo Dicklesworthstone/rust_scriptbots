@@ -10,10 +10,11 @@
 
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, DeathRecord,
-    DynamicAgentSnapshot, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
-    PersistenceBatch, ResourceLedgerTick, ScientificStateError, ScriptBotsConfig, TerrainKind,
-    Tick, TickCombatSummary, TickEvents, TickSummary, toroidal_delta,
+    AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, ControlCommand,
+    DeathRecord, DynamicAgentSnapshot, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
+    PersistenceBatch, ResourceLedgerTick, ScientificStateError, ScriptBotsConfig, SelectionUpdate,
+    SimulationCommand, TerrainKind, Tick, TickCombatSummary, TickEvents, TickSummary,
+    toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1595,6 +1596,29 @@ pub enum HostCommand {
     Step,
     /// Atomically replace the active simulation configuration.
     UpdateConfig(Box<ScriptBotsConfig>),
+    /// Apply one renderer-neutral selection update.
+    UpdateSelection(SelectionUpdate),
+    /// Adjust one live agent's mutation-rate controls by stable run identity.
+    AdjustAgentMutationRates {
+        /// Stable target identity; stale or missing targets are accepted no-ops.
+        agent_uid: AgentUid,
+        /// Delta applied to the primary mutation probability.
+        delta_primary: f32,
+        /// Delta applied to the secondary mutation probability.
+        delta_secondary: f32,
+    },
+    /// Inject one randomly positioned agent using the world-owned population RNG stream.
+    SpawnAgent {
+        /// Herbivore tendency assigned to the injected runtime.
+        herbivore_tendency: f32,
+    },
+    /// Inject a crossover child from two explicitly named stable parents.
+    SpawnCrossover {
+        /// First stable parent identity.
+        parent_a: AgentUid,
+        /// Second stable parent identity.
+        parent_b: AgentUid,
+    },
     /// Begin orderly host shutdown.
     Shutdown,
 }
@@ -1613,6 +1637,25 @@ impl HostCommand {
                         message: error.to_string(),
                     })
             }
+            Self::AdjustAgentMutationRates {
+                delta_primary,
+                delta_secondary,
+                ..
+            } if !delta_primary.is_finite() || !delta_secondary.is_finite() => {
+                Err(CommandValidationError::InvalidWorldCommand {
+                    message: "agent mutation-rate deltas must be finite".to_owned(),
+                })
+            }
+            Self::SpawnAgent { herbivore_tendency } if !herbivore_tendency.is_finite() => {
+                Err(CommandValidationError::InvalidWorldCommand {
+                    message: "agent herbivore tendency must be finite".to_owned(),
+                })
+            }
+            Self::SpawnCrossover { parent_a, parent_b } if parent_a == parent_b => {
+                Err(CommandValidationError::InvalidWorldCommand {
+                    message: "crossover parents must be distinct".to_owned(),
+                })
+            }
             _ => Ok(()),
         }
     }
@@ -1629,9 +1672,102 @@ impl HostCommand {
             | Self::SetSpeed(_)
             | Self::Step
             | Self::UpdateConfig(_)
+            | Self::UpdateSelection(_)
+            | Self::AdjustAgentMutationRates { .. }
+            | Self::SpawnAgent { .. }
+            | Self::SpawnCrossover { .. }
             | Self::Shutdown => true,
         }
     }
+}
+
+/// Failure to map a legacy core control request into one atomic host command.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum HostCommandMappingError {
+    /// The playback update requested no operation.
+    #[error("simulation update does not request an operation")]
+    EmptySimulationUpdate,
+    /// One legacy playback update combined operations that need distinct ordered envelopes.
+    #[error("simulation update combines {operation_count} operations")]
+    AmbiguousSimulationUpdate {
+        /// Number of pause, speed, and step operations requested together.
+        operation_count: usize,
+    },
+    /// The legacy playback request failed its canonical normalization contract.
+    #[error("{message}")]
+    InvalidSimulationUpdate {
+        /// Core validation diagnostic.
+        message: String,
+    },
+}
+
+impl TryFrom<ControlCommand> for HostCommand {
+    type Error = HostCommandMappingError;
+
+    fn try_from(command: ControlCommand) -> Result<Self, Self::Error> {
+        match command {
+            ControlCommand::UpdateConfig(config) => Ok(Self::UpdateConfig(config)),
+            ControlCommand::UpdateSelection(update) => Ok(Self::UpdateSelection(update)),
+            ControlCommand::AdjustAgentMutationRates {
+                agent_uid,
+                delta_primary,
+                delta_secondary,
+            } => Ok(Self::AdjustAgentMutationRates {
+                agent_uid,
+                delta_primary,
+                delta_secondary,
+            }),
+            ControlCommand::SpawnAgent { herbivore_tendency } => {
+                Ok(Self::SpawnAgent { herbivore_tendency })
+            }
+            ControlCommand::SpawnCrossover { parent_a, parent_b } => {
+                Ok(Self::SpawnCrossover { parent_a, parent_b })
+            }
+            ControlCommand::UpdateSimulation(update) => map_simulation_command(update),
+            ControlCommand::Pause => Ok(Self::Pause),
+            ControlCommand::Resume => Ok(Self::Resume),
+            ControlCommand::Step => Ok(Self::Step),
+            ControlCommand::SetSpeed(speed) => {
+                if !speed.is_finite() || speed < 0.0 {
+                    return Err(HostCommandMappingError::InvalidSimulationUpdate {
+                        message: "speed_multiplier must be finite and non-negative".to_owned(),
+                    });
+                }
+                Ok(Self::SetSpeed(speed.clamp(0.0, 32.0)))
+            }
+            ControlCommand::Shutdown => Ok(Self::Shutdown),
+        }
+    }
+}
+
+fn map_simulation_command(
+    update: SimulationCommand,
+) -> Result<HostCommand, HostCommandMappingError> {
+    let update = update.into_normalized().map_err(|error| {
+        HostCommandMappingError::InvalidSimulationUpdate {
+            message: error.to_string(),
+        }
+    })?;
+    let operation_count = usize::from(update.paused.is_some())
+        + usize::from(update.speed_multiplier.is_some())
+        + usize::from(update.step_once);
+    if operation_count == 0 {
+        return Err(HostCommandMappingError::EmptySimulationUpdate);
+    }
+    if operation_count != 1 {
+        return Err(HostCommandMappingError::AmbiguousSimulationUpdate { operation_count });
+    }
+    if let Some(paused) = update.paused {
+        return Ok(if paused {
+            HostCommand::Pause
+        } else {
+            HostCommand::Resume
+        });
+    }
+    if let Some(speed) = update.speed_multiplier {
+        return Ok(HostCommand::SetSpeed(speed));
+    }
+    Ok(HostCommand::Step)
 }
 
 /// A command plus its stable identity and optional control-revision compare-and-set guard.
@@ -2286,16 +2422,15 @@ fn retained_death_bytes(record: &DeathRecord) -> usize {
 }
 
 fn retained_command_bytes(command: Option<&CommandEnvelope>) -> usize {
-    let Some(CommandEnvelope {
-        command: HostCommand::UpdateConfig(config),
-        ..
-    }) = command
-    else {
-        return 0;
-    };
-    size_of::<ScriptBotsConfig>().saturating_add(retained_vec_bytes::<usize>(
-        config.neuroflow.hidden_layers.capacity(),
-    ))
+    match command.map(|envelope| &envelope.command) {
+        Some(HostCommand::UpdateConfig(config)) => size_of::<ScriptBotsConfig>().saturating_add(
+            retained_vec_bytes::<usize>(config.neuroflow.hidden_layers.capacity()),
+        ),
+        Some(HostCommand::UpdateSelection(update)) => {
+            retained_vec_bytes::<u64>(update.agent_ids.capacity())
+        }
+        _ => 0,
+    }
 }
 
 const fn retained_application_state_bytes(application: &ApplicationState) -> usize {
@@ -3002,6 +3137,12 @@ pub enum CommandValidationError {
     #[error("{message}")]
     InvalidConfig {
         /// Core validation diagnostic.
+        message: String,
+    },
+    /// A typed scientific-world command failed its scalar or identity contract.
+    #[error("{message}")]
+    InvalidWorldCommand {
+        /// Core-compatible validation diagnostic.
         message: String,
     },
 }
@@ -6460,6 +6601,15 @@ mod tests {
                             .checked_next()
                             .ok_or_else(|| protocol_violation("config revision exhausted"))?;
                     }
+                    HostCommand::UpdateSelection(_) => {}
+                    HostCommand::AdjustAgentMutationRates { .. }
+                    | HostCommand::SpawnAgent { .. }
+                    | HostCommand::SpawnCrossover { .. } => {
+                        self.revisions.scientific =
+                            self.revisions.scientific.checked_next().ok_or_else(|| {
+                                protocol_violation("scientific revision exhausted")
+                            })?;
+                    }
                     HostCommand::Shutdown => self.lifecycle = HostLifecycle::Stopped,
                 }
                 ApplicationState::Applied(AppliedCommand {
@@ -6873,16 +7023,163 @@ mod tests {
 
     #[test]
     fn every_command_class_requires_a_terminal_lifecycle_audit() {
+        let selection = scriptbots_core::SelectionUpdate {
+            mode: scriptbots_core::SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: scriptbots_core::SelectionState::Selected,
+        };
         for command in [
             HostCommand::Pause,
             HostCommand::Resume,
             HostCommand::SetSpeed(1.0),
             HostCommand::Step,
             HostCommand::UpdateConfig(Box::default()),
+            HostCommand::UpdateSelection(selection),
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid: AgentUid(1),
+                delta_primary: 0.01,
+                delta_secondary: -0.01,
+            },
+            HostCommand::SpawnAgent {
+                herbivore_tendency: 0.5,
+            },
+            HostCommand::SpawnCrossover {
+                parent_a: AgentUid(1),
+                parent_b: AgentUid(2),
+            },
             HostCommand::Shutdown,
         ] {
             assert!(command.requires_journal());
         }
+    }
+
+    #[test]
+    fn typed_world_commands_reject_invalid_payloads_before_admission() {
+        assert!(matches!(
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid: AgentUid(1),
+                delta_primary: f32::NAN,
+                delta_secondary: 0.0,
+            }
+            .validate(),
+            Err(CommandValidationError::InvalidWorldCommand { .. })
+        ));
+        assert!(matches!(
+            HostCommand::SpawnAgent {
+                herbivore_tendency: f32::INFINITY,
+            }
+            .validate(),
+            Err(CommandValidationError::InvalidWorldCommand { .. })
+        ));
+        assert!(matches!(
+            HostCommand::SpawnCrossover {
+                parent_a: AgentUid(7),
+                parent_b: AgentUid(7),
+            }
+            .validate(),
+            Err(CommandValidationError::InvalidWorldCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_control_commands_map_once_without_collapsing_order() {
+        let selection = scriptbots_core::SelectionUpdate {
+            mode: scriptbots_core::SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: scriptbots_core::SelectionState::Selected,
+        };
+        let exact_pairs = [
+            (ControlCommand::Pause, HostCommand::Pause),
+            (ControlCommand::Resume, HostCommand::Resume),
+            (ControlCommand::Step, HostCommand::Step),
+            (
+                ControlCommand::UpdateConfig(Box::default()),
+                HostCommand::UpdateConfig(Box::default()),
+            ),
+            (
+                ControlCommand::UpdateSelection(selection.clone()),
+                HostCommand::UpdateSelection(selection),
+            ),
+            (
+                ControlCommand::AdjustAgentMutationRates {
+                    agent_uid: AgentUid(1),
+                    delta_primary: 0.1,
+                    delta_secondary: -0.2,
+                },
+                HostCommand::AdjustAgentMutationRates {
+                    agent_uid: AgentUid(1),
+                    delta_primary: 0.1,
+                    delta_secondary: -0.2,
+                },
+            ),
+            (
+                ControlCommand::SpawnAgent {
+                    herbivore_tendency: 0.75,
+                },
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.75,
+                },
+            ),
+            (
+                ControlCommand::SpawnCrossover {
+                    parent_a: AgentUid(1),
+                    parent_b: AgentUid(2),
+                },
+                HostCommand::SpawnCrossover {
+                    parent_a: AgentUid(1),
+                    parent_b: AgentUid(2),
+                },
+            ),
+            (ControlCommand::Shutdown, HostCommand::Shutdown),
+        ];
+        for (legacy, expected) in exact_pairs {
+            assert_eq!(
+                HostCommand::try_from(legacy).expect("direct command mapping"),
+                expected
+            );
+        }
+        assert_eq!(
+            HostCommand::try_from(ControlCommand::SetSpeed(64.0))
+                .expect("direct speed mapping uses the canonical clamp"),
+            HostCommand::SetSpeed(32.0)
+        );
+        assert!(matches!(
+            HostCommand::try_from(ControlCommand::SetSpeed(-1.0)),
+            Err(HostCommandMappingError::InvalidSimulationUpdate { .. })
+        ));
+
+        assert_eq!(
+            HostCommand::try_from(ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: None,
+                step_once: false,
+            }))
+            .expect("single pause mapping"),
+            HostCommand::Pause
+        );
+        assert_eq!(
+            HostCommand::try_from(ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: None,
+                speed_multiplier: Some(64.0),
+                step_once: false,
+            }))
+            .expect("single normalized speed mapping"),
+            HostCommand::SetSpeed(32.0)
+        );
+        assert_eq!(
+            HostCommand::try_from(ControlCommand::UpdateSimulation(
+                SimulationCommand::default()
+            )),
+            Err(HostCommandMappingError::EmptySimulationUpdate)
+        );
+        assert_eq!(
+            HostCommand::try_from(ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: Some(2.0),
+                step_once: true,
+            })),
+            Err(HostCommandMappingError::AmbiguousSimulationUpdate { operation_count: 3 })
+        );
     }
 
     #[test]
