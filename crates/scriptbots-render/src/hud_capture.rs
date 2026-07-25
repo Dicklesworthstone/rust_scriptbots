@@ -735,6 +735,51 @@ mod tests {
         hits
     }
 
+    /// bd-c7pg CAUSATION PROBE — is the ~10k floor measurement noise, or two different
+    /// worlds?
+    ///
+    /// Captures twice and reports the world tick after each. If the tick advances, the
+    /// differing pixels are not noise at all: they are real simulation change being
+    /// misread as instrument error, and the bead is about a harness photographing two
+    /// different worlds rather than a flaky renderer.
+    #[test]
+    #[ignore = "bd-c7pg diagnostic; run explicitly with --ignored"]
+    fn diagnose_whether_the_world_advances_between_captures() {
+        let (w, h) = (
+            1280.0 * HEADLESS_DEVICE_SCALE,
+            720.0 * HEADLESS_DEVICE_SCALE,
+        );
+
+        // Case A: two captures sharing ONE world. Any tick advance is caused by capture.
+        let shared = capture_world();
+        let t0 = shared.lock().expect("lock").tick().0;
+        let a1 = capture_view(Arc::clone(&shared), GuiViewRole::Hud, w, h).expect("a1");
+        let t1 = shared.lock().expect("lock").tick().0;
+        let a2 = capture_view(Arc::clone(&shared), GuiViewRole::Hud, w, h).expect("a2");
+        let t2 = shared.lock().expect("lock").tick().0;
+        let shared_delta = a1.pixels().zip(a2.pixels()).filter(|(x, y)| x != y).count();
+
+        // Case B: two captures from two FRESH worlds, as every existing test does.
+        let b1 = capture_view(capture_world(), GuiViewRole::Hud, w, h).expect("b1");
+        let b2 = capture_view(capture_world(), GuiViewRole::Hud, w, h).expect("b2");
+        let fresh_delta = b1.pixels().zip(b2.pixels()).filter(|(x, y)| x != y).count();
+
+        println!(
+            "  shared world ticks: {t0} -> {t1} -> {t2}  (advance per capture: {})",
+            t1 - t0
+        );
+        println!("  shared-world pixel delta: {shared_delta}");
+        println!("  fresh-world  pixel delta: {fresh_delta}");
+        println!(
+            "  VERDICT: {}",
+            if t1 > t0 {
+                "world ADVANCES during capture — the floor is real simulation change"
+            } else {
+                "world does not advance — the floor has another source"
+            }
+        );
+    }
+
     /// bd-bacf AUDIT INSTRUMENT — drive every advertised shortcut and see if it does
     /// anything.
     ///
