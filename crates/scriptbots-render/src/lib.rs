@@ -319,9 +319,6 @@ pub mod world_compositor {
         save_every: u32,
         save_counter: u64,
         save_prefix: String,
-        // Capture the very first frame even when save is disabled, so we can
-        // diagnose blank screens without user setup.
-        force_first_capture: bool,
         last_digest: Option<ReadbackDigest>,
         /// Whether the adapter that actually rasterized is a CPU surrogate.
         ///
@@ -359,7 +356,6 @@ pub mod world_compositor {
                 .unwrap_or(1);
             let save_prefix =
                 std::env::var("SB_WGPU_SAVE_PREFIX").unwrap_or_else(|_| "frame".to_string());
-            let force_first_capture = true; // one-time capture for diagnostics
             Self {
                 renderer: None,
                 image: None,
@@ -378,7 +374,6 @@ pub mod world_compositor {
                 save_every,
                 save_counter: 0,
                 save_prefix,
-                force_first_capture,
                 last_digest: None,
                 adapter_is_software: false,
             }
@@ -398,7 +393,6 @@ pub mod world_compositor {
             compositor.save_every = 1;
             compositor.save_counter = 0;
             compositor.save_prefix = save_prefix;
-            compositor.force_first_capture = false;
             compositor
         }
 
@@ -681,7 +675,24 @@ pub mod world_compositor {
         }
 
         fn save_view_if_requested(&mut self, view: &ReadbackView, digest: &ReadbackDigest) {
-            if !self.save_enabled && !(self.force_first_capture && self.save_counter == 0) {
+            self.save_rgba_if_requested(
+                view.bytes(),
+                view.width,
+                view.height,
+                view.bytes_per_row as usize,
+                digest,
+            );
+        }
+
+        fn save_rgba_if_requested(
+            &mut self,
+            src: &[u8],
+            width: u32,
+            height: u32,
+            stride: usize,
+            digest: &ReadbackDigest,
+        ) {
+            if !self.save_enabled {
                 return;
             }
             self.save_counter = self.save_counter.saturating_add(1);
@@ -690,18 +701,10 @@ pub mod world_compositor {
             }
 
             // Ensure directory exists
-            let target_dir = if self.save_enabled {
-                self.save_dir.clone()
-            } else {
-                std::path::PathBuf::from("frames_live")
-            };
+            let target_dir = self.save_dir.clone();
             let _ = std::fs::create_dir_all(&target_dir);
             // Repack from padded rows into tightly packed RGBA8 buffer
-            let width = view.width;
-            let height = view.height;
-            let stride = view.bytes_per_row as usize;
             let row_bytes = (width as usize) * 4;
-            let src = view.bytes();
             let mut tight = vec![0u8; row_bytes * (height as usize)];
             for y in 0..(height as usize) {
                 let src_off = y * stride;
@@ -762,8 +765,88 @@ pub mod world_compositor {
                 sample_a = digest.sample_rgba[3],
                 "wgpu readback frame saved"
             );
-            // Only force one capture
-            self.force_first_capture = false;
+        }
+    }
+
+    #[cfg(test)]
+    mod capture_policy_tests {
+        use super::{Compositor, ReadbackDigest};
+
+        fn unique_capture_dir(label: &str) -> std::path::PathBuf {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time must follow the Unix epoch")
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "scriptbots_capture_policy_{label}_{}_{nonce}",
+                std::process::id()
+            ))
+        }
+
+        fn test_digest() -> ReadbackDigest {
+            ReadbackDigest {
+                width: 2,
+                height: 1,
+                stride: 8,
+                checksum: 0x1234,
+                non_zero: 8,
+                populated_bytes: 8,
+                min_byte: 10,
+                max_byte: 255,
+                sample_rgba: [10, 20, 30, 255],
+            }
+        }
+
+        #[test]
+        fn default_capture_policy_is_write_free_and_explicit_capture_writes_once() {
+            let rgba = [10, 20, 30, 255, 40, 50, 60, 255];
+            let digest = test_digest();
+
+            let disabled_dir = unique_capture_dir("disabled");
+            let mut default = Compositor::new();
+            default.save_enabled = false;
+            default.save_dir = disabled_dir.clone();
+            default.save_prefix = "default".to_owned();
+            default.save_rgba_if_requested(&rgba, 2, 1, 8, &digest);
+
+            assert_eq!(
+                default.save_counter, 0,
+                "a disabled capture policy must not consume a capture sequence number"
+            );
+            assert!(
+                !disabled_dir.exists(),
+                "default capture policy must not create {}",
+                disabled_dir.display()
+            );
+
+            let explicit_dir = unique_capture_dir("explicit");
+            let mut explicit = Compositor::new();
+            explicit.save_enabled = true;
+            explicit.save_dir = explicit_dir.clone();
+            explicit.save_every = 1;
+            explicit.save_counter = 0;
+            explicit.save_prefix = "explicit".to_owned();
+            explicit.save_rgba_if_requested(&rgba, 2, 1, 8, &digest);
+
+            assert_eq!(
+                explicit.save_counter, 1,
+                "one explicit capture request must consume one sequence number"
+            );
+            assert!(
+                explicit_dir.join("explicit_000001.png").is_file(),
+                "the explicit capture path must write exactly one PNG"
+            );
+            assert!(
+                explicit_dir.join("explicit_000001.txt").is_file(),
+                "the explicit capture path must retain its matching metadata"
+            );
+            assert_eq!(
+                std::fs::read_dir(&explicit_dir)
+                    .expect("explicit capture directory must be readable")
+                    .count(),
+                2,
+                "one explicit capture must create only its PNG and metadata artifacts"
+            );
         }
     }
 
