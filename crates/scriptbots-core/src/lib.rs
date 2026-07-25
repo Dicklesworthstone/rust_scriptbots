@@ -15486,6 +15486,41 @@ impl fmt::Debug for WorldState {
             .finish()
     }
 }
+/// Append the four behaviour metrics that summarise one signal channel (bd-mv2j).
+///
+/// Sensors and outputs were two textually duplicated blocks differing only in the metric names
+/// and which accumulators they read.
+///
+/// Names are passed as `&'static str` rather than built with `format!` so each `MetricSample`
+/// keeps its borrowed `Cow` exactly as before -- interpolating would have quietly turned every
+/// metric name into an owned allocation on each batch.
+///
+/// Two asymmetries are deliberate and preserved: `.max` reports the MEAN of the per-agent
+/// peaks rather than the population maximum, and `.stddev` is taken from the mean accumulator
+/// rather than the peak one. Both were true before this extraction and both are easy to
+/// "tidy" into a behaviour change, so they are stated here instead of left implicit.
+fn project_signal_metrics(
+    names: SignalMetricNames,
+    mean: &RunningStats,
+    peak: &RunningStats,
+    entropy: &RunningStats,
+    metrics: &mut Vec<MetricSample>,
+) {
+    metrics.push(MetricSample::new(names.mean, mean.mean()));
+    metrics.push(MetricSample::new(names.stddev, mean.stddev()));
+    metrics.push(MetricSample::new(names.max, peak.mean()));
+    metrics.push(MetricSample::new(names.entropy, entropy.mean()));
+}
+
+/// The four metric names one signal channel publishes.
+#[derive(Debug, Clone, Copy)]
+struct SignalMetricNames {
+    mean: &'static str,
+    stddev: &'static str,
+    max: &'static str,
+    entropy: &'static str,
+}
+
 // bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
 // order and widening int→float casts are part of the science contract; fma fusion,
 // reassociation, or width changes alter world digests.
@@ -21472,33 +21507,30 @@ impl WorldState {
         }
 
         if behavior_enabled {
-            metrics.push(MetricSample::new(
-                "behavior.sensors.mean",
-                sensor_mean.mean(),
-            ));
-            metrics.push(MetricSample::new(
-                "behavior.sensors.stddev",
-                sensor_mean.stddev(),
-            ));
-            metrics.push(MetricSample::new("behavior.sensors.max", sensor_max.mean()));
-            metrics.push(MetricSample::new(
-                "behavior.sensors.entropy",
-                sensor_entropy.mean(),
-            ));
-
-            metrics.push(MetricSample::new(
-                "behavior.outputs.mean",
-                output_mean.mean(),
-            ));
-            metrics.push(MetricSample::new(
-                "behavior.outputs.stddev",
-                output_mean.stddev(),
-            ));
-            metrics.push(MetricSample::new("behavior.outputs.max", output_max.mean()));
-            metrics.push(MetricSample::new(
-                "behavior.outputs.entropy",
-                output_entropy.mean(),
-            ));
+            project_signal_metrics(
+                SignalMetricNames {
+                    mean: "behavior.sensors.mean",
+                    stddev: "behavior.sensors.stddev",
+                    max: "behavior.sensors.max",
+                    entropy: "behavior.sensors.entropy",
+                },
+                &sensor_mean,
+                &sensor_max,
+                &sensor_entropy,
+                &mut metrics,
+            );
+            project_signal_metrics(
+                SignalMetricNames {
+                    mean: "behavior.outputs.mean",
+                    stddev: "behavior.outputs.stddev",
+                    max: "behavior.outputs.max",
+                    entropy: "behavior.outputs.entropy",
+                },
+                &output_mean,
+                &output_max,
+                &output_entropy,
+                &mut metrics,
+            );
         }
 
         let events = self.project_persistence_events(&summary);
