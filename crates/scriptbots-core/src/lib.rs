@@ -3578,6 +3578,8 @@ pub enum WorldContinuationBlocker {
     BrainFault,
     /// A latched persistence fault.
     PersistenceFault,
+    /// A latched scientific-state invariant fault.
+    ScientificFault,
     /// An unacknowledged persistence batch is retained.
     RetainedPersistenceBatch,
 }
@@ -3587,6 +3589,7 @@ impl fmt::Display for WorldContinuationBlocker {
         formatter.write_str(match self {
             Self::BrainFault => "brain fault",
             Self::PersistenceFault => "persistence fault",
+            Self::ScientificFault => "scientific fault",
             Self::RetainedPersistenceBatch => "retained persistence batch",
         })
     }
@@ -6537,10 +6540,15 @@ fn encode_world_step_trace_error(
         }
         WorldStepTraceError::NonContinuable { blocker } => {
             encoder.u8(1);
+            // bd-cqja: discriminant 3 EXTENDS this wire's domain without changing any
+            // existing encoding -- 0, 1 and 2 are untouched, so no previously produced trace
+            // changes a single byte or hash. The new value is only reachable in a state that
+            // used to abort the process outright, so no pre-existing artifact can contain it.
             encoder.u8(match blocker {
                 WorldContinuationBlocker::BrainFault => 0,
                 WorldContinuationBlocker::PersistenceFault => 1,
                 WorldContinuationBlocker::RetainedPersistenceBatch => 2,
+                WorldContinuationBlocker::ScientificFault => 3,
             });
         }
         WorldStepTraceError::MissingAgentData { agent_id } => {
@@ -15386,6 +15394,13 @@ pub struct WorldState {
     persistence_binding: Arc<PersistenceSessionToken>,
     persistence_boundary: PersistenceBoundaryStatus,
     brain_fault: Option<BrainSpawnError>,
+    /// Latched scientific-state invariant violation (bd-cqja).
+    ///
+    /// Mirrors `brain_fault`: a stage that cannot return an error records the exact typed
+    /// fault, finishes the transition inertly, and every later transition is refused. The
+    /// release profile is `panic = "abort"`, so the alternative was killing the process and
+    /// taking the run's unadmitted scientific state with it.
+    scientific_fault: Option<ScientificStateError>,
     persistence_discarded_records_at: Option<Tick>,
     pending_persistence_runtime_tail: AgentMap<PersistenceRuntimeTail>,
     pending_birth_events: usize,
@@ -15557,6 +15572,7 @@ impl WorldState {
             persistence_binding: Arc::new(PersistenceSessionToken::default()),
             persistence_boundary: PersistenceBoundaryStatus::Open { tick: Tick::zero() },
             brain_fault: None,
+            scientific_fault: None,
             persistence_discarded_records_at: None,
             pending_persistence_runtime_tail: AgentMap::new(),
             pending_birth_events: 0,
@@ -15698,22 +15714,35 @@ impl WorldState {
     /// only one branch. A checkpoint restore or test that materializes the same scientific world
     /// in a different slot/dense layout marks the representation dirty; that physical accident
     /// must not choose RNG recipients, reduction order, neighbor priority, or offspring identity.
-    fn canonicalize_agent_execution_order(&mut self) {
+    fn canonicalize_agent_execution_order(&mut self) -> Result<(), ScientificStateError> {
         if self.agent_execution_order_canonical {
-            return;
+            return Ok(());
         }
 
         self.work_handles.clear();
         self.work_handles.extend(self.agents.iter_handles());
+
+        // bd-cqja: prove every handle has an identity BEFORE sorting. A missing one used to
+        // abort the process; it must not instead become an arbitrary sort key, because the
+        // sort order chosen here decides RNG recipients, reduction order, neighbour priority
+        // and offspring identity. Failing before the sort leaves the layout untouched, and
+        // the caller refuses the tick before any stage work runs.
+        if self
+            .work_handles
+            .iter()
+            .any(|id| self.identities.get(*id).is_none())
+        {
+            return Err(ScientificStateError::MissingAgentIdentity {
+                path: "canonicalize_agent_execution_order".to_owned(),
+            });
+        }
+
         let identities = &self.identities;
-        self.work_handles.sort_unstable_by_key(|id| {
-            identities
-                .get(*id)
-                .expect("every live agent must have a stable identity")
-                .uid
-        });
+        self.work_handles
+            .sort_unstable_by_key(|id| identities.get(*id).map(|identity| identity.uid));
         self.agents.reorder(&self.work_handles);
         self.agent_execution_order_canonical = true;
+        Ok(())
     }
 
     fn capture_resource_amounts(&self) -> Option<ResourceAmounts> {
@@ -17740,17 +17769,22 @@ impl WorldState {
         // already owe. This preserves a non-cadence-aligned final tick without allocating and
         // copying a second full agent map on every simulation tick.
         self.pending_persistence_runtime_tail.clear();
+        // bd-cqja: `self.runtime` is borrowed mutably by this loop, so the fault is collected
+        // here and latched after it ends. A missing identity skips that agent's retained tail
+        // rather than aborting the process; the latch then refuses every later transition.
+        let mut missing_identity = false;
+        let identities = &self.identities;
+        let tails = &mut self.pending_persistence_runtime_tail;
         for (agent_id, runtime) in &mut self.runtime {
             if preserve_persistence_tail {
-                let agent_uid = self
-                    .identities
-                    .get(agent_id)
-                    .expect("live runtime must have stable identity")
-                    .uid;
-                self.pending_persistence_runtime_tail.insert(
-                    agent_id,
-                    PersistenceRuntimeTail::capture(agent_uid, runtime),
-                );
+                if let Some(identity) = identities.get(agent_id) {
+                    tails.insert(
+                        agent_id,
+                        PersistenceRuntimeTail::capture(identity.uid, runtime),
+                    );
+                } else {
+                    missing_identity = true;
+                }
             }
             runtime.spiked = false;
             runtime.food_delta = 0.0;
@@ -17762,6 +17796,11 @@ impl WorldState {
                     runtime.indicator = IndicatorState::default();
                 }
             }
+        }
+        if missing_identity {
+            self.latch_scientific_fault(ScientificStateError::MissingAgentIdentity {
+                path: "stage_reset_events.runtime_tail".to_owned(),
+            });
         }
         self.last_births = 0;
         self.last_deaths = 0;
@@ -19880,12 +19919,20 @@ impl WorldState {
             return DeathResourceActivity::default();
         }
 
-        dead.sort_unstable_by_key(|(_, id)| {
-            self.identities
-                .get(*id)
-                .expect("live dying agent must have a stable identity")
-                .uid
-        });
+        // bd-cqja: as in canonicalization, a missing identity must not become an arbitrary
+        // sort key -- death order decides carcass distribution order. Latch and refuse the
+        // run rather than silently reordering the dead.
+        if dead
+            .iter()
+            .any(|(_, id)| self.identities.get(*id).is_none())
+        {
+            self.latch_scientific_fault(ScientificStateError::MissingAgentIdentity {
+                path: "stage_death_cleanup.dead".to_owned(),
+            });
+            self.last_deaths = 0;
+            return DeathResourceActivity::default();
+        }
+        dead.sort_unstable_by_key(|(_, id)| self.identities.get(*id).map(|i| i.uid));
 
         let death_records: Vec<DeathRecord> = {
             let columns = self.agents.columns();
@@ -21544,6 +21591,9 @@ impl WorldState {
         if let Some(brain) = self.brain_fault.clone() {
             return Err(brain.into());
         }
+        if let Some(scientific) = self.scientific_fault.clone() {
+            return Err(scientific.into());
+        }
         if let PersistenceBoundaryStatus::Pending { tick } = self.persistence_boundary {
             return Err(ScientificStateError::PersistenceBoundaryUnresolved {
                 path: "world.step".to_owned(),
@@ -21552,7 +21602,7 @@ impl WorldState {
             .into());
         }
 
-        self.canonicalize_agent_execution_order();
+        self.canonicalize_agent_execution_order()?;
         let next_tick = self.tick.next();
         self.validate_step_generation_headroom(next_tick)?;
         let step_started_at = observer.begin_step(next_tick);
@@ -22212,6 +22262,11 @@ impl WorldState {
             if self.brain_fault.is_some() {
                 return Err(CharacterizationError::NonContinuable {
                     blocker: WorldContinuationBlocker::BrainFault,
+                });
+            }
+            if self.scientific_fault.is_some() {
+                return Err(CharacterizationError::NonContinuable {
+                    blocker: WorldContinuationBlocker::ScientificFault,
                 });
             }
             if matches!(
@@ -23041,6 +23096,43 @@ impl WorldState {
         self.brain_fault.as_ref()
     }
 
+    /// Latched scientific-state invariant violation that prevents later science ticks.
+    #[must_use]
+    pub const fn scientific_fault(&self) -> Option<&ScientificStateError> {
+        self.scientific_fault.as_ref()
+    }
+
+    /// Record a scientific-state invariant violation without aborting the process.
+    ///
+    /// First fault wins: a later cascade must not overwrite the original cause, because the
+    /// first one is the diagnosis and everything after it is consequence.
+    fn latch_scientific_fault(&mut self, error: ScientificStateError) {
+        if self.scientific_fault.is_none() {
+            self.scientific_fault = Some(error);
+        }
+    }
+
+    /// Resolve a stable `AgentUid` inside a stage that cannot return an error.
+    ///
+    /// On success this is exactly `agent_uid`. On the unreachable miss it latches the typed
+    /// fault and yields `None`, so the caller skips that agent, the transition still completes
+    /// deterministically, and every later transition is refused (bd-cqja).
+    fn require_agent_uid_or_latch(
+        &mut self,
+        id: AgentId,
+        path: impl FnOnce() -> String,
+    ) -> Option<AgentUid> {
+        match self.agent_uid(id) {
+            Some(uid) => Some(uid),
+            None => {
+                self.latch_scientific_fault(ScientificStateError::MissingAgentIdentity {
+                    path: path(),
+                });
+                None
+            }
+        }
+    }
+
     /// World-owned view of any fault or unresolved marker that prevents a later science tick.
     ///
     /// Detailed sink acknowledgement failures live on [`PersistenceAdmissionSession`].
@@ -23048,6 +23140,9 @@ impl WorldState {
     pub fn latched_step_error(&self) -> Option<WorldStepError> {
         if let Some(brain) = &self.brain_fault {
             return Some(WorldStepError::BrainSpawn(brain.clone()));
+        }
+        if let Some(scientific) = &self.scientific_fault {
+            return Some(WorldStepError::ScientificState(scientific.clone()));
         }
         match self.persistence_boundary {
             PersistenceBoundaryStatus::Pending { tick } => Some(WorldStepError::ScientificState(
@@ -38760,8 +38855,15 @@ mod tests {
         assert_eq!(world.last_deaths, 2);
     }
 
+    /// A dying agent with no stable identity must never be silently dropped.
+    ///
+    /// This used to assert a panic. Under `panic = "abort"` that was an unrecoverable process
+    /// kill which also destroyed the run's unadmitted scientific state, so bd-cqja replaced it
+    /// with a latched typed fault. The requirement the original test encoded is unchanged and
+    /// the assertion is now strictly stronger: not merely "it did not proceed quietly", but
+    /// that the fault is typed, names its path, is observable, refuses every later transition,
+    /// and refuses to certify the world with a digest.
     #[test]
-    #[should_panic(expected = "live dying agent must have stable identity")]
     fn death_cleanup_never_silently_drops_a_scientific_record() {
         let mut world = WorldState::new(ScriptBotsConfig {
             rng_seed: Some(1234),
@@ -38772,7 +38874,44 @@ mod tests {
         world.identities.remove(agent);
         world.pending_deaths.push(agent);
 
-        world.stage_death_cleanup(Tick::zero());
+        let activity = world.stage_death_cleanup(Tick::zero());
+
+        // The record is not processed, and nothing is invented for it.
+        assert_eq!(activity.carcass_delta, ResourceAmounts::default());
+        assert_eq!(world.last_deaths, 0);
+
+        // The fault is typed and names exactly where it happened.
+        assert!(
+            matches!(
+                world.scientific_fault(),
+                Some(ScientificStateError::MissingAgentIdentity { path })
+                    if path == "stage_death_cleanup.dead"
+            ),
+            "expected a latched MissingAgentIdentity, got {:?}",
+            world.scientific_fault()
+        );
+
+        // Every later transition is refused rather than silently continuing on broken state.
+        assert!(
+            matches!(
+                world.step(),
+                Err(WorldStepError::ScientificState(
+                    ScientificStateError::MissingAgentIdentity { .. }
+                ))
+            ),
+            "a latched scientific fault must refuse the next transition"
+        );
+
+        // And the world will not certify itself while the fault stands.
+        assert!(
+            matches!(
+                world.world_digest_v1(),
+                Err(CharacterizationError::NonContinuable {
+                    blocker: WorldContinuationBlocker::ScientificFault
+                })
+            ),
+            "a faulted world must refuse to produce a canonical digest"
+        );
     }
 
     fn characterization_world(seed: u64) -> (WorldState, Vec<AgentId>) {
