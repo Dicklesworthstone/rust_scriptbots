@@ -2,7 +2,10 @@
 
 use bytemuck::{Pod, Zeroable};
 use scriptbots_core::{NUM_EYES, RenderTonemapMode, visual};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 #[cfg(feature = "perf_counters")]
 use std::time::Instant;
 
@@ -84,6 +87,7 @@ pub struct WorldRenderer {
     renderer_id: u64,
     frame_generation: u64,
     device: wgpu::Device,
+    device_fault: DeviceFaultMonitor,
     queue: wgpu::Queue,
     size: (u32, u32),
     color: wgpu::Texture,
@@ -134,14 +138,20 @@ impl WorldRenderer {
             .map_err(|error| {
                 ReadbackError::Device(format!("wgpu device request failed: {error}"))
             })?;
+        let device_fault = DeviceFaultMonitor::install(&device);
 
         let format = WORLD_COLOR_FORMAT;
-        let readback = ReadbackRing::new(&device, size, format)?;
-        let (color, color_view) = create_color(&device, format, size);
-        let view = ViewUniforms::new(&device, &queue, size);
-        let mut terrain = TerrainPipeline::new(&device, format, &view);
-        terrain.init_atlas(&device, &queue);
-        let agents = AgentPipeline::new(&device, format, &view);
+        let initialized = scoped_gpu_result(&device, "renderer initialization", || {
+            let readback = ReadbackRing::new(&device, size, format)?;
+            let (color, color_view) = create_color(&device, format, size)?;
+            let view = ViewUniforms::new(&device, &queue, size);
+            let mut terrain = TerrainPipeline::new(&device, format, &view);
+            terrain.init_atlas(&device, &queue);
+            let agents = AgentPipeline::new(&device, format, &view);
+            Ok((readback, color, color_view, view, terrain, agents))
+        });
+        device_fault.check()?;
+        let (readback, color, color_view, view, terrain, agents) = initialized?;
         let renderer_id = NEXT_RENDERER_ID
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
@@ -152,6 +162,7 @@ impl WorldRenderer {
             renderer_id,
             frame_generation: 0,
             device,
+            device_fault,
             queue,
             size,
             color,
@@ -174,6 +185,7 @@ impl WorldRenderer {
     }
 
     pub fn resize(&mut self, new_size: (u32, u32)) -> Result<(), ReadbackError> {
+        self.device_fault.check()?;
         if new_size == self.size {
             return Ok(());
         }
@@ -187,27 +199,46 @@ impl WorldRenderer {
             .frame_generation
             .checked_add(1)
             .ok_or_else(|| ReadbackError::Device("render generation overflow".to_owned()))?;
-        // Complete typed device-limit validation and the fallible readback constructor before
-        // replacing any live renderer resource. An invalid extent must leave the prior frame
-        // size and generation usable rather than partially installing the requested extent.
-        let readback = ReadbackRing::new(&self.device, new_size, self.format)?;
-        let (tex, view) = create_color(&self.device, self.format, new_size);
+        let device = self.device.clone();
+        let format = self.format;
+        let needs_post_target = self.post.is_some();
+        let queue = self.queue.clone();
+        let last_anim_seconds = self.last_anim_seconds;
+        let cam_scale = self.cam_scale;
+        let cam_offset = self.cam_offset;
+        let view_uniforms = &self.view;
+        // Prepare every allocation under typed wgpu error scopes before replacing live
+        // renderer resources. Validation and OOM failures therefore preserve the prior
+        // color/readback/post targets, view uniform, size, and generation.
+        let prepared = scoped_gpu_result(&device, "renderer resize", || {
+            let readback = ReadbackRing::new(&device, new_size, format)?;
+            let (tex, view) = create_color(&device, format, new_size)?;
+            let post_target = needs_post_target
+                .then(|| create_color(&device, format, new_size))
+                .transpose()?;
+            let prepared_view = view_uniforms.prepare_resize(
+                &device,
+                &queue,
+                new_size,
+                last_anim_seconds,
+                cam_scale,
+                cam_offset,
+            );
+            Ok((readback, tex, view, post_target, prepared_view))
+        });
+        self.device_fault.check()?;
+        let (readback, tex, view, post_target, prepared_view) = prepared?;
+
         self.color = tex;
         self.color_view = view;
         self.readback = readback;
         self.size = new_size;
-        // keep time monotonic across resizes: reuse the last tick-derived animation time
-        self.view.update(
-            &self.queue,
-            new_size,
-            self.last_anim_seconds,
-            self.cam_scale,
-            self.cam_offset,
-        );
-        if let Some(post) = self.post.as_mut() {
-            post.resize(&self.device, self.format, new_size);
+        self.view.install_resize(prepared_view);
+        if let (Some(post), Some((target, target_view))) = (self.post.as_mut(), post_target) {
+            post.install_resize(format, target, target_view);
         }
         self.frame_generation = next_generation;
+        self.device_fault.check()?;
         Ok(())
     }
 
@@ -217,6 +248,19 @@ impl WorldRenderer {
     }
 
     pub fn render(&mut self, snapshot: &WorldSnapshot) -> Result<RenderFrame, ReadbackError> {
+        self.device_fault.check()?;
+        let device = self.device.clone();
+        let result = scoped_gpu_result(&device, "frame render", || self.render_scoped(snapshot));
+        if let Err(error) = &result
+            && error.is_terminal_gpu_fault()
+        {
+            self.device_fault.record(error.clone());
+        }
+        self.device_fault.check()?;
+        result
+    }
+
+    fn render_scoped(&mut self, snapshot: &WorldSnapshot) -> Result<RenderFrame, ReadbackError> {
         validate_snapshot(snapshot)?;
         if !self.cam_scale.is_finite()
             || self.cam_scale <= 0.0
@@ -315,7 +359,7 @@ impl WorldRenderer {
 
         // Post‑FX (ACES + vignette; FXAA stub): color_view → post.target
         self.post_ran = false;
-        if self.ensure_post(&post_controls, selected_tonemap)
+        if self.ensure_post(&post_controls, selected_tonemap)?
             && let Some(p) = self.post.as_mut()
         {
             // The selected RenderSettings tonemap control wins over the environment
@@ -348,6 +392,21 @@ impl WorldRenderer {
     }
 
     pub fn copy_to_readback(&mut self, frame: &RenderFrame) -> Result<(), ReadbackError> {
+        self.device_fault.check()?;
+        let device = self.device.clone();
+        let result = scoped_gpu_result(&device, "readback copy", || {
+            self.copy_to_readback_scoped(frame)
+        });
+        if let Err(error) = &result
+            && error.is_terminal_gpu_fault()
+        {
+            self.device_fault.record(error.clone());
+        }
+        self.device_fault.check()?;
+        result
+    }
+
+    fn copy_to_readback_scoped(&mut self, frame: &RenderFrame) -> Result<(), ReadbackError> {
         validate_frame_token(frame, self.size, self.renderer_id, self.frame_generation)?;
         #[cfg(feature = "perf_counters")]
         let t0 = Instant::now();
@@ -366,6 +425,7 @@ impl WorldRenderer {
     }
 
     pub fn mapped_rgba(&mut self) -> Result<ReadbackView, ReadbackError> {
+        self.device_fault.check()?;
         self.readback.mapped()
     }
 
@@ -374,9 +434,13 @@ impl WorldRenderer {
         (self.last_render_ms, self.last_readback_ms)
     }
 
-    fn ensure_post(&mut self, controls: &PostControls, selected_tonemap: Option<u32>) -> bool {
+    fn ensure_post(
+        &mut self,
+        controls: &PostControls,
+        selected_tonemap: Option<u32>,
+    ) -> Result<bool, ReadbackError> {
         if !controls.wants_post(selected_tonemap) {
-            return false;
+            return Ok(false);
         }
         if self.post.is_none() {
             self.post = Some(PostFx::new(
@@ -384,9 +448,9 @@ impl WorldRenderer {
                 self.format,
                 &self.color_view,
                 self.size,
-            ));
+            )?);
         }
-        true
+        Ok(true)
     }
 }
 
@@ -550,32 +614,34 @@ fn create_color(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     size: (u32, u32),
-) -> (wgpu::Texture, wgpu::TextureView) {
+) -> Result<(wgpu::Texture, wgpu::TextureView), ReadbackError> {
     // Defensive clamp to ensure valid texture extent
     let size = (size.0.max(1), size.1.max(1));
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("world.color"),
-        size: wgpu::Extent3d {
-            width: size.0,
-            height: size.1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    (tex, view)
+    scoped_gpu_value(device, "color-target allocation", || {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("world.color"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    })
 }
 
 // ---------------- Readback ring (triple-buffered) ----------------
 
-pub struct ReadbackRing {
+struct ReadbackRing {
     slots: [ReadbackSlot; 3],
     curr: usize,
     bytes_per_row: u32,
@@ -594,8 +660,27 @@ struct ReadbackLayout {
 pub enum ReadbackError {
     /// No adapter satisfied the request.
     AdapterUnavailable,
-    /// Device-level failure (poll, submit, lost device).
+    /// Device-level internal or host-side poll failure.
     Device(String),
+    /// A wgpu code/data contract was rejected without losing the device.
+    Validation {
+        /// Public operation whose GPU contract was rejected.
+        operation: String,
+        /// Backend-provided validation detail.
+        detail: String,
+    },
+    /// The device-lost callback reported a terminal GPU device loss.
+    DeviceLost {
+        /// Backend classification for the loss.
+        reason: wgpu::DeviceLostReason,
+        /// Optional backend detail.
+        detail: String,
+    },
+    /// A scoped GPU operation exhausted device memory.
+    OutOfMemory {
+        /// Public operation whose allocation failed.
+        operation: String,
+    },
     /// Unsupported resize extent or readback layout.
     Resize(String),
     /// Buffer map request failed.
@@ -621,6 +706,18 @@ impl std::fmt::Display for ReadbackError {
         match self {
             Self::AdapterUnavailable => write!(f, "no GPU adapter satisfied the request"),
             Self::Device(detail) => write!(f, "GPU device failure: {detail}"),
+            Self::Validation { operation, detail } => {
+                write!(f, "GPU validation rejected {operation}: {detail}")
+            }
+            Self::DeviceLost { reason, detail } if detail.is_empty() => {
+                write!(f, "GPU device lost: {reason:?}")
+            }
+            Self::DeviceLost { reason, detail } => {
+                write!(f, "GPU device lost ({reason:?}): {detail}")
+            }
+            Self::OutOfMemory { operation } => {
+                write!(f, "GPU out of memory during {operation}")
+            }
             Self::Resize(detail) => write!(f, "GPU resize failure: {detail}"),
             Self::Map(detail) => write!(f, "GPU buffer map failure: {detail}"),
             Self::Timeout => write!(f, "GPU readback did not map within the bounded wait"),
@@ -646,7 +743,119 @@ impl std::fmt::Display for ReadbackError {
 
 impl std::error::Error for ReadbackError {}
 
-pub struct ReadbackSlot {
+impl ReadbackError {
+    fn is_terminal_gpu_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::Device(_) | Self::DeviceLost { .. } | Self::OutOfMemory { .. }
+        )
+    }
+}
+
+#[derive(Clone, Default)]
+struct DeviceFaultMonitor {
+    first_fault: Arc<Mutex<Option<ReadbackError>>>,
+}
+
+impl DeviceFaultMonitor {
+    fn install(device: &wgpu::Device) -> Self {
+        let monitor = Self::default();
+
+        let lost_monitor = monitor.clone();
+        device.set_device_lost_callback(move |reason, detail| {
+            lost_monitor.record(ReadbackError::DeviceLost { reason, detail });
+        });
+
+        let uncaptured_monitor = monitor.clone();
+        device.on_uncaptured_error(Arc::new(move |error| {
+            uncaptured_monitor.record(readback_error_from_wgpu(
+                "uncaptured renderer operation",
+                error,
+            ));
+        }));
+
+        monitor
+    }
+
+    fn record(&self, error: ReadbackError) {
+        if let Ok(mut first_fault) = self.first_fault.lock() {
+            let definitive_device_loss = matches!(error, ReadbackError::DeviceLost { .. });
+            let prior_is_device_loss =
+                matches!(first_fault.as_ref(), Some(ReadbackError::DeviceLost { .. }));
+            if first_fault.is_none() || definitive_device_loss && !prior_is_device_loss {
+                *first_fault = Some(error);
+            }
+        }
+    }
+
+    fn check(&self) -> Result<(), ReadbackError> {
+        let mut first_fault = self
+            .first_fault
+            .lock()
+            .map_err(|_| ReadbackError::Device("GPU fault monitor lock was poisoned".to_owned()))?;
+        let Some(error) = first_fault.as_ref() else {
+            return Ok(());
+        };
+        if error.is_terminal_gpu_fault() {
+            return Err(error.clone());
+        }
+        match first_fault.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+fn readback_error_from_wgpu(operation: &str, error: wgpu::Error) -> ReadbackError {
+    match error {
+        wgpu::Error::OutOfMemory { .. } => ReadbackError::OutOfMemory {
+            operation: operation.to_owned(),
+        },
+        wgpu::Error::Validation { description, .. } => ReadbackError::Validation {
+            operation: operation.to_owned(),
+            detail: description,
+        },
+        wgpu::Error::Internal { description, .. } => {
+            ReadbackError::Device(format!("{operation} failed internally: {description}"))
+        }
+    }
+}
+
+fn scoped_gpu_result<T>(
+    device: &wgpu::Device,
+    operation: &str,
+    perform: impl FnOnce() -> Result<T, ReadbackError>,
+) -> Result<T, ReadbackError> {
+    // One filter per scope is required by wgpu. Push all three so allocation and
+    // implementation failures become values instead of reaching the default
+    // uncaptured-error panic handler.
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    device.push_error_scope(wgpu::ErrorFilter::Internal);
+    device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+
+    let result = perform();
+
+    // Native wgpu-core resolves these futures immediately. Drain every scope,
+    // even after finding one error, so no stale scope captures a later frame.
+    let out_of_memory = pollster::block_on(device.pop_error_scope());
+    let internal = pollster::block_on(device.pop_error_scope());
+    let validation = pollster::block_on(device.pop_error_scope());
+    if let Some(error) = out_of_memory.or(internal).or(validation) {
+        return Err(readback_error_from_wgpu(operation, error));
+    }
+
+    result
+}
+
+fn scoped_gpu_value<T>(
+    device: &wgpu::Device,
+    operation: &str,
+    perform: impl FnOnce() -> T,
+) -> Result<T, ReadbackError> {
+    scoped_gpu_result(device, operation, || Ok(perform()))
+}
+
+struct ReadbackSlot {
     buf: wgpu::Buffer,
     ready: bool,
     mapped: std::sync::Arc<AtomicBool>,
@@ -723,7 +932,7 @@ fn validate_readback_layout(
 }
 
 impl ReadbackRing {
-    pub fn new(
+    fn new(
         device: &wgpu::Device,
         extent: (u32, u32),
         format: wgpu::TextureFormat,
@@ -735,21 +944,23 @@ impl ReadbackRing {
             });
         }
         let layout = validate_readback_layout(extent, &device.limits())?;
-        let mk = || {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("world.readback"),
-                size: layout.size_bytes,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            })
-        };
-        let mk_slot = || ReadbackSlot {
-            buf: mk(),
-            ready: false,
-            mapped: std::sync::Arc::new(AtomicBool::new(false)),
-            map_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        };
-        let slots = [mk_slot(), mk_slot(), mk_slot()];
+        let slots = scoped_gpu_value(device, "readback-ring allocation", || {
+            let mk = || {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("world.readback"),
+                    size: layout.size_bytes,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            };
+            let mk_slot = || ReadbackSlot {
+                buf: mk(),
+                ready: false,
+                mapped: Arc::new(AtomicBool::new(false)),
+                map_error: Arc::new(Mutex::new(None)),
+            };
+            [mk_slot(), mk_slot(), mk_slot()]
+        })?;
         Ok(Self {
             slots,
             curr: 0,
@@ -758,7 +969,7 @@ impl ReadbackRing {
         })
     }
 
-    pub fn copy(
+    fn copy(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -822,7 +1033,7 @@ impl ReadbackRing {
         Ok(())
     }
 
-    pub fn mapped(&mut self) -> Result<ReadbackView, ReadbackError> {
+    fn mapped(&mut self) -> Result<ReadbackView, ReadbackError> {
         // Surface any recorded asynchronous map failure before scanning for readiness.
         for slot in &self.slots {
             if let Ok(mut slot_error) = slot.map_error.lock()
@@ -883,9 +1094,10 @@ fn parse_fxaa_env(previous: u32) -> Result<u32, ReadbackError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentInstance, PostControls, ReadbackError, ReadbackLayout, RenderFrame, TerrainView,
-        WorldSnapshot, parse_control_f32, parse_toggle, resolve_bloom_intensity,
-        terrain_atlas_palette, validate_frame_token, validate_readback_layout, validate_snapshot,
+        AgentInstance, DeviceFaultMonitor, PostControls, ReadbackError, ReadbackLayout,
+        RenderFrame, TerrainView, WorldSnapshot, parse_control_f32, parse_toggle,
+        readback_error_from_wgpu, resolve_bloom_intensity, scoped_gpu_value, terrain_atlas_palette,
+        validate_frame_token, validate_readback_layout, validate_snapshot,
     };
     use bytemuck::Zeroable;
     use scriptbots_core::{
@@ -919,9 +1131,11 @@ mod tests {
 
     #[test]
     fn resize_layout_failures_are_typed_before_gpu_allocation() {
-        let mut limits = wgpu::Limits::default();
-        limits.max_texture_dimension_2d = 128;
-        limits.max_buffer_size = 1_024;
+        let limits = wgpu::Limits {
+            max_texture_dimension_2d: 128,
+            max_buffer_size: 1_024,
+            ..wgpu::Limits::default()
+        };
 
         assert_eq!(
             validate_readback_layout((65, 2), &limits),
@@ -962,6 +1176,116 @@ mod tests {
         assert!(
             matches!(pitch_error, ReadbackError::Resize(ref detail) if detail.contains("u32 copy-layout limit")),
             "unexpected row-pitch attribution: {pitch_error}"
+        );
+    }
+
+    #[test]
+    fn device_fault_destroyed_noop_device_is_typed() {
+        let (device, _queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let monitor = DeviceFaultMonitor::install(&device);
+        assert_eq!(monitor.check(), Ok(()));
+
+        device.destroy();
+        device
+            .poll(wgpu::PollType::Poll)
+            .expect("noop device destruction should remain pollable");
+
+        assert_eq!(
+            monitor.check(),
+            Err(ReadbackError::DeviceLost {
+                reason: wgpu::DeviceLostReason::Destroyed,
+                detail: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn device_fault_scoped_noop_validation_is_typed_and_non_terminal() {
+        let (device, _queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let invalid_size = device
+            .limits()
+            .max_buffer_size
+            .checked_add(1)
+            .expect("noop max_buffer_size must leave room for an invalid request");
+
+        let error = scoped_gpu_value(&device, "validation regression", || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("intentionally-oversized-test-buffer"),
+                size: invalid_size,
+                usage: wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+        .expect_err("an oversized buffer must be returned as a scoped error");
+
+        assert!(
+            matches!(
+                &error,
+                ReadbackError::Validation {
+                    operation,
+                    detail
+                } if operation == "validation regression"
+                    && detail.contains("Buffer size")
+            ),
+            "unexpected scoped validation attribution: {error}"
+        );
+        assert!(
+            !error.is_terminal_gpu_fault(),
+            "validation is a rejected operation contract, not a lost device"
+        );
+
+        let monitor = DeviceFaultMonitor::default();
+        monitor.record(error.clone());
+        assert_eq!(monitor.check(), Err(error));
+        assert_eq!(
+            monitor.check(),
+            Ok(()),
+            "an uncaptured validation is surfaced once rather than permanently poisoning the device"
+        );
+    }
+
+    #[test]
+    fn device_fault_synthetic_out_of_memory_classification_is_typed_and_sticky() {
+        let monitor = DeviceFaultMonitor::default();
+        let out_of_memory = readback_error_from_wgpu(
+            "synthetic allocation boundary",
+            wgpu::Error::OutOfMemory {
+                source: Box::new(std::io::Error::other("synthetic OOM classification proof")),
+            },
+        );
+        assert_eq!(
+            out_of_memory,
+            ReadbackError::OutOfMemory {
+                operation: "synthetic allocation boundary".to_owned(),
+            }
+        );
+
+        monitor.record(out_of_memory.clone());
+        assert_eq!(monitor.check(), Err(out_of_memory.clone()));
+        assert_eq!(
+            monitor.check(),
+            Err(out_of_memory),
+            "a terminal OOM remains sticky until the renderer is replaced"
+        );
+    }
+
+    #[test]
+    fn device_fault_definitive_loss_overrides_an_earlier_oom_classification() {
+        let monitor = DeviceFaultMonitor::default();
+        monitor.record(ReadbackError::OutOfMemory {
+            operation: "earlier allocation".to_owned(),
+        });
+        monitor.record(ReadbackError::DeviceLost {
+            reason: wgpu::DeviceLostReason::Unknown,
+            detail: "later callback".to_owned(),
+        });
+        assert_eq!(
+            monitor.check(),
+            Err(ReadbackError::DeviceLost {
+                reason: wgpu::DeviceLostReason::Unknown,
+                detail: "later callback".to_owned(),
+            }),
+            "a definitive loss callback must outrank a less-specific allocation symptom"
         );
     }
 
@@ -1213,6 +1537,11 @@ struct ViewUniforms {
     bg: wgpu::BindGroup,
 }
 
+struct PreparedViewUniforms {
+    buf: wgpu::Buffer,
+    bg: wgpu::BindGroup,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ViewData {
@@ -1254,6 +1583,42 @@ impl ViewUniforms {
         let this = Self { buf, layout, bg };
         this.update(queue, size, 0.0, 1.0, (0.0, 0.0));
         this
+    }
+
+    fn prepare_resize(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: (u32, u32),
+        time: f32,
+        scale: f32,
+        offset: (f32, f32),
+    ) -> PreparedViewUniforms {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view.ubuf.resize"),
+            size: std::mem::size_of::<ViewData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("view.bg.resize"),
+            layout: &self.layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf.as_entire_binding(),
+            }],
+        });
+        let data = ViewData {
+            v0: [size.0 as f32, size.1 as f32, time, scale],
+            v1: [offset.0, offset.1, 0.0, 0.0],
+        };
+        queue.write_buffer(&buf, 0, bytemuck::bytes_of(&data));
+        PreparedViewUniforms { buf, bg }
+    }
+
+    fn install_resize(&mut self, prepared: PreparedViewUniforms) {
+        self.buf = prepared.buf;
+        self.bg = prepared.bg;
     }
 
     fn update(
@@ -2435,7 +2800,7 @@ impl PostFx {
         format: wgpu::TextureFormat,
         src_view: &wgpu::TextureView,
         size: (u32, u32),
-    ) -> Self {
+    ) -> Result<Self, ReadbackError> {
         // Final composite shader
         let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("postfx.wgsl"),
@@ -2557,7 +2922,7 @@ impl PostFx {
             multiview: None,
             cache: None,
         });
-        let (target, target_view) = create_color(device, format, size);
+        let (target, target_view) = create_color(device, format, size)?;
 
         // Bloom shaders and layouts
         let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2708,7 +3073,7 @@ impl PostFx {
             cache: None,
         });
 
-        Self {
+        Ok(Self {
             pipeline,
             sampler,
             src_layout,
@@ -2731,13 +3096,17 @@ impl PostFx {
             bloom_a_view: None,
             bloom_b: None,
             bloom_b_view: None,
-        }
+        })
     }
 
-    fn resize(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) {
-        let (t, v) = create_color(device, format, size);
-        self.target = t;
-        self.target_view = v;
+    fn install_resize(
+        &mut self,
+        format: wgpu::TextureFormat,
+        target: wgpu::Texture,
+        target_view: wgpu::TextureView,
+    ) {
+        self.target = target;
+        self.target_view = target_view;
         self.color_format = format;
         // Drop bloom targets; will be recreated lazily on next run
         self.bloom_a = None;
@@ -2827,6 +3196,7 @@ impl PostFx {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
         device: &wgpu::Device,
