@@ -158,6 +158,8 @@ pub struct EventStyle {
     pub reproduce: EventCueStyle,
     /// Extended-spike flash.
     pub spike: EventCueStyle,
+    /// Movement-boost motion trail.
+    pub boost: EventCueStyle,
 }
 
 /// Shared application chrome tokens.
@@ -349,6 +351,16 @@ pub const BIOLUMINESCENT_DARK_FIELD_V1: VisualStyleV1 = {
                 accent_srgb: spike_core,
                 emissive_gain: 5.5,
                 duration_ticks: 6,
+            },
+            // Cool exhaust reading as SPEED rather than damage: deliberately far from
+            // `combat` (hot magenta) and `spike` (white) so a boosting agent is never
+            // mistaken for an attacking one at a glance. Short duration -- a trail that
+            // outlives the boost reads as a smear.
+            boost: EventCueStyle {
+                core_srgb: [0.62, 0.96, 1.00],
+                accent_srgb: herbivore,
+                emissive_gain: 2.6,
+                duration_ticks: 10,
             },
         },
         chrome: InterfaceStyle {
@@ -1177,6 +1189,17 @@ pub enum WorldVisualEvent {
     Reproduce,
     /// A spike began extending (telegraph).
     SpikeExtend,
+    /// Movement boost engaged this tick.
+    ///
+    /// Defined here rather than left to the renderer (WildDuck's `vfx.rs` question): boost is
+    /// a real, observable agent action with an existing output channel, so it gets a canonical
+    /// cue like every other action. Leaving it undefined is what produces a second palette --
+    /// the renderer would have had to invent a colour, and then core and GPUI would disagree
+    /// about what "boosting" looks like.
+    Boost {
+        /// Engaged drive magnitude in `[0, 1]`; scales trail length and brightness.
+        magnitude: f32,
+    },
 }
 
 /// Cue families the two renderers know how to draw.
@@ -1196,6 +1219,12 @@ pub enum VisualCueKind {
     PulseRing,
     /// Brief full-body flash (spike telegraph).
     Flash,
+    /// Short motion trail drawn BEHIND the agent along its heading (movement boost).
+    ///
+    /// Distinct from every other family: it is directional and persistent-per-tick rather
+    /// than a one-shot burst, so a renderer must place it using the agent's heading rather
+    /// than centring it on the body.
+    BoostTrail,
 }
 
 /// A resolved visual cue: what to draw, in which color, for how long.
@@ -1311,6 +1340,21 @@ pub fn visual_cue_for_event(event: &WorldVisualEvent) -> VisualCue {
                 accent_color: style.accent_srgb,
                 intensity: normalized_event_gain(style),
                 radius: 3.0,
+                duration_ticks: style.duration_ticks,
+            }
+        }
+        WorldVisualEvent::Boost { magnitude } => {
+            let style = BIOLUMINESCENT_DARK_FIELD_V1.events.boost;
+            // `radius` is the trail LENGTH for this family, laid along the agent's heading
+            // rather than a radius about its body. Scaled by magnitude so a hard boost reads
+            // as a longer streak; the floor keeps a light boost visible rather than absent.
+            let magnitude = clamp01(magnitude);
+            VisualCue {
+                kind: VisualCueKind::BoostTrail,
+                color: style.core_srgb,
+                accent_color: style.accent_srgb,
+                intensity: normalized_event_gain(style) * (0.45 + 0.55 * magnitude),
+                radius: 4.0 + 6.0 * magnitude,
                 duration_ticks: style.duration_ticks,
             }
         }
@@ -1793,7 +1837,10 @@ mod tests {
     fn the_resolved_default_day_night_cycle_actually_varies() {
         let (cycle_ticks, start_phase) = resolve_day_night(None, None);
         assert_eq!(cycle_ticks, DEFAULT_DAY_NIGHT_CYCLE_TICKS);
-        assert!(cycle_ticks > 0, "an unset day/night block must select a real cycle");
+        assert!(
+            cycle_ticks > 0,
+            "an unset day/night block must select a real cycle"
+        );
 
         let mut minimum = f32::INFINITY;
         let mut maximum = f32::NEG_INFINITY;
@@ -1912,7 +1959,10 @@ mod tests {
     #[test]
     fn lushness_folds_fertility_in_signed_and_stays_in_range() {
         let neutral = terrain_lushness(0.5, 0.0);
-        assert!((neutral - 0.5).abs() < EPS, "zero bias must pass moisture through");
+        assert!(
+            (neutral - 0.5).abs() < EPS,
+            "zero bias must pass moisture through"
+        );
         assert!(
             terrain_lushness(0.5, 1.0) > neutral,
             "positive fertility must read lusher"
