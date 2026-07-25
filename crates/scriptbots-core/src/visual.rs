@@ -635,19 +635,20 @@ pub const fn diet_stripe_color(herbivore_tendency: f32, _temperature_preference:
     mix_vec3(CARNIVORE_RGB, HERBIVORE_RGB, herbivore)
 }
 
-/// The body health factor: `health/2` clamped to the style's visibility floor.
+/// The body health factor: the normalized `0..=2` health range mapped from the
+/// style's visibility floor through full luminance.
 ///
-/// The floor keeps even dying agents visible; the divisor is the simulation's
+/// The floor keeps even dying agents visible without flattening every low-health
+/// agent into the same luminance class. The divisor is the simulation's
 /// canonical `0..=2` health scale (a legacy Bevy HUD path once normalized
 /// against 100 — that bug class is impossible here because this is the only
 /// implementation).
 #[must_use]
 pub const fn health_factor(health: f32) -> f32 {
     if health.is_finite() {
-        (health / 2.0).clamp(
-            BIOLUMINESCENT_DARK_FIELD_V1.agents.health_luminance_floor,
-            1.0,
-        )
+        let normalized = (health / 2.0).clamp(0.0, 1.0);
+        let floor = BIOLUMINESCENT_DARK_FIELD_V1.agents.health_luminance_floor;
+        floor + (1.0 - floor) * normalized
     } else {
         BIOLUMINESCENT_DARK_FIELD_V1.agents.health_luminance_floor
     }
@@ -2508,6 +2509,21 @@ mod tests {
                 - rgb.into_iter().fold(f32::INFINITY, f32::min)
         };
         assert!(chroma(newborn.body_color) > chroma(old.body_color));
+
+        // Weathering must not collapse health into an unreadable low-end
+        // plateau. These are the exact full/mid/floor classes exercised by the
+        // controlled 1280x720 GPUI proof for bd-ydym.
+        let old_full = params(2.0, 10_000, 0.5);
+        let old_mid = params(1.2, 10_000, 0.5);
+        let old_floor = params(0.05, 10_000, 0.5);
+        assert!(
+            luminance(old_full.body_color) > luminance(old_mid.body_color) + 0.10,
+            "old full-health agents must remain brighter than mid-health agents"
+        );
+        assert!(
+            luminance(old_mid.body_color) > luminance(old_floor.body_color) + 0.10,
+            "old mid-health agents must remain brighter than floor-health agents"
+        );
 
         for age_ticks in [0, 5_000, 10_000] {
             for health in [0.0, 1.0, 2.0] {
