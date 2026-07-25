@@ -119,6 +119,53 @@ fn a_narration_burst_cannot_refuse_a_batch_of_science() {
     );
 }
 
+/// The budgets must be independent *under pressure*, not merely in the estimator (`bd-erff`).
+///
+/// The test above proves narration does not change the scientific estimate. This proves the
+/// consequence that actually matters: a batch whose commentary vastly exceeds the scientific
+/// caps is still admitted, because it is the scientific content that those caps govern.
+///
+/// This is the failure the miscount was hiding. A refusal here is `PayloadTooLarge`, a
+/// definite `NotAdmitted` that latches the world and blocks later science ticks — so before
+/// the separation, a run generating a lot of commentary could stop recording simulation data
+/// entirely, and the commentary that cost it was not even stored.
+#[test]
+fn a_narration_burst_cannot_starve_simulation_admission_through_the_real_path() {
+    let path = temp_db("narration-pressure");
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+        .expect("pipeline");
+
+    // Caps sized so the science below fits comfortably while the narration riding along is
+    // orders of magnitude past them. If the two pools were still shared, this is precisely
+    // the shape that would be refused.
+    pipeline.set_payload_budget(PayloadBudget {
+        max_batch_bytes: 64 << 10,
+        max_batch_events: 128,
+        max_inflight_bytes: 1 << 20,
+    });
+
+    let mut loud = batch(1, 8);
+    loud.narrative_events = (0..512).map(narrative_event).collect();
+    let (narrative_bytes, narrative_events) = estimate_narrative_size(&loud);
+    assert!(
+        narrative_events > 128 && narrative_bytes > (64 << 10),
+        "the fixture must exceed both scientific caps to be a real pressure test, got \
+         {narrative_events} events / {narrative_bytes} bytes"
+    );
+
+    pipeline
+        .submit(&loud)
+        .expect("commentary must not be able to refuse a batch of scientific rows");
+
+    // And the pipeline is not left degraded: ordinary science still admits afterwards.
+    pipeline
+        .submit(&batch(2, 8))
+        .expect("a later scientific batch must still be admitted");
+
+    pipeline.shutdown().expect("shutdown");
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn the_size_estimate_is_deterministic_monotonic_and_allocates_nothing() {
     // The estimate must be computable WITHOUT serializing the batch. Serializing
