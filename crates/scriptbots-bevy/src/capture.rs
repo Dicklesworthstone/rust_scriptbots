@@ -42,6 +42,7 @@ use bevy::render::{RenderApp, RenderPlugin};
 use bevy::window::{ExitCondition, WindowPlugin};
 use scriptbots_core::{RenderQuality, RenderSettings, WorldState};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
 use crate::{
@@ -55,6 +56,63 @@ use crate::{
 
 /// Schema tag for provenance manifests (`scriptbots.capture-provenance.v1`).
 pub const PROVENANCE_SCHEMA: &str = "scriptbots.capture-provenance.v1";
+
+const READBACK_MAP_TIMEOUT: Duration = Duration::from_secs(10);
+const READBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+fn wait_for_readback_map<E>(
+    receiver: &std::sync::mpsc::Receiver<std::result::Result<(), E>>,
+    timeout: Duration,
+    mut poll_once: impl FnMut() -> Result<()>,
+) -> Result<()>
+where
+    E: std::fmt::Display,
+{
+    let started = Instant::now();
+    let timeout_error = || anyhow!("readback map timed out after {timeout:?} (wedged GPU?)");
+    let mut has_polled = false;
+    loop {
+        // Permit one immediate progress check even for a zero timeout, then
+        // never begin another poll after the deadline.
+        if has_polled && started.elapsed() >= timeout {
+            return Err(timeout_error());
+        }
+        has_polled = true;
+
+        // wgpu 26 has no bounded `PollType::Wait`. Polling once is explicitly
+        // nonblocking, so the deadline below remains reachable even when the
+        // submitted GPU work never completes.
+        let poll_result = poll_once();
+        match receiver.try_recv() {
+            Ok(result) => {
+                return result.map_err(|error| anyhow!("readback buffer map failed: {error}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!(
+                    "readback map callback channel disconnected before completion"
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => poll_result?,
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(timeout_error());
+        }
+        std::thread::sleep(READBACK_POLL_INTERVAL.min(remaining));
+    }
+}
+
+const fn readback_poll_type() -> wgpu::PollType {
+    wgpu::PollType::Poll
+}
+
+fn poll_readback_device(device: &RenderDevice) -> Result<()> {
+    device
+        .poll(readback_poll_type())
+        .map(|_| ())
+        .map_err(|error| anyhow!("device poll during readback: {error}"))
+}
 
 /// Full provenance for one captured frame: everything needed to decide
 /// whether a golden comparison is same-class and to reproduce the frame.
@@ -805,12 +863,7 @@ impl<'a> OffscreenCapture<'a> {
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
             });
-        device
-            .poll(wgpu::PollType::Wait)
-            .map_err(|error| anyhow!("device poll during readback: {error}"))?;
-        rx.recv_timeout(std::time::Duration::from_secs(10))
-            .map_err(|error| anyhow!("readback map timed out (wedged GPU?): {error}"))?
-            .map_err(|error| anyhow!("readback buffer map failed: {error}"))?;
+        wait_for_readback_map(&rx, READBACK_MAP_TIMEOUT, || poll_readback_device(&device))?;
         let data = {
             let mapped = buffer.slice(..).get_mapped_range();
             Vec::from(&*mapped)
@@ -1276,6 +1329,93 @@ mod tests {
 
     fn frame(width: u32, height: u32, value: u8) -> Vec<u8> {
         vec![value; (width * height * 4) as usize]
+    }
+
+    #[test]
+    fn readback_map_wait_keeps_the_timeout_reachable() {
+        assert!(
+            matches!(readback_poll_type(), wgpu::PollType::Poll),
+            "the production poll seam must remain explicitly nonblocking"
+        );
+        let (_sender, receiver) =
+            std::sync::mpsc::channel::<std::result::Result<(), &'static str>>();
+        let mut polls = 0;
+        let error = wait_for_readback_map(&receiver, Duration::ZERO, || {
+            polls += 1;
+            Ok(())
+        })
+        .expect_err("a map that never completes must time out");
+
+        assert_eq!(
+            polls, 1,
+            "the nonblocking poll must run before the deadline"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("readback map timed out after 0ns"),
+            "timeout must remain explicit and attributable: {error}"
+        );
+    }
+
+    #[test]
+    fn readback_map_wait_observes_completion_from_the_poll_callback() {
+        let (sender, receiver) =
+            std::sync::mpsc::channel::<std::result::Result<(), &'static str>>();
+        let mut sender = Some(sender);
+        let mut polls = 0;
+
+        wait_for_readback_map(&receiver, Duration::from_secs(1), || {
+            polls += 1;
+            sender
+                .take()
+                .expect("completion sent once")
+                .send(Ok(()))
+                .expect("receiver remains connected");
+            Ok(())
+        })
+        .expect("poll-driven callback completion must be observed");
+
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn readback_map_wait_preserves_map_and_poller_failures() {
+        let (map_sender, map_receiver) =
+            std::sync::mpsc::channel::<std::result::Result<(), &'static str>>();
+        map_sender
+            .send(Err("map rejected"))
+            .expect("receiver remains connected");
+        let map_error = wait_for_readback_map(&map_receiver, Duration::from_secs(1), || Ok(()))
+            .expect_err("map failure must be surfaced");
+        assert!(
+            map_error.to_string().contains("map rejected"),
+            "map failure must retain its cause: {map_error}"
+        );
+
+        let (_poll_sender, poll_receiver) =
+            std::sync::mpsc::channel::<std::result::Result<(), &'static str>>();
+        let poll_error = wait_for_readback_map(&poll_receiver, Duration::from_secs(1), || {
+            Err(anyhow!("poll hook failed"))
+        })
+        .expect_err("poller failure must be surfaced");
+        assert!(
+            poll_error.to_string().contains("poll hook failed"),
+            "poller failure must retain its cause: {poll_error}"
+        );
+
+        let (disconnected_sender, disconnected_receiver) =
+            std::sync::mpsc::channel::<std::result::Result<(), &'static str>>();
+        drop(disconnected_sender);
+        let disconnected_error =
+            wait_for_readback_map(&disconnected_receiver, Duration::from_secs(1), || Ok(()))
+                .expect_err("a vanished callback sender must be surfaced");
+        assert!(
+            disconnected_error
+                .to_string()
+                .contains("channel disconnected"),
+            "callback disconnection must be attributable: {disconnected_error}"
+        );
     }
 
     fn seeded_world(seed: u64) -> scriptbots_core::WorldState {
