@@ -267,6 +267,12 @@ mod tests {
             population_minimum: 0,
             population_spawn_interval: 0,
             persistence_interval: 0,
+            // SEEDED — this is the root of bd-c7pg. Unseeded, every call built a
+            // differently-random world, so two captures of "the same" scene differed by
+            // ~10k pixels in agent and food layout alone. That floor swallowed 21 of 27
+            // shortcut deltas and would swallow any small visual change. Fixed at the
+            // source; the alternative would have been a tolerance tuned to hide it.
+            rng_seed: Some(0xBD_C7_09),
             ..ScriptBotsConfig::default()
         };
         Arc::new(Mutex::new(
