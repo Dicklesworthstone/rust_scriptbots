@@ -1362,6 +1362,36 @@ fn use_wgpu_renderer() -> bool {
 }
 
 #[cfg(feature = "world_wgpu")]
+fn emit_wgpu_paint_entry_diagnostic() {
+    tracing::trace!("entered paint_world_with_wgpu");
+}
+
+#[cfg(feature = "world_wgpu")]
+fn emit_wgpu_camera_mapping_diagnostic(
+    width_px: f32,
+    height_px: f32,
+    world_dims: (f32, f32),
+    layout: ViewLayout,
+    cam_offset: (f32, f32),
+) {
+    tracing::trace!(
+        vw = width_px,
+        vh = height_px,
+        world_w = world_dims.0,
+        world_h = world_dims.1,
+        base_scale = layout.base_scale,
+        scale = layout.scale,
+        pad_x = layout.pad.0,
+        pad_y = layout.pad.1,
+        offset_x = layout.offset.0,
+        offset_y = layout.offset.1,
+        cam_off_x = cam_offset.0,
+        cam_off_y = cam_offset.1,
+        "wgpu camera mapping"
+    );
+}
+
+#[cfg(feature = "world_wgpu")]
 fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
     use scriptbots_world_gfx::WorldSnapshot as GfxSnapshot;
     use world_compositor::Compositor;
@@ -1369,7 +1399,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let comp = COMPOSITOR.get_or_init(|| std::sync::Mutex::new(Compositor::new()));
     let mut comp = comp.lock().expect("compositor mutex");
 
-    tracing::info!("entered paint_world_with_wgpu");
+    emit_wgpu_paint_entry_diagnostic();
 
     let world_size = state.frame.world_size;
     // Root-cause guard: GPUI may report 0x0 during initial layout or when minimized
@@ -1536,21 +1566,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         tonemap_mode: state.frame.tonemap_mode,
     };
 
-    tracing::info!(
-        vw = width_px,
-        vh = height_px,
-        world_w = world_dims.0,
-        world_h = world_dims.1,
-        base_scale = base_scale,
-        scale = scale,
-        pad_x = pad_x,
-        pad_y = pad_y,
-        offset_x = layout.offset.0,
-        offset_y = layout.offset.1,
-        cam_off_x = cam_offset.0,
-        cam_off_y = cam_offset.1,
-        "wgpu camera mapping"
-    );
+    emit_wgpu_camera_mapping_diagnostic(width_px, height_px, world_dims, layout, cam_offset);
 
     // Render using current camera mapping. The camera layout was computed in
     // logical pixels; scale it to the physical-resolution render target.
@@ -1562,6 +1578,100 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     if !comp.paint_world(bounds, window) {
         // If the wgpu image isn't ready, draw the CPU canvas frame this turn to avoid a blank window.
         paint_frame(state, bounds, window);
+    }
+}
+
+#[cfg(all(test, feature = "world_wgpu"))]
+mod wgpu_paint_diagnostic_tests {
+    use super::{
+        ViewLayout, emit_wgpu_camera_mapping_diagnostic, emit_wgpu_paint_entry_diagnostic,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing::{
+        Event, Level, Metadata, Subscriber,
+        span::{Attributes, Id, Record},
+    };
+
+    #[derive(Default)]
+    struct EventCounts {
+        info: AtomicUsize,
+        trace: AtomicUsize,
+    }
+
+    struct CountingSubscriber {
+        counts: Arc<EventCounts>,
+    }
+
+    impl Subscriber for CountingSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            panic!("this event-only subscriber must not observe spans")
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            match *event.metadata().level() {
+                Level::INFO => {
+                    self.counts.info.fetch_add(1, Ordering::Relaxed);
+                }
+                Level::TRACE => {
+                    self.counts.trace.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[test]
+    fn steady_state_wgpu_paint_diagnostics_are_below_info() {
+        let counts = Arc::new(EventCounts::default());
+        let subscriber = CountingSubscriber {
+            counts: Arc::clone(&counts),
+        };
+        let layout = ViewLayout {
+            base_scale: 0.5,
+            scale: 0.75,
+            pad: (8.0, 12.0),
+            offset: (3.0, 4.0),
+            render_size: (640.0, 480.0),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..2 {
+                emit_wgpu_paint_entry_diagnostic();
+                emit_wgpu_camera_mapping_diagnostic(
+                    640.0,
+                    480.0,
+                    (1_200.0, 900.0),
+                    layout,
+                    (3.0, 4.0),
+                );
+            }
+        });
+
+        assert_eq!(
+            counts.info.load(Ordering::Relaxed),
+            0,
+            "steady-state paint diagnostics must not emit INFO events"
+        );
+        assert_eq!(
+            counts.trace.load(Ordering::Relaxed),
+            4,
+            "both diagnostics must remain available at TRACE for every sampled frame"
+        );
     }
 }
 
