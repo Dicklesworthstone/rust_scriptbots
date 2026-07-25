@@ -1142,7 +1142,7 @@ mod tests {
             .find(|c| c.founder_uid == AgentUid(1))
             .unwrap();
         assert_eq!(f1_contrib.total_descendants, 2);
-        assert_eq!(f1_contrib.living_descendants, 3); // 1, 3, 4 all living
+        assert_eq!(f1_contrib.living_descendants, 2); // 3, 4 living descendants
 
         let fitness = graph.compute_lineage_fitness(AgentUid(1)).unwrap();
         assert_eq!(fitness.founder_uid, AgentUid(1));
