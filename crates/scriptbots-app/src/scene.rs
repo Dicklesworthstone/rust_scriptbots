@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Result;
 use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState, parse_render_quality};
@@ -371,6 +372,102 @@ pub struct SceneLog {
     pub timings_ms: BTreeMap<String, u64>,
     /// Final world digest when available.
     pub world_digest: Option<String>,
+}
+
+impl SceneLog {
+    /// Phases every completed run must time.
+    ///
+    /// The key set is the contract, not the durations: a fast phase legitimately
+    /// rounds to 0 ms, so asserting nonzero values would only buy a flaky test.
+    /// What must never happen again is a log that reports no phases at all
+    /// (bd-2z0.14.3.5.1: `timings_ms` was hardcoded to an empty map, and the
+    /// existing guard only checked that the *field* existed, which an empty map
+    /// satisfies).
+    pub const TIMING_PHASES: [&'static str; 4] = ["validate", "driver_run", "evaluate", "total"];
+
+    /// Reject a log that cannot serve as evidence.
+    ///
+    /// Called before the artifact is written, so a structurally useless log fails
+    /// the run instead of being published as proof.
+    ///
+    /// # Errors
+    /// Returns a [`SceneError`] listing every structural problem found.
+    pub fn validate(&self) -> Result<(), SceneError> {
+        let mut problems = Vec::new();
+        if self.name.trim().is_empty() {
+            problems.push("scene log has an empty name".to_owned());
+        }
+        if self.frontend.trim().is_empty() {
+            problems.push("scene log has an empty frontend".to_owned());
+        }
+        for phase in Self::TIMING_PHASES {
+            if !self.timings_ms.contains_key(phase) {
+                problems.push(format!("scene log is missing the `{phase}` timing phase"));
+            }
+        }
+        for capture in &self.captures {
+            if capture.name.trim().is_empty() {
+                problems.push("a capture record has an empty name".to_owned());
+            }
+            if capture.hash.trim().is_empty() {
+                problems.push(format!("capture `{}` has an empty hash", capture.name));
+            }
+        }
+        for expectation in &self.expectations {
+            if expectation.desc.trim().is_empty() {
+                problems.push("an expectation result has an empty description".to_owned());
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(SceneError { problems })
+        }
+    }
+
+    /// Whether every evaluated expectation held.
+    #[must_use]
+    pub fn all_expectations_passed(&self) -> bool {
+        self.expectations.iter().all(|result| result.pass)
+    }
+}
+
+/// Canonical file name of the structured per-scene evidence artifact.
+pub const SCENE_LOG_FILE: &str = "scene_log.json";
+
+/// Write the structured scene log beside the capture artifacts.
+///
+/// README advertises that `--dump-scene-png` emits "capture PNGs + provenance JSON
+/// + a JSON scene log"; only the first two were ever written, so the documented
+/// evidence artifact did not exist (bd-2z0.14.3.5.1). The log is validated before
+/// the write and re-read afterwards, so a run cannot report success while leaving
+/// behind evidence that is absent, truncated, or unparseable.
+///
+/// # Errors
+/// Returns a [`SceneError`] when the log is structurally unusable, the directory
+/// cannot be created, or the artifact fails to write or read back.
+pub fn write_scene_log(dir: &Path, log: &SceneLog) -> Result<PathBuf, SceneError> {
+    log.validate()?;
+    std::fs::create_dir_all(dir).map_err(|error| SceneError {
+        problems: vec![format!("create {}: {error}", dir.display())],
+    })?;
+    let path = dir.join(SCENE_LOG_FILE);
+    let body = serde_json::to_string_pretty(log).map_err(|error| SceneError {
+        problems: vec![format!("encode scene log: {error}")],
+    })?;
+    std::fs::write(&path, body).map_err(|error| SceneError {
+        problems: vec![format!("write {}: {error}", path.display())],
+    })?;
+
+    // Prove the artifact a reviewer receives is the one we meant to publish.
+    let readback = std::fs::read_to_string(&path).map_err(|error| SceneError {
+        problems: vec![format!("read back {}: {error}", path.display())],
+    })?;
+    let parsed: SceneLog = serde_json::from_str(&readback).map_err(|error| SceneError {
+        problems: vec![format!("re-parse {}: {error}", path.display())],
+    })?;
+    parsed.validate()?;
+    Ok(path)
 }
 
 /// One capture record.
@@ -1062,9 +1159,29 @@ pub fn run_scene(
     manifest: &SceneManifest,
     driver: &mut dyn SceneDriver,
 ) -> Result<SceneLog, SceneError> {
+    // Real phase wall-clock, not a placeholder: the log's timings map is the only
+    // record of where a scene spent its time, and it used to ship empty
+    // (bd-2z0.14.3.5.1). Durations stay out of determinism comparisons by
+    // convention; the key set is what the log contract guarantees.
+    let total_started = Instant::now();
+    let validate_started = Instant::now();
     manifest.validate()?;
+    let validate_ms = elapsed_ms(validate_started);
+
+    let driver_started = Instant::now();
     let facts = driver.run(manifest)?;
+    let driver_ms = elapsed_ms(driver_started);
+
+    let evaluate_started = Instant::now();
     let expectations = evaluate_expectations(manifest, &facts);
+    let evaluate_ms = elapsed_ms(evaluate_started);
+
+    let timings_ms = BTreeMap::from([
+        ("validate".to_owned(), validate_ms),
+        ("driver_run".to_owned(), driver_ms),
+        ("evaluate".to_owned(), evaluate_ms),
+        ("total".to_owned(), elapsed_ms(total_started)),
+    ]);
     Ok(SceneLog {
         name: manifest.name.clone(),
         frontend: driver.name().to_string(),
@@ -1081,9 +1198,14 @@ pub fn run_scene(
             })
             .collect(),
         expectations,
-        timings_ms: BTreeMap::new(),
+        timings_ms,
         world_digest: facts.world_digest.clone(),
     })
+}
+
+/// Saturating milliseconds since `started`, clamped into the log's `u64` field.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1240,6 +1362,98 @@ stars = true
         let rerun = evaluate_expectations(&manifest, &facts);
         assert_eq!(results[1].pass, rerun[1].pass);
         assert!(!results[2].pass, "flash at tick 0 must fail when absent");
+    }
+
+    /// The bug this bead was reopened for: `timings_ms` shipped hardcoded empty, so
+    /// the log could not say where a scene spent its time. The old guard asserted
+    /// only that the field existed, which an empty map satisfies — assert the phase
+    /// key set instead. Durations are deliberately not asserted: a fast phase
+    /// legitimately rounds to 0 ms.
+    #[test]
+    fn run_scene_records_every_timing_phase() {
+        let log = run_scene(&base_manifest(), &mut NullDriver).expect("scene");
+        for phase in SceneLog::TIMING_PHASES {
+            assert!(
+                log.timings_ms.contains_key(phase),
+                "timings_ms is missing `{phase}`: {:?}",
+                log.timings_ms
+            );
+        }
+        assert_eq!(log.timings_ms.len(), SceneLog::TIMING_PHASES.len());
+        log.validate().expect("a completed run yields a valid log");
+    }
+
+    /// README advertises a JSON scene log beside the PNGs; it was never written.
+    #[test]
+    fn write_scene_log_publishes_a_reparseable_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = run_scene(&base_manifest(), &mut NullDriver).expect("scene");
+        let path = write_scene_log(dir.path(), &log).expect("scene log writes");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(SCENE_LOG_FILE)
+        );
+        let round_tripped: SceneLog =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+                .expect("artifact parses");
+        assert_eq!(round_tripped.name, log.name);
+        assert_eq!(round_tripped.timings_ms, log.timings_ms);
+        assert_eq!(round_tripped.seed, log.seed);
+    }
+
+    /// A structurally useless log must fail the run rather than be published as
+    /// evidence. Covers the missing-phase and empty-field cases.
+    #[test]
+    fn write_scene_log_refuses_structurally_useless_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = run_scene(&base_manifest(), &mut NullDriver).expect("scene");
+
+        let mut no_timings = good.clone();
+        no_timings.timings_ms.clear();
+        let error = write_scene_log(dir.path(), &no_timings).expect_err("must refuse");
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|problem| problem.contains("total")),
+            "the refusal must name the missing phase: {:?}",
+            error.problems
+        );
+
+        let mut blank_name = good.clone();
+        blank_name.name = "   ".to_owned();
+        let error = write_scene_log(dir.path(), &blank_name).expect_err("must refuse");
+        assert!(error.problems.iter().any(|p| p.contains("empty name")));
+
+        let mut blank_hash = good;
+        blank_hash.captures.push(CaptureRecord {
+            name: "shot".to_owned(),
+            tick: 1,
+            hash: String::new(),
+            bytes: 0,
+        });
+        let error = write_scene_log(dir.path(), &blank_hash).expect_err("must refuse");
+        assert!(error.problems.iter().any(|p| p.contains("empty hash")));
+
+        // None of the refusals may leave a partial artifact behind.
+        assert!(!dir.path().join(SCENE_LOG_FILE).exists());
+    }
+
+    /// A corrupt artifact on disk must not read back as valid evidence.
+    #[test]
+    fn corrupt_scene_log_artifact_does_not_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = run_scene(&base_manifest(), &mut NullDriver).expect("scene");
+        let path = write_scene_log(dir.path(), &log).expect("scene log writes");
+
+        let body = std::fs::read_to_string(&path).expect("read back");
+        let truncated = &body[..body.len() / 2];
+        std::fs::write(&path, truncated).expect("truncate");
+        assert!(
+            serde_json::from_str::<SceneLog>(truncated).is_err(),
+            "a truncated log must not deserialize"
+        );
     }
 
     #[test]

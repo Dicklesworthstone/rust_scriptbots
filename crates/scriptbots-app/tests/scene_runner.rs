@@ -6,7 +6,9 @@
 
 use std::path::PathBuf;
 
-use scriptbots_app::scene::{NullDriver, SceneManifest, TerminalHeadlessDriver, run_scene};
+use scriptbots_app::scene::{
+    NullDriver, SceneLog, SceneManifest, TerminalHeadlessDriver, run_scene,
+};
 
 fn scenes_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/scenes")
@@ -58,6 +60,24 @@ fn every_reference_scene_validates_and_runs_null_driver() {
                 manifest.name
             );
         }
+        // Field presence alone was ceremonial: `timings_ms` existed but shipped
+        // permanently empty, so this loop passed while the log carried no timing
+        // evidence at all (bd-2z0.14.3.5.1). Require the phase key set, and require
+        // the log to pass its own structural validation.
+        for phase in SceneLog::TIMING_PHASES {
+            assert!(
+                log.timings_ms.contains_key(phase),
+                "scene {} log is missing the `{phase}` timing phase: {:?}",
+                manifest.name,
+                log.timings_ms
+            );
+        }
+        log.validate().unwrap_or_else(|error| {
+            panic!(
+                "scene {} produced a structurally invalid log: {error}",
+                manifest.name
+            )
+        });
     }
 }
 

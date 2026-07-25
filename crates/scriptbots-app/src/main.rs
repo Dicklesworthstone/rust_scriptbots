@@ -2489,6 +2489,7 @@ fn snapshot_exit_requested(cli: &AppCli) -> bool {
 fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
     use scriptbots_app::scene::{
         BevyOffscreenDriver, GoldenOutcome, SceneManifest, process_golden, run_scene,
+        write_scene_log,
     };
     use scriptbots_bevy::capture::{CaptureProvenance, CapturedFrame, decode_png};
 
@@ -2509,6 +2510,19 @@ fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
         ..BevyOffscreenDriver::default()
     };
     let log = run_scene(&manifest, &mut driver).map_err(|error| anyhow!("scene run: {error}"))?;
+
+    // Publish the structured per-scene evidence README promises alongside the PNGs
+    // and provenance. Written before the golden workflow so a golden mismatch still
+    // leaves the run's own log on disk for the reviewer diagnosing it
+    // (bd-2z0.14.3.5.1).
+    let log_path = write_scene_log(&artifacts_dir, &log)
+        .map_err(|error| anyhow!("write scene log: {error}"))?;
+    info!(
+        scene = %log.name,
+        path = %log_path.display(),
+        phases = log.timings_ms.len(),
+        "wrote structured scene log"
+    );
 
     // Golden workflow per capture, re-reading the artifacts from disk so
     // the comparison path exercises exactly what a reviewer receives.
@@ -2582,6 +2596,8 @@ fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
         "captures": capture_outcomes,
         "expectations": log.expectations,
         "regen_mode": regen,
+        "scene_log": log_path,
+        "timings_ms": log.timings_ms,
     });
     println!(
         "{}",
