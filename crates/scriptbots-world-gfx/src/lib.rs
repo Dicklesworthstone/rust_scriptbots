@@ -38,8 +38,9 @@ pub struct TerrainView<'a> {
     pub cell_size: u32,
     pub tiles: &'a [u32], // index into a tileset palette/atlas (kept simple for MVP)
     /// Final natural/accessibility-mapped sRGB terrain colors from the core
-    /// visual authority. The GPU backend rasterizes these values; it must not
-    /// invent a second biome palette or shading model.
+    /// visual authority. The GPU backend decodes these to linear before
+    /// writing its sRGB attachment; it must not invent a second biome palette
+    /// or shading model.
     pub colors: &'a [[f32; 4]],
     pub elevation: Option<&'a [f32]>, // optional elevation field for slope accents
 }
@@ -113,6 +114,7 @@ pub struct RenderFrame {
 }
 
 static NEXT_RENDERER_ID: AtomicU64 = AtomicU64::new(1);
+const WORLD_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 impl WorldRenderer {
     pub async fn new(adapter: &wgpu::Adapter, size: (u32, u32)) -> Result<Self, ReadbackError> {
@@ -131,7 +133,7 @@ impl WorldRenderer {
                 ReadbackError::Device(format!("wgpu device request failed: {error}"))
             })?;
 
-        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let format = WORLD_COLOR_FORMAT;
         let (color, color_view) = create_color(&device, format, size);
         let readback = ReadbackRing::new(&device, size, format)?;
         let view = ViewUniforms::new(&device, &queue, size);
@@ -883,6 +885,28 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_srgb_terrain_color_is_decoded_once_for_the_gpu_target() {
+        assert_eq!(
+            super::WORLD_COLOR_FORMAT,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "the transfer contract is paired with an sRGB attachment"
+        );
+        let linear = super::terrain_srgb_to_linear([0.5, 0.25, 0.75, 0.4]);
+        let expected = [0.214_041_14, 0.050_876_09, 0.522_521_56, 0.4];
+        for (channel, (actual, expected)) in linear.into_iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1.0e-7,
+                "linear channel {channel}: expected {expected}, got {actual}"
+            );
+        }
+        assert_eq!(
+            super::terrain_srgb_to_linear([0.0, 1.0, 0.04045, 0.25]),
+            [0.0, 1.0, 0.04045 / 12.92, 0.25],
+            "sRGB endpoints and alpha ownership must be exact"
+        );
+    }
+
+    #[test]
     fn disabled_bloom_has_exactly_zero_composite_intensity() {
         assert_eq!(
             resolve_bloom_intensity(false, 0.65).to_bits(),
@@ -1100,6 +1124,26 @@ struct TileInstance {
     color: [f32; 4],
     kind: u32,
     slope: f32,
+}
+
+/// Decode an authoritative sRGB terrain color before a fragment writes it to
+/// an `Rgba8UnormSrgb` attachment. wgpu performs the inverse linear-to-sRGB
+/// transfer for RGB attachment writes; alpha is always linear and unchanged.
+fn terrain_srgb_to_linear(srgba: [f32; 4]) -> [f32; 4] {
+    [
+        srgb_component_to_linear(srgba[0]),
+        srgb_component_to_linear(srgba[1]),
+        srgb_component_to_linear(srgba[2]),
+        srgba[3],
+    ]
+}
+
+fn srgb_component_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn terrain_atlas_palette() -> [[u8; 4]; 6] {
@@ -1379,7 +1423,7 @@ impl TerrainPipeline {
                 staging.push(TileInstance {
                     pos: [px, py],
                     size: [cell, cell],
-                    color: snapshot.terrain.colors[idx],
+                    color: terrain_srgb_to_linear(snapshot.terrain.colors[idx]),
                     kind: tile_id,
                     slope,
                 });
@@ -1453,9 +1497,10 @@ fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
-  // Final terrain color is projected by scriptbots-core::visual on the CPU.
-  // This shader owns rasterization only; it must not invent a competing
-  // biome palette, shimmer, slope curve, or hash-noise model.
+  // Core projects the final terrain color in sRGB; CPU staging decodes it to
+  // this linear value, and Rgba8UnormSrgb performs the sole output encoding.
+  // The shader owns rasterization only and must not invent a competing biome
+  // palette, shimmer, slope curve, or hash-noise model.
   return v.color;
 }
 "#;
