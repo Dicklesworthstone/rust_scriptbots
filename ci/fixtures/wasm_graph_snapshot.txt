@@ -1,5 +1,6 @@
 ahash
 anyhow
+arc-swap
 arrayref
 arrayvec
 autocfg
@@ -11,6 +12,7 @@ cobs
 constant_time_eq
 coord_2d
 direction
+equivalent
 find-msvc-tools
 futures-core
 futures-task
@@ -18,6 +20,7 @@ futures-util
 getrandom
 grid_2d
 hashbrown
+indexmap
 itoa
 js-sys
 libc
@@ -39,18 +42,27 @@ rustversion
 scriptbots-brain
 scriptbots-core
 scriptbots-index
+scriptbots-runtime
 scriptbots-web
 serde
 serde-wasm-bindgen
 serde_core
 serde_derive
 serde_json
+serde_spanned
 shlex
 slab
 slotmap
 syn
 thiserror
 thiserror-impl
+toml
+toml_datetime
+toml_edit
+toml_write
+tracing
+tracing-attributes
+tracing-core
 unicode-ident
 version_check
 wasm-bindgen
@@ -58,5 +70,6 @@ wasm-bindgen-macro
 wasm-bindgen-macro-support
 wasm-bindgen-shared
 wfc
+winnow
 zerocopy
 zmij
