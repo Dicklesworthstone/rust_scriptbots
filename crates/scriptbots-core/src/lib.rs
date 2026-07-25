@@ -25567,12 +25567,71 @@ mod tests {
         }
     }
 
+    /// bd-g4aw: the RNG algorithm choice must not depend on the target pointer width.
+    ///
+    /// THIS IS A PROXY AND MUST BE READ AS ONE. The real property is:
+    ///
+    ///   two worlds constructed from the same seed on different pointer widths
+    ///   produce identical initial state.
+    ///
+    /// That CANNOT be asserted in-process. A test binary runs on exactly one pointer width
+    /// and never observes the other, so no in-process assertion can compare them. Proving
+    /// the real property needs the two-lane browser harness in bd-7mh6's acceptance.
+    ///
+    /// What this asserts instead is the narrower SOURCE property that makes the real one
+    /// possible: `RANDOM_STREAM_ALGORITHM` must have ONE definition rather than one per
+    /// target. That is strictly weaker, and the distinction is written here rather than left
+    /// to be discovered, because a proxy presented as the real thing is exactly how the
+    /// `from_state` guard ended up useless -- it validates a correct invariant on the restore
+    /// path while the divergence happens at construction (bd-g4aw).
+    ///
+    /// Why a source read rather than a runtime check: target-dependence is a property of the
+    /// SOURCE, not of any value this process can observe. On 64-bit every runtime value is
+    /// self-consistent; there is nothing to compare against.
+    ///
+    /// BORN RED, deliberately. It fails today because the constant is cfg-selected at two
+    /// sites, and that is precisely bd-7mh6's root cause. UN-IGNORE IT AS PART OF bd-7mh6;
+    /// do not delete it, and do not "fix" it by loosening the assertion.
+    ///
+    /// An ignored test is itself shape 2 of the bd-d3wu taxonomy -- a proof that executes
+    /// nothing -- if nobody ever runs it. It is named in bd-7mh6's acceptance for that
+    /// reason: the fix is not complete until this runs and passes unignored.
+    #[test]
+    #[ignore = "bd-g4aw born-red: fails until bd-7mh6 unifies the RNG lane; un-ignore with that fix"]
+    fn a_random_stream_algorithm_must_not_be_target_dependent() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
+        )
+        .expect("read core source for the target-dependence check");
+        let definitions: Vec<&str> = source
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("const RANDOM_STREAM_ALGORITHM"))
+            .collect();
+        assert_eq!(
+            definitions.len(),
+            1,
+            "RANDOM_STREAM_ALGORITHM has {} definitions, so identical u64 seeds initialise \
+             DIFFERENT scientific worlds depending on target pointer width. bd-7mh6 measures \
+             this as agent[0].position.x expected 287.596893311, actual 210.409286499 at tick \
+             1. Definitions found: {definitions:#?}",
+            definitions.len(),
+        );
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn small_rng_stream_codec_v1_freezes_seed_and_state_words_as_little_endian() {
         let state = SmallRngStream::seed_from_u64(0).checkpoint();
         assert_eq!(state.version, RANDOM_STREAM_STATE_VERSION);
-        assert_eq!(state.algorithm, SmallRngStream::algorithm());
+        // bd-g4aw: pinned as a LITERAL, not as `SmallRngStream::algorithm()`. The previous
+        // form compared the produced value against the same constant that produced it, so it
+        // could not fail for any change to that constant -- the identity could be swapped
+        // wholesale and this assertion would still pass. A literal makes it a real check.
+        assert_eq!(
+            state.algorithm,
+            "rand-0.9.5-smallrng-xoshiro256plusplus-64-seed-from-u64"
+        );
         assert_eq!(state.codec_version, SMALL_RNG_STATE_CODEC_VERSION);
         assert_eq!(
             state.state,
