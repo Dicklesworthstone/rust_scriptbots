@@ -31,3 +31,4 @@ crates/scriptbots-render/frames_render_test/*.png
 
 # bv (beads viewer) local config and caches
 .bv/
+beads_compliance_audit/
