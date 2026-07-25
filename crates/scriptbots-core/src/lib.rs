@@ -1149,6 +1149,50 @@ const fn clamp01(value: f32) -> f32 {
 const MAX_EXACT_F32_INTEGER: u32 = 1_u32 << f32::MANTISSA_DIGITS;
 const MAX_EXACT_F32_INTEGER_USIZE: usize = 1_usize << f32::MANTISSA_DIGITS;
 
+#[derive(Debug, Clone, Copy)]
+enum OrderedPopulationSum {
+    PinnedF32 { total: f32, divisor: f32 },
+    WideF64 { total: f64, divisor: f64 },
+}
+
+impl OrderedPopulationSum {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the f32 summary schema cannot encode every usize population; this isolated conversion preserves exact f32 divisors through 2^24 and postpones wider rounding to f64"
+    )]
+    fn new(agent_count: usize) -> Self {
+        if agent_count <= MAX_EXACT_F32_INTEGER_USIZE {
+            Self::PinnedF32 {
+                total: 0.0,
+                divisor: agent_count.max(1) as f32,
+            }
+        } else {
+            Self::WideF64 {
+                total: 0.0,
+                divisor: agent_count as f64,
+            }
+        }
+    }
+
+    fn push(&mut self, value: f32) {
+        match self {
+            Self::PinnedF32 { total, .. } => *total += value,
+            Self::WideF64 { total, .. } => *total += f64::from(value),
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "population summaries have an f32 schema; the wide path narrows once after preserving the ordered f64 sum and division"
+    )]
+    fn finish(self) -> (f32, f32) {
+        match self {
+            Self::PinnedF32 { total, divisor } => (total, total / divisor),
+            Self::WideF64 { total, divisor } => (total as f32, (total / divisor) as f32),
+        }
+    }
+}
+
 #[inline]
 #[allow(
     clippy::cast_precision_loss,
@@ -1167,6 +1211,15 @@ fn validated_world_unit_f32(value: u32) -> f32 {
 fn validated_grid_index_f32(value: usize) -> f32 {
     debug_assert!(value <= MAX_EXACT_F32_INTEGER_USIZE);
     value as f32
+}
+
+#[inline]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the analytics schema is f64 and intentionally rounds observational usize counts above 2^53; these values never feed simulation state"
+)]
+fn telemetry_count_f64(value: usize) -> f64 {
+    value as f64
 }
 
 #[allow(
@@ -3203,15 +3256,12 @@ impl DynamicWorldSnapshot {
     /// Returns a typed scientific-state error if a live arena row has no matching stable identity
     /// or runtime projection. The release profile aborts on panic, so a renderer or host must be
     /// able to refuse a malformed projection without terminating the process.
-    // bd-tqpj: usize→f32 population divisor cast is the snapshot-summary contract;
-    // pinned for byte-stable encodings.
-    #[allow(clippy::cast_precision_loss)]
     pub fn from_world(world: &WorldState) -> Result<Self, ScientificStateError> {
         let arena = world.agents();
         let columns = arena.columns();
         let mut agents = Vec::with_capacity(arena.len());
-        let mut total_energy = 0.0_f32;
-        let mut total_health = 0.0_f32;
+        let mut energy_sum = OrderedPopulationSum::new(arena.len());
+        let mut health_sum = OrderedPopulationSum::new(arena.len());
 
         for (dense_index, id) in arena.iter_handles().enumerate() {
             let data = columns.snapshot(dense_index);
@@ -3224,8 +3274,8 @@ impl DynamicWorldSnapshot {
                 }
             })?;
             let energy = runtime.energy;
-            total_energy += energy;
-            total_health += data.health;
+            energy_sum.push(energy);
+            health_sum.push(data.health);
             agents.push(DynamicAgentSnapshot {
                 id: id.raw(),
                 uid,
@@ -3245,7 +3295,8 @@ impl DynamicWorldSnapshot {
         }
 
         let agent_count = agents.len();
-        let divisor = agent_count.max(1) as f32;
+        let (total_energy, average_energy) = energy_sum.finish();
+        let (_, average_health) = health_sum.finish();
         let (births, deaths) = world
             .history()
             .last()
@@ -3256,8 +3307,8 @@ impl DynamicWorldSnapshot {
             births,
             deaths,
             total_energy,
-            average_energy: total_energy / divisor,
-            average_health: total_health / divisor,
+            average_energy,
+            average_health,
         };
         let config = world.config();
 
@@ -15764,6 +15815,15 @@ const fn legacy_clock_counter(next_tick: u64) -> u64 {
     next_tick % LEGACY_EPOCH_TICKS
 }
 
+#[inline]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the legacy clock counter is reduced modulo 10,000 and is therefore exactly representable in f32"
+)]
+fn legacy_clock_counter_f32(next_tick: u64) -> f32 {
+    legacy_clock_counter(next_tick) as f32
+}
+
 /// Population aggregates accumulated by `prepare_persistence`'s single pass over live
 /// agents, carried to the metric projection so that pass and the ~170 lines of metric
 /// assembly are no longer one function (bd-mv2j).
@@ -15835,25 +15895,11 @@ struct SignalMetricNames {
     entropy: &'static str,
 }
 
-// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
-// order and widening int→float casts are part of the science contract; fma fusion,
-// reassociation, or width changes alter world digests.
-//
-// bd-9zq2: the three NARROWING lints (cast_possible_truncation, cast_sign_loss,
-// cast_possible_wrap) are deliberately NOT allowed here. Widening a u32 into an f32
-// loses precision in a bounded, intended way, so blanket-allowing it across this impl
-// is defensible. Truncating an f32 into an i32, wrapping a u32, or dropping a sign can
-// produce an arbitrarily wrong value, and those are exactly the accidents that must not
-// be able to hide in ~8,500 lines. They are allowed per-site with a stated reason
-// instead, so a NEW narrowing cast anywhere in this impl fails the lint.
-// bd-9zq2 (measured 2026-07-25): `float_cmp` and `imprecise_flops` were also allowed here
-// and were suppressing NOTHING -- `--force-warn` on this impl (lines 15721..24514, 8,793
-// lines) reports 0 of each. They are removed rather than kept "just in case": an allow that
-// suppresses nothing cannot be justified by what it currently permits, only by what it would
-// permit later, which is precisely the property that makes a blanket allow unfalsifiable.
-// Measuring a suppression does NOT require deleting it -- `cargo clippy -- --force-warn
-// clippy::<lint>` overrides `#[allow]`, so the count is obtainable without touching source.
-#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+// bd-9zq2: no numeric lint is allowed across this implementation. Validated geometry and
+// observational telemetry conversions pass through small helpers that state their bounds;
+// arithmetic whose exact f32 order is part of the science contract carries a function-local
+// `suboptimal_flops` rationale. A new cast or reassociation candidate anywhere else therefore
+// fails lint instead of disappearing inside an 8,500-line blanket exemption.
 impl WorldState {
     /// Instantiate a new world using the supplied configuration.
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
@@ -15890,9 +15936,9 @@ impl WorldState {
         let food = FoodGrid::new(food_w, food_h, config.initial_food)?;
         let food_profiles = FoodCellProfile::compute(&config, &terrain);
         let index = UniformGridIndex::new(
-            config.food_cell_size as f32,
-            config.world_width as f32,
-            config.world_height as f32,
+            validated_world_unit_f32(config.food_cell_size),
+            validated_world_unit_f32(config.world_width),
+            validated_world_unit_f32(config.world_height),
         );
         let history_capacity = config.history_capacity;
         let cadence = TickCadence::from_config(&config);
@@ -16297,8 +16343,8 @@ impl WorldState {
         if self.active_effects.is_empty() {
             return 1.0;
         }
-        let world_width = self.config.world_width as f32;
-        let world_height = self.config.world_height as f32;
+        let world_width = validated_world_unit_f32(self.config.world_width);
+        let world_height = validated_world_unit_f32(self.config.world_height);
         for effect in &self.active_effects {
             if effect.kind == ActiveEffectKind::Embargo
                 && effect.region.contains(x, y, world_width, world_height)
@@ -16311,6 +16357,10 @@ impl WorldState {
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "food dynamics preserve the established f32 operation order; mul_add or reassociation would change scientific digests"
+    )]
     fn apply_food_regrowth(&mut self) {
         let growth = self.config.food_growth_rate;
         let decay = self.config.food_decay_rate;
@@ -16609,6 +16659,10 @@ impl WorldState {
     }
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "sensor arithmetic preserves the established f32 operation order shared with scalar and SIMD parity tests"
+    )]
     fn stage_sense(&mut self) {
         let agent_count = self.agents.len();
         if agent_count == 0 {
@@ -16698,16 +16752,16 @@ impl WorldState {
             units_finite && fovs_finite
         });
 
-        let world_width = self.config.world_width as f32;
-        let world_height = self.config.world_height as f32;
+        let world_width = validated_world_unit_f32(self.config.world_width);
+        let world_height = validated_world_unit_f32(self.config.world_height);
         let radius = self.config.sense_radius;
         let radius_sq = radius * radius;
-        let cell_size = self.config.food_cell_size as f32;
+        let cell_size = validated_world_unit_f32(self.config.food_cell_size);
         let food_width = self.food.width();
         let food_height = self.food.height();
         let food_cells = self.food.cells();
         let food_max = self.config.food_max;
-        let tick_value = legacy_clock_counter(self.tick.0.saturating_add(1)) as f32;
+        let tick_value = legacy_clock_counter_f32(self.tick.0.saturating_add(1));
         let index = &self.index;
 
         let sensor_results: Vec<([f32; INPUT_SIZE], u32)> =
@@ -16840,6 +16894,10 @@ impl WorldState {
     #[must_use]
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "sensor explanations must preserve the production sensing operation order bit for bit"
+    )]
     pub fn explain_sensors(
         &self,
         agent: AgentId,
@@ -16858,8 +16916,8 @@ impl WorldState {
         let traits = observer.trait_modifiers;
         let radius = self.config.sense_radius;
         let radius_sq = radius * radius;
-        let world_width = self.config.world_width as f32;
-        let world_height = self.config.world_height as f32;
+        let world_width = validated_world_unit_f32(self.config.world_width);
+        let world_height = validated_world_unit_f32(self.config.world_height);
         let mut eye_units = [[0.0; 2]; NUM_EYES];
         let eye_fovs = observer.eye_fov;
         for eye in 0..NUM_EYES {
@@ -16957,7 +17015,7 @@ impl WorldState {
         let hearing_channel = sense_fixed::from_fixed(accumulator.hearing) * traits.hearing;
         let blood = sense_fixed::from_fixed(accumulator.blood) * traits.blood;
 
-        let cell_size = self.config.food_cell_size as f32;
+        let cell_size = validated_world_unit_f32(self.config.food_cell_size);
         let food_width = self.food.width();
         let food_height = self.food.height();
         let food_max = self.config.food_max;
@@ -16970,7 +17028,7 @@ impl WorldState {
         let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
         let food_value = self.food.cells().get(food_idx).copied().unwrap_or(0.0) / food_max;
 
-        let tick_value = legacy_clock_counter(self.tick.0.saturating_add(1)) as f32;
+        let tick_value = legacy_clock_counter_f32(self.tick.0.saturating_add(1));
         let clocks = observer.clocks;
         let env_temperature = sample_temperature(&self.config, position.x);
         let discomfort = temperature_discomfort(env_temperature, observer.temperature_preference);
@@ -17365,6 +17423,10 @@ impl WorldState {
         first_error.map_or(Ok(()), Err)
     }
 
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "rotation preserves the established separate multiply and add sequence used by scientific digests"
+    )]
     fn rotate_vector_ccw(x: f32, y: f32, angle: f32) -> (f32, f32) {
         let cosine = angle.cos();
         let sine = angle.sin();
@@ -17430,6 +17492,10 @@ impl WorldState {
     // bd-tqpj: manual midpoint forms are pinned to the legacy locomotion contract;
     // `f32::midpoint` reassociates and would alter digests.
     #[allow(clippy::manual_midpoint)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "locomotion preserves the legacy f32 operation order; fused arithmetic would alter trajectories and digests"
+    )]
     fn actuation_locomotion(
         position: Position,
         heading: f32,
@@ -17526,6 +17592,10 @@ impl WorldState {
     }
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "actuation preserves the established scalar arithmetic order across normal and fault-injection paths"
+    )]
     fn stage_actuation(&mut self) {
         #[derive(Copy, Clone)]
         struct DecodedOutputs {
@@ -17606,7 +17676,7 @@ impl WorldState {
 
         let runtime = &self.runtime;
         let terrain = &self.terrain;
-        let cell_size = self.config.food_cell_size as f32;
+        let cell_size = validated_world_unit_f32(self.config.food_cell_size);
         let topo_enabled = self.config.topography_enabled;
         let topo_gain = self.config.topography_speed_gain.max(0.0);
         let topo_penalty = self.config.topography_energy_penalty.max(0.0);
@@ -18204,17 +18274,21 @@ impl WorldState {
 
     fn stage_record_history(&mut self, next_tick: Tick) -> TickSummary {
         let agent_count = self.agents.len();
-        let total_energy: f32 = self
-            .agents
-            .iter_handles()
-            .map(|id| {
+        let mut energy_sum = OrderedPopulationSum::new(agent_count);
+        for id in self.agents.iter_handles() {
+            energy_sum.push(
                 self.runtime
                     .get(id)
                     .expect("world-step companion preflight guarantees runtime state")
-            })
-            .map(|runtime| runtime.energy)
-            .sum();
-        let total_health: f32 = self.agents.columns().health().iter().copied().sum();
+                    .energy,
+            );
+        }
+        let mut health_sum = OrderedPopulationSum::new(agent_count);
+        for health in self.agents.columns().health() {
+            health_sum.push(*health);
+        }
+        let (total_energy, average_energy) = energy_sum.finish();
+        let (_, average_health) = health_sum.finish();
         let max_age = self
             .agents
             .columns()
@@ -18223,23 +18297,14 @@ impl WorldState {
             .copied()
             .max()
             .unwrap_or(0);
-        let divisor = agent_count as f32;
         let summary = TickSummary {
             tick: next_tick,
             agent_count,
             births: self.last_births,
             deaths: self.last_deaths,
             total_energy,
-            average_energy: if agent_count == 0 {
-                0.0
-            } else {
-                total_energy / divisor
-            },
-            average_health: if agent_count == 0 {
-                0.0
-            } else {
-                total_health / divisor
-            },
+            average_energy,
+            average_health,
             max_age,
             spike_hits: self.combat_spike_hits,
         };
@@ -18254,6 +18319,10 @@ impl WorldState {
 
     /// Sample one position uniformly inside a region on the torus. Discs sample uniform
     /// by area (sqrt of the radial draw); rects sample each wrapped axis independently.
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "seeded placement preserves its established f32 draw-to-position operation order"
+    )]
     fn sample_position_in_region(
         region: Region,
         rng: &mut SmallRng,
@@ -18411,8 +18480,8 @@ impl WorldState {
 
     fn count_agents_in_region(&self, region: Region) -> usize {
         let (width, height) = (
-            self.config.world_width as f32,
-            self.config.world_height as f32,
+            validated_world_unit_f32(self.config.world_width),
+            validated_world_unit_f32(self.config.world_height),
         );
         self.agents
             .columns()
@@ -18424,15 +18493,18 @@ impl WorldState {
 
     fn count_food_cells_in_region(&self, region: Region) -> usize {
         let (world_width, world_height) = (
-            self.config.world_width as f32,
-            self.config.world_height as f32,
+            validated_world_unit_f32(self.config.world_width),
+            validated_world_unit_f32(self.config.world_height),
         );
-        let cell_size = self.config.food_cell_size as f32;
+        let cell_size = validated_world_unit_f32(self.config.food_cell_size);
         let (width, height) = (self.food.width(), self.food.height());
         let mut count = 0_usize;
         for cy in 0..height {
             for cx in 0..width {
-                let (px, py) = ((cx as f32 + 0.5) * cell_size, (cy as f32 + 0.5) * cell_size);
+                let (px, py) = (
+                    (validated_world_unit_f32(cx) + 0.5) * cell_size,
+                    (validated_world_unit_f32(cy) + 0.5) * cell_size,
+                );
                 if region.contains(px, py, world_width, world_height) {
                     count += 1;
                 }
@@ -18455,9 +18527,9 @@ impl WorldState {
     fn stage_interventions(&mut self) -> ResourceAmounts {
         let mut rejected = ResourceAmounts::default();
         let queued = std::mem::take(&mut self.pending_interventions);
-        let world_width = self.config.world_width as f32;
-        let world_height = self.config.world_height as f32;
-        let cell_size = self.config.food_cell_size as f32;
+        let world_width = validated_world_unit_f32(self.config.world_width);
+        let world_height = validated_world_unit_f32(self.config.world_height);
+        let cell_size = validated_world_unit_f32(self.config.food_cell_size);
 
         for intervention in queued {
             match intervention {
@@ -18505,8 +18577,10 @@ impl WorldState {
                     let (width, height) = (self.food.width(), self.food.height());
                     for cy in 0..height {
                         for cx in 0..width {
-                            let (px, py) =
-                                ((cx as f32 + 0.5) * cell_size, (cy as f32 + 0.5) * cell_size);
+                            let (px, py) = (
+                                (validated_world_unit_f32(cx) + 0.5) * cell_size,
+                                (validated_world_unit_f32(cy) + 0.5) * cell_size,
+                            );
                             if region.contains(px, py, world_width, world_height)
                                 && let Some(cell) = self.food.get_mut(cx, cy)
                             {
@@ -18528,8 +18602,10 @@ impl WorldState {
                     let (width, height) = (self.food.width(), self.food.height());
                     for cy in 0..height {
                         for cx in 0..width {
-                            let (px, py) =
-                                ((cx as f32 + 0.5) * cell_size, (cy as f32 + 0.5) * cell_size);
+                            let (px, py) = (
+                                (validated_world_unit_f32(cx) + 0.5) * cell_size,
+                                (validated_world_unit_f32(cy) + 0.5) * cell_size,
+                            );
                             if region.contains(px, py, world_width, world_height)
                                 && let Some(cell) = self.food.get_mut(cx, cy)
                             {
@@ -18561,8 +18637,10 @@ impl WorldState {
                     let mut tiles = 0_usize;
                     for ty in 0..height {
                         for tx in 0..width {
-                            let (px, py) =
-                                ((tx as f32 + 0.5) * cell_size, (ty as f32 + 0.5) * cell_size);
+                            let (px, py) = (
+                                (validated_world_unit_f32(tx) + 0.5) * cell_size,
+                                (validated_world_unit_f32(ty) + 0.5) * cell_size,
+                            );
                             if region.contains(px, py, world_width, world_height)
                                 && let Some(tile) = self.terrain.tile_mut(tx, ty)
                             {
@@ -18578,8 +18656,10 @@ impl WorldState {
                         let (width, height) = (self.terrain.width(), self.terrain.height());
                         for ty in 0..height {
                             for tx in 0..width {
-                                let (px, py) =
-                                    ((tx as f32 + 0.5) * cell_size, (ty as f32 + 0.5) * cell_size);
+                                let (px, py) = (
+                                    (validated_world_unit_f32(tx) + 0.5) * cell_size,
+                                    (validated_world_unit_f32(ty) + 0.5) * cell_size,
+                                );
                                 if region.contains(px, py, world_width, world_height) {
                                     let index = (ty as usize) * (width as usize) + (tx as usize);
                                     if let Some(profile) = self.food_profiles.get_mut(index) {
@@ -18685,9 +18765,13 @@ impl WorldState {
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit. The manual
     // midpoint form is pinned: `f32::midpoint` reassociates and would alter digests.
     #[allow(clippy::too_many_lines, clippy::manual_midpoint)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "food intake and sharing preserve established f32 operation order and replay digests"
+    )]
     fn stage_food(&mut self) -> FoodResourceActivity {
         let mut activity = FoodResourceActivity::default();
-        let cell_size = self.config.food_cell_size as f32;
+        let cell_size = validated_world_unit_f32(self.config.food_cell_size);
         #[cfg(any(test, feature = "economy-faults"))]
         let ledger_fault = self.current_ledger_fault();
         // Reuse buffers: positions, handles, sharers
@@ -18811,8 +18895,8 @@ impl WorldState {
             self.config.food_sharing_radius
         };
         let distance_sq = distance * distance;
-        let world_width = self.config.world_width as f32;
-        let world_height = self.config.world_height as f32;
+        let world_width = validated_world_unit_f32(self.config.world_width);
+        let world_height = validated_world_unit_f32(self.config.world_height);
 
         // Sharing is a self-contained simulation stage: rebuild from the exact
         // positions this stage uses rather than relying on `stage_sense` to
@@ -19290,8 +19374,8 @@ impl WorldState {
             return Ok(None);
         }
 
-        let width = self.config.world_width as f32;
-        let height = self.config.world_height as f32;
+        let width = validated_world_unit_f32(self.config.world_width);
+        let height = validated_world_unit_f32(self.config.world_height);
         let parent_agent_uid =
             self.require_agent_uid(parent_id, || "spawn_crossover_agent.parent".to_owned())?;
         let partner_agent_uid =
@@ -19542,8 +19626,8 @@ impl WorldState {
 
     fn spawn_random_agent(&mut self, record_tick: Tick) -> Result<AgentId, PopulationSpawnError> {
         let mut reservation = self.reserve_agent_insertion(BirthOrigin::Injected);
-        let width = self.config.world_width as f32;
-        let height = self.config.world_height as f32;
+        let width = validated_world_unit_f32(self.config.world_width);
+        let height = validated_world_unit_f32(self.config.world_height);
         let (position, heading, color) = {
             let rng = self.rng.stream(RngDomain::Population);
             (
@@ -19708,6 +19792,10 @@ impl WorldState {
     }
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "combat geometry and damage preserve established f32 operation order across scalar and SIMD paths"
+    )]
     fn stage_combat(&mut self) {
         let spike_radius = self.config.spike_radius;
         if spike_radius <= 0.0 {
@@ -19726,8 +19814,8 @@ impl WorldState {
             return;
         }
 
-        let world_w = self.config.world_width as f32;
-        let world_h = self.config.world_height as f32;
+        let world_w = validated_world_unit_f32(self.config.world_width);
+        let world_h = validated_world_unit_f32(self.config.world_height);
         let min_length = self.config.spike_min_length;
         let alignment_threshold = self.config.spike_alignment_cosine.clamp(0.0, 1.0);
         let speed_bonus = self.config.spike_speed_damage_bonus;
@@ -20075,6 +20163,10 @@ impl WorldState {
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "carcass reward allocation preserves established ordered f32 reductions and replay digests"
+    )]
     fn distribute_carcass_rewards(&mut self, dead: &[(usize, AgentId)]) -> ResourceAmounts {
         let mut rejected = ResourceAmounts::default();
         if dead.is_empty() {
@@ -20106,8 +20198,8 @@ impl WorldState {
         let exponent = self.config.carcass_neighbor_exponent.max(1.0);
         let energy_rate = self.config.carcass_energy_share_rate.max(0.0);
         let indicator_scale = self.config.carcass_indicator_scale.max(0.0);
-        let width = self.config.world_width as f32;
-        let height = self.config.world_height as f32;
+        let width = validated_world_unit_f32(self.config.world_width);
+        let height = validated_world_unit_f32(self.config.world_height);
 
         for (dense_idx, agent_id) in dead {
             let Some(victim_runtime) = self.runtime.get(*agent_id) else {
@@ -20435,6 +20527,10 @@ impl WorldState {
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "reproduction interpolation and mutation preserve established f32 order for deterministic offspring"
+    )]
     fn stage_reproduction(&mut self) -> Result<(), ScientificStateError> {
         if self.config.reproduction_energy_threshold <= 0.0 {
             return Ok(());
@@ -21299,38 +21395,47 @@ impl WorldState {
         }
         metrics.push(MetricSample::new(
             "mortality.combat_carnivore.count",
-            combat_carnivore as f64,
+            telemetry_count_f64(combat_carnivore),
         ));
         metrics.push(MetricSample::new(
             "mortality.combat_herbivore.count",
-            combat_herbivore as f64,
+            telemetry_count_f64(combat_herbivore),
         ));
         metrics.push(MetricSample::new(
             "mortality.starvation.count",
-            starvation as f64,
+            telemetry_count_f64(starvation),
         ));
-        metrics.push(MetricSample::new("mortality.aging.count", aging as f64));
-        metrics.push(MetricSample::new("mortality.unknown.count", unknown as f64));
-        metrics.push(MetricSample::new("mortality.total.count", total as f64));
+        metrics.push(MetricSample::new(
+            "mortality.aging.count",
+            telemetry_count_f64(aging),
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.unknown.count",
+            telemetry_count_f64(unknown),
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.total.count",
+            telemetry_count_f64(total),
+        ));
         metrics.push(MetricSample::new(
             "mortality.combat_carnivore.ratio",
-            combat_carnivore as f64 / total as f64,
+            telemetry_count_f64(combat_carnivore) / telemetry_count_f64(total),
         ));
         metrics.push(MetricSample::new(
             "mortality.combat_herbivore.ratio",
-            combat_herbivore as f64 / total as f64,
+            telemetry_count_f64(combat_herbivore) / telemetry_count_f64(total),
         ));
         metrics.push(MetricSample::new(
             "mortality.starvation.ratio",
-            starvation as f64 / total as f64,
+            telemetry_count_f64(starvation) / telemetry_count_f64(total),
         ));
         metrics.push(MetricSample::new(
             "mortality.aging.ratio",
-            aging as f64 / total as f64,
+            telemetry_count_f64(aging) / telemetry_count_f64(total),
         ));
         metrics.push(MetricSample::new(
             "mortality.unknown.ratio",
-            unknown as f64 / total as f64,
+            telemetry_count_f64(unknown) / telemetry_count_f64(total),
         ));
     }
 
@@ -21347,12 +21452,18 @@ impl WorldState {
             .iter()
             .filter(|record| record.is_hybrid)
             .count();
-        metrics.push(MetricSample::new("births.total.count", total as f64));
-        metrics.push(MetricSample::new("births.hybrid.count", hybrid as f64));
+        metrics.push(MetricSample::new(
+            "births.total.count",
+            telemetry_count_f64(total),
+        ));
+        metrics.push(MetricSample::new(
+            "births.hybrid.count",
+            telemetry_count_f64(hybrid),
+        ));
         if total > 0 {
             metrics.push(MetricSample::new(
                 "births.hybrid.ratio",
-                hybrid as f64 / total as f64,
+                telemetry_count_f64(hybrid) / telemetry_count_f64(total),
             ));
         }
     }
@@ -21362,36 +21473,35 @@ impl WorldState {
     /// Emitted only when the macro cadence selects this tick; the caller gates on that, so an
     /// absent family means "not sampled" rather than "all zero".
     fn project_macro_metrics(&self, agg: &TickAggregates, metrics: &mut Vec<MetricSample>) {
-        let as_f64 = |value: usize| value as f64;
         metrics.push(MetricSample::new(
             "population.carnivore.count",
-            as_f64(agg.carnivores),
+            telemetry_count_f64(agg.carnivores),
         ));
         metrics.push(MetricSample::new(
             "population.herbivore.count",
-            as_f64(agg.herbivores),
+            telemetry_count_f64(agg.herbivores),
         ));
         metrics.push(MetricSample::new(
             "population.hybrid.count",
-            as_f64(agg.hybrids),
+            telemetry_count_f64(agg.hybrids),
         ));
 
         if agg.carnivores > 0 {
             metrics.push(MetricSample::new(
                 "population.carnivore.avg_energy",
-                agg.carnivore_energy / as_f64(agg.carnivores),
+                agg.carnivore_energy / telemetry_count_f64(agg.carnivores),
             ));
         }
         if agg.herbivores > 0 {
             metrics.push(MetricSample::new(
                 "population.herbivore.avg_energy",
-                agg.herbivore_energy / as_f64(agg.herbivores),
+                agg.herbivore_energy / telemetry_count_f64(agg.herbivores),
             ));
         }
         if agg.hybrids > 0 {
             metrics.push(MetricSample::new(
                 "population.hybrid.avg_energy",
-                agg.hybrid_energy / as_f64(agg.hybrids),
+                agg.hybrid_energy / telemetry_count_f64(agg.hybrids),
             ));
         }
 
@@ -21440,15 +21550,15 @@ impl WorldState {
         if agg.agent_count > 0 {
             metrics.push(MetricSample::new(
                 "food_delta.mean",
-                agg.food_delta_sum / agg.agent_count as f64,
+                agg.food_delta_sum / telemetry_count_f64(agg.agent_count),
             ));
             metrics.push(MetricSample::new(
                 "food_delta.mean_abs",
-                agg.food_delta_abs_sum / agg.agent_count as f64,
+                agg.food_delta_abs_sum / telemetry_count_f64(agg.agent_count),
             ));
             metrics.push(MetricSample::new(
                 "population.age.mean",
-                agg.age_sum / agg.agent_count as f64,
+                agg.age_sum / telemetry_count_f64(agg.agent_count),
             ));
             metrics.push(MetricSample::new(
                 "population.age.max",
@@ -21456,12 +21566,12 @@ impl WorldState {
             ));
             metrics.push(MetricSample::new(
                 "behavior.boost.count",
-                agg.boost_count as f64,
+                telemetry_count_f64(agg.boost_count),
             ));
             metrics.push(MetricSample::new(
                 "behavior.boost.ratio",
                 if agg.agent_count > 0 {
-                    agg.boost_count as f64 / agg.agent_count as f64
+                    telemetry_count_f64(agg.boost_count) / telemetry_count_f64(agg.agent_count)
                 } else {
                     0.0
                 },
@@ -21480,7 +21590,7 @@ impl WorldState {
             ));
             metrics.push(MetricSample::new(
                 "population.generation.mean",
-                agg.generation_sum / agg.agent_count as f64,
+                agg.generation_sum / telemetry_count_f64(agg.agent_count),
             ));
             metrics.push(MetricSample::new(
                 "population.generation.max",
@@ -21506,7 +21616,7 @@ impl WorldState {
         if let Some(hydrology) = self.hydrology.as_ref() {
             let total_water = hydrology.total_water_depth();
             let flooded = hydrology.flooded_cell_counts(0.05, 0.2);
-            let cell_count = hydrology.cell_count().max(1) as f64;
+            let cell_count = telemetry_count_f64(hydrology.cell_count().max(1));
             metrics.push(MetricSample::new(
                 "hydrology.water.total_depth",
                 f64::from(total_water),
@@ -21517,19 +21627,19 @@ impl WorldState {
             ));
             metrics.push(MetricSample::new(
                 "hydrology.water.flooded.shallow.count",
-                flooded.0 as f64,
+                telemetry_count_f64(flooded.0),
             ));
             metrics.push(MetricSample::new(
                 "hydrology.water.flooded.deep.count",
-                flooded.1 as f64,
+                telemetry_count_f64(flooded.1),
             ));
             metrics.push(MetricSample::new(
                 "hydrology.water.flooded.shallow.ratio",
-                flooded.0 as f64 / cell_count,
+                telemetry_count_f64(flooded.0) / cell_count,
             ));
             metrics.push(MetricSample::new(
                 "hydrology.water.flooded.deep.ratio",
-                flooded.1 as f64 / cell_count,
+                telemetry_count_f64(flooded.1) / cell_count,
             ));
         }
 
@@ -21538,12 +21648,12 @@ impl WorldState {
             let key = sanitize_metric_key(label);
             metrics.push(MetricSample::new(
                 format!("brain.population.{key}.count"),
-                count as f64,
+                telemetry_count_f64(count),
             ));
             if count > 0 {
                 metrics.push(MetricSample::new(
                     format!("brain.population.{key}.avg_energy"),
-                    energy_sum / count as f64,
+                    energy_sum / telemetry_count_f64(count),
                 ));
             }
         }
@@ -21699,8 +21809,8 @@ impl WorldState {
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         let agent_count = handles.len();
 
-        let mut total_energy = 0.0f32;
-        let mut total_health = 0.0f32;
+        let mut energy_sum = OrderedPopulationSum::new(agent_count);
+        let mut health_sum = OrderedPopulationSum::new(agent_count);
 
         let mut carnivores = 0usize;
         let mut herbivores = 0usize;
@@ -21777,7 +21887,7 @@ impl WorldState {
         let mut temperature_discomfort_stats = RunningStats::default();
 
         for (idx, agent_id) in handles.iter().enumerate() {
-            total_health += healths.get(idx).copied().unwrap_or(0.0);
+            health_sum.push(healths.get(idx).copied().unwrap_or(0.0));
             if let Some(age) = ages.get(idx).copied() {
                 age_sum += f64::from(age);
                 if age > age_max {
@@ -21788,7 +21898,7 @@ impl WorldState {
                 boost_count += 1;
             }
             if let Some(runtime) = self.runtime.get(*agent_id) {
-                total_energy += runtime.energy;
+                energy_sum.push(runtime.energy);
 
                 reproduction_counter_stats.update(f64::from(runtime.reproduction_counter));
                 temperature_pref_stats.update(f64::from(runtime.temperature_preference));
@@ -21861,16 +21971,8 @@ impl WorldState {
             }
         }
 
-        let average_energy = if agent_count > 0 {
-            total_energy / agent_count as f32
-        } else {
-            0.0
-        };
-        let average_health = if agent_count > 0 {
-            total_health / agent_count as f32
-        } else {
-            0.0
-        };
+        let (total_energy, average_energy) = energy_sum.finish();
+        let (_, average_health) = health_sum.finish();
 
         let summary = TickSummary {
             tick: next_tick,
@@ -23306,9 +23408,9 @@ impl WorldState {
     }
 
     /// Apply a new configuration, refreshing derived caches while preserving runtime state.
-    // bd-tqpj: exact f32 != dimension guards are intentional identity checks; u32→f32 grid
-    // casts are pinned by the science contract; long fn reviewed as a unit.
-    #[allow(clippy::float_cmp, clippy::cast_precision_loss, clippy::too_many_lines)]
+    // bd-tqpj: exact f32 != dimension guards are intentional identity checks; long fn reviewed
+    // as a unit.
+    #[allow(clippy::float_cmp, clippy::too_many_lines)]
     pub fn apply_config_update(
         &mut self,
         new_config: ScriptBotsConfig,
@@ -23394,19 +23496,12 @@ impl WorldState {
             }
         }
 
-        let new_index = UniformGridIndex::new(
-            new_config.food_cell_size as f32,
-            new_config.world_width as f32,
-            new_config.world_height as f32,
-        );
-
         if let Ok(value) = serde_json::to_value(&new_config) {
             self.record_config_audit(value);
         }
 
         self.config = new_config;
         self.food_profiles = food_profiles;
-        self.index = new_index;
         self.cadence = TickCadence::from_config(&self.config);
         self.config_revision = self.config_revision.saturating_add(1);
         Ok(())
@@ -39927,6 +40022,31 @@ mod tests {
             carcass_neighbor_normalizer(16_777_217, 1.25).to_bits(),
             0x4e80_0001
         );
+
+        let mut pinned_sum = OrderedPopulationSum::new(3);
+        pinned_sum.push(16_777_216.0);
+        pinned_sum.push(1.0);
+        pinned_sum.push(-16_777_216.0);
+        let (pinned_total, pinned_mean) = pinned_sum.finish();
+        assert_eq!(pinned_total.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(pinned_mean.to_bits(), 0.0_f32.to_bits());
+
+        let mut exact_boundary_sum = OrderedPopulationSum::new(MAX_EXACT_F32_INTEGER_USIZE);
+        exact_boundary_sum.push(1.0);
+        let (_, exact_boundary_mean) = exact_boundary_sum.finish();
+        assert_eq!(exact_boundary_mean.to_bits(), 0x3380_0000);
+
+        let mut wide_sum = OrderedPopulationSum::new(MAX_EXACT_F32_INTEGER_USIZE + 1);
+        wide_sum.push(16_777_216.0);
+        wide_sum.push(1.0);
+        wide_sum.push(-16_777_216.0);
+        let (wide_total, wide_mean) = wide_sum.finish();
+        assert_eq!(wide_total.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(wide_mean.to_bits(), 0x337f_ffff);
+
+        let (empty_total, empty_mean) = OrderedPopulationSum::new(0).finish();
+        assert_eq!(empty_total.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(empty_mean.to_bits(), 0.0_f32.to_bits());
     }
 
     #[test]
