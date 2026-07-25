@@ -39,6 +39,7 @@ use scriptbots_core::{
     TickSummary, WorldState, apply_control_command,
     attribution::{AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs},
     narrative::{EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord},
+    visual,
 };
 #[cfg(test)]
 use scriptbots_storage::AnalyticsSnapshotProvider;
@@ -4306,6 +4307,9 @@ pub fn is_reduced_motion_requested() -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CuratedThemeId {
+    /// bd-9pqz art direction, derived from `visual::BIOLUMINESCENT_DARK_FIELD_V1`.
+    /// The default, so terminal mode shares the GUI's look instead of diverging.
+    BioluminescentDarkField,
     CyberpunkAurora,
     Darcula,
     LumenLight,
@@ -4315,7 +4319,7 @@ pub enum CuratedThemeId {
 
 impl Default for CuratedThemeId {
     fn default() -> Self {
-        Self::CyberpunkAurora
+        Self::BioluminescentDarkField
     }
 }
 
@@ -4323,17 +4327,19 @@ impl CuratedThemeId {
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
+            Self::BioluminescentDarkField => Self::CyberpunkAurora,
             Self::CyberpunkAurora => Self::Darcula,
             Self::Darcula => Self::LumenLight,
             Self::LumenLight => Self::NordicFrost,
             Self::NordicFrost => Self::HighContrast,
-            Self::HighContrast => Self::CyberpunkAurora,
+            Self::HighContrast => Self::BioluminescentDarkField,
         }
     }
 
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::BioluminescentDarkField => "Bioluminescent Dark Field",
             Self::CyberpunkAurora => "Cyberpunk Aurora",
             Self::Darcula => "Darcula",
             Self::LumenLight => "Lumen Light",
@@ -4345,6 +4351,7 @@ impl CuratedThemeId {
     #[must_use]
     pub fn header_color(self) -> Color {
         match self {
+            Self::BioluminescentDarkField => srgb_color(visual::HERBIVORE_RGB),
             Self::CyberpunkAurora => rgb(0x00f5ff),
             Self::Darcula => rgb(0xffc66d),
             Self::LumenLight => rgb(0x1e293b),
@@ -4387,6 +4394,24 @@ struct TerminalTheme {
     energy_spark: Color,
     terrain_fg: [Color; 6],
     terrain_bg: [Color; 6],
+}
+
+/// Bridge a `visual.rs` sRGB triple into a terminal colour.
+///
+/// bd-9pqz's rule is that the ramp is defined once and no renderer invents a colour.
+/// The TUI is a renderer, so its art-direction theme is derived here rather than
+/// hand-picked — change the constant in visual.rs and terminal mode follows.
+fn srgb_color(srgb: scriptbots_core::visual::Srgb) -> Color {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color::Rgb(byte(srgb[0]), byte(srgb[1]), byte(srgb[2]))
+}
+
+/// Lift a very dark substrate value toward legibility without leaving the ramp.
+/// Terminal cells have no bloom or tonemap, so the raw abyss values render as flat
+/// black; this keeps the hue and raises only the value.
+fn srgb_lifted(srgb: scriptbots_core::visual::Srgb, lift: f32) -> Color {
+    let byte = |v: f32| ((v + lift).clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color::Rgb(byte(srgb[0]), byte(srgb[1]), byte(srgb[2]))
 }
 
 fn rgb(hex: u32) -> Color {
@@ -4443,6 +4468,61 @@ impl Palette {
     }
 
     fn theme(&self) -> TerminalTheme {
+        // bd-f4x0 / bd-9pqz: the art-direction theme is a full theme, not an accent
+        // tweak, and every value below traces to visual.rs. It is checked before the
+        // palette-mode match so terminal mode carries the same look as the GUI.
+        //
+        // The accessibility modes are untouched and still reachable: cycling themes
+        // moves off this one, and HighContrast in particular keeps its own values.
+        if self.theme_id == CuratedThemeId::BioluminescentDarkField {
+            let herb = visual::HERBIVORE_RGB;
+            let carn = visual::CARNIVORE_RGB;
+            // Omnivore sits midway on the deliberate cyan->magenta diet ramp rather
+            // than being a third invented hue.
+            let omni = [
+                (herb[0] + carn[0]) * 0.5,
+                (herb[1] + carn[1]) * 0.5,
+                (herb[2] + carn[2]) * 0.5,
+            ];
+            let food = visual::FOOD_MID_RGB;
+            let base = visual::TERRAIN_BASE_COLORS;
+            return TerminalTheme {
+                header: srgb_color(herb),
+                accent: srgb_color(food),
+                paused_fg: srgb_color(visual::BIOLUMINESCENT_DARK_FIELD_V1.substrate.abyss_srgb),
+                paused_bg: srgb_color(carn),
+                running_fg: srgb_color(visual::BIOLUMINESCENT_DARK_FIELD_V1.substrate.abyss_srgb),
+                running_bg: srgb_color(food),
+                diet: [srgb_color(herb), srgb_color(omni), srgb_color(carn)],
+                event: [
+                    srgb_color(food),
+                    srgb_color(carn),
+                    srgb_color(omni),
+                    srgb_color(herb),
+                ],
+                population_spark: srgb_color(herb),
+                energy_spark: srgb_color(food),
+                // Substrate is near-black by design; terrain reads through VALUE and
+                // material, not hue swaps. Backgrounds take the ramp as-is and glyph
+                // ink is the same colour lifted, so the two never drift apart.
+                terrain_fg: [
+                    srgb_lifted(base[0], 0.34),
+                    srgb_lifted(base[1], 0.34),
+                    srgb_lifted(base[2], 0.30),
+                    srgb_lifted(base[3], 0.30),
+                    srgb_lifted(base[4], 0.36),
+                    srgb_lifted(base[5], 0.26),
+                ],
+                terrain_bg: [
+                    srgb_color(base[0]),
+                    srgb_color(base[1]),
+                    srgb_color(base[2]),
+                    srgb_color(base[3]),
+                    srgb_color(base[4]),
+                    srgb_color(base[5]),
+                ],
+            };
+        }
         match self.mode {
             TerminalPaletteMode::Natural => TerminalTheme {
                 header: rgb(0x93c5fd),
