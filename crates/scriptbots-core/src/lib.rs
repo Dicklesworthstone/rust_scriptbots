@@ -40977,6 +40977,71 @@ mod tests {
         let batch = batches.last().expect("one projected batch");
         let names: Vec<&str> = batch.metrics.iter().map(|m| m.name.as_ref()).collect();
 
+        // bd-mv2j: EMISSION ORDER, not just membership.
+        //
+        // Metric order is load-bearing and easy to disturb by accident. The
+        // brain.population entries come from a BTreeMap, so they iterate sorted by label;
+        // switching that to a HashMap would reorder them nondeterministically. serde_json is
+        // built with preserve_order workspace-wide, so a Value object serializes in INSERTION
+        // order rather than sorted -- anything downstream reaching a digest or manifest would
+        // change bytes without a single value changing. Pinning the sequence makes a
+        // reordering fail HERE rather than surface later as an unexplained digest diff.
+        //
+        // Captured from a real projected batch. If you deliberately add, remove or reorder a
+        // metric, update this list in the same commit.
+        let expected_order = [
+            "total_energy",
+            "average_energy",
+            "average_health",
+            "population.carnivore.count",
+            "population.herbivore.count",
+            "population.hybrid.count",
+            "population.carnivore.avg_energy",
+            "population.herbivore.avg_energy",
+            "mutation.primary.mean",
+            "mutation.primary.stddev",
+            "mutation.secondary.mean",
+            "mutation.secondary.stddev",
+            "traits.smell.mean",
+            "traits.sound.mean",
+            "traits.hearing.mean",
+            "traits.eye.mean",
+            "traits.blood.mean",
+            "herbivore_tendency.mean",
+            "herbivore_tendency.stddev",
+            "food_delta.mean",
+            "food_delta.mean_abs",
+            "population.age.mean",
+            "population.age.max",
+            "behavior.boost.count",
+            "behavior.boost.ratio",
+            "reproduction.counter.mean",
+            "temperature.preference.mean",
+            "temperature.preference.stddev",
+            "population.generation.mean",
+            "population.generation.max",
+            "temperature.discomfort.mean",
+            "temperature.discomfort.stddev",
+            "food.total",
+            "food.mean",
+            "food.stddev",
+            "food.max",
+            "brain.population.unbound.count",
+            "brain.population.unbound.avg_energy",
+            "behavior.sensors.mean",
+            "behavior.sensors.stddev",
+            "behavior.sensors.max",
+            "behavior.sensors.entropy",
+            "behavior.outputs.mean",
+            "behavior.outputs.stddev",
+            "behavior.outputs.max",
+            "behavior.outputs.entropy",
+        ];
+        assert_eq!(
+            names, expected_order,
+            "projected metric sequence changed; read the note above before updating this list"
+        );
+
         // One representative from each family the projection is responsible for.
         for expected in [
             "total_energy", // summary scalars
