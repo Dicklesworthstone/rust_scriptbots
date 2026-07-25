@@ -20,9 +20,10 @@
 #![allow(clippy::too_many_lines)]
 
 use scriptbots_core::{
-    AgentData, AgentId, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE, LocomotionModel,
-    NUM_EYES, NullPersistence, OUTPUT_SIZE, OutputChannel, Position, SENSOR_LAYOUT,
-    ScriptBotsConfig, SensorKind, Tick, TickSummary, TraitModifiers, WorldState,
+    AgentData, AgentId, BirthOrigin, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE,
+    LocomotionModel, NUM_EYES, NullPersistence, OUTPUT_SIZE, OutputChannel, Position,
+    SENSOR_LAYOUT, ScriptBotsConfig, SensorKind, Tick, TickSummary, TraitModifiers, WorldState,
+    WorldStateError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1868,4 +1869,339 @@ fn gallery_manifest_in_repo_is_valid_and_verifiable() {
             );
         }
     }
+}
+
+#[test]
+fn numeric_precision_rejects_geometry_beyond_f32_consecutive_integer_range() {
+    const MAX_EXACT_WORLD_UNIT: u32 = 1_u32 << f32::MANTISSA_DIGITS;
+    const FIRST_INEXACT_WORLD_UNIT: u32 = MAX_EXACT_WORLD_UNIT + 1;
+
+    let cases = [
+        (
+            ScriptBotsConfig {
+                world_width: FIRST_INEXACT_WORLD_UNIT,
+                world_height: 1,
+                food_cell_size: 1,
+                ..ScriptBotsConfig::default()
+            },
+            "world_width must not exceed 16777216 for exact f32 world geometry",
+        ),
+        (
+            ScriptBotsConfig {
+                world_width: 1,
+                world_height: FIRST_INEXACT_WORLD_UNIT,
+                food_cell_size: 1,
+                ..ScriptBotsConfig::default()
+            },
+            "world_height must not exceed 16777216 for exact f32 world geometry",
+        ),
+        (
+            ScriptBotsConfig {
+                world_width: FIRST_INEXACT_WORLD_UNIT,
+                world_height: FIRST_INEXACT_WORLD_UNIT,
+                food_cell_size: FIRST_INEXACT_WORLD_UNIT,
+                ..ScriptBotsConfig::default()
+            },
+            "food_cell_size must not exceed 16777216 for exact f32 world geometry",
+        ),
+    ];
+
+    for (config, expected_message) in cases {
+        let error = config
+            .validate()
+            .expect_err("inexact f32 geometry must fail before allocation");
+        match error {
+            WorldStateError::InvalidConfig(actual_message) => {
+                assert_eq!(actual_message, expected_message);
+            }
+            other => panic!("expected invalid configuration, got {other}"),
+        }
+    }
+
+    let boundary = ScriptBotsConfig {
+        world_width: MAX_EXACT_WORLD_UNIT,
+        world_height: MAX_EXACT_WORLD_UNIT,
+        food_cell_size: MAX_EXACT_WORLD_UNIT,
+        ..ScriptBotsConfig::default()
+    };
+    assert_eq!(
+        boundary
+            .food_dimensions()
+            .expect("2^24 remains exactly representable in f32"),
+        (1, 1)
+    );
+}
+
+#[test]
+fn numeric_precision_reproduction_cooldown_does_not_round_down_and_fire_early() {
+    let mut world = WorldState::new(ScriptBotsConfig {
+        world_width: 40,
+        world_height: 40,
+        food_cell_size: 10,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        food_intake_rate: 0.0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        reproduction_energy_threshold: 0.5,
+        reproduction_energy_cost: 0.0,
+        reproduction_cooldown: 16_777_217,
+        reproduction_attempt_interval: 1,
+        reproduction_attempt_chance: 1.0,
+        reproduction_rate_carnivore: 2.0,
+        reproduction_rate_herbivore: 2.0,
+        reproduction_partner_chance: 0.0,
+        reproduction_spawn_jitter: 0.0,
+        reproduction_spawn_back_distance: 0.0,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        spike_radius: f32::MIN_POSITIVE,
+        persistence_interval: 0,
+        closed: true,
+        rng_seed: Some(0xBD9_2),
+        ..ScriptBotsConfig::default()
+    })
+    .expect("precision-boundary world");
+
+    let parent = world
+        .try_spawn_agent_with(
+            AgentData {
+                position: Position::new(10.0, 10.0),
+                ..AgentData::default()
+            },
+            |runtime| {
+                runtime.energy = 1.0;
+                runtime.herbivore_tendency = 0.0;
+                runtime.reproduction_counter = 16_777_214.0;
+            },
+        )
+        .expect("finite parent");
+    bind_zero_brain(&mut world, &[parent]);
+
+    let first = world
+        .step_outcome()
+        .expect("first precision-boundary step")
+        .outcome;
+    assert_eq!(
+        first.summary.births, 0,
+        "an integer cooldown must not round down into an early birth"
+    );
+    assert!(first.births.is_empty());
+    assert_eq!(
+        world
+            .agent_runtime(parent)
+            .expect("parent survives first step")
+            .reproduction_counter
+            .to_bits(),
+        16_777_216.0_f32.to_bits()
+    );
+
+    let second = world
+        .step_outcome()
+        .expect("second precision-boundary step")
+        .outcome;
+    assert_eq!(second.summary.births, 1);
+    assert_eq!(second.births.len(), 1);
+    assert_eq!(second.births[0].origin, BirthOrigin::Born);
+}
+
+#[test]
+fn numeric_precision_reproduction_cooldown_must_be_reachable_by_the_minimum_rate() {
+    const UNREACHABLE_MESSAGE: &str =
+        "reproduction_cooldown must be reachable at the minimum configured reproduction rate";
+
+    let cases = [
+        ScriptBotsConfig {
+            reproduction_cooldown: 16_777_218,
+            reproduction_rate_carnivore: 1.0,
+            reproduction_rate_herbivore: 1.0,
+            ..ScriptBotsConfig::default()
+        },
+        ScriptBotsConfig {
+            reproduction_cooldown: 2_000_000,
+            reproduction_rate_carnivore: 0.1,
+            reproduction_rate_herbivore: 0.1,
+            ..ScriptBotsConfig::default()
+        },
+    ];
+    for config in cases {
+        match config
+            .validate()
+            .expect_err("an unreachable f32 counter threshold must be rejected")
+        {
+            WorldStateError::InvalidConfig(message) => {
+                assert_eq!(message, UNREACHABLE_MESSAGE);
+            }
+            other => panic!("expected invalid configuration, got {other}"),
+        }
+    }
+
+    for config in [
+        ScriptBotsConfig {
+            reproduction_cooldown: 16_777_216,
+            reproduction_rate_carnivore: 1.0,
+            reproduction_rate_herbivore: 1.0,
+            ..ScriptBotsConfig::default()
+        },
+        ScriptBotsConfig {
+            reproduction_cooldown: 16_777_217,
+            reproduction_rate_carnivore: 2.0,
+            reproduction_rate_herbivore: 2.0,
+            ..ScriptBotsConfig::default()
+        },
+    ] {
+        config
+            .validate()
+            .expect("a reachable reproduction threshold must remain valid");
+    }
+}
+
+#[test]
+fn numeric_precision_carcass_maturity_ratio_preserves_u32_order() {
+    const AGE: u32 = 1_u32 << f32::MANTISSA_DIGITS;
+    const MATURITY_AGE: u32 = AGE + 1;
+
+    let mut world = WorldState::new(ScriptBotsConfig {
+        world_width: 200,
+        world_height: 200,
+        food_cell_size: 10,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        food_intake_rate: 0.0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        reproduction_energy_threshold: 0.0,
+        carcass_distribution_radius: 50.0,
+        carcass_health_reward: 0.0,
+        carcass_reproduction_reward: 1.0,
+        carcass_neighbor_exponent: 1.0,
+        carcass_maturity_age: MATURITY_AGE,
+        carcass_energy_share_rate: 0.0,
+        carcass_indicator_scale: 0.0,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        spike_radius: f32::MIN_POSITIVE,
+        persistence_interval: 0,
+        closed: true,
+        rng_seed: Some(0xCA2C_A55),
+        ..ScriptBotsConfig::default()
+    })
+    .expect("carcass precision world");
+
+    let victim = world
+        .try_spawn_agent_with(
+            AgentData {
+                position: Position::new(10.0, 10.0),
+                health: 0.0,
+                age: AGE,
+                ..AgentData::default()
+            },
+            |runtime| runtime.spiked = true,
+        )
+        .expect("finite victim");
+    let neighbor = world
+        .try_spawn_agent_with(
+            AgentData {
+                position: Position::new(12.0, 10.0),
+                ..AgentData::default()
+            },
+            |runtime| {
+                runtime.herbivore_tendency = 0.0;
+                runtime.reproduction_counter = 0.0;
+            },
+        )
+        .expect("finite neighbor");
+    bind_zero_brain(&mut world, &[victim, neighbor]);
+
+    let _ = world
+        .step_outcome()
+        .expect("carcass precision step must complete");
+
+    let expected = (f64::from(AGE) / f64::from(MATURITY_AGE)) as f32;
+    assert_eq!(expected.to_bits(), 0x3f7f_ffff);
+    assert_eq!(
+        world
+            .agent_runtime(neighbor)
+            .expect("neighbor survives")
+            .reproduction_counter
+            .to_bits(),
+        expected.to_bits(),
+        "an age strictly below maturity must not round up to full maturity"
+    );
+}
+
+#[test]
+fn numeric_precision_aging_decay_preserves_u32_elapsed_ticks() {
+    const INITIAL_AGE: u32 = 1_u32 << f32::MANTISSA_DIGITS;
+
+    let mut world = WorldState::new(ScriptBotsConfig {
+        world_width: 40,
+        world_height: 40,
+        food_cell_size: 10,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        food_intake_rate: 0.0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        reproduction_energy_threshold: 2.0,
+        aging_tick_interval: 1,
+        aging_health_decay_start: 0,
+        aging_health_decay_rate: 5.0e-8,
+        aging_health_decay_max: 2.0,
+        aging_energy_penalty_rate: 0.0,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        spike_radius: f32::MIN_POSITIVE,
+        persistence_interval: 0,
+        closed: true,
+        rng_seed: Some(0xA61_9),
+        ..ScriptBotsConfig::default()
+    })
+    .expect("aging precision world");
+
+    let agent = world
+        .try_spawn_agent_with(
+            AgentData {
+                position: Position::new(10.0, 10.0),
+                health: 2.0,
+                age: INITIAL_AGE,
+                ..AgentData::default()
+            },
+            |runtime| runtime.energy = 1.0,
+        )
+        .expect("finite aging probe");
+    bind_zero_brain(&mut world, &[agent]);
+
+    let _ = world
+        .step_outcome()
+        .expect("aging precision step must complete");
+
+    let elapsed = INITIAL_AGE + 1;
+    let expected_penalty =
+        (f64::from(elapsed) * f64::from(5.0e-8_f32)).min(f64::from(2.0_f32)) as f32;
+    let expected_health = 2.0 - expected_penalty;
+    assert_eq!(expected_health.to_bits(), 0x3f94_a035);
+
+    let index = world
+        .agents()
+        .index_of(agent)
+        .expect("aging probe survives");
+    let actual_health = world.agents().columns().health()[index];
+    assert_eq!(
+        actual_health.to_bits(),
+        expected_health.to_bits(),
+        "elapsed ticks above 2^24 must be widened before applying the f32 decay rate"
+    );
 }

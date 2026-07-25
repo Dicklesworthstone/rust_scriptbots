@@ -1144,6 +1144,73 @@ const fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
+/// Largest integer for which every smaller non-negative integer is exactly representable in
+/// `f32`.
+const MAX_EXACT_F32_INTEGER: u32 = 1_u32 << f32::MANTISSA_DIGITS;
+const MAX_EXACT_F32_INTEGER_USIZE: usize = 1_usize << f32::MANTISSA_DIGITS;
+
+#[inline]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "configuration validation bounds every world-space integer to f32's exact range"
+)]
+fn validated_world_unit_f32(value: u32) -> f32 {
+    debug_assert!(value <= MAX_EXACT_F32_INTEGER);
+    value as f32
+}
+
+#[inline]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "grid indices derive from validated world geometry and remain exactly representable"
+)]
+fn validated_grid_index_f32(value: usize) -> f32 {
+    debug_assert!(value <= MAX_EXACT_F32_INTEGER_USIZE);
+    value as f32
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "preserve the established f32 path through 2^24; wider elapsed ages multiply in f64 and narrow once into the existing f32 health schema"
+)]
+fn aging_decay_penalty(over: u32, rate: f32, max_penalty: f32) -> f32 {
+    if over <= MAX_EXACT_F32_INTEGER {
+        ((over as f32) * rate).min(max_penalty)
+    } else {
+        (f64::from(over) * f64::from(rate)).min(f64::from(max_penalty)) as f32
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "preserve the established f32 ratio through 2^24; larger u32 ratios divide exactly in f64 and narrow once into the existing f32 reward schema"
+)]
+fn carcass_maturity_multiplier(age: u32, maturity_age: u32) -> f32 {
+    let maturity_age = maturity_age.max(1);
+    if age >= maturity_age {
+        1.0
+    } else if maturity_age <= MAX_EXACT_F32_INTEGER {
+        (age as f32) / (maturity_age as f32)
+    } else {
+        (f64::from(age) / f64::from(maturity_age)) as f32
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "preserve the established f32 powf path through 2^24; larger populations use deterministic libm f64 arithmetic and narrow once into the existing f32 reward schema"
+)]
+fn carcass_neighbor_normalizer(count: usize, exponent: f32) -> f32 {
+    if count <= MAX_EXACT_F32_INTEGER_USIZE {
+        (count as f32).powf(exponent)
+    } else {
+        libm::pow(count as f64, f64::from(exponent)) as f32
+    }
+}
+
 /// Returns the canonical minimum-image separation `a - b` on a toroidal axis.
 ///
 /// For a finite positive `extent`, the result lies in `(-extent / 2, extent / 2]`: every exact
@@ -11502,6 +11569,18 @@ impl ScriptBotsConfig {
         reject_unless!(self.world_height != 0, "world_height must be non-zero");
         reject_unless!(self.food_cell_size != 0, "food_cell_size must be non-zero");
         reject_unless!(
+            self.food_cell_size <= MAX_EXACT_F32_INTEGER,
+            "food_cell_size must not exceed 16777216 for exact f32 world geometry"
+        );
+        reject_unless!(
+            self.world_width <= MAX_EXACT_F32_INTEGER,
+            "world_width must not exceed 16777216 for exact f32 world geometry"
+        );
+        reject_unless!(
+            self.world_height <= MAX_EXACT_F32_INTEGER,
+            "world_height must not exceed 16777216 for exact f32 world geometry"
+        );
+        reject_unless!(
             self.world_width.is_multiple_of(self.food_cell_size),
             "world_width must be divisible by food_cell_size"
         );
@@ -11921,6 +12000,15 @@ impl ScriptBotsConfig {
         reject_unless!(
             self.reproduction_rate_carnivore > 0.0,
             "reproduction_rate_carnivore must be positive"
+        );
+        let minimum_reproduction_rate = self
+            .reproduction_rate_herbivore
+            .min(self.reproduction_rate_carnivore);
+        let maximum_reachable_cooldown =
+            f64::from(minimum_reproduction_rate) * f64::from(MAX_EXACT_F32_INTEGER);
+        reject_unless!(
+            f64::from(self.reproduction_cooldown.max(1)) <= maximum_reachable_cooldown,
+            "reproduction_cooldown must be reachable at the minimum configured reproduction rate"
         );
         reject_unless!(
             self.reproduction_food_bonus >= 0.0,
@@ -16089,8 +16177,8 @@ impl WorldState {
 
         for (idx, age) in ages_snapshot.iter().enumerate() {
             if *age > start {
-                let over = (*age - start) as f32;
-                let penalty = (over * rate).min(max_penalty);
+                let over = *age - start;
+                let penalty = aging_decay_penalty(over, rate, max_penalty);
                 if penalty > 0.0 {
                     penalties[idx] = penalty;
                 }
@@ -16187,11 +16275,11 @@ impl WorldState {
         if self.active_effects.is_empty() {
             return 1.0;
         }
-        let cell_size = self.config.food_cell_size as f32;
-        let px = (cell_x as f32 + 0.5) * cell_size;
-        let py = (cell_y as f32 + 0.5) * cell_size;
-        let world_width = self.config.world_width as f32;
-        let world_height = self.config.world_height as f32;
+        let cell_size = validated_world_unit_f32(self.config.food_cell_size);
+        let px = (validated_grid_index_f32(cell_x) + 0.5) * cell_size;
+        let py = (validated_grid_index_f32(cell_y) + 0.5) * cell_size;
+        let world_width = validated_world_unit_f32(self.config.world_width);
+        let world_height = validated_world_unit_f32(self.config.world_height);
         let mut scale = 1.0f32;
         for effect in &self.active_effects {
             if let ActiveEffectKind::GrowthScale(growth_scale) = effect.kind
@@ -17469,8 +17557,8 @@ impl WorldState {
             }
         }
 
-        let width = self.config.world_width as f32;
-        let height = self.config.world_height as f32;
+        let width = validated_world_unit_f32(self.config.world_width);
+        let height = validated_world_unit_f32(self.config.world_height);
         let bot_speed = self.config.bot_speed.max(0.0);
         let bot_radius = self.config.bot_radius;
         let locomotion_model = self.config.locomotion_model;
@@ -20016,7 +20104,6 @@ impl WorldState {
 
         let radius_sq = radius * radius;
         let exponent = self.config.carcass_neighbor_exponent.max(1.0);
-        let maturity_age = self.config.carcass_maturity_age.max(1);
         let energy_rate = self.config.carcass_energy_share_rate.max(0.0);
         let indicator_scale = self.config.carcass_indicator_scale.max(0.0);
         let width = self.config.world_width as f32;
@@ -20038,11 +20125,7 @@ impl WorldState {
             }
             let victim_pos = positions.get(victim_index).copied().unwrap_or_default();
             let age = ages.get(victim_index).copied().unwrap_or(0);
-            let age_multiplier = if age < maturity_age {
-                (age as f32) / (maturity_age as f32)
-            } else {
-                1.0
-            };
+            let age_multiplier = carcass_maturity_multiplier(age, self.config.carcass_maturity_age);
             if age_multiplier <= 0.0 {
                 continue;
             }
@@ -20112,8 +20195,7 @@ impl WorldState {
             if neighbor_indices.is_empty() {
                 continue;
             }
-            let count = neighbor_indices.len() as f32;
-            let norm = count.powf(exponent);
+            let norm = carcass_neighbor_normalizer(neighbor_indices.len(), exponent);
 
             for idx in neighbor_indices {
                 if let Some(runtime_neighbor) = self.runtime.get(handles[idx]) {
@@ -20358,16 +20440,17 @@ impl WorldState {
             return Ok(());
         }
 
-        let width = self.config.world_width as f32;
-        let height = self.config.world_height as f32;
+        let width = validated_world_unit_f32(self.config.world_width);
+        let height = validated_world_unit_f32(self.config.world_height);
         let jitter = self.config.reproduction_spawn_jitter;
         let back_offset = self.config.reproduction_spawn_back_distance;
         let color_jitter = self.config.reproduction_color_jitter;
         let partner_chance = self.config.reproduction_partner_chance;
         let gene_log_capacity = self.config.reproduction_gene_log_capacity;
-        let cooldown = self.config.reproduction_cooldown.max(1) as f32;
+        let cooldown = f64::from(self.config.reproduction_cooldown.max(1));
         let rate_carnivore = self.config.reproduction_rate_carnivore;
         let rate_herbivore = self.config.reproduction_rate_herbivore;
+        let minimum_rate = rate_carnivore.min(rate_herbivore);
         let root_seed = self.rng.root_seed();
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
@@ -20392,12 +20475,13 @@ impl WorldState {
                     continue;
                 };
                 let herb = runtime.herbivore_tendency.clamp(0.0, 1.0);
-                let reproduction_rate = rate_carnivore + (rate_herbivore - rate_carnivore) * herb;
+                let reproduction_rate =
+                    (rate_carnivore + (rate_herbivore - rate_carnivore) * herb).max(minimum_rate);
                 runtime.reproduction_counter += reproduction_rate;
                 if runtime.energy < self.config.reproduction_energy_threshold {
                     continue;
                 }
-                if runtime.reproduction_counter < cooldown {
+                if f64::from(runtime.reproduction_counter) < cooldown {
                     continue;
                 }
                 if runtime.energy < self.config.reproduction_energy_cost {
@@ -27913,8 +27997,8 @@ mod tests {
             reproduction_cooldown: 1,
             reproduction_attempt_interval: 0,
             reproduction_attempt_chance: 1.0,
-            reproduction_rate_herbivore: f32::MIN_POSITIVE,
-            reproduction_rate_carnivore: f32::MIN_POSITIVE,
+            reproduction_rate_herbivore: 1.0,
+            reproduction_rate_carnivore: 1.0,
             reproduction_partner_chance: 0.0,
             persistence_interval: 0,
             rng_seed: Some(0x1e6a_c700),
@@ -31394,8 +31478,8 @@ mod tests {
             reproduction_cooldown: 1,
             reproduction_attempt_interval: 0,
             reproduction_attempt_chance: 1.0,
-            reproduction_rate_herbivore: f32::MIN_POSITIVE,
-            reproduction_rate_carnivore: f32::MIN_POSITIVE,
+            reproduction_rate_herbivore: 1.0,
+            reproduction_rate_carnivore: 1.0,
             reproduction_partner_chance: 0.0,
             rng_seed: Some(0xB17A_0B0A),
             ..ScriptBotsConfig::default()
@@ -31520,8 +31604,8 @@ mod tests {
                 reproduction_cooldown: 1,
                 reproduction_attempt_interval: 0,
                 reproduction_attempt_chance: 1.0,
-                reproduction_rate_herbivore: f32::MIN_POSITIVE,
-                reproduction_rate_carnivore: f32::MIN_POSITIVE,
+                reproduction_rate_herbivore: 1.0,
+                reproduction_rate_carnivore: 1.0,
                 reproduction_partner_chance: 0.0,
                 persistence_interval: 0,
                 rng_seed: Some(0xF411_1B1E),
@@ -39813,6 +39897,35 @@ mod tests {
             "expected energy {:.6}, got {:.6}",
             1.0 - expected_energy_penalty,
             runtime.energy
+        );
+    }
+
+    #[test]
+    fn numeric_boundary_helpers_preserve_common_paths_and_widen_large_inputs() {
+        assert_eq!(
+            carcass_maturity_multiplier(4, 5).to_bits(),
+            (4.0_f32 / 5.0).to_bits()
+        );
+        assert_eq!(
+            aging_decay_penalty(2, 0.02, 1.0).to_bits(),
+            (2.0_f32 * 0.02).to_bits()
+        );
+        assert_eq!(
+            carcass_neighbor_normalizer(3, 1.25).to_bits(),
+            3.0_f32.powf(1.25).to_bits()
+        );
+
+        assert_eq!(
+            carcass_maturity_multiplier(16_777_216, 16_777_217).to_bits(),
+            0x3f7f_ffff
+        );
+        assert_eq!(
+            aging_decay_penalty(16_777_217, 5.0e-8, 2.0).to_bits(),
+            0x3f56_bf96
+        );
+        assert_eq!(
+            carcass_neighbor_normalizer(16_777_217, 1.25).to_bits(),
+            0x4e80_0001
         );
     }
 
