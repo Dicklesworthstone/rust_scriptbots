@@ -70,6 +70,8 @@ pub struct AgentInstance {
     pub trait_eye: f32,
     pub trait_blood: f32,
     pub selection: f32, // 0=None, 1=Hovered, 2=Selected/Focused
+    /// Authoritative semantic sRGB body color. The GPU staging boundary decodes
+    /// RGB to linear exactly once before the sRGB render target encodes output.
     pub color: [f32; 4],
     pub glow: f32,  // 0..1 extra glow (e.g., reproduction/spike)
     pub boost: f32, // 0..1 boost intensity
@@ -826,10 +828,11 @@ fn align_256(n: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        PostControls, RenderFrame, TerrainView, WorldSnapshot, align_256, parse_control_f32,
-        parse_toggle, resolve_bloom_intensity, terrain_atlas_palette, validate_frame_token,
-        validate_snapshot,
+        AgentInstance, PostControls, RenderFrame, TerrainView, WorldSnapshot, align_256,
+        parse_control_f32, parse_toggle, resolve_bloom_intensity, terrain_atlas_palette,
+        validate_frame_token, validate_snapshot,
     };
+    use bytemuck::Zeroable;
     use scriptbots_core::visual;
 
     #[test]
@@ -891,7 +894,7 @@ mod tests {
             wgpu::TextureFormat::Rgba8UnormSrgb,
             "the transfer contract is paired with an sRGB attachment"
         );
-        let linear = super::terrain_srgb_to_linear([0.5, 0.25, 0.75, 0.4]);
+        let linear = super::semantic_srgba_to_linear([0.5, 0.25, 0.75, 0.4]);
         let expected = [0.214_041_14, 0.050_876_09, 0.522_521_56, 0.4];
         for (channel, (actual, expected)) in linear.into_iter().zip(expected).enumerate() {
             assert!(
@@ -900,10 +903,31 @@ mod tests {
             );
         }
         assert_eq!(
-            super::terrain_srgb_to_linear([0.0, 1.0, 0.04045, 0.25]),
+            super::semantic_srgba_to_linear([0.0, 1.0, 0.04045, 0.25]),
             [0.0, 1.0, 0.04045 / 12.92, 0.25],
             "sRGB endpoints and alpha ownership must be exact"
         );
+    }
+
+    #[test]
+    fn authoritative_srgb_agent_body_color_is_decoded_in_the_gpu_instance() {
+        assert_eq!(
+            super::WORLD_COLOR_FORMAT,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "the agent transfer contract is paired with an sRGB attachment"
+        );
+        let agent = AgentInstance {
+            color: [0.5, 0.25, 0.75, 0.4],
+            ..AgentInstance::zeroed()
+        };
+        let actual = super::agent_instance_gpu(&agent).data6;
+        let expected = [0.214_041_14, 0.050_876_09, 0.522_521_56, 0.4];
+        for (channel, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1.0e-7,
+                "linear agent channel {channel}: expected {expected}, got {actual}"
+            );
+        }
     }
 
     #[test]
@@ -1126,10 +1150,10 @@ struct TileInstance {
     slope: f32,
 }
 
-/// Decode an authoritative sRGB terrain color before a fragment writes it to
+/// Decode an authoritative semantic sRGB color before a fragment writes it to
 /// an `Rgba8UnormSrgb` attachment. wgpu performs the inverse linear-to-sRGB
 /// transfer for RGB attachment writes; alpha is always linear and unchanged.
-fn terrain_srgb_to_linear(srgba: [f32; 4]) -> [f32; 4] {
+fn semantic_srgba_to_linear(srgba: [f32; 4]) -> [f32; 4] {
     [
         srgb_component_to_linear(srgba[0]),
         srgb_component_to_linear(srgba[1]),
@@ -1423,7 +1447,7 @@ impl TerrainPipeline {
                 staging.push(TileInstance {
                     pos: [px, py],
                     size: [cell, cell],
-                    color: terrain_srgb_to_linear(snapshot.terrain.colors[idx]),
+                    color: semantic_srgba_to_linear(snapshot.terrain.colors[idx]),
                     kind: tile_id,
                     slope,
                 });
@@ -1526,6 +1550,51 @@ struct AgentInstanceGpu {
     data7: [f32; 4],
     data8: [f32; 4],
     data9: [f32; 4],
+}
+
+fn agent_instance_gpu(agent: &AgentInstance) -> AgentInstanceGpu {
+    AgentInstanceGpu {
+        data0: [
+            agent.position[0],
+            agent.position[1],
+            agent.quad_extent[0],
+            agent.quad_extent[1],
+        ],
+        data1: [
+            agent.heading[0],
+            agent.heading[1],
+            agent.body_radius,
+            agent.body_half_length,
+        ],
+        data2: [
+            agent.wheel_offset,
+            agent.wheel_radius,
+            agent.mouth_open,
+            agent.herbivore_tendency,
+        ],
+        data3: [
+            agent.temperature_preference,
+            agent.food_delta,
+            agent.sound_level,
+            agent.sound_output,
+        ],
+        data4: [
+            agent.wheel_left,
+            agent.wheel_right,
+            agent.trait_smell,
+            agent.trait_sound,
+        ],
+        data5: [
+            agent.trait_hearing,
+            agent.trait_eye,
+            agent.trait_blood,
+            agent.selection,
+        ],
+        data6: semantic_srgba_to_linear(agent.color),
+        data7: [agent.glow, agent.boost, agent.spiked, agent.spike_length],
+        data8: agent.eye_dirs,
+        data9: agent.eye_fov,
+    }
 }
 
 impl AgentPipeline {
@@ -1643,38 +1712,7 @@ impl AgentPipeline {
             {
                 continue;
             }
-            staging.push(AgentInstanceGpu {
-                data0: [
-                    a.position[0],
-                    a.position[1],
-                    a.quad_extent[0],
-                    a.quad_extent[1],
-                ],
-                data1: [
-                    a.heading[0],
-                    a.heading[1],
-                    a.body_radius,
-                    a.body_half_length,
-                ],
-                data2: [
-                    a.wheel_offset,
-                    a.wheel_radius,
-                    a.mouth_open,
-                    a.herbivore_tendency,
-                ],
-                data3: [
-                    a.temperature_preference,
-                    a.food_delta,
-                    a.sound_level,
-                    a.sound_output,
-                ],
-                data4: [a.wheel_left, a.wheel_right, a.trait_smell, a.trait_sound],
-                data5: [a.trait_hearing, a.trait_eye, a.trait_blood, a.selection],
-                data6: a.color,
-                data7: [a.glow, a.boost, a.spiked, a.spike_length],
-                data8: a.eye_dirs,
-                data9: a.eye_fov,
-            });
+            staging.push(agent_instance_gpu(a));
         }
         if !staging.is_empty() {
             let needed = (staging.len() * std::mem::size_of::<AgentInstanceGpu>()) as u64;
