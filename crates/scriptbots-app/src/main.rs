@@ -246,15 +246,18 @@ fn main() -> Result<()> {
             .filter(|threads| *threads > 0);
         let profile_thread_policy =
             resolve_thread_policy(cli.threads, env_threads, None, cli.low_power);
-        if profile_thread_policy.source != ThreadSource::Environment
-            && let Some(threads) = profile_thread_policy.threads
-        {
-            // SAFETY: Profile dispatch happens before constructing a world or starting worker
-            // threads, so the resolved cap cannot race an environment reader.
-            unsafe {
-                std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
-            }
+        // Profile dispatch is the other pre-thread path, and it publishes only the
+        // thread cap: it never reaches a renderer, so the render toggles and the GPU
+        // adapter preference have no meaning here (bd-o0cq).
+        PreThreadEnvironment {
+            max_threads: profile_thread_policy
+                .threads
+                .filter(|_| profile_thread_policy.source != ThreadSource::Environment),
+            render_watermark: false,
+            render_safe: false,
+            prefer_high_performance_gpu: false,
         }
+        .publish();
         if let Some(ticks) = cli.profile_steps {
             profile_world_steps(&config, ticks, cli.brain)?;
         }
@@ -353,39 +356,23 @@ fn main() -> Result<()> {
             "a less specific configuration layer was declined"
         );
     }
-    // Only write the variable when a layer other than the environment decided;
-    // rewriting it with the value it already holds is noise, and rewriting it
-    // with a DIFFERENT value is the clobber this whole module exists to prevent.
-    if policy.source != ThreadSource::Environment
-        && let Some(threads) = policy.threads
-    {
-        unsafe {
-            std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
-        }
+    // One audited environment publication for the whole interactive startup, rather
+    // than four scattered `unsafe` blocks (bd-o0cq).
+    PreThreadEnvironment {
+        // Only write the variable when a layer other than the environment decided;
+        // rewriting it with the value it already holds is noise, and rewriting it
+        // with a DIFFERENT value is the clobber `precedence` exists to prevent.
+        max_threads: policy
+            .threads
+            .filter(|_| policy.source != ThreadSource::Environment),
+        render_watermark: cli.debug_watermark,
+        render_safe: cli.renderer_safe || cli.low_power,
+        prefer_high_performance_gpu: true,
     }
+    .publish();
 
     // Apply OS-level priority niceness where supported.
     apply_process_niceness(cli.low_power)?;
-
-    // Prefer high-performance adapter on Windows for wgpu
-    #[cfg(windows)]
-    unsafe {
-        if std::env::var("WGPU_POWER_PREFERENCE").is_err() {
-            std::env::set_var("WGPU_POWER_PREFERENCE", "high_performance");
-        }
-    }
-
-    // Renderer debug toggles
-    if cli.debug_watermark {
-        unsafe {
-            std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1");
-        }
-    }
-    if cli.renderer_safe || cli.low_power {
-        unsafe {
-            std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1");
-        }
-    }
     let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
         config,
         BootstrapRequest {
@@ -744,6 +731,68 @@ fn validate_shutdown_receipt(
         );
     }
     Ok(receipt)
+}
+
+/// Every process-environment value startup publishes for a later reader.
+///
+/// These four variables are consumed through the environment because their readers
+/// require it, not by preference: `SCRIPTBOTS_MAX_THREADS` is read by
+/// `scriptbots-core` when it caps Rayon, `SCRIPTBOTS_RENDER_SAFE` and
+/// `SCRIPTBOTS_RENDER_WATERMARK` by `scriptbots-render`, and
+/// `WGPU_POWER_PREFERENCE` by `wgpu` itself, which offers no programmatic
+/// equivalent. Collecting them in one value keeps the set closed and reviewable and
+/// reduces startup from four separate `unsafe` blocks to the single audited write
+/// below (bd-o0cq).
+///
+/// A `None`/`false` field means "do not speak for this variable", which is not the
+/// same as clearing it: an operator's exported value must survive a layer that
+/// declined to override it.
+struct PreThreadEnvironment {
+    /// Resolved worker-thread cap, when a layer other than the environment won.
+    max_threads: Option<usize>,
+    /// Overlay the diagnostics watermark in the render canvas.
+    render_watermark: bool,
+    /// Force the conservative paint path.
+    render_safe: bool,
+    /// Ask wgpu for the high-performance adapter (Windows only, and only if the
+    /// operator has not already expressed a preference).
+    prefer_high_performance_gpu: bool,
+}
+
+impl PreThreadEnvironment {
+    /// Publish the requested values into the process environment.
+    ///
+    /// Must be called only from the startup path, before any world, Rayon pool,
+    /// renderer, or control-runtime thread exists.
+    fn publish(&self) {
+        // SAFETY: `std::env::set_var` is unsound only when it races another thread
+        // touching the environment. This is the one audited write for the whole
+        // binary and every caller is on the single-threaded startup path: profile
+        // dispatch runs before any world is constructed, and the interactive path
+        // runs before `bootstrap_world`, the Rayon pool, the control runtime, and
+        // every renderer. `LaunchEnvironmentV0::pin()` has already captured the
+        // operator's pre-publication environment for build provenance (bd-3p7i), so
+        // these writes cannot retroactively rewrite what the manifest reports.
+        unsafe {
+            if let Some(threads) = self.max_threads {
+                std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
+            }
+            if self.render_watermark {
+                std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1");
+            }
+            if self.render_safe {
+                std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1");
+            }
+            #[cfg(windows)]
+            if self.prefer_high_performance_gpu && std::env::var("WGPU_POWER_PREFERENCE").is_err() {
+                std::env::set_var("WGPU_POWER_PREFERENCE", "high_performance");
+            }
+        }
+        // The adapter preference exists only on Windows; reference the field
+        // elsewhere so a non-Windows build does not warn about one it cannot use.
+        #[cfg(not(windows))]
+        let _ = self.prefer_high_performance_gpu;
+    }
 }
 
 #[cfg(unix)]
