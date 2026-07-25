@@ -1431,7 +1431,12 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
     let world_dims = (world_size.0.max(1.0), world_size.1.max(1.0));
     let mut camera_guard = state.camera.lock().expect("camera mutex poisoned");
-    let mut layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
+    let mut layout = layout_camera_for_frame(
+        &mut camera_guard,
+        &state.frame,
+        origin,
+        (width_px, height_px),
+    );
 
     let coverage_too_small =
         layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
@@ -2490,6 +2495,7 @@ impl SimulationView {
 
     fn fit_world_view(&self, cx: &mut Context<Self>) {
         if let Ok(mut camera) = self.camera.lock() {
+            camera.cancel_initial_population_view();
             camera.fit_world();
         }
         cx.notify();
@@ -2497,6 +2503,7 @@ impl SimulationView {
 
     fn fit_selection_view(&self, bounds: (Position, Position), cx: &mut Context<Self>) {
         if let Ok(mut camera) = self.camera.lock() {
+            camera.cancel_initial_population_view();
             camera.fit_bounds(bounds.0, bounds.1, 120.0);
         }
         cx.notify();
@@ -4594,6 +4601,7 @@ impl SimulationView {
             CommandAction::ClearSelection => self.clear_selection(cx),
             CommandAction::SelectAll => self.select_all_agents(cx),
             CommandAction::FocusFirstSelected => self.focus_first_selected(cx),
+            CommandAction::FitWorld => self.fit_world_view(cx),
             CommandAction::ToggleSettings => self.toggle_settings(cx),
         }
     }
@@ -4804,11 +4812,6 @@ impl SimulationView {
                         "Sense Radius",
                         self.format_float(config.sense_radius, 1),
                         "Perception range",
-                    ),
-                    (
-                        "Max Neighbors",
-                        self.format_float(config.sense_max_neighbors, 0),
-                        "Normalization factor",
                     ),
                     (
                         "Carnivore Threshold",
@@ -8510,11 +8513,6 @@ impl SimulationView {
                         "Perception range",
                     ),
                     (
-                        "Max Neighbors",
-                        self.format_float(config.sense_max_neighbors, 0),
-                        "Normalization factor",
-                    ),
-                    (
                         "Carnivore Threshold",
                         self.format_float(config.carnivore_threshold, 2),
                         "Herbivore tendency cutoff for carnivores",
@@ -11116,7 +11114,7 @@ impl ConfigCategory {
         match self {
             ConfigCategory::World => 5, // ACTUAL: width, height, food_cell_size, initial_food, rng_seed
             ConfigCategory::Food => 11, // ACTUAL: respawn_interval, respawn_amount, max, growth_rate, decay_rate, diffusion_rate, intake_rate, sharing_radius, sharing_rate, transfer_rate, sharing_distance
-            ConfigCategory::Agent => 6, // ACTUAL: bot_speed, bot_radius, boost_multiplier, sense_radius, sense_max_neighbors, carnivore_threshold
+            ConfigCategory::Agent => 5, // ACTUAL: bot_speed, bot_radius, boost_multiplier, sense_radius, carnivore_threshold
             ConfigCategory::Metabolism => 5, // ACTUAL: drain, movement_drain, ramp_floor, ramp_rate, boost_penalty
             ConfigCategory::Temperature => 4, // ACTUAL: discomfort_rate, comfort_band, gradient_exponent, discomfort_exponent
             ConfigCategory::Reproduction => 14, // ACTUAL: energy_threshold, energy_cost, cooldown, herbivore_rate, carnivore_rate, child_energy, spawn_jitter, spawn_back_distance, color_jitter, mutation_scale, partner_chance, gene_log_capacity, meta_mutation_chance, meta_mutation_scale
@@ -11419,6 +11417,7 @@ enum CommandAction {
     ClearSelection,
     SelectAll,
     FocusFirstSelected,
+    FitWorld,
     ToggleSettings,
 }
 
@@ -11447,6 +11446,7 @@ impl CommandAction {
             CommandAction::ClearSelection => "Clear selection",
             CommandAction::SelectAll => "Select all agents",
             CommandAction::FocusFirstSelected => "Focus first selected agent",
+            CommandAction::FitWorld => "Fit world",
             CommandAction::ToggleSettings => "Toggle settings panel",
         }
     }
@@ -11547,6 +11547,10 @@ impl Default for InputBindings {
         map.insert(
             CommandAction::FocusFirstSelected,
             Keystroke::parse("ctrl-f").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::FitWorld,
+            Keystroke::parse("0").unwrap_or_default(),
         );
         map.insert(
             CommandAction::ToggleSettings,
@@ -12609,6 +12613,21 @@ impl RenderFrame {
             palette,
         })
     }
+}
+
+fn layout_camera_for_frame(
+    camera: &mut Camera,
+    frame: &RenderFrame,
+    origin: (f32, f32),
+    canvas_size: (f32, f32),
+) -> ViewLayout {
+    camera.layout_with_initial_population(
+        origin,
+        canvas_size,
+        frame.world_size,
+        frame.agent_base_radius,
+        frame.agents.iter().map(|agent| agent.position),
+    )
 }
 
 fn build_terrain_frame(layer: &TerrainLayer) -> TerrainFrame {
@@ -14277,10 +14296,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
-    let mut layout = camera_guard.layout(
+    let mut layout = layout_camera_for_frame(
+        &mut camera_guard,
+        frame,
         (origin_x, origin_y),
         (width_px, height_px),
-        frame.world_size,
     );
 
     tracing::debug!(
@@ -15161,6 +15181,7 @@ mod command_characterization_tests {
             ("g", CommandAction::GoLive),
             ("p", CommandAction::ToggleSimulationPause),
             ("ctrl-p", CommandAction::CyclePalette),
+            ("0", CommandAction::FitWorld),
         ] {
             let stroke = Keystroke::parse(binding).expect("valid production shortcut");
             assert_eq!(
@@ -15193,6 +15214,67 @@ mod command_characterization_tests {
             expected_table.trim(),
             "README GPUI shortcuts must be rendered from the production default binding registry"
         );
+    }
+
+    #[test]
+    fn production_render_frame_layout_is_legible_at_both_supported_viewports() {
+        let config = ScriptBotsConfig {
+            world_width: 6_000,
+            world_height: 3_000,
+            food_cell_size: 50,
+            initial_food: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let agent_radius = config.bot_radius;
+        let mut world = WorldState::new(config).expect("production-layout world");
+        for x in [120.0, 240.0, 360.0] {
+            for y in [120.0, 240.0, 360.0] {
+                world
+                    .try_spawn_agent(AgentData {
+                        position: Position::new(x, y),
+                        ..AgentData::default()
+                    })
+                    .expect("seed clustered production-layout agent");
+            }
+        }
+        world
+            .try_spawn_agent(AgentData {
+                position: Position::new(5_900.0, 2_900.0),
+                ..AgentData::default()
+            })
+            .expect("seed distant production-layout outlier");
+        let frame = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+            .expect("production frame must assemble");
+
+        for viewport in [(1_280.0, 720.0), (1_600.0, 900.0)] {
+            let mut camera = Camera::default();
+            let layout = layout_camera_for_frame(&mut camera, &frame, (0.0, 0.0), viewport);
+            let visible_agent_diameters = viewport.0 / (layout.scale * agent_radius * 2.0);
+            assert!(
+                (visible_agent_diameters - 120.0).abs() <= 1e-3,
+                "{viewport:?} production layout must show 120 agent diameters across, got \
+                 {visible_agent_diameters}"
+            );
+            assert!(
+                layout.scale * agent_radius >= 5.0,
+                "{viewport:?} production layout must render an agent radius at five or more \
+                 pixels, got {}",
+                layout.scale * agent_radius
+            );
+
+            let population_center = camera
+                .world_to_screen((240.0, 240.0))
+                .expect("population median must remain visible");
+            assert!(
+                (population_center.0 - viewport.0 * 0.5).abs() <= 1e-3
+                    && (population_center.1 - viewport.1 * 0.5).abs() <= 1e-3,
+                "{viewport:?} production layout must center population density, got \
+                 {population_center:?}"
+            );
+        }
     }
 
     #[derive(Default)]
