@@ -536,7 +536,19 @@ pub fn compute_phenotype_analysis(
     run_id: &str,
     tick: Tick,
     vectors: &[AgentPhenotypeVector],
+    cohorts: &[(&str, &[AgentPhenotypeVector])],
 ) -> PhenotypeAnalysisReport {
+    // bd-ehvv: `comparisons` used to be hardcoded empty on BOTH return paths, so every caller
+    // received a well-formed report whose headline field was permanently `[]`. That is worse
+    // than an error: an empty `comparisons` is indistinguishable from "these cohorts do not
+    // differ", so a consumer cannot tell a real null result from a function that did nothing.
+    //
+    // The cohorts to compare are now a REQUIRED parameter rather than something this function
+    // was expected to invent. That makes the empty case honest -- you get no comparisons only
+    // when you asked for none -- and it is a change worth making now precisely because the
+    // function has no callers yet; the same fix at forty call sites would be a migration.
+    let comparisons = compare_cohort_pairs(cohorts);
+
     if vectors.is_empty() {
         return PhenotypeAnalysisReport {
             run_id: run_id.to_string(),
@@ -544,7 +556,7 @@ pub fn compute_phenotype_analysis(
             total_agents_analyzed: 0,
             mean_phenotype: vec![0.0; 6],
             phenotype_variance: vec![0.0; 6],
-            comparisons: Vec::new(),
+            comparisons,
         };
     }
 
@@ -578,8 +590,27 @@ pub fn compute_phenotype_analysis(
         total_agents_analyzed: vectors.len(),
         mean_phenotype: means,
         phenotype_variance: vars,
-        comparisons: Vec::new(),
+        comparisons,
     }
+}
+
+/// Compare every unordered pair of named cohorts (bd-ehvv).
+///
+/// Pairs are emitted in input order -- `(0,1), (0,2), (1,2), ...` -- so a report built from the
+/// same cohorts twice is byte-identical. Fewer than two cohorts yields no comparisons, which is
+/// the one honest empty case: there is nothing to compare against.
+fn compare_cohort_pairs(
+    cohorts: &[(&str, &[AgentPhenotypeVector])],
+) -> Vec<PhenotypeClusterComparison> {
+    let mut comparisons = Vec::new();
+    for (left_index, (left_name, left)) in cohorts.iter().enumerate() {
+        for (right_name, right) in cohorts.iter().skip(left_index + 1) {
+            comparisons.push(compare_phenotype_clusters(
+                left_name, left, right_name, right,
+            ));
+        }
+    }
+    comparisons
 }
 
 #[cfg(test)]
@@ -753,9 +784,48 @@ mod tests {
             reproduction_rate: 0.01,
         }];
 
-        let report = compute_phenotype_analysis("run-test", Tick(100), &cohort_a);
+        // bd-ehvv: the report's headline field must actually be populated. It used to be
+        // hardcoded empty on every path, so this assertion is the whole point of the fix --
+        // an empty `comparisons` is indistinguishable from "these cohorts do not differ".
+        let report = compute_phenotype_analysis(
+            "run-test",
+            Tick(100),
+            &cohort_a,
+            &[("Herbivores", &cohort_a), ("Carnivores", &cohort_b)],
+        );
         assert_eq!(report.total_agents_analyzed, 2);
         assert_eq!(report.mean_phenotype.len(), 6);
+        assert_eq!(
+            report.comparisons.len(),
+            1,
+            "two cohorts must yield exactly one pairwise comparison, got {:?}",
+            report.comparisons.len()
+        );
+        let pair = &report.comparisons[0];
+        assert_eq!(pair.cluster_a_name, "Herbivores");
+        assert_eq!(pair.cluster_b_name, "Carnivores");
+        assert!(
+            pair.feature_effect_sizes.contains_key("movement_speed"),
+            "the populated comparison must carry real effect sizes"
+        );
+
+        // Asking for no cohorts is the ONE honest empty case.
+        let empty = compute_phenotype_analysis("run-test", Tick(100), &cohort_a, &[]);
+        assert!(empty.comparisons.is_empty());
+
+        // Three cohorts produce all three unordered pairs, in input order.
+        let three = compute_phenotype_analysis(
+            "run-test",
+            Tick(100),
+            &cohort_a,
+            &[("A", &cohort_a), ("B", &cohort_b), ("C", &cohort_a)],
+        );
+        let pairs: Vec<(&str, &str)> = three
+            .comparisons
+            .iter()
+            .map(|c| (c.cluster_a_name.as_str(), c.cluster_b_name.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("A", "B"), ("A", "C"), ("B", "C")]);
 
         let comparison =
             compare_phenotype_clusters("Herbivores", &cohort_a, "Carnivores", &cohort_b);
