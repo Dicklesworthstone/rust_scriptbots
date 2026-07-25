@@ -9,7 +9,9 @@ use scriptbots_core::{
     MetricSample, PersistenceBatch, PersistenceEvent, PersistenceEventKind, ReplayEvent,
     ReplayEventKind, Tick, TickSummary,
 };
-use scriptbots_storage::{PayloadBudget, StorageError, StoragePipeline, estimate_batch_size};
+use scriptbots_storage::{
+    PayloadBudget, StorageError, StoragePipeline, estimate_batch_size, estimate_narrative_size,
+};
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,6 +58,65 @@ fn batch(tick: u64, metrics: usize) -> PersistenceBatch {
         replay_events: Vec::new(),
         narrative_events: Vec::new(),
     }
+}
+
+/// One narrative event, sized so a burst of them is unmistakably large.
+fn narrative_event(tick: u64) -> scriptbots_core::narrative::EventRecord {
+    scriptbots_core::narrative::EventRecord {
+        schema_version: 1,
+        tick: Tick(tick),
+        kind: scriptbots_core::narrative::EventKind::PopulationCrash,
+        severity: 0.5,
+        magnitude: 1.0,
+        window: (tick.saturating_sub(1), tick),
+        metric: "population".to_owned(),
+        before: 100.0,
+        after: 10.0,
+        score: 1.0,
+        subject: None,
+        human_text: "x".repeat(4096),
+    }
+}
+
+/// A burst of narration must not be able to refuse a batch of scientific rows (`bd-erff`).
+///
+/// Narrative events used to be folded into `estimate_batch_size`, so they counted against
+/// `max_batch_events` and `max_batch_bytes` alongside metrics, agents, births, deaths and
+/// replay rows. Exceeding either cap refuses the *whole* batch as a definite `NotAdmitted`,
+/// which latches the world and blocks later science ticks — so derived commentary about the
+/// simulation could stop the simulation being recorded. That inverts what the budget is for.
+///
+/// Narration is now estimated separately, against its own pool. This asserts the property
+/// that separation buys: identical scientific content is admitted identically whether or not
+/// a large amount of commentary rides along.
+#[test]
+fn a_narration_burst_cannot_refuse_a_batch_of_science() {
+    let science_only = batch(1, 64);
+    let mut with_narration = batch(1, 64);
+    with_narration.narrative_events = (0..512).map(narrative_event).collect();
+
+    let (quiet_bytes, quiet_events) = estimate_batch_size(&science_only);
+    let (loud_bytes, loud_events) = estimate_batch_size(&with_narration);
+    assert_eq!(
+        (quiet_bytes, quiet_events),
+        (loud_bytes, loud_events),
+        "narration changed the scientific estimate, so it can still consume the budget \
+         that protects science"
+    );
+
+    // And the commentary is still accounted for, in its own pool rather than nowhere:
+    // separating the budgets must not become a way of charging nothing at all.
+    let (narrative_bytes, narrative_events) = estimate_narrative_size(&with_narration);
+    assert_eq!(narrative_events, 512);
+    assert!(
+        narrative_bytes > 512 * 4096,
+        "the narrative estimate must cover the human text it carries, got {narrative_bytes}"
+    );
+    assert_eq!(
+        estimate_narrative_size(&science_only),
+        (0, 0),
+        "a batch with no commentary must cost nothing in the narrative pool"
+    );
 }
 
 #[test]

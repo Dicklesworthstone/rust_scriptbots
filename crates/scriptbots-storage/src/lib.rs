@@ -3962,6 +3962,9 @@ impl Default for PayloadBudget {
 /// oversized refusal instead of wrapping below a cap.
 #[must_use]
 pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
+    // Scientific rows only. `narrative_events` is deliberately absent: see
+    // [`estimate_narrative_size`] for why derived commentary is budgeted separately
+    // (`bd-erff`).
     let events = [
         payload.metrics.len(),
         payload.events.len(),
@@ -3969,7 +3972,6 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
         payload.births.len(),
         payload.deaths.len(),
         payload.replay_events.len(),
-        payload.narrative_events.len(),
     ]
     .into_iter()
     .fold(0usize, usize::saturating_add);
@@ -3983,7 +3985,6 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
     const BIRTH_BYTES: usize = 192;
     const DEATH_BYTES: usize = 192;
     const REPLAY_BYTES: usize = 512;
-    const NARRATIVE_EVENT_BYTES: usize = 256;
     const SUMMARY_BYTES: usize = 256;
 
     // A JSON string byte can expand to six ASCII bytes (`\u00xx`). The prepared
@@ -4004,7 +4005,6 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
         (payload.births.len(), BIRTH_BYTES),
         (payload.deaths.len(), DEATH_BYTES),
         (payload.replay_events.len(), REPLAY_BYTES),
-        (payload.narrative_events.len(), NARRATIVE_EVENT_BYTES),
     ] {
         bytes = bytes.saturating_add(count.saturating_mul(row_bytes));
     }
@@ -4051,6 +4051,30 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
             bytes = bytes.saturating_add(outputs.len().saturating_mul(REPLAY_OUTPUT_BYTES));
         }
     }
+    (bytes, events)
+}
+
+/// Estimated bytes and record count for a batch's derived narrative commentary.
+///
+/// Kept out of [`estimate_batch_size`] on purpose (`bd-erff`). Narrative events are
+/// operational output: human-readable commentary derived from the scientific record and
+/// reconstructible from it. Charging them against the scientific caps meant a burst of
+/// narration could push a batch past `max_batch_events` or `max_batch_bytes`, and that
+/// refusal is a definite `NotAdmitted` — the world latches the fault and blocks later
+/// science ticks. Commentary about the data could stop the data being recorded, which
+/// inverts what the budget exists to protect.
+///
+/// The same per-record and string multipliers are used, so the two estimates stay
+/// comparable and equally conservative; only the pool they are charged against differs.
+#[must_use]
+pub fn estimate_narrative_size(payload: &PersistenceBatch) -> (usize, usize) {
+    /// Matches the fixed per-record allocation `estimate_batch_size` uses for other rows.
+    const NARRATIVE_EVENT_BYTES: usize = 256;
+    /// Matches `estimate_batch_size`'s owned-plus-escaped string multiplier.
+    const OWNED_STRING_AND_OUTBOX_MULTIPLIER: usize = 7;
+
+    let events = payload.narrative_events.len();
+    let mut bytes = events.saturating_mul(NARRATIVE_EVENT_BYTES);
     for event in &payload.narrative_events {
         bytes = bytes.saturating_add(
             event
@@ -4059,7 +4083,6 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
                 .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
         );
     }
-
     (bytes, events)
 }
 
