@@ -1831,7 +1831,8 @@ fn run_repetition(
 
         for _ in 0..PERF_SNAPSHOT_SAMPLES_PER_TICK {
             let snapshot_started = Instant::now();
-            let snapshot = DynamicWorldSnapshot::from_world(&profiled_world);
+            let snapshot = DynamicWorldSnapshot::from_world(&profiled_world)
+                .map_err(|error| format!("dynamic snapshot failed: {error}"))?;
             let elapsed = duration_ns(snapshot_started.elapsed());
             if snapshot.agents.len() != agents {
                 return Err(format!(

@@ -12,8 +12,8 @@ use arc_swap::ArcSwap;
 use scriptbots_core::{
     AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, DeathRecord,
     DynamicAgentSnapshot, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
-    PersistenceBatch, ResourceLedgerTick, ScriptBotsConfig, TerrainKind, Tick, TickCombatSummary,
-    TickEvents, TickSummary, toroidal_delta,
+    PersistenceBatch, ResourceLedgerTick, ScientificStateError, ScriptBotsConfig, TerrainKind,
+    Tick, TickCombatSummary, TickEvents, TickSummary, toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -4021,6 +4021,9 @@ pub enum HostAccessError {
     /// The transport or in-process port is no longer connected.
     #[error("host port disconnected")]
     Disconnected,
+    /// Core refused to construct a trustworthy world projection.
+    #[error(transparent)]
+    ScientificState(#[from] ScientificStateError),
     /// A stable command id was retried with a different canonical envelope.
     #[error("command id {command_id} was already used for a different command envelope")]
     CommandIdCollision {

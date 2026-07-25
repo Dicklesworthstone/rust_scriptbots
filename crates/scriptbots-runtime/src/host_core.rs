@@ -22,7 +22,8 @@ use scriptbots_core::{
     ACTIVATION_CAPTURE_BUDGET, BrainInspectionClientId, BrainInspectionError,
     BrainInspectionRequest, BrainInspectionRevision, CharacterizationError, CompletedStepFault,
     DynamicAgentSnapshot, DynamicWorldSnapshot, NullPersistence, PersistenceAdmissionSession,
-    PersistenceSessionError, ScriptBotsConfig, Tick, TickSummary, WorldDigestV1, WorldState,
+    PersistenceSessionError, ScientificStateError, ScriptBotsConfig, Tick, TickSummary,
+    WorldDigestV1, WorldState,
 };
 use std::{
     cell::RefCell,
@@ -95,6 +96,9 @@ pub enum HostCoreBuildError {
     /// The persistence session could not be acquired or does not belong to the supplied world.
     #[error(transparent)]
     Persistence(#[from] PersistenceSessionError),
+    /// The initial world could not produce a trustworthy dynamic projection.
+    #[error(transparent)]
+    ScientificState(#[from] ScientificStateError),
 }
 
 /// Same-thread volatile journal used by [`HostCore::new`].
@@ -1272,14 +1276,7 @@ impl HostCore {
         validate_options(options)?;
         let events = Self::build_event_hub(session_id, options, journal.as_ref())?;
         let persistence = world.bind_persistence(Box::new(NullPersistence))?;
-        Ok(Self::from_bound_parts(
-            session_id,
-            world,
-            persistence,
-            options,
-            journal,
-            events,
-        ))
+        Self::from_bound_parts(session_id, world, persistence, options, journal, events)
     }
 
     /// Construct a host from a caller-bound persistence session and injected journal.
@@ -1299,14 +1296,7 @@ impl HostCore {
         validate_options(options)?;
         persistence.validate_binding(&world)?;
         let events = Self::build_event_hub(session_id, options, journal.as_ref())?;
-        Ok(Self::from_bound_parts(
-            session_id,
-            world,
-            persistence,
-            options,
-            journal,
-            events,
-        ))
+        Self::from_bound_parts(session_id, world, persistence, options, journal, events)
     }
 
     fn build_event_hub(
@@ -1332,7 +1322,7 @@ impl HostCore {
         options: HostCoreOptions,
         journal: Box<dyn JournalPort>,
         events: EventHub,
-    ) -> Self {
+    ) -> Result<Self, HostCoreBuildError> {
         let revisions = HostRevisions {
             control: ControlRevision::new(0),
             scientific: ScientificRevision::new(world.tick().0),
@@ -1342,7 +1332,7 @@ impl HostCore {
         let lifecycle = HostLifecycle::Running;
         let health = HostHealth::Healthy;
         let (snapshot_layers, layer_refresh) = SnapshotLayerCache::new(&world);
-        let dynamic_world = DynamicWorldSnapshot::from_world(&world);
+        let dynamic_world = DynamicWorldSnapshot::from_world(&world)?;
         let summary_history = Arc::new(world.history().cloned().collect::<Vec<_>>());
         let build = snapshot_build_stats(
             &dynamic_world,
@@ -1397,7 +1387,7 @@ impl HostCore {
                 revisions,
             },
         }));
-        Self {
+        Ok(Self {
             session_id,
             world,
             persistence,
@@ -1430,7 +1420,7 @@ impl HostCore {
             shutdown_receipt: None,
             failed_journal_batches: HashSet::new(),
             latched_fault: None,
-        }
+        })
     }
 
     /// Create another same-thread handle to the bounded host port.
@@ -2072,7 +2062,7 @@ impl HostCore {
             .ok_or_else(|| protocol_violation("snapshot revision exhausted"))?;
         let mut layers = self.snapshot_layers.clone();
         let refresh = layers.refresh(&self.world)?;
-        let dynamic_world = DynamicWorldSnapshot::from_world(&self.world);
+        let dynamic_world = DynamicWorldSnapshot::from_world(&self.world)?;
         let summary_history_allocated = self.revisions.scientific != self.last_published_scientific;
         let summary_history = if summary_history_allocated {
             Arc::new(self.world.history().cloned().collect::<Vec<_>>())

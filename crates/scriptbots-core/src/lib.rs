@@ -3131,15 +3131,15 @@ pub struct DynamicWorldSnapshot {
 impl DynamicWorldSnapshot {
     /// Capture current dynamic world state without terrain or other static layers.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if internal live-agent identity/runtime maps have diverged from the arena. Such a
-    /// divergence is a core invariant violation, not a recoverable renderer condition.
-    #[must_use]
+    /// Returns a typed scientific-state error if a live arena row has no matching stable identity
+    /// or runtime projection. The release profile aborts on panic, so a renderer or host must be
+    /// able to refuse a malformed projection without terminating the process.
     // bd-tqpj: usize→f32 population divisor cast is the snapshot-summary contract;
     // pinned for byte-stable encodings.
     #[allow(clippy::cast_precision_loss)]
-    pub fn from_world(world: &WorldState) -> Self {
+    pub fn from_world(world: &WorldState) -> Result<Self, ScientificStateError> {
         let arena = world.agents();
         let columns = arena.columns();
         let mut agents = Vec::with_capacity(arena.len());
@@ -3148,17 +3148,20 @@ impl DynamicWorldSnapshot {
 
         for (dense_index, id) in arena.iter_handles().enumerate() {
             let data = columns.snapshot(dense_index);
-            let runtime = world
-                .agent_runtime(id)
-                .expect("every live agent has runtime projection state");
+            let uid = world.require_agent_uid(id, || {
+                format!("dynamic_world_snapshot.agents[{dense_index}].identity")
+            })?;
+            let runtime = world.agent_runtime(id).ok_or_else(|| {
+                ScientificStateError::MissingAgentRuntime {
+                    path: format!("dynamic_world_snapshot.agents[uid={}].runtime", uid.get()),
+                }
+            })?;
             let energy = runtime.energy;
             total_energy += energy;
             total_health += data.health;
             agents.push(DynamicAgentSnapshot {
                 id: id.raw(),
-                uid: world
-                    .agent_uid(id)
-                    .expect("every live agent has a stable logical identity"),
+                uid,
                 position: [data.position.x, data.position.y],
                 velocity: [data.velocity.vx, data.velocity.vy],
                 heading: data.heading,
@@ -3191,7 +3194,7 @@ impl DynamicWorldSnapshot {
         };
         let config = world.config();
 
-        Self {
+        Ok(Self {
             tick: world.tick().0,
             epoch: world.epoch(),
             world: DynamicSnapshotWorld {
@@ -3201,7 +3204,7 @@ impl DynamicWorldSnapshot {
             },
             summary,
             agents,
-        }
+        })
     }
 }
 
@@ -9769,6 +9772,17 @@ pub enum ScientificStateError {
         /// Exact field or collection path rejected.
         path: String,
     },
+    /// A live arena row had no runtime companion, so its brain and dynamic scientific state
+    /// could not be read or advanced.
+    ///
+    /// Runtime state is stored separately from the dense scalar arena. A mismatch is an
+    /// invariant violation, but it is typed so callers can refuse a tick or projection before
+    /// `panic = "abort"` terminates the process and strands persistence work.
+    #[error("agent runtime state is missing at `{path}`")]
+    MissingAgentRuntime {
+        /// Exact field or collection path rejected.
+        path: String,
+    },
     /// Scientific mutation was attempted while the current persistence admission was unresolved.
     #[error(
         "persistence boundary for tick {tick} is unresolved at `{path}`; retry the exact retained persistence batch before advancing the world or mutating scientific state"
@@ -9849,6 +9863,7 @@ impl ScientificStateError {
             | Self::AgentRngCounterExhausted { path, .. }
             | Self::MissingAgentRngCounters { path }
             | Self::MissingAgentIdentity { path }
+            | Self::MissingAgentRuntime { path }
             | Self::PersistenceBoundaryUnresolved { path, .. }
             | Self::PersistenceBoundarySealed { path, .. }
             | Self::SeededArrivalAfterBootstrap { path, .. }
@@ -15877,7 +15892,7 @@ impl WorldState {
                 .map(|id| {
                     self.runtime
                         .get(id)
-                        .expect("every live agent must have runtime state")
+                        .expect("world-step companion preflight guarantees runtime state")
                 })
                 .map(|runtime| f64::from(runtime.energy))
                 .sum(),
@@ -15889,6 +15904,26 @@ impl WorldState {
                 .map(|value| f64::from(*value))
                 .sum(),
         }
+    }
+
+    /// Validate the separately stored companions consumed by infallible tick stages.
+    ///
+    /// Every production insertion and removal updates the arena, identity map, and runtime map
+    /// together. Checking their live key set once before a tick starts turns the later hot-path
+    /// lookups into documented invariants while still returning a typed error for a pre-existing
+    /// representation fault. The scan happens before canonicalization or any stage mutation.
+    fn validate_live_agent_companions(&self) -> Result<(), ScientificStateError> {
+        for id in self.agents.iter_handles() {
+            let uid = self.require_agent_uid(id, || {
+                format!("world.step.agents[raw={}].identity", id.raw())
+            })?;
+            if self.runtime.get(id).is_none() {
+                return Err(ScientificStateError::MissingAgentRuntime {
+                    path: format!("world.step.agents[uid={}].runtime", uid.get()),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Sets the hard ceiling on per-tick activation snapshotting (bd-16g.4.4).
@@ -18056,7 +18091,7 @@ impl WorldState {
             .map(|id| {
                 self.runtime
                     .get(id)
-                    .expect("every live agent must have runtime state")
+                    .expect("world-step companion preflight guarantees runtime state")
             })
             .map(|runtime| runtime.energy)
             .sum();
@@ -20182,11 +20217,11 @@ impl WorldState {
                     let identity = self
                         .identities
                         .get(*agent_id)
-                        .expect("live dying agent must have stable identity");
+                        .expect("death-candidate identity preflight guarantees stable identity");
                     let runtime = self
                         .runtime
                         .get(*agent_id)
-                        .expect("live dying agent must have runtime state")
+                        .expect("world-step companion preflight guarantees runtime state")
                         .clone();
                     let herbivore = clamp01(runtime.herbivore_tendency);
                     let brain_kind = runtime.brain.kind().map(str::to_string);
@@ -21963,6 +21998,7 @@ impl WorldState {
             .into());
         }
 
+        self.validate_live_agent_companions()?;
         self.canonicalize_agent_execution_order()?;
         let next_tick = self.tick.next();
         self.validate_step_generation_headroom(next_tick)?;
@@ -42984,7 +43020,8 @@ mod tests {
         world.step().expect("completed tick");
         let second_id = world.spawn_agent(sample_agent(1));
 
-        let snapshot = DynamicWorldSnapshot::from_world(&world);
+        let snapshot =
+            DynamicWorldSnapshot::from_world(&world).expect("consistent dynamic snapshot");
         let total_energy = snapshot
             .agents
             .iter()
@@ -43032,7 +43069,8 @@ mod tests {
         let replacement_stable_uid = world
             .agent_uid(replacement_id)
             .expect("replacement stable uid");
-        let churned = DynamicWorldSnapshot::from_world(&world);
+        let churned =
+            DynamicWorldSnapshot::from_world(&world).expect("consistent churned snapshot");
         assert_ne!(replacement_stable_uid, first_stable_uid);
         assert!(
             churned
@@ -43043,6 +43081,52 @@ mod tests {
         assert!(churned.agents.iter().any(|agent| {
             agent.id == replacement_id.raw() && agent.uid == replacement_stable_uid
         }));
+
+        let replacement_runtime = world
+            .runtime
+            .remove(replacement_id)
+            .expect("replacement runtime");
+        let runtime_error = DynamicWorldSnapshot::from_world(&world)
+            .expect_err("a snapshot must refuse a missing runtime companion");
+        let expected_runtime_path = format!(
+            "dynamic_world_snapshot.agents[uid={}].runtime",
+            replacement_stable_uid.get()
+        );
+        assert!(
+            matches!(
+                &runtime_error,
+                ScientificStateError::MissingAgentRuntime { path }
+                    if path == &expected_runtime_path
+            ),
+            "expected the exact missing-runtime path, got {runtime_error:?}"
+        );
+        assert!(
+            world
+                .runtime
+                .insert(replacement_id, replacement_runtime)
+                .is_none()
+        );
+
+        let replacement_dense_index = world
+            .agents()
+            .index_of(replacement_id)
+            .expect("replacement dense index");
+        world
+            .identities
+            .remove(replacement_id)
+            .expect("replacement identity");
+        let identity_error = DynamicWorldSnapshot::from_world(&world)
+            .expect_err("a snapshot must refuse a missing stable identity");
+        let expected_identity_path =
+            format!("dynamic_world_snapshot.agents[{replacement_dense_index}].identity");
+        assert!(
+            matches!(
+                &identity_error,
+                ScientificStateError::MissingAgentIdentity { path }
+                    if path == &expected_identity_path
+            ),
+            "expected the exact missing-identity path, got {identity_error:?}"
+        );
     }
 
     fn reference_render_settings() -> RenderSettings {
@@ -43556,6 +43640,46 @@ mod tests {
                 ))
             ),
             "bind_agent_brain must return the typed fault, got {bound:?}"
+        );
+    }
+
+    /// A representation fault that exists before a tick starts must be refused before any
+    /// scientific mutation. Reaching one of the later runtime-map `expect` calls would abort
+    /// the release process and strand the current persistence boundary.
+    #[test]
+    fn a_live_agent_without_runtime_is_refused_before_tick_mutation() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(0xC0FF_EE02),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let id = world.try_spawn_agent(sample_agent(4)).expect("seed agent");
+        let uid = world.agent_uid(id).expect("stable identity");
+        let before_tick = world.tick();
+        let before_agent = world.agents.snapshot(id).expect("live agent");
+        world.runtime.remove(id).expect("live runtime");
+
+        let result = world.step();
+        let expected_path = format!("world.step.agents[uid={}].runtime", uid.get());
+
+        assert!(
+            matches!(
+                &result,
+                Err(WorldStepError::ScientificState(
+                    ScientificStateError::MissingAgentRuntime { path }
+                )) if path == &expected_path
+            ),
+            "a missing runtime companion must name its exact path, got {result:?}"
+        );
+        assert_eq!(world.tick(), before_tick);
+        assert_eq!(
+            world.agents.snapshot(id),
+            Some(before_agent),
+            "the rejected tick must not mutate agent scalar state"
         );
     }
 }
