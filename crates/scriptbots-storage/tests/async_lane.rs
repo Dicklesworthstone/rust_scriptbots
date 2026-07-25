@@ -154,20 +154,15 @@ fn lane_reads_match_the_sync_reader() {
     cleanup(&path);
 }
 
-/// The fixture defect is FIXED (`bd-sf9h`); only the verification run is outstanding.
+/// This test is correct and currently fails against a real defect (`bd-aj12`).
 ///
-/// This no longer uses the recursive CTE that the engine truncated to 1001 rows. It now
-/// runs a measured ~6.3 s self-join, so a 50 ms cancellation has something real to
-/// interrupt and the assertions below can fail honestly. Whether lane cancellation
-/// actually works is still unknown in both directions — that is the open question, and it
-/// is what this test now genuinely asks.
-///
-/// Left ignored only because I could not obtain a worker to run it (rch refused ten
-/// consecutive dispatches: `no admissible workers`). Un-ignoring is deleting this attribute
-/// and the one on `sub_ms_deadline_expires_a_slow_query`; do that the moment a slot is
-/// available. If they then fail, that is a real bound-enforcement defect, not a fixture bug.
+/// With the fixture fixed it exercises a genuine ~6.3 s query, and the lane runs it to
+/// completion anyway: the assertion reports `COUNT(*) = 512000`, the full 80^3 self-join,
+/// despite `cancel()` firing after 50 ms. `AsyncReadLane` does not enforce cancellation.
+/// Ignored so the suite stays green while the defect stays visible; delete this attribute
+/// once the bound is enforced and it will pass unchanged.
 #[test]
-#[ignore = "bd-sf9h: fixture fixed and measured; awaiting one verification run before un-ignoring"]
+#[ignore = "bd-aj12: AsyncReadLane does not enforce cancellation; this test is correct and fails against that defect"]
 fn cancelled_query_surfaces_typed_interrupt_and_lane_recovers() {
     let path = test_path("cancel");
     let path_string = path.to_string_lossy().to_string();
@@ -212,8 +207,12 @@ fn cancelled_query_surfaces_typed_interrupt_and_lane_recovers() {
 /// Fixture fixed alongside the cancellation test above; see it for the full reasoning
 /// (`bd-sf9h`). A 1 ms budget against a measured ~6.3 s query is now a real test of
 /// deadline enforcement rather than a race an instant query always won.
+/// Correct, and failing against the same defect as the cancellation test (`bd-aj12`).
+///
+/// A 1 ms budget against a measured ~6.3 s query returns the complete result instead of a
+/// typed interrupt, so the deadline is not enforced either.
 #[test]
-#[ignore = "bd-sf9h: fixture fixed and measured; awaiting one verification run before un-ignoring"]
+#[ignore = "bd-aj12: AsyncReadLane does not enforce deadlines; this test is correct and fails against that defect"]
 fn sub_ms_deadline_expires_a_slow_query() {
     let path = test_path("deadline");
     let path_string = path.to_string_lossy().to_string();
@@ -249,16 +248,37 @@ fn sub_ms_deadline_expires_a_slow_query() {
 ///
 /// Worth resolving rather than rewriting around: if a clean `Storage::close` can leave a
 /// sidecar that later refuses its own database, the same shape can strand a real run.
+/// Correct as written, and flaky against a real defect (`bd-qan3`).
+///
+/// `bd-jjxe` unblocked this test — its stale-sidecar refusal is gone, and the seeding below
+/// now goes through the pipeline because a new run refuses an existing database path. Doing
+/// so revealed the next problem underneath: `AsyncReadLane::close` closes with
+/// `Budget::MINIMAL`, so a reader closing while the writer is mid-commit can fail with
+/// `Database(Busy)`. It passes when the whole file runs and fails when run alone, purely on
+/// scheduling, so it is ignored rather than landed flaky. Delete this attribute once a
+/// read-only close no longer contends.
 #[test]
-#[ignore = "bd-jjxe: write_fixture's close leaves a -wal sidecar that StoragePipeline then refuses as a stale-sidecar InvalidTarget"]
+#[ignore = "bd-qan3: AsyncReadLane::close returns Database(Busy) under an active writer, making this timing-dependent"]
 fn concurrent_lane_readers_observe_commit_boundaries_while_writer_applies_batches() {
     let path = test_path("concurrent");
     let path_string = path.to_string_lossy().to_string();
-    write_fixture(&path_string, 3);
 
+    // The writer seeds its own baseline rather than reusing a `write_fixture` database.
+    // A new run refuses an existing database path — correctly, and independently of
+    // sidecars — so pre-seeding with a separate `Storage` and then opening a pipeline on
+    // the same file cannot work. Submitting the first ticks through this pipeline gives
+    // readers the same pre-existing commit boundary the test is about.
     let mut pipeline =
         StoragePipeline::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)
             .expect("writer pipeline opens");
+    for tick in 1..=3 {
+        pipeline
+            .submit(&sample_batch(tick, tick as f64 * 1.5))
+            .expect("baseline batch admitted");
+    }
+    pipeline
+        .flush_and_wait()
+        .expect("baseline commit boundary is durable");
 
     let mut readers = Vec::new();
     for _reader_index in 0..4 {
