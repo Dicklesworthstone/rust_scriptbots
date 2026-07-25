@@ -22,17 +22,51 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, HeadlessAppContext, px, size};
 use image::RgbaImage;
-use scriptbots_core::{ScriptBotsConfig, WorldState};
+use scriptbots_core::{AgentId, ScriptBotsConfig, WorldState};
+#[cfg(target_os = "macos")]
+use scriptbots_core::{OutputChannel, SelectionState};
 
 use crate::{
-    AnalyticsSnapshotProvider, ControlCommand, GuiSession, GuiViewRole, HUD_RAIL_WIDTH,
-    WorldStepDriver,
+    AnalyticsSnapshotProvider, CameraSnapshot, ControlCommand, GuiSession, GuiViewRole,
+    HUD_RAIL_WIDTH, WorldStepDriver,
 };
 
 // GPUI's test window reports a fixed 2× device scale. `HeadlessAppContext::open_window`
 // accepts logical pixels, while `capture_screenshot` returns device pixels, so divide
 // here to keep the capture API and evidence filenames expressed in physical pixels.
 const HEADLESS_DEVICE_SCALE: f32 = 2.0;
+
+#[derive(Clone, Copy, Default)]
+struct CaptureOverrides {
+    force_legacy_world_painter: bool,
+    draw_agents: Option<bool>,
+    draw_food: Option<bool>,
+    forced_fps: Option<f32>,
+    hovered_agent: Option<AgentId>,
+}
+
+struct CapturedView {
+    image: RgbaImage,
+    camera: CameraSnapshot,
+}
+
+fn apply_capture_overrides(view: &mut crate::SimulationView, overrides: CaptureOverrides) {
+    view.force_legacy_world_painter = overrides.force_legacy_world_painter;
+    if let Some(draw_agents) = overrides.draw_agents {
+        view.controls.draw_agents = draw_agents;
+    }
+    if let Some(draw_food) = overrides.draw_food {
+        view.controls.draw_food = draw_food;
+    }
+    if let Some(fps) = overrides.forced_fps {
+        view.last_perf.fps = fps;
+    }
+    if let Some(hovered_agent) = overrides.hovered_agent
+        && let Ok(mut inspector) = view.inspector.lock()
+    {
+        inspector.hovered_agent = Some(hovered_agent);
+    }
+}
 
 /// Render one GPUI view offscreen at exact output dimensions in device pixels.
 pub(crate) fn capture_view(
@@ -41,7 +75,7 @@ pub(crate) fn capture_view(
     width: f32,
     height: f32,
 ) -> Result<RgbaImage, String> {
-    capture_view_with_world_painter(world, role, width, height, false)
+    capture_view_with_overrides(world, role, width, height, CaptureOverrides::default())
 }
 
 fn capture_view_with_world_painter(
@@ -51,6 +85,39 @@ fn capture_view_with_world_painter(
     height: f32,
     force_legacy_world_painter: bool,
 ) -> Result<RgbaImage, String> {
+    capture_view_with_overrides(
+        world,
+        role,
+        width,
+        height,
+        CaptureOverrides {
+            force_legacy_world_painter,
+            ..CaptureOverrides::default()
+        },
+    )
+}
+
+fn capture_view_with_overrides(
+    world: Arc<Mutex<WorldState>>,
+    role: GuiViewRole,
+    width: f32,
+    height: f32,
+    overrides: CaptureOverrides,
+) -> Result<RgbaImage, String> {
+    let capture = capture_view_with_overrides_and_camera(world, role, width, height, overrides)?;
+    if !capture.camera.last_scale.is_finite() {
+        return Err("headless GPUI camera produced a non-finite scale".to_owned());
+    }
+    Ok(capture.image)
+}
+
+fn capture_view_with_overrides_and_camera(
+    world: Arc<Mutex<WorldState>>,
+    role: GuiViewRole,
+    width: f32,
+    height: f32,
+    overrides: CaptureOverrides,
+) -> Result<CapturedView, String> {
     // `headless = true`: no window server is contacted. The text system still comes from
     // the real platform, so glyph rasterization matches what a user sees.
     let platform = gpui_platform::current_platform(true);
@@ -91,7 +158,7 @@ fn capture_view_with_world_painter(
                     let focus_handle = cx.focus_handle();
                     focus_handle.focus(window, cx);
                     let mut view = session.new_view(role, focus_handle);
-                    view.force_legacy_world_painter = force_legacy_world_painter;
+                    apply_capture_overrides(&mut view, overrides);
                     view
                 })
             },
@@ -108,11 +175,37 @@ fn capture_view_with_world_painter(
     // only a thin strip of footer text. An empty scene reads exactly like a broken
     // renderer, so this must be explicit rather than incidental.
     cx.run_until_parked();
-    let _ = cx.update_window(window.into(), |_, window, _| window.refresh());
+    cx.update_window(window.into(), |root_view, window, app| {
+        let view = root_view
+            .downcast::<crate::SimulationView>()
+            .expect("headless root view type mismatch");
+        view.update(app, |view, _| {
+            // Settling the view may have recorded a real performance sample.
+            // Reapply controlled inputs immediately before the evidence repaint.
+            apply_capture_overrides(view, overrides);
+        });
+        window.refresh();
+    })
+    .map_err(|error| format!("refresh headless GPUI window: {error:?}"))?;
     cx.run_until_parked();
 
-    cx.capture_screenshot(window.into())
-        .map_err(|error| format!("read back headless GPUI frame: {error:?}"))
+    let camera = cx
+        .update_window(window.into(), |root_view, _, app| {
+            let view = root_view
+                .downcast::<crate::SimulationView>()
+                .expect("headless root view type mismatch");
+            view.update(app, |view, _| {
+                view.camera
+                    .lock()
+                    .expect("camera lock poisoned during offscreen capture")
+                    .snapshot()
+            })
+        })
+        .map_err(|error| format!("read headless GPUI camera: {error:?}"))?;
+    let image = cx
+        .capture_screenshot(window.into())
+        .map_err(|error| format!("read back headless GPUI frame: {error:?}"))?;
+    Ok(CapturedView { image, camera })
 }
 
 #[cfg(test)]
@@ -209,6 +302,285 @@ mod tests {
         );
 
         Arc::new(Mutex::new(world))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn controlled_agent_position(column: usize, row: usize) -> (f32, f32) {
+        (130.0 + column as f32 * 194.0, 105.0 + row as f32 * 141.0)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_agent_expression_world() -> Arc<Mutex<WorldState>> {
+        const COLUMNS: usize = 12;
+
+        let world = capture_visual_world();
+        let mut guard = world.lock().expect("agent expression world lock");
+        let agent_ids: Vec<_> = guard.agents().iter_handles().collect();
+        let reference_age = guard.config().aging_health_decay_start.max(1);
+
+        for (index, agent_id) in agent_ids.into_iter().enumerate() {
+            let column = index % COLUMNS;
+            let row = index / COLUMNS;
+            let group = column / 3;
+            let health_class = column % 3;
+            guard
+                .try_update_agent(agent_id, |agent, runtime| {
+                    // A regular 12×8 matrix makes semantic differences readable in
+                    // the owner-facing capture instead of hiding them in random overlap.
+                    let position = controlled_agent_position(column, row);
+                    agent.position.x = position.0;
+                    agent.position.y = position.1;
+                    // Orientation is already proven by bd-1lls. Facing every agent
+                    // right makes spike reach directly comparable between groups.
+                    agent.heading = 0.0;
+                    agent.color = [0.25, 0.25, 0.25];
+                    agent.boost = false;
+
+                    // Columns repeat full, mid, and floor health. Rows repeat young
+                    // and weathered ages, so luminance and saturation remain separate
+                    // readable dimensions.
+                    agent.health = match health_class {
+                        0 => 2.0,
+                        1 => 1.2,
+                        _ => 0.05,
+                    };
+                    agent.age = if row < 4 { 0 } else { reference_age };
+
+                    // Four three-column groups, each repeating full/mid/floor health:
+                    // short neutral; long neutral; long attacker; long victim-only.
+                    // Attacker and victim groups share extension and length so the
+                    // outer strike flash is the only intended footprint difference.
+                    let spike_extended = group >= 2;
+                    agent.spike_length = if group == 0 { 0.05 } else { 0.85 };
+                    runtime.outputs.fill(0.0);
+                    runtime.outputs[OutputChannel::SpikeTarget.index()] =
+                        if spike_extended { 1.0 } else { 0.0 };
+                    runtime.combat.spike_attacker = group == 2;
+                    runtime.spiked = group == 3;
+
+                    runtime.outputs[OutputChannel::Boost.index()] =
+                        if row.is_multiple_of(4) { 1.0 } else { 0.0 };
+                    runtime.herbivore_tendency = if row.is_multiple_of(2) { 0.0 } else { 1.0 };
+                    runtime.temperature_preference = 0.5;
+                    runtime.sound_multiplier = 1.0;
+                    runtime.sound_output = 0.0;
+                    runtime.food_delta = 0.0;
+                    runtime.give_intent = 0.0;
+                    runtime.trait_modifiers = Default::default();
+                    runtime.eye_fov.fill(1.0);
+                    runtime.eye_direction.fill(0.0);
+                    runtime.indicator = Default::default();
+                    runtime.selection = if row == 1 {
+                        SelectionState::Selected
+                    } else {
+                        SelectionState::None
+                    };
+                })
+                .expect("install controlled agent visual state");
+        }
+        drop(guard);
+        world
+    }
+
+    #[cfg(target_os = "macos")]
+    fn count_agent_delta_classes(
+        control: &RgbaImage,
+        rendered: &RgbaImage,
+        camera: &CameraSnapshot,
+    ) -> [usize; 5] {
+        let mut classes = [0usize; 5];
+        for row in 0..8 {
+            for column in 0..12 {
+                let center = device_point(camera, controlled_agent_position(column, row));
+                let radius = 30.0;
+                let min_x = (center.0 - radius).floor().max(0.0) as u32;
+                let max_x = (center.0 + radius)
+                    .ceil()
+                    .min(rendered.width() as f32 - 1.0) as u32;
+                let min_y = (center.1 - radius).floor().max(0.0) as u32;
+                let max_y = (center.1 + radius)
+                    .ceil()
+                    .min(rendered.height() as f32 - 1.0) as u32;
+                let radius_squared = radius * radius;
+                for y in min_y..=max_y {
+                    for x in min_x..=max_x {
+                        let dx = x as f32 - center.0;
+                        let dy = y as f32 - center.1;
+                        if dx * dx + dy * dy > radius_squared {
+                            continue;
+                        }
+                        let background = control.get_pixel(x, y);
+                        let agent = rendered.get_pixel(x, y);
+                        if background == agent {
+                            continue;
+                        }
+                        classes[0] += 1;
+                        let [r, g, b, _] = agent.0;
+                        let luma =
+                            (u32::from(r) * 54 + u32::from(g) * 183 + u32::from(b) * 19) / 256;
+                        if b > r.saturating_add(16) && g > r.saturating_add(16) {
+                            classes[1] += 1;
+                        }
+                        if r > g.saturating_add(16) && b > g.saturating_add(16) {
+                            classes[2] += 1;
+                        }
+                        if luma >= 96 {
+                            classes[3] += 1;
+                        }
+                        if (12..=64).contains(&luma) {
+                            classes[4] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        classes
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_camera_transform_eq(
+        label: &str,
+        control: &CameraSnapshot,
+        rendered: &CameraSnapshot,
+    ) {
+        for world in [(0.0, 0.0), (1_200.0, 600.0), (2_400.0, 1_200.0)] {
+            let control_point = control.world_to_screen(world);
+            let rendered_point = rendered.world_to_screen(world);
+            assert_eq!(
+                control_point.is_some(),
+                rendered_point.is_some(),
+                "{label} camera visibility differs at {world:?}"
+            );
+            if let (Some(control_point), Some(rendered_point)) = (control_point, rendered_point) {
+                assert!(
+                    (control_point.0 - rendered_point.0).abs() <= 1.0e-4
+                        && (control_point.1 - rendered_point.1).abs() <= 1.0e-4,
+                    "{label} hidden/visible cameras drifted at {world:?}: \
+                     control={control_point:?}, rendered={rendered_point:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn device_point(camera: &CameraSnapshot, world: (f32, f32)) -> (f32, f32) {
+        let (x, y) = camera
+            .world_to_screen(world)
+            .unwrap_or_else(|| panic!("controlled agent {world:?} is outside the capture camera"));
+        (x * HEADLESS_DEVICE_SCALE, y * HEADLESS_DEVICE_SCALE)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn average_luma_delta_in_disc(
+        control: &RgbaImage,
+        rendered: &RgbaImage,
+        center: (f32, f32),
+        radius: f32,
+    ) -> f32 {
+        let min_x = (center.0 - radius).floor().max(0.0) as u32;
+        let max_x = (center.0 + radius)
+            .ceil()
+            .min(rendered.width() as f32 - 1.0) as u32;
+        let min_y = (center.1 - radius).floor().max(0.0) as u32;
+        let max_y = (center.1 + radius)
+            .ceil()
+            .min(rendered.height() as f32 - 1.0) as u32;
+        let radius_squared = radius * radius;
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let dx = x as f32 - center.0;
+                let dy = y as f32 - center.1;
+                if dx * dx + dy * dy > radius_squared {
+                    continue;
+                }
+                let [control_r, control_g, control_b, _] = control.get_pixel(x, y).0;
+                let [rendered_r, rendered_g, rendered_b, _] = rendered.get_pixel(x, y).0;
+                let control_luma = 0.2126 * f32::from(control_r)
+                    + 0.7152 * f32::from(control_g)
+                    + 0.0722 * f32::from(control_b);
+                let rendered_luma = 0.2126 * f32::from(rendered_r)
+                    + 0.7152 * f32::from(rendered_g)
+                    + 0.0722 * f32::from(rendered_b);
+                sum += rendered_luma - control_luma;
+                count += 1;
+            }
+        }
+        assert!(count > 0, "luma-delta sample disc must contain pixels");
+        sum / count as f32
+    }
+
+    #[cfg(target_os = "macos")]
+    fn average_rgb_delta_in_disc(
+        control: &RgbaImage,
+        rendered: &RgbaImage,
+        center: (f32, f32),
+        radius: f32,
+    ) -> [f32; 3] {
+        let min_x = (center.0 - radius).floor().max(0.0) as u32;
+        let max_x = (center.0 + radius)
+            .ceil()
+            .min(rendered.width() as f32 - 1.0) as u32;
+        let min_y = (center.1 - radius).floor().max(0.0) as u32;
+        let max_y = (center.1 + radius)
+            .ceil()
+            .min(rendered.height() as f32 - 1.0) as u32;
+        let radius_squared = radius * radius;
+        let mut sum = [0.0; 3];
+        let mut count = 0usize;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let dx = x as f32 - center.0;
+                let dy = y as f32 - center.1;
+                if dx * dx + dy * dy > radius_squared {
+                    continue;
+                }
+                let [control_r, control_g, control_b, _] = control.get_pixel(x, y).0;
+                let [rendered_r, rendered_g, rendered_b, _] = rendered.get_pixel(x, y).0;
+                sum[0] += f32::from(rendered_r) - f32::from(control_r);
+                sum[1] += f32::from(rendered_g) - f32::from(control_g);
+                sum[2] += f32::from(rendered_b) - f32::from(control_b);
+                count += 1;
+            }
+        }
+        assert!(count > 0, "RGB-delta sample disc must contain pixels");
+        [
+            sum[0] / count as f32,
+            sum[1] / count as f32,
+            sum[2] / count as f32,
+        ]
+    }
+
+    #[cfg(target_os = "macos")]
+    fn changed_pixels_in_disc(
+        control: &RgbaImage,
+        rendered: &RgbaImage,
+        center: (f32, f32),
+        radius: f32,
+    ) -> usize {
+        let min_x = (center.0 - radius).floor().max(0.0) as u32;
+        let max_x = (center.0 + radius)
+            .ceil()
+            .min(rendered.width() as f32 - 1.0) as u32;
+        let min_y = (center.1 - radius).floor().max(0.0) as u32;
+        let max_y = (center.1 + radius)
+            .ceil()
+            .min(rendered.height() as f32 - 1.0) as u32;
+        let radius_squared = radius * radius;
+        let mut count = 0usize;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let dx = x as f32 - center.0;
+                let dy = y as f32 - center.1;
+                if dx * dx + dy * dy <= radius_squared
+                    && control.get_pixel(x, y) != rendered.get_pixel(x, y)
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     fn probe_dir() -> PathBuf {
@@ -456,5 +828,254 @@ mod tests {
         continuous
             .save(probe_dir.join("after_continuous_fields_1280x720.png"))
             .expect("write bd-1lls continuous-field probe");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn controlled_agents_express_spike_health_and_compact_lod_in_real_gpui_pixels() {
+        let probe_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/rendering_reference/live_probes/bd-ydym");
+        std::fs::create_dir_all(&probe_dir).expect("bd-ydym probe output directory");
+
+        let world = capture_agent_expression_world();
+        let hovered_agent = world
+            .lock()
+            .expect("agent capture world lock")
+            .agents()
+            .iter_handles()
+            .nth(5 * 12 + 4)
+            .expect("controlled hover agent");
+        let digest_before = world
+            .lock()
+            .expect("agent capture world lock")
+            .world_digest_v1()
+            .expect("pre-agent-capture world digest");
+        let individual_hidden = capture_view_with_overrides_and_camera(
+            Arc::clone(&world),
+            GuiViewRole::WorldCanvas,
+            1280.0,
+            720.0,
+            CaptureOverrides {
+                draw_agents: Some(false),
+                draw_food: Some(false),
+                forced_fps: Some(60.0),
+                hovered_agent: Some(hovered_agent),
+                ..CaptureOverrides::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("headless hidden-agent control failed: {error:#}"));
+        let individual = capture_view_with_overrides_and_camera(
+            Arc::clone(&world),
+            GuiViewRole::WorldCanvas,
+            1280.0,
+            720.0,
+            CaptureOverrides {
+                draw_agents: Some(true),
+                draw_food: Some(false),
+                forced_fps: Some(60.0),
+                hovered_agent: Some(hovered_agent),
+                ..CaptureOverrides::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("headless individual-agent capture failed: {error:#}"));
+        let compact_hidden = capture_view_with_overrides_and_camera(
+            Arc::clone(&world),
+            GuiViewRole::WorldCanvas,
+            1280.0,
+            720.0,
+            CaptureOverrides {
+                draw_agents: Some(false),
+                draw_food: Some(false),
+                forced_fps: Some(12.0),
+                hovered_agent: Some(hovered_agent),
+                ..CaptureOverrides::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("headless compact hidden-agent control failed: {error:#}"));
+        let compact = capture_view_with_overrides_and_camera(
+            Arc::clone(&world),
+            GuiViewRole::WorldCanvas,
+            1280.0,
+            720.0,
+            CaptureOverrides {
+                draw_agents: Some(true),
+                draw_food: Some(false),
+                forced_fps: Some(12.0),
+                hovered_agent: Some(hovered_agent),
+                ..CaptureOverrides::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("headless compact-agent capture failed: {error:#}"));
+        let digest_after = world
+            .lock()
+            .expect("agent capture world lock")
+            .world_digest_v1()
+            .expect("post-agent-capture world digest");
+
+        assert_eq!(individual_hidden.image.dimensions(), (1280, 720));
+        assert_eq!(individual.image.dimensions(), (1280, 720));
+        assert_eq!(compact_hidden.image.dimensions(), (1280, 720));
+        assert_eq!(compact.image.dimensions(), (1280, 720));
+        assert_camera_transform_eq("individual", &individual_hidden.camera, &individual.camera);
+        assert_camera_transform_eq("compact", &compact_hidden.camera, &compact.camera);
+        assert_eq!(
+            digest_before, digest_after,
+            "agent-only repaints mutated scientific state"
+        );
+
+        individual
+            .image
+            .save(probe_dir.join("spike_health_entities_1280x720.png"))
+            .expect("write bd-ydym individual-agent probe");
+        compact
+            .image
+            .save(probe_dir.join("compact_lod_96_agents_1280x720.png"))
+            .expect("write bd-ydym compact-agent probe");
+
+        // Every comparison uses an agents-hidden frame at the SAME forced FPS.
+        // Low-FPS mode changes the post stack, so comparing the 12-FPS frame with
+        // a 60-FPS background would count scanline/grain changes as agent pixels.
+        let individual_classes = count_agent_delta_classes(
+            &individual_hidden.image,
+            &individual.image,
+            &individual.camera,
+        );
+        let compact_classes =
+            count_agent_delta_classes(&compact_hidden.image, &compact.image, &compact.camera);
+        for (label, classes) in [
+            ("individual", individual_classes),
+            ("compact", compact_classes),
+        ] {
+            let [changed, cyan, magenta, bright, dim] = classes;
+            assert!(
+                changed >= 1_500,
+                "{label} GPUI path emitted too few controlled-agent pixels: {changed}"
+            );
+            assert!(
+                cyan >= 80 && magenta >= 80,
+                "{label} GPUI path lost the canonical diet axis: cyan={cyan}, magenta={magenta}"
+            );
+            assert!(
+                bright >= 80 && dim >= 80,
+                "{label} GPUI path lost health/age luminance classes: bright={bright}, dim={dim}"
+            );
+        }
+
+        for (label, control, rendered, camera) in [
+            (
+                "individual",
+                &individual_hidden.image,
+                &individual.image,
+                &individual.camera,
+            ),
+            (
+                "compact",
+                &compact_hidden.image,
+                &compact.image,
+                &compact.camera,
+            ),
+        ] {
+            // Each three-column group repeats full, mid, and floor health while
+            // holding diet, age, boost, spike state, and heading constant.
+            for row in 0..8 {
+                let full = device_point(camera, controlled_agent_position(0, row));
+                let mid = device_point(camera, controlled_agent_position(1, row));
+                let floor = device_point(camera, controlled_agent_position(2, row));
+                let full_luma = average_luma_delta_in_disc(control, rendered, full, 2.5);
+                let mid_luma = average_luma_delta_in_disc(control, rendered, mid, 2.5);
+                let floor_luma = average_luma_delta_in_disc(control, rendered, floor, 2.5);
+                assert!(
+                    full_luma > mid_luma + 5.0 && mid_luma > floor_luma + 3.0,
+                    "{label} health luminance is not ordered on row {row}: \
+                     full={full_luma:.1}, mid={mid_luma:.1}, floor={floor_luma:.1}"
+                );
+            }
+
+            // Compare a short and long neutral spike at the same health/diet/age.
+            // The probe sits beyond the short tip but inside the long tip.
+            for row in 0..8 {
+                let short_center = device_point(camera, controlled_agent_position(0, row));
+                let long_center = device_point(camera, controlled_agent_position(3, row));
+                let short_probe = (short_center.0 + 25.0, short_center.1);
+                let long_probe = (long_center.0 + 25.0, long_center.1);
+                let short_reach = changed_pixels_in_disc(control, rendered, short_probe, 4.0);
+                let long_reach = changed_pixels_in_disc(control, rendered, long_probe, 4.0);
+                assert!(
+                    long_reach >= short_reach + 4,
+                    "{label} spike length has no pixel reach on row {row}: \
+                     short={short_reach}, long={long_reach}"
+                );
+            }
+
+            // Long attacker and victim-only groups share extension, health, age,
+            // diet, boost, and heading. Only the attacker owns the outer hot flash.
+            for row in 0..8 {
+                let attacker = device_point(camera, controlled_agent_position(6, row));
+                let victim = device_point(camera, controlled_agent_position(9, row));
+                let attacker_footprint = changed_pixels_in_disc(control, rendered, attacker, 24.0);
+                let victim_footprint = changed_pixels_in_disc(control, rendered, victim, 24.0);
+                assert!(
+                    attacker_footprint >= victim_footprint + 40,
+                    "{label} attacker strike is not distinguishable from victim-only state \
+                     on row {row}: attacker={attacker_footprint}, victim={victim_footprint}"
+                );
+            }
+
+            let sample_column = 4;
+            let young_boost = device_point(camera, controlled_agent_position(sample_column, 0));
+            let young_plain = device_point(camera, controlled_agent_position(sample_column, 2));
+            let old_boost = device_point(camera, controlled_agent_position(sample_column, 4));
+            let selected = device_point(camera, controlled_agent_position(sample_column, 1));
+            let selection_control =
+                device_point(camera, controlled_agent_position(sample_column, 3));
+            let hovered = device_point(camera, controlled_agent_position(sample_column, 5));
+            let hover_control = device_point(camera, controlled_agent_position(sample_column, 7));
+
+            let young_luma = average_luma_delta_in_disc(control, rendered, young_boost, 2.5);
+            let old_luma = average_luma_delta_in_disc(control, rendered, old_boost, 2.5);
+            assert!(
+                young_luma > old_luma + 4.0,
+                "{label} age weathering is not visible: young={young_luma:.1}, old={old_luma:.1}"
+            );
+
+            let boost_tail = (young_boost.0 - 18.0, young_boost.1);
+            let plain_tail = (young_plain.0 - 18.0, young_plain.1);
+            let boost_pixels = changed_pixels_in_disc(control, rendered, boost_tail, 7.0);
+            let plain_pixels = changed_pixels_in_disc(control, rendered, plain_tail, 7.0);
+            assert!(
+                boost_pixels >= plain_pixels + 4,
+                "{label} boost trail is not visible: boost={boost_pixels}, plain={plain_pixels}"
+            );
+
+            let selected_pixels = changed_pixels_in_disc(control, rendered, selected, 24.0);
+            let selection_control_pixels =
+                changed_pixels_in_disc(control, rendered, selection_control, 24.0);
+            assert!(
+                selected_pixels >= selection_control_pixels + 16,
+                "{label} selection rim is not visible: selected={selected_pixels}, \
+                 control={selection_control_pixels}"
+            );
+            let hovered_pixels = changed_pixels_in_disc(control, rendered, hovered, 20.0);
+            let hover_control_pixels =
+                changed_pixels_in_disc(control, rendered, hover_control, 20.0);
+            assert!(
+                hovered_pixels >= hover_control_pixels + 8,
+                "{label} hover rim is not visible: hovered={hovered_pixels}, \
+                 control={hover_control_pixels}"
+            );
+
+            // Rows 2 and 3 are otherwise matched young/plain agents; diet is
+            // the sole chromatic semantic.
+            let carnivore = average_rgb_delta_in_disc(control, rendered, young_plain, 2.5);
+            let herbivore = average_rgb_delta_in_disc(control, rendered, selection_control, 2.5);
+            assert!(
+                carnivore[0] > carnivore[1] + 8.0 && carnivore[2] > carnivore[1] + 8.0,
+                "{label} carnivore body is not magenta-axis: {carnivore:?}"
+            );
+            assert!(
+                herbivore[1] > herbivore[0] + 8.0 && herbivore[2] > herbivore[0] + 8.0,
+                "{label} herbivore body is not cyan-axis: {herbivore:?}"
+            );
+        }
     }
 }
