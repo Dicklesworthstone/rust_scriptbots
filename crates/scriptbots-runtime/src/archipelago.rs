@@ -2009,28 +2009,45 @@ mod tests {
 
     #[test]
     fn test_island_independence_across_archipelago_sizes() {
-        let master_seed = 987654321;
-        let mut config_single = populated_config(Some(master_seed));
-        config_single.rng_seed = Some(derive_island_value("WORLD", master_seed, IslandId(0)));
+        let master_seed = 987_654_321;
+        let island_specs: Vec<IslandSpec> =
+            (0..8).map(|id| spec(id, populated_config(None))).collect();
+        let expected_seed = Some(derive_island_value(
+            ISLAND_RNG_SEED_TAG,
+            master_seed,
+            IslandId(0),
+        ));
+        let mut baseline: Option<(usize, WorldDigestV1)> = None;
 
-        let mut single_world = WorldState::new(config_single).expect("single world");
-        for _ in 0..100 {
-            single_world.step().expect("step single world");
+        for island_count in [1, 2, 4, 8] {
+            let mut config = archipelago_config(island_specs[..island_count].to_vec(), 100);
+            config.master_seed = master_seed;
+            let mut archipelago = populated_archipelago(config).expect("valid archipelago");
+
+            let subject = archipelago
+                .islands()
+                .find(|meta| meta.id == IslandId(0))
+                .expect("island zero");
+            assert_eq!(
+                subject.effective_config.rng_seed, expected_seed,
+                "island-count changes must not change the per-island seed"
+            );
+
+            archipelago.step_to_barrier().expect("barrier");
+            let digest = archipelago
+                .island_digest(IslandId(0))
+                .expect("island zero digest");
+
+            if let Some((baseline_count, baseline_digest)) = &baseline {
+                assert_eq!(
+                    &digest, baseline_digest,
+                    "island zero science changed between {baseline_count}- and \
+                     {island_count}-island archipelagos"
+                );
+            } else {
+                baseline = Some((island_count, digest));
+            }
         }
-        let single_digest = single_world.characterization_digest_v0().unwrap().overall;
-
-        let specs = vec![spec(0, populated_config(Some(master_seed)))];
-        let mut arch_1 = populated_archipelago(archipelago_config(specs, 100)).expect("arch 1");
-        arch_1.step_to_barrier().expect("barrier 1");
-        let arch_1_digest = arch_1
-            .island_digest(IslandId(0))
-            .expect("digest arch 1")
-            .overall;
-
-        assert_eq!(
-            single_digest, arch_1_digest,
-            "Island 0 running inside Archipelago must produce identical digest to single world"
-        );
     }
 
     #[test]
