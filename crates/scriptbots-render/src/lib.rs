@@ -5818,16 +5818,9 @@ impl SimulationView {
     }
 
     fn toggle_closed_environment(&mut self, cx: &mut Context<Self>) {
-        if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.latched_step_error() {
-                warn!(error = %error, "Environment mutation blocked by terminal simulation failure");
-                return;
-            }
-            let next = !world.is_closed();
-            if let Err(error) = world.set_closed(next) {
-                warn!(error = %error, "Environment mutation rejected");
-            }
-        }
+        self.submit_config_update(|config| {
+            config.closed = !config.closed;
+        });
         cx.notify();
     }
 
@@ -6854,27 +6847,15 @@ impl SimulationView {
             this.spawn_agent_with_tendency(1.0, cx);
         });
         let open_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            if let Ok(mut world) = this.world.lock() {
-                if world.latched_step_error().is_none() {
-                    if let Err(error) = world.set_closed(false) {
-                        warn!(error = %error, "Open-world action rejected");
-                    }
-                } else {
-                    warn!("Open-world action blocked by terminal simulation failure");
-                }
-            }
+            this.submit_config_update(|config| {
+                config.closed = false;
+            });
             cx.notify();
         });
         let close_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            if let Ok(mut world) = this.world.lock() {
-                if world.latched_step_error().is_none() {
-                    if let Err(error) = world.set_closed(true) {
-                        warn!(error = %error, "Close-world action rejected");
-                    }
-                } else {
-                    warn!("Close-world action blocked by terminal simulation failure");
-                }
-            }
+            this.submit_config_update(|config| {
+                config.closed = true;
+            });
             cx.notify();
         });
 
@@ -16593,6 +16574,17 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn production_renderer_has_no_direct_closed_world_writes() {
+        let (production, _) = include_str!("lib.rs")
+            .split_once("#[cfg(test)]\nmod command_characterization_tests")
+            .expect("command characterization test boundary");
+        assert!(
+            !production.contains(".set_closed("),
+            "GPUI closed-world changes must be admitted through ControlCommand, never written to WorldState"
+        );
+    }
+
+    #[test]
     fn readme_gui_shortcuts_match_production_bindings() {
         let bindings = InputBindings::default();
         let entries = bindings.iter();
@@ -17752,7 +17744,14 @@ mod command_characterization_tests {
                     .push(command);
                 true
             });
-        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let drain_commands = Arc::clone(&submitted_commands);
+        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
+            Arc::new(move || {
+                let mut commands = drain_commands
+                    .lock()
+                    .expect("closed-world submitted command queue");
+                std::mem::take(&mut *commands)
+            });
         let session = Arc::new(GuiSession::new(
             Arc::clone(&world),
             disabled_persistence_step_driver(&world),
@@ -17777,17 +17776,36 @@ mod command_characterization_tests {
             .expect("dispatch production HUD closed-world shortcut");
         });
 
+        let mut expected_config = world
+            .lock()
+            .expect("closed-world world lock")
+            .config()
+            .clone();
+        expected_config.closed = true;
         assert_eq!(
             submitted_commands
                 .lock()
                 .expect("closed-world submitted command queue")
-                .len(),
-            1,
-            "one C keypress must enqueue exactly one canonical scientific intent"
+                .as_slice(),
+            &[ControlCommand::UpdateConfig(Box::new(expected_config))],
+            "one C keypress must enqueue the exact canonical closed-world intent"
         );
         assert!(
             !world.lock().expect("closed-world world lock").is_closed(),
             "the GPUI handler must not mutate scientific world state before the intent is drained"
+        );
+        app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
+        app.run_until_parked();
+        assert!(
+            submitted_commands
+                .lock()
+                .expect("closed-world submitted command queue")
+                .is_empty(),
+            "the production driver must drain the admitted closed-world intent"
+        );
+        assert!(
+            world.lock().expect("closed-world world lock").is_closed(),
+            "the shared command application path must apply the GPUI closed-world intent"
         );
         app.update(|app| app.shutdown());
     }
