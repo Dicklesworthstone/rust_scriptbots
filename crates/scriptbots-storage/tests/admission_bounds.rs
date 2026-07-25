@@ -10,7 +10,8 @@ use scriptbots_core::{
     ReplayEventKind, Tick, TickSummary,
 };
 use scriptbots_storage::{
-    PayloadBudget, StorageError, StoragePipeline, estimate_batch_size, estimate_narrative_size,
+    PayloadBudget, StorageError, StoragePipeline, StorageReader, estimate_batch_size,
+    estimate_narrative_size,
 };
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -163,6 +164,61 @@ fn a_narration_burst_cannot_starve_simulation_admission_through_the_real_path() 
         .expect("a later scientific batch must still be admitted");
 
     pipeline.shutdown().expect("shutdown");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Narrative events must never be discarded without surfacing (`bd-erff`).
+///
+/// This pins the defect that mattered most in bd-erff, and it was not the miscount.
+/// `StorageBuffer` declared `run_events` but never wired it into `append`, so rows built
+/// per batch were dropped the instant batches merged into the flush buffer. Nothing failed:
+/// admission succeeded, the flush committed, the run reported complete, and the narrative
+/// was simply absent with no error, no counter and no log to say it had ever existed. A
+/// silent drop is worse than a wrong count — a wrong count is visible in the arithmetic,
+/// whereas this looked like a run that generated no commentary.
+///
+/// Deliberately exercises the *merge* path rather than a single batch: buffering several
+/// batches before a flush is exactly what the broken `append` destroyed, and a one-batch
+/// test would have passed against the bug.
+#[test]
+fn buffered_narrative_events_are_never_dropped_between_batches() {
+    let path = temp_db("narrative-no-drop");
+    // Thresholds high enough that batches accumulate in the buffer and must be merged,
+    // rather than each one flushing on its own.
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+        &path, 1_000, 1_000, 1_000, 1_000,
+    )
+    .expect("pipeline");
+
+    let mut expected = Vec::new();
+    for tick in 1..=6_u64 {
+        let mut batch = batch(tick, 1);
+        let event = narrative_event(tick);
+        expected.push((tick, event.human_text.clone()));
+        batch.narrative_events = vec![event];
+        pipeline.submit(&batch).expect("batch admitted");
+    }
+    let shutdown = pipeline.shutdown().expect("shutdown");
+    assert!(
+        shutdown.committed_tick.is_some(),
+        "expected a committed tick"
+    );
+
+    let reader = StorageReader::open(&path).expect("reader opens");
+    let stored = reader.recent_run_events(64).expect("run events query");
+    reader.close().expect("reader closes");
+
+    let actual = stored
+        .iter()
+        .map(|event| (event.tick, event.human_text.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual, expected,
+        "narrative events were lost between admission and the database — every submitted \
+         event must be readable back, and a shortfall here means rows were discarded with \
+         no error to reveal it"
+    );
+
     let _ = std::fs::remove_file(&path);
 }
 

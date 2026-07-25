@@ -3291,6 +3291,27 @@ pub struct PersistedMetric {
     pub value: f64,
 }
 
+/// Narrative event row read back from a run database (`bd-erff`).
+///
+/// The readable projection of `run_events`: enough to render a run timeline without
+/// exposing the detector internals (`magnitude`, `window`, `before`/`after`, `score`) that
+/// only a re-derivation would need. Those stay in the table for offline analysis.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedRunEvent {
+    /// Tick the detector fired at.
+    pub tick: u64,
+    /// Which detector fired, as its stable string form.
+    pub kind: String,
+    /// Rough importance in `[0, 1]`.
+    pub severity: f64,
+    /// Series the change was detected on.
+    pub metric: String,
+    /// Human-readable description of what happened.
+    pub human_text: String,
+    /// Encoded subject (`agent:`/`species:`/`island:`), when the event names one.
+    pub subject_ref: Option<String>,
+}
+
 /// Tick ledger row exposed to storage consumers without leaking SQL details.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersistedTick {
@@ -7155,6 +7176,42 @@ impl StorageReader {
     }
 
     /// Load a bounded page of the newest metric rows in chronological order.
+    /// The most recent `limit` narrative events, ordered oldest-first (`bd-erff`).
+    ///
+    /// Mirrors [`Self::recent_metrics`] exactly — bounded limit, newest-window select,
+    /// ascending return — so a caller moving between the two surfaces does not have to
+    /// remember which way each one runs. That symmetry is deliberate: `AsyncReadLane` and
+    /// `StorageReader` silently disagreed on metric order until `bd-vd3t`, and a second
+    /// reader with its own convention would invite the same defect.
+    pub fn recent_run_events(&self, limit: usize) -> Result<Vec<PersistedRunEvent>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bound = checked_query_limit("recent_run_events.limit", limit)?;
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick, kind, severity, metric, human_text, subject_ref
+             FROM run_events
+             WHERE run_id = ?1
+             ORDER BY tick DESC, kind DESC, metric DESC
+             LIMIT ?2",
+            &[sqlite_run_id(self.run_id), bound.into()],
+        )?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            events.push(PersistedRunEvent {
+                tick: checked_u64("run_events.tick", decode(&row, 0, "run_events.tick")?)?,
+                kind: decode(&row, 1, "run_events.kind")?,
+                severity: decode(&row, 2, "run_events.severity")?,
+                metric: decode(&row, 3, "run_events.metric")?,
+                human_text: decode(&row, 4, "run_events.human_text")?,
+                subject_ref: decode(&row, 5, "run_events.subject_ref")?,
+            });
+        }
+        events.reverse();
+        Ok(events)
+    }
+
     pub fn recent_metrics(&self, limit: usize) -> Result<Vec<PersistedMetric>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
