@@ -1,3 +1,4 @@
+use fsqlite::compat::{OpenFlags, RowExt, open_with_flags};
 use scriptbots_core::{
     AgentData, PersistenceBatch, ReplayEvent, ReplayEventKind, ScriptBotsConfig, Tick, TickSummary,
     WorldState,
@@ -128,20 +129,20 @@ fn storage_persists_metrics_roundtrip() {
 }
 
 #[test]
-/// Narrative events reach the persistence boundary, but nothing reads them back yet.
+/// Every narrative event emitted online must be readable back from the run database.
 ///
-/// This test was written as an online/offline parity proof. It cannot be one: storage
-/// counts `PersistenceBatch.narrative_events` against the bounded admission budget and
-/// then discards it — there is no narrative row type, no insert in the batch transaction,
-/// and no reader accessor — so there is no offline side to compare against. The recovered
-/// prior-session edit replaced a call to the nonexistent `StorageReader::search_narrative`
-/// with a `max_tick` probe, which made the file compile while leaving the parity claim in
-/// the name.
+/// This is a real parity proof again (`bd-erff`). It could not be one for most of its life:
+/// storage charged `PersistenceBatch.narrative_events` against the admission budget and then
+/// discarded it, so there was no offline side to compare against. An earlier session made
+/// the file compile by replacing a call to the nonexistent `StorageReader::search_narrative`
+/// with a `max_tick` probe, which left the parity claim in the name while asserting nothing
+/// about it.
 ///
-/// Renamed to state what it actually proves: a run that generates narrative events online
-/// still drives the pipeline to a durable tick. Restoring a real parity assertion is
-/// `bd-erff`, together with actually persisting the events.
-fn narrative_events_are_generated_online_and_the_run_still_commits() {
+/// The offline half now exists, and asserting it immediately earned its keep: it caught that
+/// `StorageBuffer::append` silently dropped `run_events`, so rows were built per batch and
+/// then lost when batches merged into the flush buffer. The writer looked correct and
+/// persisted nothing.
+fn narrative_events_persisted_online_are_readable_offline() {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
@@ -202,7 +203,35 @@ fn narrative_events_are_generated_online_and_the_run_still_commits() {
         !online_events.is_empty(),
         "expected online events generated during run"
     );
-
     storage.close().expect("close storage reader");
+
+    // The offline half, restored (bd-erff). This test was named for online/offline parity
+    // but could not check it: narrative events reached the persistence boundary and were
+    // discarded, because nothing wrote `StorageBuffer.run_events`. With the writer in place
+    // every event the world emitted must now be readable back from the run database.
+    let reader = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("independent read-only reader opens");
+    let rows = reader
+        .query("SELECT tick, human_text FROM run_events ORDER BY tick ASC, human_text ASC")
+        .expect("run_events query runs");
+    let mut offline_events = rows
+        .iter()
+        .map(|row| {
+            let tick: i64 = row.get_typed(0).expect("tick is INTEGER");
+            let text: String = row.get_typed(1).expect("human_text is TEXT");
+            (u64::try_from(tick).expect("tick is non-negative"), text)
+        })
+        .collect::<Vec<_>>();
+    reader.close().expect("read-only reader closes");
+
+    let mut expected = online_events.clone();
+    expected.sort();
+    offline_events.sort();
+    assert_eq!(
+        offline_events, expected,
+        "every narrative event the world emitted online must be readable back from the run \
+         database; this is the parity the test is named for"
+    );
+
     let _ = fs::remove_file(&path);
 }

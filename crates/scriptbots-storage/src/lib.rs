@@ -4731,6 +4731,7 @@ impl StorageBuffer {
             && self.births.is_empty()
             && self.deaths.is_empty()
             && self.replay_events.is_empty()
+            && self.run_events.is_empty()
     }
 
     /// Total buffered rows across every table, for degraded-close reporting.
@@ -4742,6 +4743,7 @@ impl StorageBuffer {
             + self.births.len()
             + self.deaths.len()
             + self.replay_events.len()
+            + self.run_events.len()
     }
 
     fn clear(&mut self) {
@@ -4752,6 +4754,7 @@ impl StorageBuffer {
         self.births.clear();
         self.deaths.clear();
         self.replay_events.clear();
+        self.run_events.clear();
     }
 
     fn append(&mut self, mut other: Self) {
@@ -4762,6 +4765,7 @@ impl StorageBuffer {
         self.births.append(&mut other.births);
         self.deaths.append(&mut other.deaths);
         self.replay_events.append(&mut other.replay_events);
+        self.run_events.append(&mut other.run_events);
     }
 
     fn validate_contents(&self, enclosing_tick: u64) -> Result<(), StorageError> {
@@ -12032,6 +12036,10 @@ impl Storage {
                 .push(replay_row_from_event(event, tick, seq)?);
         }
 
+        for event in &payload.narrative_events {
+            prepared.run_events.push(run_event_row_from_record(event)?);
+        }
+
         prepared.validate_contents(summary.tick.0)?;
         Ok(prepared)
     }
@@ -12298,6 +12306,53 @@ impl Storage {
         Ok(())
     }
 
+    /// Insert narrative rows in the same transaction as every scientific table (`bd-erff`).
+    ///
+    /// Atomic with the rest of the batch by design: a tick's commentary and the data it
+    /// describes commit or roll back together, so an interrupted flush cannot leave
+    /// narration referring to a tick that was never recorded.
+    fn insert_run_events(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[RunEventRow],
+    ) -> Result<(), FrankenError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // `insert or replace` matches the other scientific tables: replaying an admitted
+        // outbox batch after recovery must be idempotent rather than a constraint violation
+        // on the (run_id, tick, kind, metric) primary key.
+        let sql = "insert or replace into run_events (
+                run_id, tick, kind, severity, magnitude, window_start, window_end,
+                metric, before_value, after_value, score, subject_ref, human_text,
+                schema_version
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+        for row in rows {
+            tx.execute_with_params(
+                sql,
+                &[
+                    sqlite_run_id(run_id),
+                    row.tick.into(),
+                    row.kind.as_str().into(),
+                    row.severity.into(),
+                    row.magnitude.into(),
+                    row.window_start.into(),
+                    row.window_end.into(),
+                    row.metric.as_str().into(),
+                    row.before_value.into(),
+                    row.after_value.into(),
+                    row.score.into(),
+                    row.subject_ref
+                        .as_deref()
+                        .map_or(SqliteValue::Null, Into::into),
+                    row.human_text.as_str().into(),
+                    row.schema_version.into(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn insert_replay_events(
         tx: &Transaction<'_>,
         run_id: RunId,
@@ -12384,6 +12439,7 @@ impl Storage {
                 HostJournalFaultPoint::PersistenceAfterDeaths,
             )?;
             Self::insert_replay_events(&tx, run_id, &buffer.replay_events)?;
+            Self::insert_run_events(&tx, run_id, &buffer.run_events)?;
             #[cfg(test)]
             fail_at_host_journal_transaction_fault(
                 path,
@@ -15381,6 +15437,70 @@ fn scope_label(scope: ReplayRngScope) -> String {
             format!("agent:{}", phase_label(phase))
         }
     }
+}
+
+/// Convert one narrative event into its persisted row (`bd-erff`).
+///
+/// Narrative events reached the persistence boundary and were discarded: nothing wrote
+/// `StorageBuffer.run_events`, so commentary was charged against admission and dropped. The
+/// row type and the `run_events` table already existed; only this conversion and the insert
+/// were missing.
+///
+/// The table's CHECK constraints are the contract, so the conversion refuses what the schema
+/// would reject rather than deferring to a constraint violation that would roll back the
+/// whole batch — including the scientific rows sharing the transaction.
+fn run_event_row_from_record(
+    record: &scriptbots_core::narrative::EventRecord,
+) -> Result<RunEventRow, StorageError> {
+    let invalid = |reason: String| StorageError::InvalidData {
+        context: "run_events",
+        reason,
+    };
+    if record.human_text.is_empty() {
+        return Err(invalid("human_text is empty".to_owned()));
+    }
+    if record.metric.is_empty() {
+        return Err(invalid("metric is empty".to_owned()));
+    }
+    if !record.severity.is_finite() || !(0.0..=1.0).contains(&record.severity) {
+        return Err(invalid(format!(
+            "severity {} is outside 0.0..=1.0",
+            record.severity
+        )));
+    }
+    for (label, value) in [
+        ("magnitude", record.magnitude),
+        ("before", record.before),
+        ("after", record.after),
+        ("score", record.score),
+    ] {
+        if !value.is_finite() {
+            return Err(invalid(format!("{label} is not finite: {value}")));
+        }
+    }
+    let as_i64 = |label: &str, value: u64| -> Result<i64, StorageError> {
+        i64::try_from(value).map_err(|_| StorageError::InvalidData {
+            context: "run_events",
+            reason: format!("{label} {value} exceeds i64"),
+        })
+    };
+    Ok(RunEventRow {
+        tick: as_i64("tick", record.tick.0)?,
+        kind: record.kind.as_str().to_owned(),
+        severity: f64::from(record.severity),
+        magnitude: record.magnitude,
+        window_start: as_i64("window_start", record.window.0)?,
+        window_end: as_i64("window_end", record.window.1)?,
+        metric: record.metric.clone(),
+        before_value: record.before,
+        after_value: record.after,
+        score: record.score,
+        subject_ref: record
+            .subject
+            .map(scriptbots_core::narrative::SubjectRef::to_db_string),
+        human_text: record.human_text.clone(),
+        schema_version: i64::from(record.schema_version),
+    })
 }
 
 fn replay_row_from_event(
