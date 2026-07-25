@@ -12,8 +12,8 @@ use gpui::{
     AlignItems, App, Background, Bounds, Context, Corners, Div, FocusHandle, KeyDownEvent,
     Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
     Point, QuitMode, RenderImage, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
-    StyleRefinement, Window, WindowBounds, WindowOptions, canvas, div, fill, point, prelude::*, px,
-    rgb, size,
+    StyleRefinement, Window, WindowBounds, WindowOptions, canvas, div, fill, linear_color_stop,
+    linear_gradient, point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use rand::Rng;
@@ -34,10 +34,11 @@ use scriptbots_core::{
     AgentRuntime, AgentUid, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
     BrainInspectionRevision, BrainInspectionUnavailable, ControlCommand, ControlDisposition,
     FoodGrid, Generation, IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt,
-    Position, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig, SelectedBrainTelemetryOutcome,
-    SelectionMode, SelectionState, SelectionUpdate, SensorAttribution, SensorKind,
-    SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers,
-    Velocity, WorldState, WorldStepDriver, apply_control_command,
+    Position, RenderFogMode, RenderQuality, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
+    SelectedBrainTelemetryOutcome, SelectionMode, SelectionState, SelectionUpdate,
+    SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile,
+    TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver, apply_control_command,
+    tier_features,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
@@ -13001,11 +13002,19 @@ struct PostProcessStack {
 }
 #[derive(Clone, Copy)]
 enum PostProcessPass {
+    Exposure {
+        factor: f32,
+    },
     Vignette {
         strength: f32,
+        smoothness: f32,
     },
     Bloom {
         strength: f32,
+    },
+    Fog {
+        strength: f32,
+        color: [f32; 3],
     },
     Scanlines {
         intensity: f32,
@@ -13024,7 +13033,12 @@ enum PostProcessPass {
 
 fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> PostProcessStack {
     let tick = world.tick().0;
-    let day_phase = (tick as f32 * 0.00025).sin() * 0.5 + 0.5;
+    let render = &world.config().render;
+    let quality = render.requested_quality();
+    let features = tier_features(quality);
+    let (cycle_ticks, start_phase) = render.resolved_day_night();
+    let daylight = visual::daylight_factor(tick, cycle_ticks, start_phase);
+    let night = 1.0 - daylight;
     let closed_bonus = if world.is_closed() { 0.18 } else { 0.0 };
     let agent_count = world.agent_count().max(1) as f32;
     let latest = world.history().last();
@@ -13038,18 +13052,63 @@ fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> Po
         .unwrap_or((0.0, 0.0));
     let life_delta = (births_ratio - deaths_ratio).clamp(-1.0, 1.0);
     let tension = life_delta.abs();
+    let post = render.post.as_ref();
+    let atmosphere = &visual::visual_style().atmosphere;
+    let potato = matches!(quality, RenderQuality::Potato);
 
-    let vignette_strength =
-        (0.36 + day_phase * 0.24 + closed_bonus + (-life_delta).max(0.0) * 0.28).clamp(0.2, 0.82);
-    let bloom_strength = (0.24 + day_phase * 0.32 + life_delta.max(0.0) * 0.28).clamp(0.12, 0.78);
-    let scanline_intensity =
-        (0.18 + (1.0 - day_phase) * 0.22 + closed_bonus * 0.35 + (-life_delta).max(0.0) * 0.18)
-            .clamp(0.08, 0.65);
-    let grain_strength =
-        (0.11 + (tick % 4096) as f32 / 4096.0 * 0.08 + tension * 0.06).clamp(0.08, 0.26);
+    // Potato is the canonical no-post tier. Explicit per-effect blocks and exposure
+    // still win: an operator who asks for one effect should not have that intent
+    // silently discarded merely because the baseline tier is Potato.
+    let explicit_effect = post.is_some() || render.tonemap_exposure_bias.is_some();
+    if potato && !explicit_effect {
+        return PostProcessStack { passes: Vec::new() };
+    }
+
+    let exposure_bias = render.tonemap_exposure_bias.unwrap_or(0.0).clamp(-4.0, 4.0);
+    let exposure_factor =
+        (atmosphere.exposure * 2.0_f32.powf(exposure_bias) * (0.90 + daylight * 0.24))
+            .clamp(0.25, 2.5);
+
+    let vignette = post.and_then(|settings| settings.vignette.as_ref());
+    let vignette_enabled = vignette.map_or(!potato, |settings| settings.enabled);
+    let vignette_strength = vignette
+        .and_then(|settings| settings.intensity)
+        .unwrap_or(atmosphere.vignette + night * 0.42 + closed_bonus)
+        .clamp(0.0, 0.9);
+    let vignette_smoothness = vignette
+        .and_then(|settings| settings.smoothness)
+        .unwrap_or(0.68)
+        .clamp(0.0, 1.0);
+
+    let bloom = post.and_then(|settings| settings.bloom.as_ref());
+    let bloom_enabled = bloom.map_or(features.bloom, |settings| settings.enabled);
+    let bloom_strength = bloom
+        .and_then(|settings| settings.intensity)
+        .unwrap_or(
+            atmosphere.bloom_intensity * (0.80 + daylight * 0.28) + life_delta.max(0.0) * 0.20,
+        )
+        .clamp(0.0, 1.0);
+
+    let fog = post.and_then(|settings| settings.fog.as_ref());
+    let fog_mode = fog
+        .and_then(|settings| settings.mode)
+        .unwrap_or(if features.fog {
+            RenderFogMode::Medium
+        } else {
+            RenderFogMode::Off
+        });
+    let fog_strength = match fog_mode {
+        RenderFogMode::Off => 0.0,
+        RenderFogMode::Low => 0.07,
+        RenderFogMode::Medium => 0.14,
+        RenderFogMode::High => 0.24,
+    };
+    let fog_color = fog
+        .and_then(|settings| settings.color)
+        .unwrap_or(atmosphere.fog_srgb);
 
     let temperature = match palette {
-        ColorPaletteMode::Natural => 0.08 - life_delta * 0.05,
+        ColorPaletteMode::Natural => 0.07 - night * 0.13 - life_delta * 0.05,
         ColorPaletteMode::Deuteranopia => 0.05,
         ColorPaletteMode::Protanopia => -0.04,
         ColorPaletteMode::Tritanopia => 0.12,
@@ -13057,28 +13116,47 @@ fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> Po
     };
 
     let color_grade = PostProcessPass::ColorGrade {
-        lift: (0.05 + closed_bonus * 0.12 - life_delta * 0.06).clamp(0.0, 0.12),
-        gain: (1.02 + day_phase * 0.08 + life_delta.max(0.0) * 0.12).clamp(1.0, 1.25),
+        lift: (0.025 + daylight * 0.025 + closed_bonus * 0.08 - life_delta * 0.04).clamp(0.0, 0.12),
+        gain: (0.88 + daylight * 0.25 + life_delta.max(0.0) * 0.12).clamp(0.8, 1.3),
         temperature,
     };
 
-    let passes = vec![
-        color_grade,
-        PostProcessPass::Vignette {
-            strength: vignette_strength,
-        },
-        PostProcessPass::Bloom {
+    let mut passes = Vec::with_capacity(7);
+    if fog_strength > 0.0 {
+        passes.push(PostProcessPass::Fog {
+            strength: fog_strength * (0.75 + night * 0.65),
+            color: fog_color,
+        });
+    }
+    if !potato {
+        passes.push(color_grade);
+    }
+    if !potato || render.tonemap_exposure_bias.is_some() {
+        passes.push(PostProcessPass::Exposure {
+            factor: exposure_factor,
+        });
+    }
+    if bloom_enabled && bloom_strength > 0.0 {
+        passes.push(PostProcessPass::Bloom {
             strength: bloom_strength,
-        },
-        PostProcessPass::Scanlines {
-            intensity: scanline_intensity,
-            spacing: 4.5,
-        },
-        PostProcessPass::FilmGrain {
-            strength: grain_strength,
+        });
+    }
+    if vignette_enabled && vignette_strength > 0.0 {
+        passes.push(PostProcessPass::Vignette {
+            strength: vignette_strength,
+            smoothness: vignette_smoothness,
+        });
+    }
+    if matches!(quality, RenderQuality::High | RenderQuality::Ultra) {
+        passes.push(PostProcessPass::Scanlines {
+            intensity: (0.10 + night * 0.18 + closed_bonus * 0.25).clamp(0.06, 0.42),
+            spacing: 5.5,
+        });
+        passes.push(PostProcessPass::FilmGrain {
+            strength: (0.14 + tension * 0.06).clamp(0.10, 0.24),
             seed: tick,
-        },
-    ];
+        });
+    }
 
     PostProcessStack { passes }
 }
@@ -15435,6 +15513,29 @@ fn apply_post_processing(
 
     for pass in &stack.passes {
         match *pass {
+            PostProcessPass::Exposure { factor } => {
+                if factor > 1.001 {
+                    let alpha = ((factor - 1.0) * 0.24).clamp(0.0, 0.36);
+                    let exposure_base = rgba_from_triplet_with_alpha(
+                        visual::visual_style().chrome.primary_text_srgb,
+                        alpha,
+                    );
+                    window.paint_quad(fill(
+                        bounds,
+                        Background::from(apply_palette(exposure_base, palette)),
+                    ));
+                } else if factor < 0.999 {
+                    let alpha = ((1.0 - factor) * 0.42).clamp(0.0, 0.55);
+                    let exposure_base = rgba_from_triplet_with_alpha(
+                        visual::visual_style().substrate.abyss_srgb,
+                        alpha,
+                    );
+                    window.paint_quad(fill(
+                        bounds,
+                        Background::from(apply_palette(exposure_base, palette)),
+                    ));
+                }
+            }
             PostProcessPass::ColorGrade {
                 lift,
                 gain,
@@ -15446,96 +15547,197 @@ fn apply_post_processing(
                     window.paint_quad(fill(bounds, Background::from(lift_color)));
                 }
                 if temperature.abs() > 0.001 {
-                    let temp_hex = if temperature >= 0.0 {
-                        0xffa94d
+                    let style = visual::visual_style();
+                    let temp_rgb = if temperature >= 0.0 {
+                        style.chrome.warning_srgb
                     } else {
-                        0x3b82f6
+                        style.chrome.accent_cyan_srgb
                     };
                     let temp_alpha = temperature.abs().clamp(0.0, 0.25) * 0.6;
                     if temp_alpha > 0.0 {
-                        let temp_color =
-                            apply_palette(rgba_from_hex(temp_hex, temp_alpha), palette);
+                        let temp_color = apply_palette(
+                            rgba_from_triplet_with_alpha(temp_rgb, temp_alpha),
+                            palette,
+                        );
                         window.paint_quad(fill(bounds, Background::from(temp_color)));
                     }
                 }
                 if gain > 1.0 {
                     let gain_alpha = (gain - 1.0).clamp(0.0, 0.4);
                     if gain_alpha > 0.0 {
-                        let gain_bounds = Bounds::new(
-                            point(
-                                px(origin_x + width_px * 0.12),
-                                px(origin_y + height_px * 0.12),
-                            ),
-                            size(px(width_px * 0.76), px(height_px * 0.76)),
+                        let gain_base = rgba_from_triplet_with_alpha(
+                            visual::visual_style().chrome.primary_text_srgb,
+                            gain_alpha * 0.35,
                         );
-                        let gain_color =
-                            apply_palette(rgba_from_hex(0xf1f5f9, gain_alpha * 0.35), palette);
-                        window.paint_quad(fill(gain_bounds, Background::from(gain_color)));
+                        window.paint_quad(fill(
+                            bounds,
+                            Background::from(apply_palette(gain_base, palette)),
+                        ));
                     }
+                } else if gain < 1.0 {
+                    let gain_alpha = ((1.0 - gain) * 0.55).clamp(0.0, 0.30);
+                    let gain_base = rgba_from_triplet_with_alpha(
+                        visual::visual_style().substrate.abyss_srgb,
+                        gain_alpha,
+                    );
+                    window.paint_quad(fill(
+                        bounds,
+                        Background::from(apply_palette(gain_base, palette)),
+                    ));
                 }
             }
-            PostProcessPass::Vignette { strength } => {
+            PostProcessPass::Vignette {
+                strength,
+                smoothness,
+            } => {
                 if strength > 0.01 {
-                    let alpha = (0.22 + (1.0 - daylight) * 0.14) * strength;
-                    let edge_base = rgba_from_hex(0x01040c, alpha.clamp(0.05, 0.55));
-                    let edge_color = if matches!(palette, ColorPaletteMode::Natural) {
-                        edge_base
-                    } else {
-                        apply_palette(edge_base, palette)
+                    // GPUI's CPU canvas has no framebuffer-sampling post pass, so
+                    // four edge gradients approximate a smooth vignette. The
+                    // configured smoothness controls the falloff width instead of
+                    // being accepted and silently ignored.
+                    let edge_fraction = 0.08 + smoothness * 0.15;
+                    let alpha = ((0.24 + (1.0 - daylight) * 0.18) * strength).clamp(0.03, 0.50);
+                    let edge_color = apply_palette(
+                        rgba_from_triplet_with_alpha(
+                            visual::visual_style().substrate.abyss_srgb,
+                            alpha,
+                        ),
+                        palette,
+                    );
+                    let transparent = Rgba {
+                        a: 0.0,
+                        ..edge_color
                     };
-                    let top_bounds = Bounds::new(
-                        point(px(origin_x), px(origin_y)),
-                        size(px(width_px), px(height_px * 0.18)),
-                    );
-                    let bottom_bounds = Bounds::new(
-                        point(px(origin_x), px(origin_y + height_px * 0.82)),
-                        size(px(width_px), px(height_px * 0.18)),
-                    );
-                    window.paint_quad(fill(top_bounds, Background::from(edge_color)));
-                    window.paint_quad(fill(bottom_bounds, Background::from(edge_color)));
-
-                    let side_alpha = (alpha * 0.8).clamp(0.04, 0.45);
-                    let side_base = rgba_from_hex(0x020816, side_alpha);
-                    let side_color = if matches!(palette, ColorPaletteMode::Natural) {
-                        side_base
-                    } else {
-                        apply_palette(side_base, palette)
-                    };
-                    let side_width = width_px * 0.08;
-                    let left_bounds = Bounds::new(
-                        point(px(origin_x), px(origin_y)),
-                        size(px(side_width), px(height_px)),
-                    );
-                    let right_bounds = Bounds::new(
-                        point(px(origin_x + width_px - side_width), px(origin_y)),
-                        size(px(side_width), px(height_px)),
-                    );
-                    window.paint_quad(fill(left_bounds, Background::from(side_color)));
-                    window.paint_quad(fill(right_bounds, Background::from(side_color)));
+                    let band_height = height_px * edge_fraction;
+                    let band_width = width_px * edge_fraction * 0.62;
+                    for (edge_bounds, angle) in [
+                        (
+                            Bounds::new(
+                                point(px(origin_x), px(origin_y)),
+                                size(px(width_px), px(band_height)),
+                            ),
+                            0.0,
+                        ),
+                        (
+                            Bounds::new(
+                                point(px(origin_x), px(origin_y + height_px - band_height)),
+                                size(px(width_px), px(band_height)),
+                            ),
+                            180.0,
+                        ),
+                        (
+                            Bounds::new(
+                                point(px(origin_x), px(origin_y)),
+                                size(px(band_width), px(height_px)),
+                            ),
+                            270.0,
+                        ),
+                        (
+                            Bounds::new(
+                                point(px(origin_x + width_px - band_width), px(origin_y)),
+                                size(px(band_width), px(height_px)),
+                            ),
+                            90.0,
+                        ),
+                    ] {
+                        window.paint_quad(fill(
+                            edge_bounds,
+                            linear_gradient(
+                                angle,
+                                linear_color_stop(transparent, 0.0),
+                                linear_color_stop(edge_color, 1.0),
+                            ),
+                        ));
+                    }
                 }
             }
             PostProcessPass::Bloom { strength } => {
                 if strength > 0.01 {
-                    let bloom_width = width_px * (0.48 + strength * 0.36);
-                    let bloom_height = height_px * (0.48 + strength * 0.36);
-                    let bloom_bounds = Bounds::new(
-                        point(
-                            px(origin_x + (width_px - bloom_width) * 0.5),
-                            px(origin_y + (height_px - bloom_height) * 0.5),
-                        ),
-                        size(px(bloom_width), px(bloom_height)),
-                    );
+                    // Four gradients converge on the scene centre, approximating a
+                    // broad emissive glow without the hard rectangle used before.
+                    let style = visual::visual_style();
                     let bloom_base = lerp_rgba(
-                        rgba_from_hex(0x3b82f6, 0.14 * strength),
-                        rgba_from_hex(0x22c55e, 0.10 * strength),
+                        rgba_from_triplet_with_alpha(
+                            style.chrome.accent_magenta_srgb,
+                            0.045 * strength,
+                        ),
+                        rgba_from_triplet_with_alpha(
+                            style.chrome.accent_cyan_srgb,
+                            0.040 * strength,
+                        ),
                         daylight.clamp(0.0, 1.0),
                     );
-                    let bloom_color = if matches!(palette, ColorPaletteMode::Natural) {
-                        bloom_base
-                    } else {
-                        apply_palette(bloom_base, palette)
+                    let bloom_color = apply_palette(bloom_base, palette);
+                    let transparent = Rgba {
+                        a: 0.0,
+                        ..bloom_color
                     };
-                    window.paint_quad(fill(bloom_bounds, Background::from(bloom_color)));
+                    for (bloom_bounds, angle) in [
+                        (
+                            Bounds::new(
+                                point(px(origin_x), px(origin_y)),
+                                size(px(width_px), px(height_px * 0.5)),
+                            ),
+                            180.0,
+                        ),
+                        (
+                            Bounds::new(
+                                point(px(origin_x), px(origin_y + height_px * 0.5)),
+                                size(px(width_px), px(height_px * 0.5)),
+                            ),
+                            0.0,
+                        ),
+                        (
+                            Bounds::new(
+                                point(px(origin_x), px(origin_y)),
+                                size(px(width_px * 0.5), px(height_px)),
+                            ),
+                            90.0,
+                        ),
+                        (
+                            Bounds::new(
+                                point(px(origin_x + width_px * 0.5), px(origin_y)),
+                                size(px(width_px * 0.5), px(height_px)),
+                            ),
+                            270.0,
+                        ),
+                    ] {
+                        window.paint_quad(fill(
+                            bloom_bounds,
+                            linear_gradient(
+                                angle,
+                                linear_color_stop(transparent, 0.0),
+                                linear_color_stop(bloom_color, 1.0),
+                            ),
+                        ));
+                    }
+                }
+            }
+            PostProcessPass::Fog { strength, color } => {
+                if strength > 0.001 {
+                    // Distance and height fog becomes a horizon gradient in this
+                    // 2D canvas backend, preserving terrain silhouettes without
+                    // the visible bands of the old approximation.
+                    let fog_bounds = Bounds::new(
+                        point(px(origin_x), px(origin_y + height_px * 0.34)),
+                        size(px(width_px), px(height_px * 0.66)),
+                    );
+                    let fog_color = apply_palette(
+                        rgba_from_triplet_with_alpha(color, strength * 0.42),
+                        palette,
+                    );
+                    let transparent = Rgba {
+                        a: 0.0,
+                        ..fog_color
+                    };
+                    window.paint_quad(fill(
+                        fog_bounds,
+                        linear_gradient(
+                            180.0,
+                            linear_color_stop(transparent, 0.0),
+                            linear_color_stop(fog_color, 1.0),
+                        ),
+                    ));
                 }
             }
             PostProcessPass::Scanlines { intensity, spacing } => {
@@ -15793,6 +15995,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     } else {
         raw_height_px
     };
+    // GPUI can report a one-pixel flex-canvas height during the custom element's
+    // paint callback. The world painter already compensates with the window
+    // height above; every screen-space post pass must consume the same effective
+    // bounds or it technically runs while touching only a one-pixel strip.
+    let effective_bounds = Bounds::new(origin, size(px(width_px), px(height_px)));
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
@@ -16371,7 +16578,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         apply_post_processing(
             &frame.post_stack,
             frame.palette,
-            bounds,
+            effective_bounds,
             window,
             daylight,
             scale,

@@ -24,7 +24,9 @@ use gpui::{AppContext as _, HeadlessAppContext, px, size};
 use image::RgbaImage;
 use scriptbots_core::{AgentId, ScriptBotsConfig, WorldState};
 #[cfg(target_os = "macos")]
-use scriptbots_core::{OutputChannel, SelectionState};
+use scriptbots_core::{
+    OutputChannel, RenderDayNightSettings, RenderQuality, RenderSettings, SelectionState,
+};
 
 use crate::{
     AnalyticsSnapshotProvider, CameraSnapshot, ControlCommand, GuiSession, GuiViewRole,
@@ -281,7 +283,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn capture_visual_world() -> Arc<Mutex<WorldState>> {
+    fn capture_visual_world_with_render(render: RenderSettings) -> Arc<Mutex<WorldState>> {
         const POPULATION: usize = 96;
 
         // Production initial-population framing shows 120 agent diameters across.
@@ -297,6 +299,7 @@ mod tests {
             population_spawn_interval: 0,
             persistence_interval: 0,
             rng_seed: Some(0xBD11_5EED),
+            render,
             ..ScriptBotsConfig::default()
         };
         let mut world = WorldState::new(config).expect("offscreen visual capture world");
@@ -341,6 +344,11 @@ mod tests {
         );
 
         Arc::new(Mutex::new(world))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_visual_world() -> Arc<Mutex<WorldState>> {
+        capture_visual_world_with_render(RenderSettings::default())
     }
 
     #[cfg(target_os = "macos")]
@@ -620,6 +628,34 @@ mod tests {
             }
         }
         count
+    }
+
+    #[cfg(target_os = "macos")]
+    fn whole_frame_delta(left: &RgbaImage, right: &RgbaImage) -> (usize, f32) {
+        assert_eq!(
+            left.dimensions(),
+            right.dimensions(),
+            "whole-frame comparison requires equal dimensions"
+        );
+        let mut changed = 0usize;
+        let mut absolute_luma_delta = 0.0_f64;
+        for (left, right) in left.pixels().zip(right.pixels()) {
+            if left != right {
+                changed += 1;
+            }
+            let [left_r, left_g, left_b, _] = left.0;
+            let [right_r, right_g, right_b, _] = right.0;
+            let left_luma = 0.2126 * f64::from(left_r)
+                + 0.7152 * f64::from(left_g)
+                + 0.0722 * f64::from(left_b);
+            let right_luma = 0.2126 * f64::from(right_r)
+                + 0.7152 * f64::from(right_g)
+                + 0.0722 * f64::from(right_b);
+            absolute_luma_delta += (left_luma - right_luma).abs();
+        }
+        let pixels = u64::from(left.width()) * u64::from(left.height());
+        assert!(pixels > 0, "whole-frame comparison requires pixels");
+        (changed, (absolute_luma_delta / pixels as f64) as f32)
     }
 
     fn probe_dir() -> PathBuf {
@@ -967,6 +1003,100 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configured_post_stack_and_day_night_are_perceptible_in_real_gpui_pixels() {
+        let daylight_settings = |start_phase| RenderSettings {
+            day_night: Some(RenderDayNightSettings {
+                cycle_ticks: Some(10_000),
+                start_phase: Some(start_phase),
+                ..RenderDayNightSettings::default()
+            }),
+            ..RenderSettings::default()
+        };
+        let default_world = capture_visual_world_with_render(RenderSettings::default());
+        let potato_world = capture_visual_world_with_render(RenderSettings {
+            quality: Some(RenderQuality::Potato),
+            ..RenderSettings::default()
+        });
+        let noon_world = capture_visual_world_with_render(daylight_settings(0.25));
+        let midnight_world = capture_visual_world_with_render(daylight_settings(0.75));
+
+        let digest = |world: &Arc<Mutex<WorldState>>| {
+            world
+                .lock()
+                .expect("visual proof world lock")
+                .world_digest_v1()
+                .expect("visual proof world digest")
+        };
+        let expected_digest = digest(&default_world);
+        for (label, world) in [
+            ("potato", &potato_world),
+            ("noon", &noon_world),
+            ("midnight", &midnight_world),
+        ] {
+            assert_eq!(
+                expected_digest,
+                digest(world),
+                "{label} presentation settings changed scientific state"
+            );
+        }
+
+        let capture = |world| {
+            capture_view_with_overrides(
+                world,
+                GuiViewRole::WorldCanvas,
+                1280.0,
+                720.0,
+                CaptureOverrides {
+                    draw_agents: Some(false),
+                    draw_food: Some(false),
+                    forced_fps: Some(60.0),
+                    ..CaptureOverrides::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("headless post-stack capture failed: {error:#}"))
+        };
+        let default = capture(default_world);
+        let potato = capture(potato_world);
+        let noon = capture(noon_world);
+        let midnight = capture(midnight_world);
+
+        let probe_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/rendering_reference/live_probes/bd-lhml");
+        std::fs::create_dir_all(&probe_dir).expect("bd-lhml probe output directory");
+        for (name, image) in [
+            ("default_medium_post_1280x720.png", &default),
+            ("potato_no_post_1280x720.png", &potato),
+            ("default_noon_1280x720.png", &noon),
+            ("default_midnight_1280x720.png", &midnight),
+        ] {
+            image
+                .save(probe_dir.join(name))
+                .unwrap_or_else(|error| panic!("write {name}: {error}"));
+        }
+
+        let total_pixels = default.width() as usize * default.height() as usize;
+        let (post_changed, post_luma_delta) = whole_frame_delta(&default, &potato);
+        let (clock_changed, clock_luma_delta) = whole_frame_delta(&noon, &midnight);
+        eprintln!(
+            "bd-lhml pixel proof: post changed={post_changed}/{total_pixels}, \
+             mean_abs_luma={post_luma_delta:.3}; half-cycle changed={clock_changed}/{total_pixels}, \
+             mean_abs_luma={clock_luma_delta:.3}"
+        );
+        assert!(
+            post_changed >= total_pixels / 20 && post_luma_delta >= 1.0,
+            "the configured default post stack is not perceptible against Potato/no-post: \
+             changed={post_changed}/{total_pixels}, mean absolute luma delta={post_luma_delta:.3}"
+        );
+
+        assert!(
+            clock_changed >= total_pixels / 4 && clock_luma_delta >= 5.0,
+            "half-cycle day/night frames are not perceptibly different: \
+             changed={clock_changed}/{total_pixels}, mean absolute luma delta={clock_luma_delta:.3}"
+        );
     }
 
     #[cfg(target_os = "macos")]
