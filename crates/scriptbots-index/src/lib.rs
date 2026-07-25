@@ -44,7 +44,6 @@ pub struct UniformGridIndex {
     pub cell_size: f32,
     width: f32,
     height: f32,
-    inv_cell_size: f32,
     cells_x: i32,
     cells_y: i32,
     buckets: Buckets,
@@ -70,11 +69,6 @@ impl UniformGridIndex {
     /// Create a new uniform grid with the provided cell size and world dimensions.
     #[must_use]
     pub fn new(cell_size: f32, width: f32, height: f32) -> Self {
-        let inv_cell_size = if cell_size > 0.0 {
-            1.0 / cell_size
-        } else {
-            0.0
-        };
         let cells_x = if cell_size > 0.0 {
             Self::cells_for_dimension(width, cell_size)
         } else {
@@ -89,7 +83,6 @@ impl UniformGridIndex {
             cell_size,
             width,
             height,
-            inv_cell_size,
             cells_x,
             cells_y,
             buckets: Buckets::Sparse(HashMap::new()),
@@ -111,15 +104,16 @@ impl UniformGridIndex {
         if agent_idx >= self.positions.len() || radius < 0.0 {
             return;
         }
-        let (cell_x, cell_y) = self.agent_cells[agent_idx];
-        let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
-        let span_x = Self::wrapped_span(cell_radius, self.cells_x);
-        let span_y = Self::wrapped_span(cell_radius, self.cells_y);
+        let (ax, ay) = self.positions[agent_idx];
+        let (start_x, span_x) =
+            self.axis_bucket_span(ax, f64::from(radius), self.width, self.cells_x);
+        let (start_y, span_y) =
+            self.axis_bucket_span(ay, f64::from(radius), self.height, self.cells_y);
 
         for step_x in 0..span_x {
             for step_y in 0..span_y {
-                let nx = Self::wrap(cell_x - cell_radius + step_x, self.cells_x);
-                let ny = Self::wrap(cell_y - cell_radius + step_y, self.cells_y);
+                let nx = Self::advance_cell(start_x, step_x, self.cells_x);
+                let ny = Self::advance_cell(start_y, step_y, self.cells_y);
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
@@ -161,6 +155,7 @@ impl UniformGridIndex {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     const fn wrap(value: i32, max: i32) -> i32 {
         if max <= 0 {
@@ -169,36 +164,84 @@ impl UniformGridIndex {
         ((value % max) + max) % max
     }
 
-    /// Number of cells to scan along one axis so each wrapped cell is visited at most once.
-    #[inline]
-    const fn wrapped_span(cell_radius: i32, cells: i32) -> i32 {
-        let span = cell_radius.saturating_mul(2).saturating_add(1);
-        if span < cells { span } else { cells }
-    }
-
     /// Minimum-image delta between two coordinates on a toroidal axis of the given extent.
     #[inline]
-    const fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
-        let mut delta = a - b;
+    fn toroidal_delta(a: f32, b: f32, extent: f32) -> f64 {
+        let extent = f64::from(extent);
+        let a = f64::from(a).rem_euclid(extent);
+        let b = f64::from(b).rem_euclid(extent);
+        let delta = (a - b).rem_euclid(extent);
         if delta > extent * 0.5 {
-            delta -= extent;
-        } else if delta < -extent * 0.5 {
-            delta += extent;
+            delta - extent
+        } else {
+            delta
         }
-        delta
+    }
+
+    #[inline]
+    fn cell_for_axis(&self, coordinate: f32, extent: f32, cells: i32) -> i32 {
+        let canonical = f64::from(coordinate).rem_euclid(f64::from(extent));
+        self.cell_for_canonical_axis(canonical, cells)
+    }
+
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    fn cell_for_canonical_axis(&self, coordinate: f64, cells: i32) -> i32 {
+        let cell = (coordinate / f64::from(self.cell_size)).floor();
+        cell.max(0.0).min(f64::from(cells - 1)) as i32
+    }
+
+    /// Inclusive cyclic bucket span intersecting a physical minimum-image interval.
+    fn axis_bucket_span(
+        &self,
+        coordinate: f32,
+        radius: f64,
+        extent: f32,
+        cells: i32,
+    ) -> (i32, i32) {
+        if cells <= 1 {
+            return (0, 1);
+        }
+
+        let extent = f64::from(extent);
+        let center = f64::from(coordinate).rem_euclid(extent);
+        if !center.is_finite() || !radius.is_finite() || radius >= extent * 0.5 {
+            return (0, cells);
+        }
+
+        let lower = center - radius;
+        let upper = center + radius;
+        let start = self.cell_for_canonical_axis(lower.rem_euclid(extent), cells);
+        let end = self.cell_for_canonical_axis(upper.rem_euclid(extent), cells);
+        let span = if lower < 0.0 || upper >= extent {
+            i64::from(cells - start) + i64::from(end) + 1
+        } else {
+            i64::from(end - start) + 1
+        };
+        let span = i32::try_from(span.clamp(1, i64::from(cells))).unwrap_or(cells);
+        (start, span)
+    }
+
+    #[inline]
+    fn advance_cell(start: i32, offset: i32, cells: i32) -> i32 {
+        if cells <= 0 {
+            return 0;
+        }
+        let cell = (i64::from(start) + i64::from(offset)).rem_euclid(i64::from(cells));
+        i32::try_from(cell).unwrap_or(0)
     }
 
     #[inline]
     fn cell_from_point(&self, x: f32, y: f32) -> (i32, i32) {
-        let cx = Self::wrap(Self::discretize_cell(x * self.inv_cell_size), self.cells_x);
-        let cy = Self::wrap(Self::discretize_cell(y * self.inv_cell_size), self.cells_y);
+        let cx = self.cell_for_axis(x, self.width, self.cells_x);
+        let cy = self.cell_for_axis(y, self.height, self.cells_y);
         (cx, cy)
     }
 
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     const fn linear_index(&self, cx: i32, cy: i32) -> usize {
-        // wrap() guarantees 0 <= cx < cells_x and 0 <= cy < cells_y
+        // Bucket construction and cyclic scans guarantee in-bounds cell coordinates.
         (cy as usize) * (self.cells_x as usize) + (cx as usize)
     }
 
@@ -210,25 +253,6 @@ impl UniformGridIndex {
     fn cells_for_dimension(dimension: f32, cell_size: f32) -> i32 {
         let raw = (dimension / cell_size).ceil().max(1.0);
         raw.min(i32::MAX as f32) as i32
-    }
-
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    fn discretize_cell(value: f32) -> i32 {
-        let floored = value.floor();
-        floored.max(i32::MIN as f32).min(i32::MAX as f32) as i32
-    }
-
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    fn discretize_positive(value: f32) -> i32 {
-        value.ceil().max(0.0).min(i32::MAX as f32) as i32
     }
 }
 
@@ -292,6 +316,7 @@ impl NeighborhoodIndex for UniformGridIndex {
         Ok(())
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn neighbors_within(
         &self,
         agent_idx: usize,
@@ -302,16 +327,14 @@ impl NeighborhoodIndex for UniformGridIndex {
             return;
         }
         let (ax, ay) = self.positions[agent_idx];
-        let (cell_x, cell_y) = self.agent_cells[agent_idx];
-        let radius = radius_sq.sqrt();
-        let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
-        let span_x = Self::wrapped_span(cell_radius, self.cells_x);
-        let span_y = Self::wrapped_span(cell_radius, self.cells_y);
+        let radius = f64::from(radius_sq).sqrt();
+        let (start_x, span_x) = self.axis_bucket_span(ax, radius, self.width, self.cells_x);
+        let (start_y, span_y) = self.axis_bucket_span(ay, radius, self.height, self.cells_y);
 
         for step_x in 0..span_x {
             for step_y in 0..span_y {
-                let nx = Self::wrap(cell_x - cell_radius + step_x, self.cells_x);
-                let ny = Self::wrap(cell_y - cell_radius + step_y, self.cells_y);
+                let nx = Self::advance_cell(start_x, step_x, self.cells_x);
+                let ny = Self::advance_cell(start_y, step_y, self.cells_y);
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
@@ -324,8 +347,8 @@ impl NeighborhoodIndex for UniformGridIndex {
                                 let dx = Self::toroidal_delta(ox, ax, self.width);
                                 let dy = Self::toroidal_delta(oy, ay, self.height);
                                 let dist_sq = dx.mul_add(dx, dy * dy);
-                                if dist_sq <= radius_sq {
-                                    visitor(other_idx, OrderedFloat(dist_sq));
+                                if dist_sq <= f64::from(radius_sq) {
+                                    visitor(other_idx, OrderedFloat(dist_sq as f32));
                                 }
                             }
                         }
@@ -340,8 +363,8 @@ impl NeighborhoodIndex for UniformGridIndex {
                                 let dx = Self::toroidal_delta(ox, ax, self.width);
                                 let dy = Self::toroidal_delta(oy, ay, self.height);
                                 let dist_sq = dx.mul_add(dx, dy * dy);
-                                if dist_sq <= radius_sq {
-                                    visitor(other_idx, OrderedFloat(dist_sq));
+                                if dist_sq <= f64::from(radius_sq) {
+                                    visitor(other_idx, OrderedFloat(dist_sq as f32));
                                 }
                             }
                         }
@@ -360,23 +383,23 @@ impl NeighborhoodIndex for UniformGridIndex {
         if agent_idx >= self.positions.len() || radius < 0.0 {
             return;
         }
-        let (_ax, _ay) = self.positions[agent_idx];
-        let (cell_x, cell_y) = self.agent_cells[agent_idx];
-        let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
-        let span_x = Self::wrapped_span(cell_radius, self.cells_x);
-        let span_y = Self::wrapped_span(cell_radius, self.cells_y);
+        let (ax, ay) = self.positions[agent_idx];
+        let (start_x, span_x) =
+            self.axis_bucket_span(ax, f64::from(radius), self.width, self.cells_x);
+        let (start_y, span_y) =
+            self.axis_bucket_span(ay, f64::from(radius), self.height, self.cells_y);
 
         for step_x in 0..span_x {
             for step_y in 0..span_y {
-                let nx = Self::wrap(cell_x - cell_radius + step_x, self.cells_x);
-                let ny = Self::wrap(cell_y - cell_radius + step_y, self.cells_y);
+                let nx = Self::advance_cell(start_x, step_x, self.cells_x);
+                let ny = Self::advance_cell(start_y, step_y, self.cells_y);
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
-                        if let Some(indices) = b.get(lin) {
-                            if !indices.is_empty() {
-                                visitor(indices);
-                            }
+                        if let Some(indices) = b.get(lin)
+                            && !indices.is_empty()
+                        {
+                            visitor(indices);
                         }
                     }
                     Buckets::Sparse(m) => {
@@ -408,8 +431,11 @@ mod tests {
         index
     }
 
-    fn minimum_image_delta(a: f32, b: f32, extent: f32) -> f32 {
-        let direct = (a - b).abs().rem_euclid(extent);
+    fn minimum_image_delta(a: f32, b: f32, extent: f32) -> f64 {
+        let extent = f64::from(extent);
+        let a = f64::from(a).rem_euclid(extent);
+        let b = f64::from(b).rem_euclid(extent);
+        let direct = (a - b).abs();
         direct.min(extent - direct)
     }
 
@@ -419,7 +445,7 @@ mod tests {
         width: f32,
         height: f32,
         radius_sq: f32,
-    ) -> BTreeMap<usize, f32> {
+    ) -> BTreeMap<usize, f64> {
         let (ax, ay) = positions[agent_idx];
         positions
             .iter()
@@ -431,7 +457,7 @@ mod tests {
                 let dx = minimum_image_delta(ox, ax, width);
                 let dy = minimum_image_delta(oy, ay, height);
                 let distance_sq = dx.mul_add(dx, dy * dy);
-                (distance_sq <= radius_sq).then_some((other_idx, distance_sq))
+                (distance_sq <= f64::from(radius_sq)).then_some((other_idx, distance_sq))
             })
             .collect()
     }
@@ -440,7 +466,7 @@ mod tests {
         index: &UniformGridIndex,
         agent_idx: usize,
         radius_sq: f32,
-    ) -> BTreeMap<usize, f32> {
+    ) -> BTreeMap<usize, f64> {
         let mut delivered = HashSet::new();
         let mut neighbors = BTreeMap::new();
         index.neighbors_within(agent_idx, radius_sq, &mut |other_idx, distance_sq| {
@@ -448,7 +474,7 @@ mod tests {
                 delivered.insert(other_idx),
                 "query delivered agent {other_idx} more than once"
             );
-            neighbors.insert(other_idx, distance_sq.into_inner());
+            neighbors.insert(other_idx, f64::from(distance_sq.into_inner()));
         });
         neighbors
     }
@@ -510,7 +536,7 @@ mod tests {
         width: f32,
         height: f32,
         radius_sq: f32,
-    ) -> BTreeMap<usize, f32> {
+    ) -> BTreeMap<usize, f64> {
         let (ax, ay) = positions[agent_idx];
         candidates
             .iter()
@@ -522,15 +548,15 @@ mod tests {
                 let dx = minimum_image_delta(ox, ax, width);
                 let dy = minimum_image_delta(oy, ay, height);
                 let distance_sq = dx.mul_add(dx, dy * dy);
-                (distance_sq <= radius_sq).then_some((other_idx, distance_sq))
+                (distance_sq <= f64::from(radius_sq)).then_some((other_idx, distance_sq))
             })
             .collect()
     }
 
     fn assert_neighbor_maps_close(
         context: &str,
-        expected: &BTreeMap<usize, f32>,
-        actual: &BTreeMap<usize, f32>,
+        expected: &BTreeMap<usize, f64>,
+        actual: &BTreeMap<usize, f64>,
     ) {
         assert_eq!(
             expected.keys().collect::<Vec<_>>(),
@@ -656,6 +682,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn toroidal_oracle_covers_ragged_seams_and_degenerate_grids() {
+        let ragged_positions = [(29.75, 10.25), (0.25, 10.25), (15.0, 19.75), (15.0, 0.25)];
+        assert_all_query_surfaces_match_oracle(
+            10.0,
+            30.5,
+            20.5,
+            &ragged_positions,
+            &[0.0, 0.25, 1.0, 3.75],
+        );
+
+        let one_cell_positions = [(0.1, 0.1), (3.9, 2.9), (2.0, 1.5)];
+        assert_all_query_surfaces_match_oracle(
+            10.0,
+            4.0,
+            3.0,
+            &one_cell_positions,
+            &[0.0, 0.3, 2.5],
+        );
+    }
+
+    #[test]
+    fn toroidal_oracle_covers_multi_extent_representatives() {
+        let positions = [(0.25, 0.25), (24.25, -15.75), (37.25, 17.25), (11.75, 7.75)];
+        assert_all_query_surfaces_match_oracle(2.0, 12.0, 8.0, &positions, &[0.0, 0.75, 1.5, 5.0]);
+
+        let ragged_positions = [(15.25, 3.0), (76.25, 3.0), (0.25, 3.0)];
+        assert_all_query_surfaces_match_oracle(
+            10.0,
+            30.5,
+            7.25,
+            &ragged_positions,
+            &[0.0, 1.0, 15.0],
+        );
+
+        let large_translation_positions = [(16_777_216.0, 0.5), (1.4, 0.5), (101.4, 0.5)];
+        assert_all_query_surfaces_match_oracle(
+            0.1,
+            100.0,
+            1.0,
+            &large_translation_positions,
+            &[0.0, 14.8],
+        );
     }
 
     #[test]
