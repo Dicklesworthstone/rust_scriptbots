@@ -594,8 +594,7 @@ pub const CUMULATIVE_RESIDUAL_RELATIVE_TOLERANCE: f64 = 1.0e-7;
 pub fn evaluate_conservation(seeds: &[SeedVerdict]) -> ConservationVerdict {
     let mut failures = Vec::new();
     for seed in seeds {
-        if !seed.breaches.is_empty() || seed.truncated_breaches > 0 {
-            let first = seed.breaches.first().expect("nonempty checked");
+        if let Some(first) = seed.breaches.first() {
             failures.push(format!(
                 "seed {}: {} per-tick breaches (+{} truncated); first at tick {} on \
                  {:?} (residual {:.6e}, worst category {:?})",
@@ -606,6 +605,12 @@ pub fn evaluate_conservation(seeds: &[SeedVerdict]) -> ConservationVerdict {
                 first.stock,
                 first.residual,
                 first.worst_category,
+            ));
+        } else if seed.truncated_breaches > 0 {
+            failures.push(format!(
+                "seed {}: 0 retained per-tick breaches (+{} truncated); first breach \
+                 unavailable because the bounded evidence retained no row",
+                seed.seed, seed.truncated_breaches,
             ));
         }
         for (stock_index, stock) in EconomyStock::ALL.into_iter().enumerate() {
@@ -1427,6 +1432,22 @@ mod tests {
         let breach = &verdict.seeds[0].breaches[0];
         assert_eq!(breach.tick, Tick(9));
         assert_eq!(breach.worst_category, Some(ResourceFlowKind::FoodDynamics));
+    }
+
+    #[test]
+    fn gate_fails_without_aborting_when_only_truncated_breaches_are_available() {
+        let mut seed = ConservationGate::new().finish(12);
+        seed.truncated_breaches = 1;
+
+        let verdict = evaluate_conservation(&[seed]);
+
+        assert!(!verdict.pass);
+        assert_eq!(verdict.failures.len(), 1);
+        assert!(
+            verdict.failures[0].contains("1 truncated"),
+            "the unavailable bounded evidence must still fail explicitly: {:?}",
+            verdict.failures
+        );
     }
 
     #[test]
