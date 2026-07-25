@@ -4363,6 +4363,14 @@ impl CuratedThemeId {
     #[must_use]
     pub fn accent_color(self) -> Color {
         match self {
+            // Derived, not chosen. `header_color` above resolves this theme through
+            // `srgb_color(visual::…)` rather than a hex literal, so the accent follows the same
+            // route instead of introducing a second palette in the terminal. Every other theme
+            // pairs a primary header with a contrasting accent, and CyberpunkAurora is the exact
+            // precedent for this hue pair: cyan header, magenta accent. HERBIVORE_RGB and
+            // CARNIVORE_RGB are the contrast pair BIOLUMINESCENT_DARK_FIELD_V1 already defines,
+            // so this reuses core's own opposition rather than inventing a colour for it.
+            Self::BioluminescentDarkField => srgb_color(visual::CARNIVORE_RGB),
             Self::CyberpunkAurora => rgb(0xff007f),
             Self::Darcula => rgb(0xcc7832),
             Self::LumenLight => rgb(0x0284c7),
