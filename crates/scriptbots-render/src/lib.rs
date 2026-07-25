@@ -1,6 +1,10 @@
 //! GPUI rendering layer for ScriptBots.
 
 mod camera;
+/// Headless GPUI HUD capture (bd-abu3). Test-only: it depends on GPUI's
+/// `test-support` feature, which is a dev-dependency and must not reach production.
+#[cfg(test)]
+mod hud_capture;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{

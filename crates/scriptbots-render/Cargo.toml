@@ -18,6 +18,9 @@ naga = { version = "27", features = ["termcolor"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# Supplies current_headless_renderer (Metal offscreen) for the bd-abu3 HUD capture.
+# Dev-only: test-support must never reach a production build.
+gpui_platform = { workspace = true, features = ["test-support"] }
 scriptbots-brain = { path = "../scriptbots-brain" }
 
 [features]
