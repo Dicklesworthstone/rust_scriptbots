@@ -828,7 +828,9 @@ Treat cass as a way to avoid re-solving problems other agents already handled.
 
 This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
-**Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
+**Important:** `br` is non-invasive—it NEVER executes git commands. After
+`br sync --flush-only`, commit the exported paths through the reviewed-snapshot
+protocol below.
 
 ### Essential Commands
 
@@ -867,13 +869,45 @@ br sync --flush-only  # Export to JSONL (NO git operations)
 **Before ending any session, run this checklist:**
 
 ```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads to JSONL
-git add .beads/         # Stage beads changes
-git commit -m "..."     # Commit everything together
-git push                # Push to remote
+git status
+
+# Freeze the exact code snapshot, read EVERY printed hunk, then copy its token.
+AGENT_NAME=<mail-name> scripts/shared_tree_commit.py review \
+  -m "fix(crate): what and why (bd-xxxx)" -- <exact-code-files>
+AGENT_NAME=<mail-name> scripts/shared_tree_commit.py commit --review <token>
+
+# Export and commit tracker state as a separate reviewed snapshot.
+br sync --flush-only
+AGENT_NAME=<mail-name> scripts/shared_tree_commit.py review \
+  -m "chore(beads): close bd-xxxx" -- .beads/issues.jsonl .beads/last-touched
+AGENT_NAME=<mail-name> scripts/shared_tree_commit.py commit --review <token>
+
+git push origin main
+git push origin main:master
 ```
+
+Never stage into the shared index and never use a raw, bare, or pathspec
+`git commit`. A pathspec protects only the shared index; it still re-reads
+whatever half-written bytes happen to be in the working tree. The wrapper
+instead creates a fresh private index from the current `HEAD`, displays the
+complete immutable candidate, binds the approval token to its base/tree/path
+set/message, and finalizes it under a short repository mutex. If `HEAD` moves,
+review again. Existing reservation and close-reason hooks still inspect the
+private candidate index.
+
+The mutex serializes only snapshot creation and commit finalization, not edits
+or builds. The protocol cannot infer authorship of an unexpected hunk already
+present before review: that is why every hunk must actually be read and every
+path must have an exclusive Agent Mail reservation. Install the per-clone
+enforcement plugin with:
+
+```bash
+scripts/shared_tree_commit.py install-hook
+```
+
+The pre-push reservation-range defect for a fast-forward `main:master` mirror
+is tracked separately by `bd-donj`. Never use `AGENT_MAIL_GUARD_MODE=warn` to
+route around it; coordinate a brief reservation-release window.
 
 ### Best Practices
 
@@ -881,7 +915,8 @@ git push                # Push to remote
 - Update status as you work (in_progress -> closed)
 - Create new issues with `br create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
-- Always `br sync --flush-only && git add .beads/` before ending session
+- Always `br sync --flush-only` and commit the exact changed `.beads/` files as
+  their own reviewed snapshot before ending a session
 
 <!-- end-bv-agent-instructions -->
 
