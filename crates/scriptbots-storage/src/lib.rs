@@ -1,3 +1,5 @@
+#![cfg_attr(windows, feature(windows_by_handle))]
+
 //! FrankenSQLite-backed persistence layer for ScriptBots.
 
 use arc_swap::ArcSwap;
