@@ -218,9 +218,20 @@ mod tests {
     /// cannot distinguish chrome from backdrop.
     const HISTORY_PANEL_BG: [u8; 3] = [0x0a, 0x16, 0x29];
 
-    /// Border drawn by every docked panel (`render_overlay`, `render_perf_overlay`).
-    /// Unlike the panel fills, this is not shared with the root container background.
-    const PANEL_BORDER: [u8; 3] = [0x1e, 0x29, 0x3b];
+    /// Border drawn by every docked panel, read from the chrome system itself rather
+    /// than hardcoded.
+    ///
+    /// It WAS hardcoded to 0x1e293b, and bd-f4x0 repointed the panels to a
+    /// substrate-derived colour — so the marker silently stopped describing the thing
+    /// it names. Worse than a plain failure: 0x1e293b is used by 51 other elements, so
+    /// at 1280x720 it still scraped 6 stray hits inside the rail band and the test
+    /// PASSED for the wrong reason, while 1600x900 got zero and failed. Deriving it
+    /// from chrome::border() means a future palette change moves the marker with it.
+    fn panel_border() -> [u8; 3] {
+        let rgba: gpui::Rgba = crate::chrome::border().into();
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        [byte(rgba.r), byte(rgba.g), byte(rgba.b)]
+    }
 
     /// The two viewports the production windows actually open at
     /// (`GuiViewRole::window_options`).
@@ -705,11 +716,11 @@ mod tests {
             // element that paints a raster, so it is the widest contiguous column span
             // whose columns carry many distinct colours. Chrome is flat fill plus text.
             let (centre_lo, centre_hi) = world_canvas_columns(&image);
-            let centre_hits = count_color(&image, PANEL_BORDER, centre_lo, centre_hi);
+            let centre_hits = count_color(&image, panel_border(), centre_lo, centre_hi);
 
             // Right band: the rightmost rail-width strip, where the docked rail lives.
             let rail_band = (HUD_RAIL_WIDTH * HEADLESS_DEVICE_SCALE) as u32;
-            let right_hits = count_color(&image, PANEL_BORDER, w.saturating_sub(rail_band), w);
+            let right_hits = count_color(&image, panel_border(), w.saturating_sub(rail_band), w);
 
             // Named by LOGICAL viewport so the evidence matches the window size a user
             // actually has; the file itself is a 2x HiDPI buffer, as a Retina screenshot
