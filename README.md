@@ -618,6 +618,9 @@ Simulation controls and retained-history playback are separate. The unmodified `
 | Focus first selected agent | `Ctrl + F` |
 | Fit world | `0` |
 | Toggle settings panel | `,` |
+| Toggle stats panel | `1` |
+| Toggle history panel | `2` |
+| Toggle performance panel | `3` |
 
 <!-- END GENERATED GPUI DEFAULT SHORTCUTS -->
 

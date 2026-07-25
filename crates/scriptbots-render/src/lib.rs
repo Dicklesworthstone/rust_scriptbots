@@ -2316,6 +2316,12 @@ struct SimulationView {
     focus_handle: Option<FocusHandle>,
     key_capture: Option<CommandAction>,
     settings_panel: SettingsPanelState,
+    /// User intent for HUD chrome (bd-v9cz). Never written by the resize rule.
+    hud: HudLayout,
+    /// Transient hysteresis latch: true once the window crossed below
+    /// [`HUD_RAIL_COLLAPSE_WIDTH`], cleared only above [`HUD_RAIL_RESTORE_WIDTH`].
+    /// Deliberately not part of [`HudLayout`] — it is window geometry, not intent.
+    hud_rail_forced_closed: bool,
     analytics_cache: Option<HudAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: StorageUiStatus,
@@ -2391,6 +2397,8 @@ impl SimulationView {
             bindings: InputBindings::default(),
             focus_handle: None,
             settings_panel: SettingsPanelState::default(),
+            hud: HudLayout::default(),
+            hud_rail_forced_closed: false,
             key_capture: None,
             analytics_cache: None,
             analytics_revision: None,
@@ -4084,9 +4092,14 @@ impl SimulationView {
         );
     }
 
-    fn render_canvas(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
+    fn render_canvas(
+        &self,
+        snapshot: &HudSnapshot,
+        resolved: ResolvedHudLayout,
+        cx: &mut Context<Self>,
+    ) -> Div {
         if let Some(frame) = snapshot.render_frame.clone() {
-            self.render_canvas_world(snapshot, frame, cx)
+            self.render_canvas_world(snapshot, frame, resolved, cx)
         } else {
             self.render_canvas_placeholder(snapshot)
         }
@@ -4095,6 +4108,7 @@ impl SimulationView {
         &self,
         snapshot: &HudSnapshot,
         frame: RenderFrame,
+        resolved: ResolvedHudLayout,
         cx: &mut Context<Self>,
     ) -> Div {
         let follow_target = self.compute_follow_target(&frame, &snapshot.inspector);
@@ -4216,9 +4230,27 @@ impl SimulationView {
                     cx.notify();
                 }
             }))
-            .child(canvas_element)
-            .child(self.render_overlay(snapshot))
-            .child(self.render_history_chart(snapshot));
+            .child(canvas_element);
+
+        // bd-v9cz layout policy. The world pane and the rail are FLEX SIBLINGS, not a
+        // stack: previously `render_overlay` and `render_history_chart` were absolutely
+        // positioned children of this same element, so they punched opaque rectangles
+        // through the world and — because the mouse handlers live on the parent — a
+        // click on a stats panel also selected whatever agent sat underneath it.
+        // Docking makes overlap structurally impossible rather than a rule to remember.
+        let world_row = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .h_full()
+            .min_h(px(400.0))
+            .gap_3()
+            .child(canvas_stack);
+
+        let canvas_stack = match self.render_hud_rail(snapshot, resolved) {
+            Some(rail) => world_row.child(rail),
+            None => world_row,
+        };
 
         let camera_snapshot = self.camera_snapshot();
         let footer = div()
@@ -4603,6 +4635,20 @@ impl SimulationView {
             CommandAction::FocusFirstSelected => self.focus_first_selected(cx),
             CommandAction::FitWorld => self.fit_world_view(cx),
             CommandAction::ToggleSettings => self.toggle_settings(cx),
+            // bd-v9cz: panels are dismissible. These write user INTENT; the resize
+            // rule never does, so a narrow window cannot silently undo this choice.
+            CommandAction::ToggleStatsPanel => {
+                self.hud.stats_open = !self.hud.stats_open;
+                cx.notify();
+            }
+            CommandAction::ToggleHistoryPanel => {
+                self.hud.history_open = !self.hud.history_open;
+                cx.notify();
+            }
+            CommandAction::TogglePerfPanel => {
+                self.hud.perf_open = !self.hud.perf_open;
+                cx.notify();
+            }
         }
     }
 
@@ -7535,6 +7581,38 @@ impl SimulationView {
                 snapshot.tick, snapshot.agent_count
             )))
     }
+    /// The docked HUD rail (bd-v9cz). Returns `None` when nothing is open or the
+    /// window is too narrow, in which case the world gets the full width.
+    ///
+    /// Panels are children of this rail, so they occupy reserved space and cannot
+    /// overlap the world. Colours are left exactly as they were: bd-f4x0 owns
+    /// typography and palette, and bd-9pqz defines the ramp once for everyone.
+    fn render_hud_rail(&self, snapshot: &HudSnapshot, resolved: ResolvedHudLayout) -> Option<Div> {
+        if !resolved.show_rail {
+            return None;
+        }
+
+        let mut rail = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(HUD_RAIL_WIDTH))
+            .h_full()
+            .gap_3()
+            .overflow_hidden();
+
+        if resolved.stats_open {
+            rail = rail.child(self.render_overlay(snapshot));
+        }
+        if resolved.history_open {
+            rail = rail.child(self.render_history_chart(snapshot));
+        }
+        if resolved.perf_open {
+            rail = rail.child(self.render_perf_overlay(self.last_perf));
+        }
+        Some(rail)
+    }
+
     fn render_overlay(&self, snapshot: &HudSnapshot) -> Div {
         let mut lines: Vec<String> = if let Some(summary) = snapshot.summary.as_ref() {
             vec![
@@ -7774,10 +7852,11 @@ impl SimulationView {
 
         container = container.child(text_column);
 
+        // Docked into the HUD rail (bd-v9cz): no .absolute(), no top/left. It is a
+        // flex sibling of the world, so it occupies reserved space instead of
+        // covering the simulation. Colours unchanged — bd-f4x0/bd-9pqz own those.
         div()
-            .absolute()
-            .top(px(12.0))
-            .left(px(12.0))
+            .flex_none()
             .bg(rgb(0x0b1120))
             .rounded_md()
             .shadow_md()
@@ -7805,10 +7884,9 @@ impl SimulationView {
             lines.push(format!("Samples {}", stats.sample_count));
         }
 
+        // Docked into the HUD rail (bd-v9cz) — see render_overlay.
         div()
-            .absolute()
-            .top(px(12.0))
-            .right(px(12.0))
+            .flex_none()
             .bg(rgb(0x111b2b))
             .border_1()
             .border_color(rgb(0x1e293b))
@@ -7847,10 +7925,9 @@ impl SimulationView {
                     .child(legend_item(rgb(0x22c55e), "Births"))
                     .child(legend_item(rgb(0xef4444), "Deaths"));
 
+                // Docked into the HUD rail (bd-v9cz) — see render_overlay.
                 div()
-                    .absolute()
-                    .bottom(px(12.0))
-                    .right(px(12.0))
+                    .flex_none()
                     .w(px(WIDTH))
                     .bg(rgb(0x0a1629))
                     .border_1()
@@ -7866,9 +7943,7 @@ impl SimulationView {
                     .child(legend)
             }
             None => div()
-                .absolute()
-                .bottom(px(12.0))
-                .right(px(12.0))
+                .flex_none()
                 .bg(rgb(0x0a1629))
                 .border_1()
                 .border_color(rgb(0x13304e))
@@ -10090,6 +10165,22 @@ impl Render for SimulationView {
         self.validate_rail_selection(&snapshot);
         self.maybe_log_rail_first_show(&snapshot);
 
+        // bd-v9cz resize rule. The latch is transient window geometry; `self.hud` holds
+        // user intent and is deliberately NOT written here, so a window dragged briefly
+        // narrow does not destroy the layout the user chose. Separate collapse and
+        // restore thresholds give hysteresis, so dragging an edge cannot strobe the rail.
+        let viewport_width = f32::from(window.bounds().size.width);
+        if self.hud_rail_forced_closed {
+            if viewport_width >= HUD_RAIL_RESTORE_WIDTH {
+                self.hud_rail_forced_closed = false;
+            }
+        } else if viewport_width < HUD_RAIL_COLLAPSE_WIDTH {
+            self.hud_rail_forced_closed = true;
+        }
+        let resolved = self
+            .hud
+            .resolve(viewport_width, self.hud_rail_forced_closed);
+
         let mut content = if self.minimal_canvas_mode {
             // Dedicated window: render only canvas + overlay and skip heavy HUD sections
             div()
@@ -10100,7 +10191,7 @@ impl Render for SimulationView {
                 .bg(rgb(0x0f172a))
                 .text_color(rgb(0xf8fafc))
                 .p_2()
-                .child(self.render_canvas(&snapshot, cx))
+                .child(self.render_canvas(&snapshot, resolved, cx))
         } else {
             div()
                 .size_full()
@@ -10122,7 +10213,7 @@ impl Render for SimulationView {
                         .h_full()
                         .flex_grow(1.0)
                         .child(self.render_history(&snapshot))
-                        .child(self.render_canvas(&snapshot, cx))
+                        .child(self.render_canvas(&snapshot, resolved, cx))
                         .child(self.render_inspector(&snapshot, cx));
                     canvas_row.style().align_items = Some(AlignItems::Stretch);
                     canvas_row
@@ -10145,10 +10236,12 @@ impl Render for SimulationView {
         #[cfg(feature = "audio")]
         self.update_audio(&snapshot);
 
-        // Update perf overlay at a modest cadence to reduce churn
-        if perf_snapshot.sample_count.is_multiple_of(4) {
-            content = content.child(self.render_perf_overlay(perf_snapshot));
-        }
+        // The perf readout is docked in the HUD rail (bd-v9cz), so it is no longer
+        // appended here as a floating overlay. It previously rendered only on frames
+        // where sample_count % 4 == 0; because GPUI rebuilds the element tree every
+        // frame that throttled the panel's EXISTENCE rather than its data, strobing it
+        // at a quarter of frame rate (bd-rzy3). The rail reads self.last_perf, which is
+        // assigned every frame just above, so the panel is stable and the value fresh.
 
         if self.settings_panel.open {
             content = content.child(self.render_settings_panel(cx));
@@ -10942,6 +11035,69 @@ struct InspectorSnapshot {
     persistence_cached_interval: u32,
 }
 
+/// Minimum world viewport, in logical pixels. The world has absolute layout
+/// priority: chrome collapses to make room, never the other way round.
+const WORLD_MIN_WIDTH: f32 = 640.0;
+
+/// Docked rail width.
+const HUD_RAIL_WIDTH: f32 = 320.0;
+
+/// Below this the rail is force-collapsed; above [`HUD_RAIL_RESTORE_WIDTH`] it comes
+/// back. The gap between them is hysteresis — with a single threshold, dragging a
+/// window edge across it makes the whole rail strobe.
+const HUD_RAIL_COLLAPSE_WIDTH: f32 = WORLD_MIN_WIDTH + HUD_RAIL_WIDTH;
+const HUD_RAIL_RESTORE_WIDTH: f32 = HUD_RAIL_COLLAPSE_WIDTH + 80.0;
+
+/// Where HUD chrome is permitted to exist (bd-v9cz layout policy).
+///
+/// These fields are USER INTENT. They are read to decide what to draw, but the
+/// resize rule must never write to them: a window briefly dragged narrow would
+/// otherwise silently destroy the layout the user chose. Forced collapse is
+/// derived per-frame in [`HudLayout::resolve`] and thrown away.
+#[derive(Clone, Copy)]
+struct HudLayout {
+    stats_open: bool,
+    history_open: bool,
+    perf_open: bool,
+}
+
+impl Default for HudLayout {
+    fn default() -> Self {
+        // First run, no saved config: stats and history docked and visible, perf
+        // collapsed because it is a diagnostic rather than a first-run readout.
+        Self {
+            stats_open: true,
+            history_open: true,
+            perf_open: false,
+        }
+    }
+}
+
+/// What the current window size actually permits, given the user's intent.
+#[derive(Clone, Copy)]
+struct ResolvedHudLayout {
+    show_rail: bool,
+    stats_open: bool,
+    history_open: bool,
+    perf_open: bool,
+}
+
+impl HudLayout {
+    /// Fold intent together with the available width. Panels drop in a fixed
+    /// order — perf, then history, then the whole rail — so a given window size
+    /// always yields the same layout.
+    fn resolve(self, available_width: f32, rail_forced_closed: bool) -> ResolvedHudLayout {
+        let room_for_rail = !rail_forced_closed && available_width >= HUD_RAIL_COLLAPSE_WIDTH;
+        let any_panel_open = self.stats_open || self.history_open || self.perf_open;
+        ResolvedHudLayout {
+            show_rail: room_for_rail && any_panel_open,
+            stats_open: self.stats_open,
+            history_open: self.history_open,
+            perf_open: self.perf_open,
+        }
+    }
+}
+
 /// Settings panel state for configuration management
 #[derive(Clone)]
 struct SettingsPanelState {
@@ -11419,6 +11575,9 @@ enum CommandAction {
     FocusFirstSelected,
     FitWorld,
     ToggleSettings,
+    ToggleStatsPanel,
+    ToggleHistoryPanel,
+    TogglePerfPanel,
 }
 
 impl CommandAction {
@@ -11448,6 +11607,9 @@ impl CommandAction {
             CommandAction::FocusFirstSelected => "Focus first selected agent",
             CommandAction::FitWorld => "Fit world",
             CommandAction::ToggleSettings => "Toggle settings panel",
+            CommandAction::ToggleStatsPanel => "Toggle stats panel",
+            CommandAction::ToggleHistoryPanel => "Toggle history panel",
+            CommandAction::TogglePerfPanel => "Toggle performance panel",
         }
     }
 }
@@ -11555,6 +11717,20 @@ impl Default for InputBindings {
         map.insert(
             CommandAction::ToggleSettings,
             Keystroke::parse(",").unwrap_or_default(),
+        );
+        // bd-v9cz panel dismissal. Digits 1/2/3 were unbound; grouping them keeps the
+        // rail's three panels adjacent and memorable.
+        map.insert(
+            CommandAction::ToggleStatsPanel,
+            Keystroke::parse("1").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleHistoryPanel,
+            Keystroke::parse("2").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::TogglePerfPanel,
+            Keystroke::parse("3").unwrap_or_default(),
         );
         Self { map }
     }
