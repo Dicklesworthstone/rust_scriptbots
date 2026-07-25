@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use bytemuck::{Pod, Zeroable};
-use scriptbots_core::{NUM_EYES, RenderTonemapMode};
-use std::sync::atomic::{AtomicBool, Ordering};
+use scriptbots_core::{NUM_EYES, RenderTonemapMode, visual};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "perf_counters")]
 use std::time::Instant;
 
@@ -37,6 +37,10 @@ pub struct TerrainView<'a> {
     pub dims: (u32, u32),
     pub cell_size: u32,
     pub tiles: &'a [u32], // index into a tileset palette/atlas (kept simple for MVP)
+    /// Final natural/accessibility-mapped sRGB terrain colors from the core
+    /// visual authority. The GPU backend rasterizes these values; it must not
+    /// invent a second biome palette or shading model.
+    pub colors: &'a [[f32; 4]],
     pub elevation: Option<&'a [f32]>, // optional elevation field for slope accents
 }
 
@@ -74,6 +78,8 @@ pub struct AgentInstance {
 }
 
 pub struct WorldRenderer {
+    renderer_id: u64,
+    frame_generation: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
     size: (u32, u32),
@@ -102,7 +108,11 @@ pub struct WorldRenderer {
 
 pub struct RenderFrame {
     pub extent: (u32, u32),
+    renderer_id: u64,
+    generation: u64,
 }
+
+static NEXT_RENDERER_ID: AtomicU64 = AtomicU64::new(1);
 
 impl WorldRenderer {
     pub async fn new(adapter: &wgpu::Adapter, size: (u32, u32)) -> Result<Self, ReadbackError> {
@@ -128,8 +138,15 @@ impl WorldRenderer {
         let mut terrain = TerrainPipeline::new(&device, format, &view);
         terrain.init_atlas(&device, &queue);
         let agents = AgentPipeline::new(&device, format, &view);
+        let renderer_id = NEXT_RENDERER_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| ReadbackError::Device("renderer identity space exhausted".to_owned()))?;
 
         Ok(Self {
+            renderer_id,
+            frame_generation: 0,
             device,
             queue,
             size,
@@ -178,6 +195,10 @@ impl WorldRenderer {
         if let Some(post) = self.post.as_mut() {
             post.resize(&self.device, self.format, new_size);
         }
+        self.frame_generation = self
+            .frame_generation
+            .checked_add(1)
+            .ok_or_else(|| ReadbackError::Device("render generation overflow".to_owned()))?;
         Ok(())
     }
 
@@ -186,7 +207,18 @@ impl WorldRenderer {
         self.cam_offset = offset;
     }
 
-    pub fn render(&mut self, snapshot: &WorldSnapshot) -> RenderFrame {
+    pub fn render(&mut self, snapshot: &WorldSnapshot) -> Result<RenderFrame, ReadbackError> {
+        validate_snapshot(snapshot)?;
+        if !self.cam_scale.is_finite()
+            || self.cam_scale <= 0.0
+            || !self.cam_offset.0.is_finite()
+            || !self.cam_offset.1.is_finite()
+        {
+            return Err(ReadbackError::MetadataMismatch {
+                expected: "finite positive camera scale and finite offset".to_owned(),
+                actual: format!("scale={} offset={:?}", self.cam_scale, self.cam_offset),
+            });
+        }
         #[cfg(feature = "perf_counters")]
         let t0 = Instant::now();
         let mut encoder = self
@@ -263,17 +295,22 @@ impl WorldRenderer {
             agents = vis_agents,
             "wgpu visible instances"
         );
+        // Freeze presentation controls once for this frame. Reading the
+        // environment independently in `ensure_post` and `PostFx::run` made
+        // one frozen snapshot depend on wall-clock cache refreshes.
+        let post_controls = PostControls::from_env()?;
+        let selected_tonemap = snapshot.tonemap_mode.map(|mode| match mode {
+            RenderTonemapMode::Aces | RenderTonemapMode::Tony => 1_u32,
+            RenderTonemapMode::Agx => 3_u32,
+        });
+
         // Post‑FX (ACES + vignette; FXAA stub): color_view → post.target
         self.post_ran = false;
-        if self.ensure_post()
+        if self.ensure_post(&post_controls, selected_tonemap)
             && let Some(p) = self.post.as_mut()
         {
             // The selected RenderSettings tonemap control wins over the environment
             // default so the chosen curve is actually consumed (bd-2z0.7.11).
-            let selected_tonemap = snapshot.tonemap_mode.map(|mode| match mode {
-                RenderTonemapMode::Aces | RenderTonemapMode::Tony => 1_u32,
-                RenderTonemapMode::Agx => 3_u32,
-            });
             p.run(
                 &self.device,
                 &self.queue,
@@ -281,6 +318,7 @@ impl WorldRenderer {
                 &self.color_view,
                 self.size,
                 selected_tonemap,
+                &post_controls,
             );
             self.post_ran = true;
         }
@@ -289,10 +327,19 @@ impl WorldRenderer {
         {
             self.last_render_ms = t0.elapsed().as_secs_f32() * 1000.0;
         }
-        RenderFrame { extent: self.size }
+        self.frame_generation = self
+            .frame_generation
+            .checked_add(1)
+            .ok_or_else(|| ReadbackError::Device("render generation overflow".to_owned()))?;
+        Ok(RenderFrame {
+            extent: self.size,
+            renderer_id: self.renderer_id,
+            generation: self.frame_generation,
+        })
     }
 
-    pub fn copy_to_readback(&mut self, _frame: &RenderFrame) -> Result<(), ReadbackError> {
+    pub fn copy_to_readback(&mut self, frame: &RenderFrame) -> Result<(), ReadbackError> {
+        validate_frame_token(frame, self.size, self.renderer_id, self.frame_generation)?;
         #[cfg(feature = "perf_counters")]
         let t0 = Instant::now();
         let src_tex: &wgpu::Texture = match self.post.as_ref() {
@@ -318,9 +365,8 @@ impl WorldRenderer {
         (self.last_render_ms, self.last_readback_ms)
     }
 
-    fn ensure_post(&mut self) -> bool {
-        let enable = wants_post();
-        if !enable {
+    fn ensure_post(&mut self, controls: &PostControls, selected_tonemap: Option<u32>) -> bool {
+        if !controls.wants_post(selected_tonemap) {
             return false;
         }
         if self.post.is_none() {
@@ -333,6 +379,89 @@ impl WorldRenderer {
         }
         true
     }
+}
+
+fn validate_frame_token(
+    frame: &RenderFrame,
+    renderer_extent: (u32, u32),
+    renderer_id: u64,
+    generation: u64,
+) -> Result<(), ReadbackError> {
+    if frame.extent != renderer_extent {
+        return Err(ReadbackError::MetadataMismatch {
+            expected: format!("{}x{} render extent", renderer_extent.0, renderer_extent.1),
+            actual: format!("{}x{} render extent", frame.extent.0, frame.extent.1),
+        });
+    }
+    if frame.renderer_id != renderer_id || frame.generation != generation {
+        return Err(ReadbackError::MetadataMismatch {
+            expected: format!("renderer {renderer_id} generation {generation}"),
+            actual: format!(
+                "renderer {} generation {}",
+                frame.renderer_id, frame.generation
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_snapshot(snapshot: &WorldSnapshot<'_>) -> Result<(), ReadbackError> {
+    let (width, height) = snapshot.terrain.dims;
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| ReadbackError::MetadataMismatch {
+            expected: "terrain dimensions with a representable cell count".to_owned(),
+            actual: format!("{width}x{height}"),
+        })?;
+    if snapshot.terrain.tiles.len() != expected {
+        return Err(ReadbackError::MetadataMismatch {
+            expected: format!("{expected} terrain kind values"),
+            actual: format!("{} terrain kind values", snapshot.terrain.tiles.len()),
+        });
+    }
+    if snapshot.terrain.colors.len() != expected {
+        return Err(ReadbackError::MetadataMismatch {
+            expected: format!("{expected} authoritative terrain colors"),
+            actual: format!("{} terrain colors", snapshot.terrain.colors.len()),
+        });
+    }
+    if let Some(elevation) = snapshot.terrain.elevation
+        && elevation.len() != expected
+    {
+        return Err(ReadbackError::MetadataMismatch {
+            expected: format!("{expected} terrain elevations"),
+            actual: format!("{} terrain elevations", elevation.len()),
+        });
+    }
+    if !snapshot.world_size.0.is_finite()
+        || !snapshot.world_size.1.is_finite()
+        || snapshot.world_size.0 <= 0.0
+        || snapshot.world_size.1 <= 0.0
+    {
+        return Err(ReadbackError::MetadataMismatch {
+            expected: "finite positive world dimensions".to_owned(),
+            actual: format!("{:?}", snapshot.world_size),
+        });
+    }
+    if !snapshot.anim_seconds.is_finite() {
+        return Err(ReadbackError::MetadataMismatch {
+            expected: "finite tick-derived animation time".to_owned(),
+            actual: snapshot.anim_seconds.to_string(),
+        });
+    }
+    if let Some((index, color)) = snapshot
+        .terrain
+        .colors
+        .iter()
+        .enumerate()
+        .find(|(_, color)| color.iter().any(|channel| !channel.is_finite()))
+    {
+        return Err(ReadbackError::MetadataMismatch {
+            expected: "finite authoritative terrain colors".to_owned(),
+            actual: format!("non-finite color at terrain cell {index}: {color:?}"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -355,19 +484,21 @@ mod capture_smoke_test {
             pollster::block_on(WorldRenderer::new(&adapter, size)).expect("renderer");
         let dims = (120u32, 60u32);
         let tiles = vec![3u32; (dims.0 * dims.1) as usize];
+        let colors = vec![[0.15, 0.45, 0.2, 1.0]; tiles.len()];
         let snapshot = WorldSnapshot {
             world_size: (6000.0, 3000.0),
             terrain: TerrainView {
                 dims,
                 cell_size: 50,
                 tiles: &tiles,
+                colors: &colors,
                 elevation: None,
             },
             agents: &[],
             anim_seconds: 0.0,
             tonemap_mode: None,
         };
-        let frame = renderer.render(&snapshot);
+        let frame = renderer.render(&snapshot).expect("valid render snapshot");
         renderer
             .copy_to_readback(&frame)
             .expect("real wgpu offscreen framebuffer copy");
@@ -384,6 +515,24 @@ mod capture_smoke_test {
         assert!(
             bytes.iter().any(|byte| *byte != 0),
             "real wgpu framebuffer readback must contain rendered color data"
+        );
+        let first = bytes.to_vec();
+        drop(view);
+
+        let second_frame = renderer
+            .render(&snapshot)
+            .expect("same valid snapshot must render twice");
+        renderer
+            .copy_to_readback(&second_frame)
+            .expect("second framebuffer copy");
+        let second = renderer
+            .mapped_rgba()
+            .expect("second framebuffer readback")
+            .bytes()
+            .to_vec();
+        assert_eq!(
+            first, second,
+            "same snapshot, controls, adapter, and tick-derived animation time must be byte-identical"
         );
     }
 }
@@ -426,7 +575,7 @@ pub struct ReadbackRing {
 
 /// Typed failures for the adapter/device/readback/capture surface (bd-2z0.7.11).
 /// No failure on this surface may be reported as an empty vector or a silent success.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadbackError {
     /// No adapter satisfied the request.
     AdapterUnavailable,
@@ -446,6 +595,10 @@ pub enum ReadbackError {
     MetadataMismatch { expected: String, actual: String },
     /// Zero-sized render or capture extent was rejected instead of clamped.
     ZeroDimensions { width: u32, height: u32 },
+    /// Invalid renderer control or environment configuration.
+    Configuration(String),
+    /// Explicit capture artifact could not be encoded or persisted.
+    Artifact(String),
 }
 
 impl std::fmt::Display for ReadbackError {
@@ -470,6 +623,8 @@ impl std::fmt::Display for ReadbackError {
                     "zero-sized render/capture extent {width}x{height} is rejected"
                 )
             }
+            Self::Configuration(detail) => write!(f, "GPU renderer configuration error: {detail}"),
+            Self::Artifact(detail) => write!(f, "GPU capture artifact failure: {detail}"),
         }
     }
 }
@@ -637,23 +792,26 @@ impl ReadbackRing {
 /// Parse the `SB_WGPU_FXAA` toggle truthfully: FXAA is not implemented in the post
 /// pipeline, so any nonzero request logs a one-time warning and resolves to disabled
 /// rather than silently claiming the feature (bd-2z0.7.11).
-fn parse_fxaa_env(previous: u32) -> u32 {
+fn parse_fxaa_env(previous: u32) -> Result<u32, ReadbackError> {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    match std::env::var("SB_WGPU_FXAA")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-    {
-        Some(0) => 0,
-        Some(_) => {
+    match std::env::var("SB_WGPU_FXAA") {
+        Err(std::env::VarError::NotPresent) => Ok(previous),
+        Err(error) => Err(ReadbackError::Configuration(format!(
+            "SB_WGPU_FXAA is not valid Unicode: {error}"
+        ))),
+        Ok(value) if parse_toggle_value(&value) == Some(false) => Ok(0),
+        Ok(value) if parse_toggle_value(&value) == Some(true) => {
             if !WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     "SB_WGPU_FXAA requests FXAA, but FXAA is not implemented in the post \
                      pipeline; the request is ignored"
                 );
             }
-            0
+            Ok(0)
         }
-        None => previous,
+        Ok(value) => Err(ReadbackError::Configuration(format!(
+            "SB_WGPU_FXAA={value:?}; expected a boolean toggle"
+        ))),
     }
 }
 
@@ -665,7 +823,12 @@ fn align_256(n: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::align_256;
+    use super::{
+        PostControls, RenderFrame, TerrainView, WorldSnapshot, align_256, parse_control_f32,
+        parse_toggle, resolve_bloom_intensity, terrain_atlas_palette, validate_frame_token,
+        validate_snapshot,
+    };
+    use scriptbots_core::visual;
 
     #[test]
     fn stride_alignment_is_multiple_of_256() {
@@ -700,6 +863,148 @@ mod tests {
             assert!((0.0..=1.0).contains(&base[1]));
             assert!((0.0..=1.0).contains(&base[2]));
         }
+    }
+
+    #[test]
+    fn terrain_atlas_palette_matches_the_core_visual_authority() {
+        let actual = terrain_atlas_palette();
+        let expected = visual::TERRAIN_BASE_COLORS.map(|rgb| {
+            [
+                (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                u8::MAX,
+            ]
+        });
+        assert_eq!(
+            actual, expected,
+            "world-gfx must not own a competing terrain palette"
+        );
+    }
+
+    #[test]
+    fn disabled_bloom_has_exactly_zero_composite_intensity() {
+        assert_eq!(
+            resolve_bloom_intensity(false, 0.65).to_bits(),
+            0.0_f32.to_bits(),
+            "disabling bloom must remove its additive contribution, not bind the source texture \
+             at the configured intensity"
+        );
+    }
+
+    #[test]
+    fn bloom_toggle_accepts_documented_boolean_spellings() {
+        for value in ["0", "off", "false", "no", "OFF", "False"] {
+            assert!(
+                !parse_toggle(Some(value), true),
+                "{value} must disable bloom"
+            );
+        }
+        for value in ["1", "on", "true", "yes", "ON", "True"] {
+            assert!(
+                parse_toggle(Some(value), false),
+                "{value} must enable bloom"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_or_out_of_range_post_controls_fail_closed() {
+        for value in ["NaN", "inf", "-0.01", "1.01", "not-a-number"] {
+            assert!(
+                parse_control_f32(
+                    "SB_WGPU_VIGNETTE",
+                    value,
+                    |parsed| (0.0..=1.0).contains(&parsed),
+                    "a finite number in 0..=1",
+                )
+                .is_err(),
+                "{value:?} must not reach WGSL as a vignette control"
+            );
+        }
+    }
+
+    #[test]
+    fn post_decision_is_a_pure_function_of_the_frozen_controls() {
+        let controls = PostControls {
+            vignette: 0.0,
+            tonemap: 0,
+            bloom_enabled: false,
+            fog_enabled: false,
+            fxaa: 0,
+            ..PostControls::default()
+        };
+        assert!(!controls.wants_post(None));
+        assert!(!controls.wants_post(None));
+        assert!(
+            controls.wants_post(Some(1)),
+            "a snapshot-selected tonemap must not be skipped because environment defaults are off"
+        );
+    }
+
+    #[test]
+    fn readback_rejects_a_frame_from_a_different_extent() {
+        let error = validate_frame_token(
+            &RenderFrame {
+                extent: (64, 32),
+                renderer_id: 7,
+                generation: 11,
+            },
+            (128, 64),
+            7,
+            11,
+        )
+        .expect_err("cross-extent readback must be rejected");
+        assert!(
+            matches!(error, super::ReadbackError::MetadataMismatch { .. }),
+            "unexpected readback error: {error}"
+        );
+    }
+
+    #[test]
+    fn readback_rejects_a_same_extent_stale_or_foreign_frame() {
+        let stale = RenderFrame {
+            extent: (128, 64),
+            renderer_id: 7,
+            generation: 10,
+        };
+        assert!(matches!(
+            validate_frame_token(&stale, (128, 64), 7, 11),
+            Err(super::ReadbackError::MetadataMismatch { .. })
+        ));
+
+        let foreign = RenderFrame {
+            extent: (128, 64),
+            renderer_id: 8,
+            generation: 11,
+        };
+        assert!(matches!(
+            validate_frame_token(&foreign, (128, 64), 7, 11),
+            Err(super::ReadbackError::MetadataMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_metadata_mismatch_is_typed_before_gpu_submission() {
+        let tiles = [3_u32];
+        let missing_colors: [[f32; 4]; 0] = [];
+        let snapshot = WorldSnapshot {
+            world_size: (10.0, 10.0),
+            terrain: TerrainView {
+                dims: (1, 1),
+                cell_size: 10,
+                tiles: &tiles,
+                colors: &missing_colors,
+                elevation: None,
+            },
+            agents: &[],
+            anim_seconds: 0.0,
+            tonemap_mode: None,
+        };
+        assert!(matches!(
+            validate_snapshot(&snapshot),
+            Err(super::ReadbackError::MetadataMismatch { .. })
+        ));
     }
 }
 
@@ -792,9 +1097,20 @@ struct TerrainPipeline {
 struct TileInstance {
     pos: [f32; 2],
     size: [f32; 2],
-    atlas_uv: [f32; 4],
+    color: [f32; 4],
     kind: u32,
     slope: f32,
+}
+
+fn terrain_atlas_palette() -> [[u8; 4]; 6] {
+    visual::TERRAIN_BASE_COLORS.map(|rgb| {
+        [
+            (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            u8::MAX,
+        ]
+    })
 }
 
 impl TerrainPipeline {
@@ -932,14 +1248,7 @@ impl TerrainPipeline {
             .create_view(&wgpu::TextureViewDescriptor::default());
         // fill tiles with curated colors
         let mut pixels = vec![0u8; (self.atlas_w * self.atlas_h * 4) as usize];
-        let colors: [[u8; 4]; 6] = [
-            [18, 98, 189, 255],   // DeepWater
-            [38, 140, 220, 255],  // ShallowWater
-            [219, 180, 117, 255], // Sand
-            [90, 140, 64, 255],   // Grass
-            [159, 201, 84, 255],  // Bloom
-            [125, 125, 125, 255], // Rock
-        ];
+        let colors = terrain_atlas_palette();
         for row in 0..self.grid_rows {
             for col in 0..self.grid_cols {
                 let idx = (row * self.grid_cols + col) as usize;
@@ -994,23 +1303,6 @@ impl TerrainPipeline {
                 },
             ],
         });
-    }
-
-    fn atlas_uv_for(&self, tile_index: u32) -> [f32; 4] {
-        // Map palette indices 0..5 to our 3x2 grid
-        let idx = (tile_index as usize).min(5);
-        let col = (idx % (self.grid_cols as usize)) as u32;
-        let row = (idx / (self.grid_cols as usize)) as u32;
-        // Inset the tile rect by half a texel so LINEAR filtering never samples a
-        // neighboring tile at quad edges (atlas edge bleed, bd-2z0.7.11). With the
-        // 1x1 placeholder atlas the rect degenerates to the single texel centre.
-        let inset_u = 0.5 / self.atlas_w as f32;
-        let inset_v = 0.5 / self.atlas_h as f32;
-        let u0 = ((col as f32 * self.tile_w as f32) / self.atlas_w as f32 + inset_u).min(1.0);
-        let v0 = ((row as f32 * self.tile_h as f32) / self.atlas_h as f32 + inset_v).min(1.0);
-        let u1 = (((col + 1) as f32 * self.tile_w as f32) / self.atlas_w as f32 - inset_u).max(u0);
-        let v1 = (((row + 1) as f32 * self.tile_h as f32) / self.atlas_h as f32 - inset_v).max(v0);
-        [u0, v0, u1, v1]
     }
 
     fn ensure_vbuf_capacity(&mut self, device: &wgpu::Device, needed_bytes: u64) {
@@ -1076,7 +1368,6 @@ impl TerrainPipeline {
                 }
                 let idx = (y as usize) * (tw as usize) + (x as usize);
                 let tile_id = snapshot.terrain.tiles.get(idx).copied().unwrap_or(3);
-                let uv = self.atlas_uv_for(tile_id);
                 // slope via central differences if elevation present
                 let slope = if elev_opt.is_some() {
                     let dx = (get_elev(x + 1, y) - get_elev(x - 1, y)) * 0.5;
@@ -1088,7 +1379,7 @@ impl TerrainPipeline {
                 staging.push(TileInstance {
                     pos: [px, py],
                     size: [cell, cell],
-                    atlas_uv: uv,
+                    color: snapshot.terrain.colors[idx],
                     kind: tile_id,
                     slope,
                 });
@@ -1128,17 +1419,14 @@ const TERRAIN_WGSL: &str = r#"
 struct VsIn {
   @location(0) pos: vec2<f32>,
   @location(1) size: vec2<f32>,
-  @location(2) uv: vec4<f32>,
+  @location(2) color: vec4<f32>,
   @location(3) kind: u32,
   @location(4) slope: f32,
 };
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
-  @location(0) uv: vec2<f32>,
-  @location(1) kind: u32,
-  @location(2) slope: f32,
-  @location(3) world: vec2<f32>,
+  @location(0) color: vec4<f32>,
 };
 
 struct View { v0: vec4<f32>, v1: vec4<f32> }; // v0=(viewport.x,viewport.y,time,scale) v1=(offset_x,offset_y,_,_)
@@ -1156,10 +1444,7 @@ fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
   let pos = (inst.pos + p * inst.size) * scale + offset;
   let ndc = vec2<f32>(pos.x / viewport.x * 2.0 - 1.0, 1.0 - (pos.y / viewport.y * 2.0));
   o.pos = vec4<f32>(ndc, 0.0, 1.0);
-  o.uv = mix(inst.uv.xy, inst.uv.zw, p);
-  o.kind = inst.kind;
-  o.slope = inst.slope;
-  o.world = inst.pos;
+  o.color = inst.color;
   return o;
 }
 
@@ -1168,31 +1453,10 @@ fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
-  var base = textureSample(atlas_tex, atlas_smp, v.uv);
-  var rgb = base.rgb;
-  // water shimmer for Deep/Shallow water kinds (0,1)
-  if (v.kind <= 1u) {
-    let time = view.v0.z;
-    let wave = sin((v.uv.x * 40.0 + v.uv.y * 28.0) + time * 2.2);
-    let shimmer = 0.04 + 0.06 * wave;
-    // tuned caustics: stronger on shallow (kind==1), very subtle on deep (kind==0)
-    let ca_s = (sin(v.uv.x * 160.0 + time * 1.7) * sin(v.uv.y * 140.0 + time * 1.5));
-    let ca_amp = select(0.01, 0.05, v.kind == 1u);
-    let ca = ca_s * ca_amp;
-    rgb = clamp(rgb + vec3<f32>(shimmer + ca), vec3<f32>(0.0), vec3<f32>(1.0));
-  } else {
-    // slope accents (darken proportionally)
-    let darken = clamp(1.0 - v.slope * 0.35, 0.0, 1.0);
-    rgb = rgb * vec3<f32>(darken);
-  }
-  // subtle biome variation for grass/bloom/rock (kinds 3,4,5)
-  if (v.kind >= 3u && v.kind <= 5u) {
-    // stable hash from world coords -> [-1,1] noise
-    let h = fract(sin(dot(v.world, vec2<f32>(12.9898, 78.233))) * 43758.5453);
-    let n = (h * 2.0 - 1.0) * 0.06; // +/-6% brightness tweak
-    rgb = clamp(rgb * (1.0 + n), vec3<f32>(0.0), vec3<f32>(1.0));
-  }
-  return vec4<f32>(rgb, base.a);
+  // Final terrain color is projected by scriptbots-core::visual on the CPU.
+  // This shader owns rasterization only; it must not invent a competing
+  // biome palette, shimmer, slope curve, or hash-noise model.
+  return v.color;
 }
 "#;
 
@@ -1692,19 +1956,6 @@ struct PostFx {
     bloom_a_view: Option<wgpu::TextureView>,
     bloom_b: Option<wgpu::Texture>,
     bloom_b_view: Option<wgpu::TextureView>,
-
-    // Cached env-driven parameters to avoid per-frame parsing
-    last_env_update: Option<std::time::Instant>,
-    env_exposure: f32,
-    env_vignette: f32,
-    env_tonemap: u32,
-    env_fxaa: u32,
-    env_bloom_on: u32,
-    env_bloom_thresh: f32,
-    env_bloom_intensity: f32,
-    env_fog_enabled: u32,
-    env_fog_density: f32,
-    env_fog_color: [f32; 3],
 }
 
 #[repr(C)]
@@ -1720,6 +1971,228 @@ struct PostParams {
     fog_enabled: u32,
     fog_color: [f32; 3],
     _pad0: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PostControls {
+    exposure: f32,
+    vignette: f32,
+    tonemap: u32,
+    fxaa: u32,
+    bloom_enabled: bool,
+    bloom_thresh: f32,
+    bloom_intensity: f32,
+    fog_enabled: bool,
+    fog_density: f32,
+    fog_color: [f32; 3],
+}
+
+impl Default for PostControls {
+    fn default() -> Self {
+        Self {
+            exposure: 1.0,
+            vignette: 0.08,
+            tonemap: 1,
+            fxaa: 0,
+            bloom_enabled: true,
+            bloom_thresh: 0.8,
+            bloom_intensity: 0.65,
+            fog_enabled: false,
+            fog_density: 0.6,
+            fog_color: [0.6, 0.7, 0.8],
+        }
+    }
+}
+
+impl PostControls {
+    fn from_env() -> Result<Self, ReadbackError> {
+        let mut controls = Self::default();
+        controls.exposure = env_control_f32(
+            "SB_WGPU_EXPOSURE",
+            controls.exposure,
+            |value| value >= 0.0,
+            "a finite non-negative number",
+        )?;
+        controls.vignette = env_control_f32(
+            "SB_WGPU_VIGNETTE",
+            controls.vignette,
+            |value| (0.0..=1.0).contains(&value),
+            "a finite number in 0..=1",
+        )?;
+        controls.tonemap = match std::env::var("SB_WGPU_TONEMAP") {
+            Err(std::env::VarError::NotPresent) => controls.tonemap,
+            Err(error) => {
+                return Err(ReadbackError::Configuration(format!(
+                    "SB_WGPU_TONEMAP is not valid Unicode: {error}"
+                )));
+            }
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "off" | "none" | "0" | "" => 0,
+                "aces" | "filmic" => 1,
+                "reinhard" => 2,
+                "agx" => 3,
+                _ => {
+                    return Err(ReadbackError::Configuration(format!(
+                        "SB_WGPU_TONEMAP={value:?}; expected off, aces, reinhard, or agx"
+                    )));
+                }
+            },
+        };
+        controls.fxaa = parse_fxaa_env(controls.fxaa)?;
+        controls.bloom_enabled = match std::env::var("SB_WGPU_BLOOM") {
+            Err(std::env::VarError::NotPresent) => controls.bloom_enabled,
+            Err(error) => {
+                return Err(ReadbackError::Configuration(format!(
+                    "SB_WGPU_BLOOM is not valid Unicode: {error}"
+                )));
+            }
+            Ok(value) => parse_toggle_value(&value).ok_or_else(|| {
+                ReadbackError::Configuration(format!(
+                    "SB_WGPU_BLOOM={value:?}; expected a boolean toggle"
+                ))
+            })?,
+        };
+        controls.bloom_thresh = env_control_f32(
+            "SB_WGPU_BLOOM_THRESH",
+            controls.bloom_thresh,
+            |value| value >= 0.0,
+            "a finite non-negative number",
+        )?;
+        controls.bloom_intensity = env_control_f32(
+            "SB_WGPU_BLOOM_INTENSITY",
+            controls.bloom_intensity,
+            |value| value >= 0.0,
+            "a finite non-negative number",
+        )?;
+
+        let fog_mode = match std::env::var("SB_WGPU_FOG") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => "off".to_owned(),
+            Err(error) => {
+                return Err(ReadbackError::Configuration(format!(
+                    "SB_WGPU_FOG is not valid Unicode: {error}"
+                )));
+            }
+        };
+        let fog_mode = fog_mode.trim().to_ascii_lowercase();
+        controls.fog_enabled = matches!(fog_mode.as_str(), "low" | "med" | "high");
+        controls.fog_density = match fog_mode.as_str() {
+            "low" => 0.6,
+            "med" => 1.0,
+            "high" => 1.6,
+            "off" | "none" | "0" | "" => controls.fog_density,
+            _ => {
+                return Err(ReadbackError::Configuration(format!(
+                    "SB_WGPU_FOG={fog_mode:?}; expected off, low, med, or high"
+                )));
+            }
+        };
+        match std::env::var("SB_WGPU_FOG_COLOR") {
+            Ok(value) => {
+                let color = parse_rgb(&value).ok_or_else(|| {
+                    ReadbackError::Configuration(format!(
+                        "SB_WGPU_FOG_COLOR={value:?}; expected three finite 0..=1 channels"
+                    ))
+                })?;
+                if color
+                    .iter()
+                    .any(|channel| !channel.is_finite() || !(0.0..=1.0).contains(channel))
+                {
+                    return Err(ReadbackError::Configuration(format!(
+                        "SB_WGPU_FOG_COLOR={value:?}; expected three finite 0..=1 channels"
+                    )));
+                }
+                controls.fog_color = color;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => {
+                return Err(ReadbackError::Configuration(format!(
+                    "SB_WGPU_FOG_COLOR is not valid Unicode: {error}"
+                )));
+            }
+        }
+        Ok(controls)
+    }
+
+    fn wants_post(self, selected_tonemap: Option<u32>) -> bool {
+        self.exposure != 1.0
+            || self.vignette != 0.0
+            || self.fxaa != 0
+            || selected_tonemap.unwrap_or(self.tonemap) != 0
+            || self.bloom_enabled
+            || self.fog_enabled
+    }
+}
+
+fn parse_control_f32(
+    name: &str,
+    raw: &str,
+    valid: impl FnOnce(f32) -> bool,
+    expected: &str,
+) -> Result<f32, ReadbackError> {
+    let value = raw.parse::<f32>().map_err(|_| {
+        ReadbackError::Configuration(format!("{name}={raw:?}; expected {expected}"))
+    })?;
+    if !value.is_finite() || !valid(value) {
+        return Err(ReadbackError::Configuration(format!(
+            "{name}={raw:?}; expected {expected}"
+        )));
+    }
+    Ok(value)
+}
+
+fn env_control_f32(
+    name: &str,
+    default: f32,
+    valid: impl FnOnce(f32) -> bool,
+    expected: &str,
+) -> Result<f32, ReadbackError> {
+    match std::env::var(name) {
+        Ok(raw) => parse_control_f32(name, &raw, valid, expected),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(ReadbackError::Configuration(format!(
+            "{name} is not valid Unicode: {error}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+fn parse_toggle(value: Option<&str>, default: bool) -> bool {
+    value.and_then(parse_toggle_value).unwrap_or(default)
+}
+
+fn parse_toggle_value(value: &str) -> Option<bool> {
+    let value = value.trim();
+    if let Ok(numeric) = value.parse::<u32>() {
+        return Some(numeric != 0);
+    }
+    if value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+    {
+        Some(false)
+    } else if value.eq_ignore_ascii_case("on")
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+    {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn parse_rgb(value: &str) -> Option<[f32; 3]> {
+    let mut channels = value.split(',').map(str::trim);
+    let color = [
+        channels.next()?.parse().ok()?,
+        channels.next()?.parse().ok()?,
+        channels.next()?.parse().ok()?,
+    ];
+    channels.next().is_none().then_some(color)
+}
+
+fn resolve_bloom_intensity(enabled: bool, configured: f32) -> f32 {
+    if enabled { configured } else { 0.0 }
 }
 
 impl PostFx {
@@ -2024,17 +2497,6 @@ impl PostFx {
             bloom_a_view: None,
             bloom_b: None,
             bloom_b_view: None,
-            last_env_update: None,
-            env_exposure: 1.0,
-            env_vignette: 0.08,
-            env_tonemap: 1, // aces
-            env_fxaa: 0,
-            env_bloom_on: 1,
-            env_bloom_thresh: 0.8,
-            env_bloom_intensity: 0.65,
-            env_fog_enabled: 1,
-            env_fog_density: 0.6, // low
-            env_fog_color: [0.6, 0.7, 0.8],
         }
     }
 
@@ -2139,91 +2601,21 @@ impl PostFx {
         src: &wgpu::TextureView,
         size: (u32, u32),
         selected_tonemap: Option<u32>,
+        controls: &PostControls,
     ) {
-        // Refresh env-driven parameters at most every 250ms to avoid per-frame parsing overhead
-        let needs_refresh = self
-            .last_env_update
-            .map(|t| t.elapsed().as_millis() > 250)
-            .unwrap_or(true);
-        if needs_refresh {
-            self.env_exposure = std::env::var("SB_WGPU_EXPOSURE")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(self.env_exposure);
-            self.env_vignette = std::env::var("SB_WGPU_VIGNETTE")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(self.env_vignette);
-            self.env_tonemap = match std::env::var("SB_WGPU_TONEMAP").ok().as_deref() {
-                Some("off") | Some("none") | Some("0") => 0u32,
-                Some("aces") | Some("filmic") => 1u32,
-                Some("reinhard") => 2u32,
-                // Unset or unrecognized: keep the current value (constructor
-                // default is 1 = aces), matching `wants_post()`.
-                _ => self.env_tonemap,
-            };
-            self.env_fxaa = parse_fxaa_env(self.env_fxaa);
-            self.env_bloom_on = std::env::var("SB_WGPU_BLOOM")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(self.env_bloom_on);
-            self.env_bloom_thresh = std::env::var("SB_WGPU_BLOOM_THRESH")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(self.env_bloom_thresh);
-            self.env_bloom_intensity = std::env::var("SB_WGPU_BLOOM_INTENSITY")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(self.env_bloom_intensity);
-            let fog_mode = std::env::var("SB_WGPU_FOG")
-                .ok()
-                .unwrap_or_else(|| "off".to_string());
-            self.env_fog_enabled = match fog_mode.as_str() {
-                "low" | "med" | "high" => 1u32,
-                _ => 0u32,
-            };
-            self.env_fog_density = match fog_mode.as_str() {
-                "low" => 0.6,
-                "med" => 1.0,
-                "high" => 1.6,
-                _ => self.env_fog_density,
-            };
-            if let Some(c) = std::env::var("SB_WGPU_FOG_COLOR").ok().and_then(|v| {
-                let parts: Vec<_> = v.split(',').collect();
-                if parts.len() == 3 {
-                    Some([
-                        parts[0]
-                            .trim()
-                            .parse::<f32>()
-                            .unwrap_or(self.env_fog_color[0]),
-                        parts[1]
-                            .trim()
-                            .parse::<f32>()
-                            .unwrap_or(self.env_fog_color[1]),
-                        parts[2]
-                            .trim()
-                            .parse::<f32>()
-                            .unwrap_or(self.env_fog_color[2]),
-                    ])
-                } else {
-                    None
-                }
-            }) {
-                self.env_fog_color = c;
-            }
-            self.last_env_update = Some(std::time::Instant::now());
-        }
-
         let params = PostParams {
-            exposure: self.env_exposure,
-            vignette: self.env_vignette,
-            tonemap: selected_tonemap.unwrap_or(self.env_tonemap),
-            fxaa: self.env_fxaa,
-            bloom_thresh: self.env_bloom_thresh,
-            bloom_intensity: self.env_bloom_intensity,
-            fog_density: self.env_fog_density,
-            fog_enabled: self.env_fog_enabled,
-            fog_color: self.env_fog_color,
+            exposure: controls.exposure,
+            vignette: controls.vignette,
+            tonemap: selected_tonemap.unwrap_or(controls.tonemap),
+            fxaa: controls.fxaa,
+            bloom_thresh: controls.bloom_thresh,
+            bloom_intensity: resolve_bloom_intensity(
+                controls.bloom_enabled,
+                controls.bloom_intensity,
+            ),
+            fog_density: controls.fog_density,
+            fog_enabled: u32::from(controls.fog_enabled),
+            fog_color: controls.fog_color,
             _pad0: 0.0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -2239,7 +2631,7 @@ impl PostFx {
 
         // Bloom pass chain if enabled
         let mut bloom_view_opt: Option<wgpu::TextureView> = None;
-        if self.env_bloom_on != 0 {
+        if controls.bloom_enabled {
             self.ensure_bloom_targets(device, self.color_format, size);
             // Create fresh local views to avoid borrowing self across mutable calls
             let a_view_local = self
@@ -2351,34 +2743,6 @@ impl PostFx {
         pass.set_bind_group(1, &self.params_bg, &[]);
         pass.draw(0..3, 0..1);
     }
-}
-
-fn wants_post() -> bool {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, bool)>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), true)));
-    let mut guard = cache.lock().unwrap();
-    let (last, val) = &mut *guard;
-    if last.elapsed().as_millis() > 250 {
-        let fxaa = parse_fxaa_env(0) != 0;
-        // Unset defaults to aces (matches the PostFx constructor default).
-        let tonemap = !matches!(
-            std::env::var("SB_WGPU_TONEMAP").ok().as_deref(),
-            Some("off") | Some("none") | Some("0") | Some("")
-        );
-        let bloom = std::env::var("SB_WGPU_BLOOM")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(1)
-            != 0;
-        let fog = matches!(
-            std::env::var("SB_WGPU_FOG").ok().as_deref(),
-            Some("low") | Some("med") | Some("high")
-        );
-        *val = fxaa || tonemap || bloom || fog;
-        *last = std::time::Instant::now();
-    }
-    *val
 }
 
 const POST_WGSL: &str = r#"

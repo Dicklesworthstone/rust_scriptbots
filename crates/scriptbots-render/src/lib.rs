@@ -65,7 +65,9 @@ use tracing::{debug, error, info, warn};
 pub mod world_compositor {
     use super::*;
     use scriptbots_core::{TerrainKind, WorldState};
-    use scriptbots_world_gfx::{ReadbackView, WorldRenderer, WorldSnapshot as GfxSnapshot};
+    use scriptbots_world_gfx::{
+        ReadbackError, ReadbackView, WorldRenderer, WorldSnapshot as GfxSnapshot,
+    };
 
     pub struct GpuiImage {
         size: (u32, u32),
@@ -239,6 +241,7 @@ pub mod world_compositor {
         populated_bytes: usize,
         min_byte: u8,
         max_byte: u8,
+        varied_rgb: bool,
         sample_rgba: [u8; 4],
     }
 
@@ -250,9 +253,35 @@ pub mod world_compositor {
             if self.non_zero == 0 {
                 return true;
             }
-            let dynamic_range = self.max_byte.saturating_sub(self.min_byte);
-            dynamic_range < 12
+            !self.varied_rgb
         }
+    }
+
+    fn rgba8_is_visually_blank(bytes: &[u8]) -> bool {
+        let mut pixels = bytes.as_chunks::<4>().0.iter();
+        let Some(first) = pixels.next() else {
+            return true;
+        };
+        let first_rgb = [first[0], first[1], first[2]];
+        let mut has_nonzero_rgb = first_rgb.iter().any(|channel| *channel != 0);
+        let mut varied_rgb = false;
+        for pixel in pixels {
+            let rgb = [pixel[0], pixel[1], pixel[2]];
+            has_nonzero_rgb |= rgb.iter().any(|channel| *channel != 0);
+            varied_rgb |= rgb != first_rgb;
+        }
+        !has_nonzero_rgb || !varied_rgb
+    }
+
+    /// Honest outcome of one compositor request.
+    ///
+    /// Rate limiting is the only non-rendering success: it deliberately reuses
+    /// a previously completed frame. Every unavailable or failed GPU stage is a
+    /// typed [`ReadbackError`] so callers can choose and report their fallback.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RenderSnapshotOutcome {
+        Rendered,
+        ReusedRateLimitedFrame,
     }
 
     fn readback_stats(view: &ReadbackView) -> ReadbackDigest {
@@ -264,21 +293,29 @@ pub mod world_compositor {
         let mut min_byte = u8::MAX;
         let mut max_byte = u8::MIN;
         let mut populated = 0usize;
+        let mut first_rgb: Option<[u8; 3]> = None;
+        let mut varied_rgb = false;
         for y in 0..(view.height as usize) {
             let start = y * stride;
             let end = start.saturating_add(row_bytes).min(src.len());
             let row = &src[start..end];
             populated = populated.saturating_add(row.len());
-            for &byte in row {
-                checksum = checksum.wrapping_add(u64::from(byte));
-                if byte != 0 {
-                    non_zero += 1;
+            for pixel in row.as_chunks::<4>().0 {
+                for &byte in pixel {
+                    checksum = checksum.wrapping_add(u64::from(byte));
                 }
-                if byte < min_byte {
-                    min_byte = byte;
+                let rgb = [pixel[0], pixel[1], pixel[2]];
+                for byte in rgb {
+                    if byte != 0 {
+                        non_zero += 1;
+                    }
+                    min_byte = min_byte.min(byte);
+                    max_byte = max_byte.max(byte);
                 }
-                if byte > max_byte {
-                    max_byte = byte;
+                if let Some(first) = first_rgb {
+                    varied_rgb |= rgb != first;
+                } else {
+                    first_rgb = Some(rgb);
                 }
             }
         }
@@ -306,6 +343,7 @@ pub mod world_compositor {
             populated_bytes: populated,
             min_byte,
             max_byte,
+            varied_rgb,
             sample_rgba: sample,
         }
     }
@@ -427,9 +465,9 @@ pub mod world_compositor {
             }
         }
 
-        fn ensure_renderer(&mut self, size: (u32, u32)) -> Result<(), String> {
-            if let Some(reason) = self.adapter_failure.clone() {
-                return Err(reason);
+        fn ensure_renderer(&mut self, size: (u32, u32)) -> Result<(), ReadbackError> {
+            if self.adapter_failure.is_some() {
+                return Err(ReadbackError::AdapterUnavailable);
             }
             if self.adapter.is_none() {
                 // Create a headless adapter suitable for offscreen rendering
@@ -442,13 +480,13 @@ pub mod world_compositor {
                             force_fallback_adapter: false,
                         })
                         .await;
-                    res.map_err(|_| "wgpu adapter not available".to_string())
+                    res.map_err(|_| ReadbackError::AdapterUnavailable)
                 };
                 let adapter = match pollster::block_on(future) {
                     Ok(adapter) => adapter,
-                    Err(err) => {
-                        self.record_adapter_failure(err.clone());
-                        return Err(err);
+                    Err(error) => {
+                        self.record_adapter_failure(error.to_string());
+                        return Err(error);
                     }
                 };
                 let info = adapter.get_info();
@@ -472,7 +510,7 @@ pub mod world_compositor {
                         info.name, info.vendor
                     );
                     self.record_adapter_failure(reason.clone());
-                    return Err(reason);
+                    return Err(ReadbackError::AdapterUnavailable);
                 } else if is_software {
                     self.adapter_is_software = true;
                     warn!(
@@ -488,11 +526,7 @@ pub mod world_compositor {
                 let future = scriptbots_world_gfx::WorldRenderer::new(adapter, size);
                 let mut renderer = match pollster::block_on(future) {
                     Ok(renderer) => renderer,
-                    Err(err) => {
-                        let reason = format!("wgpu renderer init failed: {err}");
-                        self.record_adapter_failure(reason.clone());
-                        return Err(reason);
-                    }
+                    Err(error) => return Err(error),
                 };
                 renderer.set_camera(self.cam_scale, self.cam_offset);
                 self.renderer = Some(renderer);
@@ -501,24 +535,32 @@ pub mod world_compositor {
         }
 
         #[allow(dead_code)]
-        pub fn resize(&mut self, size: (u32, u32)) {
-            if let Some(r) = self.renderer.as_mut() {
-                let _ = r.resize(size);
-            }
+        pub fn resize(&mut self, size: (u32, u32)) -> Result<(), ReadbackError> {
+            let Some(renderer) = self.renderer.as_mut() else {
+                return Err(ReadbackError::AdapterUnavailable);
+            };
+            renderer.resize(size)
         }
 
-        pub fn render_snapshot(&mut self, snapshot: &GfxSnapshot, target_size: (u32, u32)) {
-            // Root-cause guard: skip rendering when target is zero-sized (startup/minimize)
+        pub fn render_snapshot(
+            &mut self,
+            snapshot: &GfxSnapshot,
+            target_size: (u32, u32),
+        ) -> Result<RenderSnapshotOutcome, ReadbackError> {
             if target_size.0 == 0 || target_size.1 == 0 {
-                self.last_digest = None;
-                return;
+                self.invalidate_presentable_frame();
+                return Err(ReadbackError::ZeroDimensions {
+                    width: target_size.0,
+                    height: target_size.1,
+                });
             }
-            // Optional FPS cap: skip re-render and reuse last-ready image if interval not elapsed
+            // Rate limiting is explicit and may only reuse a successfully completed image.
             if self.min_interval > 0.0
                 && let Some(last) = self.last_submit
                 && last.elapsed().as_secs_f32() < self.min_interval
+                && self.has_presentable_frame()
             {
-                return;
+                return Ok(RenderSnapshotOutcome::ReusedRateLimitedFrame);
             }
             let render_size = if self.render_scale < 0.9999 {
                 (
@@ -532,12 +574,19 @@ pub mod world_compositor {
             } else {
                 (target_size.0.max(1), target_size.1.max(1))
             };
-            if self.ensure_renderer(render_size).is_err() {
-                self.last_digest = None;
-                self.maybe_report_adapter_failure();
-                return;
+            if let Err(error) = self.ensure_renderer(render_size) {
+                self.invalidate_presentable_frame();
+                if matches!(error, ReadbackError::AdapterUnavailable) {
+                    self.maybe_report_adapter_failure();
+                }
+                return Err(error);
             }
-            let r = self.renderer.as_mut().unwrap();
+            let Some(r) = self.renderer.as_mut() else {
+                self.invalidate_presentable_frame();
+                return Err(ReadbackError::Device(
+                    "compositor initialized without a world renderer".to_owned(),
+                ));
+            };
             // When rendering at a reduced offscreen resolution, scale the camera mapping
             // so CPU culling and shader NDC math remain consistent with the smaller viewport.
             let rs = if self.render_scale < 0.9999 {
@@ -549,79 +598,115 @@ pub mod world_compositor {
             let effective_offset = (self.cam_offset.0 * rs, self.cam_offset.1 * rs);
             r.set_camera(effective_scale, effective_offset);
             if let Err(error) = r.resize(render_size) {
-                tracing::warn!(%error, "wgpu resize failed; keeping the previous frame");
-                return;
+                self.invalidate_presentable_frame();
+                return Err(error);
             }
-            let _frame = r.render(snapshot);
-            if let Err(error) = r.copy_to_readback(&_frame) {
-                tracing::warn!(%error, "wgpu readback copy failed; keeping the previous frame");
-                return;
+            let frame = match r.render(snapshot) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.invalidate_presentable_frame();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = r.copy_to_readback(&frame) {
+                self.invalidate_presentable_frame();
+                return Err(error);
             }
-            // Small bounded spin to ensure first mapped frame is ready; avoids blank-first-paint
-            let mut view_opt = r.mapped_rgba().ok();
-            if view_opt.is_none() {
-                for _ in 0..64 {
-                    std::hint::spin_loop();
-                    view_opt = r.mapped_rgba().ok();
-                    if view_opt.is_some() {
-                        break;
-                    }
+            let view = match r.mapped_rgba() {
+                Ok(view) => view,
+                Err(error) => {
+                    self.invalidate_presentable_frame();
+                    return Err(error);
                 }
+            };
+            let digest = readback_stats(&view);
+            if digest.is_visually_blank() {
+                self.invalidate_presentable_frame();
+                return Err(ReadbackError::Blank);
             }
-            if let Some(view) = view_opt {
-                let digest = readback_stats(&view);
-                self.last_digest = Some(digest);
-                // Lazy-initialize image with known dimensions; avoid stale size from previous runs
-                if self.image.is_none() {
-                    self.image = Some(GpuiImage::new(
-                        (view.width, view.height),
-                        view.bytes_per_row,
-                    ));
-                }
-                if let Some(img) = self.image.as_mut() {
-                    img.ensure((view.width, view.height), view.bytes_per_row);
-                    img.upload_from_readback(&view);
-                }
-                self.save_view_if_requested(&view, &digest);
-                if env_flag("SB_WGPU_READBACK_CHECKSUM") {
-                    tracing::info!(
-                        width = digest.width,
-                        height = digest.height,
-                        stride = digest.stride,
-                        checksum = digest.checksum,
-                        checksum_hex = format!("{:016x}", digest.checksum),
-                        non_zero_bytes = digest.non_zero,
-                        populated_bytes = digest.populated_bytes,
-                        min_byte = digest.min_byte,
-                        max_byte = digest.max_byte,
-                        sample_r = digest.sample_rgba[0],
-                        sample_g = digest.sample_rgba[1],
-                        sample_b = digest.sample_rgba[2],
-                        sample_a = digest.sample_rgba[3],
-                        "wgpu readback checksum"
-                    );
-                }
-                self.last_submit = Some(std::time::Instant::now());
-                if env_flag("SB_WGPU_LOG_VIS") {
-                    tracing::info!(
-                        width = digest.width,
-                        height = digest.height,
-                        stride = digest.stride,
-                        checksum = digest.checksum,
-                        non_zero_bytes = digest.non_zero,
-                        populated_bytes = digest.populated_bytes,
-                        min_byte = digest.min_byte,
-                        max_byte = digest.max_byte,
-                        sample_r = digest.sample_rgba[0],
-                        sample_g = digest.sample_rgba[1],
-                        sample_b = digest.sample_rgba[2],
-                        sample_a = digest.sample_rgba[3],
-                        "wgpu readback mapped"
-                    );
-                }
-            } else if env_flag("SB_WGPU_LOG_VIS") {
-                tracing::info!("wgpu readback not yet mapped");
+            self.last_digest = Some(digest);
+            // Lazy-initialize image with known dimensions; avoid stale size from previous runs.
+            if self.image.is_none() {
+                self.image = Some(GpuiImage::new(
+                    (view.width, view.height),
+                    view.bytes_per_row,
+                ));
             }
+            if let Some(img) = self.image.as_mut() {
+                img.ensure((view.width, view.height), view.bytes_per_row);
+                img.upload_from_readback(&view);
+            }
+            // `ReadbackView` borrows the renderer's mapped buffer. Explicit
+            // artifact capture is rare, so copy only on that opt-in path and
+            // release the mapping before mutably borrowing compositor policy.
+            let save_payload = self.save_enabled.then(|| {
+                (
+                    view.bytes().to_vec(),
+                    view.width,
+                    view.height,
+                    view.bytes_per_row as usize,
+                )
+            });
+            drop(view);
+            if let Some((bytes, width, height, stride)) = save_payload
+                && let Err(error) =
+                    self.save_rgba_if_requested(&bytes, width, height, stride, &digest)
+            {
+                self.invalidate_presentable_frame();
+                return Err(error);
+            }
+            if env_flag("SB_WGPU_READBACK_CHECKSUM") {
+                tracing::info!(
+                    width = digest.width,
+                    height = digest.height,
+                    stride = digest.stride,
+                    checksum = digest.checksum,
+                    checksum_hex = format!("{:016x}", digest.checksum),
+                    non_zero_bytes = digest.non_zero,
+                    populated_bytes = digest.populated_bytes,
+                    min_byte = digest.min_byte,
+                    max_byte = digest.max_byte,
+                    varied_rgb = digest.varied_rgb,
+                    sample_r = digest.sample_rgba[0],
+                    sample_g = digest.sample_rgba[1],
+                    sample_b = digest.sample_rgba[2],
+                    sample_a = digest.sample_rgba[3],
+                    "wgpu readback checksum"
+                );
+            }
+            self.last_submit = Some(std::time::Instant::now());
+            if env_flag("SB_WGPU_LOG_VIS") {
+                tracing::info!(
+                    width = digest.width,
+                    height = digest.height,
+                    stride = digest.stride,
+                    checksum = digest.checksum,
+                    non_zero_bytes = digest.non_zero,
+                    populated_bytes = digest.populated_bytes,
+                    min_byte = digest.min_byte,
+                    max_byte = digest.max_byte,
+                    varied_rgb = digest.varied_rgb,
+                    sample_r = digest.sample_rgba[0],
+                    sample_g = digest.sample_rgba[1],
+                    sample_b = digest.sample_rgba[2],
+                    sample_a = digest.sample_rgba[3],
+                    "wgpu readback mapped"
+                );
+            }
+            Ok(RenderSnapshotOutcome::Rendered)
+        }
+
+        fn has_presentable_frame(&self) -> bool {
+            self.image.is_some()
+                && self
+                    .last_digest
+                    .as_ref()
+                    .is_some_and(|digest| !digest.is_visually_blank())
+        }
+
+        fn invalidate_presentable_frame(&mut self) {
+            self.last_digest = None;
+            self.last_submit = None;
         }
 
         fn record_adapter_failure(&mut self, reason: String) {
@@ -645,21 +730,23 @@ pub mod world_compositor {
         }
 
         pub fn paint_world(&mut self, bounds: Bounds<Pixels>, window: &mut Window) -> bool {
-            if let Some(img) = &self.image {
-                if let Some(digest) = self.last_digest.as_ref()
-                    && digest.is_visually_blank()
-                {
-                    if env_flag("SB_WGPU_LOG_VIS") {
-                        tracing::warn!(
-                            checksum = digest.checksum,
-                            non_zero = digest.non_zero,
-                            min_byte = digest.min_byte,
-                            max_byte = digest.max_byte,
-                            "wgpu readback appears blank; falling back to CPU canvas"
-                        );
-                    }
-                    return false;
+            let Some(digest) = self.last_digest.as_ref() else {
+                return false;
+            };
+            if digest.is_visually_blank() {
+                if env_flag("SB_WGPU_LOG_VIS") {
+                    tracing::warn!(
+                        checksum = digest.checksum,
+                        non_zero = digest.non_zero,
+                        min_byte = digest.min_byte,
+                        max_byte = digest.max_byte,
+                        varied_rgb = digest.varied_rgb,
+                        "wgpu readback appears blank; falling back to CPU canvas"
+                    );
                 }
+                return false;
+            }
+            if let Some(img) = &self.image {
                 let mode = std::env::var("SB_WGPU_PRESENT_MODE")
                     .ok()
                     .or_else(|| Some("full".to_string()));
@@ -683,16 +770,6 @@ pub mod world_compositor {
             self.render_scale
         }
 
-        fn save_view_if_requested(&mut self, view: &ReadbackView, digest: &ReadbackDigest) {
-            self.save_rgba_if_requested(
-                view.bytes(),
-                view.width,
-                view.height,
-                view.bytes_per_row as usize,
-                digest,
-            );
-        }
-
         fn save_rgba_if_requested(
             &mut self,
             src: &[u8],
@@ -700,18 +777,23 @@ pub mod world_compositor {
             height: u32,
             stride: usize,
             digest: &ReadbackDigest,
-        ) {
+        ) -> Result<(), ReadbackError> {
             if !self.save_enabled {
-                return;
+                return Ok(());
             }
             self.save_counter = self.save_counter.saturating_add(1);
             if !(self.save_counter - 1).is_multiple_of(u64::from(self.save_every)) {
-                return;
+                return Ok(());
             }
 
             // Ensure directory exists
             let target_dir = self.save_dir.clone();
-            let _ = std::fs::create_dir_all(&target_dir);
+            std::fs::create_dir_all(&target_dir).map_err(|error| {
+                ReadbackError::Artifact(format!(
+                    "create capture directory {}: {error}",
+                    target_dir.display()
+                ))
+            })?;
             // Repack from padded rows into tightly packed RGBA8 buffer
             let row_bytes = (width as usize) * 4;
             let mut tight = vec![0u8; row_bytes * (height as usize)];
@@ -719,24 +801,34 @@ pub mod world_compositor {
                 let src_off = y * stride;
                 let dst_off = y * row_bytes;
                 let end = src_off + row_bytes;
-                if end <= src.len() {
-                    tight[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..end]);
+                if end > src.len() {
+                    return Err(ReadbackError::MetadataMismatch {
+                        expected: format!(
+                            "{} mapped bytes for {height} rows at stride {stride}",
+                            stride * height as usize
+                        ),
+                        actual: format!("{} mapped bytes", src.len()),
+                    });
                 }
+                tight[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..end]);
             }
             let filename = format!("{}_{:06}.png", self.save_prefix, self.save_counter);
             let path = target_dir.join(filename);
-            let _ = image::save_buffer_with_format(
+            image::save_buffer_with_format(
                 &path,
                 &tight,
                 width,
                 height,
                 image::ColorType::Rgba8,
                 image::ImageFormat::Png,
-            );
+            )
+            .map_err(|error| {
+                ReadbackError::Artifact(format!("write capture PNG {}: {error}", path.display()))
+            })?;
             let meta_path = path.with_extension("txt");
             let checksum_hex = format!("{:016x}", digest.checksum);
             let meta = format!(
-                "width={}\nheight={}\nstride={}\npopulated_bytes={}\nnonzero_bytes={}\nchecksum_decimal={}\nchecksum_hex={}\nmin_byte={}\nmax_byte={}\nsample_rgba={:?}\n",
+                "width={}\nheight={}\nstride={}\npopulated_bytes={}\nnonzero_rgb_bytes={}\nchecksum_decimal={}\nchecksum_hex={}\nmin_rgb_byte={}\nmax_rgb_byte={}\nvaried_rgb={}\nsample_rgba={:?}\n",
                 digest.width,
                 digest.height,
                 digest.stride,
@@ -746,15 +838,15 @@ pub mod world_compositor {
                 checksum_hex,
                 digest.min_byte,
                 digest.max_byte,
+                digest.varied_rgb,
                 digest.sample_rgba
             );
-            if let Err(err) = std::fs::write(&meta_path, meta) {
-                warn!(
-                    target = "scriptbots::render::wgpu",
-                    path = %meta_path.display(),
-                    "failed to write readback metadata: {err:?}"
-                );
-            }
+            std::fs::write(&meta_path, meta).map_err(|error| {
+                ReadbackError::Artifact(format!(
+                    "write capture metadata {}: {error}",
+                    meta_path.display()
+                ))
+            })?;
             info!(
                 target = "scriptbots::render::wgpu",
                 path = %path.display(),
@@ -768,18 +860,23 @@ pub mod world_compositor {
                 checksum_hex,
                 min_byte = digest.min_byte,
                 max_byte = digest.max_byte,
+                varied_rgb = digest.varied_rgb,
                 sample_r = digest.sample_rgba[0],
                 sample_g = digest.sample_rgba[1],
                 sample_b = digest.sample_rgba[2],
                 sample_a = digest.sample_rgba[3],
                 "wgpu readback frame saved"
             );
+            Ok(())
         }
     }
 
     #[cfg(test)]
     mod capture_policy_tests {
-        use super::{Compositor, ReadbackDigest};
+        use super::{Compositor, ReadbackDigest, RenderSnapshotOutcome, rgba8_is_visually_blank};
+        use scriptbots_world_gfx::{
+            AgentInstance, ReadbackError, TerrainView, WorldSnapshot as GfxSnapshot,
+        };
 
         fn unique_capture_dir(label: &str) -> std::path::PathBuf {
             let nonce = std::time::SystemTime::now()
@@ -802,8 +899,125 @@ pub mod world_compositor {
                 populated_bytes: 8,
                 min_byte: 10,
                 max_byte: 255,
+                varied_rgb: true,
                 sample_rgba: [10, 20, 30, 255],
             }
+        }
+
+        #[test]
+        fn blank_detection_ignores_opaque_alpha_and_requires_rgb_variation() {
+            let opaque_black = ReadbackDigest {
+                non_zero: 0,
+                varied_rgb: false,
+                ..test_digest()
+            };
+            assert!(
+                opaque_black.is_visually_blank(),
+                "opaque alpha must not make an otherwise black frame look rendered"
+            );
+
+            let uniform_color = ReadbackDigest {
+                non_zero: 6,
+                varied_rgb: false,
+                ..test_digest()
+            };
+            assert!(
+                uniform_color.is_visually_blank(),
+                "a uniform clear color is not framebuffer evidence"
+            );
+
+            assert!(
+                !test_digest().is_visually_blank(),
+                "varying nonzero RGB is render evidence"
+            );
+
+            assert!(rgba8_is_visually_blank(&[0, 0, 0, 255, 0, 0, 0, 255]));
+            assert!(rgba8_is_visually_blank(&[20, 30, 40, 255, 20, 30, 40, 255]));
+            assert!(!rgba8_is_visually_blank(&[
+                20, 30, 40, 255, 21, 30, 40, 255
+            ]));
+        }
+
+        fn minimal_snapshot<'a>(tiles: &'a [u32], colors: &'a [[f32; 4]]) -> GfxSnapshot<'a> {
+            GfxSnapshot {
+                world_size: (1.0, 1.0),
+                terrain: TerrainView {
+                    dims: (1, 1),
+                    cell_size: 1,
+                    tiles,
+                    colors,
+                    elevation: None,
+                },
+                agents: &[] as &[AgentInstance],
+                anim_seconds: 0.0,
+                tonemap_mode: None,
+            }
+        }
+
+        #[test]
+        fn compositor_rejects_zero_dimensions_instead_of_silently_reusing_pixels() {
+            let tiles = [3];
+            let colors = [[0.2, 0.5, 0.2, 1.0]];
+            let mut compositor = Compositor::new();
+            let error = compositor
+                .render_snapshot(&minimal_snapshot(&tiles, &colors), (0, 64))
+                .expect_err("zero-width capture must fail");
+            assert_eq!(
+                error,
+                ReadbackError::ZeroDimensions {
+                    width: 0,
+                    height: 64
+                }
+            );
+        }
+
+        #[test]
+        fn cached_adapter_failure_remains_a_typed_unavailable_error() {
+            let tiles = [3];
+            let colors = [[0.2, 0.5, 0.2, 1.0]];
+            let mut compositor = Compositor::new();
+            compositor.adapter_failure = Some("no compatible native adapter".to_owned());
+            let error = compositor
+                .render_snapshot(&minimal_snapshot(&tiles, &colors), (64, 64))
+                .expect_err("cached adapter failure must not masquerade as success");
+            assert_eq!(error, ReadbackError::AdapterUnavailable);
+        }
+
+        #[test]
+        fn rate_limit_reuse_is_an_explicit_success_outcome() {
+            let tiles = [3];
+            let colors = [[0.2, 0.5, 0.2, 1.0]];
+            let mut compositor = Compositor::new();
+            compositor.last_submit = Some(std::time::Instant::now());
+            compositor.min_interval = 60.0;
+            compositor.image = Some(super::GpuiImage::new((64, 64), 256));
+            compositor.last_digest = Some(test_digest());
+            let outcome = compositor
+                .render_snapshot(&minimal_snapshot(&tiles, &colors), (64, 64))
+                .expect("rate limiting deliberately reuses the last completed frame");
+            assert_eq!(outcome, RenderSnapshotOutcome::ReusedRateLimitedFrame);
+        }
+
+        #[test]
+        fn a_failed_frame_cannot_be_reused_by_the_rate_limiter() {
+            let tiles = [3];
+            let colors = [[0.2, 0.5, 0.2, 1.0]];
+            let mut compositor = Compositor::new();
+            compositor.last_submit = Some(std::time::Instant::now());
+            compositor.min_interval = 60.0;
+            compositor.image = Some(super::GpuiImage::new((64, 64), 256));
+            compositor.last_digest = Some(test_digest());
+
+            compositor.invalidate_presentable_frame();
+            compositor.adapter_failure = Some("no compatible native adapter".to_owned());
+            let error = compositor
+                .render_snapshot(&minimal_snapshot(&tiles, &colors), (64, 64))
+                .expect_err("an invalidated image must not become a rate-limit success");
+            assert_eq!(error, ReadbackError::AdapterUnavailable);
+            assert!(
+                !compositor.has_presentable_frame(),
+                "the old allocation may remain reusable, but its pixels are not presentable"
+            );
         }
 
         #[test]
@@ -816,7 +1030,9 @@ pub mod world_compositor {
             default.save_enabled = false;
             default.save_dir = disabled_dir.clone();
             default.save_prefix = "default".to_owned();
-            default.save_rgba_if_requested(&rgba, 2, 1, 8, &digest);
+            default
+                .save_rgba_if_requested(&rgba, 2, 1, 8, &digest)
+                .expect("disabled capture is an intentional no-op");
 
             assert_eq!(
                 default.save_counter, 0,
@@ -835,7 +1051,9 @@ pub mod world_compositor {
             explicit.save_every = 1;
             explicit.save_counter = 0;
             explicit.save_prefix = "explicit".to_owned();
-            explicit.save_rgba_if_requested(&rgba, 2, 1, 8, &digest);
+            explicit
+                .save_rgba_if_requested(&rgba, 2, 1, 8, &digest)
+                .expect("explicit capture artifacts");
 
             assert_eq!(
                 explicit.save_counter, 1,
@@ -877,7 +1095,15 @@ pub mod world_compositor {
         }
         // Build snapshot from world
         let frame = crate::RenderFrame::from_world(world, crate::ColorPaletteMode::Natural)
-            .expect("render frame");
+            .ok_or_else(|| scriptbots_world_gfx::ReadbackError::MetadataMismatch {
+                expected: "a finite non-empty world render snapshot".to_owned(),
+                actual: format!(
+                    "world {}x{} at tick {} could not produce a render frame",
+                    world.config().world_width,
+                    world.config().world_height,
+                    world.tick().0
+                ),
+            })?;
         let world_size = frame.world_size;
         let dims = frame.terrain.dimensions;
         let tiles_u32: Vec<u32> = frame
@@ -894,6 +1120,7 @@ pub mod world_compositor {
             })
             .collect();
         let elevation: Vec<f32> = frame.terrain.tiles.iter().map(|t| t.elevation).collect();
+        let terrain_colors = canonical_gpu_terrain_colors(&frame);
         let palette_is_natural = matches!(frame.palette, ColorPaletteMode::Natural);
         let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = frame
             .agents
@@ -907,6 +1134,7 @@ pub mod world_compositor {
                 dims,
                 cell_size: frame.terrain.cell_size,
                 tiles: &tiles_u32,
+                colors: &terrain_colors,
                 elevation: Some(&elevation),
             },
             agents: &agents_gpu,
@@ -925,7 +1153,7 @@ pub mod world_compositor {
         let pad_y = (height_px - world_size.1 * base_scale) * 0.5;
         comp.set_camera_params(base_scale, (pad_x, pad_y));
 
-        comp.render_snapshot(&snapshot, (width, height));
+        comp.render_snapshot(&snapshot, (width, height))?;
 
         // Extract mapped frame. Geometry must come from the readback view:
         // render_snapshot may render at a reduced resolution (SB_WGPU_RES_SCALE),
@@ -934,7 +1162,11 @@ pub mod world_compositor {
         let view = comp
             .renderer
             .as_mut()
-            .ok_or(scriptbots_world_gfx::ReadbackError::AdapterUnavailable)?
+            .ok_or_else(|| {
+                scriptbots_world_gfx::ReadbackError::Device(
+                    "compositor reported success without a world renderer".to_owned(),
+                )
+            })?
             .mapped_rgba()?;
         let view_width = view.width;
         let view_height = view.height;
@@ -946,11 +1178,19 @@ pub mod world_compositor {
             let s = y * stride;
             let d = y * row_bytes;
             let end = s + row_bytes;
-            if end <= src.len() {
-                tight[d..d + row_bytes].copy_from_slice(&src[s..end]);
+            if end > src.len() {
+                return Err(scriptbots_world_gfx::ReadbackError::MetadataMismatch {
+                    expected: format!(
+                        "{} bytes for {} rows at stride {stride}",
+                        stride * view_height as usize,
+                        view_height
+                    ),
+                    actual: format!("{} mapped bytes", src.len()),
+                });
             }
+            tight[d..d + row_bytes].copy_from_slice(&src[s..end]);
         }
-        if tight.iter().all(|byte| *byte == 0) {
+        if rgba8_is_visually_blank(&tight) {
             return Err(scriptbots_world_gfx::ReadbackError::Blank);
         }
         let mut png: Vec<u8> = Vec::new();
@@ -964,7 +1204,7 @@ pub mod world_compositor {
             image::ExtendedColorType::Rgba8,
         )
         .map_err(|error| {
-            scriptbots_world_gfx::ReadbackError::Device(format!("PNG encode failed: {error}"))
+            scriptbots_world_gfx::ReadbackError::Artifact(format!("PNG encode failed: {error}"))
         })?;
         Ok(png)
     }
@@ -974,6 +1214,33 @@ pub mod world_compositor {
 mod wgpu_capture_test {
     use super::world_compositor::Compositor;
     use scriptbots_world_gfx::{AgentInstance, TerrainView, WorldSnapshot as GfxSnapshot};
+
+    fn test_terrain_colors(tiles: &[u32]) -> Vec<[f32; 4]> {
+        tiles
+            .iter()
+            .map(|kind| {
+                let kind = match kind {
+                    0 => scriptbots_core::TerrainKind::DeepWater,
+                    1 => scriptbots_core::TerrainKind::ShallowWater,
+                    2 => scriptbots_core::TerrainKind::Sand,
+                    3 => scriptbots_core::TerrainKind::Grass,
+                    4 => scriptbots_core::TerrainKind::Bloom,
+                    _ => scriptbots_core::TerrainKind::Rock,
+                };
+                let rgb = scriptbots_core::visual::terrain_shaded_color(
+                    &scriptbots_core::visual::TerrainShadeInput {
+                        kind,
+                        moisture: 0.5,
+                        elevation: 0.5,
+                        slope: 0.0,
+                        accent: 0.0,
+                        daylight: scriptbots_core::visual::DAYLIGHT_STATIC,
+                    },
+                );
+                [rgb[0], rgb[1], rgb[2], 1.0]
+            })
+            .collect()
+    }
 
     fn capture_target(label: &str) -> (std::path::PathBuf, String, std::path::PathBuf) {
         let nonce = std::time::SystemTime::now()
@@ -1109,12 +1376,14 @@ mod wgpu_capture_test {
         // Simple 120x60 grass snapshot (50-unit cells matching default config)
         let dims = (120u32, 60u32);
         let tiles: Vec<u32> = vec![3u32; (dims.0 * dims.1) as usize];
+        let colors = test_terrain_colors(&tiles);
         let snapshot = GfxSnapshot {
             world_size: (6000.0, 3000.0),
             terrain: TerrainView {
                 dims,
                 cell_size: 50,
                 tiles: &tiles,
+                colors: &colors,
                 elevation: None,
             },
             agents: &[] as &[AgentInstance],
@@ -1122,7 +1391,8 @@ mod wgpu_capture_test {
             tonemap_mode: None,
         };
         comp.set_camera_params(1.0, (0.0, 0.0));
-        comp.render_snapshot(&snapshot, viewport);
+        comp.render_snapshot(&snapshot, viewport)
+            .expect("terrain capture must either render or return a typed GPU failure");
 
         assert!(
             expected_png.is_file(),
@@ -1218,6 +1488,7 @@ mod wgpu_capture_test {
                 tiles.push((x + y) % 6);
             }
         }
+        let colors = test_terrain_colors(&tiles);
 
         // Fit entire world into the viewport (match the GPUI mapping)
         let world_size = (6000.0f32, 3000.0f32);
@@ -1254,6 +1525,7 @@ mod wgpu_capture_test {
                 dims,
                 cell_size: 50,
                 tiles: &tiles,
+                colors: &colors,
                 elevation: None,
             },
             agents: &agents,
@@ -1261,7 +1533,8 @@ mod wgpu_capture_test {
             tonemap_mode: None,
         };
 
-        comp.render_snapshot(&snapshot, viewport);
+        comp.render_snapshot(&snapshot, viewport)
+            .expect("agent capture must either render or return a typed GPU failure");
 
         assert!(
             expected_png.is_file(),
@@ -1308,13 +1581,15 @@ mod wgpu_capture_test {
                 dims,
                 cell_size: 50,
                 tiles: &tiles,
+                colors: &colors,
                 elevation: None,
             },
             agents: &[] as &[AgentInstance],
             anim_seconds: 0.0,
             tonemap_mode: None,
         };
-        comp.render_snapshot(&empty, viewport);
+        comp.render_snapshot(&empty, viewport)
+            .expect("comparison capture must either render or return a typed GPU failure");
         let without_agents =
             decode_capture(&second_png).expect("captured comparison frame must decode");
         assert_eq!(
@@ -1558,6 +1833,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         .iter()
         .map(|t| t.elevation)
         .collect();
+    let terrain_colors = canonical_gpu_terrain_colors(&state.frame);
     let palette_is_natural = matches!(state.frame.palette, ColorPaletteMode::Natural);
     let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = state
         .frame
@@ -1570,6 +1846,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         dims: terrain_dims,
         cell_size: state.frame.terrain.cell_size,
         tiles: &tiles_u32,
+        colors: &terrain_colors,
         elevation: Some(&elevation),
     };
     let snapshot = GfxSnapshot {
@@ -1588,10 +1865,25 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         scale * scale_factor,
         (cam_offset.0 * scale_factor, cam_offset.1 * scale_factor),
     );
-    comp.render_snapshot(&snapshot, viewport);
-    if !comp.paint_world(bounds, window) {
-        // If the wgpu image isn't ready, draw the CPU canvas frame this turn to avoid a blank window.
-        paint_frame(state, bounds, window);
+    match comp.render_snapshot(&snapshot, viewport) {
+        Ok(_) if comp.paint_world(bounds, window) => {}
+        Ok(_) => {
+            // A completed/reused image that cannot be presented is not allowed
+            // to produce a blank window.
+            paint_frame(state, bounds, window);
+        }
+        Err(scriptbots_world_gfx::ReadbackError::AdapterUnavailable) => {
+            // `Compositor` reports this policy fallback once with adapter
+            // diagnostics; never repaint a stale GPU image afterward.
+            paint_frame(state, bounds, window);
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "wgpu compositor failed; drawing the deterministic CPU frame instead"
+            );
+            paint_frame(state, bounds, window);
+        }
     }
 }
 
@@ -4272,10 +4564,11 @@ impl SimulationView {
             .gap_3()
             .child(canvas_stack);
 
-        let canvas_stack = match self.render_hud_rail(snapshot, resolved) {
-            Some(rail) => world_row.child(rail),
-            None => world_row,
-        };
+        // The rail is no longer nested here — it is a sibling of this canvas in the
+        // HUD row (see render()). Nesting it made the rail invisible to any path that
+        // did not go through render_canvas, and fed the resize rule a width this
+        // container never had.
+        let canvas_stack = world_row;
 
         let camera_snapshot = self.camera_snapshot();
         let footer = div()
@@ -7626,14 +7919,19 @@ impl SimulationView {
             .gap_3()
             .overflow_hidden();
 
+        // Each panel may SHRINK so they share the rail's height. Without this the first
+        // panel takes everything it wants and `overflow_hidden` silently swallows the
+        // rest: the bd-abu3 capture proved the history chart was being clipped out of
+        // existence while the policy reported it open. A panel the layout says is
+        // visible must be visible, or the toggle state is a lie.
         if resolved.stats_open {
-            rail = rail.child(self.render_overlay(snapshot));
+            rail = rail.child(self.render_overlay(snapshot).flex_shrink(1.0));
         }
         if resolved.history_open {
-            rail = rail.child(self.render_history_chart(snapshot));
+            rail = rail.child(self.render_history_chart(snapshot).flex_shrink(1.0));
         }
         if resolved.perf_open {
-            rail = rail.child(self.render_perf_overlay(self.last_perf));
+            rail = rail.child(self.render_perf_overlay(self.last_perf).flex_shrink(1.0));
         }
         Some(rail)
     }
@@ -10256,6 +10554,15 @@ impl Render for SimulationView {
                         .child(self.render_history(&snapshot))
                         .child(self.render_canvas(&snapshot, resolved, cx))
                         .child(self.render_inspector(&snapshot, cx));
+                    // bd-v9cz: the HUD rail is a FIRST-CLASS SIBLING here, not a child of
+                    // render_canvas. Nesting it inside the canvas meant the capture
+                    // harness and the real window could disagree about whether chrome
+                    // exists, and it fed the resize rule the wrong width — the rule read
+                    // the 1280px window while the rail actually lived in the ~592px
+                    // canvas container, so it never collapsed when it should have.
+                    if let Some(rail) = self.render_hud_rail(&snapshot, resolved) {
+                        canvas_row = canvas_row.child(rail);
+                    }
                     canvas_row.style().align_items = Some(AlignItems::Stretch);
                     canvas_row
                 })
@@ -13959,6 +14266,23 @@ fn terrain_surface_color(
         blended[2] += shaded[2] * weight;
     }
     apply_palette(rgba_from_triplet_with_alpha(blended, 1.0), palette)
+}
+
+fn canonical_gpu_terrain_colors(frame: &RenderFrame) -> Vec<[f32; 4]> {
+    let daylight = visual::daylight_factor(
+        frame.tick,
+        frame.day_night_cycle_ticks,
+        frame.day_night_start_phase,
+    );
+    frame
+        .terrain
+        .tiles
+        .iter()
+        .map(|tile| {
+            let color = terrain_surface_color(*tile, daylight, frame.palette);
+            [color.r, color.g, color.b, color.a]
+        })
+        .collect()
 }
 
 const WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL: u32 = 4;
