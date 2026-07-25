@@ -2617,6 +2617,13 @@ struct SimulationView {
     playback: PlaybackState,
     perf: PerfStats,
     last_perf: PerfSnapshot,
+    /// When set, `render` must NOT overwrite `last_perf` (bd-c7pg).
+    ///
+    /// Capture pinned perf at view construction and `render` clobbered it on frame one,
+    /// so the pin controlled nothing after that. Captures rendering different numbers of
+    /// frames then disagreed on sample_count and the ms values, which rendered as ~14k
+    /// pixels of changed glyph text and was misread as harness nondeterminism.
+    forced_perf: Option<PerfSnapshot>,
     accessibility: AccessibilitySettings,
     debug: DebugOverlayState,
     selection_events: VecDeque<SelectionEvent>,
@@ -2703,6 +2710,7 @@ impl SimulationView {
             playback: PlaybackState::new(240),
             perf: PerfStats::new(240),
             last_perf: PerfSnapshot::default(),
+            forced_perf: None,
             accessibility: AccessibilitySettings::default(),
             debug: DebugOverlayState::default(),
             selection_events: VecDeque::with_capacity(MAX_SELECTION_EVENTS),
@@ -10470,7 +10478,11 @@ impl Render for SimulationView {
         }));
 
         let perf_snapshot = self.perf.end_frame();
-        self.last_perf = perf_snapshot;
+        // Respect a pinned snapshot: assigning unconditionally made the capture pin
+        // last exactly one frame (bd-c7pg).
+        if self.forced_perf.is_none() {
+            self.last_perf = perf_snapshot;
+        }
 
         #[cfg(feature = "audio")]
         self.update_audio(&snapshot);

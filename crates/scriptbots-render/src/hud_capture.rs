@@ -77,6 +77,8 @@ fn apply_capture_overrides(view: &mut crate::SimulationView, overrides: CaptureO
     }
     if let Some(perf) = overrides.forced_perf {
         view.last_perf = perf;
+        // Sticky, not initial: without this render() overwrites it on frame one.
+        view.forced_perf = Some(perf);
     }
     if let Some(hovered_agent) = overrides.hovered_agent
         && let Ok(mut inspector) = view.inspector.lock()
