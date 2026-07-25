@@ -11248,7 +11248,7 @@ impl Default for InputBindings {
         );
         map.insert(
             CommandAction::CyclePalette,
-            Keystroke::parse("ctrl+p").unwrap_or_default(),
+            Keystroke::parse("ctrl-p").unwrap_or_default(),
         );
         map.insert(
             CommandAction::ToggleSimulationPause,
@@ -11268,11 +11268,11 @@ impl Default for InputBindings {
         );
         map.insert(
             CommandAction::ToggleAgentOutline,
-            Keystroke::parse("ctrl+shift+o").unwrap_or_default(),
+            Keystroke::parse("ctrl-shift-o").unwrap_or_default(),
         );
         map.insert(
             CommandAction::IncreaseSimulationSpeed,
-            Keystroke::parse("shift+=").unwrap_or_default(),
+            Keystroke::parse("shift-=").unwrap_or_default(),
         );
         map.insert(
             CommandAction::DecreaseSimulationSpeed,
@@ -11296,7 +11296,7 @@ impl Default for InputBindings {
         );
         map.insert(
             CommandAction::FollowSelected,
-            Keystroke::parse("shift+s").unwrap_or_default(),
+            Keystroke::parse("shift-s").unwrap_or_default(),
         );
         map.insert(
             CommandAction::FollowOldest,
@@ -11304,7 +11304,7 @@ impl Default for InputBindings {
         );
         map.insert(
             CommandAction::ToggleDebugOverlay,
-            Keystroke::parse("shift+f").unwrap_or_default(),
+            Keystroke::parse("shift-f").unwrap_or_default(),
         );
         map.insert(
             CommandAction::ClearSelection,
@@ -11312,11 +11312,11 @@ impl Default for InputBindings {
         );
         map.insert(
             CommandAction::SelectAll,
-            Keystroke::parse("ctrl+a").unwrap_or_default(),
+            Keystroke::parse("ctrl-a").unwrap_or_default(),
         );
         map.insert(
             CommandAction::FocusFirstSelected,
-            Keystroke::parse("ctrl+f").unwrap_or_default(),
+            Keystroke::parse("ctrl-f").unwrap_or_default(),
         );
         map.insert(
             CommandAction::ToggleSettings,
@@ -14915,11 +14915,11 @@ mod command_characterization_tests {
 
         for (binding, action) in [
             ("s", CommandAction::StepSimulation),
-            ("shift+s", CommandAction::FollowSelected),
+            ("shift-s", CommandAction::FollowSelected),
             ("space", CommandAction::TogglePlayback),
             ("g", CommandAction::GoLive),
             ("p", CommandAction::ToggleSimulationPause),
-            ("ctrl+p", CommandAction::CyclePalette),
+            ("ctrl-p", CommandAction::CyclePalette),
         ] {
             let stroke = Keystroke::parse(binding).expect("valid production shortcut");
             assert_eq!(
