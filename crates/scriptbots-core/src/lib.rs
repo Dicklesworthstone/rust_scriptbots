@@ -20163,7 +20163,7 @@ impl WorldState {
                 attempt_ordinal,
             );
             let partner_index =
-                self.select_partner_index(idx, &handles, &ages, partner_chance, &mut partner_rng);
+                self.select_partner_index(idx, &handles, &ages, partner_chance, &mut partner_rng)?;
             let partner_data = partner_index.map(|j| parent_snapshots[j]);
             // Cloning an AgentRuntime is deep (logs, sensor arrays); do it only
             // for the one partner of an actual birth, not the whole population.
@@ -20268,13 +20268,13 @@ impl WorldState {
         ages: &[u32],
         partner_chance: f32,
         rng: &mut dyn RandomStream,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, ScientificStateError> {
         let population = handles.len();
         if population < 2 || partner_chance <= 0.0 {
-            return None;
+            return Ok(None);
         }
         if rng.random_range(0.0..1.0) >= partner_chance {
-            return None;
+            return Ok(None);
         }
         let mut best: Option<(usize, u32, AgentUid)> = None;
         for (idx, age) in ages.iter().enumerate() {
@@ -20282,8 +20282,7 @@ impl WorldState {
                 continue;
             }
             let uid = self
-                .agent_uid(handles[idx])
-                .expect("live partner candidate must have stable identity");
+                .require_agent_uid(handles[idx], || "select_partner_index.candidate".to_owned())?;
             match best {
                 Some((_, best_age, best_uid)) => {
                     if *age > best_age || (*age == best_age && uid < best_uid) {
@@ -20293,7 +20292,7 @@ impl WorldState {
                 None => best = Some((idx, *age, uid)),
             }
         }
-        best.map(|(idx, _, _)| idx)
+        Ok(best.map(|(idx, _, _)| idx))
     }
 
     fn refund_spawn_orders(&mut self, orders: &[SpawnOrder]) {
@@ -21006,11 +21005,12 @@ impl WorldState {
     /// tail is restored first so the row reflects the state at the completed boundary rather
     /// than the mutated live value.
     fn project_agent_states(
-        &self,
+        &mut self,
         handles: &[AgentId],
         force_partial_batch: bool,
     ) -> Vec<AgentState> {
         let mut agents = Vec::with_capacity(handles.len());
+        let mut missing_identity = false;
         for id in handles {
             if let (Some(data), Some(mut runtime)) =
                 (self.agents.snapshot(*id), self.runtime.get(*id).cloned())
@@ -21020,16 +21020,27 @@ impl WorldState {
                 {
                     tail.restore_into(&mut runtime);
                 }
+                // bd-cqja: prepare_persistence returns a projection and cannot carry an error,
+                // so an agent with no stable identity is omitted from the batch and the fault
+                // is latched. Omitting is the honest option: a row keyed by a fabricated
+                // identity would be worse than an absent one, and the latch guarantees the
+                // truncated batch can never be mistaken for a complete tick.
+                let Some(identity) = self.identities.get(*id).copied() else {
+                    missing_identity = true;
+                    continue;
+                };
                 agents.push(AgentState {
                     id: *id,
-                    identity: *self
-                        .identities
-                        .get(*id)
-                        .expect("live agent must have stable identity"),
+                    identity,
                     data,
                     runtime,
                 });
             }
+        }
+        if missing_identity {
+            self.latch_scientific_fault(ScientificStateError::MissingAgentIdentity {
+                path: "project_agent_states".to_owned(),
+            });
         }
         agents.sort_unstable_by_key(|agent| agent.identity.uid);
         agents
