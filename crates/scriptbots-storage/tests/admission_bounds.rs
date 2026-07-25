@@ -277,6 +277,9 @@ fn long_dynamic_strings_and_nested_brain_outputs_cross_the_byte_cap() {
     let mut empty_outputs = batch(4, 0);
     empty_outputs.replay_events.push(ReplayEvent {
         agent_uid: None,
+        position: None,
+        counterpart: None,
+        counterpart_position: None,
         kind: ReplayEventKind::BrainOutputs {
             outputs: Vec::new(),
         },
@@ -286,6 +289,9 @@ fn long_dynamic_strings_and_nested_brain_outputs_cross_the_byte_cap() {
     let mut nested_outputs = batch(5, 0);
     nested_outputs.replay_events.push(ReplayEvent {
         agent_uid: None,
+        position: None,
+        counterpart: None,
+        counterpart_position: None,
         kind: ReplayEventKind::BrainOutputs {
             outputs: vec![0.25; 4_096],
         },

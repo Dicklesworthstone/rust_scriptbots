@@ -48,6 +48,9 @@ fn storage_persists_metrics_roundtrip() {
             deaths: Vec::new(),
             replay_events: vec![ReplayEvent {
                 agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
                 kind: ReplayEventKind::BrainOutputs {
                     outputs: vec![0.25, 0.75],
                 },
@@ -233,5 +236,264 @@ fn narrative_events_persisted_online_are_readable_offline() {
          database; this is the parity the test is named for"
     );
 
+    let _ = fs::remove_file(&path);
+}
+
+/// Build a batch carrying exactly the supplied replay events at `tick`.
+fn batch_with_replay_events(tick: u64, replay_events: Vec<ReplayEvent>) -> PersistenceBatch {
+    PersistenceBatch {
+        summary: TickSummary {
+            tick: Tick(tick),
+            agent_count: 2,
+            births: 0,
+            deaths: 0,
+            total_energy: 0.0,
+            average_energy: 0.0,
+            average_health: 0.0,
+            max_age: 0,
+            spike_hits: 0,
+        },
+        epoch: 0,
+        closed: false,
+        metrics: Vec::new(),
+        events: Vec::new(),
+        agents: Vec::new(),
+        births: Vec::new(),
+        deaths: Vec::new(),
+        replay_events,
+        narrative_events: Vec::new(),
+    }
+}
+
+fn temp_run_path(label: &str) -> std::path::PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_micros();
+    std::env::temp_dir().join(format!(
+        "scriptbots_storage_{label}_{}_{}.sqlite",
+        std::process::id(),
+        timestamp
+    ))
+}
+
+/// An emitted pairwise edge must survive the write path with both participants and both
+/// positions intact, and must be reachable as an interaction without parsing JSON.
+///
+/// This is the persistence half of `bd-2z0.5.9`. It is written against a hand-constructed
+/// event rather than a simulated run ON PURPOSE, and the distinction matters:
+///
+///   * `ReplayEventKind` has no pairwise variant yet, so `counterpart` is `None` at every
+///     emission site in core. A run-driven test would assert `0 == 0` and pass while proving
+///     nothing -- the same shape as the always-empty stream that `replay_event_tick_cap = 0`
+///     produces, and the shape this session has repeatedly found masquerading as coverage.
+///   * Constructing the event here tests the PROJECTION, which is the part storage owns. It
+///     cannot pass vacuously: if `replay_row_from_event` drops a field, or the writer omits a
+///     column, or the writer's pairwise filter is wrong, an assertion below fails.
+///
+/// When core gains a pairwise kind, this test keeps its meaning unchanged and the emission
+/// side becomes a separate, genuinely run-driven assertion.
+#[test]
+fn a_pairwise_replay_event_persists_as_a_queryable_interaction_edge() {
+    let path = temp_run_path("interaction_edge");
+    let path_str = path.to_str().expect("utf8 path");
+
+    let actor = scriptbots_core::AgentUid(7);
+    let target = scriptbots_core::AgentUid(11);
+    let actor_position = scriptbots_core::Position::new(12.5, -3.25);
+    let target_position = scriptbots_core::Position::new(14.0, -2.5);
+
+    {
+        let mut pipeline =
+            StoragePipeline::create_unattributed_file_with_thresholds(path_str, 1, 1, 1, 1)
+                .expect("pipeline");
+        pipeline
+            .submit(&batch_with_replay_events(
+                4,
+                vec![
+                    // The pairwise edge under test.
+                    ReplayEvent {
+                        agent_uid: Some(actor),
+                        position: Some(actor_position),
+                        counterpart: Some(target),
+                        counterpart_position: Some(target_position),
+                        kind: ReplayEventKind::Action {
+                            left_wheel: 0.5,
+                            right_wheel: 0.25,
+                            boost: true,
+                            spike_target: Some(target),
+                            sound_level: 0.125,
+                            give_intent: 0.75,
+                        },
+                    },
+                    // A single-agent event at the same tick. It must not become an edge.
+                    ReplayEvent {
+                        agent_uid: Some(actor),
+                        position: Some(actor_position),
+                        counterpart: None,
+                        counterpart_position: None,
+                        kind: ReplayEventKind::BrainOutputs {
+                            outputs: vec![0.5, 0.5],
+                        },
+                    },
+                ],
+            ))
+            .expect("hand-built replay fixture enters the bounded queue");
+        pipeline.flush_and_wait().expect("flush the staged batch");
+        pipeline.shutdown().expect("durable pipeline shutdown");
+    }
+
+    let storage = StorageReader::open(path_str).expect("open storage after shutdown");
+
+    // Premise: both events were actually written. Without this the exclusion assertion below
+    // would be satisfied by a run that persisted nothing at all.
+    let replayed = storage.load_replay_events().expect("replay events");
+    assert_eq!(
+        replayed.len(),
+        2,
+        "both hand-built events must reach the database before the edge projection can be judged"
+    );
+
+    let edge_event = replayed
+        .iter()
+        .find(|persisted| persisted.event.counterpart.is_some())
+        .expect("the pairwise event must round-trip with its counterpart still set");
+    assert_eq!(edge_event.event.agent_uid, Some(actor));
+    assert_eq!(edge_event.event.counterpart, Some(target));
+    assert_eq!(
+        edge_event.event.position,
+        Some(actor_position),
+        "the emission-time actor position must survive the write path"
+    );
+    assert_eq!(
+        edge_event.event.counterpart_position,
+        Some(target_position),
+        "the emission-time counterpart position must survive the write path"
+    );
+
+    let interactions = storage.recent_interactions(16).expect("interaction edges");
+    assert_eq!(
+        interactions.len(),
+        1,
+        "exactly the pairwise event is an interaction; the single-agent event is not: \
+         {interactions:?}"
+    );
+    let edge = &interactions[0];
+    assert_eq!(edge.tick, 4);
+    assert_eq!(edge.actor, actor);
+    assert_eq!(edge.target, target);
+    assert_eq!(edge.kind, "action");
+    assert_eq!(edge.actor_position, Some(actor_position));
+    assert_eq!(edge.target_position, Some(target_position));
+    assert_eq!(
+        edge.value, None,
+        "no ReplayEventKind carries a magnitude yet; a non-null value here would mean storage \
+         invented a measurement"
+    );
+
+    storage.close().expect("close storage reader");
+
+    // The edge is answerable in SQL by an offline consumer that never links this crate --
+    // the property bd-2z0.5.9 was filed for, and the one a JSON payload could not provide.
+    let reader = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("independent read-only reader opens");
+    let rows = reader
+        .query(
+            "SELECT actor_agent_uid, target_agent_uid, kind FROM interactions
+             ORDER BY tick ASC, seq ASC",
+        )
+        .expect("interactions table is queryable");
+    assert_eq!(rows.len(), 1, "exactly the one edge must be recorded");
+    let actor_uid: i64 = rows[0].get_typed(0).expect("actor_agent_uid is INTEGER");
+    let target_uid: i64 = rows[0].get_typed(1).expect("target_agent_uid is INTEGER");
+    let kind: String = rows[0].get_typed(2).expect("kind is TEXT");
+    assert_eq!(actor_uid, 7);
+    assert_eq!(target_uid, 11);
+    assert_eq!(kind, "action");
+
+    // The accounting identity bd-2z0.5.9 asks for: an interaction row exists for exactly the
+    // replay events that name two participants -- no edge without an event, no pairwise event
+    // without an edge. Expressed as SQL over both tables rather than as two Rust counts, so it
+    // also proves the shared (run_id, tick, seq) key really does join them.
+    let orphans = reader
+        .query(
+            "SELECT
+               (SELECT COUNT(*) FROM interactions i
+                  LEFT JOIN replay_events e
+                    ON e.run_id = i.run_id AND e.tick = i.tick AND e.seq = i.seq
+                 WHERE e.run_id IS NULL),
+               (SELECT COUNT(*) FROM replay_events e
+                  LEFT JOIN interactions i
+                    ON i.run_id = e.run_id AND i.tick = e.tick AND i.seq = e.seq
+                 WHERE e.agent_uid IS NOT NULL
+                   AND e.counterpart_uid IS NOT NULL
+                   AND i.run_id IS NULL)",
+        )
+        .expect("accounting identity query runs");
+    let edges_without_events: i64 = orphans[0].get_typed(0).expect("count is INTEGER");
+    let pairwise_events_without_edges: i64 = orphans[0].get_typed(1).expect("count is INTEGER");
+    assert_eq!(
+        edges_without_events, 0,
+        "an edge exists with no source event"
+    );
+    assert_eq!(
+        pairwise_events_without_edges, 0,
+        "a pairwise event was persisted without its interaction edge"
+    );
+
+    reader.close().expect("read-only reader closes");
+
+    let _ = fs::remove_file(&path);
+}
+
+/// A run whose events name no counterpart must yield an empty interaction set, not an error
+/// and not a row with an invented participant.
+///
+/// The negative half of the guard above. Exercised in both directions because a writer with a
+/// wrong pairwise filter -- say, one that required only an `agent_uid` -- would still satisfy
+/// the positive test while turning every ordinary brain-output event into a fictional edge
+/// between an agent and itself.
+#[test]
+fn events_without_a_counterpart_produce_no_interaction_edges() {
+    let path = temp_run_path("no_interaction_edges");
+    let path_str = path.to_str().expect("utf8 path");
+
+    {
+        let mut pipeline =
+            StoragePipeline::create_unattributed_file_with_thresholds(path_str, 1, 1, 1, 1)
+                .expect("pipeline");
+        pipeline
+            .submit(&batch_with_replay_events(
+                1,
+                vec![ReplayEvent {
+                    agent_uid: Some(scriptbots_core::AgentUid(3)),
+                    position: Some(scriptbots_core::Position::new(1.0, 2.0)),
+                    counterpart: None,
+                    counterpart_position: None,
+                    kind: ReplayEventKind::BrainOutputs {
+                        outputs: vec![0.1, 0.2],
+                    },
+                }],
+            ))
+            .expect("single-agent fixture enters the bounded queue");
+        pipeline.flush_and_wait().expect("flush the staged batch");
+        pipeline.shutdown().expect("durable pipeline shutdown");
+    }
+
+    let storage = StorageReader::open(path_str).expect("open storage after shutdown");
+    assert_eq!(
+        storage.load_replay_events().expect("replay events").len(),
+        1,
+        "premise: the event was persisted, so an empty interaction set is a real exclusion \
+         rather than an empty database"
+    );
+    assert!(
+        storage
+            .recent_interactions(16)
+            .expect("interaction edges")
+            .is_empty(),
+        "an event with no counterpart is not an interaction"
+    );
+    storage.close().expect("close storage reader");
     let _ = fs::remove_file(&path);
 }

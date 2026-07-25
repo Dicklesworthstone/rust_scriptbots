@@ -63,6 +63,9 @@ fn synth_db_with_replay(dir: &tempfile::TempDir, include_replay: bool) -> String
         if include_replay && tick == 1 {
             tick_batch.replay_events.push(ReplayEvent {
                 agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
                 kind: ReplayEventKind::RngSample {
                     scope: ReplayRngScope::World,
                     range_min: 0.0,
@@ -74,6 +77,9 @@ fn synth_db_with_replay(dir: &tempfile::TempDir, include_replay: bool) -> String
         if include_replay && tick == 3 {
             tick_batch.replay_events.push(ReplayEvent {
                 agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
                 kind: ReplayEventKind::BrainOutputs {
                     outputs: vec![0.5, -0.25],
                 },

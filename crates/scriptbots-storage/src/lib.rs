@@ -41,8 +41,8 @@ use journal::{
 use scriptbots_core::{
     AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding,
     DeathCause, DeathRecord, Generation, PersistenceAdmissionError, PersistenceAdmissionState,
-    PersistenceBatch, PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind,
-    ReplayRngScope, Tick, WorldPersistence,
+    PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase, ReplayEvent,
+    ReplayEventKind, ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
     rng_domains::{AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain},
     world_counters_digest_v1,
@@ -181,9 +181,10 @@ pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
 const SCRIPTBOTS_SCHEMA_V6_VERSION: i64 = 6;
 const SCRIPTBOTS_SCHEMA_V7_VERSION: i64 = 7;
 const SCRIPTBOTS_SCHEMA_V8_VERSION: i64 = 8;
+const SCRIPTBOTS_SCHEMA_V9_VERSION: i64 = 9;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 9;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 10;
 
 /// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
@@ -1002,6 +1003,39 @@ pub const SCRIPTBOTS_SCHEMA_V9: &str = r#"
     PRAGMA user_version = 9;
 "#;
 
+/// V10 migration: carry the emission-time positions and the pairwise counterpart that
+/// [`scriptbots_core::ReplayEvent`] gained, and expose the pairwise subset as a view.
+///
+/// WHY COLUMNS AND NOT JSON. `payload` already exists and would have absorbed these fields
+/// without a migration. That is exactly what bd-2z0.5.9 was filed to stop: aggregate counts
+/// plus a JSON blob cannot answer a graph question without parsing every row, and the parse
+/// is schema-fragile in a way a column is not. An interaction edge is a first-class fact.
+///
+/// NO NEW TABLE, AND EMPHATICALLY NOT A VIEW NAMED `interactions`. The `interactions` table
+/// bd-2z0.5.9 asks for has existed since V6 (see the V6 DDL above), with the exact columns the
+/// bead specifies and two purpose-built indexes -- and with no writer anywhere in the
+/// workspace. It was declared and never wired. This migration therefore adds only what is
+/// genuinely absent, and the accompanying writer fills the table that was already there.
+///
+/// A view of that name would also have been unshippable: it fails on every existing database
+/// with "table interactions already exists", which a fresh-install test would never have
+/// caught because a fresh install runs V6 first and hits the same collision.
+///
+/// NULLABLE, DELIBERATELY. Every column added here is optional on the event itself. A
+/// world-level fact such as the digest anchor has no position and no participants, and a
+/// synthetic centroid would be an invented value indistinguishable from a measured one.
+/// Rows written before this migration are genuinely unknown rather than zero, and NULL is
+/// the only honest encoding of that.
+const SCRIPTBOTS_SCHEMA_V10: &str = r#"
+    ALTER TABLE replay_events ADD COLUMN position_x REAL;
+    ALTER TABLE replay_events ADD COLUMN position_y REAL;
+    ALTER TABLE replay_events ADD COLUMN counterpart_uid INTEGER;
+    ALTER TABLE replay_events ADD COLUMN counterpart_position_x REAL;
+    ALTER TABLE replay_events ADD COLUMN counterpart_position_y REAL;
+
+    PRAGMA user_version = 10;
+"#;
+
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaObject {
     object_type: String,
@@ -1025,7 +1059,11 @@ impl SchemaObject {
 
 fn refuse_lossy_command_lifecycle_migration(connection: &Connection) -> Result<(), StorageError> {
     let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
-    if user_version >= SCRIPTBOTS_SCHEMA_VERSION {
+    // Anchored at V9, the version this preflight is about, rather than at the current version.
+    // Written as `>= SCRIPTBOTS_SCHEMA_VERSION` it would silently re-arm on every later schema
+    // bump: a database already carrying complete V9 lifecycle evidence would be re-inspected
+    // and refused for archives the V9 migration had already accepted.
+    if user_version >= SCRIPTBOTS_SCHEMA_V9_VERSION {
         return Ok(());
     }
     let archive_table_count: i64 = connection
@@ -1072,18 +1110,33 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
             SCRIPTBOTS_SCHEMA_V8,
         )
         .add(
-            SCRIPTBOTS_SCHEMA_VERSION,
+            SCRIPTBOTS_SCHEMA_V9_VERSION,
             "add_host_command_lifecycle_projection",
             SCRIPTBOTS_SCHEMA_V9,
         )
+        .add(
+            SCRIPTBOTS_SCHEMA_VERSION,
+            "add_replay_event_interaction_edges",
+            SCRIPTBOTS_SCHEMA_V10,
+        )
         .run(connection)?;
+    // Every suffix of the chain is a legal lineage: a database joins at whatever version it
+    // was left at and runs forward from there. Enumerated rather than computed so that adding
+    // a migration without extending this list fails loudly instead of accepting a gap.
     let applied_is_valid = result.applied.is_empty()
         || result.applied == [SCRIPTBOTS_SCHEMA_VERSION]
-        || result.applied == [SCRIPTBOTS_SCHEMA_V8_VERSION, SCRIPTBOTS_SCHEMA_VERSION]
+        || result.applied == [SCRIPTBOTS_SCHEMA_V9_VERSION, SCRIPTBOTS_SCHEMA_VERSION]
+        || result.applied
+            == [
+                SCRIPTBOTS_SCHEMA_V8_VERSION,
+                SCRIPTBOTS_SCHEMA_V9_VERSION,
+                SCRIPTBOTS_SCHEMA_VERSION,
+            ]
         || result.applied
             == [
                 SCRIPTBOTS_SCHEMA_V7_VERSION,
                 SCRIPTBOTS_SCHEMA_V8_VERSION,
+                SCRIPTBOTS_SCHEMA_V9_VERSION,
                 SCRIPTBOTS_SCHEMA_VERSION,
             ]
         || result.applied
@@ -1091,6 +1144,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
                 SCRIPTBOTS_SCHEMA_V6_VERSION,
                 SCRIPTBOTS_SCHEMA_V7_VERSION,
                 SCRIPTBOTS_SCHEMA_V8_VERSION,
+                SCRIPTBOTS_SCHEMA_V9_VERSION,
                 SCRIPTBOTS_SCHEMA_VERSION,
             ];
     if result.current != SCRIPTBOTS_SCHEMA_VERSION || !applied_is_valid {
@@ -3743,6 +3797,23 @@ struct ReplayEventRow {
     scope: String,
     event_type: String,
     payload: String,
+    /// Emission-time position of [`Self::agent_uid`], carried from the event rather than
+    /// resolved here. Looking it up from live agent state would record where the agent is now,
+    /// not where the fact happened.
+    ///
+    /// `#[serde(default)]` is a DURABILITY requirement, not a style choice. This struct is
+    /// serialized into the outbox payload, so a batch admitted by a pre-V10 binary and then
+    /// recovered by a post-V10 one presents JSON with these keys absent. Without an explicit
+    /// default that recovery is a deserialization failure -- an in-flight batch that was
+    /// durably admitted becoming unreplayable purely because the record grew. Absent means
+    /// "the emitter did not record a position", which is exactly `None`.
+    #[serde(default)]
+    position: Option<(f64, f64)>,
+    /// The other participant of an inherently pairwise event, and where it was.
+    #[serde(default)]
+    counterpart: Option<i64>,
+    #[serde(default)]
+    counterpart_position: Option<(f64, f64)>,
 }
 
 /// Aggregate event count grouped by replay event type.
@@ -3866,6 +3937,33 @@ pub struct PersistedReplayEvent {
     pub tick: u64,
     pub seq: u64,
     pub event: ReplayEvent,
+}
+
+/// One directed interaction edge: who did what to whom, and where.
+///
+/// Assembled from the `interactions` row and the `replay_events` row it was derived from, which
+/// share a primary key. This type deliberately carries no field neither table has -- it is a
+/// shape for reading an edge, not a second definition of one. `kind` and `payload` pass through
+/// verbatim so a new pairwise event kind becomes queryable without a storage change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedInteraction {
+    pub tick: u64,
+    pub seq: u64,
+    pub kind: String,
+    pub actor: AgentUid,
+    pub target: AgentUid,
+    /// Magnitude of the interaction -- damage dealt, energy transferred.
+    ///
+    /// `None` for every edge today: no `ReplayEventKind` variant carries a magnitude yet, and
+    /// deriving one from the payload here would make storage the author of a measurement it
+    /// did not take.
+    pub value: Option<f64>,
+    /// Where the actor was when it acted, if the emitter recorded it.
+    pub actor_position: Option<Position>,
+    /// Where the target was at the same instant, if the emitter recorded it.
+    pub target_position: Option<Position>,
+    /// The event's own payload, verbatim.
+    pub payload: String,
 }
 
 /// Checkpoint record reconstructed from persisted storage.
@@ -4005,6 +4103,10 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
     const AGENT_BYTES: usize = 512;
     const BIRTH_BYTES: usize = 192;
     const DEATH_BYTES: usize = 192;
+    // Re-examined when V10 widened the record by an optional counterpart uid and two optional
+    // positions (about 40 bytes). 512 still covers the fixed part with room to spare, so the
+    // constant is unchanged -- but the check is the point. bd-erff was an estimator that had
+    // drifted from what the writer actually wrote, and a record can only grow silently once.
     const REPLAY_BYTES: usize = 512;
     const SUMMARY_BYTES: usize = 256;
 
@@ -5165,6 +5267,17 @@ fn sqlite_optional_i64(value: Option<i64>) -> SqliteValue {
 
 fn sqlite_optional_text(value: Option<&str>) -> SqliteValue {
     value.map_or(SqliteValue::Null, SqliteValue::from)
+}
+
+/// Split an optional position into two bound values that are NULL or non-NULL together.
+///
+/// Returning the pair from one call is what keeps them consistent: binding the coordinates
+/// from two independent `Option` expressions is how a row ends up with an x and no y, which
+/// no reader could interpret and no CHECK constraint on a single column would catch.
+fn split_optional_position(position: Option<(f64, f64)>) -> (SqliteValue, SqliteValue) {
+    position.map_or((SqliteValue::Null, SqliteValue::Null), |(x, y)| {
+        (SqliteValue::from(x), SqliteValue::from(y))
+    })
 }
 
 fn decode_birth_origin(value: &str) -> Result<BirthOrigin, StorageError> {
@@ -6903,23 +7016,12 @@ impl StorageReader {
 
     /// Load replay events in deterministic tick/sequence order.
     pub fn load_replay_events(&self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
-        let rows = self.connection()?.query_with_params(
-            "SELECT tick, seq, agent_uid, scope, event_type, payload
-             FROM replay_events
-             WHERE run_id = ?1
-             ORDER BY tick ASC, seq ASC",
-            &[sqlite_run_id(self.run_id)],
-        )?;
+        let rows = self
+            .connection()?
+            .query_with_params(REPLAY_EVENT_SELECT_ASCENDING, &[sqlite_run_id(self.run_id)])?;
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let replay_row = ReplayEventRow {
-                tick: decode(&row, 0, "replay_events.tick")?,
-                seq: decode(&row, 1, "replay_events.seq")?,
-                agent_uid: decode(&row, 2, "replay_events.agent_uid")?,
-                scope: decode(&row, 3, "replay_events.scope")?,
-                event_type: decode(&row, 4, "replay_events.event_type")?,
-                payload: decode(&row, 5, "replay_events.payload")?,
-            };
+            let replay_row = replay_event_row_from_query_row(&row)?;
             let event = replay_event_from_row(&replay_row)?;
             events.push(PersistedReplayEvent {
                 tick: checked_u64("replay_events.tick", replay_row.tick)?,
@@ -6940,23 +7042,12 @@ impl StorageReader {
         }
         let bound = checked_query_limit("recent_replay_events.limit", limit)?;
         let rows = self.connection()?.query_with_params(
-            "SELECT tick, seq, agent_uid, scope, event_type, payload
-             FROM replay_events
-             WHERE run_id = ?1
-             ORDER BY tick DESC, seq DESC
-             LIMIT ?2",
+            REPLAY_EVENT_SELECT_DESCENDING_BOUNDED,
             &[sqlite_run_id(self.run_id), bound.into()],
         )?;
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let replay_row = ReplayEventRow {
-                tick: decode(&row, 0, "replay_events.tick")?,
-                seq: decode(&row, 1, "replay_events.seq")?,
-                agent_uid: decode(&row, 2, "replay_events.agent_uid")?,
-                scope: decode(&row, 3, "replay_events.scope")?,
-                event_type: decode(&row, 4, "replay_events.event_type")?,
-                payload: decode(&row, 5, "replay_events.payload")?,
-            };
+            let replay_row = replay_event_row_from_query_row(&row)?;
             events.push(PersistedReplayEvent {
                 tick: checked_u64("replay_events.tick", replay_row.tick)?,
                 seq: checked_u64("replay_events.seq", replay_row.seq)?,
@@ -6965,6 +7056,98 @@ impl StorageReader {
         }
         events.reverse();
         Ok(events)
+    }
+
+    /// Load a bounded page of the newest interaction edges in chronological order.
+    ///
+    /// Reads the `interactions` table rather than filtering `replay_events` here, so that SQL
+    /// consumers (the fnx interaction-centrality report, energy-flow accounting) and Rust
+    /// consumers answer from the same rows. A predicate duplicated in Rust would be free to
+    /// disagree with what the writer actually recorded.
+    ///
+    /// That table has existed since the V6 schema, indexed on both actor and target, with no
+    /// writer anywhere in the workspace until `Storage::insert_interactions`. Anything that
+    /// queried it before now got an empty answer from a table that looked deliberately built.
+    ///
+    /// Returns an empty page when the run recorded no pairwise events. That is the CURRENT
+    /// state of every run: `ReplayEventKind` has no pairwise variant yet, so `counterpart` is
+    /// `None` at every emission site in core. This reader is the persistence half of
+    /// `bd-2z0.5.9` and is wired ahead of the emission half deliberately -- an event kind
+    /// arriving later flows through without another schema change. Do not read an empty result
+    /// as evidence that a run had no interactions.
+    pub fn recent_interactions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PersistedInteraction>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bound = checked_query_limit("recent_interactions.limit", limit)?;
+        // Joined to `replay_events` on the shared (run_id, tick, seq) key rather than copying
+        // coordinates into `interactions`. The edge and the geometry are the same fact recorded
+        // once each: duplicating position into both tables would create two answers to "where
+        // did this happen" that nothing keeps in agreement. LEFT JOIN because an edge is still
+        // a real edge if the emitter recorded no position.
+        let rows = self.connection()?.query_with_params(
+            "SELECT i.tick, i.seq, i.kind, i.actor_agent_uid, i.target_agent_uid,
+                    i.value, i.payload_json,
+                    e.position_x, e.position_y,
+                    e.counterpart_position_x, e.counterpart_position_y
+             FROM interactions i
+             LEFT JOIN replay_events e
+                    ON e.run_id = i.run_id AND e.tick = i.tick AND e.seq = i.seq
+             WHERE i.run_id = ?1
+             ORDER BY i.tick DESC, i.seq DESC
+             LIMIT ?2",
+            &[sqlite_run_id(self.run_id), bound.into()],
+        )?;
+        let mut interactions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tick: i64 = decode(&row, 0, "interactions.tick")?;
+            let seq: i64 = decode(&row, 1, "interactions.seq")?;
+            // Decoded as optional and then required. The column is nullable in the schema, so
+            // an edge missing a participant is representable; reporting which one is missing
+            // beats decoding a NULL into a type error that names neither row nor column.
+            let actor =
+                decode_agent_uid(decode(&row, 3, "interactions.actor_agent_uid")?, tick, seq)?
+                    .ok_or_else(|| StorageError::InvalidData {
+                        context: "interactions.actor_agent_uid",
+                        reason: format!("interaction has no actor at tick {tick}, seq {seq}"),
+                    })?;
+            let target =
+                decode_agent_uid(decode(&row, 4, "interactions.target_agent_uid")?, tick, seq)?
+                    .ok_or_else(|| StorageError::InvalidData {
+                        context: "interactions.target_agent_uid",
+                        reason: format!("interaction has no target at tick {tick}, seq {seq}"),
+                    })?;
+            interactions.push(PersistedInteraction {
+                tick: checked_u64("interactions.tick", tick)?,
+                seq: checked_u64("interactions.seq", seq)?,
+                kind: decode(&row, 2, "interactions.kind")?,
+                actor,
+                target,
+                value: decode(&row, 5, "interactions.value")?,
+                payload: decode(&row, 6, "interactions.payload_json")?,
+                actor_position: paired_position(
+                    decode(&row, 7, "replay_events.position_x")?,
+                    decode(&row, 8, "replay_events.position_y")?,
+                    "interactions.actor_position",
+                    tick,
+                    seq,
+                )?
+                .map(position_from_columns),
+                target_position: paired_position(
+                    decode(&row, 9, "replay_events.counterpart_position_x")?,
+                    decode(&row, 10, "replay_events.counterpart_position_y")?,
+                    "interactions.target_position",
+                    tick,
+                    seq,
+                )?
+                .map(position_from_columns),
+            });
+        }
+        interactions.reverse();
+        Ok(interactions)
     }
 
     /// Load checkpoints in tick/ordinal order.
@@ -8795,15 +8978,11 @@ impl Storage {
             "SELECT version, name FROM _schema_migrations
              ORDER BY version ASC",
         )?;
-        if migrations.len() != 4 {
-            return Err(StorageError::InvalidData {
-                context: "storage.recovery_schema",
-                reason: format!(
-                    "expected exactly four ScriptBots migrations through v9, found {}",
-                    migrations.len()
-                ),
-            });
-        }
+        // Declared before the length check so the count and the message are DERIVED from the
+        // chain rather than restated as literals. The previous form said "exactly four ...
+        // through v9" in a hand-written string, which is the bd-u8ti defect: a schema bump
+        // leaves the assertion describing a version that no longer exists, and the reader
+        // trusts the sentence over the code.
         let expected_migrations = [
             (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
@@ -8812,10 +8991,24 @@ impl Storage {
                 "add_host_domain_event_projection",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V9_VERSION,
                 "add_host_command_lifecycle_projection",
             ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_replay_event_interaction_edges",
+            ),
         ];
+        if migrations.len() != expected_migrations.len() {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_schema",
+                reason: format!(
+                    "expected exactly {} ScriptBots migrations through v{SCRIPTBOTS_SCHEMA_VERSION}, found {}",
+                    expected_migrations.len(),
+                    migrations.len()
+                ),
+            });
+        }
         for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
             let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
             let actual_name: String = decode(row, 1, "_schema_migrations.name")?;
@@ -12419,9 +12612,13 @@ impl Storage {
             return Ok(());
         }
         let sql = "insert or replace into replay_events (
-                run_id, tick, seq, agent_uid, scope, event_type, payload
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+                run_id, tick, seq, agent_uid, scope, event_type, payload,
+                position_x, position_y,
+                counterpart_uid, counterpart_position_x, counterpart_position_y
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
         for row in rows {
+            let (position_x, position_y) = split_optional_position(row.position);
+            let (counterpart_x, counterpart_y) = split_optional_position(row.counterpart_position);
             tx.execute_with_params(
                 sql,
                 &[
@@ -12431,6 +12628,57 @@ impl Storage {
                     sqlite_optional_i64(row.agent_uid),
                     row.scope.as_str().into(),
                     row.event_type.as_str().into(),
+                    row.payload.as_str().into(),
+                    position_x,
+                    position_y,
+                    sqlite_optional_i64(row.counterpart),
+                    counterpart_x,
+                    counterpart_y,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Project the pairwise subset of this flush's replay events into `interactions`.
+    ///
+    /// DERIVED FROM `buffer.replay_events` RATHER THAN BUFFERED SEPARATELY, on purpose. A
+    /// second `StorageBuffer` field would need appending, clearing, counting, and emptiness
+    /// checks kept in agreement across four methods -- and `run_events` proved that is exactly
+    /// where rows go missing, declared on the struct and wired into none of them. Deriving at
+    /// flush time makes "every pairwise replay event has an interaction row" true by
+    /// construction instead of true by maintenance.
+    ///
+    /// Keyed by the source event's own `(tick, seq)`, so `insert or replace` is idempotent
+    /// under recovery replay for the same reason the replay row is, and the edge joins back to
+    /// the event it came from without a surrogate key.
+    ///
+    /// `value` is NULL today. It is the column for a magnitude -- combat damage, transfer
+    /// amount -- and no `ReplayEventKind` variant carries one yet, so writing anything else
+    /// would be inventing a measurement. `payload_json` carries the event payload verbatim, so
+    /// a kind that gains a magnitude becomes queryable before this function changes.
+    fn insert_interactions(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[ReplayEventRow],
+    ) -> Result<(), FrankenError> {
+        let sql = "insert or replace into interactions (
+                run_id, tick, seq, actor_agent_uid, target_agent_uid, kind, value, payload_json
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+        for row in rows {
+            let (Some(actor), Some(target)) = (row.agent_uid, row.counterpart) else {
+                continue;
+            };
+            tx.execute_with_params(
+                sql,
+                &[
+                    sqlite_run_id(run_id),
+                    row.tick.into(),
+                    row.seq.into(),
+                    actor.into(),
+                    target.into(),
+                    row.event_type.as_str().into(),
+                    SqliteValue::Null,
                     row.payload.as_str().into(),
                 ],
             )?;
@@ -12496,6 +12744,9 @@ impl Storage {
                 HostJournalFaultPoint::PersistenceAfterDeaths,
             )?;
             Self::insert_replay_events(&tx, run_id, &buffer.replay_events)?;
+            // Same transaction and same source slice as the replay rows above, so an edge can
+            // never be committed without the event it was derived from, nor the reverse.
+            Self::insert_interactions(&tx, run_id, &buffer.replay_events)?;
             Self::insert_run_events(&tx, run_id, &buffer.run_events)?;
             #[cfg(test)]
             fail_at_host_journal_transaction_fault(
@@ -12878,23 +13129,12 @@ impl Storage {
     /// Load all replay events ordered by tick/sequence and reconstruct their payloads.
     pub fn load_replay_events(&mut self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
         self.flush()?;
-        let rows = self.connection()?.query_with_params(
-            "SELECT tick, seq, agent_uid, scope, event_type, payload
-             from replay_events
-             WHERE run_id = ?1
-             ORDER BY tick ASC, seq ASC",
-            &[sqlite_run_id(self.run_id)],
-        )?;
+        let rows = self
+            .connection()?
+            .query_with_params(REPLAY_EVENT_SELECT_ASCENDING, &[sqlite_run_id(self.run_id)])?;
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let replay_row = ReplayEventRow {
-                tick: decode(&row, 0, "replay_events.tick")?,
-                seq: decode(&row, 1, "replay_events.seq")?,
-                agent_uid: decode(&row, 2, "replay_events.agent_uid")?,
-                scope: decode(&row, 3, "replay_events.scope")?,
-                event_type: decode(&row, 4, "replay_events.event_type")?,
-                payload: decode(&row, 5, "replay_events.payload")?,
-            };
+            let replay_row = replay_event_row_from_query_row(&row)?;
             let event = replay_event_from_row(&replay_row)?;
             events.push(PersistedReplayEvent {
                 tick: checked_u64("replay_events.tick", replay_row.tick)?,
@@ -15671,6 +15911,21 @@ fn replay_row_from_event(
         }
     };
 
+    // Positions are validated here rather than left to a CHECK constraint: a non-finite
+    // coordinate reaching the transaction would abort the whole batch and take the tick's
+    // science with it, where a typed InvalidData names the offending field before admission.
+    let finite_position = |position: Option<Position>,
+                           context: &'static str|
+     -> Result<Option<(f64, f64)>, StorageError> {
+        match position {
+            None => Ok(None),
+            Some(position) if position.x.is_finite() && position.y.is_finite() => {
+                Ok(Some((f64::from(position.x), f64::from(position.y))))
+            }
+            Some(_) => Err(invalid_non_finite(context)),
+        }
+    };
+
     Ok(ReplayEventRow {
         tick,
         seq: checked_i64("replay_events.seq", seq)?,
@@ -15678,6 +15933,12 @@ fn replay_row_from_event(
         scope,
         event_type,
         payload: payload_value.to_string(),
+        position: finite_position(event.position, "replay_events.position")?,
+        counterpart: optional_agent_uid("replay_events.counterpart", event.counterpart)?,
+        counterpart_position: finite_position(
+            event.counterpart_position,
+            "replay_events.counterpart_position",
+        )?,
     })
 }
 
@@ -15789,6 +16050,92 @@ struct WorldDigestPayload {
     overall: String,
 }
 
+/// Column list shared by every `replay_events` reader.
+///
+/// Written once because the columns and the positional [`decode`] indices in
+/// [`replay_event_row_from_query_row`] have to agree. When each reader carried its own copy,
+/// extending the table meant remembering to widen every one of them -- and a reader left
+/// un-widened does not fail, it silently returns rows with the new fields absent.
+macro_rules! replay_event_columns {
+    () => {
+        "tick, seq, agent_uid, scope, event_type, payload,
+         position_x, position_y,
+         counterpart_uid, counterpart_position_x, counterpart_position_y"
+    };
+}
+
+const REPLAY_EVENT_SELECT_ASCENDING: &str = concat!(
+    "SELECT ",
+    replay_event_columns!(),
+    " FROM replay_events
+     WHERE run_id = ?1
+     ORDER BY tick ASC, seq ASC"
+);
+
+const REPLAY_EVENT_SELECT_DESCENDING_BOUNDED: &str = concat!(
+    "SELECT ",
+    replay_event_columns!(),
+    " FROM replay_events
+     WHERE run_id = ?1
+     ORDER BY tick DESC, seq DESC
+     LIMIT ?2"
+);
+
+/// Rebuild a [`ReplayEventRow`] from a query row selected with `replay_event_columns!()`.
+fn replay_event_row_from_query_row(row: &Row) -> Result<ReplayEventRow, StorageError> {
+    let tick: i64 = decode(row, 0, "replay_events.tick")?;
+    let seq: i64 = decode(row, 1, "replay_events.seq")?;
+    Ok(ReplayEventRow {
+        tick,
+        seq,
+        agent_uid: decode(row, 2, "replay_events.agent_uid")?,
+        scope: decode(row, 3, "replay_events.scope")?,
+        event_type: decode(row, 4, "replay_events.event_type")?,
+        payload: decode(row, 5, "replay_events.payload")?,
+        position: paired_position(
+            decode(row, 6, "replay_events.position_x")?,
+            decode(row, 7, "replay_events.position_y")?,
+            "replay_events.position",
+            tick,
+            seq,
+        )?,
+        counterpart: decode(row, 8, "replay_events.counterpart_uid")?,
+        counterpart_position: paired_position(
+            decode(row, 9, "replay_events.counterpart_position_x")?,
+            decode(row, 10, "replay_events.counterpart_position_y")?,
+            "replay_events.counterpart_position",
+            tick,
+            seq,
+        )?,
+    })
+}
+
+/// Refuse a half-written coordinate pair rather than inventing the missing half.
+///
+/// A row with an x and no y cannot be interpreted: the alternatives are to guess zero, which
+/// puts the event at the world origin and looks like a real measurement, or to drop the
+/// position, which silently discards a fact that WAS recorded. Both are worse than refusing.
+fn paired_position(
+    x: Option<f64>,
+    y: Option<f64>,
+    context: &'static str,
+    tick: i64,
+    seq: i64,
+) -> Result<Option<(f64, f64)>, StorageError> {
+    match (x, y) {
+        (None, None) => Ok(None),
+        (Some(x), Some(y)) => Ok(Some((x, y))),
+        (present_x, _) => Err(StorageError::InvalidData {
+            context,
+            reason: format!(
+                "half-written coordinate pair at tick {tick}, seq {seq}: {} present, {} missing",
+                if present_x.is_some() { "x" } else { "y" },
+                if present_x.is_some() { "y" } else { "x" },
+            ),
+        }),
+    }
+}
+
 fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageError> {
     let agent_uid = decode_agent_uid(row.agent_uid, row.tick, row.seq)?;
     let kind = match row.event_type.as_str() {
@@ -15869,7 +16216,25 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
         }
     };
 
-    Ok(ReplayEvent { agent_uid, kind })
+    // Reconstructed from the dedicated columns, never from the payload. Round-tripping through
+    // `payload` would make the JSON blob a second authority on where an event happened, and the
+    // two would drift the first time either side changed its serialization.
+    Ok(ReplayEvent {
+        agent_uid,
+        position: row.position.map(position_from_columns),
+        counterpart: decode_agent_uid(row.counterpart, row.tick, row.seq)?,
+        counterpart_position: row.counterpart_position.map(position_from_columns),
+        kind,
+    })
+}
+
+/// Narrow persisted `REAL` coordinates back to the `f32` the world uses.
+///
+/// Lossless in this direction: the columns only ever hold values widened from `f32` by
+/// [`replay_row_from_event`], so the narrowing recovers exactly the emitted coordinate.
+#[allow(clippy::cast_possible_truncation)]
+fn position_from_columns((x, y): (f64, f64)) -> Position {
+    Position::new(x as f32, y as f32)
 }
 
 fn birth_row_from_record(record: &BirthRecord) -> Result<BirthRow, StorageError> {
@@ -17085,11 +17450,35 @@ mod tests {
 
         let production_connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&production_connection)?;
-        assert_eq!(
-            normalized_scientific_schema(&connection)?,
-            normalized_scientific_schema(&production_connection)?,
-            "exported scientific DDL drifted from the production migration result"
-        );
+
+        // The V6 constant must remain a standalone-executable EXPORT of the scientific schema
+        // and must not diverge from production -- but "must not diverge" is not the same as
+        // "must be identical", and this asserted identity until V10.
+        //
+        // Identity held only while every migration after V6 confined itself to host-journal
+        // tables. V10 extends `replay_events`, so production now legitimately has columns the
+        // V6 export does not. Demanding equality here would have forced the interaction edge
+        // into a parallel table or a JSON blob to avoid tripping a test -- the test dictating
+        // the schema rather than checking it.
+        //
+        // What must hold is that production is a SUPERSET: every object the export defines
+        // still exists in production, and no object was renamed or dropped out from under a
+        // consumer of the export. Column-level extension is checked separately by
+        // `v6_scientific_schema_is_only_ever_extended_by_later_migrations`.
+        let exported = normalized_scientific_schema(&connection)?;
+        let production = normalized_scientific_schema(&production_connection)?;
+        let production_names: BTreeSet<(String, String)> = production
+            .iter()
+            .map(|(object_type, name, _, _)| (object_type.clone(), name.clone()))
+            .collect();
+        assert!(!exported.is_empty(), "the V6 export defined no objects");
+        for (object_type, name, table, _) in &exported {
+            assert!(
+                production_names.contains(&(object_type.clone(), name.clone())),
+                "the production migration chain dropped or renamed exported {object_type} \
+                 {name} on {table}"
+            );
+        }
 
         let table_names = connection
             .query(
@@ -17908,9 +18297,14 @@ mod tests {
             }
             Err(error) => error,
         };
+        // Names the fixture. This helper is called with several databases in one test, and
+        // without the path a failure says only that "recovery" produced the wrong error --
+        // leaving the reader to guess which of them, which is how the V10 bump turned a
+        // one-line fixture problem into a long diagnosis.
         assert!(
             error.to_string().contains(expected_error_fragment),
-            "unexpected recovery error: {error}"
+            "recovering {} produced the wrong refusal:\n  expected to contain: {expected_error_fragment:?}\n  actual: {error}",
+            path.display()
         );
         assert_eq!(
             fs::read(path)?,
@@ -18017,7 +18411,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v9_schema_records_exact_ledger_and_is_idempotent()
+    fn fresh_schema_records_exact_ledger_and_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&connection)?;
@@ -18025,7 +18419,6 @@ mod tests {
         let first_schema = read_schema_objects(&connection)?;
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 4);
         let expected = [
             (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
@@ -18034,10 +18427,15 @@ mod tests {
                 "add_host_domain_event_projection",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V9_VERSION,
                 "add_host_command_lifecycle_projection",
             ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_replay_event_interaction_edges",
+            ),
         ];
+        assert_eq!(migrations.len(), expected.len());
         for (row, (expected_version, expected_name)) in migrations.iter().zip(expected) {
             assert_eq!(
                 decode::<i64>(row, 0, "_schema_migrations.version")?,
@@ -18057,15 +18455,89 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _schema_migrations")?
             .get_typed(0)?;
         assert_eq!(
-            migration_count, 4,
+            migration_count,
+            i64::try_from(expected.len())?,
             "idempotent install duplicated its ledger"
         );
         connection.close()?;
         Ok(())
     }
 
+    /// A batch admitted before V10 must still replay after the record grew.
+    ///
+    /// `ReplayEventRow` is serialized into the durable outbox payload, so this is a durability
+    /// property rather than a serde detail. If a pre-V10 binary durably admitted a batch and a
+    /// post-V10 binary recovers it, the stored JSON has no position or counterpart keys. Those
+    /// must deserialize to `None`, because the alternative is that a batch which was already
+    /// promised durable becomes unreplayable purely because the record gained fields -- data
+    /// loss caused by an additive change.
+    ///
+    /// Exercised in both directions: the legacy payload must load, and a payload written now
+    /// must round-trip its new fields rather than quietly discarding them on the way back.
     #[test]
-    fn v6_schema_upgrades_additively_to_the_exact_v9_lineage()
+    fn an_outbox_row_predating_the_position_columns_still_replays() {
+        let legacy = r#"{
+            "tick": 7,
+            "seq": 2,
+            "agent_uid": 11,
+            "scope": "agent:action",
+            "event_type": "action",
+            "payload": "{}"
+        }"#;
+        let row: ReplayEventRow = serde_json::from_str(legacy)
+            .expect("a pre-V10 outbox row must still deserialize after the record grew");
+        assert_eq!(row.tick, 7);
+        assert_eq!(row.agent_uid, Some(11));
+        assert_eq!(row.position, None);
+        assert_eq!(row.counterpart, None);
+        assert_eq!(row.counterpart_position, None);
+
+        let modern = ReplayEventRow {
+            tick: 7,
+            seq: 2,
+            agent_uid: Some(11),
+            scope: "agent:action".to_owned(),
+            event_type: "action".to_owned(),
+            payload: "{}".to_owned(),
+            position: Some((1.5, -2.5)),
+            counterpart: Some(13),
+            counterpart_position: Some((3.0, 4.0)),
+        };
+        let encoded = serde_json::to_string(&modern).expect("row serializes");
+        let decoded: ReplayEventRow =
+            serde_json::from_str(&encoded).expect("row survives a round trip");
+        assert_eq!(decoded.position, Some((1.5, -2.5)));
+        assert_eq!(decoded.counterpart, Some(13));
+        assert_eq!(decoded.counterpart_position, Some((3.0, 4.0)));
+    }
+
+    /// Column names of one table, in declaration order.
+    fn table_columns(
+        connection: &Connection,
+        table: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let rows = connection.query(&format!("PRAGMA table_info({table})"))?;
+        rows.iter()
+            .map(|row| Ok(decode::<String>(row, 1, "table_info.name")?))
+            .collect()
+    }
+
+    /// The V6 scientific schema may be EXTENDED by a later migration, never rewritten.
+    ///
+    /// This replaces a byte-equality assertion that read "the additive host-journal migration
+    /// changed the frozen V6 scientific schema". That held only while every migration after V6
+    /// confined itself to host-journal tables, and V10 deliberately does not: it adds the
+    /// emission-time position and pairwise counterpart columns to `replay_events`.
+    ///
+    /// Equality was never the property worth protecting -- it merely happened to be true, and
+    /// keeping it would have forced the interaction edge into a parallel table or a JSON blob to
+    /// avoid tripping a test. The property that MATTERS is that an existing run database is never
+    /// reinterpreted: every V6 table survives, every V6 column keeps its name and its position,
+    /// and anything new is appended. A migration that reordered, renamed, retyped, or dropped a
+    /// V6 column would silently change the meaning of already-written rows, and that is what this
+    /// now refuses -- including for the tables V10 does not touch.
+    #[test]
+    fn v6_scientific_schema_is_only_ever_extended_by_later_migrations()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         let v6_result = MigrationRunner::new()
@@ -18077,42 +18549,90 @@ mod tests {
             .run(&connection)?;
         assert_eq!(v6_result.current, SCRIPTBOTS_SCHEMA_V6_VERSION);
         assert_eq!(v6_result.applied, [SCRIPTBOTS_SCHEMA_V6_VERSION]);
-        let v6_scientific_schema = normalized_scientific_schema(&connection)?;
+
+        let v6_tables: Vec<String> = connection
+            .query(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\'
+                 ORDER BY name ASC",
+            )?
+            .iter()
+            .map(|row| decode::<String>(row, 0, "sqlite_schema.name"))
+            .collect::<Result<_, _>>()?;
+        assert!(
+            v6_tables.iter().any(|name| name == "replay_events"),
+            "the V6 baseline did not contain replay_events, so this test is not exercising \
+             the table V10 extends: {v6_tables:?}"
+        );
+        let v6_columns: Vec<(String, Vec<String>)> = v6_tables
+            .iter()
+            .map(|table| Ok((table.clone(), table_columns(&connection, table)?)))
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
 
         install_scriptbots_schema(&connection)?;
 
-        assert_eq!(
-            normalized_scientific_schema(&connection)?,
-            v6_scientific_schema,
-            "the additive host-journal migration changed the frozen V6 scientific schema"
-        );
+        for (table, before) in &v6_columns {
+            let after = table_columns(&connection, table)?;
+            assert!(
+                after.len() >= before.len(),
+                "migration DROPPED a column from the frozen V6 table {table}: \
+                 {before:?} -> {after:?}"
+            );
+            assert_eq!(
+                &after[..before.len()],
+                &before[..],
+                "migration REWROTE the frozen V6 columns of {table} instead of appending; \
+                 already-written rows would change meaning"
+            );
+        }
+
+        // The extension actually happened. Without this the loop above passes vacuously if the
+        // V10 migration silently no-ops -- the identical shape to the empty-stream trap.
+        let replay_columns = table_columns(&connection, "replay_events")?;
+        for added in [
+            "position_x",
+            "position_y",
+            "counterpart_uid",
+            "counterpart_position_x",
+            "counterpart_position_y",
+        ] {
+            assert!(
+                replay_columns.iter().any(|column| column == added),
+                "V10 did not add replay_events.{added}: {replay_columns:?}"
+            );
+        }
+
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 4);
-        assert_eq!(
-            decode::<i64>(&migrations[1], 0, "_schema_migrations.version")?,
-            SCRIPTBOTS_SCHEMA_V7_VERSION
-        );
-        assert_eq!(
-            decode::<String>(&migrations[1], 1, "_schema_migrations.name")?,
-            "add_host_journal_archive"
-        );
-        assert_eq!(
-            decode::<i64>(&migrations[2], 0, "_schema_migrations.version")?,
-            SCRIPTBOTS_SCHEMA_V8_VERSION
-        );
-        assert_eq!(
-            decode::<String>(&migrations[2], 1, "_schema_migrations.name")?,
-            "add_host_domain_event_projection"
-        );
-        assert_eq!(
-            decode::<i64>(&migrations[3], 0, "_schema_migrations.version")?,
-            SCRIPTBOTS_SCHEMA_VERSION
-        );
-        assert_eq!(
-            decode::<String>(&migrations[3], 1, "_schema_migrations.name")?,
-            "add_host_command_lifecycle_projection"
-        );
+        assert_eq!(migrations.len(), 5);
+        for (index, (expected_version, expected_name)) in [
+            (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
+            (
+                SCRIPTBOTS_SCHEMA_V8_VERSION,
+                "add_host_domain_event_projection",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_V9_VERSION,
+                "add_host_command_lifecycle_projection",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_replay_event_interaction_edges",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = &migrations[index + 1];
+            assert_eq!(
+                decode::<i64>(row, 0, "_schema_migrations.version")?,
+                expected_version
+            );
+            assert_eq!(
+                decode::<String>(row, 1, "_schema_migrations.name")?,
+                expected_name
+            );
+        }
         let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
         assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
         connection.close()?;
@@ -18634,16 +19154,22 @@ mod tests {
     #[test]
     fn recovery_requires_the_exact_supported_migration_set_without_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
+        // Both the injected version and the expected message are DERIVED from the current head
+        // rather than written as literals. The literals were `10` and "expected exactly four
+        // ... through v9": the V10 bump turned the "future" migration into the real head, so
+        // the insert collided on the ledger primary key and the test failed for a reason that
+        // had nothing to do with what it checks. Same defect as bd-u8ti, in a fixture.
+        let beyond_head = SCRIPTBOTS_SCHEMA_VERSION + 1;
+        let migration_count_fragment = "expected exactly";
         let future = temp_db_path("storage-recovery-future-migration");
         create_valid_database(&future)?;
         add_schema_object(
             &future,
-            "INSERT INTO _schema_migrations (version, name) VALUES (10, 'future_schema')",
+            &format!(
+                "INSERT INTO _schema_migrations (version, name) VALUES ({beyond_head}, 'future_schema')"
+            ),
         )?;
-        assert_recovery_refused_without_database_mutation(
-            &future,
-            "expected exactly four ScriptBots migrations through v9",
-        )?;
+        assert_recovery_refused_without_database_mutation(&future, migration_count_fragment)?;
 
         let legacy = temp_db_path("storage-recovery-legacy-v5-lineage");
         let legacy_connection = Connection::open(legacy.to_string_lossy().as_ref())?;
@@ -18660,10 +19186,7 @@ mod tests {
              PRAGMA user_version = 5;",
         )?;
         legacy_connection.close()?;
-        assert_recovery_refused_without_database_mutation(
-            &legacy,
-            "expected exactly four ScriptBots migrations through v9",
-        )?;
+        assert_recovery_refused_without_database_mutation(&legacy, migration_count_fragment)?;
 
         let v6_only = temp_db_path("storage-recovery-v6-only-lineage");
         let v6_connection = Connection::open(v6_only.to_string_lossy().as_ref())?;
@@ -18675,10 +19198,7 @@ mod tests {
             )
             .run(&v6_connection)?;
         v6_connection.close()?;
-        assert_recovery_refused_without_database_mutation(
-            &v6_only,
-            "expected exactly four ScriptBots migrations through v9",
-        )?;
+        assert_recovery_refused_without_database_mutation(&v6_only, migration_count_fragment)?;
 
         let mismatched_user_version = temp_db_path("storage-recovery-user-version-mismatch");
         create_valid_database(&mismatched_user_version)?;
@@ -18705,7 +19225,8 @@ mod tests {
                 (6, 'create_multi_run_schema', 'forged'),
                 (7, 'add_host_journal_archive', 'forged'),
                 (8, 'add_host_domain_event_projection', 'forged'),
-                (9, 'add_host_command_lifecycle_projection', 'forged');
+                (9, 'add_host_command_lifecycle_projection', 'forged'),
+                (10, 'add_replay_event_interaction_edges', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -18715,9 +19236,26 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 9;",
+             PRAGMA user_version = 10;",
         )?;
         connection.close()?;
+
+        // The forgery must claim the CURRENT head version, and this asserts it does. At any
+        // older version recovery would try to migrate the forged file first, and the test would
+        // quietly stop testing what it is named for -- refusal by schema fingerprint -- while
+        // still failing or passing for unrelated reasons. The V10 bump is what exposed that:
+        // the ledger above was pinned at v9 and had to be advanced deliberately.
+        let forged_version = {
+            let probe = Connection::open(forged.to_string_lossy().as_ref())?;
+            let version: i64 = probe.query_row("PRAGMA user_version")?.get_typed(0)?;
+            probe.close()?;
+            version
+        };
+        assert_eq!(
+            forged_version, SCRIPTBOTS_SCHEMA_VERSION,
+            "the forged lookalike must sit at the head version, or this test exercises the \
+             migration path instead of the fingerprint check"
+        );
 
         assert_recovery_refused_without_database_mutation(&forged, "schema fingerprint mismatch")?;
 
@@ -20182,6 +20720,9 @@ mod tests {
         let mut batch = sample_batch(5, 1.0);
         batch.replay_events.push(ReplayEvent {
             agent_uid: Some(outer_agent),
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::RngSample {
                 scope: ReplayRngScope::Agent {
                     agent_uid: scope_agent,
@@ -20214,6 +20755,9 @@ mod tests {
         let mut batch = sample_batch(6, 1.0);
         batch.replay_events.push(ReplayEvent {
             agent_uid: Some(actor),
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::Action {
                 left_wheel: -0.25,
                 right_wheel: 0.75,
@@ -20294,6 +20838,9 @@ mod tests {
         let mut invalid = sample_batch(1, 1.0);
         invalid.replay_events.push(ReplayEvent {
             agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::BrainOutputs {
                 outputs: vec![f32::NAN],
             },
@@ -20407,6 +20954,9 @@ mod tests {
         let mut invalid = sample_batch(2, 2.0);
         invalid.replay_events.push(ReplayEvent {
             agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::RngSample {
                 scope: ReplayRngScope::World,
                 range_min: 0.0,
@@ -21353,6 +21903,9 @@ mod tests {
         synchronize_lifecycle_counts(&mut batch);
         batch.replay_events.push(ReplayEvent {
             agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::BrainOutputs {
                 outputs: vec![0.25],
             },
@@ -22353,6 +22906,9 @@ mod tests {
         let mut action = sample_batch(9, 1.0);
         action.replay_events.push(ReplayEvent {
             agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::Action {
                 left_wheel: 0.0,
                 right_wheel: 0.0,
@@ -22375,6 +22931,9 @@ mod tests {
         let mut rng = sample_batch(9, 1.0);
         rng.replay_events.push(ReplayEvent {
             agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::RngSample {
                 scope: ReplayRngScope::Agent {
                     agent_uid: invalid_uid,
@@ -22486,6 +23045,9 @@ mod tests {
 
         let replay = ReplayEvent {
             agent_uid: Some(invalid_uid),
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::BrainOutputs {
                 outputs: vec![0.25],
             },
@@ -22501,6 +23063,9 @@ mod tests {
     fn replay_sequence_above_sql_integer_range_is_rejected() {
         let replay = ReplayEvent {
             agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::BrainOutputs {
                 outputs: vec![0.25],
             },
