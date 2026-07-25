@@ -95,8 +95,17 @@ fn capture_view_with_world_painter(
         )
         .map_err(|error| format!("open headless GPUI window: {error:?}"))?;
 
-    // Let the view settle so the first frame is a real composed frame rather than a
-    // partially initialized one.
+    // Let the view settle, then FORCE A REDRAW before reading back.
+    //
+    // `capture_screenshot` returns `self.rendered_frame.scene` — the last frame the
+    // window actually composed. `run_until_parked` alone drains the task queue but does
+    // not guarantee a full paint, and with `show: false` nothing else drives one. The
+    // first working run of this harness proved it: the readback was a real, correctly
+    // sized PNG that was almost entirely flat background — no rail, no world canvas,
+    // only a thin strip of footer text. An empty scene reads exactly like a broken
+    // renderer, so this must be explicit rather than incidental.
+    cx.run_until_parked();
+    let _ = cx.update_window(window.into(), |_, window, _| window.refresh());
     cx.run_until_parked();
 
     cx.capture_screenshot(window.into())
@@ -224,10 +233,25 @@ mod tests {
     fn docked_hud_never_covers_the_world_centre_at_either_viewport() {
         std::fs::create_dir_all(probe_dir()).expect("probe output directory");
 
-        for (width, height) in VIEWPORTS {
+        for (logical_w, logical_h) in VIEWPORTS {
+            // VIEWPORTS are the LOGICAL sizes the production windows open at, and the
+            // layout must be exercised at those. `capture_view` takes DEVICE pixels and
+            // divides by HEADLESS_DEVICE_SCALE, so ask for the scaled size or the app
+            // sees a half-size window.
+            //
+            // This is not a detail. Requesting 1280 device px opens a 640-logical window,
+            // and HUD_RAIL_COLLAPSE_WIDTH is 960 (WORLD_MIN_WIDTH 640 + HUD_RAIL_WIDTH
+            // 320), so the resize rule correctly force-collapses the rail and the capture
+            // shows a HUD with no chrome at all. The first real run of this test failed
+            // exactly that way.
+            let width = logical_w * HEADLESS_DEVICE_SCALE;
+            let height = logical_h * HEADLESS_DEVICE_SCALE;
             let image = capture_view(capture_world(), GuiViewRole::Hud, width, height)
                 .unwrap_or_else(|error| {
-                    panic!("headless HUD capture failed at {width}x{height}: {error:#}")
+                    panic!(
+                        "headless HUD capture failed at {logical_w}x{logical_h} logical \
+                         ({width}x{height} device): {error:#}"
+                    )
                 });
 
             let w = image.width();
@@ -247,7 +271,13 @@ mod tests {
             // Right band: where the docked rail lives.
             let right_hits = count_color(&image, HISTORY_PANEL_BG, centre_hi, w);
 
-            let path = probe_dir().join(format!("hud_docked_{}x{}.png", w, h));
+            // Named by LOGICAL viewport so the evidence matches the window size a user
+            // actually has; the file itself is a 2x HiDPI buffer, as a Retina screenshot
+            // of that window would be.
+            let path = probe_dir().join(format!(
+                "hud_docked_{}x{}.png",
+                logical_w as u32, logical_h as u32
+            ));
             image.save(&path).expect("write HUD probe png");
 
             assert!(
