@@ -896,8 +896,15 @@ mod tests {
         // redraws between captures and every frame differs from baseline by ~12k px
         // regardless of the keystroke — a noise floor that swallowed 21 of 27 results
         // on the first run and would have let a dead control read as working.
+        // Baseline dispatches an UNBOUND key ("z" has no binding). Previously it
+        // dispatched nothing while each shortcut capture dispatched one, so the sides
+        // differed in input history AND frame count - confounded. Now both take an
+        // identical dispatch path, so any delta is the shortcut's own effect.
+        // Shortcut captures override `keystrokes` explicitly, so only the baseline
+        // picks this up.
         let stable = || CaptureOverrides {
             forced_perf: Some(pinned_perf()),
+            keystrokes: &["z"],
             ..CaptureOverrides::default()
         };
         // ONE world cloned into every capture (bd-c7pg isolation). Building a fresh
