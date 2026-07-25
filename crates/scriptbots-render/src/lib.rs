@@ -4422,7 +4422,7 @@ impl SimulationView {
         &self,
         snapshot: &HudSnapshot,
         frame: RenderFrame,
-        resolved: ResolvedHudLayout,
+        _resolved: ResolvedHudLayout,
         cx: &mut Context<Self>,
     ) -> Div {
         let follow_target = self.compute_follow_target(&frame, &snapshot.inspector);
@@ -11402,7 +11402,8 @@ struct InspectorSnapshot {
 /// 3. RESTRAINT. The world is the subject. Chrome carries exactly one accent — the
 ///    herbivore cyan — and otherwise moves only in value.
 mod chrome {
-    use super::{Hsla, rgb_from_triplet};
+    use super::rgb_from_triplet;
+    use gpui::Hsla;
     use scriptbots_core::visual::{
         BIOLUMINESCENT_DARK_FIELD_V1 as STYLE, CARNIVORE_RGB, FOOD_MID_RGB, HERBIVORE_RGB,
     };
