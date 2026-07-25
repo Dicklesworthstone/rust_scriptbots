@@ -666,7 +666,6 @@ fn dense_bench_config() -> ScriptBotsConfig {
         food_decay_rate: 0.0,
         food_diffusion_rate: 0.0,
         sense_radius: 1.0,
-        sense_max_neighbors: 1.0,
         bot_speed: 0.0,
         bot_radius: 1.0,
         boost_multiplier: 1.0,
@@ -1036,7 +1035,6 @@ fn bench_world_steps(c: &mut Criterion) {
                     config.population_spawn_count = 1;
                     config.population_crossover_chance = 0.0;
                     config.sense_radius = 20.0;
-                    config.sense_max_neighbors = 16.0;
                     config.bot_radius = 2.0;
                     config.bot_speed = 1.0;
                     let mut world = WorldState::new(config).expect("world");

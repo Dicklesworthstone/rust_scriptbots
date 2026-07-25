@@ -56,8 +56,8 @@ pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.3";
 /// requires a codec bump. A change to future-state coverage or field meaning requires a new
 /// checkpoint schema. Never rebless the representative V1 wire golden without reviewing both
 /// version identities.
-pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 5;
-const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v5";
+pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 6;
+const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v6";
 
 /// Maximum complete checkpoint wire accepted by the decoder.
 ///
@@ -2844,9 +2844,9 @@ mod tests {
     // portable across the other supported lanes.
     #[cfg(target_pointer_width = "64")]
     #[test]
-    #[ignore = "bd-16g.10.1: ActiveEffect gained a kind discriminant (GrowthScale/Embargo) and \
-     Region a Rect variant; the V1.3/codec-5 wire re-pin must be recorded with fresh DSR \
-     evidence before this byte golden runs again"]
+    #[ignore = "bd-16g.10.1: ActiveEffect gained a kind discriminant (GrowthScale/Embargo), \
+     Region a Rect variant, and bd-yw1j retired a positional config field; the V1.3/codec-6 \
+     wire re-pin must be recorded with fresh DSR evidence before this byte golden runs again"]
     fn checkpoint_v1_representative_wire_golden() {
         let (mut world, brain_key) = world_with_checkpoint_family();
         install_nontrivial_hydrology(&mut world);
@@ -3218,6 +3218,11 @@ mod tests {
 
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode private wire fixture");
+        assert_eq!(wire.codec_version, 6, "bd-yw1j checkpoint codec bump");
+        assert_eq!(
+            wire.codec, "postcard+blake3-v6",
+            "bd-yw1j checkpoint codec identity bump"
+        );
 
         wire.schema = "scriptbots.world-checkpoint.v1.2".to_owned();
         let foreign_schema = postcard::to_allocvec(&wire).expect("foreign schema wire");

@@ -3177,13 +3177,13 @@ pub struct CharacterizationDigestV0 {
 }
 
 /// Schema tag for [`WorldDigestV1`].
-/// V1.6 adds the selected locomotion model to the future-affecting scientific-config lane.
-pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.6";
-/// Wire revision for the canonical V1.6 payload.
-pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 6;
-/// Stable hash algorithm identifier carried by and hashed into V1.6.
+/// V1.7 removes the orphaned `sense_max_neighbors` control from the scientific-config lane.
+pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.7";
+/// Wire revision for the canonical V1.7 payload.
+pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 7;
+/// Stable hash algorithm identifier carried by and hashed into V1.7.
 pub const WORLD_DIGEST_V1_ALGORITHM: &str = "fnv1a64-v0";
-/// Stable logical identity used by the V1.6 agent lane and transition order.
+/// Stable logical identity used by the V1.7 agent lane and transition order.
 pub const WORLD_DIGEST_V1_AGENT_IDENTITY: &str = "AgentUid";
 
 #[derive(Clone, Copy)]
@@ -3356,7 +3356,7 @@ pub struct WorldDigestV1 {
     pub agent_identity: String,
 }
 
-/// A decoded V1.6 boundary digest violated its pinned semantic contract.
+/// A decoded V1.7 boundary digest violated its pinned semantic contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorldDigestV1ContractError {
     /// Decoded schema tag did not match the pinned wire schema.
@@ -5360,12 +5360,12 @@ pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
 pub const WORLD_STEP_OUTCOME_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v3";
 
 /// Schema identifier for opt-in per-stage scientific-state digests.
-pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.6";
+pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.7";
 /// Wire revision for the adapter-attested canonical-UID six-point trace payload.
-pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 6;
+pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 7;
 /// Schema identifier for a non-boundary world digest captured during one transition.
 pub const WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA: &str =
-    "scriptbots.world-step-stage-world-digest.v6";
+    "scriptbots.world-step-stage-world-digest.v7";
 
 /// Stable stage identifiers emitted by [`WorldStepProfile`].
 ///
@@ -10906,6 +10906,7 @@ pub enum LocomotionModel {
 
 /// Static configuration for a `ScriptBots` world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptBotsConfig {
     /// Width of the world in world units.
     pub world_width: u32,
@@ -10933,8 +10934,6 @@ pub struct ScriptBotsConfig {
     pub food_diffusion_rate: f32,
     /// Radius used for neighborhood sensing.
     pub sense_radius: f32,
-    /// Normalization factor for counting neighbors.
-    pub sense_max_neighbors: f32,
     /// Base wheel speed produced when outputs saturate.
     pub bot_speed: f32,
     /// Legacy wheel separation and differential-drive half wheelbase, in world units.
@@ -11144,7 +11143,6 @@ impl Default for ScriptBotsConfig {
             food_decay_rate: 0.002,
             food_diffusion_rate: 0.15,
             sense_radius: 120.0,
-            sense_max_neighbors: 12.0,
             bot_speed: 0.3,
             bot_radius: 10.0,
             locomotion_model: LocomotionModel::Legacy,
@@ -11376,7 +11374,7 @@ impl ScriptBotsConfig {
             "world_height must be divisible by food_cell_size"
         );
 
-        let finite_fields: [(f32, &'static str); 70] = [
+        let finite_fields: [(f32, &'static str); 69] = [
             (self.initial_food, "initial_food must be finite"),
             (
                 self.food_respawn_amount,
@@ -11390,10 +11388,6 @@ impl ScriptBotsConfig {
                 "food_diffusion_rate must be finite",
             ),
             (self.sense_radius, "sense_radius must be finite"),
-            (
-                self.sense_max_neighbors,
-                "sense_max_neighbors must be finite",
-            ),
             (self.bot_speed, "bot_speed must be finite"),
             (self.bot_radius, "bot_radius must be finite"),
             (self.boost_multiplier, "boost_multiplier must be finite"),
@@ -11658,10 +11652,6 @@ impl ScriptBotsConfig {
             "food_diffusion_rate must be within [0, 0.25]"
         );
         reject_unless!(self.sense_radius > 0.0, "sense_radius must be positive");
-        reject_unless!(
-            self.sense_max_neighbors > 0.0,
-            "sense_max_neighbors must be positive"
-        );
         reject_unless!(self.bot_speed >= 0.0, "bot_speed must be non-negative");
         reject_unless!(self.bot_radius > 0.0, "bot_radius must be positive");
         reject_unless!(
@@ -25967,14 +25957,14 @@ mod tests {
         let legacy = WorldState::new(base.clone())
             .expect("legacy digest world")
             .world_digest_v1()
-            .expect("legacy V1.6 digest");
+            .expect("legacy V1.7 digest");
         let differential = WorldState::new(ScriptBotsConfig {
             locomotion_model: LocomotionModel::Differential,
             ..base
         })
         .expect("differential digest world")
         .world_digest_v1()
-        .expect("differential V1.6 digest");
+        .expect("differential V1.7 digest");
 
         assert_ne!(legacy.config, differential.config);
         assert_ne!(legacy.overall, differential.overall);
@@ -26348,6 +26338,45 @@ mod tests {
     }
 
     #[test]
+    fn bd_yw1j_retired_neighbor_normalizer_is_not_a_public_config_knob() {
+        let encoded = serde_json::to_value(ScriptBotsConfig::default())
+            .expect("default configuration must serialize");
+        let object = encoded
+            .as_object()
+            .expect("ScriptBotsConfig must serialize as an object");
+        let sense_keys = object
+            .keys()
+            .filter(|key| key.starts_with("sense_"))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sense_keys,
+            ["sense_radius"],
+            "the retired neighbor-count normalizer must not remain in the \
+             serialized science config or any API that flattens it"
+        );
+    }
+
+    #[test]
+    fn bd_yw1j_retired_neighbor_normalizer_is_rejected_on_input() {
+        let mut encoded = serde_json::to_value(ScriptBotsConfig::default())
+            .expect("default configuration must serialize");
+        encoded
+            .as_object_mut()
+            .expect("ScriptBotsConfig must serialize as an object")
+            .insert(
+                "sense_max_neighbors".to_owned(),
+                serde_json::Value::from(12.0),
+            );
+        let error = serde_json::from_value::<ScriptBotsConfig>(encoded)
+            .expect_err("a retired scientific knob must fail closed instead of being ignored");
+        assert!(
+            error.to_string().contains("sense_max_neighbors"),
+            "the rejection must identify the retired knob: {error}"
+        );
+    }
+
+    #[test]
     fn every_public_config_float_rejects_non_finite_values_with_its_field_path() {
         fn collect_float_paths(
             prefix: &str,
@@ -26373,7 +26402,7 @@ mod tests {
         }
 
         type Setter = fn(&mut ScriptBotsConfig, f32);
-        let fields: [(&str, Setter); 73] = [
+        let fields: [(&str, Setter); 72] = [
             ("initial_food", |config, value| config.initial_food = value),
             ("food_respawn_amount", |config, value| {
                 config.food_respawn_amount = value;
@@ -26389,9 +26418,6 @@ mod tests {
                 config.food_diffusion_rate = value;
             }),
             ("sense_radius", |config, value| config.sense_radius = value),
-            ("sense_max_neighbors", |config, value| {
-                config.sense_max_neighbors = value;
-            }),
             ("bot_speed", |config, value| config.bot_speed = value),
             ("bot_radius", |config, value| config.bot_radius = value),
             ("boost_multiplier", |config, value| {
@@ -26630,7 +26656,7 @@ mod tests {
     #[test]
     fn every_bounded_public_config_float_rejects_a_finite_out_of_range_value() {
         type Setter = fn(&mut ScriptBotsConfig, f32);
-        let fields: [(&str, f32, Setter); 72] = [
+        let fields: [(&str, f32, Setter); 71] = [
             ("initial_food", -1.0, |config, value| {
                 config.initial_food = value;
             }),
@@ -26649,9 +26675,6 @@ mod tests {
             }),
             ("sense_radius", 0.0, |config, value| {
                 config.sense_radius = value;
-            }),
-            ("sense_max_neighbors", 0.0, |config, value| {
-                config.sense_max_neighbors = value;
             }),
             ("bot_speed", -1.0, |config, value| config.bot_speed = value),
             ("bot_radius", 0.0, |config, value| config.bot_radius = value),
@@ -41219,7 +41242,7 @@ mod tests {
                 (&EXPECTED[..], "0c0d9785026bc3f8")
             );
             println!(
-                "scriptbots.world-digest-golden.v1.6: six checkpoints and trace overall {} verified",
+                "scriptbots.world-digest-golden.v1.7: six checkpoints and trace overall {} verified",
                 trace.overall
             );
         } else {
@@ -41672,8 +41695,8 @@ mod tests {
             "legacy raw-slot characterization must prove the fixture layouts really differ"
         );
         assert_eq!(
-            left.world_digest_v1().expect("left pre-step V1.6"),
-            right.world_digest_v1().expect("right pre-step V1.6")
+            left.world_digest_v1().expect("left pre-step V1.7"),
+            right.world_digest_v1().expect("right pre-step V1.7")
         );
 
         let mut left_tracer = WorldStepTracer::default();
@@ -41749,8 +41772,8 @@ mod tests {
         assert_eq!(left.resource_ledger(), right.resource_ledger());
         assert_eq!(left.history, right.history);
         assert_eq!(
-            left.world_digest_v1().expect("left final V1.6"),
-            right.world_digest_v1().expect("right final V1.6")
+            left.world_digest_v1().expect("left final V1.7"),
+            right.world_digest_v1().expect("right final V1.7")
         );
     }
 
@@ -41902,8 +41925,8 @@ mod tests {
                 right.agent_brain_evaluator_state(right_child).unwrap()
             );
         }
-        let left_final = left.world_digest_v1().expect("left reproduction V1.6");
-        let right_final = right.world_digest_v1().expect("right reproduction V1.6");
+        let left_final = left.world_digest_v1().expect("left reproduction V1.7");
+        let right_final = right.world_digest_v1().expect("right reproduction V1.7");
         assert_eq!(left_final.rng, right_final.rng);
         assert_eq!(left_final.counters, right_final.counters);
         assert_eq!(left_final, right_final);
@@ -42051,8 +42074,8 @@ mod tests {
             .expect("right scheduled trace contract");
         assert_eq!(left_trace.first_divergence(right_trace).unwrap(), None);
         assert_eq!(left.resource_ledger(), right.resource_ledger());
-        let left_final = left.world_digest_v1().expect("left crossover V1.6");
-        let right_final = right.world_digest_v1().expect("right crossover V1.6");
+        let left_final = left.world_digest_v1().expect("left crossover V1.7");
+        let right_final = right.world_digest_v1().expect("right crossover V1.7");
         assert_eq!(left_final.rng, right_final.rng);
         assert_eq!(left_final.counters, right_final.counters);
         assert_eq!(left_final, right_final);
