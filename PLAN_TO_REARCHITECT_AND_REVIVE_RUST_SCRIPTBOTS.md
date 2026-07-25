@@ -2143,6 +2143,14 @@ claim that world integration early.
   serialized config tree. The digest and trace identities remain V1.6: no lane, counter, or
   science semantic changed; the six-point and checkpoint goldens were re-pinned after review
   showed only the config-lane encoding advancing transitively, matching the bd-2i1 pattern;
+- [Currently In Progress — `bd-yw1j`] Retire the orphaned `sense_max_neighbors` placeholder
+  rather than inventing a non-C++ sensor channel for it. Advance the scientific digest and trace
+  to `scriptbots.world-digest.v1.7`/codec-7 and
+  `scriptbots.world-step-trace.v1.7`/codec-7, advance the positional checkpoint encoding to
+  `scriptbots.world-checkpoint.v1.3`/codec-6 with `postcard+blake3-v6`, and advance only the
+  bootstrap manifest to V3.6. The base V3.3 manifest remains valid because its normalized config
+  is self-described generic JSON. Source tests prove the retired input fails closed; guarded
+  DSR golden and performance-baseline promotion remain separate evidence passes;
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical base V3 plus the then-current
   V3.1 bootstrap minor with the fixed six-domain continuation object; `bd-h547` advanced that
   bootstrap minor to V3.2 for adapter-attested V1.4 evidence. `bd-1kxd` now advances the canonical
@@ -2150,7 +2158,9 @@ claim that world integration early.
   `scriptbots.run-manifest.v3.4`, which binds those exact launch values to the tick-zero V1.5
   digest. `bd-2i1` advances only the bootstrap form to `scriptbots.run-manifest.v3.5` so the
   selected locomotion model is bound through the tick-zero V1.6 digest. The V3.5 schema movement
-  is complete under the same pinned DSR evidence. [Currently In Progress — `bd-hiv1`] Correct the
+  is complete under the same pinned DSR evidence. `bd-yw1j` advances the bootstrap form to V3.6
+  for the V1.7 digest that excludes the dead neighbor normalizer; the base V3.3 form remains
+  unchanged. [Currently In Progress — `bd-hiv1`] Correct the
   separate movement-noise and spike-speed consumers to use named legacy wheel effort rather than
   physical displacement.
 
@@ -2651,8 +2661,8 @@ TopazCastle, 2026-07-17]
   (source complete; DSR pending);
 - nonempty exact birth/death and aggregate-combat domain events
   (source complete; DSR pending);
-- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.3`/codec-5
-  `postcard+blake3-v5` science envelope, then
+- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.3`/codec-6
+  `postcard+blake3-v6` science envelope, then
   reconstruct host-owned persistence/session state around the restored core world;
 - checkpoint resume and first-divergence verification.
 

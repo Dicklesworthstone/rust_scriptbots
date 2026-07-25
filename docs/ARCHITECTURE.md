@@ -205,7 +205,7 @@ that exact generator identity; native and browser continuations therefore cannot
   order when both paths touched the same parent.
 - **Manifest launch binding.** `scriptbots.run-manifest.v3.3` records the root, exact six-domain
   checkpoint, `AgentSubstreamProtocolV1`, and UID-ordered `AgentRngCounterStateV1` launch rows. The
-  `scriptbots.run-manifest.v3.5` bootstrap form additionally binds the tick-zero V1.6 start
+  `scriptbots.run-manifest.v3.6` bootstrap form additionally binds the tick-zero V1.7 start
   `WorldDigestV1`; the protocol/counters in that digest and manifest must describe the same launch.
 
 **The hashing rule, learned the hard way.** Anything persisted or compared across runs uses a
@@ -229,7 +229,7 @@ reconstruction envelope for the core science state whose equality those digests 
   limitations (in `CharacterizationLimitationsV0`, whose `superseded_by` field names
   `WorldDigestV1`): it is blind to brain weights, keys agents by the *recycled* slotmap id, and its
   RNG evidence is only a forward probe rather than a restorable continuation checkpoint.
-- `WorldDigestV1` — `scriptbots.world-digest.v1.6`/codec-6 supersedes v0 with per-lane hashes:
+- `WorldDigestV1` — `scriptbots.world-digest.v1.7`/codec-7 supersedes v0 with per-lane hashes:
   agents ordered by the **stable `AgentUid`**
   (not the reused slot key), brains (genome + evaluator state via `state_digest`), food, terrain,
   hydrology, the **restorable six-domain** RNG checkpoint, exact `AgentSubstreamProtocolV1`,
@@ -238,11 +238,13 @@ reconstruction envelope for the core science state whose equality those digests 
   captured for every admitted protocol adapter.
   Coverage is part of the output: if a bound brain cannot expose its state,
   `evaluator_state_covered` is false and the family is *named*, so a digest computed while blind can
-  never collide with one computed while seeing. V1.6 considers protocol construction semantics
+  never collide with one computed while seeing. V1.7 excludes the orphaned
+  `sense_max_neighbors` placeholder, which never influenced the C++-parity sensing transition, and
+  considers protocol construction semantics
   covered only when the family identity is present; legacy factories still use their explicit
   captured-state digest.
-- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1.3`/codec-5
-  `postcard+blake3-v5` envelope with an unkeyed BLAKE3 corruption checksum, only at an open,
+- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1.3`/codec-6
+  `postcard+blake3-v6` envelope with an unkeyed BLAKE3 corruption checksum, only at an open,
   persistence-disabled completed boundary with no deferred host output. It carries the complete
   configuration including the locomotion model, stable-UID agents, genome/evaluator state, exact
   declarative registry roster and allocation cursor, protocol adapter identities,
@@ -252,7 +254,7 @@ reconstruction envelope for the core science state whose equality those digests 
   Restore validates the protocol, counter cardinality/order/UID correspondence, and registry recipe
   before constructing any evaluator or agent, allocates fresh physical `AgentId` values through the
   exact caller-prepared `BrainRegistry`, and rechecks the saved `WorldDigestV1`.
-- `WorldStepTrace` — `scriptbots.world-step-trace.v1.6`/codec-6 carries the same embedded V1.6
+- `WorldStepTrace` — `scriptbots.world-step-trace.v1.7`/codec-7 carries the same embedded V1.7
   world contract at each of its six semantic capture points. Its deferred-work lane includes queued
   offspring identities/counter-relevant state, so first-divergence evidence cannot omit a claim that
   will affect the Population stage.
