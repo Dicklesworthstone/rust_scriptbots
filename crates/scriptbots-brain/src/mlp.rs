@@ -22,8 +22,8 @@ const CONNECTIONS: usize = 4;
 const BRAIN_SIZE_WIRE: u16 = 200;
 const CONNECTIONS_WIRE: u8 = 4;
 const MLP_FAMILY_ID: &str = "mlp-baseline";
-const ADAPTER_SEMANTIC_VERSION: u32 = 2;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.adapter-semantics.v2";
+const ADAPTER_SEMANTIC_VERSION: u32 = 3;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.adapter-semantics.v3";
 const GENOME_SCHEMA_VERSION: u32 = 1;
 const GENOME_CODEC_VERSION: u16 = 1;
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -200,22 +200,34 @@ impl MlpBrain {
 
     fn mutate_parameters(&mut self, rng: &mut dyn RandomStream, rate: f32, scale: f32) {
         // Preserve randn(0, MR2) exactly: a zero mutation scale consumes the
-        // same random draws but contributes a zero delta.
+        // same random draws, while unconstrained fields skip arithmetic that
+        // would canonicalize valid `-0.0` bits. Damping still takes the legacy
+        // clamp path because initial values up to 1.1 mutate into [0.01, 1.0].
         let sigma = scale;
+        let apply_continuous_step = sigma != 0.0;
         for params in &mut self.nodes {
             if rng.random::<f32>() < rate {
-                params.bias += Self::gaussian(rng) * sigma;
+                let deviate = Self::gaussian(rng);
+                if apply_continuous_step {
+                    params.bias += deviate * sigma;
+                }
             }
             if rng.random::<f32>() < rate {
                 params.damping = (params.damping + Self::gaussian(rng) * sigma)
                     .clamp(MUTATED_DAMPING_MIN, MUTATED_DAMPING_MAX);
             }
             if rng.random::<f32>() < rate {
-                params.gain = (params.gain + Self::gaussian(rng) * sigma).max(0.0);
+                let deviate = Self::gaussian(rng);
+                if apply_continuous_step {
+                    params.gain = (params.gain + deviate * sigma).max(0.0);
+                }
             }
             if rng.random::<f32>() < rate {
                 let idx = rng.random_range(0..CONNECTIONS);
-                params.weights[idx] += Self::gaussian(rng) * sigma;
+                let deviate = Self::gaussian(rng);
+                if apply_continuous_step {
+                    params.weights[idx] += deviate * sigma;
+                }
             }
             if rng.random::<f32>() < rate {
                 let idx = rng.random_range(0..CONNECTIONS);
@@ -1145,12 +1157,12 @@ mod tests {
     };
 
     #[test]
-    fn adapter_semantic_identity_v2_is_pinned() {
+    fn adapter_semantic_identity_v3_is_pinned() {
         let identity = MlpBrainFamily::new().adapter_identity();
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "2bc16975eac2e80179564647f0009f912d28aa8fa454fb73569759991f7688f1",
+            "8fbb8b2a3cbbf4efb5744f9404ca1d82fe28ccf56b2e2e33230cb53408543177",
             "update only after reviewing an intentional MLP executable-semantics change"
         );
     }
@@ -1929,7 +1941,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_damping_oracle_preserves_initial_overshoot_then_mutation_cap() {
+    fn zero_scale_preserves_signed_zero_and_legacy_damping_cap() {
         assert_eq!(INITIAL_DAMPING_MIN, 0.9);
         assert_eq!(INITIAL_DAMPING_MAX, 1.1);
         assert_eq!(MUTATED_DAMPING_MIN, 0.01);
@@ -1937,12 +1949,12 @@ mod tests {
 
         let family = MlpBrainFamily::new();
         let node = NodeParams {
-            weights: [0.0; CONNECTIONS],
+            weights: [-0.0; CONNECTIONS],
             targets: [0; CONNECTIONS],
             kinds: [SynapseKind::Regular; CONNECTIONS],
-            gain: 0.0,
+            gain: -0.0,
             damping: INITIAL_DAMPING_MAX,
-            bias: 0.0,
+            bias: -0.0,
         };
         let genome = family
             .genome(&vec![node; BRAIN_SIZE], BrainProvenance::default())
@@ -1974,12 +1986,25 @@ mod tests {
         assert!(
             after
                 .iter()
-                .all(|node| (MUTATED_DAMPING_MIN..=MUTATED_DAMPING_MAX).contains(&node.damping))
+                .all(|node| node.damping.to_bits() == MUTATED_DAMPING_MAX.to_bits()),
+            "selected legacy damping 1.1 must clamp exactly to 1.0 even at zero scale"
         );
         for (before, after) in before.iter().zip(&after) {
-            assert_eq!(after.bias.to_bits(), before.bias.to_bits());
-            assert_eq!(after.gain.to_bits(), before.gain.to_bits());
-            assert_eq!(after.weights, before.weights);
+            assert_eq!(
+                after.bias.to_bits(),
+                before.bias.to_bits(),
+                "zero-scale bias mutation must preserve signed-zero bits"
+            );
+            assert_eq!(
+                after.gain.to_bits(),
+                before.gain.to_bits(),
+                "zero-scale gain mutation must preserve signed-zero bits"
+            );
+            assert_eq!(
+                after.weights.map(f32::to_bits),
+                before.weights.map(f32::to_bits),
+                "zero-scale weight mutation must preserve signed-zero bits"
+            );
         }
         assert_eq!(rng.random::<u64>(), 0x0753_bb8e_add8_2f25);
     }
