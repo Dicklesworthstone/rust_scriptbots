@@ -92,7 +92,7 @@ pub enum HostCoreBuildError {
         /// Actionable option diagnostic.
         message: String,
     },
-    /// The world had already surrendered its one lifetime persistence binding.
+    /// The persistence session could not be acquired or does not belong to the supplied world.
     #[error(transparent)]
     Persistence(#[from] PersistenceSessionError),
 }
@@ -1263,7 +1263,6 @@ impl HostCore {
     }
 
     /// Construct a host with an injected runtime-neutral journal adapter.
-    #[allow(clippy::too_many_lines)]
     pub fn with_journal(
         session_id: HostSessionId,
         world: WorldState,
@@ -1271,15 +1270,69 @@ impl HostCore {
         journal: Box<dyn JournalPort>,
     ) -> Result<Self, HostCoreBuildError> {
         validate_options(options)?;
-        let events = EventHub::new(
+        let events = Self::build_event_hub(session_id, options, journal.as_ref())?;
+        let persistence = world.bind_persistence(Box::new(NullPersistence))?;
+        Ok(Self::from_bound_parts(
+            session_id,
+            world,
+            persistence,
+            options,
+            journal,
+            events,
+        ))
+    }
+
+    /// Construct a host from a caller-bound persistence session and injected journal.
+    ///
+    /// This is the ownership-transfer counterpart to [`Self::with_journal`]:
+    /// it consumes the world's existing one-shot persistence session instead
+    /// of attempting a conflicting second bind. The session's opaque
+    /// world-identity check is validated here and again before every
+    /// scientific transition, so a wrong-world pair never constructs.
+    pub fn with_journal_and_persistence(
+        session_id: HostSessionId,
+        world: WorldState,
+        options: HostCoreOptions,
+        journal: Box<dyn JournalPort>,
+        persistence: PersistenceAdmissionSession,
+    ) -> Result<Self, HostCoreBuildError> {
+        validate_options(options)?;
+        persistence.validate_binding(&world)?;
+        let events = Self::build_event_hub(session_id, options, journal.as_ref())?;
+        Ok(Self::from_bound_parts(
+            session_id,
+            world,
+            persistence,
+            options,
+            journal,
+            events,
+        ))
+    }
+
+    fn build_event_hub(
+        session_id: HostSessionId,
+        options: HostCoreOptions,
+        journal: &dyn JournalPort,
+    ) -> Result<EventHub, HostCoreBuildError> {
+        EventHub::new(
             session_id,
             options.scientific_event_capacity,
             journal.event_reader(session_id),
         )
         .map_err(|error| HostCoreBuildError::InvalidOptions {
             message: error.to_string(),
-        })?;
-        let persistence = world.bind_persistence(Box::new(NullPersistence))?;
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn from_bound_parts(
+        session_id: HostSessionId,
+        world: WorldState,
+        persistence: PersistenceAdmissionSession,
+        options: HostCoreOptions,
+        journal: Box<dyn JournalPort>,
+        events: EventHub,
+    ) -> Self {
         let revisions = HostRevisions {
             control: ControlRevision::new(0),
             scientific: ScientificRevision::new(world.tick().0),
@@ -1344,7 +1397,7 @@ impl HostCore {
                 revisions,
             },
         }));
-        Ok(Self {
+        Self {
             session_id,
             world,
             persistence,
@@ -1377,7 +1430,7 @@ impl HostCore {
             shutdown_receipt: None,
             failed_journal_batches: HashSet::new(),
             latched_fault: None,
-        })
+        }
     }
 
     /// Create another same-thread handle to the bounded host port.

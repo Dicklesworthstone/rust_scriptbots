@@ -1346,24 +1346,63 @@ mod tests {
             }
         }
 
-        let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
-            rng_seed: Some(0x5eed_cafe),
-            persistence_interval: 0,
-            ..ScriptBotsConfig::default()
-        })
-        .expect("deterministic test world");
-        let _persistence = world
+        fn persistence_disabled_world() -> scriptbots_core::WorldState {
+            scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(0x5eed_cafe),
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("deterministic test world")
+        }
+
+        let world = persistence_disabled_world();
+        let persistence = world
             .bind_persistence(Box::new(scriptbots_core::NullPersistence))
             .expect("one-shot binding");
-        let options = HostCoreOptions::default();
-        let core = HostCore::with_journal(
+        let core = HostCore::with_journal_and_persistence(
             HostSessionId::new(9),
             world,
-            options,
+            HostCoreOptions::default(),
+            Box::new(NullTestJournal),
+            persistence,
+        )
+        .expect("caller-bound session must construct");
+        assert_eq!(core.world_tick(), scriptbots_core::Tick(0));
+
+        let session_world = persistence_disabled_world();
+        let wrong_session = session_world
+            .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+            .expect("wrong-world fixture binding");
+        let wrong_world = persistence_disabled_world();
+        let wrong_pair = HostCore::with_journal_and_persistence(
+            HostSessionId::new(10),
+            wrong_world,
+            HostCoreOptions::default(),
+            Box::new(NullTestJournal),
+            wrong_session,
+        );
+        assert!(matches!(
+            wrong_pair,
+            Err(crate::HostCoreBuildError::Persistence(
+                scriptbots_core::PersistenceSessionError::WrongWorld
+            ))
+        ));
+
+        let conflicting_world = persistence_disabled_world();
+        let _existing_session = conflicting_world
+            .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+            .expect("first binding");
+        let conflicting = HostCore::with_journal(
+            HostSessionId::new(11),
+            conflicting_world,
+            HostCoreOptions::default(),
             Box::new(NullTestJournal),
         );
-        if let Err(error) = &core {
-            panic!("caller-bound session must construct: {error:?}");
-        }
+        assert!(matches!(
+            conflicting,
+            Err(crate::HostCoreBuildError::Persistence(
+                scriptbots_core::PersistenceSessionError::AlreadyBound
+            ))
+        ));
     }
 }
