@@ -18522,8 +18522,10 @@ impl WorldState {
             ));
         }
         let parent_agent_uid = self
-            .agent_uid(parent_id)
-            .expect("live brain parent must have stable identity");
+            .require_agent_uid(parent_id, || {
+                "prepare_protocol_offspring_brain.parent".to_owned()
+            })
+            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
         let parent_state = parent_runtime
             .brain
             .checkpoint_evaluator_state_with(adapter)?
@@ -18554,8 +18556,10 @@ impl WorldState {
                             )
                         })?;
                     let uid = self
-                        .agent_uid(partner_id)
-                        .expect("live brain partner must have stable identity");
+                        .require_agent_uid(partner_id, || {
+                            "prepare_protocol_offspring_brain.partner".to_owned()
+                        })
+                        .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
                     Some((genome.clone(), state, uid))
                 }
                 // Whole-agent lineage and brain-material lineage are deliberately distinct.
@@ -18717,9 +18721,8 @@ impl WorldState {
             let Some(index) = self.agents.index_of(*id) else {
                 return Ok(None);
             };
-            let uid = self
-                .agent_uid(*id)
-                .expect("live crossover candidate must have a stable identity");
+            let uid =
+                self.require_agent_uid(*id, || "spawn_crossover_agent.candidate".to_owned())?;
             self.agents.columns().generations()[index]
                 .next_at(format!("agents[uid={}].generation", uid.get()))?;
         }
@@ -18804,12 +18807,10 @@ impl WorldState {
 
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
-        let parent_agent_uid = self
-            .agent_uid(parent_id)
-            .expect("live crossover parent must have stable identity");
-        let partner_agent_uid = self
-            .agent_uid(partner_id)
-            .expect("live crossover partner must have stable identity");
+        let parent_agent_uid =
+            self.require_agent_uid(parent_id, || "spawn_crossover_agent.parent".to_owned())?;
+        let partner_agent_uid =
+            self.require_agent_uid(partner_id, || "spawn_crossover_agent.partner".to_owned())?;
         let counters_before = self
             .agent_rng_counters
             .get(parent_id)
