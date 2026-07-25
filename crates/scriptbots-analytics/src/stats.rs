@@ -400,6 +400,61 @@ pub fn cohens_d(before: &[f64], after: &[f64]) -> Result<f64, StatsError> {
     Ok((mean(after)? - mean(before)?) / pooled_sd)
 }
 
+/// Which standardized-mean-difference estimator produced a reported effect size.
+///
+/// Carried in results rather than documented, because `n` alone is not enough to interpret one.
+/// The realised sample size tells a reader whether the small-sample regime applies; this tells
+/// them whether the correction has ALREADY been applied. Without it, a reader who correctly
+/// notices `n_before = 6` cannot tell whether to discount the number or has already been given
+/// a discounted one, and applying the correction twice is as wrong as never applying it.
+// Deliberately NOT Serialize/Deserialize: this module is dependency-free by design (see the
+// header), and its sibling result types — ConfidenceInterval, EventCertification — derive only
+// Debug/Clone/PartialEq. Matching them keeps the constraint intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectSizeEstimator {
+    /// [`cohens_d`]: uncorrected. Biased HIGH for small samples.
+    CohensD,
+    /// [`hedges_g`]: Cohen's d with the small-sample bias correction applied.
+    HedgesG,
+}
+
+/// Hedges' g: Cohen's d corrected for small-sample bias.
+///
+/// Cohen's d is a BIASED estimator of the population standardized mean difference — it
+/// overstates the effect, and the overstatement grows as the sample shrinks. Hedges' correction
+/// multiplies by
+///
+/// ```text
+///     J(df) = 1 - 3 / (4 * df - 1),   df = n1 + n2 - 2
+/// ```
+///
+/// The size of what this corrects, so a caller can judge whether it matters (equal n per group):
+///
+/// ```text
+///     n per group     J        d overstates by
+///          3        0.800          +25.0%
+///          5        0.903          +10.7%
+///         10        0.958           +4.4%
+///         20        0.980           +2.0%
+///         30        0.987           +1.3%
+///        100        0.996           +0.4%
+/// ```
+///
+/// So the correction is material below roughly n=15 per group and negligible above n=30. It is
+/// offered ALONGSIDE [`cohens_d`] rather than replacing it, so the choice is explicit at the
+/// call site instead of an invisible default — and whichever is chosen, report it with
+/// [`EffectSizeEstimator`] so the reader is not left guessing (`bd-k3f3`).
+///
+/// Degenerate inputs behave exactly as [`cohens_d`] does, including the infinite effect for
+/// two different constants: correcting an unbounded effect leaves it unbounded.
+pub fn hedges_g(before: &[f64], after: &[f64]) -> Result<f64, StatsError> {
+    let d = cohens_d(before, after)?;
+    // `cohens_d` already refused n<2 per group, so df >= 2 and the denominator cannot vanish.
+    let df = (before.len() + after.len()) as f64 - 2.0;
+    let correction = 1.0 - 3.0 / (4.0 * df - 1.0);
+    Ok(d * correction)
+}
+
 /// Cliff's delta: a nonparametric effect size in `[-1, 1]`.
 ///
 /// The probability that a randomly drawn `after` value exceeds a randomly drawn `before` value,
@@ -747,5 +802,55 @@ mod tests {
         for (narrow, wide) in f32_series.iter().zip(&widened) {
             assert_eq!(f64::from(*narrow), *wide);
         }
+    }
+
+    /// Hedges' correction must actually bite at small n and vanish at large n.
+    ///
+    /// This asserts the SHAPE of the correction, not merely that a number comes back. A test
+    /// that only checked `hedges_g` returns something finite would pass with the correction
+    /// factor accidentally equal to 1.0 — i.e. with the bug this function exists to fix still
+    /// present. So both ends are pinned: a material gap at n=5 and a negligible one at n=100.
+    #[test]
+    fn hedges_correction_diverges_at_small_n_and_converges_at_large_n() {
+        // Same standardized effect at both sizes, so any difference is the correction alone.
+        let small_before: Vec<f64> = (0..5).map(|i| f64::from(i)).collect();
+        let small_after: Vec<f64> = (0..5).map(|i| f64::from(i) + 4.0).collect();
+        let large_before: Vec<f64> = (0..100).map(|i| f64::from(i % 5)).collect();
+        let large_after: Vec<f64> = (0..100).map(|i| f64::from(i % 5) + 4.0).collect();
+
+        let d_small = cohens_d(&small_before, &small_after).expect("d small");
+        let g_small = hedges_g(&small_before, &small_after).expect("g small");
+        let d_large = cohens_d(&large_before, &large_after).expect("d large");
+        let g_large = hedges_g(&large_before, &large_after).expect("g large");
+
+        // n=5 per group -> df=8 -> J = 1 - 3/31 = 0.9032, so g is ~9.7% BELOW d.
+        let small_ratio = g_small / d_small;
+        assert!(
+            (0.900..0.906).contains(&small_ratio),
+            "at n=5 per group the correction must shrink d by ~10%; got ratio {small_ratio}"
+        );
+
+        // n=100 per group -> df=198 -> J = 0.9962, under half a percent.
+        let large_ratio = g_large / d_large;
+        assert!(
+            (0.995..1.0).contains(&large_ratio),
+            "at n=100 per group the correction must be negligible; got ratio {large_ratio}"
+        );
+
+        // The correction always shrinks toward zero and never flips sign.
+        assert!(
+            g_small.abs() < d_small.abs(),
+            "correction must shrink the estimate"
+        );
+        assert!(
+            g_small.signum() == d_small.signum(),
+            "correction must not flip sign"
+        );
+
+        // And the whole point: the correction matters MORE at small n than at large n.
+        assert!(
+            (1.0 - small_ratio) > (1.0 - large_ratio) * 10.0,
+            "the small-sample penalty must dominate the large-sample one"
+        );
     }
 }

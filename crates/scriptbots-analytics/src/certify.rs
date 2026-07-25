@@ -37,8 +37,8 @@
 #![allow(clippy::cast_precision_loss)]
 
 use crate::stats::{
-    self, ConfidenceInterval, StatsError, bootstrap_mean_difference_ci, cliffs_delta, cohens_d,
-    moving_block_bootstrap_mean_ci, permutation_test_mean_difference,
+    self, ConfidenceInterval, EffectSizeEstimator, StatsError, bootstrap_mean_difference_ci,
+    cliffs_delta, cohens_d, moving_block_bootstrap_mean_ci, permutation_test_mean_difference,
 };
 
 /// Parameters governing a certification pass.
@@ -93,6 +93,14 @@ pub struct EventCertification {
     pub p_value: f64,
     /// Parametric effect size (standardized mean difference).
     pub cohens_d: f64,
+    /// Which estimator produced [`Self::cohens_d`] — corrected for small-sample bias, or not.
+    ///
+    /// Reported because `n_before` / `n_after` are necessary but NOT sufficient to interpret the
+    /// effect size. They tell a reader whether the small-sample regime applies; only this tells
+    /// them whether the correction was already applied. A reader who sees `n_before = 6` and
+    /// discounts a number that had already been discounted is as wrong as one who does not
+    /// discount at all (`bd-k3f3`).
+    pub effect_estimator: EffectSizeEstimator,
     /// Distribution-free effect size in `[-1, 1]`.
     pub cliffs_delta: f64,
     /// Number of samples in the before window that was tested.
@@ -150,6 +158,11 @@ pub fn certify_event(
         after_mean_ci,
         p_value: test.p_value,
         cohens_d: d,
+        // Declared, not switched. Certification keeps reporting the UNCORRECTED estimator so
+        // this change alters no number anyone has already published; the correction is now
+        // available as `stats::hedges_g` and adopting it is a deliberate one-line decision
+        // rather than a silent shift in reported effect sizes (`bd-k3f3`).
+        effect_estimator: EffectSizeEstimator::CohensD,
         cliffs_delta: delta,
         n_before: before.len(),
         n_after: after.len(),
