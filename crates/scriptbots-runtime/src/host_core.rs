@@ -1409,7 +1409,9 @@ impl HostCore {
     /// Native cancellation uses one reserved lifecycle slot after every
     /// command already admitted through [`HostPort`]. The method closes normal
     /// ingress immediately, never bypasses that existing total order, and
-    /// returns the same command status on every later call.
+    /// returns the same command status on every later call. Candidate identities
+    /// retained by either live or archived idempotency authority are skipped,
+    /// while the current sequence remains admissible before a successor is required.
     pub fn request_shutdown(&mut self) -> Result<CommandStatus, HostAccessError> {
         if let Some(command_id) = self.shared.borrow().shutdown_command_id {
             return self
@@ -1423,13 +1425,18 @@ impl HostCore {
 
         let command_id = loop {
             let sequence = self.next_lifecycle_command_sequence;
+            let candidate = CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
+            let occupied = {
+                let shared = self.shared.borrow();
+                shared.commands.contains_key(&candidate)
+                    || shared.archived_idempotency.contains_key(&candidate)
+            };
+            if !occupied {
+                break candidate;
+            }
             self.next_lifecycle_command_sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| protocol_violation("lifecycle command sequence exhausted"))?;
-            let candidate = CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
-            if !self.shared.borrow().commands.contains_key(&candidate) {
-                break candidate;
-            }
         };
         self.shared.borrow_mut().submit(
             CommandEnvelope::new(command_id, HostCommand::Shutdown),
@@ -6311,6 +6318,61 @@ mod tests {
         core.drive(ManualInstant::from_nanos(0))
             .expect("volatile shutdown barrier");
         assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+    }
+
+    #[test]
+    fn lifecycle_shutdown_skips_an_archived_client_command_id() {
+        let session_id = HostSessionId::new(24);
+        let archived_id =
+            CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, session_id.get());
+        let mut core =
+            HostCore::new(session_id, world(0), options(true)).expect("collision test host");
+        let mut port = core.local_port();
+        port.submit(CommandEnvelope::new(archived_id, HostCommand::Step))
+            .expect("colliding client command admission");
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("colliding client command application");
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("colliding client command archival");
+        {
+            let shared = core.shared.borrow();
+            assert!(
+                !shared.commands.contains_key(&archived_id),
+                "the collision must leave the live command map"
+            );
+            assert!(
+                shared.archived_idempotency.contains_key(&archived_id),
+                "the collision must be retained by the archived idempotency authority"
+            );
+        }
+
+        let shutdown = core
+            .request_shutdown()
+            .expect("shutdown allocator must skip the archived identity");
+        assert_eq!(
+            shutdown.command_id(),
+            CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, session_id.get() + 1)
+        );
+    }
+
+    #[test]
+    fn lifecycle_shutdown_admits_a_free_maximum_sequence() {
+        let session_id = HostSessionId::new(u64::MAX);
+        let mut core =
+            HostCore::new(session_id, world(0), options(true)).expect("maximum-session host");
+
+        let shutdown = core
+            .request_shutdown()
+            .expect("the free maximum lifecycle identity remains admissible");
+        assert_eq!(
+            shutdown.command_id(),
+            CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, u64::MAX)
+        );
+        assert_eq!(
+            core.request_shutdown()
+                .expect("maximum lifecycle shutdown remains idempotent"),
+            shutdown
+        );
     }
 
     #[test]
