@@ -33,12 +33,15 @@ use bevy::camera::prelude::*;
 use bevy::ecs::system::RunSystemOnce;
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
 use bevy::prelude::*;
-use bevy::render::RenderApp;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy::render::renderer::{RenderAdapterInfo, RenderDevice};
+use bevy::render::renderer::{
+    RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue, WgpuWrapper,
+};
+use bevy::render::settings::{RenderCreation, WgpuSettings, WgpuSettingsPriority};
+use bevy::render::{RenderApp, RenderPlugin};
 use bevy::window::{ExitCondition, WindowPlugin};
 use scriptbots_core::{RenderQuality, RenderSettings, WorldState};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tracing::{debug, info};
 
 use crate::{
@@ -315,6 +318,103 @@ pub struct OffscreenCaptureConfig {
     pub corrupt: bool,
 }
 
+/// Failures that can occur before the Bevy render app owns a device.
+///
+/// Bevy's automatic renderer initialization uses `expect` for adapter
+/// selection and `unwrap` for device creation. The release profile aborts on
+/// panic, so the capture harness creates these resources itself and reports
+/// every initialization failure before handing them to [`RenderPlugin`].
+#[derive(Debug)]
+pub enum CaptureRendererInitError {
+    /// No adapter satisfies the selected backend and fallback policy.
+    AdapterUnavailable,
+    /// `WGPU_ADAPTER_NAME` selected an adapter that is not present.
+    RequestedAdapterUnavailable {
+        /// Requested adapter name.
+        requested: String,
+        /// Backends enabled for this process.
+        backends: wgpu::Backends,
+    },
+    /// Bevy requested features the selected adapter does not expose.
+    UnsupportedFeatures {
+        /// Actual adapter name.
+        adapter: String,
+        /// Required features absent from the adapter.
+        missing: wgpu::Features,
+    },
+    /// Bevy's requested limits exceed the selected adapter's limits.
+    UnsupportedLimits {
+        /// Actual adapter name.
+        adapter: String,
+        /// Human-readable list of violated limits.
+        violations: String,
+    },
+    /// Bevy changed its defaults to use a constrained-limit policy that this
+    /// manually mirrored initializer does not yet implement.
+    UnsupportedConfiguration(&'static str),
+    /// The adapter was selected, but creating its logical device failed.
+    DeviceRequest {
+        /// Actual adapter name.
+        adapter: String,
+        /// Actual adapter backend.
+        backend: wgpu::Backend,
+        /// Original wgpu failure.
+        source: wgpu::RequestDeviceError,
+    },
+}
+
+impl std::fmt::Display for CaptureRendererInitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AdapterUnavailable => formatter.write_str(
+                "no GPU adapter available for offscreen capture \
+                 (software lane requires llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)",
+            ),
+            Self::RequestedAdapterUnavailable {
+                requested,
+                backends,
+            } => write!(
+                formatter,
+                "requested GPU adapter {requested:?} is unavailable for backends {backends:?}"
+            ),
+            Self::UnsupportedFeatures { adapter, missing } => write!(
+                formatter,
+                "GPU adapter {adapter:?} lacks required Bevy features {missing:?}"
+            ),
+            Self::UnsupportedLimits {
+                adapter,
+                violations,
+            } => write!(
+                formatter,
+                "GPU adapter {adapter:?} cannot satisfy Bevy limits: {violations}"
+            ),
+            Self::UnsupportedConfiguration(detail) => {
+                write!(
+                    formatter,
+                    "unsupported Bevy renderer configuration: {detail}"
+                )
+            }
+            Self::DeviceRequest {
+                adapter,
+                backend,
+                source,
+            } => write!(
+                formatter,
+                "GPU device creation failed for adapter {adapter:?} on {backend:?}: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CaptureRendererInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DeviceRequest { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 /// The offscreen image target handle shared with the scene setup.
 #[derive(Resource, Clone)]
 struct CaptureTarget(Handle<Image>);
@@ -390,12 +490,6 @@ impl<'a> OffscreenCapture<'a> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return Err(anyhow!(
                 "capture viewport {width}x{height} outside 1..=8192"
-            ));
-        }
-        if crate::probe_gpu_capability().is_none() {
-            return Err(anyhow!(
-                "no GPU adapter available for offscreen capture (software lane requires \
-                 llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)"
             ));
         }
         let mut guard = CAPTURE_APP.lock().unwrap_or_else(|e| e.into_inner());
@@ -758,6 +852,7 @@ fn validate_capture_seed(world_seed: u64, requested_seed: u64) -> Result<()> {
 /// stays initial-fill black (the bd-x6v6 root cause, isolated by the
 /// minimal upstream canary in `tests/hdr_probe.rs`).
 fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
+    let render_creation = initialize_capture_renderer()?;
     let mut app = App::new();
     app.insert_resource(AmbientLight {
         color: Color::srgb(0.45, 0.52, 0.65),
@@ -772,6 +867,10 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
             .build()
             .disable::<bevy::winit::WinitPlugin>()
             .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
+            .set(RenderPlugin {
+                render_creation,
+                ..default()
+            })
             .set(WindowPlugin {
                 primary_window: None,
                 exit_condition: ExitCondition::DontExit,
@@ -806,6 +905,141 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
         "process-wide offscreen capture app built"
     );
     Ok(app)
+}
+
+/// Create the exact wgpu resources that Bevy will render with.
+///
+/// This mirrors Bevy 0.17's automatic `initialize_renderer` policy for its
+/// default settings, but replaces the adapter `expect` and device `unwrap`
+/// with typed failures. It also makes `WGPU_ADAPTER_NAME` authoritative:
+/// asking for an unavailable adapter fails instead of silently selecting a
+/// different backend and mislabelling the resulting evidence.
+fn initialize_capture_renderer() -> std::result::Result<RenderCreation, CaptureRendererInitError> {
+    let settings = WgpuSettings::default();
+    let backends = settings
+        .backends
+        .ok_or(CaptureRendererInitError::UnsupportedConfiguration(
+            "WgpuSettings.backends must be explicit for offscreen capture",
+        ))?;
+    if settings.constrained_limits.is_some() {
+        return Err(CaptureRendererInitError::UnsupportedConfiguration(
+            "constrained_limits require updating the manual Bevy initializer",
+        ));
+    }
+
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends,
+        flags: settings.instance_flags,
+        memory_budget_thresholds: settings.instance_memory_budget_thresholds,
+        backend_options: wgpu::BackendOptions {
+            gl: wgpu::GlBackendOptions {
+                gles_minor_version: settings.gles3_minor_version,
+                fence_behavior: wgpu::GlFenceBehavior::Normal,
+            },
+            dx12: wgpu::Dx12BackendOptions {
+                shader_compiler: settings.dx12_shader_compiler.clone(),
+            },
+            noop: wgpu::NoopBackendOptions { enable: false },
+        },
+    });
+
+    let force_fallback_adapter = force_fallback_adapter(
+        settings.force_fallback_adapter,
+        std::env::var("WGPU_FORCE_FALLBACK_ADAPTER").ok().as_deref(),
+    );
+    let requested_name = std::env::var("WGPU_ADAPTER_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or(settings.adapter_name.clone());
+    let request_options = wgpu::RequestAdapterOptions {
+        power_preference: settings.power_preference,
+        compatible_surface: None,
+        force_fallback_adapter,
+    };
+    let adapter = if let Some(requested) = requested_name {
+        instance
+            .enumerate_adapters(backends)
+            .into_iter()
+            .find(|adapter| adapter.get_info().name.eq_ignore_ascii_case(&requested))
+            .ok_or(CaptureRendererInitError::RequestedAdapterUnavailable {
+                requested,
+                backends,
+            })?
+    } else {
+        bevy::tasks::block_on(instance.request_adapter(&request_options))
+            .map_err(|_| CaptureRendererInitError::AdapterUnavailable)?
+    };
+    let adapter_info = adapter.get_info();
+    let adapter_features = adapter.features();
+    let adapter_limits = adapter.limits();
+
+    let mut features = wgpu::Features::empty();
+    let mut limits = settings.limits.clone();
+    if matches!(settings.priority, WgpuSettingsPriority::Functionality) {
+        features = adapter_features;
+        if adapter_info.device_type == wgpu::DeviceType::DiscreteGpu {
+            features.remove(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+        }
+        limits = adapter_limits.clone();
+    }
+    if let Some(disabled_features) = settings.disabled_features {
+        features.remove(disabled_features);
+    }
+    features |= settings.features;
+
+    if !adapter_features.contains(features) {
+        return Err(CaptureRendererInitError::UnsupportedFeatures {
+            adapter: adapter_info.name,
+            missing: features.difference(adapter_features),
+        });
+    }
+    if !limits.check_limits(&adapter_limits) {
+        let mut violations = Vec::new();
+        limits.check_limits_with_fail_fn(&adapter_limits, false, |name, requested, allowed| {
+            violations.push(format!("{name} requested={requested} available={allowed}"));
+        });
+        return Err(CaptureRendererInitError::UnsupportedLimits {
+            adapter: adapter_info.name,
+            violations: violations.join(", "),
+        });
+    }
+
+    let descriptor = wgpu::DeviceDescriptor {
+        label: settings.device_label.as_deref(),
+        required_features: features,
+        required_limits: limits,
+        memory_hints: settings.memory_hints,
+        trace: wgpu::Trace::Off,
+    };
+    let (device, queue) =
+        bevy::tasks::block_on(adapter.request_device(&descriptor)).map_err(|source| {
+            CaptureRendererInitError::DeviceRequest {
+                adapter: adapter_info.name.clone(),
+                backend: adapter_info.backend,
+                source,
+            }
+        })?;
+    debug!(
+        adapter = %adapter_info.name,
+        backend = ?adapter_info.backend,
+        device_type = ?adapter_info.device_type,
+        force_fallback_adapter,
+        "initialized fallible Bevy offscreen renderer"
+    );
+
+    Ok(RenderCreation::manual(
+        RenderDevice::from(device),
+        RenderQueue(Arc::new(WgpuWrapper::new(queue))),
+        RenderAdapterInfo(WgpuWrapper::new(adapter_info)),
+        RenderAdapter(Arc::new(WgpuWrapper::new(adapter))),
+        RenderInstance(Arc::new(WgpuWrapper::new(instance))),
+    ))
+}
+
+fn force_fallback_adapter(default: bool, override_value: Option<&str>) -> bool {
+    override_value.map_or(default, |value| {
+        !(value.is_empty() || value == "0" || value == "false")
+    })
 }
 
 /// Create the offscreen render target image (sRGB RGBA8, render attachment
@@ -1115,6 +1349,24 @@ mod tests {
             error.to_string().contains("world root is 41"),
             "error must name the world root seed: {error}"
         );
+    }
+
+    #[test]
+    fn fallback_adapter_override_matches_bevy_environment_contract() {
+        assert_eq!(
+            CaptureRendererInitError::AdapterUnavailable.to_string(),
+            "no GPU adapter available for offscreen capture \
+             (software lane requires llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)",
+            "adapterless hosts must retain the one exact, auditable skip boundary"
+        );
+        assert!(!force_fallback_adapter(false, None));
+        assert!(force_fallback_adapter(true, None));
+        for disabled in ["", "0", "false"] {
+            assert!(!force_fallback_adapter(true, Some(disabled)));
+        }
+        for enabled in ["1", "true", "TRUE", "yes"] {
+            assert!(force_fallback_adapter(false, Some(enabled)));
+        }
     }
 
     /// The C4 alarm contract: a deliberately corrupted render (blackout sun +
