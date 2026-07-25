@@ -1,5 +1,8 @@
-use gpui::{Pixels, Point, ScrollDelta, ScrollWheelEvent};
+use gpui::{Pixels, Point, ScrollWheelEvent, px};
 use scriptbots_core::Position;
+
+const SCROLL_LINE_HEIGHT_PX: f32 = 20.0;
+const ZOOM_PER_SCROLL_LINE: f32 = 1.1;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CameraConfig {
@@ -219,17 +222,27 @@ impl Camera {
     }
 
     pub fn apply_scroll(&mut self, event: &ScrollWheelEvent) -> bool {
-        let scroll_y = match event.delta {
-            ScrollDelta::Pixels(delta) => -f32::from(delta.y) / 120.0,
-            ScrollDelta::Lines(lines) => -lines.y,
-        };
-        if scroll_y.abs() < 0.01 {
+        // GPUI normalizes platform wheel direction: positive Y is ScrollUp on every backend.
+        // It does not expose a second "natural scrolling" flag, so applying another inversion
+        // here reverses the user's platform setting.
+        let scroll_lines =
+            f32::from(event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT_PX)).y) / SCROLL_LINE_HEIGHT_PX;
+        if !scroll_lines.is_finite() || scroll_lines.abs() < 0.01 {
             return false;
         }
 
         let old_zoom = self.state.zoom;
-        let new_zoom =
-            (old_zoom * (1.0 + scroll_y * 0.1)).clamp(self.config.min_zoom, self.config.max_zoom);
+        let base_scale = self.state.last_base_scale;
+        if !old_zoom.is_finite()
+            || old_zoom <= 0.0
+            || !base_scale.is_finite()
+            || base_scale <= f32::EPSILON
+        {
+            return false;
+        }
+
+        let new_zoom = (old_zoom * ZOOM_PER_SCROLL_LINE.powf(scroll_lines))
+            .clamp(self.config.min_zoom, self.config.max_zoom);
         if (new_zoom - old_zoom).abs() <= f32::EPSILON {
             return false;
         }
@@ -238,24 +251,25 @@ impl Camera {
         let canvas_y = f32::from(event.position.y);
         let origin_x = self.state.last_canvas_origin.0;
         let origin_y = self.state.last_canvas_origin.1;
-        let pad_x = (self.state.last_canvas_size.0
-            - self.state.last_world_size.0 * self.state.last_scale)
-            * 0.5;
-        let pad_y = (self.state.last_canvas_size.1
-            - self.state.last_world_size.1 * self.state.last_scale)
-            * 0.5;
+        let canvas_size = self.state.last_canvas_size;
+        let world_size = self.state.last_world_size;
+        let old_scale = base_scale * old_zoom;
+        let new_scale = base_scale * new_zoom;
+        let old_pad_x = (canvas_size.0 - world_size.0 * old_scale) * 0.5;
+        let old_pad_y = (canvas_size.1 - world_size.1 * old_scale) * 0.5;
+        let new_pad_x = (canvas_size.0 - world_size.0 * new_scale) * 0.5;
+        let new_pad_y = (canvas_size.1 - world_size.1 * new_scale) * 0.5;
 
-        let cursor_x = canvas_x;
-        let cursor_y = canvas_y;
-        let old_scale = self.state.last_scale;
-        let new_scale = self.state.last_base_scale * new_zoom;
-
-        let world_x = (cursor_x - origin_x - pad_x - self.state.offset_px.0) / old_scale;
-        let world_y = (cursor_y - origin_y - pad_y - self.state.offset_px.1) / old_scale;
+        let world_x = (canvas_x - origin_x - old_pad_x - self.state.offset_px.0) / old_scale;
+        let world_y = (canvas_y - origin_y - old_pad_y - self.state.offset_px.1) / old_scale;
+        if !world_x.is_finite() || !world_y.is_finite() {
+            return false;
+        }
 
         self.state.zoom = new_zoom;
-        self.state.offset_px.0 = cursor_x - origin_x - pad_x - world_x * new_scale;
-        self.state.offset_px.1 = cursor_y - origin_y - pad_y - world_y * new_scale;
+        self.state.offset_px.0 = canvas_x - origin_x - new_pad_x - world_x * new_scale;
+        self.state.offset_px.1 = canvas_y - origin_y - new_pad_y - world_y * new_scale;
+        self.state.last_scale = new_scale;
         self.state.zoom_initialized = true;
         true
     }
@@ -464,7 +478,7 @@ struct LayoutComputation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::px;
+    use gpui::{ScrollDelta, px};
     use scriptbots_core::ScriptBotsConfig;
 
     const VIEWPORT: (f32, f32) = (1600.0, 900.0);
@@ -480,6 +494,136 @@ mod tests {
 
     fn approx_eq(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() <= eps
+    }
+
+    fn scroll_event(position: (f32, f32), delta_y: f32) -> ScrollWheelEvent {
+        ScrollWheelEvent {
+            position: Point {
+                x: px(position.0),
+                y: px(position.1),
+            },
+            delta: ScrollDelta::Lines(Point { x: 0.0, y: delta_y }),
+            ..ScrollWheelEvent::default()
+        }
+    }
+
+    #[test]
+    fn positive_platform_scroll_zooms_in_and_inverse_scroll_restores_zoom() {
+        let mut camera = configured_camera();
+        let original_zoom = camera.zoom();
+        let cursor = (VIEWPORT.0 * 0.5, VIEWPORT.1 * 0.5);
+
+        assert!(camera.apply_scroll(&scroll_event(cursor, 1.0)));
+        assert!(
+            camera.zoom() > original_zoom,
+            "positive GPUI scroll delta must zoom in without a second platform-direction inversion"
+        );
+
+        assert!(camera.apply_scroll(&scroll_event(cursor, -1.0)));
+        assert!(
+            approx_eq(camera.zoom(), original_zoom, 1e-6),
+            "equal opposite notches must be multiplicative inverses: {} versus {original_zoom}",
+            camera.zoom()
+        );
+    }
+
+    #[test]
+    fn precise_pixels_and_lines_produce_the_same_exponential_zoom_step() {
+        let mut line_camera = configured_camera();
+        let mut pixel_camera = configured_camera();
+        let cursor = Point {
+            x: px(VIEWPORT.0 * 0.5),
+            y: px(VIEWPORT.1 * 0.5),
+        };
+
+        assert!(line_camera.apply_scroll(&ScrollWheelEvent {
+            position: cursor,
+            delta: ScrollDelta::Lines(Point { x: 0.0, y: 1.0 }),
+            ..ScrollWheelEvent::default()
+        }));
+        assert!(pixel_camera.apply_scroll(&ScrollWheelEvent {
+            position: cursor,
+            delta: ScrollDelta::Pixels(Point {
+                x: px(0.0),
+                y: px(SCROLL_LINE_HEIGHT_PX),
+            }),
+            ..ScrollWheelEvent::default()
+        }));
+
+        assert!(
+            approx_eq(line_camera.zoom(), pixel_camera.zoom(), 1e-6),
+            "one precise pixel line and one wheel line must have the same zoom factor"
+        );
+        assert!(
+            approx_eq(
+                line_camera.zoom(),
+                CameraConfig::default().legacy_scale
+                    / (VIEWPORT.0 / WORLD.0).min(VIEWPORT.1 / WORLD.1)
+                    * ZOOM_PER_SCROLL_LINE,
+                1e-6,
+            ),
+            "one positive line must multiply zoom by the documented exponential step"
+        );
+    }
+
+    #[test]
+    fn scroll_zoom_keeps_the_world_point_under_an_off_center_cursor() {
+        let mut camera = Camera::default();
+        let canvas_origin = (137.0, 83.0);
+        let base = (VIEWPORT.0 / WORLD.0).min(VIEWPORT.1 / WORLD.1);
+        camera.ensure_default_zoom(base);
+        camera.record_render_metrics(canvas_origin, VIEWPORT, WORLD, base);
+        let cursor = Point {
+            x: px(canvas_origin.0 + VIEWPORT.0 * 0.75),
+            y: px(canvas_origin.1 + VIEWPORT.1 / 3.0),
+        };
+        let world_before = camera
+            .screen_to_world(cursor)
+            .expect("off-center cursor starts over the world");
+
+        assert!(camera.apply_scroll(&ScrollWheelEvent {
+            position: cursor,
+            delta: ScrollDelta::Lines(Point { x: 0.0, y: 1.0 }),
+            ..ScrollWheelEvent::default()
+        }));
+
+        let world_after = camera
+            .screen_to_world(cursor)
+            .expect("off-center cursor remains over the world");
+        assert!(
+            approx_eq(world_before.0, world_after.0, 1e-3)
+                && approx_eq(world_before.1, world_after.1, 1e-3),
+            "cursor anchor drifted from {world_before:?} to {world_after:?}"
+        );
+        let snapshot = camera.snapshot();
+        assert!(
+            approx_eq(
+                snapshot.last_scale,
+                snapshot.last_base_scale * snapshot.zoom,
+                f32::EPSILON,
+            ),
+            "scroll must update the cached scale before the next repaint"
+        );
+    }
+
+    #[test]
+    fn horizontal_only_scroll_is_not_misread_as_zoom() {
+        let mut camera = configured_camera();
+        let before = camera.snapshot();
+
+        assert!(!camera.apply_scroll(&ScrollWheelEvent {
+            position: Point {
+                x: px(VIEWPORT.0 * 0.5),
+                y: px(VIEWPORT.1 * 0.5),
+            },
+            delta: ScrollDelta::Lines(Point { x: 1.0, y: 0.0 }),
+            ..ScrollWheelEvent::default()
+        }));
+
+        let after = camera.snapshot();
+        assert_eq!(after.zoom.to_bits(), before.zoom.to_bits());
+        assert_eq!(after.offset_px.0.to_bits(), before.offset_px.0.to_bits());
+        assert_eq!(after.offset_px.1.to_bits(), before.offset_px.1.to_bits());
     }
 
     #[test]
