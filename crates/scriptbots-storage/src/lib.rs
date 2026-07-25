@@ -12589,8 +12589,100 @@ impl Storage {
         self.flush()?;
         self.finalize_applied_outbox()?;
         let connection = self.conn.take().ok_or(StorageError::Closed)?;
+        Self::truncate_wal_before_close(&connection, &self.path);
         connection.close()?;
+        Self::remove_emptied_wal_sidecars_after_close(&self.path);
         Ok(())
+    }
+
+    /// Fold the WAL back into the database and truncate it, so a clean close leaves no
+    /// sidecar behind (`bd-jjxe`).
+    ///
+    /// `Connection::close` checkpoints `Passive`, which folds what it can but leaves the
+    /// `-wal` file in place at full size — a completed run was observed leaving a 515 KiB
+    /// WAL beside a 464 KiB database. `ensure_no_storage_sidecars` then refuses that path
+    /// for a new run, because a leftover WAL is exactly how an unclean shutdown looks.
+    /// Nothing in the file distinguishes the two, so the guard cannot be relaxed without
+    /// teaching it to skip recovery on genuinely crashed runs; the asymmetry has to be
+    /// removed here instead, by making a clean close actually leave nothing.
+    ///
+    /// `TRUNCATE` is safe in the way `Passive` plus a manual delete would not be: it
+    /// truncates only after every frame is checkpointed into the database, and reports busy
+    /// rather than discarding frames it could not fold in. A busy result therefore means
+    /// "the WAL still matters" — it is logged and the WAL is left exactly as it is, which is
+    /// the pre-existing behaviour, so this can only ever remove a sidecar that was already
+    /// redundant.
+    fn truncate_wal_before_close(connection: &Connection, path: &str) {
+        if path == ":memory:" {
+            return;
+        }
+        match connection.query("PRAGMA wal_checkpoint(TRUNCATE)") {
+            Ok(rows) => {
+                let busy = rows
+                    .first()
+                    .and_then(|row| row.get_typed::<i64>(0).ok())
+                    .unwrap_or(1);
+                if busy != 0 {
+                    warn!(
+                        path = %path,
+                        "close could not truncate the write-ahead log; the sidecar remains \
+                         and a later new-run open of this path will refuse it"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    path = %path,
+                    error = %error,
+                    "close could not checkpoint the write-ahead log before closing"
+                );
+            }
+        }
+    }
+
+    /// Remove the write-ahead sidecars that a successful truncating checkpoint has proven
+    /// carry nothing.
+    ///
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` folds every frame into the database and empties the
+    /// log, but the files stay on disk: the `-wal` at exactly its 32-byte header and the
+    /// `-shm` at zero length — both measured, not assumed.
+    /// `ensure_no_storage_sidecars` refuses a path on sidecar *existence*, so those remnants
+    /// are still enough to make a cleanly closed run poison the next open.
+    ///
+    /// Each removal is gated on a proof rather than a heuristic:
+    ///
+    /// * a log of at most the header length holds zero frames by construction, since a frame
+    ///   is a 24-byte header plus a page, so nothing that small can contain one;
+    /// * a zero-length `-shm` is an empty shared-memory index, which is rebuilt on demand and
+    ///   is meaningless once its log is gone.
+    ///
+    /// Anything larger is left exactly as it is. That is either a checkpoint that reported
+    /// busy or an unclean shutdown, and both must keep their sidecars so recovery can replay
+    /// them — which is also why this runs only on the explicit close path and never on the
+    /// error paths.
+    fn remove_emptied_wal_sidecars_after_close(path: &str) {
+        /// A SQLite write-ahead log header is 32 bytes; frames follow it.
+        const WAL_HEADER_LEN: u64 = 32;
+
+        if path == ":memory:" {
+            return;
+        }
+        for (suffix, empty_len) in [("-wal", WAL_HEADER_LEN), ("-shm", 0)] {
+            let sidecar = PathBuf::from(format!("{path}{suffix}"));
+            match fs::metadata(&sidecar) {
+                Ok(meta) if meta.is_file() && meta.len() <= empty_len => {
+                    if let Err(error) = fs::remove_file(&sidecar) {
+                        warn!(
+                            path = %path,
+                            sidecar = %sidecar.display(),
+                            error = %error,
+                            "could not remove an emptied write-ahead sidecar after a clean close"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Dispose of a terminally failed worker without replaying its buffered transaction in Drop.
@@ -19693,6 +19785,86 @@ mod tests {
             "a terminally failed writer minted another batch identity"
         );
         storage.abandon_after_error();
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    /// `bd-jjxe`: a cleanly closed run must leave no sidecar, so that a sidecar's existence
+    /// unambiguously means the previous run did not close cleanly.
+    ///
+    /// Before this, `Connection::close`'s passive checkpoint left the `-wal` in place, and
+    /// `ensure_no_storage_sidecars` then refused the same path for a new run — a clean
+    /// shutdown poisoned the next open. The guard is correct and deliberately cannot tell a
+    /// clean close from a crash, so the fix is that a clean close leaves nothing to find.
+    #[test]
+    fn a_clean_close_leaves_no_sidecar_to_refuse() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-clean-close-sidecars");
+        let path_string = path.to_string_lossy().to_string();
+
+        let mut storage = create_file_storage(&path_string)?;
+        for (tick, energy) in [(1_u64, 1.5_f32), (2, 3.0), (3, 4.5), (4, 6.0)] {
+            storage.persist(&sample_batch(tick, energy))?;
+        }
+        storage.flush()?;
+        storage.close()?;
+
+        for suffix in ["-wal", "-shm", "-journal", "-wal-fec"] {
+            let sidecar = PathBuf::from(format!("{path_string}{suffix}"));
+            // Report the length too: a zero-length remnant and a full-size one are very
+            // different failures. The first means the checkpoint worked and only the file
+            // survived; the second means the WAL was never folded in at all.
+            let length = fs::metadata(&sidecar).map(|meta| meta.len());
+            assert!(
+                !sidecar.exists(),
+                "a clean close left {} behind ({length:?} bytes), which a later new-run \
+                 open refuses",
+                sidecar.display()
+            );
+        }
+
+        // A new-run open of this path is still refused, and that is correct — reusing a
+        // prior run's database is forbidden regardless of sidecars. What matters is *which*
+        // refusal fires: it must be the existing-database one, never the stale-sidecar one,
+        // because the sidecar reason is what a clean shutdown used to trigger spuriously.
+        // `Storage` is not `Debug`, so take the error side rather than `expect_err`.
+        let refusal = create_file_storage(&path_string)
+            .err()
+            .expect("a new run must still refuse an existing database path");
+        let reason = match &refusal {
+            StorageError::InvalidTarget { reason, .. } => reason.clone(),
+            _ => String::new(),
+        };
+        assert!(
+            !reason.is_empty(),
+            "expected an InvalidTarget refusal, got {refusal:?}"
+        );
+        assert!(
+            !reason.contains("sidecar"),
+            "a cleanly closed run was refused for a stale sidecar, which is the bug: {reason}"
+        );
+        assert!(
+            reason.contains("existing database path"),
+            "expected the existing-database refusal, got {reason}"
+        );
+
+        // The data survived the truncating checkpoint and the sidecar removal: recovery
+        // opens the same file and still sees every admitted batch. This is the safety half
+        // of the fix — emptying and deleting the log must never cost committed rows.
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        let shutdown = recovered.shutdown()?;
+        assert_eq!(
+            shutdown.watermarks.durable.map(PersistenceBatchId::get),
+            Some(4),
+            "recovery after a truncating close lost admitted batches"
+        );
+        let reader = StorageReader::open(&path_string)?;
+        assert_eq!(
+            reader.max_tick()?,
+            Some(4),
+            "recovery after a truncating close lost scientific rows"
+        );
+        reader.close()?;
+
         let _ = fs::remove_file(path);
         Ok(())
     }
