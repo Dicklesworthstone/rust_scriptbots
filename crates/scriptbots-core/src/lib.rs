@@ -1186,7 +1186,7 @@ fn fixed_sense_contribution(
         let dot = eye_unit[0] * neighbor_x + eye_unit[1] * neighbor_y;
         let difference = sense_fixed::poly_acos(dot.clamp(-1.0, 1.0));
         let fov = observer.eye_fov[eye];
-        if difference >= fov {
+        if fov <= 0.0 || difference >= fov {
             continue;
         }
         let fov_factor = ((fov - difference) / fov).max(0.0);
@@ -2853,6 +2853,11 @@ impl AgentRuntime {
         }
         validate_finite_slice(&format!("{path}.clocks"), &self.clocks)?;
         validate_finite_slice(&format!("{path}.eye_fov"), &self.eye_fov)?;
+        if let Some((index, _)) = self.eye_fov.iter().enumerate().find(|(_, fov)| **fov < 0.0) {
+            return Err(ScientificStateError::NegativeValue {
+                path: format!("{path}.eye_fov[{index}]"),
+            });
+        }
         validate_finite_slice(&format!("{path}.eye_direction"), &self.eye_direction)?;
         validate_finite(&format!("{path}.sound_multiplier"), self.sound_multiplier)?;
         validate_finite(&format!("{path}.give_intent"), self.give_intent)?;
@@ -9583,6 +9588,12 @@ pub enum ScientificStateError {
         /// Exact field or collection path rejected.
         path: String,
     },
+    /// A scientific value whose model contract is non-negative was negative.
+    #[error("negative scientific state at `{path}`")]
+    NegativeValue {
+        /// Exact field or collection path rejected.
+        path: String,
+    },
     /// A dense imported field did not contain exactly one value per declared cell.
     #[error("scientific-state length mismatch at `{path}`: expected {expected}, got {actual}")]
     LengthMismatch {
@@ -9732,6 +9743,7 @@ impl ScientificStateError {
     pub fn path(&self) -> &str {
         match self {
             Self::NonFinite { path }
+            | Self::NegativeValue { path }
             | Self::LengthMismatch { path, .. }
             | Self::DimensionOverflow { path }
             | Self::DimensionsMismatch { path, .. }
@@ -15388,7 +15400,7 @@ pub struct WorldState {
     work_position_pairs: Vec<(f32, f32)>,
     work_trait_modifiers: Vec<TraitModifiers>,
     work_eye_units: Vec<[[f32; 2]; NUM_EYES]>,
-    work_eye_fov_clamped: Vec<[f32; NUM_EYES]>,
+    work_eye_fov: Vec<[f32; NUM_EYES]>,
     work_clocks: Vec<[f32; 2]>,
     work_temperature_preferences: Vec<f32>,
     work_sound_emitters: Vec<f32>,
@@ -15606,7 +15618,7 @@ impl WorldState {
             work_position_pairs: Vec::new(),
             work_trait_modifiers: Vec::new(),
             work_eye_units: Vec::new(),
-            work_eye_fov_clamped: Vec::new(),
+            work_eye_fov: Vec::new(),
             work_clocks: Vec::new(),
             work_temperature_preferences: Vec::new(),
             work_sound_emitters: Vec::new(),
@@ -16307,8 +16319,7 @@ impl WorldState {
             .resize(agent_count, TraitModifiers::default());
         self.work_eye_units
             .resize(agent_count, [[0.0; 2]; NUM_EYES]);
-        self.work_eye_fov_clamped
-            .resize(agent_count, [1.0; NUM_EYES]);
+        self.work_eye_fov.resize(agent_count, [1.0; NUM_EYES]);
         self.work_clocks.resize(agent_count, [50.0, 50.0]);
         self.work_temperature_preferences.resize(agent_count, 0.5);
         self.work_sound_emitters.resize(agent_count, 0.0);
@@ -16317,18 +16328,18 @@ impl WorldState {
         for (idx, id) in handles.iter().enumerate() {
             if let Some(rt) = runtime.get(*id) {
                 self.work_trait_modifiers[idx] = rt.trait_modifiers;
-                // Precompute per-eye unit vectors and clamped FOV once per agent. The
+                // Precompute per-eye unit vectors and literal FOV once per agent. The
                 // neighbour loop then uses only dot products and the shared polynomial acos.
                 let mut units = [[0.0; 2]; NUM_EYES];
-                let mut fovc = [1.0; NUM_EYES];
+                let mut fovs = [1.0; NUM_EYES];
                 let base_heading = headings[idx];
                 for e in 0..NUM_EYES {
                     let direction = wrap_signed_angle(base_heading + rt.eye_direction[e]);
                     units[e] = [libm::cosf(direction), libm::sinf(direction)];
-                    fovc[e] = rt.eye_fov[e].max(0.01);
+                    fovs[e] = rt.eye_fov[e];
                 }
                 self.work_eye_units[idx] = units;
-                self.work_eye_fov_clamped[idx] = fovc;
+                self.work_eye_fov[idx] = fovs;
                 self.work_clocks[idx] = rt.clocks;
                 self.work_temperature_preferences[idx] = rt.temperature_preference;
                 self.work_sound_emitters[idx] = rt.sound_multiplier;
@@ -16337,7 +16348,7 @@ impl WorldState {
         }
         let trait_modifiers = &self.work_trait_modifiers;
         let eye_units = &self.work_eye_units;
-        let eye_fov = &self.work_eye_fov_clamped;
+        let eye_fov = &self.work_eye_fov;
         let clocks = &self.work_clocks;
         let temperature_preferences = &self.work_temperature_preferences;
         let sound_emitters = &self.work_sound_emitters;
@@ -16383,7 +16394,7 @@ impl WorldState {
                 let traits = trait_modifiers[idx];
                 let observer = SenseObserverGeometry {
                     eye_units: self.work_eye_units[idx],
-                    eye_fov: self.work_eye_fov_clamped[idx],
+                    eye_fov: self.work_eye_fov[idx],
                     heading_unit: [libm::cosf(heading), libm::sinf(heading)],
                     eye_sensitivity: traits.eye,
                     radius,
@@ -16523,11 +16534,10 @@ impl WorldState {
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
         let mut eye_units = [[0.0; 2]; NUM_EYES];
-        let mut eye_fovs = [1.0f32; NUM_EYES];
+        let eye_fovs = observer.eye_fov;
         for eye in 0..NUM_EYES {
             let direction = wrap_signed_angle(heading + observer.eye_direction[eye]);
             eye_units[eye] = [libm::cosf(direction), libm::sinf(direction)];
-            eye_fovs[eye] = observer.eye_fov[eye].max(0.01);
         }
         let geometry = SenseObserverGeometry {
             eye_units,
@@ -20854,14 +20864,19 @@ impl WorldState {
 
             for i in 0..runtime.eye_fov.len() {
                 let before = runtime.eye_fov[i];
-                let after = Self::mutate_value_with_probability(
-                    mutation_rng,
-                    runtime.eye_fov[i],
-                    primary_rate,
-                    mutation_scale,
-                    0.2,
-                    4.5,
-                );
+                let after = if primary_rate > 0.0
+                    && mutation_rng.random_range(0.0..1.0) < primary_rate * 5.0
+                {
+                    Self::mutate_value(
+                        mutation_rng,
+                        runtime.eye_fov[i],
+                        mutation_scale,
+                        0.0,
+                        f32::MAX,
+                    )
+                } else {
+                    runtime.eye_fov[i]
+                };
                 runtime.eye_fov[i] = after;
                 runtime.log_change(gene_log_capacity, &format!("eye_fov{i}"), before, after);
             }
@@ -29256,6 +29271,161 @@ mod tests {
         assert_eq!(finalized.sound.to_bits(), 0.125_f32.to_bits());
         assert_eq!(finalized.hearing.to_bits(), 0.25_f32.to_bits());
         assert_eq!(finalized.blood.to_bits(), 0.5_f32.to_bits());
+    }
+
+    #[test]
+    fn bd_iyl2_zero_fov_eyes_are_blind_in_production_and_introspection() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            sense_radius: 100.0,
+            rng_seed: Some(0x1_1E55),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let observer = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(100.0, 100.0),
+                heading: 0.0,
+                ..AgentData::default()
+            })
+            .expect("observer");
+        world
+            .try_update_agent_runtime(observer, |runtime| {
+                runtime.eye_fov = [0.0; NUM_EYES];
+                runtime.eye_direction = [0.0; NUM_EYES];
+            })
+            .expect("zero FOV is valid");
+        world
+            .try_spawn_agent(AgentData {
+                position: Position::new(120.0, 100.0),
+                color: [1.0, 0.5, 0.25],
+                ..AgentData::default()
+            })
+            .expect("visible neighbour");
+
+        let explained = world
+            .explain_sensors(observer, 8)
+            .expect("observer exists")
+            .clamped;
+        world.stage_sense();
+        let produced = world
+            .agent_runtime(observer)
+            .expect("observer runtime")
+            .sensors;
+        for index in [0, 1, 2, 3, 5, 6, 7, 8, 12, 13, 14, 15, 21, 22, 23, 24] {
+            assert_eq!(
+                (explained[index].to_bits(), produced[index].to_bits()),
+                (0.0_f32.to_bits(), 0.0_f32.to_bits()),
+                "zero-FOV eye channel {index} must stay blind in both paths"
+            );
+        }
+    }
+
+    #[test]
+    fn bd_iyl2_tiny_positive_fov_is_not_silently_widened() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            sense_radius: 100.0,
+            rng_seed: Some(0x714E_1E55),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let observer = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(100.0, 100.0),
+                heading: 0.0,
+                ..AgentData::default()
+            })
+            .expect("observer");
+        world
+            .try_update_agent_runtime(observer, |runtime| {
+                runtime.eye_fov = [0.0; NUM_EYES];
+                runtime.eye_fov[0] = 0.001;
+                runtime.eye_direction = [0.0; NUM_EYES];
+            })
+            .expect("tiny positive FOV is valid");
+        let bearing = 0.005_f32;
+        world
+            .try_spawn_agent(AgentData {
+                position: Position::new(
+                    100.0 + 20.0 * libm::cosf(bearing),
+                    100.0 + 20.0 * libm::sinf(bearing),
+                ),
+                color: [1.0, 0.5, 0.25],
+                ..AgentData::default()
+            })
+            .expect("off-axis neighbour");
+
+        let explained = world
+            .explain_sensors(observer, 8)
+            .expect("observer exists")
+            .clamped;
+        world.stage_sense();
+        let produced = world
+            .agent_runtime(observer)
+            .expect("observer runtime")
+            .sensors;
+        for index in 0..=3 {
+            assert_eq!(
+                (explained[index].to_bits(), produced[index].to_bits()),
+                (0.0_f32.to_bits(), 0.0_f32.to_bits()),
+                "a neighbour outside the literal 0.001-radian cone must not enter channel {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn bd_iyl2_negative_fov_is_rejected_at_admission() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let error = world
+            .try_spawn_agent_with(AgentData::default(), |runtime| {
+                runtime.eye_fov[2] = -0.25;
+            })
+            .expect_err("negative FOV must not enter scientific state");
+
+        assert_eq!(error.path(), "agent.runtime.eye_fov[2]");
+        assert!(matches!(error, ScientificStateError::NegativeValue { .. }));
+        assert!(world.agents().is_empty(), "rejection must be atomic");
+    }
+
+    #[test]
+    fn bd_iyl2_no_event_mutation_preserves_zero_fov_bits() {
+        let world = WorldState::new(ScriptBotsConfig {
+            reproduction_mutation_scale: 1.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut parent = AgentRuntime::default();
+        parent.eye_fov[0] = 0.0;
+        parent.eye_fov[1] = -0.0;
+        parent.mutation_rates.primary = 0.0;
+        parent.mutation_rates.secondary = 1.0;
+        let identity = OffspringRngIdentityV1::new(AgentUid(1), None, 0);
+        let mut crossover_rng = SmallRngStream::seed_from_u64(0xC205_50A7);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0x0FF5_91A6);
+
+        let child = world.build_child_runtime(
+            &parent,
+            None,
+            0,
+            identity,
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+
+        for eye in 0..=1 {
+            assert_eq!(
+                child.eye_fov[eye].to_bits(),
+                parent.eye_fov[eye].to_bits(),
+                "a rejected mutation event must preserve the exact heritable FOV payload"
+            );
+        }
     }
 
     #[test]
