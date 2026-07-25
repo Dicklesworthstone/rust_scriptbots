@@ -26,7 +26,7 @@ use scriptbots_core::narrative::{
 };
 use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::visual::{
-    self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainShadeInput, VisualSelection,
+    self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
     WorldVisualEvent,
 };
 use scriptbots_core::{
@@ -14663,15 +14663,6 @@ const LEGACY_TERRAIN_ACCENT: [[f32; 3]; 6] = [
     visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[5].emissive_srgb,
 ];
 
-const TERRAIN_SPLAT_KINDS: [TerrainKind; visual::SPLAT_LAYERS] = [
-    TerrainKind::DeepWater,
-    TerrainKind::ShallowWater,
-    TerrainKind::Sand,
-    TerrainKind::Grass,
-    TerrainKind::Bloom,
-    TerrainKind::Rock,
-];
-
 #[inline]
 fn terrain_kind_index(kind: TerrainKind) -> usize {
     match kind {
@@ -14706,21 +14697,16 @@ fn terrain_surface_color(
         slope: tile.slope,
         water_depth: tile.water_depth,
     });
-    let mut blended = [0.0_f32; 3];
-    for (layer, weight) in TERRAIN_SPLAT_KINDS.into_iter().zip(weights) {
-        let shaded = visual::terrain_shaded_color(&TerrainShadeInput {
-            kind: layer,
-            moisture: tile.moisture,
-            elevation: tile.elevation,
-            slope: tile.slope,
-            accent: tile.accent,
-            daylight,
-        });
-        blended[0] += shaded[0] * weight;
-        blended[1] += shaded[1] * weight;
-        blended[2] += shaded[2] * weight;
-    }
-    apply_palette(rgba_from_triplet_with_alpha(blended, 1.0), palette)
+    let srgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
+        splat_weights: weights,
+        moisture: tile.moisture,
+        elevation: tile.elevation,
+        slope: tile.slope,
+        accent: tile.accent,
+        daylight,
+        accessibility: accessibility_palette(palette),
+    });
+    rgba_from_triplet_with_alpha(srgb, 1.0)
 }
 
 fn canonical_gpu_terrain_colors(frame: &RenderFrame) -> Vec<[f32; 4]> {
@@ -14901,26 +14887,15 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
             let sampled_accent = blend_scalar(&accent, &corners);
             let _sampled_gradient = blend_channels(&gradients, &corners);
 
-            let mut terrain_rgb = [0.0_f32; 3];
-            for (layer, weight) in TERRAIN_SPLAT_KINDS.into_iter().zip(weights) {
-                let shaded = visual::terrain_shaded_color(&TerrainShadeInput {
-                    kind: layer,
-                    moisture: sampled_moisture,
-                    elevation: sampled_elevation,
-                    slope: sampled_slope,
-                    accent: sampled_accent,
-                    daylight,
-                });
-                terrain_rgb[0] += shaded[0] * weight;
-                terrain_rgb[1] += shaded[1] * weight;
-                terrain_rgb[2] += shaded[2] * weight;
-            }
-
-            let terrain_color = apply_palette(
-                rgba_from_triplet_with_alpha(terrain_rgb, 1.0),
-                frame.palette,
-            );
-            let display_rgb = [terrain_color.r, terrain_color.g, terrain_color.b];
+            let display_rgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
+                splat_weights: weights,
+                moisture: sampled_moisture,
+                elevation: sampled_elevation,
+                slope: sampled_slope,
+                accent: sampled_accent,
+                daylight,
+                accessibility: accessibility_palette(frame.palette),
+            });
 
             let to_byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
             bgra.extend_from_slice(&[
@@ -15076,6 +15051,99 @@ mod continuous_world_raster_tests {
 
     fn rgb_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
         (left[0] - right[0]).abs() + (left[1] - right[1]).abs() + (left[2] - right[2]).abs()
+    }
+
+    #[test]
+    fn canonical_gpu_terrain_colors_use_the_core_surface_oracle_for_every_palette() {
+        let mut grass = tile(TerrainKind::Grass);
+        grass.elevation = 0.91;
+        grass.moisture = 0.37;
+        grass.accent = 0.63;
+        grass.slope = 0.82;
+        grass.water_depth = 1.5;
+
+        let mut sand = tile(TerrainKind::Sand);
+        sand.elevation = 0.08;
+        sand.moisture = 0.14;
+        sand.accent = 0.77;
+        sand.slope = 0.18;
+
+        let mut frame = frame((2, 1), 10, vec![grass, sand], (1, 1), 20, vec![0.0]);
+        frame.tick = 137;
+        frame.day_night_cycle_ticks = 480;
+        frame.day_night_start_phase = 0.17;
+        let daylight = visual::daylight_factor(
+            frame.tick,
+            frame.day_night_cycle_ticks,
+            frame.day_night_start_phase,
+        );
+
+        for palette in ColorPaletteMode::ALL {
+            frame.palette = palette;
+            let actual = canonical_gpu_terrain_colors(&frame);
+            assert_eq!(actual.len(), frame.terrain.tiles.len());
+            for (index, (tile, actual)) in
+                frame.terrain.tiles.iter().copied().zip(actual).enumerate()
+            {
+                let expected = visual::terrain_surface_srgb(&TerrainSurfaceInput {
+                    splat_weights: visual::splat_weights(&SplatInput {
+                        kind: tile.kind,
+                        elevation: tile.elevation,
+                        slope: tile.slope,
+                        water_depth: tile.water_depth,
+                    }),
+                    moisture: tile.moisture,
+                    elevation: tile.elevation,
+                    slope: tile.slope,
+                    accent: tile.accent,
+                    daylight,
+                    accessibility: accessibility_palette(palette),
+                });
+                assert_eq!(
+                    actual.map(f32::to_bits),
+                    [expected[0], expected[1], expected[2], 1.0].map(f32::to_bits),
+                    "tile {index} diverged from the core semantic-sRGB oracle for {palette:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_gpu_terrain_projection_preserves_the_world_digest() {
+        let config = ScriptBotsConfig {
+            world_width: 96,
+            world_height: 64,
+            food_cell_size: 16,
+            initial_food: 0.25,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(0xBAAC_E11D),
+            ..ScriptBotsConfig::default()
+        };
+        let world = WorldState::new(config).expect("backend-agreement world");
+        let before = world
+            .world_digest_v1()
+            .expect("pre-projection canonical world digest");
+
+        for palette in ColorPaletteMode::ALL {
+            let frame =
+                RenderFrame::from_world(&world, palette).expect("backend-agreement render frame");
+            let colors = canonical_gpu_terrain_colors(&frame);
+            assert_eq!(
+                colors.len(),
+                frame.terrain.tiles.len(),
+                "every semantic terrain tile must reach the GPU boundary"
+            );
+        }
+
+        assert_eq!(
+            world
+                .world_digest_v1()
+                .expect("post-projection canonical world digest"),
+            before,
+            "backend comparison and terrain projection must remain science-neutral"
+        );
     }
 
     #[test]
