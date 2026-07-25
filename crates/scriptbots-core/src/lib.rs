@@ -4021,25 +4021,24 @@ pub struct SensorContribution {
     pub total: f32,
 }
 
-/// What an agent perceives right now, and *why*.
+/// What an agent would perceive if sensing ran against the completed boundary
+/// exactly as it stands, and *why*.
 ///
 /// # Which tick does this describe?
 ///
-/// It describes the world **as it stands**, i.e. what the agent's next
-/// sensing pass will see. It deliberately does NOT try to reproduce
-/// `AgentRuntime::sensors`, because those were computed in `stage_sense`
-/// from the positions agents held *before* actuation moved them — the world
-/// that produced them no longer exists. Claiming to explain a vector while
-/// silently using different positions would be the worst possible outcome:
-/// an explanation that looks authoritative and is wrong.
+/// This is an instantaneous completed-boundary counterfactual. It deliberately
+/// does not reproduce `AgentRuntime::sensors`, because those were computed from
+/// the pre-actuation world that no longer exists. It is also not a prediction of
+/// the next step: queued interventions, cadence aging, and food dynamics all run
+/// before the next `stage_sense` and may change sensed state.
 ///
-/// The honest contract, which the tests enforce, is: step the world and the
-/// next `runtime.sensors` will match [`SensorAttribution::clamped`].
+/// If `stage_sense` ran immediately with no intervening mutation,
+/// [`SensorAttribution::clamped`] would be the exact brain-facing vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorAttribution {
     /// Observer.
     pub agent: AgentId,
-    /// Tick the attribution was taken at.
+    /// Completed boundary at which the counterfactual was sampled.
     pub tick: Tick,
     /// Sensor values *before* the brain-facing `[0, 1]` clamp.
     ///
@@ -4047,7 +4046,8 @@ pub struct SensorAttribution {
     /// reconcile with these totals after those documented multipliers, except in
     /// a suspect run whose fixed accumulator reached its declared ceiling.
     pub raw: [f32; INPUT_SIZE],
-    /// Sensor values after clamping — what a brain actually receives.
+    /// Sensor values after clamping — what an immediate sensing pass would
+    /// deliver to the brain if the completed boundary remained unchanged.
     pub clamped: [f32; INPUT_SIZE],
     /// Channels whose raw value exceeded the clamp.
     ///
@@ -16636,8 +16636,9 @@ impl WorldState {
         }
     }
 
-    /// Explain what `agent` currently perceives, attributing the neighbour-derived
-    /// channels to the neighbours responsible.
+    /// Explain what `agent` would perceive if sensing ran immediately against
+    /// the current completed boundary, attributing neighbour-derived channels to
+    /// the neighbours responsible.
     ///
     /// Attribution is computed here, in core, and never re-derived in a UI: the
     /// falloff is subtle (a trait multiplier, a legacy proximity factor on the
@@ -16646,6 +16647,8 @@ impl WorldState {
     /// then display the wrong explanation with total confidence.
     ///
     /// Only the probed agent is ever explained — this is an on-demand,
+    /// instantaneous counterfactual, not a projection through the interventions,
+    /// aging, and food-dynamics stages that precede the next sensing pass.
     ///
     /// Returns `None` if the agent is gone.
     #[must_use]
@@ -29282,13 +29285,12 @@ mod tests {
     /// confidently lying to the user — the worst possible outcome for a panel
     /// whose entire job is to explain.
     ///
-    /// The proof: explain what the agent perceives now, then step the world once
-    /// (`stage_sense` runs before anything moves, so it senses exactly the world we
-    /// just explained) and require core's sensors to match what we predicted.
+    /// The proof: explain the completed boundary, run `stage_sense` directly
+    /// without any intervening stage, and require the resulting brain-facing
+    /// vector to match exactly.
     #[test]
-    fn explain_sensors_reproduces_the_sensors_core_itself_computes() {
-        // Freeze the food economy so sensor[4] cannot drift between the
-        // explanation and the step; every other channel is position-derived.
+    fn explain_sensors_matches_sensing_on_the_unchanged_completed_boundary() {
+        // Keep the fixture static so this test isolates the two sensing paths.
         let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 200,
             world_height: 200,
@@ -29329,7 +29331,7 @@ mod tests {
             "three neighbours inside the sense radius must contribute"
         );
 
-        world.step().expect("step");
+        world.stage_sense();
         let sensed = world.agent_runtime(observer).expect("runtime").sensors;
 
         for (index, channel) in SENSOR_LAYOUT.iter().enumerate() {
