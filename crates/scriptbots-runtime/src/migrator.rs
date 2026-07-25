@@ -4,7 +4,8 @@
 //! Guarantees population conservation, deterministic total ordering, and total
 //! tie-breaking (no `partial_cmp().unwrap()`, no HashMap iteration).
 
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::Rng;
+use scriptbots_core::SmallRngStream;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -208,7 +209,7 @@ pub fn select_emigrants(
 
     // Rank candidates per island
     let mut ranked_candidates: BTreeMap<IslandId, Vec<(CandidateAgent, f64)>> = BTreeMap::new();
-    let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(tick));
+    let mut rng = SmallRngStream::seed_from_u64(seed.wrapping_add(tick));
 
     for (&island_id, candidates) in islands_candidates {
         let mut sorted = candidates.clone();

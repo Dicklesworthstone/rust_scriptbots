@@ -292,7 +292,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     let expected_agent_substream_protocol = AgentSubstreamProtocolV1::from_root_seed(4242);
     assert_eq!(
         sidecar.agent_substream_protocol, expected_agent_substream_protocol,
-        "the sidecar must bind the exact target-specific agent-keyed RNG protocol for this seed"
+        "the sidecar must bind the exact portable agent-keyed RNG protocol for this seed"
     );
     assert_eq!(sidecar.agent_substream_protocol.root_seed(), 4242);
     assert_eq!(sidecar.agent_substream_protocol.version(), 1);
@@ -307,7 +307,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
             .stream_algorithm()
             .trim()
             .is_empty(),
-        "the protocol must name the concrete target-specific random generator"
+        "the protocol must name the concrete target-independent random generator"
     );
     assert_eq!(sidecar.next_agent_uid, 17);
     assert_eq!(sidecar.next_spawn_ordinal, 16);

@@ -164,9 +164,11 @@ Environmental and run-global stochastic decisions are drawn from one of six doma
 `RandomStream`s owned by `DomainStreams`. Agent-affecting decisions do not consume one shared
 domain continuation: `AgentSubstreamProtocolV1` derives a fresh operation-local `SmallRngStream`
 from the root seed, stable subject identity, fixed domain/operation tag, and a persisted local
-ordinal. The concrete generator is xoshiro256++ on 64-bit and xoshiro128++ on 32-bit, so a `wasm32`
-run legitimately draws a *different* sequence from the same derived seed. The protocol records
-that exact generator identity; native and browser continuations therefore cannot be confused.
+ordinal. The concrete generator is the project-pinned Xoshiro256++/SplitMix64 lane on every target;
+the `64` in its identity names the generator word width, not the target pointer width. Native and
+`wasm32` therefore draw the same sequence from the same derived seed. Historical Xoshiro256++
+checkpoints remain compatible because their state and codec are identical, while legacy 32-bit
+Xoshiro128++ continuations keep their distinct identity and are rejected rather than reinterpreted.
 
 - **Both protocol layers are versioned and self-describing.** `DomainStreamsCheckpoint` carries the
   root seed, domain-derivation algorithm, fixed-object codec, and exactly six named domain fields.

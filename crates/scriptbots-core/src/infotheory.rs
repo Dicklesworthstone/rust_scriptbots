@@ -7,7 +7,8 @@
 //! This module is a pure mathematical leaf: no simulation dependencies, no database I/O,
 //! and no unseeded or non-reproducible randomness.
 
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use crate::SmallRngStream;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 /// Error variants for infotheory estimations.
@@ -230,7 +231,7 @@ pub fn compute_mi(
     let (plugin, corrected) = calc_mi_mm(emitter, receiver, b);
 
     // Surrogate null: Circular Time-Shift
-    let mut rng = SmallRng::seed_from_u64(params.seed);
+    let mut rng = SmallRngStream::seed_from_u64(params.seed);
     let r_runs = params.surrogate_runs.max(1);
     let mut surrogates = Vec::with_capacity(r_runs);
     let mut ge_count = 0usize;
@@ -416,7 +417,7 @@ pub fn compute_te(
     let te_bits = calc_te_mm(&r_next, &e_curr, &r_curr, b);
 
     // Surrogate null: Circular shift of E_curr relative to R
-    let mut rng = SmallRng::seed_from_u64(params.seed);
+    let mut rng = SmallRngStream::seed_from_u64(params.seed);
     let r_runs = params.surrogate_runs.max(1);
     let mut surrogates = Vec::with_capacity(r_runs);
     let mut ge_count = 0usize;
@@ -590,7 +591,7 @@ mod tests {
     #[test]
     fn test_negative_bias_correction() {
         let n = 200;
-        let mut rng = SmallRng::seed_from_u64(12345);
+        let mut rng = SmallRngStream::seed_from_u64(12345);
         let mut uncorrected_sum = 0.0;
         let mut corrected_sum = 0.0;
         let runs = 100;
@@ -641,7 +642,7 @@ mod tests {
     #[test]
     fn test_autocorrelation_trap_circular_vs_iid() {
         let n = 2000;
-        let mut rng = SmallRng::seed_from_u64(888);
+        let mut rng = SmallRngStream::seed_from_u64(888);
 
         let mut e = vec![0.0f64; n];
         let mut r = vec![0.0f64; n];
@@ -678,7 +679,7 @@ mod tests {
     #[test]
     fn test_directionality_transfer_entropy() {
         let n = 1000;
-        let mut rng = SmallRng::seed_from_u64(999);
+        let mut rng = SmallRngStream::seed_from_u64(999);
         let mut e = vec![0.0f64; n];
         let mut r = vec![0.0f64; n];
 

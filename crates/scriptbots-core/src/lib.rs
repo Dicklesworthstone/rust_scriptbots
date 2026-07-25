@@ -98,7 +98,7 @@ use rng_domains::{
     RngDomain, agent_substream, offspring_substream,
 };
 
-use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
+use rand::{Rng, RngCore};
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -283,21 +283,18 @@ pub const RANDOM_STREAM_STATE_VERSION: u16 = 1;
 pub const MAX_RANDOM_STREAM_STATE_BYTES: usize = 256;
 const SMALL_RNG_STATE_CODEC_VERSION: u16 = 1;
 const SMALL_RNG_STATE_BYTES: usize = 8 + 4 * 8;
-
-#[cfg(target_pointer_width = "64")]
 const RANDOM_STREAM_ALGORITHM: &str = "rand-0.9.5-smallrng-xoshiro256plusplus-64-seed-from-u64";
-#[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-const RANDOM_STREAM_ALGORITHM: &str = "rand-0.9.5-smallrng-xoshiro128plusplus-32-seed-from-u64";
 
 /// Serializable continuation state for one random-stream adapter.
 ///
-/// `SmallRng` deliberately does not promise a portable, serializable state. This first protocol
-/// therefore carries a bounded opaque payload identified by an algorithm and codec version. The
-/// current adapter's private codec records its seed and four state words as explicit little-endian
-/// `u64`s. Restore is constant-time and validates versions and lengths before decoding, so
-/// untrusted state cannot request unbounded work. This preserves the existing generator and
-/// fixed-seed behavior without constraining future adapters to xoshiro's state shape, selecting a
-/// replacement generator, or claiming domain separation.
+/// The scientific stream is a project-owned, target-independent Xoshiro256++ protocol rather than
+/// `rand::rngs::SmallRng`, whose algorithm depends on pointer width. The bounded opaque payload is
+/// identified by an algorithm and codec version; the current codec records its seed and four state
+/// words as explicit little-endian `u64`s. Restore is constant-time and validates versions,
+/// algorithm identity, and lengths before decoding, so untrusted state cannot request unbounded
+/// work. The former 64-bit lane already used this exact algorithm and codec, so its checkpoints
+/// remain compatible on every target. Legacy 32-bit Xoshiro128++ checkpoints carry a different
+/// identifier and are rejected rather than silently reinterpreted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RandomStreamState {
     /// Envelope version (`RANDOM_STREAM_STATE_VERSION`).
@@ -395,15 +392,6 @@ pub enum RandomStreamRestoreError {
     /// All-zero state would collapse the generator into a degenerate orbit.
     #[error("invalid all-zero random-stream state")]
     AllZeroState,
-    /// State word exceeded the 32-bit algorithm width.
-    #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-    #[error("random-stream state word {index} exceeds the 32-bit algorithm width: {value}")]
-    StateWordOutOfRange {
-        /// Index of the offending state word.
-        index: usize,
-        /// Offending word value.
-        value: u64,
-    },
 }
 
 /// Object-safe random-stream protocol consumed by core and brain families.
@@ -418,10 +406,12 @@ pub trait RandomStream: RngCore {
     fn checkpoint(&self) -> RandomStreamState;
 }
 
-/// Restorable adapter around the world's existing [`SmallRng`] algorithm.
+/// Restorable target-independent scientific random stream.
 ///
-/// The adapter implements [`RngCore`], so core and brain-family consumers retain the exact
-/// sampling operations they need after selecting an explicit world domain.
+/// The historical type name is retained, but the algorithm is project-owned Xoshiro256++ seeded
+/// by SplitMix64 on every supported pointer width. The adapter implements [`RngCore`], so core and
+/// brain-family consumers use the same sampling operations after selecting an explicit world
+/// domain on native and WASM targets.
 #[derive(Clone, Debug)]
 pub struct SmallRngStream {
     seed: u64,
@@ -429,24 +419,14 @@ pub struct SmallRngStream {
 }
 
 impl SmallRngStream {
-    /// Construct the current adapter with the same `SmallRng::seed_from_u64` behavior used before
-    /// this protocol existed.
+    /// Construct the portable stream from a `u64` seed.
+    ///
+    /// This preserves the former 64-bit `rand 0.9.5` `SmallRng` sequence while making that
+    /// Xoshiro256++ lane explicit and identical on 32-bit WASM.
     #[must_use]
     pub fn seed_from_u64(seed: u64) -> Self {
         let mut splitmix_state = seed;
-        #[cfg(target_pointer_width = "64")]
         let state_words = std::array::from_fn(|_| splitmix64(&mut splitmix_state));
-        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-        let state_words = {
-            let first = splitmix64(&mut splitmix_state);
-            let second = splitmix64(&mut splitmix_state);
-            [
-                first & u64::from(u32::MAX),
-                first >> 32,
-                second & u64::from(u32::MAX),
-                second >> 32,
-            ]
-        };
         debug_assert!(state_words.iter().any(|word| *word != 0));
         Self { seed, state_words }
     }
@@ -481,8 +461,9 @@ impl SmallRngStream {
 
     /// Restore the exact continuation represented by `state` in constant time.
     ///
-    /// Version, algorithm, word width, and the xoshiro all-zero forbidden state are validated
-    /// before construction. An error performs no sampling and has no externally visible state.
+    /// Version, algorithm, codec, payload width, and the Xoshiro all-zero forbidden state are
+    /// validated before construction. An error performs no sampling and has no externally visible
+    /// state.
     pub fn from_state(state: &RandomStreamState) -> Result<Self, RandomStreamRestoreError> {
         if state.version != RANDOM_STREAM_STATE_VERSION {
             return Err(RandomStreamRestoreError::UnsupportedVersion {
@@ -523,12 +504,6 @@ impl SmallRngStream {
         if state_words.iter().all(|word| *word == 0) {
             return Err(RandomStreamRestoreError::AllZeroState);
         }
-        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-        for (index, value) in state_words.iter().copied().enumerate() {
-            if value > u64::from(u32::MAX) {
-                return Err(RandomStreamRestoreError::StateWordOutOfRange { index, value });
-            }
-        }
         Ok(Self { seed, state_words })
     }
 }
@@ -553,80 +528,37 @@ const fn splitmix64(state: &mut u64) -> u64 {
 impl RngCore for SmallRngStream {
     #[inline]
     fn next_u32(&mut self) -> u32 {
-        #[cfg(target_pointer_width = "64")]
-        {
-            (self.next_u64() >> 32) as u32
-        }
-        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-        {
-            let mut words = self.state_words.map(|word| word as u32);
-            let result = words[0]
-                .wrapping_add(words[3])
-                .rotate_left(7)
-                .wrapping_add(words[0]);
-            let shifted = words[1] << 9;
-            words[2] ^= words[0];
-            words[3] ^= words[1];
-            words[1] ^= words[2];
-            words[0] ^= words[3];
-            words[2] ^= shifted;
-            words[3] = words[3].rotate_left(11);
-            self.state_words = words.map(u64::from);
-            result
-        }
+        (self.next_u64() >> 32) as u32
     }
 
     #[inline]
     fn next_u64(&mut self) -> u64 {
-        #[cfg(target_pointer_width = "64")]
-        {
-            let result = self.state_words[0]
-                .wrapping_add(self.state_words[3])
-                .rotate_left(23)
-                .wrapping_add(self.state_words[0]);
-            let shifted = self.state_words[1] << 17;
-            self.state_words[2] ^= self.state_words[0];
-            self.state_words[3] ^= self.state_words[1];
-            self.state_words[1] ^= self.state_words[2];
-            self.state_words[0] ^= self.state_words[3];
-            self.state_words[2] ^= shifted;
-            self.state_words[3] = self.state_words[3].rotate_left(45);
-            result
-        }
-        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-        {
-            let low = u64::from(self.next_u32());
-            let high = u64::from(self.next_u32());
-            (high << 32) | low
-        }
+        let result = self.state_words[0]
+            .wrapping_add(self.state_words[3])
+            .rotate_left(23)
+            .wrapping_add(self.state_words[0]);
+        let shifted = self.state_words[1] << 17;
+        self.state_words[2] ^= self.state_words[0];
+        self.state_words[3] ^= self.state_words[1];
+        self.state_words[1] ^= self.state_words[2];
+        self.state_words[0] ^= self.state_words[3];
+        self.state_words[2] ^= shifted;
+        self.state_words[3] = self.state_words[3].rotate_left(45);
+        result
     }
 
     #[inline]
     fn fill_bytes(&mut self, destination: &mut [u8]) {
-        #[cfg(target_pointer_width = "64")]
-        {
-            let (chunks, remainder) = destination.as_chunks_mut::<8>();
-            for chunk in chunks {
-                *chunk = self.next_u64().to_le_bytes();
-            }
-            if remainder.len() > 4 {
-                let bytes = self.next_u64().to_le_bytes();
-                remainder.copy_from_slice(&bytes[..remainder.len()]);
-            } else if !remainder.is_empty() {
-                let bytes = self.next_u32().to_le_bytes();
-                remainder.copy_from_slice(&bytes[..remainder.len()]);
-            }
+        let (chunks, remainder) = destination.as_chunks_mut::<8>();
+        for chunk in chunks {
+            *chunk = self.next_u64().to_le_bytes();
         }
-        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-        {
-            let (chunks, remainder) = destination.as_chunks_mut::<4>();
-            for chunk in chunks {
-                *chunk = self.next_u32().to_le_bytes();
-            }
-            if !remainder.is_empty() {
-                let bytes = self.next_u32().to_le_bytes();
-                remainder.copy_from_slice(&bytes[..remainder.len()]);
-            }
+        if remainder.len() > 4 {
+            let bytes = self.next_u64().to_le_bytes();
+            remainder.copy_from_slice(&bytes[..remainder.len()]);
+        } else if !remainder.is_empty() {
+            let bytes = self.next_u32().to_le_bytes();
+            remainder.copy_from_slice(&bytes[..remainder.len()]);
         }
     }
 }
@@ -12425,7 +12357,7 @@ impl TerrainLayer {
         width: u32,
         height: u32,
         cell_size: u32,
-        rng: &mut SmallRng,
+        rng: &mut SmallRngStream,
     ) -> Result<Self, WorldStateError> {
         if width == 0 || height == 0 || cell_size == 0 {
             return Err(WorldStateError::InvalidConfig(
@@ -16537,7 +16469,7 @@ impl WorldState {
         let (food_w, food_h) = config.food_dimensions()?;
         let mut rng = DomainStreams::from_root_seed(config.resolved_rng_seed());
         let mut terrain_rng =
-            SmallRng::seed_from_u64(rng.stream(RngDomain::Environment).next_u64());
+            SmallRngStream::seed_from_u64(rng.stream(RngDomain::Environment).next_u64());
         let terrain =
             TerrainLayer::generate(food_w, food_h, config.food_cell_size, &mut terrain_rng)?;
         let food = FoodGrid::new(food_w, food_h, config.initial_food)?;
@@ -18932,7 +18864,7 @@ impl WorldState {
     )]
     fn sample_position_in_region(
         region: Region,
-        rng: &mut SmallRng,
+        rng: &mut SmallRngStream,
         world_width: f32,
         world_height: f32,
     ) -> Position {
@@ -19291,7 +19223,7 @@ impl WorldState {
                     let CohortSource::RegisteredBrain { key } = genome;
                     let Placement::Seeded { region, seed } = placement;
                     let placement_region = region;
-                    let mut rng = SmallRng::seed_from_u64(seed);
+                    let mut rng = SmallRngStream::seed_from_u64(seed);
                     let mut spawned: Vec<AgentId> = Vec::with_capacity(usize::from(count));
                     let mut breach_count = 0_u32;
                     for _ in 0..count {
@@ -25538,8 +25470,11 @@ mod tests {
         assert_eq!(restored.next_u64(), expected.next_u64());
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn small_rng_stream_matches_rand_095_and_restores_every_continuation() {
+    fn portable_stream_preserves_rand_095_xoshiro256_sequence_and_continuations() {
+        use rand::{SeedableRng as _, rngs::SmallRng};
+
         for seed in [0, 1, 0x5eed_cafe_dead_beef, u64::MAX] {
             let mut expected = SmallRng::seed_from_u64(seed);
             let mut actual = SmallRngStream::seed_from_u64(seed);
@@ -25589,15 +25524,13 @@ mod tests {
     /// SOURCE, not of any value this process can observe. On 64-bit every runtime value is
     /// self-consistent; there is nothing to compare against.
     ///
-    /// BORN RED, deliberately. It fails today because the constant is cfg-selected at two
-    /// sites, and that is precisely bd-7mh6's root cause. UN-IGNORE IT AS PART OF bd-7mh6;
-    /// do not delete it, and do not "fix" it by loosening the assertion.
+    /// This was born red under bd-g4aw because the constant was cfg-selected at two sites,
+    /// precisely bd-7mh6's root cause. It became an ordinary unignored regression with the
+    /// portable-lane repair; do not delete it or loosen the assertion.
     ///
-    /// An ignored test is itself shape 2 of the bd-d3wu taxonomy -- a proof that executes
-    /// nothing -- if nobody ever runs it. It is named in bd-7mh6's acceptance for that
-    /// reason: the fix is not complete until this runs and passes unignored.
+    /// The test remains paired with the real two-runtime browser comparison because this source
+    /// proxy alone cannot prove cross-target behavior.
     #[test]
-    #[ignore = "bd-g4aw born-red: fails until bd-7mh6 unifies the RNG lane; un-ignore with that fix"]
     fn a_random_stream_algorithm_must_not_be_target_dependent() {
         let source = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
@@ -25619,9 +25552,8 @@ mod tests {
         );
     }
 
-    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn small_rng_stream_codec_v1_freezes_seed_and_state_words_as_little_endian() {
+    fn portable_small_rng_stream_codec_v1_freezes_seed_and_state_words_as_little_endian() {
         let state = SmallRngStream::seed_from_u64(0).checkpoint();
         assert_eq!(state.version, RANDOM_STREAM_STATE_VERSION);
         // bd-g4aw: pinned as a LITERAL, not as `SmallRngStream::algorithm()`. The previous
@@ -25655,12 +25587,17 @@ mod tests {
         ));
         assert_eq!(original, SmallRngStream::seed_from_u64(9).checkpoint());
 
+        let legacy_wasm_algorithm = "rand-0.9.5-smallrng-xoshiro128plusplus-32-seed-from-u64";
         let mut wrong_algorithm = original.clone();
-        wrong_algorithm.algorithm = "not-the-current-algorithm".to_owned();
-        assert!(matches!(
-            SmallRngStream::from_state(&wrong_algorithm),
-            Err(RandomStreamRestoreError::UnsupportedAlgorithm { .. })
-        ));
+        wrong_algorithm.algorithm = legacy_wasm_algorithm.to_owned();
+        assert_eq!(
+            SmallRngStream::from_state(&wrong_algorithm)
+                .expect_err("legacy target-selected WASM state must not be reinterpreted"),
+            RandomStreamRestoreError::UnsupportedAlgorithm {
+                found: legacy_wasm_algorithm.to_owned(),
+                expected: RANDOM_STREAM_ALGORITHM,
+            }
+        );
         assert_eq!(original, SmallRngStream::seed_from_u64(9).checkpoint());
 
         let mut wrong_codec = original.clone();
@@ -26738,7 +26675,7 @@ mod tests {
             "food",
         );
 
-        let mut rng = SmallRng::seed_from_u64(0xA110_CAFE);
+        let mut rng = SmallRngStream::seed_from_u64(0xA110_CAFE);
         let mut untouched_rng = rng.clone();
         assert_dimension_overflow(
             TerrainLayer::generate(u32::MAX, u32::MAX, 1, &mut rng)

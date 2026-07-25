@@ -2836,9 +2836,9 @@ mod tests {
         world.hydrology = Some(hydrology);
     }
 
-    // The nested RNG algorithm identity deliberately names its pointer-width lane. Keep this
-    // literal golden on the pinned 64-bit verification target; semantic round-trip tests remain
-    // portable across the other supported lanes.
+    // The nested RNG identity names the portable Xoshiro256++ word-width lane. Keep this literal
+    // golden on the pinned 64-bit verification target; the same scientific stream and semantic
+    // round-trip contract now apply on every supported target.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn checkpoint_v1_representative_wire_golden() {
@@ -3678,6 +3678,28 @@ mod tests {
             prepared_constructions.load(Ordering::Relaxed),
             0,
             "protocol/root mismatch must reject before reconstructing any evaluator or agent"
+        );
+
+        let mut legacy_wasm_stream = checkpoint.clone();
+        legacy_wasm_stream
+            .state
+            .random_streams
+            .streams
+            .food
+            .algorithm = "rand-0.9.5-smallrng-xoshiro128plusplus-32-seed-from-u64".to_owned();
+        assert!(matches!(
+            WorldState::restore_checkpoint_v1(&legacy_wasm_stream, prepared_registry()),
+            Err(WorldCheckpointError::RandomStreams(
+                DomainStreamRestoreError::Stream {
+                    domain: "food",
+                    source: crate::RandomStreamRestoreError::UnsupportedAlgorithm { .. },
+                }
+            ))
+        ));
+        assert_eq!(
+            prepared_constructions.load(Ordering::Relaxed),
+            0,
+            "legacy WASM stream state must reject before reconstructing any evaluator or agent"
         );
 
         let mut wrong_counter = checkpoint.clone();

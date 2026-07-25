@@ -427,10 +427,10 @@ pub enum AgentRngCounterError {
 
 /// Versioned metadata binding an agent-keyed protocol to its root and concrete RNG lane.
 ///
-/// The derivation is cross-target stable, but [`SmallRngStream`] deliberately records the exact
-/// generator algorithm selected by the compilation target. Restore must validate this envelope
-/// before consuming persisted counters so a native continuation is never misrepresented as a
-/// compatible WASM continuation, or vice versa.
+/// Both the derivation and [`SmallRngStream`] are cross-target stable. Restore still validates the
+/// exact generator identity before consuming persisted counters: compatible historical
+/// Xoshiro256++ state may resume on either target, while legacy 32-bit Xoshiro128++ state is
+/// rejected rather than silently reinterpreted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSubstreamProtocolV1 {
@@ -442,7 +442,7 @@ pub struct AgentSubstreamProtocolV1 {
 }
 
 impl AgentSubstreamProtocolV1 {
-    /// Construct the protocol metadata for one world root seed and compiled RNG lane.
+    /// Construct the protocol metadata for one world root seed and the portable RNG lane.
     #[must_use]
     pub fn from_root_seed(root_seed: u64) -> Self {
         Self {
@@ -472,7 +472,7 @@ impl AgentSubstreamProtocolV1 {
         self.codec_version
     }
 
-    /// Exact concrete generator algorithm selected by this compilation target.
+    /// Exact target-independent concrete generator algorithm.
     #[must_use]
     pub fn stream_algorithm(&self) -> &str {
         &self.stream_algorithm
@@ -484,7 +484,7 @@ impl AgentSubstreamProtocolV1 {
         self.root_seed
     }
 
-    /// Validate a decoded protocol envelope against the expected world and compiled RNG lane.
+    /// Validate a decoded protocol envelope against the expected world and portable RNG lane.
     pub fn validate(&self, expected_root_seed: u64) -> Result<(), AgentSubstreamProtocolError> {
         if self.version != AGENT_SUBSTREAM_PROTOCOL_VERSION {
             return Err(AgentSubstreamProtocolError::Version {
@@ -1485,7 +1485,8 @@ mod tests {
         ));
 
         let mut wrong_stream = protocol.clone();
-        wrong_stream.stream_algorithm = "other".to_owned();
+        wrong_stream.stream_algorithm =
+            "rand-0.9.5-smallrng-xoshiro128plusplus-32-seed-from-u64".to_owned();
         assert!(matches!(
             wrong_stream.validate(910),
             Err(AgentSubstreamProtocolError::StreamAlgorithm { .. })
@@ -1508,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn keyed_substreams_record_the_compiled_native_or_wasm_generator_lane() {
+    fn keyed_substreams_record_the_same_portable_generator_lane_on_every_target() {
         let root_seed = 2026;
         let agent_seed = derive_agent_substream_seed(
             root_seed,
@@ -1657,6 +1658,20 @@ mod tests {
         assert!(matches!(
             DomainStreams::restore(&wrong_codec),
             Err(DomainStreamRestoreError::CodecVersion { .. })
+        ));
+
+        let legacy_wasm_algorithm = "rand-0.9.5-smallrng-xoshiro128plusplus-32-seed-from-u64";
+        let mut legacy_wasm = original.checkpoint();
+        legacy_wasm.streams.food.algorithm = legacy_wasm_algorithm.to_owned();
+        assert!(matches!(
+            DomainStreams::restore(&legacy_wasm),
+            Err(DomainStreamRestoreError::Stream {
+                domain: "food",
+                source: RandomStreamRestoreError::UnsupportedAlgorithm {
+                    ref found,
+                    expected,
+                },
+            }) if found == legacy_wasm_algorithm && expected == SmallRngStream::algorithm()
         ));
     }
 

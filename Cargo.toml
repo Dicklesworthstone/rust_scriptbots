@@ -34,7 +34,7 @@ blake3 = "1.8.5"
 libc = "0.2.186"
 libm = "0.2.16"
 rayon = "1.12.0"
-rand = { version = "0.9.0", features = ["small_rng"] }
+rand = { version = "=0.9.5", features = ["small_rng"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 thiserror = "2.0.18"

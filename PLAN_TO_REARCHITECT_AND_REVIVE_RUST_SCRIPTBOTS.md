@@ -821,8 +821,8 @@ Dynamic existing-agent streams derive from `(run seed, stable AgentUid, fixed do
 agent-local operation ordinal)`. Offspring streams derive from ordered parent UIDs plus the primary
 parent's local successful-birth ordinal. That ordinal is distinct from the global demographic birth
 ordinal assigned when a `born` lifecycle record is inserted. Every next-unused agent counter and the
-exact native/WASM generator lane are explicit checkpoint state; a failed reproduction restores the
-counter preimage together with the rest of the staged transaction.
+exact portable native/WASM generator lane are explicit checkpoint state; a failed reproduction
+restores the counter preimage together with the rest of the staged transaction.
 
 The leading reuse candidate is `franken_numpy`’s `fnp-random`, which provides `SeedSequence`, hierarchical child streams, PCG64DXSM state restoration, and jump-ahead. Adoption is gated by a small adapter/toolchain/build-size spike because the current crate is pre-0.2, pulls ndarray and Rayon, and does not implement `rand::RngCore`. Pin an exact commit; never use a mutable sibling path in released builds.
 
@@ -2170,7 +2170,8 @@ runs have a canonical first-divergence oracle and checkpoint schema before runti
 #### 1.9 domain-separated RNG and `fnp-random` decision [Completed — global six-domain cutover in `bd-2cd1`; agent-keyed noninteraction and DSR proof in `bd-1kxd`]
 
 - [Completed — `bd-2z0.3.10`] Reject pinned `fnp-random`: its nightly-only, non-WASM contract
-  does not serve this project's C++ parity oracle; retain the pinned `SmallRngStream` protocol;
+  does not serve this project's C++ parity oracle; retain the pinned `SmallRngStream` protocol,
+  now fixed to one portable Xoshiro256++ lane across native and WASM;
 - [Completed — `bd-2cd1`, `a547201`, DSR `bd-2cd1-verify-5` and `bd-2cd1-perf-compare-1`]
   Routed every world stochastic boundary through one of six explicit global domains, persisted a
   strict fixed six-field checkpoint, and exposed every domain independently in the canonical digest;

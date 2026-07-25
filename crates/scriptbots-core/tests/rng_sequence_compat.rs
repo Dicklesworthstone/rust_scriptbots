@@ -21,27 +21,23 @@ use scriptbots_core::{RandomStream, SmallRngStream};
 /// An arbitrary but FIXED seed. The value is meaningless; its constancy is the point.
 const PINNED_SEED: u64 = 0x5CB1_B075_2026_0713;
 
-/// The exact algorithm identity a 64-bit run records in its manifest.
+/// The exact portable algorithm identity every run records in its manifest.
 ///
 /// This string is not decoration: `SmallRngStream::from_state` REFUSES a checkpoint whose
 /// algorithm id does not match, which is what stops a run from being resumed by a
 /// generator that no longer produces its numbers. It also embeds the `rand` version, so
 /// pinning it here means a `rand` bump that forgets to update the identity fails LOUDLY
 /// instead of silently attributing two different streams to the same name.
-#[cfg(target_pointer_width = "64")]
 const PINNED_ALGORITHM: &str = "rand-0.9.5-smallrng-xoshiro256plusplus-64-seed-from-u64";
 
-/// The first draws of the stream, as produced by the `rand` version this project is
-/// pinned to. Regenerate ONLY when deliberately accepting a new generator.
+/// The first draws of the project-owned stream. They preserve the 64-bit `rand 0.9.5`
+/// `SmallRng` sequence that established this protocol identity. Regenerate ONLY when
+/// deliberately accepting a new generator.
 ///
-/// **64-bit only, by design.** `rand`'s `SmallRng` is Xoshiro256++ on 64-bit targets and
-/// Xoshiro128++ on 32-bit ones — so a `wasm32` run draws a *different sequence from the
-/// same seed*. That is not a bug and it is not hidden: `RANDOM_STREAM_ALGORITHM` is
-/// `cfg`-gated on pointer width, so a wasm run records `xoshiro128plusplus-32` in its
-/// manifest and cannot be mistaken for a native one. Pinning a single sequence across
-/// both widths would be asserting something false, so this golden is scoped to the width
-/// it actually describes.
-#[cfg(target_pointer_width = "64")]
+/// Xoshiro256++ is selected explicitly on every target. The `64` in the identity is the
+/// generator word width, not the target pointer width. This sequence therefore applies equally
+/// to native and `wasm32`; a legacy Xoshiro128++ checkpoint retains its different identifier and
+/// is rejected rather than reseeded or reinterpreted.
 const PINNED_SEQUENCE: [u64; 8] = [
     0x983b_a855_4b84_a81a,
     0x0da6_d2ad_c991_ed42,
@@ -53,7 +49,6 @@ const PINNED_SEQUENCE: [u64; 8] = [
     0x66a6_fcce_7bf9_5ce4,
 ];
 
-#[cfg(target_pointer_width = "64")]
 #[test]
 fn the_random_stream_produces_its_pinned_sequence() {
     let mut stream = SmallRngStream::seed_from_u64(PINNED_SEED);
@@ -106,7 +101,6 @@ fn the_algorithm_identity_is_stable() {
     // changing the name would let two different streams share one identity — and every
     // checkpoint written before the bump would be silently accepted by a generator that
     // no longer produces its numbers.
-    #[cfg(target_pointer_width = "64")]
     assert_eq!(
         SmallRngStream::algorithm(),
         PINNED_ALGORITHM,
