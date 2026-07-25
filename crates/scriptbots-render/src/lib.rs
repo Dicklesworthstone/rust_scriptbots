@@ -5916,7 +5916,11 @@ impl SimulationView {
         }
 
         if let Some(frame) = snapshot.render_frame.as_ref() {
-            let spiked = frame.agents.iter().filter(|agent| agent.spiked).count();
+            let spiked = frame
+                .agents
+                .iter()
+                .filter(|agent| agent.spike_victim)
+                .count();
             if spiked > audio.last_spike_count {
                 audio.play(&audio.spike_sound);
             }
@@ -13047,7 +13051,9 @@ struct AgentRenderData {
     eye_fov: [f32; NUM_EYES],
     selection: SelectionState,
     indicator: IndicatorState,
-    spiked: bool,
+    spike_extended: bool,
+    spike_struck: bool,
+    spike_victim: bool,
     reproduction_intent: f32,
 }
 
@@ -13085,7 +13091,6 @@ impl RenderFrame {
         let healths = columns.health();
         let velocities = columns.velocities();
         let headings = columns.headings();
-        let boosts = columns.boosts();
         let ages = columns.ages();
         let agent_reference_age = u64::from(config.aging_health_decay_start.max(1));
 
@@ -13095,7 +13100,11 @@ impl RenderFrame {
             let runtime_entry = runtime.get(agent_id);
             let selection = runtime_entry.map(|rt| rt.selection).unwrap_or_default();
             let indicator = runtime_entry.map(|rt| rt.indicator).unwrap_or_default();
-            let spiked = runtime_entry.map(|rt| rt.spiked).unwrap_or(false);
+            let boost = runtime_entry.is_some_and(|rt| rt.outputs.boost_engaged());
+            let spike_extended = runtime_entry
+                .is_some_and(|rt| rt.outputs.channel(OutputChannel::SpikeTarget) > 0.5);
+            let spike_struck = runtime_entry.is_some_and(|rt| rt.combat.spike_attacker);
+            let spike_victim = runtime_entry.is_some_and(|rt| rt.spiked);
             let reproduction_intent = runtime_entry.map(|rt| rt.give_intent).unwrap_or(0.0);
 
             let (
@@ -13167,7 +13176,7 @@ impl RenderFrame {
                 heading: headings[idx],
                 health: healths[idx],
                 age: ages[idx],
-                boost: if boosts[idx] { 1.0 } else { 0.0 },
+                boost: if boost { 1.0 } else { 0.0 },
                 wheel_left,
                 wheel_right,
                 herbivore_tendency,
@@ -13185,7 +13194,9 @@ impl RenderFrame {
                 eye_fov,
                 selection,
                 indicator,
-                spiked,
+                spike_extended,
+                spike_struck,
+                spike_victim,
                 reproduction_intent,
             });
         }
@@ -13197,8 +13208,7 @@ impl RenderFrame {
                 .hydrology()
                 .map(scriptbots_core::HydrologyState::water_depth),
         );
-        let (day_night_cycle_ticks, day_night_start_phase) =
-            config.render.resolved_day_night();
+        let (day_night_cycle_ticks, day_night_start_phase) = config.render.resolved_day_night();
 
         Some(Self {
             tick: world.tick().0,
@@ -13506,6 +13516,133 @@ fn palette_color(color: Rgba, palette: ColorPaletteMode, palette_is_natural: boo
 /// cost (bd-2z0.7.12).
 const DETAIL_MIN_PX: f32 = 18.0;
 
+const AGENT_LOD_DIET_BINS: usize = 8;
+const AGENT_LOD_LUMA_BINS: usize = 4;
+const AGENT_LOD_BODY_BINS: usize = AGENT_LOD_DIET_BINS * AGENT_LOD_LUMA_BINS;
+const AGENT_LOD_SPIKE_BINS: usize = 4;
+
+#[derive(Clone, Copy, Debug)]
+struct AgentSilhouette {
+    center: (f32, f32),
+    forward: (f32, f32),
+    right: (f32, f32),
+    body_half_length: f32,
+    body_radius: f32,
+    spike: [(f32, f32); 3],
+    boost: Option<[(f32, f32); 3]>,
+    extent: f32,
+}
+
+fn agent_silhouette(
+    position: (f32, f32),
+    size_px: f32,
+    scale: f32,
+    visuals: &AgentVisualParams,
+    boost: f32,
+    sound_multiplier: f32,
+) -> AgentSilhouette {
+    let half = size_px * 0.5;
+    let forward = (visuals.facing[0], visuals.facing[1]);
+    let right = (visuals.right[0], visuals.right[1]);
+    let body_half_length = half * 1.35;
+    let body_radius = (half * 0.72).max(3.0);
+
+    let spike_base = body_radius * 0.65;
+    let base_offset = body_half_length - body_radius * 0.2;
+    let spike_front_offset = body_half_length + body_radius * 0.7 + 2.0;
+    let spike = [
+        (
+            position.0 + forward.0 * base_offset - right.0 * spike_base,
+            position.1 + forward.1 * base_offset - right.1 * spike_base,
+        ),
+        (
+            position.0 + forward.0 * base_offset + right.0 * spike_base,
+            position.1 + forward.1 * base_offset + right.1 * spike_base,
+        ),
+        (
+            position.0 + forward.0 * spike_front_offset + visuals.spike_tip_offset[0] * scale,
+            position.1 + forward.1 * spike_front_offset + visuals.spike_tip_offset[1] * scale,
+        ),
+    ];
+
+    let boost = (boost > 0.05).then(|| {
+        let boost_level = boost.clamp(0.0, 1.0);
+        let tail_offset = body_half_length - body_radius * 0.3;
+        let flame_length =
+            body_radius * (1.2 + boost_level * 1.6) + sound_multiplier.max(1.0) * 4.0;
+        [
+            (
+                position.0 - forward.0 * tail_offset - right.0 * (body_radius * 0.55),
+                position.1 - forward.1 * tail_offset - right.1 * (body_radius * 0.55),
+            ),
+            (
+                position.0 - forward.0 * tail_offset + right.0 * (body_radius * 0.55),
+                position.1 - forward.1 * tail_offset + right.1 * (body_radius * 0.55),
+            ),
+            (
+                position.0 - forward.0 * (body_half_length + flame_length),
+                position.1 - forward.1 * (body_half_length + flame_length),
+            ),
+        ]
+    });
+
+    let mut extent = body_half_length + body_radius;
+    for point in spike.into_iter().chain(boost.into_iter().flatten()) {
+        extent = extent.max((point.0 - position.0).hypot(point.1 - position.1));
+    }
+
+    AgentSilhouette {
+        center: position,
+        forward,
+        right,
+        body_half_length,
+        body_radius,
+        spike,
+        boost,
+        extent,
+    }
+}
+
+fn append_triangle(builder: &mut PathBuilder, triangle: [(f32, f32); 3]) {
+    builder.move_to(point(px(triangle[0].0), px(triangle[0].1)));
+    builder.line_to(point(px(triangle[1].0), px(triangle[1].1)));
+    builder.line_to(point(px(triangle[2].0), px(triangle[2].1)));
+    builder.close();
+}
+
+fn agent_spike_color(
+    visuals: &AgentVisualParams,
+    palette: ColorPaletteMode,
+    palette_is_natural: bool,
+) -> Rgba {
+    palette_color(
+        scale_rgb(
+            rgba_from_triplet_with_alpha(visuals.spike_color, 0.55 + visuals.spike_readiness * 0.4),
+            1.0 + visuals.spike_readiness * 0.3,
+        ),
+        palette,
+        palette_is_natural,
+    )
+}
+
+fn agent_boost_color(
+    boost: f32,
+    visuals: &AgentVisualParams,
+    palette: ColorPaletteMode,
+    palette_is_natural: bool,
+) -> Rgba {
+    let gain = (visuals.body_emissive_gain / visual::visual_style().agents.boost_emissive_gain)
+        .clamp(0.0, 1.0);
+    palette_color(
+        rgba_from_triplet_with_alpha(
+            visuals.body_emissive,
+            0.35 + boost.clamp(0.0, 1.0) * 0.3 + gain * 0.15,
+        ),
+        palette,
+        palette_is_natural,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_agent_avatar(
     window: &mut Window,
@@ -13520,13 +13657,18 @@ fn paint_agent_avatar(
     very_low_fps: bool,
 ) {
     let (px_x, px_y) = position;
-    let half = size_px * 0.5;
-    let (sin_h, cos_h) = agent.heading.sin_cos();
-    let forward = (cos_h, sin_h);
-    let right = (-sin_h, cos_h);
-
-    let body_half_length = half * 1.35;
-    let body_radius = (half * 0.72).max(3.0);
+    let silhouette = agent_silhouette(
+        position,
+        size_px,
+        scale,
+        visuals,
+        agent.boost,
+        agent.sound_multiplier,
+    );
+    let forward = silhouette.forward;
+    let right = silhouette.right;
+    let body_half_length = silhouette.body_half_length;
+    let body_radius = silhouette.body_radius;
     let wheel_half_length = body_half_length * 0.96;
     let wheel_radius = (body_radius * 0.38).max(2.0);
     let wheel_offset = body_radius + wheel_radius * 0.55;
@@ -13569,14 +13711,23 @@ fn paint_agent_avatar(
 
     if very_low_fps || size_px < DETAIL_MIN_PX {
         // LOD: below DETAIL_MIN_PX the avatar's ears/eyes/mouth resolve to sub-pixel
-        // mush; the silhouette (body capsule + spike) carries the same visual
-        // information for a fraction of the instance-buffer cost. This is the
-        // primary lever keeping typical zoomed-out scenes inside GPUI's default
-        // 2 MiB instance buffer (bd-2z0.7.12).
+        // mush; the silhouette retains facing, spike, boost, diet/health/age body
+        // color, and selection remains a separate overlay. No agent is dropped.
+        if let Some(boost) = silhouette.boost {
+            let mut boost_path = PathBuilder::fill();
+            append_triangle(&mut boost_path, boost);
+            if let Ok(path) = boost_path.build() {
+                window.paint_path(
+                    path,
+                    agent_boost_color(agent.boost, visuals, palette, palette_is_natural),
+                );
+            }
+        }
+
         let mut body_shape = PathBuilder::fill();
         append_capsule_polygon(
             &mut body_shape,
-            (px_x, px_y),
+            silhouette.center,
             forward,
             right,
             body_half_length,
@@ -13587,37 +13738,13 @@ fn paint_agent_avatar(
             window.paint_path(path, body_color);
         }
 
-        let spike_base = body_radius * 0.6;
-        let base_offset = body_half_length - body_radius * 0.25;
-        let tip_offset =
-            body_half_length + body_radius * 0.55 + agent.spike_length * scale * 0.6 + 1.0;
-        let base_left = (
-            px_x + forward.0 * base_offset - right.0 * spike_base,
-            px_y + forward.1 * base_offset - right.1 * spike_base,
-        );
-        let base_right = (
-            px_x + forward.0 * base_offset + right.0 * spike_base,
-            px_y + forward.1 * base_offset + right.1 * spike_base,
-        );
-        let tip = (px_x + forward.0 * tip_offset, px_y + forward.1 * tip_offset);
         let mut spike_path = PathBuilder::fill();
-        spike_path.move_to(point(px(base_left.0), px(base_left.1)));
-        spike_path.line_to(point(px(base_right.0), px(base_right.1)));
-        spike_path.line_to(point(px(tip.0), px(tip.1)));
-        spike_path.close();
+        append_triangle(&mut spike_path, silhouette.spike);
         if let Ok(path) = spike_path.build() {
-            let spike_color = palette_color(
-                scale_rgb(
-                    rgba_from_triplet_with_alpha(
-                        visuals.spike_color,
-                        0.55 + visuals.spike_readiness * 0.4,
-                    ),
-                    1.0 + visuals.spike_readiness * 0.25,
-                ),
-                palette,
-                palette_is_natural,
+            window.paint_path(
+                path,
+                agent_spike_color(visuals, palette, palette_is_natural),
             );
-            window.paint_path(path, spike_color);
         }
         return;
     }
@@ -13655,65 +13782,25 @@ fn paint_agent_avatar(
     }
 
     // Boost exhaust
-    if agent.boost > 0.05 {
-        let boost_level = agent.boost.clamp(0.0, 1.0);
-        let tail_offset = body_half_length - body_radius * 0.3;
-        let flame_length =
-            body_radius * (1.2 + boost_level * 1.6) + agent.sound_multiplier.max(1.0) * 4.0;
-        let tail_left = (
-            px_x - forward.0 * tail_offset - right.0 * (body_radius * 0.55),
-            px_y - forward.1 * tail_offset - right.1 * (body_radius * 0.55),
-        );
-        let tail_right = (
-            px_x - forward.0 * tail_offset + right.0 * (body_radius * 0.55),
-            px_y - forward.1 * tail_offset + right.1 * (body_radius * 0.55),
-        );
-        let tip = (
-            px_x - forward.0 * (body_half_length + flame_length),
-            px_y - forward.1 * (body_half_length + flame_length),
-        );
+    if let Some(boost) = silhouette.boost {
         let mut flame = PathBuilder::fill();
-        flame.move_to(point(px(tail_left.0), px(tail_left.1)));
-        flame.line_to(point(px(tail_right.0), px(tail_right.1)));
-        flame.line_to(point(px(tip.0), px(tip.1)));
-        flame.close();
+        append_triangle(&mut flame, boost);
         if let Ok(path) = flame.build() {
-            let gain = (visuals.body_emissive_gain
-                / visual::visual_style().agents.boost_emissive_gain)
-                .clamp(0.0, 1.0);
-            let mut flame_color = rgba_from_triplet_with_alpha(
-                visuals.body_emissive,
-                0.35 + boost_level * 0.3 + gain * 0.15,
+            window.paint_path(
+                path,
+                agent_boost_color(agent.boost, visuals, palette, palette_is_natural),
             );
-            flame_color = palette_color(flame_color, palette, palette_is_natural);
-            window.paint_path(path, flame_color);
         }
     }
 
     // Spike spear
-    let spike_base = body_radius * 0.65;
-    let base_offset = body_half_length - body_radius * 0.2;
-    let tip_offset = body_half_length + body_radius * 0.7 + agent.spike_length * scale * 0.85 + 2.0;
-    let base_left = (
-        px_x + forward.0 * base_offset - right.0 * spike_base,
-        px_y + forward.1 * base_offset - right.1 * spike_base,
-    );
-    let base_right = (
-        px_x + forward.0 * base_offset + right.0 * spike_base,
-        px_y + forward.1 * base_offset + right.1 * spike_base,
-    );
-    let tip = (px_x + forward.0 * tip_offset, px_y + forward.1 * tip_offset);
     let mut spike_path = PathBuilder::fill();
-    spike_path.move_to(point(px(base_left.0), px(base_left.1)));
-    spike_path.line_to(point(px(base_right.0), px(base_right.1)));
-    spike_path.line_to(point(px(tip.0), px(tip.1)));
-    spike_path.close();
+    append_triangle(&mut spike_path, silhouette.spike);
     if let Ok(path) = spike_path.build() {
-        let mut spike_color =
-            rgba_from_triplet_with_alpha(visuals.spike_color, 0.55 + visuals.spike_readiness * 0.4);
-        spike_color = scale_rgb(spike_color, 1.0 + visuals.spike_readiness * 0.3);
-        spike_color = palette_color(spike_color, palette, palette_is_natural);
-        window.paint_path(path, spike_color);
+        window.paint_path(
+            path,
+            agent_spike_color(visuals, palette, palette_is_natural),
+        );
     }
 
     // Mouth
@@ -13865,6 +13952,270 @@ fn paint_agent_avatar(
     if let Ok(path) = temp_ring.build() {
         window.paint_path(path, temp_color);
     }
+}
+
+#[derive(Clone, Copy)]
+struct AgentLodView {
+    offset: (f32, f32),
+    scale: f32,
+    bounds: (f32, f32, f32, f32),
+}
+
+#[derive(Clone, Copy)]
+struct AgentLodProjection {
+    silhouette: AgentSilhouette,
+    body_bin: usize,
+    body_color: Rgba,
+    spike_bin: usize,
+    spike_color: Rgba,
+    boost_bin: usize,
+    boost_color: Option<Rgba>,
+    marker_radius: f32,
+    marker_color: Rgba,
+    selection: SelectionState,
+    focused: bool,
+}
+
+#[inline]
+fn agent_screen_radius(frame: &RenderFrame, agent: &AgentRenderData, scale: f32) -> f32 {
+    let radius_world = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
+    (radius_world * scale).max(4.0)
+}
+
+fn project_agent_lod(
+    frame: &RenderFrame,
+    agent: &AgentRenderData,
+    view: AgentLodView,
+    focus_agent: Option<AgentId>,
+    palette_is_natural: bool,
+) -> Option<AgentLodProjection> {
+    let center = (
+        view.offset.0 + agent.position.x * view.scale,
+        view.offset.1 + agent.position.y * view.scale,
+    );
+    let marker_radius = agent_screen_radius(frame, agent, view.scale);
+    let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
+    let silhouette = agent_silhouette(
+        center,
+        marker_radius * 2.0,
+        view.scale,
+        &visuals,
+        agent.boost,
+        agent.sound_multiplier,
+    );
+    let (view_left, view_top, view_right, view_bottom) = view.bounds;
+    if center.0 + silhouette.extent < view_left
+        || center.0 - silhouette.extent > view_right
+        || center.1 + silhouette.extent < view_top
+        || center.1 - silhouette.extent > view_bottom
+    {
+        return None;
+    }
+
+    let mut body_color = agent_color(&visuals);
+    if !palette_is_natural {
+        body_color = apply_palette(body_color, frame.palette);
+    }
+    let luma =
+        (0.2126 * body_color.r + 0.7152 * body_color.g + 0.0722 * body_color.b).clamp(0.0, 1.0);
+    let diet_bin = ((agent.herbivore_tendency.clamp(0.0, 1.0) * AGENT_LOD_DIET_BINS as f32)
+        as usize)
+        .min(AGENT_LOD_DIET_BINS - 1);
+    let luma_bin = ((luma * AGENT_LOD_LUMA_BINS as f32) as usize).min(AGENT_LOD_LUMA_BINS - 1);
+    let body_bin = diet_bin * AGENT_LOD_LUMA_BINS + luma_bin;
+    let spike_bin = ((visuals.spike_readiness * AGENT_LOD_SPIKE_BINS as f32) as usize)
+        .min(AGENT_LOD_SPIKE_BINS - 1);
+
+    let boost_color = silhouette
+        .boost
+        .map(|_| agent_boost_color(agent.boost, &visuals, frame.palette, palette_is_natural));
+    let marker_alpha = match agent.selection {
+        SelectionState::Selected => 0.86,
+        SelectionState::Hovered => 0.62,
+        SelectionState::None => 0.72,
+    };
+    let marker_color = palette_color(
+        rgba_from_triplet_with_alpha(visuals.selection_rim_color, marker_alpha),
+        frame.palette,
+        palette_is_natural,
+    );
+
+    Some(AgentLodProjection {
+        silhouette,
+        body_bin,
+        body_color,
+        spike_bin,
+        spike_color: agent_spike_color(&visuals, frame.palette, palette_is_natural),
+        boost_bin: diet_bin,
+        boost_color,
+        marker_radius,
+        marker_color,
+        selection: agent.selection,
+        focused: focus_agent == Some(agent.agent_id),
+    })
+}
+
+fn accumulate_color(sum: &mut [f32; 4], count: &mut u32, color: Rgba) {
+    sum[0] += color.r;
+    sum[1] += color.g;
+    sum[2] += color.b;
+    sum[3] += color.a;
+    *count += 1;
+}
+
+fn averaged_color(sum: [f32; 4], count: u32) -> Rgba {
+    let denominator = count.max(1) as f32;
+    Rgba {
+        r: sum[0] / denominator,
+        g: sum[1] / denominator,
+        b: sum[2] / denominator,
+        a: sum[3] / denominator,
+    }
+}
+
+fn paint_color_buckets<const N: usize>(
+    mut builders: [Option<PathBuilder>; N],
+    sums: [[f32; 4]; N],
+    counts: [u32; N],
+    window: &mut Window,
+) {
+    for index in 0..N {
+        if counts[index] == 0 {
+            continue;
+        }
+        if let Some(builder) = builders[index].take()
+            && let Ok(path) = builder.build()
+        {
+            window.paint_path(path, averaged_color(sums[index], counts[index]));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_agent_lod_batches(
+    window: &mut Window,
+    frame: &RenderFrame,
+    focus_agent: Option<AgentId>,
+    offset_x: f32,
+    offset_y: f32,
+    scale: f32,
+    view_left: f32,
+    view_top: f32,
+    view_right: f32,
+    view_bottom: f32,
+    palette_is_natural: bool,
+) {
+    let view = AgentLodView {
+        offset: (offset_x, offset_y),
+        scale,
+        bounds: (view_left, view_top, view_right, view_bottom),
+    };
+    let mut body_builders: [Option<PathBuilder>; AGENT_LOD_BODY_BINS] =
+        std::array::from_fn(|_| Some(PathBuilder::fill()));
+    let mut body_sums = [[0.0; 4]; AGENT_LOD_BODY_BINS];
+    let mut body_counts = [0_u32; AGENT_LOD_BODY_BINS];
+    let mut spike_builders: [Option<PathBuilder>; AGENT_LOD_SPIKE_BINS] =
+        std::array::from_fn(|_| Some(PathBuilder::fill()));
+    let mut spike_sums = [[0.0; 4]; AGENT_LOD_SPIKE_BINS];
+    let mut spike_counts = [0_u32; AGENT_LOD_SPIKE_BINS];
+    let mut boost_builders: [Option<PathBuilder>; AGENT_LOD_DIET_BINS] =
+        std::array::from_fn(|_| Some(PathBuilder::fill()));
+    let mut boost_sums = [[0.0; 4]; AGENT_LOD_DIET_BINS];
+    let mut boost_counts = [0_u32; AGENT_LOD_DIET_BINS];
+    let mut marker_builders: [Option<PathBuilder>; 3] = [
+        Some(PathBuilder::stroke(px(2.4))),
+        Some(PathBuilder::stroke(px(1.8))),
+        Some(PathBuilder::stroke(px(2.8))),
+    ];
+    let mut marker_sums = [[0.0; 4]; 3];
+    let mut marker_counts = [0_u32; 3];
+
+    for agent in &frame.agents {
+        let Some(projection) =
+            project_agent_lod(frame, agent, view, focus_agent, palette_is_natural)
+        else {
+            continue;
+        };
+        let silhouette = projection.silhouette;
+        if let Some(builder) = body_builders[projection.body_bin].as_mut() {
+            append_capsule_polygon(
+                builder,
+                silhouette.center,
+                silhouette.forward,
+                silhouette.right,
+                silhouette.body_half_length,
+                silhouette.body_radius,
+                6,
+            );
+        }
+        accumulate_color(
+            &mut body_sums[projection.body_bin],
+            &mut body_counts[projection.body_bin],
+            projection.body_color,
+        );
+
+        if let Some(builder) = spike_builders[projection.spike_bin].as_mut() {
+            append_triangle(builder, silhouette.spike);
+        }
+        accumulate_color(
+            &mut spike_sums[projection.spike_bin],
+            &mut spike_counts[projection.spike_bin],
+            projection.spike_color,
+        );
+
+        if let (Some(boost), Some(boost_color)) = (silhouette.boost, projection.boost_color) {
+            if let Some(builder) = boost_builders[projection.boost_bin].as_mut() {
+                append_triangle(builder, boost);
+            }
+            accumulate_color(
+                &mut boost_sums[projection.boost_bin],
+                &mut boost_counts[projection.boost_bin],
+                boost_color,
+            );
+        }
+
+        let marker = match projection.selection {
+            SelectionState::Selected => Some((0, 1.85)),
+            SelectionState::Hovered => Some((1, 1.45)),
+            SelectionState::None => None,
+        };
+        if let Some((index, factor)) = marker {
+            if let Some(builder) = marker_builders[index].as_mut() {
+                append_circle_polygon(
+                    builder,
+                    silhouette.center.0,
+                    silhouette.center.1,
+                    projection.marker_radius * factor,
+                );
+            }
+            accumulate_color(
+                &mut marker_sums[index],
+                &mut marker_counts[index],
+                projection.marker_color,
+            );
+        }
+        if projection.focused {
+            if let Some(builder) = marker_builders[2].as_mut() {
+                append_circle_polygon(
+                    builder,
+                    silhouette.center.0,
+                    silhouette.center.1,
+                    projection.marker_radius * 2.05,
+                );
+            }
+            accumulate_color(
+                &mut marker_sums[2],
+                &mut marker_counts[2],
+                projection.marker_color,
+            );
+        }
+    }
+
+    // Motion trails sit behind bodies; spike and selection marks remain above them.
+    paint_color_buckets(boost_builders, boost_sums, boost_counts, window);
+    paint_color_buckets(body_builders, body_sums, body_counts, window);
+    paint_color_buckets(spike_builders, spike_sums, spike_counts, window);
+    paint_color_buckets(marker_builders, marker_sums, marker_counts, window);
 }
 
 fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut Window) {
@@ -15628,90 +15979,25 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     if controls.draw_agents {
         if very_low_fps {
-            // Quantized batching for agent body quads to reduce draw calls under heavy load
-            const AGENT_BINS: usize = 24;
-            let mut builders: [Option<PathBuilder>; AGENT_BINS] = [
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()),
-            ];
-            let mut colors: [Option<Rgba>; AGENT_BINS] = [None; AGENT_BINS];
-
-            for agent in &frame.agents {
-                let px_x = offset_x + agent.position.x * scale;
-                let px_y = offset_y + agent.position.y * scale;
-                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
-                let size_px = (dynamic_radius * scale).max(4.0);
-                let half = size_px * 0.5;
-
-                // Cull off-screen agents
-                if px_x + half < view_left
-                    || px_x - half > view_right
-                    || px_y + half < view_top
-                    || px_y - half > view_bottom
-                {
-                    continue;
-                }
-
-                // Core resolves diet, health, age, boost, and selection once.
-                let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
-                let mut color = agent_color(&visuals);
-                if !palette_is_natural {
-                    color = apply_palette(color, frame.palette);
-                }
-                let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-                let mut bin = ((luma * (AGENT_BINS as f32)) as isize)
-                    .clamp(0, (AGENT_BINS as isize) - 1) as usize;
-                if bin == 0 && luma > 0.0 {
-                    bin = 1;
-                }
-
-                // Append rectangle for agent body
-                if let Some(builder) = builders[bin].as_mut() {
-                    append_circle_polygon(builder, px_x, px_y, half);
-                    builder.close();
-                }
-                if colors[bin].is_none() {
-                    colors[bin] = Some(color);
-                }
-
-                // Defer outlines (batched later). Skip highlights/effects under very low FPS.
-            }
-            for b in 0..AGENT_BINS {
-                if let (Some(builder), Some(col)) = (builders[b].take(), colors[b])
-                    && let Ok(path) = builder.build()
-                {
-                    window.paint_path(path, col);
-                }
-            }
+            paint_agent_lod_batches(
+                window,
+                frame,
+                focus_agent,
+                offset_x,
+                offset_y,
+                scale,
+                view_left,
+                view_top,
+                view_right,
+                view_bottom,
+                palette_is_natural,
+            );
         } else {
             for agent in &frame.agents {
                 let px_x = offset_x + agent.position.x * scale;
                 let px_y = offset_y + agent.position.y * scale;
-                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
-                let size_px = (dynamic_radius * scale).max(4.0);
-                let half = size_px * 0.5;
+                let half = agent_screen_radius(frame, agent, scale);
+                let size_px = half * 2.0;
 
                 // Cull off-screen agents
                 if px_x + half < view_left
@@ -15833,7 +16119,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     }
                 }
 
-                if agent.spiked {
+                if agent.spike_struck {
                     let spike_radius = half * 2.2;
                     let cue = visual::visual_cue_for_event(&WorldVisualEvent::SpikeExtend);
                     let spike_color =
@@ -15887,9 +16173,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 else {
                     continue;
                 };
-                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
-                let size_px = (dynamic_radius * scale).max(4.0);
-                let half = size_px * 0.5;
+                let half = agent_screen_radius(frame, agent, scale);
                 if px_x + half < view_left
                     || px_x - half > view_right
                     || px_y + half < view_top
@@ -15898,9 +16182,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     continue;
                 }
 
-                let (sin_h, cos_h) = agent.heading.sin_cos();
-                let forward = (cos_h, sin_h);
-                let right = (-sin_h, cos_h);
+                let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
+                let forward = (visuals.facing[0], visuals.facing[1]);
+                let right = (visuals.right[0], visuals.right[1]);
                 let outline_half_length = (half * 1.35).max(half + 2.0);
                 let outline_radius = (half * 0.72).max(3.0);
                 append_capsule_polygon(
@@ -15962,7 +16246,7 @@ fn resolve_agent_visual(agent: &AgentRenderData, reference_age_ticks: u64) -> Ag
         wheel_left: agent.wheel_left,
         wheel_right: agent.wheel_right,
         heading: agent.heading,
-        spike_extended: agent.spiked,
+        spike_extended: agent.spike_extended,
         spike_length: agent.spike_length,
         boosting: agent.boost > 0.05,
         sound_output: agent.sound_output,
@@ -15996,7 +16280,7 @@ fn build_gpu_agent_instance(
     palette_is_natural: bool,
 ) -> scriptbots_world_gfx::AgentInstance {
     let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
-    let half_world = dynamic_radius * 0.5;
+    let half_world = dynamic_radius;
     let mut body_radius = half_world * 0.72;
     if body_radius < 3.0 {
         body_radius = 3.0;
@@ -16034,11 +16318,11 @@ fn build_gpu_agent_instance(
         SelectionState::None => 0.0,
     };
     let glow_indicator = (agent.indicator.intensity * 0.35).clamp(0.0, 1.0);
-    let glow_spike = if agent.spiked { 0.45 } else { 0.0 };
+    let glow_spike = if agent.spike_struck { 0.45 } else { 0.0 };
     let glow_repro = (agent.reproduction_intent * 0.25).clamp(0.0, 0.6);
     let glow = glow_indicator.max(glow_spike).max(glow_repro);
     let boost = agent.boost.clamp(0.0, 1.0);
-    let spiked = if agent.spiked { 1.0 } else { 0.0 };
+    let spiked = if agent.spike_struck { 1.0 } else { 0.0 };
 
     scriptbots_world_gfx::AgentInstance {
         position: [agent.position.x, agent.position.y],
@@ -16250,6 +16534,179 @@ mod command_characterization_tests {
                  {population_center:?}"
             );
         }
+    }
+
+    #[test]
+    fn render_frame_reads_live_boost_and_attacker_spike_state() {
+        let config = ScriptBotsConfig {
+            world_width: 600,
+            world_height: 300,
+            food_cell_size: 50,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("agent visual truth world");
+        let agent = world
+            .try_spawn_agent_with(
+                AgentData {
+                    position: Position::new(120.0, 120.0),
+                    spike_length: 2.0,
+                    // Deliberately stale opposite of the live output below.
+                    boost: false,
+                    ..AgentData::default()
+                },
+                |runtime| {
+                    runtime.outputs[OutputChannel::Boost.index()] = 1.0;
+                    runtime.outputs[OutputChannel::SpikeTarget.index()] = 1.0;
+                    // This marks the victim, not this agent's attacking spike.
+                    runtime.spiked = true;
+                    runtime.combat.spike_attacker = false;
+                },
+            )
+            .expect("seed visual truth agent");
+
+        let frame = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+            .expect("assemble visual truth frame");
+        let rendered = &frame.agents[0];
+        assert_eq!(rendered.agent_id, agent);
+        assert_eq!(rendered.boost, 1.0, "live output, not stale SoA boost");
+        assert!(rendered.spike_extended, "SpikeTarget drives extension");
+        assert!(
+            !rendered.spike_struck,
+            "victim flag must not masquerade as an attacker strike"
+        );
+        assert!(rendered.spike_victim, "audio may still observe victim hits");
+
+        world
+            .try_update_agent_runtime(agent, |runtime| {
+                runtime.outputs[OutputChannel::Boost.index()] = 0.0;
+                runtime.outputs[OutputChannel::SpikeTarget.index()] = 0.0;
+                runtime.spiked = false;
+                runtime.combat.spike_attacker = true;
+            })
+            .expect("update visual truth runtime");
+        let frame = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+            .expect("reassemble visual truth frame");
+        let rendered = &frame.agents[0];
+        assert_eq!(rendered.boost, 0.0);
+        assert!(!rendered.spike_extended);
+        assert!(rendered.spike_struck);
+        assert!(!rendered.spike_victim);
+    }
+
+    #[test]
+    fn compact_lod_projects_all_five_thousand_agents_without_semantic_drop() {
+        let config = ScriptBotsConfig {
+            world_width: 2_400,
+            world_height: 1_200,
+            food_cell_size: 50,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("compact LOD world");
+        world
+            .try_spawn_agent_with(
+                AgentData {
+                    position: Position::new(20.0, 20.0),
+                    heading: 0.0,
+                    health: 2.0,
+                    spike_length: 4.0,
+                    boost: false,
+                    ..AgentData::default()
+                },
+                |runtime| {
+                    runtime.herbivore_tendency = 0.0;
+                    runtime.selection = SelectionState::Selected;
+                    runtime.outputs[OutputChannel::SpikeTarget.index()] = 1.0;
+                },
+            )
+            .expect("seed compact LOD template");
+        let frame = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+            .expect("assemble compact LOD frame");
+        let template = frame.agents[0].clone();
+        let view = AgentLodView {
+            offset: (0.0, 0.0),
+            scale: 1.0,
+            bounds: (0.0, 0.0, 2_400.0, 1_200.0),
+        };
+
+        let mut agents = Vec::with_capacity(5_000);
+        for index in 0..5_000 {
+            let mut agent = template.clone();
+            agent.position = Position::new(
+                12.0 + (index % 100) as f32 * 23.5,
+                12.0 + (index / 100) as f32 * 23.5,
+            );
+            agent.heading = if index.is_multiple_of(2) {
+                0.0
+            } else {
+                FRAC_PI_2
+            };
+            agent.herbivore_tendency = if index.is_multiple_of(2) { 0.0 } else { 1.0 };
+            agent.health = if index.is_multiple_of(3) { 0.2 } else { 2.0 };
+            agent.age = if index.is_multiple_of(5) {
+                frame.agent_reference_age as u32
+            } else {
+                0
+            };
+            agent.boost = if index.is_multiple_of(7) { 1.0 } else { 0.0 };
+            agent.selection = match index % 11 {
+                0 => SelectionState::Selected,
+                1 => SelectionState::Hovered,
+                _ => SelectionState::None,
+            };
+            agents.push(agent);
+        }
+
+        let projected: Vec<_> = agents
+            .iter()
+            .filter_map(|agent| project_agent_lod(&frame, agent, view, None, true))
+            .collect();
+        assert_eq!(
+            projected.len(),
+            agents.len(),
+            "compact LOD may simplify geometry but must never sample or drop visible agents"
+        );
+        let body_bins: std::collections::BTreeSet<_> =
+            projected.iter().map(|agent| agent.body_bin).collect();
+        assert!(
+            body_bins.len() >= 4,
+            "diet and health/age must survive compact LOD quantization: {body_bins:?}"
+        );
+        assert!(projected.iter().any(|agent| agent.boost_color.is_some()));
+        assert!(
+            projected
+                .iter()
+                .any(|agent| agent.selection == SelectionState::Selected)
+        );
+        assert!(
+            projected
+                .iter()
+                .any(|agent| agent.selection == SelectionState::Hovered)
+        );
+
+        let facing_x =
+            project_agent_lod(&frame, &agents[0], view, None, true).expect("x-facing projection");
+        let facing_y =
+            project_agent_lod(&frame, &agents[1], view, None, true).expect("y-facing projection");
+        let x_tip = facing_x.silhouette.spike[2];
+        let y_tip = facing_y.silhouette.spike[2];
+        assert!(x_tip.0 > facing_x.silhouette.center.0);
+        assert!(y_tip.1 > facing_y.silhouette.center.1);
+        assert!(
+            (x_tip.1 - facing_x.silhouette.center.1).abs()
+                < (x_tip.0 - facing_x.silhouette.center.0).abs(),
+            "x-facing compact silhouette must remain oriented"
+        );
+        assert!(
+            (y_tip.0 - facing_y.silhouette.center.0).abs()
+                < (y_tip.1 - facing_y.silhouette.center.1).abs(),
+            "y-facing compact silhouette must remain oriented"
+        );
     }
 
     #[derive(Default)]
