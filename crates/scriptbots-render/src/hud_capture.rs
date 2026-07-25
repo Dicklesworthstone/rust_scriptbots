@@ -43,7 +43,14 @@ struct CaptureOverrides {
     force_legacy_world_painter: bool,
     draw_agents: Option<bool>,
     draw_food: Option<bool>,
-    forced_fps: Option<f32>,
+    /// Pins the ENTIRE PerfSnapshot, not just fps.
+    ///
+    /// bd-c7pg: perf reaches the frame via `snapshot.perf = self.last_perf` regardless
+    /// of whether the collapsed perf panel renders, and five of its six fields are
+    /// floating-point timings that differ every run. Pinning only `fps` left
+    /// latest_ms/average_ms/min_ms/max_ms/sample_count varying — rendered text of five
+    /// changing numbers, which is a plausible ~10k pixels of glyph difference.
+    forced_perf: Option<crate::PerfSnapshot>,
     hovered_agent: Option<AgentId>,
     /// Keystrokes dispatched into the live window before the frame is captured.
     ///
@@ -68,8 +75,8 @@ fn apply_capture_overrides(view: &mut crate::SimulationView, overrides: CaptureO
     if let Some(draw_food) = overrides.draw_food {
         view.controls.draw_food = draw_food;
     }
-    if let Some(fps) = overrides.forced_fps {
-        view.last_perf.fps = fps;
+    if let Some(perf) = overrides.forced_perf {
+        view.last_perf = perf;
     }
     if let Some(hovered_agent) = overrides.hovered_agent
         && let Ok(mut inspector) = view.inspector.lock()
@@ -735,6 +742,60 @@ mod tests {
         hits
     }
 
+    /// Every perf field frozen. Any unpinned float here reaches rendered text and
+    /// varies per run, which is the bd-c7pg floor.
+    fn pinned_perf() -> crate::PerfSnapshot {
+        pinned_perf_at_fps(60.0)
+    }
+
+    fn pinned_perf_at_fps(fps: f32) -> crate::PerfSnapshot {
+        crate::PerfSnapshot {
+            latest_ms: 16.0,
+            average_ms: 16.0,
+            min_ms: 16.0,
+            max_ms: 16.0,
+            sample_count: 128,
+            fps,
+        }
+    }
+
+    /// bd-c7pg: with perf pinned, the harness must be DETERMINISTIC — two captures of
+    /// the same world at the same tick must be byte-identical, not merely close.
+    ///
+    /// Exact equality is the only honest assertion. A tolerance here would be a
+    /// threshold tuned to hide the very noise the bead is about, which is the same
+    /// defect wearing a different hat.
+    #[test]
+    fn captures_of_one_world_are_byte_identical_when_perf_is_pinned() {
+        let (w, h) = (
+            1280.0 * HEADLESS_DEVICE_SCALE,
+            720.0 * HEADLESS_DEVICE_SCALE,
+        );
+        let world = capture_world();
+        let overrides = CaptureOverrides {
+            forced_perf: Some(pinned_perf()),
+            ..CaptureOverrides::default()
+        };
+        let first =
+            capture_view_with_overrides(Arc::clone(&world), GuiViewRole::Hud, w, h, overrides)
+                .expect("first capture");
+        let second =
+            capture_view_with_overrides(Arc::clone(&world), GuiViewRole::Hud, w, h, overrides)
+                .expect("second capture");
+
+        let differing = first
+            .pixels()
+            .zip(second.pixels())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            differing, 0,
+            "two captures of one world at one tick differ by {differing} px with perf \
+             pinned; a residual means the bd-c7pg floor is only partly explained and the \
+             remaining source must be named, not tolerated"
+        );
+    }
+
     /// bd-c7pg CAUSATION PROBE — is the ~10k floor measurement noise, or two different
     /// worlds?
     ///
@@ -834,7 +895,7 @@ mod tests {
         // regardless of the keystroke — a noise floor that swallowed 21 of 27 results
         // on the first run and would have let a dead control read as working.
         let stable = || CaptureOverrides {
-            forced_fps: Some(60.0),
+            forced_perf: Some(pinned_perf()),
             ..CaptureOverrides::default()
         };
         let base = capture_view_with_overrides(capture_world(), GuiViewRole::Hud, w, h, stable())
@@ -1098,7 +1159,7 @@ mod tests {
                 CaptureOverrides {
                     draw_agents: Some(false),
                     draw_food: Some(false),
-                    forced_fps: Some(60.0),
+                    forced_perf: Some(pinned_perf()),
                     ..CaptureOverrides::default()
                 },
             )
@@ -1264,7 +1325,7 @@ mod tests {
             CaptureOverrides {
                 draw_agents: Some(false),
                 draw_food: Some(false),
-                forced_fps: Some(60.0),
+                forced_perf: Some(pinned_perf()),
                 hovered_agent: Some(hovered_agent),
                 ..CaptureOverrides::default()
             },
@@ -1278,7 +1339,7 @@ mod tests {
             CaptureOverrides {
                 draw_agents: Some(true),
                 draw_food: Some(false),
-                forced_fps: Some(60.0),
+                forced_perf: Some(pinned_perf()),
                 hovered_agent: Some(hovered_agent),
                 ..CaptureOverrides::default()
             },
@@ -1292,7 +1353,7 @@ mod tests {
             CaptureOverrides {
                 draw_agents: Some(false),
                 draw_food: Some(false),
-                forced_fps: Some(12.0),
+                forced_perf: Some(pinned_perf_at_fps(12.0)),
                 hovered_agent: Some(hovered_agent),
                 ..CaptureOverrides::default()
             },
@@ -1306,7 +1367,7 @@ mod tests {
             CaptureOverrides {
                 draw_agents: Some(true),
                 draw_food: Some(false),
-                forced_fps: Some(12.0),
+                forced_perf: Some(pinned_perf_at_fps(12.0)),
                 hovered_agent: Some(hovered_agent),
                 ..CaptureOverrides::default()
             },
