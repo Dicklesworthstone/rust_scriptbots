@@ -832,6 +832,41 @@ pub const DAYLIGHT_STATIC: f32 = 0.65;
 /// carry the frame.
 pub const DAYLIGHT_NIGHT_FLOOR: f32 = 0.15;
 
+/// Default day/night cycle length in ticks for a run that does not choose one (bd-lhml).
+///
+/// Equal to the crate's `LEGACY_EPOCH_TICKS`, the epoch the agents' own CLOCK1/CLOCK2 sensor
+/// channels run on (`next_tick % LEGACY_EPOCH_TICKS`). Tying the visible day to the sensed
+/// clock means what the world LOOKS like and what an agent FEELS about time of day cannot
+/// disagree — one epoch, two surfaces.
+///
+/// This exists because `render.day_night` defaulting to `None` meant [`daylight_factor`]
+/// returned [`DAYLIGHT_STATIC`] for every tick of every run: the curve was live on the
+/// interactive canvas and structurally incapable of moving. See
+/// `tests/day_night_default_probe.rs`.
+pub const DEFAULT_DAY_NIGHT_CYCLE_TICKS: u32 = crate::LEGACY_EPOCH_TICKS as u32;
+
+/// Default starting phase: noon, so a fresh run opens at full light rather than mid-dusk.
+pub const DEFAULT_DAY_NIGHT_START_PHASE: f32 = 0.25;
+
+/// Resolve the effective `(cycle_ticks, start_phase)` a frontend should pass to
+/// [`daylight_factor`].
+///
+/// ONE definition of what an unset day/night block means, so the GPUI canvas, the Bevy
+/// renderer and the terminal cannot each invent their own fallback — which is exactly how the
+/// static default survived: the renderer's inline `.map_or((0, 0.25), ..)` was the only place
+/// the question was answered, and it answered "no cycle".
+///
+/// `None` for the whole block, or an absent `cycle_ticks`, now means the DEFAULT cycle.
+/// An explicit `Some(0)` still means static lighting, so a run can deliberately freeze the
+/// clock and that intent survives.
+#[must_use]
+pub fn resolve_day_night(cycle_ticks: Option<u32>, start_phase: Option<f32>) -> (u32, f32) {
+    (
+        cycle_ticks.unwrap_or(DEFAULT_DAY_NIGHT_CYCLE_TICKS),
+        start_phase.unwrap_or(DEFAULT_DAY_NIGHT_START_PHASE),
+    )
+}
+
 /// Shared day/night curve.
 ///
 /// `cycle_ticks == 0` is the historical static lighting and returns
@@ -1749,6 +1784,44 @@ mod tests {
     use super::*;
 
     const EPS: f32 = 1.0e-6;
+
+    /// bd-lhml: the resolved default must actually move the curve.
+    ///
+    /// The whole defect was a default that produced a constant, so the constant asserted here
+    /// is the fix itself: resolving an unset block must yield a cycle whose daylight varies.
+    #[test]
+    fn the_resolved_default_day_night_cycle_actually_varies() {
+        let (cycle_ticks, start_phase) = resolve_day_night(None, None);
+        assert_eq!(cycle_ticks, DEFAULT_DAY_NIGHT_CYCLE_TICKS);
+        assert!(cycle_ticks > 0, "an unset day/night block must select a real cycle");
+
+        let mut minimum = f32::INFINITY;
+        let mut maximum = f32::NEG_INFINITY;
+        for step in 0..64u64 {
+            let tick = step * u64::from(cycle_ticks) / 64;
+            let daylight = daylight_factor(tick, cycle_ticks, start_phase);
+            minimum = minimum.min(daylight);
+            maximum = maximum.max(daylight);
+        }
+        assert!(
+            maximum - minimum > 0.5,
+            "the default cycle must sweep a real range, got {minimum}..={maximum}"
+        );
+    }
+
+    /// An explicit zero must still mean static lighting.
+    ///
+    /// Without this, "give the default a cycle" would silently remove a run's ability to
+    /// freeze the clock on purpose — turning one lost intent into another.
+    #[test]
+    fn an_explicit_zero_cycle_still_means_static_lighting() {
+        let (cycle_ticks, _) = resolve_day_night(Some(0), None);
+        assert_eq!(cycle_ticks, 0, "explicit zero must survive resolution");
+        assert!(
+            (daylight_factor(12_345, cycle_ticks, 0.25) - DAYLIGHT_STATIC).abs() < EPS,
+            "a deliberately frozen clock must still return DAYLIGHT_STATIC"
+        );
+    }
 
     /// bd-1lls: flat ground must not be tinted by merely being lit.
     ///

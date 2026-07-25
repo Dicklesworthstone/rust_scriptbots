@@ -10658,13 +10658,34 @@ impl RenderSettings {
         self.quality.unwrap_or_default()
     }
 
+    /// The effective `(cycle_ticks, start_phase)` to pass to [`visual::daylight_factor`].
+    ///
+    /// ONE definition of what an unset day/night block means, so no frontend invents its own
+    /// fallback. That is precisely how the static default survived (bd-lhml): the renderer's
+    /// inline `.map_or((0, 0.25), ..)` was the only place the question was ever answered, and
+    /// it answered "no cycle" — so `daylight_factor` returned `DAYLIGHT_STATIC` for every tick
+    /// of every run while being fully wired into the live canvas.
+    ///
+    /// An absent block, or an absent `cycle_ticks`, now resolves to the default cycle. An
+    /// explicit `Some(0)` still means static lighting, so a run can deliberately freeze the
+    /// clock and that intent survives.
+    #[must_use]
+    pub fn resolved_day_night(&self) -> (u32, f32) {
+        let block = self.day_night.as_ref();
+        visual::resolve_day_night(
+            block.and_then(|settings| settings.cycle_ticks),
+            block.and_then(|settings| settings.start_phase),
+        )
+    }
+
     /// Whether the day/night cycle is active (nonzero cycle length).
+    ///
+    /// Defers to [`Self::resolved_day_night`] rather than re-deriving the rule. Two
+    /// independent answers to "is the clock running?" is the same defect class this bead
+    /// exists to remove.
     #[must_use]
     pub fn day_night_active(&self) -> bool {
-        self.day_night
-            .as_ref()
-            .and_then(|d| d.cycle_ticks)
-            .is_some_and(|ticks| ticks > 0)
+        self.resolved_day_night().0 > 0
     }
 }
 
@@ -43084,8 +43105,40 @@ mod tests {
         assert_eq!(parsed.day_night, None);
         assert_eq!(parsed.theme, None);
         assert_eq!(parsed.palette, None);
-        assert!(!parsed.day_night_active());
         assert_eq!(parsed.requested_quality(), RenderQuality::Auto);
+
+        // The STORED shape stays None (asserted above); the RESOLVED semantics do not.
+        // This assertion used to read `!parsed.day_night_active()`, which is what pinned
+        // bd-lhml in place: an absent block meant "no cycle", so `daylight_factor` returned
+        // DAYLIGHT_STATIC for every tick of every run. An unset knob must mean "use the
+        // default", not "disable the feature".
+        assert!(
+            parsed.day_night_active(),
+            "an absent day/night block must resolve to the DEFAULT cycle, not to static \
+             lighting; deferring to a frontend default is not the same as being switched off"
+        );
+        assert_eq!(
+            parsed.resolved_day_night(),
+            (
+                visual::DEFAULT_DAY_NIGHT_CYCLE_TICKS,
+                visual::DEFAULT_DAY_NIGHT_START_PHASE
+            )
+        );
+        // Explicitly frozen clocks must still be honoured, or fixing one lost intent
+        // would destroy another.
+        let frozen = RenderSettings {
+            day_night: Some(RenderDayNightSettings {
+                cycle_ticks: Some(0),
+                start_phase: None,
+                night_ambient: None,
+                stars: None,
+            }),
+            ..RenderSettings::default()
+        };
+        assert!(
+            !frozen.day_night_active(),
+            "an explicit cycle_ticks = 0 must still mean static lighting"
+        );
     }
 
     #[test]
