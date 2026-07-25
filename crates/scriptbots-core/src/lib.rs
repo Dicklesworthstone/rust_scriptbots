@@ -26,7 +26,7 @@
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 macro_rules! diag_error {
-    ($($arg:tt)*) => { ::diag_error!($($arg)*) };
+    ($($arg:tt)*) => { ::tracing::error!($($arg)*) };
 }
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 macro_rules! diag_error {
@@ -35,7 +35,7 @@ macro_rules! diag_error {
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 macro_rules! diag_warn {
-    ($($arg:tt)*) => { ::diag_warn!($($arg)*) };
+    ($($arg:tt)*) => { ::tracing::warn!($($arg)*) };
 }
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 macro_rules! diag_warn {
@@ -44,7 +44,7 @@ macro_rules! diag_warn {
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 macro_rules! diag_info {
-    ($($arg:tt)*) => { ::diag_info!($($arg)*) };
+    ($($arg:tt)*) => { ::tracing::info!($($arg)*) };
 }
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 macro_rules! diag_info {
@@ -53,7 +53,7 @@ macro_rules! diag_info {
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 macro_rules! diag_debug {
-    ($($arg:tt)*) => { ::diag_debug!($($arg)*) };
+    ($($arg:tt)*) => { ::tracing::debug!($($arg)*) };
 }
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 macro_rules! diag_debug {
