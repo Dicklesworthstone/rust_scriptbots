@@ -19,7 +19,10 @@ use scriptbots_core::narrative::{
     EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord,
 };
 use scriptbots_core::rng_domains::RngDomain;
-use scriptbots_core::visual::{self, SplatInput, TerrainShadeInput};
+use scriptbots_core::visual::{
+    self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainShadeInput, VisualSelection,
+    WorldVisualEvent,
+};
 use scriptbots_core::{
     AccessibilityPalette, ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId,
     AgentRuntime, AgentUid, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
@@ -13102,9 +13105,9 @@ fn paint_agent_avatar(
     size_px: f32,
     scale: f32,
     body_color: Rgba,
+    visuals: &AgentVisualParams,
     palette: ColorPaletteMode,
     palette_is_natural: bool,
-    day_phase: f32,
     very_low_fps: bool,
 ) {
     let (px_x, px_y) = position;
@@ -13123,15 +13126,6 @@ fn paint_agent_avatar(
     let right_center = (px_x + right.0 * wheel_offset, px_y + right.1 * wheel_offset);
 
     // Wheels behind body
-    let base_wheel_color = Rgba {
-        r: 0.14,
-        g: 0.16,
-        b: 0.21,
-        a: 1.0,
-    };
-    let wheel_left_speed = agent.wheel_left.clamp(0.0, 1.0);
-    let wheel_right_speed = agent.wheel_right.clamp(0.0, 1.0);
-
     let mut left_wheel = PathBuilder::fill();
     append_capsule_polygon(
         &mut left_wheel,
@@ -13143,7 +13137,7 @@ fn paint_agent_avatar(
         10,
     );
     if let Ok(path) = left_wheel.build() {
-        let mut wheel_color = scale_rgb(base_wheel_color, 0.75 + wheel_left_speed * 0.6);
+        let mut wheel_color = rgba_from_triplet_with_alpha(visuals.wheel_colors[0], 1.0);
         wheel_color = palette_color(wheel_color, palette, palette_is_natural);
         window.paint_path(path, wheel_color);
     }
@@ -13159,7 +13153,7 @@ fn paint_agent_avatar(
         10,
     );
     if let Ok(path) = right_wheel.build() {
-        let mut wheel_color = scale_rgb(base_wheel_color, 0.75 + wheel_right_speed * 0.6);
+        let mut wheel_color = rgba_from_triplet_with_alpha(visuals.wheel_colors[1], 1.0);
         wheel_color = palette_color(wheel_color, palette, palette_is_natural);
         window.paint_path(path, wheel_color);
     }
@@ -13205,13 +13199,11 @@ fn paint_agent_avatar(
         if let Ok(path) = spike_path.build() {
             let spike_color = palette_color(
                 scale_rgb(
-                    Rgba {
-                        r: 0.94,
-                        g: 0.46,
-                        b: 0.26,
-                        a: 0.9,
-                    },
-                    if agent.spiked { 1.25 } else { 1.0 },
+                    rgba_from_triplet_with_alpha(
+                        visuals.spike_color,
+                        0.55 + visuals.spike_readiness * 0.4,
+                    ),
+                    1.0 + visuals.spike_readiness * 0.25,
                 ),
                 palette,
                 palette_is_natural,
@@ -13237,23 +13229,7 @@ fn paint_agent_avatar(
     }
 
     // Diet stripe
-    let herb = agent.herbivore_tendency.clamp(0.0, 1.0);
-    let carnivore_color = Rgba {
-        r: 0.88,
-        g: 0.26,
-        b: 0.21,
-        a: 0.42,
-    };
-    let herbivore_color = Rgba {
-        r: 0.24,
-        g: 0.78,
-        b: 0.36,
-        a: 0.42,
-    };
-    let mut stripe_color = lerp_rgba(carnivore_color, herbivore_color, herb);
-    let day_tint = (0.9 + (day_phase - 0.5) * 0.1).clamp(0.75, 1.15);
-    let blood_tint = (0.7 + agent.trait_blood * 0.2).clamp(0.8, 1.35);
-    stripe_color = scale_rgb(stripe_color, (day_tint * blood_tint).clamp(0.7, 1.35));
+    let mut stripe_color = rgba_from_triplet_with_alpha(visuals.stripe_color, 0.42);
     stripe_color = palette_color(stripe_color, palette, palette_is_natural);
     let mut stripe = PathBuilder::fill();
     append_capsule_polygon(
@@ -13293,12 +13269,13 @@ fn paint_agent_avatar(
         flame.line_to(point(px(tip.0), px(tip.1)));
         flame.close();
         if let Ok(path) = flame.build() {
-            let mut flame_color = Rgba {
-                r: 1.0,
-                g: 0.62,
-                b: 0.22,
-                a: 0.45 + boost_level * 0.35,
-            };
+            let gain = (visuals.body_emissive_gain
+                / visual::visual_style().agents.boost_emissive_gain)
+                .clamp(0.0, 1.0);
+            let mut flame_color = rgba_from_triplet_with_alpha(
+                visuals.body_emissive,
+                0.35 + boost_level * 0.3 + gain * 0.15,
+            );
             flame_color = palette_color(flame_color, palette, palette_is_natural);
             window.paint_path(path, flame_color);
         }
@@ -13323,15 +13300,9 @@ fn paint_agent_avatar(
     spike_path.line_to(point(px(tip.0), px(tip.1)));
     spike_path.close();
     if let Ok(path) = spike_path.build() {
-        let mut spike_color = Rgba {
-            r: 0.96,
-            g: 0.44,
-            b: 0.24,
-            a: 0.94,
-        };
-        if agent.spiked {
-            spike_color = scale_rgb(spike_color, 1.3);
-        }
+        let mut spike_color =
+            rgba_from_triplet_with_alpha(visuals.spike_color, 0.55 + visuals.spike_readiness * 0.4);
+        spike_color = scale_rgb(spike_color, 1.0 + visuals.spike_readiness * 0.3);
         spike_color = palette_color(spike_color, palette, palette_is_natural);
         window.paint_path(path, spike_color);
     }
@@ -13347,15 +13318,8 @@ fn paint_agent_avatar(
         px_x + forward.0 * mouth_offset,
         px_y + forward.1 * mouth_offset,
     );
-    let mut mouth_color = Rgba {
-        r: 0.85 + eating_level * 0.08,
-        g: 0.28 + eating_level * 0.3,
-        b: 0.32,
-        a: 0.92,
-    };
-    if agent.sound_output > 0.1 {
-        mouth_color = scale_rgb(mouth_color, 1.1 + agent.sound_output * 0.25);
-    }
+    let mut mouth_color =
+        rgba_from_triplet_with_alpha(visuals.mouth_color, 0.72 + visuals.mouth_activity * 0.2);
     mouth_color = palette_color(mouth_color, palette, palette_is_natural);
     let mut mouth_path = PathBuilder::fill();
     append_capsule_polygon(
@@ -13380,12 +13344,7 @@ fn paint_agent_avatar(
     let mut nose = PathBuilder::fill();
     append_circle_polygon(&mut nose, nose_center.0, nose_center.1, nose_radius);
     if let Ok(path) = nose.build() {
-        let mut nose_color = Rgba {
-            r: 0.92,
-            g: 0.6,
-            b: 0.28,
-            a: 0.8,
-        };
+        let mut nose_color = rgba_from_triplet_with_alpha(visuals.nose_color, 0.8);
         nose_color = palette_color(nose_color, palette, palette_is_natural);
         window.paint_path(path, nose_color);
     }
@@ -13402,12 +13361,7 @@ fn paint_agent_avatar(
         px_x + forward.0 * (-ear_offset) + right.0 * (body_radius + ear_radius * 0.45),
         px_y + forward.1 * (-ear_offset) + right.1 * (body_radius + ear_radius * 0.45),
     );
-    let base_ear_color = Rgba {
-        r: 0.32,
-        g: 0.62,
-        b: 0.92,
-        a: 0.85,
-    };
+    let base_ear_color = rgba_from_triplet_with_alpha(visuals.stripe_color, 0.85);
     for center in [ear_center_left, ear_center_right] {
         let mut ear = PathBuilder::fill();
         append_circle_polygon(&mut ear, center.0, center.1, ear_radius);
@@ -13436,12 +13390,8 @@ fn paint_agent_avatar(
         let mut eye = PathBuilder::fill();
         append_circle_polygon(&mut eye, eye_center.0, eye_center.1, eye_radius);
         if let Ok(path) = eye.build() {
-            let mut sclera_color = Rgba {
-                r: 0.97,
-                g: 0.98,
-                b: 1.0,
-                a: 0.95,
-            };
+            let mut sclera_color =
+                rgba_from_triplet_with_alpha(visual::visual_style().chrome.primary_text_srgb, 0.95);
             sclera_color = palette_color(sclera_color, palette, palette_is_natural);
             window.paint_path(path, sclera_color);
         }
@@ -13450,12 +13400,8 @@ fn paint_agent_avatar(
         let mut pupil = PathBuilder::fill();
         append_circle_polygon(&mut pupil, eye_center.0, eye_center.1, pupil_radius);
         if let Ok(path) = pupil.build() {
-            let mut pupil_color = Rgba {
-                r: 0.08,
-                g: 0.11,
-                b: 0.18,
-                a: 0.98,
-            };
+            let mut pupil_color =
+                rgba_from_triplet_with_alpha(visual::visual_style().substrate.abyss_srgb, 0.98);
             pupil_color = palette_color(pupil_color, palette, palette_is_natural);
             window.paint_path(path, pupil_color);
         }
@@ -13484,12 +13430,8 @@ fn paint_agent_avatar(
                 sweep,
             );
             if let Ok(path) = arc.build() {
-                let mut arc_color = Rgba {
-                    r: 0.95,
-                    g: 0.68,
-                    b: 0.32,
-                    a: 0.35 + intensity * 0.35,
-                };
+                let mut arc_color =
+                    rgba_from_triplet_with_alpha(visuals.mouth_color, 0.35 + intensity * 0.35);
                 arc_color = palette_color(arc_color, palette, palette_is_natural);
                 window.paint_path(path, arc_color);
             }
@@ -13498,20 +13440,10 @@ fn paint_agent_avatar(
 
     // Temperature preference marker
     let temp_pref = agent.temperature_preference.clamp(0.0, 1.0);
-    let mut temp_color = lerp_rgba(
-        Rgba {
-            r: 0.20,
-            g: 0.52,
-            b: 0.96,
-            a: 0.38,
-        },
-        Rgba {
-            r: 0.98,
-            g: 0.42,
-            b: 0.18,
-            a: 0.38,
-        },
-        temp_pref,
+    let temperature_strength = ((temp_pref - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+    let mut temp_color = rgba_from_triplet_with_alpha(
+        visuals.selection_rim_color,
+        0.16 + temperature_strength * 0.22,
     );
     temp_color = palette_color(temp_color, palette, palette_is_natural);
     let temp_center = (
@@ -14613,7 +14545,6 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     drop(camera_guard);
 
-    let day_phase = frame.tick as f32 * 0.00025;
     let daylight = visual::daylight_factor(
         frame.tick,
         frame.day_night_cycle_ticks,
@@ -14746,10 +14677,12 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         continue;
                     }
                     let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
+                    let food_visuals = visual::food_visual_params(intensity);
                     let mut color = food_color(intensity);
-                    let shade_wave =
-                        ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
-                    let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
+                    let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
+                    let gain = food_visuals.emissive_gain
+                        / visual::visual_style().food.dense_emissive_gain;
+                    let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
                     color = scale_rgb(color, shade);
                     if !palette_is_natural {
                         color = apply_palette(color, frame.palette);
@@ -14768,11 +14701,13 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     let px_x = offset_x + (x as f32 * cell_world * scale);
                     let px_y = offset_y + (y as f32 * cell_world * scale);
                     if let Some(builder) = builders[bin].as_mut() {
-                        // Append rectangle path for this cell
-                        let x0 = px(px_x);
-                        let y0 = px(px_y);
-                        let x1 = px(px_x + cell_px);
-                        let y1 = px(px_y + cell_px);
+                        // Stable-hue motes shrink sparse food away from the cell edges.
+                        let mote_px = (cell_px * food_visuals.relative_radius.min(1.0)).max(1.0);
+                        let inset = (cell_px - mote_px) * 0.5;
+                        let x0 = px(px_x + inset);
+                        let y0 = px(px_y + inset);
+                        let x1 = px(px_x + inset + mote_px);
+                        let y1 = px(px_y + inset + mote_px);
                         builder.move_to(point(x0, y0));
                         builder.line_to(point(x1, y0));
                         builder.line_to(point(x1, y1));
@@ -14800,18 +14735,24 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         continue;
                     }
                     let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
+                    let food_visuals = visual::food_visual_params(intensity);
                     let mut color = food_color(intensity);
-                    let shade_wave =
-                        ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
-                    let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
+                    let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
+                    let gain = food_visuals.emissive_gain
+                        / visual::visual_style().food.dense_emissive_gain;
+                    let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
                     color = scale_rgb(color, shade);
                     if !palette_is_natural {
                         color = apply_palette(color, frame.palette);
                     }
                     let px_x = offset_x + (x as f32 * cell_world * scale);
                     let px_y = offset_y + (y as f32 * cell_world * scale);
-                    let cell_bounds =
-                        Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
+                    let mote_px = (cell_px * food_visuals.relative_radius.min(1.0)).max(1.0);
+                    let inset = (cell_px - mote_px) * 0.5;
+                    let cell_bounds = Bounds::new(
+                        point(px(px_x + inset), px(px_y + inset)),
+                        size(px(mote_px), px(mote_px)),
+                    );
                     window.paint_quad(fill(cell_bounds, Background::from(color)));
                 }
             }
@@ -14866,10 +14807,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     continue;
                 }
 
-                // Body color (approximate binning by luminance)
-                let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
-                let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-                let mut color = agent_color(agent, agent_shade);
+                // Core resolves diet, health, age, boost, and selection once.
+                let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
+                let mut color = agent_color(&visuals);
                 if !palette_is_natural {
                     color = apply_palette(color, frame.palette);
                 }
@@ -14914,6 +14854,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 {
                     continue;
                 }
+                let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
 
                 if !low_fps {
                     let shadow_radius = half * 1.25;
@@ -14928,12 +14869,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     );
                     if let Ok(path) = shadow.build() {
                         let shadow_color = apply_palette(
-                            Rgba {
-                                r: 0.05,
-                                g: 0.08,
-                                b: 0.10,
-                                a: 0.38,
-                            },
+                            rgba_from_triplet_with_alpha(
+                                visual::visual_style().substrate.abyss_srgb,
+                                0.38,
+                            ),
                             frame.palette,
                         );
                         window.paint_path(path, shadow_color);
@@ -14946,12 +14885,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                             let factor = 1.85;
                             let highlight_radius = half * factor;
                             let highlight = apply_palette(
-                                Rgba {
-                                    r: 0.98,
-                                    g: 0.82,
-                                    b: 0.32,
-                                    a: 0.36,
-                                },
+                                rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.36),
                                 frame.palette,
                             );
                             let mut highlight_path = PathBuilder::fill();
@@ -14969,12 +14903,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                             let factor = 1.45;
                             let highlight_radius = half * factor;
                             let highlight = apply_palette(
-                                Rgba {
-                                    r: 0.94,
-                                    g: 0.56,
-                                    b: 0.22,
-                                    a: 0.26,
-                                },
+                                rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.26),
                                 frame.palette,
                             );
                             let mut highlight_path = PathBuilder::fill();
@@ -14995,12 +14924,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         let factor = 2.05;
                         let highlight_radius = half * factor;
                         let highlight = apply_palette(
-                            Rgba {
-                                r: 0.40,
-                                g: 0.82,
-                                b: 0.94,
-                                a: 0.32,
-                            },
+                            rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.32),
                             frame.palette,
                         );
                         let mut focus_path = PathBuilder::fill();
@@ -15030,13 +14954,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 if agent.reproduction_intent > 0.2 && !low_fps {
                     let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
                     let pulse_radius = half * (1.8 + pulse * 1.6);
+                    let cue = visual::visual_cue_for_event(&WorldVisualEvent::Reproduce);
                     let pulse_color = apply_palette(
-                        Rgba {
-                            r: 0.88,
-                            g: 0.36,
-                            b: 0.86,
-                            a: 0.18 + 0.28 * pulse,
-                        },
+                        rgba_from_triplet_with_alpha(cue.color, 0.18 + 0.28 * pulse),
                         frame.palette,
                     );
                     let mut pulse_path = PathBuilder::fill();
@@ -15048,15 +14968,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
                 if agent.spiked {
                     let spike_radius = half * 2.2;
-                    let spike_color = apply_palette(
-                        Rgba {
-                            r: 0.95,
-                            g: 0.25,
-                            b: 0.35,
-                            a: 0.28,
-                        },
-                        frame.palette,
-                    );
+                    let cue = visual::visual_cue_for_event(&WorldVisualEvent::SpikeExtend);
+                    let spike_color =
+                        apply_palette(rgba_from_triplet_with_alpha(cue.color, 0.28), frame.palette);
                     let mut spike_path = PathBuilder::fill();
                     append_circle_polygon(&mut spike_path, px_x, px_y, spike_radius);
                     if let Ok(path) = spike_path.build() {
@@ -15064,9 +14978,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     }
                 }
 
-                let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
-                let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-                let mut body_color = agent_color(agent, agent_shade);
+                let mut body_color = agent_color(&visuals);
                 if !palette_is_natural {
                     body_color = apply_palette(body_color, frame.palette);
                 }
@@ -15078,9 +14990,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     size_px,
                     scale,
                     body_color,
+                    &visuals,
                     frame.palette,
                     palette_is_natural,
-                    day_phase,
                     very_low_fps,
                 );
             }
@@ -15135,7 +15047,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 );
             }
             if let Ok(path) = outline_builder.build() {
-                window.paint_path(path, rgba_from_hex(0x10151a, 0.78));
+                window.paint_path(
+                    path,
+                    rgba_from_triplet_with_alpha(visual::visual_style().substrate.abyss_srgb, 0.78),
+                );
             }
         }
     }
@@ -15165,41 +15080,45 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 }
 
 fn food_color(intensity: f32) -> Rgba {
-    let clamped = intensity.clamp(0.0, 1.0);
-    Rgba {
-        r: (0.16 + 0.20 * clamped).clamp(0.0, 1.0),
-        g: (0.46 + 0.36 * clamped).clamp(0.0, 1.0),
-        b: (0.19 + 0.18 * clamped).clamp(0.0, 1.0),
-        a: 0.18 + 0.42 * clamped,
-    }
+    let params = visual::food_visual_params(intensity);
+    rgba_from_triplet_with_alpha(visual::food_density_color(intensity), params.alpha)
 }
 
-fn agent_color(agent: &AgentRenderData, shade: f32) -> Rgba {
-    let base_r = agent.color[0].clamp(0.0, 1.0);
-    let base_g = agent.color[1].clamp(0.0, 1.0);
-    let base_b = agent.color[2].clamp(0.0, 1.0);
-    let health_factor = (agent.health / 2.0).clamp(0.45, 1.0);
-    let boost = agent.boost.clamp(0.0, 1.0);
+fn resolve_agent_visual(agent: &AgentRenderData, reference_age_ticks: u64) -> AgentVisualParams {
+    visual::agent_visual_params(&AgentVisualInput {
+        genome_color: agent.color,
+        health: agent.health,
+        age_ticks: u64::from(agent.age),
+        reference_age_ticks,
+        herbivore_tendency: agent.herbivore_tendency,
+        temperature_preference: agent.temperature_preference,
+        wheel_left: agent.wheel_left,
+        wheel_right: agent.wheel_right,
+        heading: agent.heading,
+        spike_extended: agent.spiked,
+        spike_length: agent.spike_length,
+        boosting: agent.boost > 0.05,
+        sound_output: agent.sound_output,
+        sound_multiplier: agent.sound_multiplier,
+        sound_level: agent.sound_level,
+        food_delta: agent.food_delta,
+        trait_smell: agent.trait_smell,
+        trait_hearing: agent.trait_hearing,
+        selection: match agent.selection {
+            SelectionState::None => VisualSelection::None,
+            SelectionState::Hovered => VisualSelection::Hovered,
+            SelectionState::Selected => VisualSelection::Selected,
+        },
+    })
+}
 
-    let blend_channel = |base: f32| {
-        let lit = base * health_factor * shade;
-        (lit * 0.85 + base * 0.15).clamp(0.08, 1.0)
-    };
-
-    let mut color = Rgba {
-        r: blend_channel(base_r),
-        g: blend_channel(base_g),
-        b: blend_channel(base_b),
+fn agent_color(visuals: &AgentVisualParams) -> Rgba {
+    Rgba {
+        r: visuals.body_color[0],
+        g: visuals.body_color[1],
+        b: visuals.body_color[2],
         a: 0.96,
-    };
-
-    if boost > 0.0 {
-        color.r = (color.r + boost * 0.28).min(1.0);
-        color.g = (color.g + boost * 0.12).min(1.0);
-        color.b = (color.b * (1.0 - boost * 0.18)).clamp(0.0, 1.0);
     }
-
-    color
 }
 
 #[cfg(feature = "world_wgpu")]
@@ -15209,7 +15128,6 @@ fn build_gpu_agent_instance(
     palette: ColorPaletteMode,
     palette_is_natural: bool,
 ) -> scriptbots_world_gfx::AgentInstance {
-    let day_phase = (frame.tick as f32 * 0.00025).sin() * 0.5 + 0.5;
     let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
     let half_world = dynamic_radius * 0.5;
     let mut body_radius = half_world * 0.72;
@@ -15237,14 +15155,12 @@ fn build_gpu_agent_instance(
     let yelling_level = agent.sound_output.abs().min(1.5);
     let mouth_open = (0.35 + eating_level * 0.4 + yelling_level * 0.55).clamp(0.35, 1.6);
 
-    let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
-    let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-    let mut body_color = agent_color(agent, agent_shade);
+    let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
+    let mut body_color = agent_color(&visuals);
     if !palette_is_natural {
         body_color = apply_palette(body_color, palette);
     }
 
-    let (sin_h, cos_h) = agent.heading.sin_cos();
     let selection = match agent.selection {
         SelectionState::Hovered => 1.0,
         SelectionState::Selected => 2.0,
@@ -15260,7 +15176,7 @@ fn build_gpu_agent_instance(
     scriptbots_world_gfx::AgentInstance {
         position: [agent.position.x, agent.position.y],
         quad_extent: [half_width, half_height],
-        heading: [cos_h, sin_h],
+        heading: visuals.facing,
         body_radius,
         body_half_length,
         wheel_offset,
