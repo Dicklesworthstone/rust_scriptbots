@@ -2143,7 +2143,7 @@ claim that world integration early.
   serialized config tree. The digest and trace identities remain V1.6: no lane, counter, or
   science semantic changed; the six-point and checkpoint goldens were re-pinned after review
   showed only the config-lane encoding advancing transitively, matching the bd-2i1 pattern;
-- [Currently In Progress — `bd-yw1j`] Retire the orphaned `sense_max_neighbors` placeholder
+- [Completed — `bd-yw1j`] Retire the orphaned `sense_max_neighbors` placeholder
   rather than inventing a non-C++ sensor channel for it. Advance the scientific digest and trace
   to `scriptbots.world-digest.v1.7`/codec-7 and
   `scriptbots.world-step-trace.v1.7`/codec-7, advance the positional checkpoint encoding to
