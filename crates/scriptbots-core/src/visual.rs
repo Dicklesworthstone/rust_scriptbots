@@ -917,6 +917,100 @@ pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
     ]
 }
 
+/// Weight of the signed `fertility_bias` channel when it is folded into moisture.
+///
+/// `TerrainTile::fertility_bias` is a signed `[-1, 1]` food-fertility term, while
+/// [`TerrainShadeInput::moisture`] is documented as a COMBINED moisture/fertility channel.
+/// This is the constant that reconciles the two, and it lives here so no frontend has to
+/// guess it (bd-1lls).
+pub const FERTILITY_LUSHNESS_WEIGHT: f32 = 0.25;
+
+/// Fold a tile's signed fertility bias into its moisture channel.
+///
+/// The result is what [`TerrainShadeInput::moisture`] means: not raw ground wetness, but how
+/// *lush* the tile reads. Fertile ground looks greener than its moisture alone implies, and
+/// barren ground looks drier; [`FERTILITY_LUSHNESS_WEIGHT`] sets how much.
+///
+/// Both inputs are clamped defensively, so a caller sampling a partially initialized field
+/// cannot push the shading path out of gamut.
+#[must_use]
+pub fn terrain_lushness(moisture: f32, fertility_bias: f32) -> f32 {
+    let moisture = clamp01(moisture);
+    let bias = if fertility_bias.is_finite() {
+        fertility_bias.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    clamp01(moisture + bias * FERTILITY_LUSHNESS_WEIGHT)
+}
+
+/// Direction the key light comes FROM, in world-space XY. Normalized.
+///
+/// Down-right, so slopes facing up-left catch the light. Fixed rather than orbiting with
+/// `daylight`: a rotating key light would make every terrain golden non-reproducible across
+/// the tick at which it was captured, and the day/night signal is carried by intensity
+/// ([`daylight_factor`]) instead.
+pub const TERRAIN_LIGHT_DIR_XY: [f32; 2] = [0.554_7, -0.832_05];
+
+/// Vertical component of the key light at full daylight.
+///
+/// The light lowers toward the horizon as `daylight` falls, which lengthens the apparent
+/// shading gradient at dusk without ever letting the term reach zero.
+pub const TERRAIN_LIGHT_HEIGHT: f32 = 0.85;
+
+/// How far the normal-lighting term is allowed to push a tile's brightness.
+///
+/// The multiplier is BOUNDED on purpose: terrain lighting modulates an already-shaded color
+/// from [`terrain_shaded_color`], so an unbounded term would silently blow out the palette
+/// that bd-9pqz established.
+pub const TERRAIN_LIGHT_FACTOR_RANGE: (f32, f32) = (0.72, 1.28);
+
+/// Bounded brightness multiplier from surface normal versus the key light.
+///
+/// `gradient` is the elevation slope `[dh/dx, dh/dy]` in elevation-units per world-unit, as a
+/// frontend would compute it from neighbouring samples. The surface normal is reconstructed as
+/// `normalize([-gx * s, -gy * s, 1])`, where `s` is the per-kind
+/// [`MaterialStyle::normal_strength`] — so rock reads as craggy and water reads as flat
+/// from the same gradient, which is the whole reason this is keyed on `kind`.
+///
+/// The return value is a MULTIPLIER centered near 1.0 and clamped to
+/// [`TERRAIN_LIGHT_FACTOR_RANGE`], intended to scale a color that
+/// [`terrain_shaded_color`] already produced. It is not a lighting model in its own right and
+/// deliberately has no ambient/specular terms; those belong to whichever renderer wants them.
+///
+/// Every constant it depends on lives in this module (bd-1lls): the renderer supplies geometry
+/// and gets appearance back, and there is exactly one definition of what a lit slope looks like.
+#[must_use]
+pub fn terrain_normal_light_factor(kind: TerrainKind, gradient: [f32; 2], daylight: f32) -> f32 {
+    let (gx, gy) = match (gradient[0].is_finite(), gradient[1].is_finite()) {
+        (true, true) => (gradient[0], gradient[1]),
+        _ => return 1.0,
+    };
+    let daylight = clamp01(daylight);
+    let strength = terrain_material(kind).normal_strength;
+
+    // Surface normal from the height gradient.
+    let nx = -gx * strength;
+    let ny = -gy * strength;
+    let n_len = (nx * nx + ny * ny + 1.0).sqrt();
+
+    // Key light: fixed azimuth, elevation rising with daylight so dusk rakes across slopes.
+    let lz = (TERRAIN_LIGHT_HEIGHT * daylight).max(0.15);
+    let l_len = (TERRAIN_LIGHT_DIR_XY[0] * TERRAIN_LIGHT_DIR_XY[0]
+        + TERRAIN_LIGHT_DIR_XY[1] * TERRAIN_LIGHT_DIR_XY[1]
+        + lz * lz)
+        .sqrt();
+
+    let n_dot_l =
+        (nx * TERRAIN_LIGHT_DIR_XY[0] + ny * TERRAIN_LIGHT_DIR_XY[1] + lz) / (n_len * l_len);
+
+    // A flat tile has n_dot_l == lz/l_len; that case must map to exactly 1.0 so flat ground is
+    // never darkened or brightened by merely being lit.
+    let flat_reference = lz / l_len;
+    let (lo, hi) = TERRAIN_LIGHT_FACTOR_RANGE;
+    (1.0 + (n_dot_l - flat_reference)).clamp(lo, hi)
+}
+
 // ---------------------------------------------------------------------------
 // Food semantics: density ramp + deterministic shimmer phase.
 // ---------------------------------------------------------------------------
@@ -1221,10 +1315,10 @@ pub struct SplatInput {
 }
 
 // ---------------------------------------------------------------------------
-// Per-pixel terrain sampling (bd-grbc, PROVISIONAL)
+// Per-pixel terrain sampling (bd-grbc, settled)
 // ---------------------------------------------------------------------------
 
-/// Borrowed view of the terrain fields a shading pass needs (bd-grbc, PROVISIONAL).
+/// Borrowed view of the terrain fields a shading pass needs (bd-grbc).
 ///
 /// `TerrainShadeInput` and `SplatInput` describe ONE cell, so a fragment path had no way to ask
 /// "what are the fields at world (x, y)?" and would have had to invent its own interpolation
@@ -1254,7 +1348,7 @@ pub struct TerrainFieldView<'a> {
     pub water_depth: &'a [f32],
 }
 
-/// The four cells surrounding a sample point, with their bilinear weights (bd-grbc, PROVISIONAL).
+/// The four cells surrounding a sample point, with their bilinear weights (bd-grbc).
 ///
 /// OPTION B of bd-grbc. Returned when the caller wants to interpolate on the GPU: sample this
 /// once per cell on the CPU, upload the corners, and let the fragment shader blend. Prefer this
@@ -1287,8 +1381,11 @@ impl TerrainFieldView<'_> {
 
     /// The four surrounding cells and their bilinear weights at world position `(x, y)`.
     ///
-    /// PROVISIONAL (bd-grbc). Sample points are taken at CELL CENTRES, so a point exactly at a
-    /// centre returns that cell with weight 1. The seam wraps.
+    /// Sample points are taken at CELL CENTRES, so a point exactly at a centre returns that cell
+    /// with weight 1. The seam wraps.
+    ///
+    /// This is OPTION B of bd-grbc and the HOT path: the caller receives indices and weights and
+    /// does the blend itself, which is what a fragment shader wants. Prefer it per-pixel.
     #[must_use]
     pub fn sample_corners(&self, x: f32, y: f32) -> TerrainSampleCorners {
         if self.cell_count() == 0 || self.cell_size <= 0.0 || !x.is_finite() || !y.is_finite() {
@@ -1332,9 +1429,12 @@ impl TerrainFieldView<'_> {
 
     /// Bilinearly sampled shading inputs at world position `(x, y)`.
     ///
-    /// OPTION A of bd-grbc, PROVISIONAL. Convenient for CPU shading and for the semantic
-    /// reference raster; use [`Self::sample_corners`] instead if the fragment shader should do
-    /// the blending.
+    /// OPTION A of bd-grbc. Convenient for CPU shading and for the semantic reference raster;
+    /// use [`Self::sample_corners`] instead if the fragment shader should do the blending.
+    ///
+    /// Both options are kept deliberately. This one exists so the golden lane and the shader
+    /// share a single definition of "the fields at (x, y)"; deleting it as redundant would put
+    /// the reference raster back to inventing its own sampling.
     ///
     /// `kind` is NEAREST, not blended -- a terrain kind is categorical, and interpolating an
     /// enum discriminant would be meaningless. `splat_weights` is the mechanism for smooth
@@ -1371,7 +1471,7 @@ impl TerrainFieldView<'_> {
 
     /// Bilinearly sampled splat inputs at world position `(x, y)`.
     ///
-    /// OPTION A of bd-grbc, PROVISIONAL. Same nearest-kind rule as [`Self::shade_input_at`].
+    /// OPTION A of bd-grbc. Same nearest-kind rule as [`Self::shade_input_at`].
     #[must_use]
     pub fn splat_input_at(&self, x: f32, y: f32) -> SplatInput {
         let corners = self.sample_corners(x, y);
@@ -1649,6 +1749,115 @@ mod tests {
     use super::*;
 
     const EPS: f32 = 1.0e-6;
+
+    /// bd-1lls: flat ground must not be tinted by merely being lit.
+    ///
+    /// This is the property that makes the helper safe to multiply into an already-shaded
+    /// color. If a zero gradient returned anything but exactly 1.0, every renderer adopting it
+    /// would shift the whole bd-9pqz palette by a constant and the goldens would move for a
+    /// reason nobody could name.
+    #[test]
+    fn flat_terrain_is_neutral_under_normal_lighting_at_every_kind_and_daylight() {
+        for kind in [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ] {
+            for daylight in [0.0, 0.15, 0.5, DAYLIGHT_STATIC, 1.0] {
+                let factor = terrain_normal_light_factor(kind, [0.0, 0.0], daylight);
+                assert!(
+                    (factor - 1.0).abs() < EPS,
+                    "flat {kind:?} at daylight {daylight} returned {factor}, expected exactly 1.0"
+                );
+            }
+        }
+    }
+
+    /// A slope facing the key light must be brighter than the same slope facing away, and both
+    /// must stay inside the declared bound so the palette cannot be blown out.
+    #[test]
+    fn normal_lighting_is_directional_and_stays_within_its_declared_bound() {
+        let (lo, hi) = TERRAIN_LIGHT_FACTOR_RANGE;
+        // TERRAIN_LIGHT_DIR_XY is (+x, -y), so a normal tilted toward (+x, -y) faces the light.
+        // The normal is -gradient, hence a gradient of (-1, +1) tilts the normal INTO the light.
+        let toward = terrain_normal_light_factor(TerrainKind::Rock, [-1.0, 1.0], 1.0);
+        let away = terrain_normal_light_factor(TerrainKind::Rock, [1.0, -1.0], 1.0);
+        assert!(
+            toward > away,
+            "a slope facing the key light ({toward}) must be brighter than one facing away \
+             ({away})"
+        );
+        for (label, factor) in [("toward", toward), ("away", away)] {
+            assert!(
+                (lo..=hi).contains(&factor),
+                "{label} slope produced {factor}, outside TERRAIN_LIGHT_FACTOR_RANGE {lo}..={hi}"
+            );
+        }
+    }
+
+    /// Rock declares a higher `normal_strength` than water, so identical geometry must produce
+    /// a stronger lighting response on rock. This is the reason the helper takes `kind` at all.
+    #[test]
+    fn normal_lighting_respects_per_kind_normal_strength() {
+        let gradient = [-0.6, 0.6];
+        let rock = terrain_normal_light_factor(TerrainKind::Rock, gradient, 1.0);
+        let water = terrain_normal_light_factor(TerrainKind::DeepWater, gradient, 1.0);
+        assert!(
+            terrain_material(TerrainKind::Rock).normal_strength
+                > terrain_material(TerrainKind::DeepWater).normal_strength,
+            "fixture assumption broken: rock must declare more normal_strength than deep water"
+        );
+        assert!(
+            (rock - 1.0).abs() > (water - 1.0).abs(),
+            "rock ({rock}) must respond more strongly than deep water ({water}) to the same \
+             gradient, because it declares a higher normal_strength"
+        );
+    }
+
+    /// Non-finite geometry must not propagate into a color.
+    #[test]
+    fn normal_lighting_rejects_non_finite_gradients() {
+        for gradient in [
+            [f32::NAN, 0.0],
+            [0.0, f32::NAN],
+            [f32::INFINITY, 0.0],
+            [0.0, f32::NEG_INFINITY],
+        ] {
+            let factor = terrain_normal_light_factor(TerrainKind::Grass, gradient, 1.0);
+            assert!(
+                (factor - 1.0).abs() < EPS,
+                "gradient {gradient:?} must fall back to the neutral 1.0, got {factor}"
+            );
+        }
+    }
+
+    /// bd-1lls: fertility moves lushness in the direction of its sign, and the result stays a
+    /// legal `[0, 1]` channel even when both inputs are pushed to their extremes.
+    #[test]
+    fn lushness_folds_fertility_in_signed_and_stays_in_range() {
+        let neutral = terrain_lushness(0.5, 0.0);
+        assert!((neutral - 0.5).abs() < EPS, "zero bias must pass moisture through");
+        assert!(
+            terrain_lushness(0.5, 1.0) > neutral,
+            "positive fertility must read lusher"
+        );
+        assert!(
+            terrain_lushness(0.5, -1.0) < neutral,
+            "negative fertility must read drier"
+        );
+        for moisture in [-1.0, 0.0, 0.5, 1.0, 2.0] {
+            for bias in [-2.0, -1.0, 0.0, 1.0, 2.0, f32::NAN] {
+                let lushness = terrain_lushness(moisture, bias);
+                assert!(
+                    (0.0..=1.0).contains(&lushness),
+                    "terrain_lushness({moisture}, {bias}) = {lushness} escaped [0, 1]"
+                );
+            }
+        }
+    }
 
     fn assert_rgb_close(actual: [f32; 3], expected: [f32; 3], label: &str) {
         for i in 0..3 {
