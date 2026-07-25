@@ -5563,18 +5563,42 @@ impl WorldStepProfile {
 pub struct WorldStepProfiler {
     latest: Option<WorldStepProfile>,
     next_schema: &'static str,
-    #[cfg(test)]
-    legacy_test_clock: LegacyProfileTestClock,
+    tail_clock: Box<dyn ProfileTailClock>,
 }
 
-#[cfg(test)]
-#[derive(Debug, Default)]
-// bd-tqpj: the shared `_ns` postfix is intentional — every field is a nanosecond duration in the legacy profile test clock.
-#[allow(clippy::struct_field_names)]
-struct LegacyProfileTestClock {
-    now_ns: u64,
-    staging_advance_ns: u64,
-    result_advance_ns: u64,
+/// Injected source of synthetic cost for the legacy v2 profile tail boundary (bd-dz37).
+///
+/// The v2 boundary must attribute session staging and downstream admission to the Persistence
+/// stage. Proving that accounting needs a controllable cost, which used to be supplied by a
+/// `#[cfg(test)]` field and `#[cfg(test)]` statements interleaved into
+/// [`PersistenceAdmissionSession::step_profiled`]. That made the tested binary structurally
+/// different from the shipped one — different struct layout, different statement sequence — so
+/// a green test proved something about a binary nobody runs. In a project whose premise is
+/// bit-reproducible determinism that is a hole under the foundation.
+///
+/// This is an ordinary runtime dependency instead. Production ships
+/// [`SystemProfileTailClock`], whose synthetic contribution is always zero, so the real path is
+/// arithmetically unchanged; tests inject a double. Both configurations compile the same code.
+pub trait ProfileTailClock: fmt::Debug + Send + Sync {
+    /// Synthetic nanoseconds accumulated so far. The shipped clock always reports zero.
+    fn synthetic_now_ns(&self) -> u64;
+    /// Account for the cost of staging the completed batch into the admission session.
+    fn advance_staging(&mut self);
+    /// Account for the cost of composing the completion and admission result.
+    fn advance_result(&mut self);
+}
+
+/// Shipped [`ProfileTailClock`]: contributes no synthetic cost, so the tail boundary is measured
+/// purely by the monotonic clock.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemProfileTailClock;
+
+impl ProfileTailClock for SystemProfileTailClock {
+    fn synthetic_now_ns(&self) -> u64 {
+        0
+    }
+    fn advance_staging(&mut self) {}
+    fn advance_result(&mut self) {}
 }
 
 impl Default for WorldStepProfiler {
@@ -5582,8 +5606,7 @@ impl Default for WorldStepProfiler {
         Self {
             latest: None,
             next_schema: WORLD_STEP_PROFILE_SCHEMA,
-            #[cfg(test)]
-            legacy_test_clock: LegacyProfileTestClock::default(),
+            tail_clock: Box::new(SystemProfileTailClock),
         }
     }
 }
@@ -5599,34 +5622,34 @@ impl WorldStepProfiler {
         self.next_schema = schema;
     }
 
-    #[cfg(test)]
-    const fn inject_legacy_tail_costs(&mut self, staging_ns: u64, result_ns: u64) {
-        self.legacy_test_clock = LegacyProfileTestClock {
-            now_ns: 0,
-            staging_advance_ns: staging_ns,
-            result_advance_ns: result_ns,
-        };
+    /// Install a different [`ProfileTailClock`].
+    ///
+    /// The shipped clock contributes nothing, so this exists for harnesses that need a
+    /// controllable tail cost. It is a normal method rather than a `#[cfg(test)]` one so the
+    /// production and test binaries stay identical (bd-dz37).
+    pub fn set_tail_clock(&mut self, clock: Box<dyn ProfileTailClock>) {
+        self.tail_clock = clock;
     }
 
-    #[cfg(test)]
-    const fn legacy_test_now_ns(&self) -> u64 {
-        self.legacy_test_clock.now_ns
+    /// Synthetic nanoseconds contributed by the injected [`ProfileTailClock`] so far.
+    ///
+    /// Always zero under the shipped [`SystemProfileTailClock`], so a nonzero value means a
+    /// harness installed its own clock.
+    #[must_use]
+    pub fn synthetic_tail_ns(&self) -> u64 {
+        self.tail_clock.synthetic_now_ns()
     }
 
-    #[cfg(test)]
-    const fn advance_legacy_test_staging(&mut self) {
-        self.legacy_test_clock.now_ns = self
-            .legacy_test_clock
-            .now_ns
-            .saturating_add(self.legacy_test_clock.staging_advance_ns);
+    fn tail_clock_now_ns(&self) -> u64 {
+        self.synthetic_tail_ns()
     }
 
-    #[cfg(test)]
-    const fn advance_legacy_test_result(&mut self) {
-        self.legacy_test_clock.now_ns = self
-            .legacy_test_clock
-            .now_ns
-            .saturating_add(self.legacy_test_clock.result_advance_ns);
+    fn advance_tail_clock_staging(&mut self) {
+        self.tail_clock.advance_staging();
+    }
+
+    fn advance_tail_clock_result(&mut self) {
+        self.tail_clock.advance_result();
     }
 
     fn finish_legacy_boundary(
@@ -24082,34 +24105,36 @@ impl PersistenceAdmissionSession {
         profiler.select_schema(WORLD_STEP_PROFILE_SCHEMA);
         let completion = world.step_outcome_observed(profiler)?;
 
+        // The synthetic terms below are supplied by the injected ProfileTailClock and are always
+        // zero under the shipped SystemProfileTailClock, so this arithmetic is a no-op in
+        // production. The statements are unconditional on purpose: the binary under test is the
+        // binary that ships (bd-dz37).
         let total_tail_started_at = Instant::now();
-        #[cfg(test)]
-        let total_tail_test_started_at = profiler.legacy_test_now_ns();
+        let total_tail_synthetic_started = profiler.tail_clock_now_ns();
         let admission_started_at = Instant::now();
-        #[cfg(test)]
-        let admission_test_started_at = profiler.legacy_test_now_ns();
+        let admission_synthetic_started = profiler.tail_clock_now_ns();
         self.stage_completion(world, &completion);
-        #[cfg(test)]
-        profiler.advance_legacy_test_staging();
+        profiler.advance_tail_clock_staging();
         let admission_result = self.admit_pending(world);
-        let admission_elapsed = admission_started_at.elapsed();
-        #[cfg(test)]
-        let admission_elapsed = admission_elapsed.saturating_add(Duration::from_nanos(
-            profiler
-                .legacy_test_now_ns()
-                .saturating_sub(admission_test_started_at),
-        ));
+        let admission_elapsed =
+            admission_started_at
+                .elapsed()
+                .saturating_add(Duration::from_nanos(
+                    profiler
+                        .tail_clock_now_ns()
+                        .saturating_sub(admission_synthetic_started),
+                ));
 
         let result = Self::combine_completion_admission(completion, admission_result);
-        #[cfg(test)]
-        profiler.advance_legacy_test_result();
-        let total_tail_elapsed = total_tail_started_at.elapsed();
-        #[cfg(test)]
-        let total_tail_elapsed = total_tail_elapsed.saturating_add(Duration::from_nanos(
-            profiler
-                .legacy_test_now_ns()
-                .saturating_sub(total_tail_test_started_at),
-        ));
+        profiler.advance_tail_clock_result();
+        let total_tail_elapsed =
+            total_tail_started_at
+                .elapsed()
+                .saturating_add(Duration::from_nanos(
+                    profiler
+                        .tail_clock_now_ns()
+                        .saturating_sub(total_tail_synthetic_started),
+                ));
         profiler.finish_legacy_boundary(admission_elapsed, total_tail_elapsed);
         result
     }
@@ -34106,7 +34131,7 @@ mod tests {
             let (mut world, mut session) =
                 world_with_session(quiet_trace_config(0x0A71_00A3, 1), spy);
             let mut profiler = WorldStepProfiler::default();
-            profiler.inject_legacy_tail_costs(STAGING_NS, RESULT_NS);
+            profiler.set_tail_clock(Box::new(SyntheticTailClock::new(STAGING_NS, RESULT_NS)));
 
             let completion = session
                 .step_profiled_outcome(&mut world, &mut profiler)
@@ -34114,7 +34139,7 @@ mod tests {
             let profile = profiler.latest().expect("v3 profile");
             assert_eq!(profile.schema, WORLD_STEP_OUTCOME_PROFILE_SCHEMA);
             assert_eq!(
-                profiler.legacy_test_now_ns(),
+                profiler.synthetic_tail_ns(),
                 0,
                 "the core-only v3 outcome boundary must not enter either legacy tail"
             );
@@ -34125,7 +34150,7 @@ mod tests {
         let spy = SpyPersistence::default();
         let (mut world, mut session) = world_with_session(quiet_trace_config(0x0A71_00A2, 1), spy);
         let mut profiler = WorldStepProfiler::default();
-        profiler.inject_legacy_tail_costs(STAGING_NS, RESULT_NS);
+        profiler.set_tail_clock(Box::new(SyntheticTailClock::new(STAGING_NS, RESULT_NS)));
 
         session
             .step_profiled(&mut world, &mut profiler)
@@ -34136,7 +34161,7 @@ mod tests {
             .expect("legacy persistence timing");
         assert_eq!(profile.schema, WORLD_STEP_PROFILE_SCHEMA);
         assert_eq!(
-            profiler.legacy_test_now_ns(),
+            profiler.synthetic_tail_ns(),
             STAGING_NS.saturating_add(RESULT_NS)
         );
         assert!(
@@ -39862,6 +39887,61 @@ mod tests {
             );
             assert_eq!(control.resource_ledger(), profiled.resource_ledger());
         }
+    }
+
+    /// Test double for [`ProfileTailClock`] that charges a fixed synthetic cost to each of the
+    /// legacy v2 tail segments, so the boundary's accounting can be asserted exactly.
+    ///
+    /// This is injected through the same public `set_tail_clock` seam production uses, so it
+    /// changes no struct layout and no statement sequence in the code under test (bd-dz37).
+    #[derive(Debug, Default)]
+    struct SyntheticTailClock {
+        now_ns: u64,
+        staging_advance_ns: u64,
+        result_advance_ns: u64,
+    }
+
+    impl SyntheticTailClock {
+        const fn new(staging_advance_ns: u64, result_advance_ns: u64) -> Self {
+            Self {
+                now_ns: 0,
+                staging_advance_ns,
+                result_advance_ns,
+            }
+        }
+    }
+
+    impl ProfileTailClock for SyntheticTailClock {
+        fn synthetic_now_ns(&self) -> u64 {
+            self.now_ns
+        }
+
+        fn advance_staging(&mut self) {
+            self.now_ns = self.now_ns.saturating_add(self.staging_advance_ns);
+        }
+
+        fn advance_result(&mut self) {
+            self.now_ns = self.now_ns.saturating_add(self.result_advance_ns);
+        }
+    }
+
+    /// The shipped clock must contribute nothing, so an ordinary profiled step measures only the
+    /// real monotonic clock. If this ever regressed, every production profile would carry
+    /// fabricated time.
+    #[test]
+    fn the_shipped_tail_clock_contributes_no_synthetic_time() {
+        let mut clock = SystemProfileTailClock;
+        assert_eq!(clock.synthetic_now_ns(), 0);
+        clock.advance_staging();
+        clock.advance_result();
+        assert_eq!(clock.synthetic_now_ns(), 0);
+
+        let profiler = WorldStepProfiler::default();
+        assert_eq!(
+            profiler.synthetic_tail_ns(),
+            0,
+            "a default profiler must ship the zero-cost clock"
+        );
     }
 
     fn quiet_trace_config(seed: u64, persistence_interval: u32) -> ScriptBotsConfig {
