@@ -20809,7 +20809,78 @@ impl WorldState {
             value.clamp(min, max)
         }
     }
-    // bd-tqpj: ~600-line cadence batch assembly; reviewed as a unit per lint policy.
+    /// Project the tick's countable events into the batch's event rows (bd-mv2j).
+    ///
+    /// Read-only over `self`: an event row is emitted only for a nonzero count, so an
+    /// honest zero stays absent rather than being recorded as a zero-valued row.
+    fn project_persistence_events(&self, summary: &TickSummary) -> Vec<PersistenceEvent> {
+        let mut events = Vec::with_capacity(4);
+        if summary.births > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Births,
+                summary.births,
+            ));
+        }
+        if summary.deaths > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Deaths,
+                summary.deaths,
+            ));
+        }
+        if self.pending_spike_attempt_events > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Custom(Cow::Borrowed("spike_attempts")),
+                self.pending_spike_attempt_events as usize,
+            ));
+        }
+        if self.pending_spike_hit_events > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Custom(Cow::Borrowed("spike_hits")),
+                self.pending_spike_hit_events as usize,
+            ));
+        }
+        events
+    }
+
+    /// Project live agents into the batch's agent rows, ordered by stable `AgentUid` (bd-mv2j).
+    ///
+    /// The ordering is not cosmetic: persistence rows are compared across runs, so they must
+    /// not inherit physical slot order. When a partial batch is forced, the retained runtime
+    /// tail is restored first so the row reflects the state at the completed boundary rather
+    /// than the mutated live value.
+    fn project_agent_states(
+        &self,
+        handles: &[AgentId],
+        force_partial_batch: bool,
+    ) -> Vec<AgentState> {
+        let mut agents = Vec::with_capacity(handles.len());
+        for id in handles {
+            if let (Some(data), Some(mut runtime)) =
+                (self.agents.snapshot(*id), self.runtime.get(*id).cloned())
+            {
+                if force_partial_batch
+                    && let Some(tail) = self.pending_persistence_runtime_tail.get(*id)
+                {
+                    tail.restore_into(&mut runtime);
+                }
+                agents.push(AgentState {
+                    id: *id,
+                    identity: *self
+                        .identities
+                        .get(*id)
+                        .expect("live agent must have stable identity"),
+                    data,
+                    runtime,
+                });
+            }
+        }
+        agents.sort_unstable_by_key(|agent| agent.identity.uid);
+        agents
+    }
+
+    // bd-tqpj: cadence batch assembly; reviewed as a unit per lint policy.
+    // bd-mv2j: event and agent-row projection extracted above; the aggregation pass and
+    // metric assembly remain inline pending their own reviewed change.
     #[allow(clippy::too_many_lines)]
     fn prepare_persistence(
         &mut self,
@@ -21262,54 +21333,8 @@ impl WorldState {
             ));
         }
 
-        let mut events = Vec::with_capacity(4);
-        if summary.births > 0 {
-            events.push(PersistenceEvent::new(
-                PersistenceEventKind::Births,
-                summary.births,
-            ));
-        }
-        if summary.deaths > 0 {
-            events.push(PersistenceEvent::new(
-                PersistenceEventKind::Deaths,
-                summary.deaths,
-            ));
-        }
-        if self.pending_spike_attempt_events > 0 {
-            events.push(PersistenceEvent::new(
-                PersistenceEventKind::Custom(Cow::Borrowed("spike_attempts")),
-                self.pending_spike_attempt_events as usize,
-            ));
-        }
-        if self.pending_spike_hit_events > 0 {
-            events.push(PersistenceEvent::new(
-                PersistenceEventKind::Custom(Cow::Borrowed("spike_hits")),
-                self.pending_spike_hit_events as usize,
-            ));
-        }
-
-        let mut agents = Vec::with_capacity(agent_count);
-        for id in &handles {
-            if let (Some(data), Some(mut runtime)) =
-                (self.agents.snapshot(*id), self.runtime.get(*id).cloned())
-            {
-                if force_partial_batch
-                    && let Some(tail) = self.pending_persistence_runtime_tail.get(*id)
-                {
-                    tail.restore_into(&mut runtime);
-                }
-                agents.push(AgentState {
-                    id: *id,
-                    identity: *self
-                        .identities
-                        .get(*id)
-                        .expect("live agent must have stable identity"),
-                    data,
-                    runtime,
-                });
-            }
-        }
-        agents.sort_unstable_by_key(|agent| agent.identity.uid);
+        let events = self.project_persistence_events(&summary);
+        let agents = self.project_agent_states(&handles, force_partial_batch);
 
         if lifecycle_enabled && !self.pending_lifecycle_death_metrics.is_empty() {
             let mut combat_carnivore = 0usize;
