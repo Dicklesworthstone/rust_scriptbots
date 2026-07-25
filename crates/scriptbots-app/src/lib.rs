@@ -25,8 +25,8 @@ pub mod tournament;
 
 /// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
 pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3.3";
-/// Compatible V3 minor schema used when a manifest carries WorldDigestV1.6 bootstrap evidence.
-pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.5";
+/// Compatible V3 minor schema used when a manifest carries WorldDigestV1.7 bootstrap evidence.
+pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.6";
 /// Schema identifier for a sequence of V2 world characterization points.
 pub const CHARACTERIZATION_TRACE_V2_SCHEMA: &str = "scriptbots.characterization-trace.v2";
 /// Safety bound for the temporary characterization runner.
@@ -565,7 +565,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// Human-readable registered brain family recorded in stable key order.
 ///
 /// This roster is a query/provenance projection, not an executable-semantics attestation. Current
-/// V3.5 bootstrap evidence carries the authoritative adapter-attested registry fingerprint in each
+/// V3.6 bootstrap evidence carries the authoritative adapter-attested registry fingerprint in each
 /// [`WorldDigestV1::brain_registry`] lane; key and kind alone cannot recompute that fingerprint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainRosterEntryV0 {
@@ -987,7 +987,7 @@ pub enum RunManifestError {
     },
     /// Older V3 minor schemas omit part of the current future-state continuation contract.
     #[error(
-        "run manifest schema `{found}` is continuation-incomplete; expected `scriptbots.run-manifest.v3.3` or `scriptbots.run-manifest.v3.5`"
+        "run manifest schema `{found}` is continuation-incomplete; expected `scriptbots.run-manifest.v3.3` or `scriptbots.run-manifest.v3.6`"
     )]
     ContinuationIncompleteSchema {
         /// Legacy schema tag supplied by a caller or decoded record.
@@ -995,11 +995,13 @@ pub enum RunManifestError {
     },
     /// A bootstrap manifest embeds a superseded scientific digest contract.
     #[error(
-        "run manifest schema `{found}` embeds the superseded WorldDigestV1.5 contract; expected `scriptbots.run-manifest.v3.5` for bootstrap evidence"
+        "run manifest schema `{found}` embeds the superseded {embedded_world_digest} contract; expected `scriptbots.run-manifest.v3.6` for bootstrap evidence"
     )]
     SupersededBootstrapSchema {
         /// Superseded bootstrap schema tag supplied by a caller or decoded record.
         found: String,
+        /// Exact scientific digest contract embedded by that manifest schema.
+        embedded_world_digest: &'static str,
     },
     /// The schema tag did not match whether bootstrap evidence is present.
     #[error("run manifest schema `{found}` does not match expected schema `{expected}`")]
@@ -1179,9 +1181,14 @@ impl RunManifestV3 {
                 found: self.schema.clone(),
             });
         }
-        if self.schema == "scriptbots.run-manifest.v3.4" {
+        if let Some(embedded_world_digest) = match self.schema.as_str() {
+            "scriptbots.run-manifest.v3.4" => Some("WorldDigestV1.5"),
+            "scriptbots.run-manifest.v3.5" => Some("WorldDigestV1.6"),
+            _ => None,
+        } {
             return Err(RunManifestError::SupersededBootstrapSchema {
                 found: self.schema.clone(),
+                embedded_world_digest,
             });
         }
         let expected_schema = if self.bootstrap_evidence.is_some() {
@@ -2039,6 +2046,10 @@ mod characterization_tests {
         );
         assert_eq!(manifest.config_digest_encoding, "blake3-canonical-json-v1");
         assert_eq!(manifest.normalized_config["locomotion_model"], "legacy");
+        assert!(
+            manifest.normalized_config["sense_max_neighbors"].is_null(),
+            "the retired neighbor normalizer must not survive in run provenance"
+        );
         let mut differential_config = world.config().clone();
         differential_config.locomotion_model = scriptbots_core::LocomotionModel::Differential;
         world
@@ -2338,7 +2349,7 @@ mod characterization_tests {
     }
 
     #[test]
-    fn bootstrap_evidence_is_explicit_validated_and_schema_tagged() {
+    fn bd_yw1j_bootstrap_evidence_is_explicit_validated_and_schema_tagged() {
         let world = test_world(Some(0xB007_57A4));
         let start = world.world_digest_v1().expect("tick-zero start digest");
         let base = RunManifestV3::from_world_with_provenance(
@@ -2361,6 +2372,10 @@ mod characterization_tests {
             })
             .expect("zero bootstrap evidence");
         assert_eq!(manifest.schema, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA);
+        assert_eq!(
+            RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA, "scriptbots.run-manifest.v3.6",
+            "WorldDigestV1.7 bootstrap evidence requires the reviewed V3.6 wire"
+        );
         let evidence = manifest
             .bootstrap_evidence
             .as_ref()
@@ -2653,11 +2668,27 @@ mod characterization_tests {
         prior_bootstrap.schema = "scriptbots.run-manifest.v3.4".to_owned();
         let error = prior_bootstrap
             .to_storage_record()
-            .expect_err("V3.4 embeds the superseded WorldDigestV1.5 contract");
+            .expect_err("V3.4 embeds a superseded WorldDigest contract");
         assert!(matches!(
             error,
-            RunManifestError::SupersededBootstrapSchema { ref found }
-                if found == "scriptbots.run-manifest.v3.4"
+            RunManifestError::SupersededBootstrapSchema {
+                ref found,
+                embedded_world_digest,
+            } if found == "scriptbots.run-manifest.v3.4"
+                && embedded_world_digest == "WorldDigestV1.5"
+        ));
+        let mut prior_bootstrap = manifest.clone();
+        prior_bootstrap.schema = "scriptbots.run-manifest.v3.5".to_owned();
+        let error = prior_bootstrap
+            .to_storage_record()
+            .expect_err("V3.5 embeds the superseded WorldDigestV1.6 contract");
+        assert!(matches!(
+            error,
+            RunManifestError::SupersededBootstrapSchema {
+                ref found,
+                embedded_world_digest,
+            } if found == "scriptbots.run-manifest.v3.5"
+                && embedded_world_digest == "WorldDigestV1.6"
         ));
         let mut missing_counter = manifest.clone();
         missing_counter.agent_rng_counters.pop();

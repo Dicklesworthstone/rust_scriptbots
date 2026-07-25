@@ -1429,6 +1429,27 @@ mod tests {
     }
 
     #[test]
+    fn bd_yw1j_retired_neighbor_normalizer_is_not_discoverable_or_mutable() {
+        let (handle, _receiver) = handle();
+        let knobs = handle.list_knobs().expect("list public knobs");
+        assert!(
+            knobs.iter().all(|knob| knob.path != "sense_max_neighbors"),
+            "the retired no-op normalizer must not remain visible as a scientific control"
+        );
+
+        let err = handle
+            .apply_updates(&[KnobUpdate {
+                path: "sense_max_neighbors".into(),
+                value: Value::from(12.0),
+            }])
+            .expect_err("the retired normalizer must fail closed");
+        assert!(matches!(
+            err,
+            ControlError::UnknownPath(ref path) if path == "sense_max_neighbors"
+        ));
+    }
+
+    #[test]
     fn dimension_updates_are_rejected() {
         let (handle, _receiver) = handle();
         let err = handle
