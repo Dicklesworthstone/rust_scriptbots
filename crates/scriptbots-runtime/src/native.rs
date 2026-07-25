@@ -292,8 +292,8 @@ impl FixedDeadlineHost {
 )]
 mod asupersync_runner {
     use super::{
-        CommandEnvelope, FixedDeadlineHost, HostDriveInterest, ManualInstant, NativeDriveReceipt,
-        NativeDriveTrigger, NativeScheduleError, SnapshotHub,
+        CommandEnvelope, FixedDeadlineHost, HostAccessError, HostDriveInterest, ManualInstant,
+        NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError, SnapshotHub,
     };
     use crate::{ApplicationState, CommandId, HostFault, HostHealth, JournalBatchId};
     use asupersync::Cx;
@@ -706,7 +706,11 @@ mod asupersync_runner {
     }
 
     /// Typed failure that leaves [`NativeRunner`] and its exact `HostCore` owned
-    /// by the caller for diagnostics or an explicit retry.
+    /// by the caller for diagnostics or recovery.
+    ///
+    /// Atomic clock/deadline schedule failures may be retried on the same
+    /// runner. A failed host admission seals ingress and retains every
+    /// unresolved envelope for recovery through [`NativeRunner::into_parts`].
     #[derive(Debug, Error)]
     pub enum NativeRunError {
         /// Asupersync runtime construction failed before the host moved.
@@ -797,6 +801,7 @@ mod asupersync_runner {
         maintenance_deadline: Option<ManualInstant>,
         terminal: Option<NativeRunOutcome>,
         panic_message: Option<String>,
+        host_admission_failure: Option<HostAccessError>,
         terminal_drain_failure: Option<TerminalDrainFailure>,
         unresolved_envelopes: Vec<CommandEnvelope>,
     }
@@ -834,6 +839,7 @@ mod asupersync_runner {
                     maintenance_deadline: None,
                     terminal: None,
                     panic_message: None,
+                    host_admission_failure: None,
                     terminal_drain_failure: None,
                     unresolved_envelopes: Vec::new(),
                 },
@@ -854,8 +860,8 @@ mod asupersync_runner {
         }
 
         /// Exact bounded envelopes retained when panic, failed host admission,
-        /// terminal protocol failure, or runner extraction left caller-owned
-        /// work without a truthful host status.
+        /// terminal protocol failure, or runner extraction left work whose
+        /// exact submission outcome requires reconciliation.
         #[must_use]
         pub fn unresolved_envelopes(&self) -> &[CommandEnvelope] {
             &self.unresolved_envelopes
@@ -944,6 +950,9 @@ mod asupersync_runner {
                 return Some(Err(NativeRunError::Panicked {
                     message: message.clone(),
                 }));
+            }
+            if let Some(error) = &self.host_admission_failure {
+                return Some(Err(NativeScheduleError::Host(error.clone()).into()));
             }
             self.terminal_drain_failure.as_ref().map(|failure| {
                 Err(NativeRunError::TerminalDrainFailed {
@@ -1228,9 +1237,13 @@ mod asupersync_runner {
             match message {
                 NativeMessage::Command(envelope) => {
                     self.metrics.command_wakes = self.metrics.command_wakes.saturating_add(1);
-                    self.host
-                        .submit(envelope)
-                        .map_err(NativeScheduleError::from)?;
+                    let retained = envelope.clone();
+                    if let Err(error) = self.host.submit(envelope) {
+                        self.unresolved_envelopes.push(retained);
+                        self.close_runner_after_failure();
+                        self.host_admission_failure = Some(error.clone());
+                        return Err(NativeScheduleError::from(error).into());
+                    }
                     Ok(trigger.combine(NativeDriveTrigger::Command))
                 }
                 NativeMessage::Wake => {
@@ -3460,6 +3473,115 @@ mod tests {
         assert_eq!(returned, after_close);
         assert_eq!(control.wake(), NativeWakeResult::Closed);
         assert_eq!(control.journal_ready(), NativeWakeResult::Closed);
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ownership trace keeps failed admission, FIFO recovery, and sticky retry evidence adjacent"
+    )]
+    fn native_admission_backpressure_retains_exact_dequeued_envelope() {
+        let mut constrained = options(true);
+        constrained.command_capacity = 1;
+        let (core, _) = captured_host_with_options(61, constrained, ReceiptMode::Immediate);
+        let (mut runner, control) = NativeRunner::new(
+            FixedDeadlineHost::new(core),
+            NativeRunnerOptions {
+                ingress_capacity: 4,
+                ..NativeRunnerOptions::default()
+            },
+        )
+        .expect("admission-backpressure runner");
+        let admitted = envelope(1, HostCommand::Step);
+        let overloaded = envelope(2, HostCommand::Pause);
+        let retryable = envelope(3, HostCommand::Resume)
+            .expecting_control_revision(crate::ControlRevision::new(17))
+            .expecting_scientific_revision(crate::ScientificRevision::new(23))
+            .expecting_config_revision(crate::ConfigRevision::new(29));
+        let later = envelope(4, HostCommand::Step);
+        control
+            .try_submit(admitted.clone())
+            .expect("admitted command enqueue");
+        control
+            .try_submit(overloaded.clone())
+            .expect("overloaded command enqueue");
+        control
+            .try_submit(retryable.clone())
+            .expect("backpressured command enqueue");
+        control
+            .try_submit(later.clone())
+            .expect("later command enqueue");
+
+        assert!(matches!(
+            runner.run_until_terminal(),
+            Err(NativeRunError::Schedule(NativeScheduleError::Host(
+                crate::HostAccessError::CommandEvidenceBackpressure { capacity: 1 }
+            )))
+        ));
+        assert_eq!(runner.metrics().command_wakes, 4);
+        assert_eq!(runner.metrics().drive_calls, 0);
+        let mut port = runner.host().local_port();
+        assert!(matches!(
+            port.command_status(admitted.command_id)
+                .expect("admitted status query")
+                .expect("admitted command status")
+                .application(),
+            crate::ApplicationState::Admitted
+        ));
+        assert!(matches!(
+            port.command_status(overloaded.command_id)
+                .expect("overloaded status query")
+                .expect("overloaded command status")
+                .application(),
+            crate::ApplicationState::Rejected(crate::RejectionReason::Overloaded { capacity: 1 })
+        ));
+        assert!(
+            port.command_status(retryable.command_id)
+                .expect("retryable status query")
+                .is_none(),
+            "host authority must not claim an envelope rejected before evidence reservation"
+        );
+        assert!(
+            port.command_status(later.command_id)
+                .expect("later status query")
+                .is_none(),
+            "work behind the failed admission must remain caller-owned"
+        );
+        assert_eq!(
+            runner.unresolved_envelopes(),
+            [retryable.clone(), later.clone()].as_slice()
+        );
+        drop(port);
+        let after_close = envelope(5, HostCommand::Pause);
+        assert_eq!(
+            control
+                .try_submit(after_close.clone())
+                .expect_err("failed host admission must seal native ingress")
+                .into_envelope(),
+            after_close
+        );
+        let metrics = runner.metrics();
+        assert!(matches!(
+            runner.run_until_terminal(),
+            Err(NativeRunError::Schedule(NativeScheduleError::Host(
+                crate::HostAccessError::CommandEvidenceBackpressure { capacity: 1 }
+            )))
+        ));
+        assert_eq!(runner.metrics(), metrics);
+
+        let (host, unresolved) = runner.into_parts();
+
+        assert_eq!(unresolved, vec![retryable.clone(), later.clone()]);
+        let mut port = host.local_port();
+        for command in [&retryable, &later] {
+            assert!(
+                port.command_status(command.command_id)
+                    .expect("recovered host status query")
+                    .is_none(),
+                "recovering the runner must not manufacture host authority"
+            );
+        }
     }
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
