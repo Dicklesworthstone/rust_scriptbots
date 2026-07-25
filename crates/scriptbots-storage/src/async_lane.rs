@@ -270,15 +270,39 @@ impl AsyncReadLane {
             .map_err(Into::into)
     }
 
-    /// Close the lane's connection with an explicit, error-checked shutdown.
-    pub fn close(mut self) -> Result<(), StorageError> {
-        let runtime = Self::runtime()?;
-        runtime
-            .block_on(async {
-                let cx: Cx = Cx::with_budget(Budget::MINIMAL);
-                self.connection.close(&cx).await
-            })
-            .map_err(Into::into)
+    /// Tear the lane down without attempting the writer-side work it has no stake in
+    /// (`bd-qan3`).
+    ///
+    /// This deliberately does not call `AsyncConnection::close`. That path runs
+    /// `Connection::close_in_place`, i.e. `close_internal(best_effort: false,
+    /// checkpoint_on_close: true)`, which attempts a passive WAL checkpoint — a *write* —
+    /// on behalf of a lane that has never written anything. With a `StoragePipeline`
+    /// actively committing, that checkpoint returns `Busy`, and because `best_effort` is
+    /// false the `?` propagates *before* `release_connection`, so the failed close also
+    /// leaves the connection unreleased. The observable symptom was a read-only lane
+    /// failing to close because some unrelated connection was mid-commit.
+    ///
+    /// The engine already skips the checkpoint for a handle where `pager.is_readonly()`,
+    /// which is what this lane morally is, but the async API offers no read-only open —
+    /// `ConnectionEnv` carries no such flag — so the handle cannot be opened that way.
+    ///
+    /// Dropping is the correct teardown instead of a workaround. `AsyncConnection::drop`
+    /// sends `Command::Shutdown` and joins the worker, and the worker's `Connection::drop`
+    /// runs `close_internal(best_effort: true, checkpoint_on_close: false)` — no checkpoint
+    /// to contend over, and it still reaches `release_connection`. So teardown always
+    /// completes, which the checkpointing path could not guarantee.
+    ///
+    /// Waiting for the writer instead was considered and rejected: it would make a
+    /// read-only teardown block on an unrelated writer, and a blocking close needs a bound
+    /// the engine cannot enforce (`bd-aj12`), which would rebuild that hang in the teardown
+    /// path. Retrying the checkpoint would be worse still — it retries work this lane
+    /// should never attempt.
+    ///
+    /// The `Result` is retained so callers need not change and so a future read-only open
+    /// can restore explicit error reporting.
+    pub fn close(self) -> Result<(), StorageError> {
+        drop(self);
+        Ok(())
     }
 }
 

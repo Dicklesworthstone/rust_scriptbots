@@ -313,28 +313,17 @@ fn sub_ms_deadline_expires_a_slow_query() {
     cleanup(&path);
 }
 
-/// IGNORED — the fixture writer leaves a sidecar the pipeline then refuses (`bd-jjxe`).
+/// Readers must observe commit boundaries and tear down cleanly while a writer is active.
 ///
-/// `write_fixture` opens a `Storage`, persists, and closes it, but a `-wal` sidecar
-/// survives that close; `StoragePipeline::create_unattributed_file_with_thresholds` then
-/// fails the same path with `InvalidTarget { reason: "stale FrankenSQLite sidecar
-/// ...-wal exists" }`. That refusal is the documented new-run policy working as intended,
-/// so the defect is on the fixture side — either the close path should not leave a `-wal`
-/// behind, or this scenario must hand the pipeline a fresh path.
+/// This test was blocked twice, and each unblocking exposed the next defect underneath.
+/// First by `bd-jjxe`: a clean `Storage::close` left a `-wal` behind, which the new-run
+/// policy then correctly refused, so the scenario could never start. Fixing that let it run
+/// and surfaced `bd-qan3`: reader lanes closing mid-commit failed with `Database(Busy)`,
+/// because the lane's close attempted a passive WAL checkpoint it had no stake in.
 ///
-/// Worth resolving rather than rewriting around: if a clean `Storage::close` can leave a
-/// sidecar that later refuses its own database, the same shape can strand a real run.
-/// Correct as written, and flaky against a real defect (`bd-qan3`).
-///
-/// `bd-jjxe` unblocked this test — its stale-sidecar refusal is gone, and the seeding below
-/// now goes through the pipeline because a new run refuses an existing database path. Doing
-/// so revealed the next problem underneath: `AsyncReadLane::close` closes with
-/// `Budget::MINIMAL`, so a reader closing while the writer is mid-commit can fail with
-/// `Database(Busy)`. It passes when the whole file runs and fails when run alone, purely on
-/// scheduling, so it is ignored rather than landed flaky. Delete this attribute once a
-/// read-only close no longer contends.
+/// Four readers closing against a live writer is exactly the contended teardown that
+/// reproduced the second one, so this stays un-ignored as the regression guard for it.
 #[test]
-#[ignore = "bd-qan3: AsyncReadLane::close returns Database(Busy) under an active writer, making this timing-dependent"]
 fn concurrent_lane_readers_observe_commit_boundaries_while_writer_applies_batches() {
     let path = test_path("concurrent");
     let path_string = path.to_string_lossy().to_string();
