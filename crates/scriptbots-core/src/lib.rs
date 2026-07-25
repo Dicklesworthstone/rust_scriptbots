@@ -20856,6 +20856,93 @@ impl WorldState {
             value.clamp(min, max)
         }
     }
+    /// Append mortality-breakdown metrics for the ticks that recorded deaths (bd-mv2j).
+    ///
+    /// Read-only over `self`. Nothing is emitted when the cadence is off or no deaths were
+    /// recorded, so an absent row means "not sampled" rather than "zero deaths" — the ratios
+    /// in particular would be meaningless against a zero denominator.
+    fn project_mortality_metrics(&self, lifecycle_enabled: bool, metrics: &mut Vec<MetricSample>) {
+        if !lifecycle_enabled || self.pending_lifecycle_death_metrics.is_empty() {
+            return;
+        }
+        let mut combat_carnivore = 0usize;
+        let mut combat_herbivore = 0usize;
+        let mut starvation = 0usize;
+        let mut aging = 0usize;
+        let mut unknown = 0usize;
+        for record in &self.pending_lifecycle_death_metrics {
+            match record.cause {
+                DeathCause::CombatCarnivore => combat_carnivore += 1,
+                DeathCause::CombatHerbivore => combat_herbivore += 1,
+                DeathCause::Starvation => starvation += 1,
+                DeathCause::Aging => aging += 1,
+                DeathCause::Unknown => unknown += 1,
+            }
+        }
+        let total = combat_carnivore + combat_herbivore + starvation + aging + unknown;
+        if total == 0 {
+            return;
+        }
+        metrics.push(MetricSample::new(
+            "mortality.combat_carnivore.count",
+            combat_carnivore as f64,
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.combat_herbivore.count",
+            combat_herbivore as f64,
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.starvation.count",
+            starvation as f64,
+        ));
+        metrics.push(MetricSample::new("mortality.aging.count", aging as f64));
+        metrics.push(MetricSample::new("mortality.unknown.count", unknown as f64));
+        metrics.push(MetricSample::new("mortality.total.count", total as f64));
+        metrics.push(MetricSample::new(
+            "mortality.combat_carnivore.ratio",
+            combat_carnivore as f64 / total as f64,
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.combat_herbivore.ratio",
+            combat_herbivore as f64 / total as f64,
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.starvation.ratio",
+            starvation as f64 / total as f64,
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.aging.ratio",
+            aging as f64 / total as f64,
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.unknown.ratio",
+            unknown as f64 / total as f64,
+        ));
+    }
+
+    /// Append birth-composition metrics for the ticks that recorded births (bd-mv2j).
+    ///
+    /// The hybrid ratio is guarded on a nonzero denominator rather than emitted as NaN.
+    fn project_birth_metrics(&self, lifecycle_enabled: bool, metrics: &mut Vec<MetricSample>) {
+        if !lifecycle_enabled || self.pending_lifecycle_birth_metrics.is_empty() {
+            return;
+        }
+        let total = self.pending_lifecycle_birth_metrics.len();
+        let hybrid = self
+            .pending_lifecycle_birth_metrics
+            .iter()
+            .filter(|record| record.is_hybrid)
+            .count();
+        metrics.push(MetricSample::new("births.total.count", total as f64));
+        metrics.push(MetricSample::new("births.hybrid.count", hybrid as f64));
+        if total > 0 {
+            metrics.push(MetricSample::new(
+                "births.hybrid.ratio",
+                hybrid as f64 / total as f64,
+            ));
+        }
+    }
+
     /// Project the tick's countable events into the batch's event rows (bd-mv2j).
     ///
     /// Read-only over `self`: an event row is emitted only for a nonzero count, so an
@@ -21383,77 +21470,8 @@ impl WorldState {
         let events = self.project_persistence_events(&summary);
         let agents = self.project_agent_states(&handles, force_partial_batch);
 
-        if lifecycle_enabled && !self.pending_lifecycle_death_metrics.is_empty() {
-            let mut combat_carnivore = 0usize;
-            let mut combat_herbivore = 0usize;
-            let mut starvation = 0usize;
-            let mut aging = 0usize;
-            let mut unknown = 0usize;
-            for record in &self.pending_lifecycle_death_metrics {
-                match record.cause {
-                    DeathCause::CombatCarnivore => combat_carnivore += 1,
-                    DeathCause::CombatHerbivore => combat_herbivore += 1,
-                    DeathCause::Starvation => starvation += 1,
-                    DeathCause::Aging => aging += 1,
-                    DeathCause::Unknown => unknown += 1,
-                }
-            }
-            let total = combat_carnivore + combat_herbivore + starvation + aging + unknown;
-            if total > 0 {
-                metrics.push(MetricSample::new(
-                    "mortality.combat_carnivore.count",
-                    combat_carnivore as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "mortality.combat_herbivore.count",
-                    combat_herbivore as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "mortality.starvation.count",
-                    starvation as f64,
-                ));
-                metrics.push(MetricSample::new("mortality.aging.count", aging as f64));
-                metrics.push(MetricSample::new("mortality.unknown.count", unknown as f64));
-                metrics.push(MetricSample::new("mortality.total.count", total as f64));
-                metrics.push(MetricSample::new(
-                    "mortality.combat_carnivore.ratio",
-                    combat_carnivore as f64 / total as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "mortality.combat_herbivore.ratio",
-                    combat_herbivore as f64 / total as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "mortality.starvation.ratio",
-                    starvation as f64 / total as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "mortality.aging.ratio",
-                    aging as f64 / total as f64,
-                ));
-                metrics.push(MetricSample::new(
-                    "mortality.unknown.ratio",
-                    unknown as f64 / total as f64,
-                ));
-            }
-        }
-
-        if lifecycle_enabled && !self.pending_lifecycle_birth_metrics.is_empty() {
-            let total = self.pending_lifecycle_birth_metrics.len();
-            let hybrid = self
-                .pending_lifecycle_birth_metrics
-                .iter()
-                .filter(|record| record.is_hybrid)
-                .count();
-            metrics.push(MetricSample::new("births.total.count", total as f64));
-            metrics.push(MetricSample::new("births.hybrid.count", hybrid as f64));
-            if total > 0 {
-                metrics.push(MetricSample::new(
-                    "births.hybrid.ratio",
-                    hybrid as f64 / total as f64,
-                ));
-            }
-        }
+        self.project_mortality_metrics(lifecycle_enabled, &mut metrics);
+        self.project_birth_metrics(lifecycle_enabled, &mut metrics);
 
         let births = std::mem::take(&mut self.pending_birth_records);
         let deaths = std::mem::take(&mut self.pending_death_records);
