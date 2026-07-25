@@ -563,9 +563,10 @@ impl CueScheduler {
             VisualCueKind::Sparkle | VisualCueKind::SparkCone | VisualCueKind::Shards => {
                 ParticlePriority::Critical
             }
-            VisualCueKind::Wilt | VisualCueKind::PulseRing | VisualCueKind::Flash => {
-                ParticlePriority::Standard
-            }
+            VisualCueKind::Wilt
+            | VisualCueKind::PulseRing
+            | VisualCueKind::Flash
+            | VisualCueKind::BoostTrail => ParticlePriority::Standard,
             VisualCueKind::Nibble => ParticlePriority::Ambient,
         }
     }
@@ -575,7 +576,7 @@ impl CueScheduler {
             VisualCueKind::Sparkle | VisualCueKind::Flash => SpriteKind::Spark,
             VisualCueKind::Wilt => SpriteKind::Mote,
             VisualCueKind::Shards | VisualCueKind::SparkCone => SpriteKind::Shard,
-            VisualCueKind::Nibble => SpriteKind::Puff,
+            VisualCueKind::Nibble | VisualCueKind::BoostTrail => SpriteKind::Puff,
             VisualCueKind::PulseRing => SpriteKind::Ring,
         }
     }
@@ -618,7 +619,7 @@ impl CueScheduler {
                 VisualCueKind::SparkCone | VisualCueKind::Shards => {
                     self.jitter(tick, ordinal, index, 3).mul_add(0.65, 0.35)
                 }
-                VisualCueKind::PulseRing | VisualCueKind::Flash => 0.05,
+                VisualCueKind::PulseRing | VisualCueKind::Flash | VisualCueKind::BoostTrail => 0.05,
             };
             let (gravity, drag) = match cue.kind {
                 VisualCueKind::Wilt => (-0.004, 0.02),
@@ -862,7 +863,7 @@ impl CueEmitter {
             trail.last_emit_tick = tick;
             // Deterministic per-trail jitter through the scheduler's hash.
             let cue = VisualCue {
-                kind: VisualCueKind::Nibble,
+                kind: VisualCueKind::BoostTrail,
                 color: trail.color,
                 accent_color: trail.accent,
                 intensity: 0.5,
@@ -1132,7 +1133,9 @@ fn fs_particle(in: VertexOutput) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::visual::{VisualCue, VisualCueKind};
+    use scriptbots_core::visual::{
+        VisualCue, VisualCueKind, WorldVisualEvent, visual_cue_for_event,
+    };
 
     fn cue(kind: VisualCueKind) -> VisualCue {
         VisualCue {
@@ -1325,16 +1328,17 @@ mod tests {
     #[test]
     fn scheduler_particles_are_sane() {
         let scheduler = CueScheduler::new(7);
-        for kind in [
-            VisualCueKind::Sparkle,
-            VisualCueKind::Shards,
-            VisualCueKind::Wilt,
-            VisualCueKind::Nibble,
-            VisualCueKind::SparkCone,
-            VisualCueKind::PulseRing,
-            VisualCueKind::Flash,
+        for recipe in [
+            cue(VisualCueKind::Sparkle),
+            cue(VisualCueKind::Shards),
+            cue(VisualCueKind::Wilt),
+            cue(VisualCueKind::Nibble),
+            cue(VisualCueKind::SparkCone),
+            cue(VisualCueKind::PulseRing),
+            cue(VisualCueKind::Flash),
+            visual_cue_for_event(&WorldVisualEvent::Boost { magnitude: 0.8 }),
         ] {
-            let batch = scheduler.schedule(50, 0, &cue(kind), [0.0; 3]);
+            let batch = scheduler.schedule(50, 0, &recipe, [0.0; 3]);
             assert!(!batch.particles.is_empty());
             for particle in &batch.particles {
                 for v in particle.velocity {
@@ -1343,6 +1347,28 @@ mod tests {
                 assert!(particle.duration_ticks >= 2);
                 assert!((0.0..=1.0).contains(&particle.intensity));
             }
+        }
+    }
+
+    #[test]
+    fn scheduler_preserves_the_canonical_boost_cue() {
+        let scheduler = CueScheduler::new(7);
+        let canonical = visual_cue_for_event(&WorldVisualEvent::Boost { magnitude: 0.73 });
+        let batch = scheduler.schedule(50, 0, &canonical, [0.0; 3]);
+
+        assert_eq!(canonical.kind, VisualCueKind::BoostTrail);
+        assert!(!batch.particles.is_empty());
+        for particle in batch.particles {
+            assert_eq!(particle.color, canonical.color);
+            assert_eq!(particle.accent, canonical.accent_color);
+            assert_eq!(particle.intensity, canonical.intensity);
+            assert_eq!(particle.priority, ParticlePriority::Standard);
+            assert_eq!(particle.sprite, SpriteKind::Puff);
+            let horizontal_speed = particle.velocity[0].hypot(particle.velocity[2]);
+            assert!(
+                (particle.velocity[1] / horizontal_speed - 0.05).abs() < 1.0e-6,
+                "boost exhaust stays near-planar rather than becoming an eat/birth arc"
+            );
         }
     }
 
@@ -1378,22 +1404,24 @@ mod tests {
         // The recipe contract: 4 + intensity * 20, clamped to [1, max_per_cue].
         let scheduler = CueScheduler::new(7);
         let golden: [(f32, u32); 5] = [(0.0, 4), (0.25, 9), (0.5, 14), (0.75, 19), (1.0, 24)];
-        for kind in [
-            VisualCueKind::Sparkle,
-            VisualCueKind::Shards,
-            VisualCueKind::Wilt,
-            VisualCueKind::Nibble,
-            VisualCueKind::SparkCone,
-            VisualCueKind::PulseRing,
-            VisualCueKind::Flash,
+        for recipe in [
+            cue(VisualCueKind::Sparkle),
+            cue(VisualCueKind::Shards),
+            cue(VisualCueKind::Wilt),
+            cue(VisualCueKind::Nibble),
+            cue(VisualCueKind::SparkCone),
+            cue(VisualCueKind::PulseRing),
+            cue(VisualCueKind::Flash),
+            visual_cue_for_event(&WorldVisualEvent::Boost { magnitude: 0.8 }),
         ] {
             for (intensity, expected) in golden {
-                let mut c = cue(kind);
+                let mut c = recipe;
                 c.intensity = intensity;
                 assert_eq!(
                     scheduler.count_for_cue(&c),
                     expected,
-                    "{kind:?} at intensity {intensity}"
+                    "{:?} at intensity {intensity}",
+                    c.kind
                 );
             }
         }
@@ -1512,13 +1540,14 @@ mod tests {
     fn boost_trail_follows_a_moving_agent_and_stays_bounded() {
         let mut emitter = CueEmitter::new(17);
         let mut pool = ParticlePool::with_capacity(256);
+        let canonical = visual_cue_for_event(&WorldVisualEvent::Boost { magnitude: 0.8 });
         emitter.bind_boost_trail(
             AgentAnchor {
                 uid: 99,
                 offset: [0.0, 0.5, 0.0],
             },
-            [0.2, 0.6, 1.0],
-            [0.8, 0.9, 1.0],
+            canonical.color,
+            canonical.accent_color,
         );
         assert_eq!(emitter.trail_count(), 1);
         // Agent moves +1 x per tick; trail puffs appear at successive spots.
@@ -1530,6 +1559,12 @@ mod tests {
         }
         let expected = CueEmitter::TRAIL_DURATION_TICKS / CueEmitter::TRAIL_INTERVAL_TICKS;
         assert_eq!(emitted_total, expected, "one puff per interval");
+        pool.for_each_live(|particle| {
+            assert_eq!(particle.color, canonical.color);
+            assert_eq!(particle.accent, canonical.accent_color);
+            assert_eq!(particle.priority, ParticlePriority::Standard);
+            assert_eq!(particle.sprite, SpriteKind::Puff);
+        });
         // Agent dies: lookup yields None -> trail detaches and stops.
         let emitted_after_death = emitter.emit_trails(999, &mut pool, |_| None);
         assert_eq!(emitted_after_death, 0);
@@ -1539,8 +1574,8 @@ mod tests {
             uid: 7,
             offset: [0.0; 3],
         };
-        emitter.bind_boost_trail(anchor, [1.0; 3], [1.0; 3]);
-        emitter.bind_boost_trail(anchor, [0.5; 3], [0.5; 3]);
+        emitter.bind_boost_trail(anchor, canonical.color, canonical.accent_color);
+        emitter.bind_boost_trail(anchor, canonical.color, canonical.accent_color);
         assert_eq!(emitter.trail_count(), 1, "rebind refreshes");
         emitter.detach_trails_for(7);
         assert_eq!(emitter.trail_count(), 0);
