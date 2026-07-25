@@ -7307,11 +7307,35 @@ pub enum ReplayEventKind {
     },
 }
 
+/// Default per-tick replay-event budget.
+///
+/// Chosen to exceed typical live populations so the common case records every agent every
+/// tick, while remaining a hard bound: a runaway world drops the excess and reports it rather
+/// than growing without limit. Runs with larger populations should raise it to at or above
+/// their peak agent count; the dropped count is how they find out they need to.
+pub const DEFAULT_REPLAY_EVENT_TICK_CAP: usize = 512;
+
 /// Lightweight wrapper pairing an agent context with a replay event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayEvent {
     /// Originating agent, if any.
     pub agent_uid: Option<AgentUid>,
+    /// World position of the originating agent at emission.
+    ///
+    /// Carried on the EVENT rather than looked up later by each consumer. A renderer
+    /// resolving position from live agent state would draw the cue where the agent is NOW,
+    /// not where the event happened, and a persister doing its own lookup would record a
+    /// third answer. One position, recorded once, at the moment of the fact.
+    pub position: Option<Position>,
+    /// The other participant, for inherently pairwise events: combat attacker -> victim,
+    /// food-share giver -> receiver. `None` for single-agent events.
+    ///
+    /// This is what makes one stream serve both consumers -- it is simultaneously the
+    /// persistence edge record (bd-2z0.5.9) and what lets a renderer draw a hit as a segment
+    /// between two bodies instead of a flash on one.
+    pub counterpart: Option<AgentUid>,
+    /// World position of [`Self::counterpart`] at emission.
+    pub counterpart_position: Option<Position>,
     /// Event payload.
     pub kind: ReplayEventKind,
 }
@@ -11210,8 +11234,15 @@ pub struct ScriptBotsConfig {
     pub persistence_interval: u32,
     /// Maximum replay events recorded per tick; `0` disables production replay emission.
     /// Runs opting into replay verification should set this at or above their peak agent
-    /// count so every live agent is recorded every tick. The zero default keeps
-    /// production runs byte-identical to their pre-instrumentation baselines.
+    /// count so every live agent is recorded every tick.
+    ///
+    /// DEFAULTS TO [`DEFAULT_REPLAY_EVENT_TICK_CAP`], NOT ZERO (bd-lhml lesson). The former
+    /// zero default was justified as keeping production runs "byte-identical to their
+    /// pre-instrumentation baselines", which is true and is not a reason to ship the feature
+    /// inert: a stream that exists, compiles, has tests, and records nothing is
+    /// indistinguishable from one that is broken, and every consumer wires against it
+    /// successfully while receiving nothing. The bound plus the dropped count IS the safety
+    /// mechanism; zero protects nothing a bounded default does not.
     ///
     /// The bound applies to each tick independently, so a window of `persistence_interval`
     /// ticks retains up to `replay_event_tick_cap * persistence_interval` events before the
@@ -11327,7 +11358,7 @@ impl Default for ScriptBotsConfig {
             narrative_capacity: default_narrative_capacity(),
             economy_debug_per_tick: false,
             persistence_interval: 0,
-            replay_event_tick_cap: 0,
+            replay_event_tick_cap: DEFAULT_REPLAY_EVENT_TICK_CAP,
             analytics_stride: AnalyticsStride::default(),
             neuroflow: NeuroflowSettings {
                 enabled: true,
@@ -36161,6 +36192,9 @@ mod tests {
         let mut replay_world = make_world();
         replay_world.replay_events.push(ReplayEvent {
             agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::BrainOutputs {
                 outputs: Vec::new(),
             },
@@ -36756,6 +36790,9 @@ mod tests {
     fn replay_marker(value: f32) -> ReplayEvent {
         ReplayEvent {
             agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
             kind: ReplayEventKind::RngSample {
                 scope: ReplayRngScope::World,
                 range_min: 0.0,

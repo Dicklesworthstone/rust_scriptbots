@@ -49,8 +49,17 @@ impl WorldState {
                 continue;
             };
             let outputs = &runtime.outputs;
+            // Position is read HERE, at emission, from the same agent whose outputs we are
+            // recording -- not resolved later by a consumer against live state.
+            let position = self
+                .agents
+                .index_of(id)
+                .and_then(|index| self.agents.columns().positions().get(index).copied());
             self.replay_events.push(ReplayEvent {
                 agent_uid: Some(uid),
+                position,
+                counterpart: None,
+                counterpart_position: None,
                 kind: ReplayEventKind::Action {
                     left_wheel: outputs.channel_clamped(OutputChannel::WheelLeft),
                     right_wheel: outputs.channel_clamped(OutputChannel::WheelRight),
@@ -90,8 +99,14 @@ impl WorldState {
             return;
         }
         match self.world_digest_v1() {
+            // The digest anchor is a world-level fact, not an agent's: no participants and
+            // no position. Deliberately not given the boundary's centroid or similar --
+            // an invented position would be a field a consumer could mistake for real.
             Ok(digest) => self.replay_events.push(ReplayEvent {
                 agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
                 kind: ReplayEventKind::WorldDigest {
                     overall: digest.overall,
                 },
