@@ -1,14 +1,39 @@
-//! Deadline-carrying, cancellation-safe read lane for control-plane queries (bd-2z0.8.9.12).
+//! Query-only read lane for control-plane queries (bd-2z0.8.9.12).
 //!
 //! The lane owns an `fsqlite::AsyncConnection` — its dedicated worker task owns the
 //! underlying `!Send` engine connection — and drives every query on a caller-scoped
-//! current-thread asupersync runtime with the caller's `fsqlite_types::cx::Cx`. Cancelling
-//! that context surfaces `FrankenError::Interrupt` at VDBE opcode boundaries instead of an
-//! unbounded wait, and an expired budget surfaces through the same typed interrupt family
-//! instead of a hang. The lane is query-only by construction: it exposes no mutating
-//! statement path, while `StoragePipeline` remains the sole writer on its own thread.
-//! MVCC snapshot semantics mean lane readers observe only commit boundaries, as proven by
+//! current-thread asupersync runtime with the caller's `fsqlite_types::cx::Cx`. It is
+//! query-only by construction: it exposes no mutating statement path, while
+//! `StoragePipeline` remains the sole writer on its own thread. MVCC snapshot semantics
+//! mean lane readers observe only commit boundaries, as proven by
 //! `tests/durability_proofs.rs`.
+//!
+//! # The budget on a `Cx` is NOT enforced while a statement runs (`bd-aj12`)
+//!
+//! This module previously documented the opposite — that cancelling the context surfaces
+//! `FrankenError::Interrupt` at VDBE opcode boundaries, and that an expired budget surfaces
+//! instead of a hang. Measured against the pinned engine, neither holds. A ~6.3 s self-join
+//! runs to completion and returns its full result under every budget dimension:
+//!
+//! | budget            | elapsed | outcome              |
+//! |-------------------|---------|----------------------|
+//! | deadline 1 ms     | 6.33 s  | `Ok`, complete result |
+//! | `poll_quota` 100  | 6.19 s  | `Ok`, complete result |
+//! | `poll_quota` 1    | 6.16 s  | `Ok`, complete result |
+//! | `cost_quota` 1    | 6.21 s  | `Ok`, complete result |
+//!
+//! `fsqlite::async_api::query_with_params` checks the context once before dispatch, then
+//! hands the statement to a worker thread that holds no reference to it. Nothing can stop
+//! the statement once it starts, and the pinned engine exposes no interrupt handle or
+//! progress callback to build one from — so this cannot be corrected here, only upstream.
+//!
+//! A caller-side timeout is deliberately NOT offered as a substitute. Returning early while
+//! the worker keeps scanning would leak the work rather than bound it, and would report a
+//! bound this lane does not have. Until the engine can interrupt a running statement, treat
+//! every lane query as unbounded and size the query accordingly: `recent_metrics`,
+//! `top_predators`, and `run_ledger_summary` bound their own inputs, while `query_rows`
+//! takes arbitrary SQL and is therefore the surface where an expensive query can block for
+//! as long as it takes.
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fsqlite::{AsyncConnection, FrankenError, compat::RowExt};
@@ -17,8 +42,19 @@ use std::time::Duration;
 
 use crate::{PersistedMetric, PersistedTick, PredatorStats, RunLedgerSummary, StorageError};
 
-/// Build a full-capability context carrying a deadline measured from when the query starts
-/// executing. `Cx::new()` remains the no-deadline convenience constructor.
+/// Build a full-capability context carrying a deadline.
+///
+/// # This deadline is not currently enforced (`bd-aj12`)
+///
+/// The budget reaches the engine intact, but nothing checks it while a statement executes:
+/// a 1 ms deadline against a measured ~6.3 s query returns the complete result after the
+/// full 6.3 s. See the module documentation for the measurements and why a caller-side
+/// timeout is not offered in its place.
+///
+/// The constructor is kept rather than removed because it is the right primitive the moment
+/// the engine can interrupt a running statement, and `tests/async_lane.rs` already contains
+/// the test that will pass unchanged when it can. Do not treat a context built here as a
+/// bound on anything today.
 #[must_use]
 pub fn cx_with_deadline(deadline: Duration) -> Cx {
     Cx::with_budget(Budget::INFINITE.with_deadline(deadline))

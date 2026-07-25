@@ -108,6 +108,82 @@ const SLOW_SQL: &str = "SELECT COUNT(*) FROM metrics a, metrics b, metrics c";
 /// without being tight enough to flake on a loaded worker.
 const INTERRUPT_BOUND: Duration = Duration::from_secs(3);
 
+/// Standing evidence for `bd-aj12`: which `Budget` dimensions bound a running statement.
+///
+/// Kept rather than deleted because it is the cheapest way to detect an upstream fix. Run it
+/// after any `fsqlite` bump — if any row stops returning a complete result, the engine has
+/// gained the ability to interrupt a statement and the two ignored interrupt tests above can
+/// be un-ignored.
+///
+/// Measured against the pinned engine (`e536d7f`), a ~6.3 s self-join runs to completion
+/// under every dimension:
+///
+/// | budget            | elapsed | outcome               |
+/// |-------------------|---------|-----------------------|
+/// | deadline 1 ms     | 6.33 s  | `Ok`, complete result |
+/// | `poll_quota` 100  | 6.19 s  | `Ok`, complete result |
+/// | `poll_quota` 1    | 6.16 s  | `Ok`, complete result |
+/// | `cost_quota` 1    | 6.21 s  | `Ok`, complete result |
+///
+/// `poll_quota` was worth testing separately: `Budget::MINIMAL` differs from `INFINITE` only
+/// in that field, and a MINIMAL close is what produces the `Database(Busy)` of `bd-qan3`. So
+/// quota enforcement does exist — but only around the close handshake, never inside a
+/// running statement.
+///
+/// Ignored because it takes ~25 s and asserts nothing; it reports.
+#[test]
+#[ignore = "bd-aj12 evidence: run explicitly with --ignored --nocapture after any fsqlite bump"]
+fn probe_which_budget_fields_bound_a_running_query() {
+    use fsqlite_types::cx::Budget;
+
+    let path = test_path("probe-budget");
+    let path_string = path.to_string_lossy().to_string();
+    write_fixture(&path_string, SLOW_FIXTURE_TICKS);
+    let lane = AsyncReadLane::open(&path_string).expect("lane opens");
+
+    let cases: [(&str, Budget); 4] = [
+        (
+            "deadline_1ms",
+            Budget::INFINITE.with_deadline(Duration::from_millis(1)),
+        ),
+        (
+            "poll_quota_100",
+            Budget {
+                poll_quota: 100,
+                ..Budget::INFINITE
+            },
+        ),
+        (
+            "poll_quota_1",
+            Budget {
+                poll_quota: 1,
+                ..Budget::INFINITE
+            },
+        ),
+        (
+            "cost_quota_1",
+            Budget {
+                cost_quota: Some(1),
+                ..Budget::INFINITE
+            },
+        ),
+    ];
+    for (label, budget) in cases {
+        let started = Instant::now();
+        let outcome = lane.query_rows(SLOW_SQL, &[], &Cx::with_budget(budget));
+        println!(
+            "PROBE {label}: elapsed={:?} outcome={}",
+            started.elapsed(),
+            match &outcome {
+                Ok(rows) => format!("Ok({rows:?})"),
+                Err(error) => format!("Err({error})"),
+            }
+        );
+    }
+    lane.close().expect("probe lane closes");
+    cleanup(&path);
+}
+
 #[test]
 fn lane_reads_match_the_sync_reader() {
     let path = test_path("parity");
