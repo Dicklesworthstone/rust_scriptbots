@@ -99,7 +99,7 @@ impl AssemblyBrain {
 
     fn tick_with_budget(&mut self, inputs: &[f32; INPUT_SIZE]) -> ([f32; OUTPUT_SIZE], usize) {
         for (idx, input) in inputs.iter().enumerate() {
-            self.cells[idx] = if input.is_nan() { 0.0 } else { *input };
+            self.cells[idx] = *input;
         }
 
         let mut scanned = 0;
@@ -159,12 +159,7 @@ impl AssemblyBrain {
         let mut outputs = [0.0; OUTPUT_SIZE];
         for (offset, output) in outputs.iter_mut().enumerate() {
             let idx = BRAIN_SIZE - 1 - offset;
-            let val = self.cells[idx];
-            *output = if val.is_nan() {
-                0.0
-            } else {
-                val.clamp(0.0, 1.0)
-            };
+            *output = self.cells[idx].clamp(0.0, 1.0);
         }
 
         (outputs, scanned)
@@ -1288,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_rejects_interpreter_nan_without_committing_working_state() {
+    fn legacy_exposes_and_protocol_rejects_interpreter_nan_transactionally() {
         let family = AssemblyFamilyAdapter::new().expect("canonical Assembly family");
         let mut cells = [0.0; BRAIN_SIZE];
 
@@ -1299,17 +1294,21 @@ mod tests {
         cells[50] = f32::MAX;
         cells[100] = f32::MAX;
 
-        cells[INPUT_SIZE + 4] = 2.25; // multiply the resulting infinity by zero
+        cells[INPUT_SIZE + 4] = 2.25; // multiply the resulting infinity by zero into output 0
         cells[INPUT_SIZE + 5] = 0.75; // cell 150
         cells[INPUT_SIZE + 6] = 0.60; // cell 120
-        cells[INPUT_SIZE + 7] = 0.80; // cell 160
+        cells[INPUT_SIZE + 7] = 0.995; // output cell 199
 
         let mut arithmetic_probe =
             AssemblyBrain::from_cells(cells).expect("finite arithmetic-overflow program");
-        arithmetic_probe.tick_with_budget(&[0.0; INPUT_SIZE]);
+        let raw_outputs = arithmetic_probe.tick(&[0.0; INPUT_SIZE]);
         assert!(
-            arithmetic_probe.cells[160].is_nan(),
+            arithmetic_probe.cells[BRAIN_SIZE - 1].is_nan(),
             "the second multiply must produce Inf * 0 -> NaN before protocol validation"
+        );
+        assert!(
+            raw_outputs[0].is_nan(),
+            "the infallible legacy API must expose an invalid output instead of laundering it to zero"
         );
 
         let genome = family
@@ -1337,7 +1336,7 @@ mod tests {
             } => {
                 assert_eq!(kind, BrainEnvelopeKind::EvaluatorState);
                 assert_eq!(&family_id, family.family_id());
-                assert_eq!(detail, "Assembly cell 160 is non-finite (NaN)");
+                assert_eq!(detail, "Assembly cell 199 is non-finite (NaN)");
             }
             other => panic!("unexpected Assembly evaluation error: {other}"),
         }
@@ -1347,6 +1346,20 @@ mod tests {
                 .expect("checkpoint after rejected tick"),
             checkpoint_before,
             "Inf * 0 must reject without committing any working-state byte"
+        );
+    }
+
+    #[test]
+    fn legacy_runner_preserves_nonfinite_sensors_like_the_cpp_oracle() {
+        let mut brain = AssemblyBrain::from_cells([0.0; BRAIN_SIZE]).expect("finite empty program");
+        let mut inputs = [0.0; INPUT_SIZE];
+        inputs[0] = f32::NAN;
+
+        let _ = brain.tick(&inputs);
+
+        assert!(
+            brain.cells[0].is_nan(),
+            "the infallible legacy API must not silently rewrite a NaN sensor to zero"
         );
     }
 

@@ -22,8 +22,8 @@ use crate::{Brain, BrainKind, into_runner};
 const BRAIN_SIZE: usize = 200;
 const CONNECTIONS: usize = 4;
 const DWRAON_FAMILY_NAME: &str = "dwraon-baseline";
-const ADAPTER_SEMANTIC_VERSION: u32 = 1;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.dwraon-baseline.adapter-semantics.v1";
+const ADAPTER_SEMANTIC_VERSION: u32 = 2;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.dwraon-baseline.adapter-semantics.v2";
 const GENOME_SCHEMA_VERSION: u32 = 1;
 const GENOME_CODEC_VERSION: u16 = 1;
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -594,16 +594,26 @@ fn validate_mutation_rates(rates: MutationRates) -> Result<(), BrainProtocolErro
 }
 
 fn mutate_nodes(nodes: &mut [NodeParams], rng: &mut dyn RandomStream, rate: f32, scale: f32) {
+    // A zero scale is the exact identity for continuous loci, including signed zero. Keep
+    // consuming the Gaussian and gate/index draws so changing only the scale cannot perturb any
+    // later structural-mutation decision.
+    let apply_continuous_step = scale != 0.0;
     for params in nodes {
         if rng.random::<f32>() < rate * 3.0 {
-            params.bias += DwraonBrain::gaussian(rng) * scale;
+            let gaussian = DwraonBrain::gaussian(rng);
+            if apply_continuous_step {
+                params.bias += gaussian * scale;
+            }
         }
         // Legacy contains a permanently disabled damping mutation branch; do
         // not consume a random draw or silently activate it here.
         if rng.random::<f32>() < rate * 3.0 {
             let index = rng.random_range(0..CONNECTIONS);
-            let weight = params.weights[index] + DwraonBrain::gaussian(rng) * scale;
-            params.weights[index] = weight.max(0.01);
+            let gaussian = DwraonBrain::gaussian(rng);
+            if apply_continuous_step {
+                let weight = params.weights[index] + gaussian * scale;
+                params.weights[index] = weight.max(0.01);
+            }
         }
         if rng.random::<f32>() < rate {
             let index = rng.random_range(0..CONNECTIONS);
@@ -1011,22 +1021,65 @@ impl Brain for DwraonBrain {
             BrainInspection::Activations(limits) => self.inspect_activations(limits).map(Some),
         }
     }
+
+    fn state_digest(&self) -> Option<u64> {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("rust-scriptbots.dwraon-legacy-state-digest.v1");
+        hasher.update(
+            &u64::try_from(self.nodes.len())
+                .expect("DWRAON node count fits u64")
+                .to_le_bytes(),
+        );
+        for node in &self.nodes {
+            hasher.update(&[match node.kind {
+                NodeKind::And => 0,
+                NodeKind::Or => 1,
+            }]);
+            hasher.update(&node.damping.to_bits().to_le_bytes());
+            hasher.update(&node.bias.to_bits().to_le_bytes());
+            for connection in 0..CONNECTIONS {
+                hasher.update(&node.weights[connection].to_bits().to_le_bytes());
+                hasher.update(
+                    &u64::try_from(node.sources[connection])
+                        .expect("DWRAON source index fits u64")
+                        .to_le_bytes(),
+                );
+                hasher.update(&[u8::from(node.inverted[connection])]);
+            }
+        }
+        hasher.update(
+            &u64::try_from(self.state.len())
+                .expect("DWRAON state count fits u64")
+                .to_le_bytes(),
+        );
+        for node in &self.state {
+            hasher.update(&node.output.to_bits().to_le_bytes());
+            hasher.update(&node.target.to_bits().to_le_bytes());
+        }
+        Some(u64::from_le_bytes(
+            hasher.finalize().as_bytes()[..8]
+                .try_into()
+                .expect("BLAKE3 output always has eight prefix bytes"),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
     use scriptbots_core::{
-        AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, SmallRngStream, Tick,
+        AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, RandomStreamState, SmallRngStream,
+        Tick,
     };
 
     #[test]
-    fn adapter_semantic_identity_v1_is_pinned() {
+    fn adapter_semantic_identity_v2_is_pinned() {
         let identity = DwraonFamilyAdapter::default().adapter_identity();
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "ef624108890dc72279e271f38bb7b068b2e2e8735b7bb88a09c93066bc4c7e55",
+            "728eb71692caeabfc7837d950d2342601dde7ffa1352208ce20872669e6e12d0",
             "update only after reviewing an intentional DWRAON executable-semantics change"
         );
     }
@@ -1053,6 +1106,55 @@ mod tests {
             inverted: [true; CONNECTIONS],
         };
         (vec![left; BRAIN_SIZE], vec![right; BRAIN_SIZE])
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct BiasOnlyMutationStream {
+        sample_index: usize,
+    }
+
+    impl BiasOnlyMutationStream {
+        fn next_scripted_u32(&mut self) -> u32 {
+            let sample = if self.sample_index < 3 { 0 } else { u32::MAX };
+            self.sample_index += 1;
+            sample
+        }
+    }
+
+    impl RngCore for BiasOnlyMutationStream {
+        fn next_u32(&mut self) -> u32 {
+            self.next_scripted_u32()
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            u64::from(self.next_u32()) << 32 | u64::from(self.next_u32())
+        }
+
+        fn fill_bytes(&mut self, destination: &mut [u8]) {
+            let (chunks, remainder) = destination.as_chunks_mut::<4>();
+            for chunk in chunks {
+                *chunk = self.next_u32().to_le_bytes();
+            }
+            if !remainder.is_empty() {
+                let sample = self.next_u32().to_le_bytes();
+                remainder.copy_from_slice(&sample[..remainder.len()]);
+            }
+        }
+    }
+
+    impl RandomStream for BiasOnlyMutationStream {
+        fn algorithm_id(&self) -> &'static str {
+            "test.dwraon-bias-only"
+        }
+
+        fn checkpoint(&self) -> RandomStreamState {
+            RandomStreamState {
+                version: 1,
+                algorithm: self.algorithm_id().to_owned(),
+                codec_version: 1,
+                state: self.sample_index.to_le_bytes().to_vec(),
+            }
+        }
     }
 
     fn codec_fixture_nodes() -> Vec<NodeParams> {
@@ -1407,6 +1509,52 @@ mod tests {
     }
 
     #[test]
+    fn zero_scale_bias_mutation_preserves_signed_zero_and_rng_schedule() {
+        let family = DwraonFamilyAdapter::default();
+        let mut nodes = codec_fixture_nodes();
+        nodes[0].bias = -0.0;
+        let parent = protocol_genome(&nodes, BrainProvenance::default());
+        let child_provenance = BrainProvenance {
+            parents: [Some(AgentUid(501)), None],
+            parent_genome_hashes: [Some(parent.material_hash()), None],
+            created_at: Tick(73),
+            derivation: BrainGenomeDerivation::Clone,
+        };
+        let mut rng = BiasOnlyMutationStream::default();
+
+        let child = family
+            .mutate_genome(
+                &parent,
+                MutationRates {
+                    primary: 0.1,
+                    secondary: 0.0,
+                },
+                child_provenance.clone(),
+                &mut rng,
+            )
+            .expect("zero-scale mutation");
+
+        assert_eq!(
+            child.payload(),
+            parent.payload(),
+            "zero continuous-mutation scale must preserve every DWRAON genome bit"
+        );
+        assert_eq!(child.material_hash(), parent.material_hash());
+        assert_eq!(child.provenance(), &child_provenance);
+        assert_eq!(
+            decode_genome(&child).expect("decode zero-scale child")[0]
+                .bias
+                .to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        assert_eq!(
+            rng.sample_index,
+            7 + (BRAIN_SIZE - 1) * 5,
+            "zero scale must retain the bias Gaussian and every later mutation-gate draw"
+        );
+    }
+
+    #[test]
     fn protocol_crossover_matches_legacy_field_order_not_whole_nodes() {
         let family = DwraonFamilyAdapter::default();
         let (left_nodes, right_nodes) = contrasting_parents();
@@ -1651,17 +1799,50 @@ mod tests {
         let mut brain = DwraonBrain::random(&mut rng);
         brain.tick(&[0.125; INPUT_SIZE]);
         let mut control = brain.clone();
-        let digest_before = brain.state_digest();
+        let digest_before = brain
+            .state_digest()
+            .expect("legacy DWRAON must expose complete digest coverage");
 
         let inspection = brain
             .inspect(BrainInspection::Activations(BrainInspectionLimits::hard()))
             .expect("legacy bounded inspection")
             .expect("DWRAON exposes activations");
         assert_eq!(inspection.build.retained_values, BRAIN_SIZE);
-        assert_eq!(brain.state_digest(), digest_before);
+        assert_eq!(brain.state_digest(), Some(digest_before));
         assert_eq!(
             brain.tick(&[0.625; INPUT_SIZE]).map(f32::to_bits),
             control.tick(&[0.625; INPUT_SIZE]).map(f32::to_bits)
+        );
+    }
+
+    #[test]
+    fn legacy_state_digest_covers_genome_and_recurrent_state_bit_exactly() {
+        let mut nodes = codec_fixture_nodes();
+        nodes[0].bias = 0.0;
+        let brain = DwraonBrain {
+            nodes,
+            state: vec![NodeState::default(); BRAIN_SIZE],
+        };
+        let baseline = brain
+            .state_digest()
+            .expect("legacy DWRAON must expose complete digest coverage");
+        assert_eq!(brain.clone().state_digest(), Some(baseline));
+        assert_eq!(into_runner(brain.clone()).state_digest(), Some(baseline));
+
+        let mut changed_genome = brain.clone();
+        changed_genome.nodes[0].bias = -0.0;
+        assert_ne!(
+            changed_genome.state_digest(),
+            Some(baseline),
+            "signed-zero genome bits must affect identity"
+        );
+
+        let mut changed_recurrent_state = brain.clone();
+        changed_recurrent_state.state[INPUT_SIZE].output = 0.25;
+        assert_ne!(
+            changed_recurrent_state.state_digest(),
+            Some(baseline),
+            "future-affecting recurrent outputs must affect identity"
         );
     }
 
