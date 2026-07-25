@@ -410,7 +410,7 @@ impl EpochAggregator {
             .filter(|flow| flow.delta.scale() != 0.0)
             .map(|flow| format!("{:?}={:.6}", flow.kind, flow.delta.scale()))
             .collect();
-        tracing::info!(
+        diag_info!(
             target: "scriptbots::economy",
             epoch = flows.epoch,
             first_tick = flows.first_tick,

@@ -97,7 +97,7 @@ impl WorldState {
                 },
             }),
             Err(error) => {
-                tracing::warn!(
+                diag_warn!(
                     %error,
                     "replay world digest request could not be satisfied at this boundary"
                 );
