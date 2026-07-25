@@ -898,14 +898,19 @@ mod tests {
             forced_perf: Some(pinned_perf()),
             ..CaptureOverrides::default()
         };
-        let base = capture_view_with_overrides(capture_world(), GuiViewRole::Hud, w, h, stable())
-            .expect("baseline");
+        // ONE world cloned into every capture (bd-c7pg isolation). Building a fresh
+        // world per capture left world construction as an uncontrolled variable, so a
+        // residual could not be attributed to the render path.
+        let world = capture_world();
+        let base =
+            capture_view_with_overrides(Arc::clone(&world), GuiViewRole::Hud, w, h, stable())
+                .expect("baseline");
 
         let mut inert = Vec::new();
         for (stroke, label) in SHORTCUTS {
             let leaked: &'static [&'static str] = Box::leak(vec![stroke].into_boxed_slice());
             let after = capture_view_with_overrides(
-                capture_world(),
+                Arc::clone(&world),
                 GuiViewRole::Hud,
                 w,
                 h,
