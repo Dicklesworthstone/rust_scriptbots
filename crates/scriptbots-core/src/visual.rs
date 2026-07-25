@@ -164,6 +164,12 @@ pub struct AgentVisualInput {
     /// Requested right wheel effort; same sign/magnitude convention as
     /// `wheel_left`.
     pub wheel_right: f32,
+    /// Facing angle in radians (bd-grbc, PROVISIONAL -- see `AgentVisualParams::facing`).
+    ///
+    /// Zero points along +X and the angle increases toward +Y, matching the convention the
+    /// locomotion model pinned under bd-2i1. Core states it here so GPUI, Bevy, the TUI and
+    /// WASM cannot each pick their own zero-angle and winding.
+    pub heading: f32,
     /// Whether the spike is currently extended.
     pub spike_extended: bool,
     /// Current spike length (world units, may be fractional).
@@ -209,6 +215,24 @@ pub struct AgentVisualParams {
     pub nose_color: [f32; 3],
     /// Spike readiness in `[0, 1]`: 1.0 when extended, else fractional growth.
     pub spike_readiness: f32,
+    /// Unit vector the agent faces (bd-grbc, PROVISIONAL).
+    ///
+    /// PROVISIONAL SHAPE -- a proposal, not a settled contract. bd-grbc exists because nothing
+    /// could orient an agent from these params, so a renderer could not draw a directional
+    /// body, place the spike, or put the wheels on the correct sides. If the draw path would
+    /// rather have a 2x2 rotation matrix, precomputed corner offsets, or a different spike
+    /// composition, say so on bd-grbc and this changes -- do NOT recompute orientation in the
+    /// renderer, because one authority for appearance is the point of bd-ikts.
+    pub facing: [f32; 2],
+    /// Unit vector 90 degrees clockwise from `facing`, i.e. the agent's right-hand side
+    /// (bd-grbc, PROVISIONAL). Supplied so wheel placement does not depend on each renderer
+    /// getting the perpendicular's sign right.
+    pub right: [f32; 2],
+    /// Offset from body centre to spike tip in world units (bd-grbc, PROVISIONAL).
+    ///
+    /// `facing` scaled by the spike length, composed here so the length/direction pairing has
+    /// a single definition.
+    pub spike_tip_offset: [f32; 2],
 }
 
 const fn mix_vec3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
@@ -356,6 +380,16 @@ pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
         clamp01(input.spike_length)
     };
 
+    // bd-grbc: one definition of facing, so no renderer has to guess a zero-angle or winding
+    // direction. `right` is `facing` rotated -90 degrees (clockwise in a +Y-up frame).
+    let (sin_heading, cos_heading) = input.heading.sin_cos();
+    let facing = [cos_heading, sin_heading];
+    let right = [sin_heading, -cos_heading];
+    let spike_tip_offset = [
+        facing[0] * input.spike_length,
+        facing[1] * input.spike_length,
+    ];
+
     AgentVisualParams {
         body_color,
         body_emissive,
@@ -367,6 +401,9 @@ pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
         mouth_color,
         nose_color,
         spike_readiness,
+        facing,
+        right,
+        spike_tip_offset,
     }
 }
 
@@ -758,6 +795,186 @@ pub struct SplatInput {
     pub slope: f32,
     /// Hydrology water depth above the tile (world units, >= 0).
     pub water_depth: f32,
+}
+
+// ---------------------------------------------------------------------------
+// Per-pixel terrain sampling (bd-grbc, PROVISIONAL)
+// ---------------------------------------------------------------------------
+
+/// Borrowed view of the terrain fields a shading pass needs (bd-grbc, PROVISIONAL).
+///
+/// `TerrainShadeInput` and `SplatInput` describe ONE cell, so a fragment path had no way to ask
+/// "what are the fields at world (x, y)?" and would have had to invent its own interpolation
+/// between cell centres. Two renderers would invent two, and neither would match the CPU
+/// semantic raster the goldens compare against.
+///
+/// This is a borrowed view rather than a `WorldState` method on purpose: it keeps appearance
+/// logic in `visual.rs`, it is testable headlessly without building a world, and it does not
+/// require touching `lib.rs`.
+#[derive(Debug, Clone, Copy)]
+pub struct TerrainFieldView<'a> {
+    /// Grid width in cells.
+    pub width: u32,
+    /// Grid height in cells.
+    pub height: u32,
+    /// World units per cell.
+    pub cell_size: f32,
+    /// Per-cell terrain kind, row-major, `width * height` entries.
+    pub kinds: &'a [TerrainKind],
+    /// Per-cell moisture/fertility in `[0, 1]`.
+    pub moisture: &'a [f32],
+    /// Per-cell normalized elevation in `[0, 1]`.
+    pub elevation: &'a [f32],
+    /// Per-cell slope magnitude in `[0, 1]`.
+    pub slope: &'a [f32],
+    /// Per-cell hydrology water depth in world units, `>= 0`.
+    pub water_depth: &'a [f32],
+}
+
+/// The four cells surrounding a sample point, with their bilinear weights (bd-grbc, PROVISIONAL).
+///
+/// OPTION B of bd-grbc. Returned when the caller wants to interpolate on the GPU: sample this
+/// once per cell on the CPU, upload the corners, and let the fragment shader blend. Prefer this
+/// over [`terrain_fields_at`] if the draw path is per-pixel, since it avoids a CPU call per
+/// pixel while keeping the CORNER SELECTION and SEAM WRAP in core.
+#[derive(Debug, Clone, Copy)]
+pub struct TerrainSampleCorners {
+    /// Flat indices of the four surrounding cells: `[x0y0, x1y0, x0y1, x1y1]`.
+    pub indices: [usize; 4],
+    /// Bilinear weights matching `indices`, summing to 1.
+    pub weights: [f32; 4],
+}
+
+impl TerrainFieldView<'_> {
+    fn cell_count(&self) -> usize {
+        (self.width as usize).saturating_mul(self.height as usize)
+    }
+
+    /// Wrap a cell coordinate onto the torus.
+    ///
+    /// Uses `rem_euclid` rather than a single add/subtract correction. bd-b09u and bd-p095 both
+    /// proved this codebase gets minimum-image arithmetic wrong whenever a site rolls its own,
+    /// and a sampler is exactly such a site.
+    fn wrap_cell(coordinate: i64, extent: u32) -> usize {
+        if extent == 0 {
+            return 0;
+        }
+        (coordinate.rem_euclid(i64::from(extent))) as usize
+    }
+
+    /// The four surrounding cells and their bilinear weights at world position `(x, y)`.
+    ///
+    /// PROVISIONAL (bd-grbc). Sample points are taken at CELL CENTRES, so a point exactly at a
+    /// centre returns that cell with weight 1. The seam wraps.
+    #[must_use]
+    pub fn sample_corners(&self, x: f32, y: f32) -> TerrainSampleCorners {
+        if self.cell_count() == 0 || self.cell_size <= 0.0 || !x.is_finite() || !y.is_finite() {
+            return TerrainSampleCorners {
+                indices: [0; 4],
+                weights: [1.0, 0.0, 0.0, 0.0],
+            };
+        }
+        // Shift by half a cell so integer coordinates land on centres.
+        let gx = x / self.cell_size - 0.5;
+        let gy = y / self.cell_size - 0.5;
+        let x0 = gx.floor();
+        let y0 = gy.floor();
+        let tx = gx - x0;
+        let ty = gy - y0;
+
+        let cx0 = Self::wrap_cell(x0 as i64, self.width);
+        let cy0 = Self::wrap_cell(y0 as i64, self.height);
+        let cx1 = Self::wrap_cell(x0 as i64 + 1, self.width);
+        let cy1 = Self::wrap_cell(y0 as i64 + 1, self.height);
+
+        let w = self.width as usize;
+        TerrainSampleCorners {
+            indices: [cy0 * w + cx0, cy0 * w + cx1, cy1 * w + cx0, cy1 * w + cx1],
+            weights: [
+                (1.0 - tx) * (1.0 - ty),
+                tx * (1.0 - ty),
+                (1.0 - tx) * ty,
+                tx * ty,
+            ],
+        }
+    }
+
+    fn blend(values: &[f32], corners: &TerrainSampleCorners) -> f32 {
+        let mut total = 0.0;
+        for (index, weight) in corners.indices.iter().zip(corners.weights.iter()) {
+            total += values.get(*index).copied().unwrap_or(0.0) * weight;
+        }
+        total
+    }
+
+    /// Bilinearly sampled shading inputs at world position `(x, y)`.
+    ///
+    /// OPTION A of bd-grbc, PROVISIONAL. Convenient for CPU shading and for the semantic
+    /// reference raster; use [`Self::sample_corners`] instead if the fragment shader should do
+    /// the blending.
+    ///
+    /// `kind` is NEAREST, not blended -- a terrain kind is categorical, and interpolating an
+    /// enum discriminant would be meaningless. `splat_weights` is the mechanism for smooth
+    /// transitions between biomes.
+    #[must_use]
+    pub fn shade_input_at(&self, x: f32, y: f32, daylight: f32, accent: f32) -> TerrainShadeInput {
+        let corners = self.sample_corners(x, y);
+        let dominant = corners
+            .weights
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |best, (slot, weight)| {
+                if *weight > best.1 {
+                    (slot, *weight)
+                } else {
+                    best
+                }
+            })
+            .0;
+        let kind = self
+            .kinds
+            .get(corners.indices[dominant])
+            .copied()
+            .unwrap_or(TerrainKind::Grass);
+        TerrainShadeInput {
+            kind,
+            moisture: Self::blend(self.moisture, &corners),
+            elevation: Self::blend(self.elevation, &corners),
+            slope: Self::blend(self.slope, &corners),
+            accent,
+            daylight,
+        }
+    }
+
+    /// Bilinearly sampled splat inputs at world position `(x, y)`.
+    ///
+    /// OPTION A of bd-grbc, PROVISIONAL. Same nearest-kind rule as [`Self::shade_input_at`].
+    #[must_use]
+    pub fn splat_input_at(&self, x: f32, y: f32) -> SplatInput {
+        let corners = self.sample_corners(x, y);
+        let dominant = corners
+            .weights
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |best, (slot, weight)| {
+                if *weight > best.1 {
+                    (slot, *weight)
+                } else {
+                    best
+                }
+            })
+            .0;
+        SplatInput {
+            kind: self
+                .kinds
+                .get(corners.indices[dominant])
+                .copied()
+                .unwrap_or(TerrainKind::Grass),
+            elevation: Self::blend(self.elevation, &corners),
+            slope: Self::blend(self.slope, &corners),
+            water_depth: Self::blend(self.water_depth, &corners),
+        }
+    }
 }
 
 /// Per-tile splat weights over the six biome layers, normalized to sum 1.
@@ -1606,5 +1823,178 @@ mod tests {
             born.intensity > seeded.intensity,
             "natural births outshine seeding"
         );
+    }
+
+    // --- bd-grbc provisional surface ---------------------------------------------------
+
+    /// Orientation must be ONE stated convention, not something each renderer re-derives.
+    #[test]
+    fn agent_facing_and_right_follow_one_stated_convention() {
+        let mut input = AgentVisualInput {
+            heading: 0.0,
+            spike_length: 2.0,
+            ..AgentVisualInput::default()
+        };
+
+        // Heading 0 points along +X; `right` is 90 degrees clockwise, i.e. -Y.
+        let params = agent_visual_params(&input);
+        assert!(
+            (params.facing[0] - 1.0).abs() < 1e-6,
+            "facing {:?}",
+            params.facing
+        );
+        assert!(params.facing[1].abs() < 1e-6, "facing {:?}", params.facing);
+        assert!(
+            params.right[1] < 0.0,
+            "right must be clockwise, got {:?}",
+            params.right
+        );
+
+        // Quarter turn toward +Y.
+        input.heading = core::f32::consts::FRAC_PI_2;
+        let params = agent_visual_params(&input);
+        assert!(params.facing[0].abs() < 1e-6, "facing {:?}", params.facing);
+        assert!(
+            (params.facing[1] - 1.0).abs() < 1e-6,
+            "facing {:?}",
+            params.facing
+        );
+
+        // Both vectors stay unit length and perpendicular right around the circle.
+        for step in 0..16 {
+            input.heading = step as f32 * core::f32::consts::TAU / 16.0;
+            let p = agent_visual_params(&input);
+            let fl = p.facing[0].hypot(p.facing[1]);
+            let rl = p.right[0].hypot(p.right[1]);
+            let dot = p.facing[0] * p.right[0] + p.facing[1] * p.right[1];
+            assert!((fl - 1.0).abs() < 1e-5, "facing not unit at step {step}");
+            assert!((rl - 1.0).abs() < 1e-5, "right not unit at step {step}");
+            assert!(
+                dot.abs() < 1e-5,
+                "facing/right not perpendicular at step {step}"
+            );
+        }
+    }
+
+    /// The spike tip is composed from the same facing the body uses, so a renderer cannot pair
+    /// a length with a direction of its own.
+    #[test]
+    fn spike_tip_offset_is_facing_scaled_by_length() {
+        let input = AgentVisualInput {
+            heading: core::f32::consts::FRAC_PI_2,
+            spike_length: 3.0,
+            ..AgentVisualInput::default()
+        };
+        let p = agent_visual_params(&input);
+        assert!(p.spike_tip_offset[0].abs() < 1e-5);
+        assert!((p.spike_tip_offset[1] - 3.0).abs() < 1e-5);
+    }
+
+    fn ramp_fields() -> (Vec<TerrainKind>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let kinds = vec![TerrainKind::Grass; 16];
+        let moisture = vec![0.5; 16];
+        let mut elevation = vec![0.0; 16];
+        for y in 0..4 {
+            for x in 0..4 {
+                elevation[y * 4 + x] = x as f32 / 3.0;
+            }
+        }
+        (kinds, moisture, elevation, vec![0.25; 16], vec![0.0; 16])
+    }
+
+    /// Sampling exactly at a cell centre returns that cell rather than a blend of neighbours.
+    #[test]
+    fn sampling_a_cell_centre_returns_that_cell() {
+        let (kinds, moisture, elevation, slope, water) = ramp_fields();
+        let view = TerrainFieldView {
+            width: 4,
+            height: 4,
+            cell_size: 10.0,
+            kinds: &kinds,
+            moisture: &moisture,
+            elevation: &elevation,
+            slope: &slope,
+            water_depth: &water,
+        };
+        // Centre of cell (2, 1) is world (25, 15).
+        let corners = view.sample_corners(25.0, 15.0);
+        let dominant = corners.weights.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            (dominant - 1.0).abs() < 1e-5,
+            "a centre sample must be unblended, weights {:?}",
+            corners.weights
+        );
+        let input = view.shade_input_at(25.0, 15.0, 1.0, 0.0);
+        assert!(
+            (input.elevation - 2.0 / 3.0).abs() < 1e-5,
+            "got {}",
+            input.elevation
+        );
+    }
+
+    /// The sampler must wrap at the toroidal seam. bd-b09u and bd-p095 both caught this
+    /// codebase getting minimum-image arithmetic wrong at exactly such sites.
+    #[test]
+    fn sampling_wraps_across_the_toroidal_seam() {
+        let (kinds, moisture, elevation, slope, water) = ramp_fields();
+        let view = TerrainFieldView {
+            width: 4,
+            height: 4,
+            cell_size: 10.0,
+            kinds: &kinds,
+            moisture: &moisture,
+            elevation: &elevation,
+            slope: &slope,
+            water_depth: &water,
+        };
+
+        // Just past the right edge must blend column 3 with column 0, not clamp.
+        let corners = view.sample_corners(39.0, 15.0);
+        assert!(
+            corners.indices.iter().any(|i| i % 4 == 0),
+            "seam sample must reach column 0, got {:?}",
+            corners.indices
+        );
+
+        // Weights form a partition of unity everywhere, including far off-grid coordinates.
+        for (x, y) in [
+            (0.0f32, 0.0f32),
+            (39.9, 39.9),
+            (-25.0, -15.0),
+            (400.0, 400.0),
+        ] {
+            let c = view.sample_corners(x, y);
+            let total: f32 = c.weights.iter().sum();
+            assert!(
+                (total - 1.0).abs() < 1e-4,
+                "weights at ({x},{y}) sum to {total}"
+            );
+            for index in c.indices {
+                assert!(index < 16, "index {index} out of range at ({x},{y})");
+            }
+        }
+    }
+
+    /// Terrain kind is categorical, so it is nearest-sampled rather than blended: interpolating
+    /// an enum discriminant would be meaningless. splat_weights is the smooth-transition path.
+    #[test]
+    fn terrain_kind_is_nearest_not_interpolated() {
+        let (mut kinds, moisture, elevation, slope, water) = ramp_fields();
+        kinds[0] = TerrainKind::Rock;
+        let view = TerrainFieldView {
+            width: 4,
+            height: 4,
+            cell_size: 10.0,
+            kinds: &kinds,
+            moisture: &moisture,
+            elevation: &elevation,
+            slope: &slope,
+            water_depth: &water,
+        };
+        assert_eq!(
+            view.shade_input_at(5.0, 5.0, 1.0, 0.0).kind,
+            TerrainKind::Rock
+        );
+        assert_eq!(view.splat_input_at(5.0, 5.0).kind, TerrainKind::Rock);
     }
 }
