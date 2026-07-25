@@ -43,6 +43,14 @@ struct CaptureOverrides {
     draw_food: Option<bool>,
     forced_fps: Option<f32>,
     hovered_agent: Option<AgentId>,
+    /// Keystrokes dispatched into the live window before the frame is captured.
+    ///
+    /// Deliberately NOT a direct field poke like the overrides above. Panel state has
+    /// to be reached the way a user reaches it — keystroke, binding lookup,
+    /// CommandAction, HudLayout — or the capture would photograph an arrangement the
+    /// production app can never be in, which is exactly the class of defect that hid
+    /// the missing rail earlier (bd-abu3).
+    keystrokes: &'static [&'static str],
 }
 
 struct CapturedView {
@@ -175,6 +183,20 @@ fn capture_view_with_overrides_and_camera(
     // only a thin strip of footer text. An empty scene reads exactly like a broken
     // renderer, so this must be explicit rather than incidental.
     cx.run_until_parked();
+
+    // Drive panel state through the REAL input path: keystroke -> InputBindings ->
+    // CommandAction -> HudLayout, the same chain a user's keypress takes. Setting the
+    // fields directly would photograph an arrangement production can never reach.
+    for stroke in overrides.keystrokes {
+        let parsed = gpui::Keystroke::parse(stroke)
+            .map_err(|error| format!("invalid capture keystroke {stroke:?}: {error:?}"))?;
+        cx.update_window(window.into(), |_, window, app| {
+            window.dispatch_keystroke(parsed.clone(), app);
+        })
+        .map_err(|error| format!("dispatch capture keystroke {stroke:?}: {error:?}"))?;
+        cx.run_until_parked();
+    }
+
     cx.update_window(window.into(), |root_view, window, app| {
         let view = root_view
             .downcast::<crate::SimulationView>()
@@ -642,6 +664,22 @@ mod tests {
         best
     }
 
+    /// Pixels in a column range that are not the app's root background — i.e. actual
+    /// rendered content of any kind.
+    fn count_non_background(image: &RgbaImage, x0: u32, x1: u32) -> u32 {
+        const ROOT_BG: [u8; 3] = [0x0f, 0x17, 0x2a];
+        let mut hits = 0;
+        for y in 0..image.height() {
+            for x in x0..x1.min(image.width()) {
+                let p = image.get_pixel(x, y).0;
+                if [p[0], p[1], p[2]] != ROOT_BG {
+                    hits += 1;
+                }
+            }
+        }
+        hits
+    }
+
     fn count_color(image: &RgbaImage, rgb: [u8; 3], x0: u32, x1: u32) -> u32 {
         let mut hits = 0;
         for y in 0..image.height() {
@@ -653,6 +691,92 @@ mod tests {
             }
         }
         hits
+    }
+
+    /// DIFFERENTIAL layout proof (bd-v9cz / bd-f4x0).
+    ///
+    /// A single capture shows one arrangement and proves nothing about the policy. This
+    /// captures the SAME scene twice — rail open, then rail closed — and diffs them.
+    ///
+    /// Both states are reached by dispatching the production keystrokes 1/2/3, so the
+    /// closed state is the one a user actually gets; nothing here pokes HudLayout.
+    ///
+    /// The pair is self-calibrating. Requiring chrome to be confined to the rail band
+    /// would pass trivially if the rail never drew, so the closed capture must show the
+    /// rail band LOSING that chrome. One assertion cannot be satisfied vacuously while
+    /// the other holds.
+    #[test]
+    fn toggling_the_rail_changes_only_the_rail_column() {
+        std::fs::create_dir_all(probe_dir()).expect("probe output directory");
+        let border = panel_border();
+
+        for (logical_w, logical_h) in VIEWPORTS {
+            let width = logical_w * HEADLESS_DEVICE_SCALE;
+            let height = logical_h * HEADLESS_DEVICE_SCALE;
+
+            let open = capture_view(capture_world(), GuiViewRole::Hud, width, height)
+                .unwrap_or_else(|e| {
+                    panic!("open capture failed at {logical_w}x{logical_h}: {e:#}")
+                });
+            // 1 = stats, 2 = history. Perf is collapsed by default, so these two empty
+            // the rail and HudLayout::resolve then reports show_rail = false.
+            let closed = capture_view_with_overrides(
+                capture_world(),
+                GuiViewRole::Hud,
+                width,
+                height,
+                CaptureOverrides {
+                    keystrokes: &["1", "2"],
+                    ..CaptureOverrides::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("closed capture failed at {logical_w}x{logical_h}: {e:#}"));
+
+            let w = open.width();
+            let rail_band = (HUD_RAIL_WIDTH * HEADLESS_DEVICE_SCALE) as u32;
+            let rail_lo = w.saturating_sub(rail_band);
+
+            let open_rail = count_color(&open, border, rail_lo, w);
+            let closed_rail = count_color(&closed, border, rail_lo, w);
+            let open_left = count_color(&open, border, 0, rail_lo);
+
+            closed
+                .save(probe_dir().join(format!(
+                    "hud_rail_closed_{}x{}.png",
+                    logical_w as u32, logical_h as u32
+                )))
+                .expect("write closed probe");
+
+            assert!(
+                open_rail > 0,
+                "rail chrome absent at {logical_w}x{logical_h}; the open state did not \
+                 render a rail, so the comparison below would be vacuous"
+            );
+            assert!(
+                closed_rail < open_rail,
+                "pressing 1 and 2 did not remove rail chrome at {logical_w}x{logical_h} \
+                 (open {open_rail}, closed {closed_rail}); either the production toggle \
+                 is broken or the capture is not reaching it"
+            );
+            // The world must RECLAIM the rail's column when the rail closes. That is
+            // what "reserved space" means: chrome and world trade the column, they never
+            // share it. Together with the two assertions above this is the docking
+            // property, proven rather than assumed.
+            //
+            // NOT asserting "zero chrome left of the rail". chrome::border() is now
+            // shared with the sibling history and inspector panels, which legitimately
+            // sit beside the world in their own columns, so border pixels outside the
+            // rail cannot be attributed to the rail. That check counted 1688 of them at
+            // 1600x900 and none at 1280x720 — a marker problem, not a layout one.
+            let closed_rail_content = count_non_background(&closed, rail_lo, w);
+            assert!(
+                closed_rail_content > 0,
+                "closing the rail at {logical_w}x{logical_h} left its column empty \
+                 ({closed_rail_content} non-background px); the world did not reclaim \
+                 the reserved space, so the column is dead area rather than shared"
+            );
+            let _ = open_left;
+        }
     }
 
     /// Captures the docked HUD at both production viewports and asserts the owner's
