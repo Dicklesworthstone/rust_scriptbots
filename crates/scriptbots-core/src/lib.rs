@@ -41993,9 +41993,18 @@ mod tests {
         out.push_str(&format!("summary {:?}\n", batch.summary));
         out.push_str(&format!("metrics {:?}\n", batch.metrics));
         out.push_str(&format!("events {:?}\n", batch.events));
-        out.push_str(&format!("agents {}\n", digest(format!("{:?}", batch.agents))));
-        out.push_str(&format!("births {}\n", digest(format!("{:?}", batch.births))));
-        out.push_str(&format!("deaths {}\n", digest(format!("{:?}", batch.deaths))));
+        out.push_str(&format!(
+            "agents {}\n",
+            digest(format!("{:?}", batch.agents))
+        ));
+        out.push_str(&format!(
+            "births {}\n",
+            digest(format!("{:?}", batch.births))
+        ));
+        out.push_str(&format!(
+            "deaths {}\n",
+            digest(format!("{:?}", batch.deaths))
+        ));
         out.push_str(&format!(
             "replay {}\n",
             digest(format!("{:?}", batch.replay_events))
@@ -42215,55 +42224,58 @@ mod tests {
         // v2 added presentation-only fields (quality tier, post stack, day/night, theme,
         // palette) to the serialized config tree: as in bd-2i1, the transition, output-tail,
         // and resource lanes are unchanged while the stage-world and aggregate lanes advanced
-        // transitively through the config-lane encoding; no science value moved.
+        // transitively through the config-lane encoding; no science value moved. Re-pinned in
+        // bd-yw1j after the trace advanced to V1.7: every lane seeds its hash with the versioned
+        // domain schema, so all six tuples move. The reviewed payload deltas are separately
+        // attributable to bd-drhs clock-channel parity and de0a24bfe positioned replay output.
         const EXPECTED: [(&str, &str, &str, &str, &str, &str); 6] = [
             (
                 "sense",
-                "004a8ff34232c73a",
-                "79c9f653219e2e99",
-                "a5c3391527f7be0f",
-                "15b8ace5445abf68",
-                "865000ef38f32868",
+                "8fcde7769fafa859",
+                "8af951c7d129bc5c",
+                "23374846ba1d9f52",
+                "9143731b043a49e3",
+                "f3c55b06e769994d",
             ),
             (
                 "brains",
-                "e47a9ca0b75f3bd2",
-                "0784675f322b8c77",
-                "e253563076bd2b5d",
-                "338ece8c58e3aa54",
-                "9f39057a48ff0d55",
+                "cd5bf342505bfac5",
+                "ce0fc1e041227e64",
+                "0a3d2025577b78fa",
+                "99e5a6f235b9b841",
+                "29de1a262f4ba3d8",
             ),
             (
                 "actuation",
-                "0b123cc4186c53d6",
-                "9372d014d2c797ef",
-                "d47fa5d7b8cf2959",
-                "f86a99d091268ea6",
-                "9c4573ee33022788",
+                "23d0c0e66e1d6bfd",
+                "c1d193ab313350d2",
+                "b00c5e6ebbd0104b",
+                "fce60d90e1f6ce79",
+                "4d6b16edb7ee82d5",
             ),
             (
                 "food",
-                "f0ca325e4c9a4c56",
-                "c015084f9ab60410",
-                "fc08078be123d220",
-                "b02ed06b5635e312",
-                "0855fe48c69c007d",
+                "8fd32d89adc861d9",
+                "5289321717b20ff7",
+                "672614c71a87f620",
+                "8d75bd4a3de97331",
+                "a6047741aec974a7",
             ),
             (
                 "death_cleanup",
-                "f0ca325e4c9a4c56",
-                "46581b2d02073daa",
-                "9b909fd41eae4aca",
-                "69b3e219fb68f4da",
-                "c28f4b1678fcf8d7",
+                "8fd32d89adc861d9",
+                "5d2be7d53cfbad2b",
+                "68f32a02d7100f24",
+                "071638bca8771c87",
+                "b8b1303ba5561213",
             ),
             (
                 "population",
-                "b3afba363a569824",
-                "ff09abb6bd938d55",
-                "1aad4a0f35a0c69b",
-                "e94c6bb812e4088d",
-                "7520bda32943fa12",
+                "2da5ca767df2c31e",
+                "a37968cb2e0e44c6",
+                "da2500b2a050831f",
+                "2d82065c3a22d366",
+                "04c6d029f3d52fc8",
             ),
         ];
 
@@ -42593,7 +42605,7 @@ mod tests {
             assert_eq!(build.pointer_width, 64);
             assert_eq!(
                 (observed.as_slice(), trace.overall.as_str()),
-                (&EXPECTED[..], "0c0d9785026bc3f8")
+                (&EXPECTED[..], "e9c659ca5cac7785")
             );
             println!(
                 "scriptbots.world-digest-golden.v1.7: six checkpoints and trace overall {} verified",
