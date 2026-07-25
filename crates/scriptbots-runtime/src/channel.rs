@@ -584,13 +584,16 @@ impl ChannelHostDriver {
     ///
     /// The loop parks without a periodic timer while the host reports
     /// [`HostDriveInterest::WakeOnly`]. A full client disconnect converts into
-    /// one ordered shutdown rather than abandoning the world.
+    /// one ordered shutdown rather than abandoning the world. An error leaves
+    /// this driver and its exact host state owned by the caller for an explicit
+    /// [`Self::step`] recovery or a later run retry; retained client ports stay
+    /// available for status inspection.
     ///
     /// # Errors
     ///
     /// Returns [`ChannelDriveError`] when a boundary cannot advance.
     pub fn run(
-        mut self,
+        &mut self,
         mut now: impl FnMut() -> ManualInstant,
     ) -> Result<ChannelRunReceipt, ChannelDriveError> {
         let mut drives = 0_u64;
@@ -710,7 +713,7 @@ mod tests {
     ) {
         let (port_tx, port_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let (driver, port) =
+            let (mut driver, port) =
                 ChannelHostDriver::new(test_host(paused), fast_options()).expect("driver");
             port_tx.send(port).expect("port handoff");
             let start = std::time::Instant::now();
@@ -923,8 +926,166 @@ mod tests {
     }
 
     #[test]
+    fn run_error_preserves_driver_and_pending_journal_work() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct DeferredJournalState {
+            suppress_receipts: bool,
+            attempts: Vec<crate::JournalBatchId>,
+            receipts: VecDeque<crate::JournalReceipt>,
+        }
+
+        struct DeferredJournal {
+            state: Rc<RefCell<DeferredJournalState>>,
+            dropped: Rc<Cell<bool>>,
+        }
+
+        impl Drop for DeferredJournal {
+            fn drop(&mut self) {
+                self.dropped.set(true);
+            }
+        }
+
+        impl crate::JournalPort for DeferredJournal {
+            fn try_admit(
+                &mut self,
+                batch: &std::sync::Arc<crate::JournalBatch>,
+            ) -> crate::JournalAdmission {
+                let mut state = self.state.borrow_mut();
+                let batch_id = batch.id();
+                state.attempts.push(batch_id);
+                if !state.suppress_receipts {
+                    state.receipts.push_back(crate::JournalReceipt::new(
+                        batch_id,
+                        crate::JournalReceiptState::Durable,
+                    ));
+                }
+                crate::JournalAdmission::Accepted { batch_id }
+            }
+
+            fn poll_receipts(&mut self, limit: usize) -> Vec<crate::JournalReceipt> {
+                let mut state = self.state.borrow_mut();
+                let count = limit.min(state.receipts.len());
+                state.receipts.drain(..count).collect()
+            }
+        }
+
+        let journal_state = Rc::new(RefCell::new(DeferredJournalState {
+            suppress_receipts: true,
+            ..DeferredJournalState::default()
+        }));
+        let journal_dropped = Rc::new(Cell::new(false));
+        let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("deterministic test world");
+        let core = HostCore::with_journal(
+            HostSessionId::new(10),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    ..PlaybackSnapshot::default()
+                },
+                tick_period_nanos: 10,
+                snapshot_interval_ticks: 1,
+                ..HostCoreOptions::default()
+            },
+            Box::new(DeferredJournal {
+                state: Rc::clone(&journal_state),
+                dropped: Rc::clone(&journal_dropped),
+            }),
+        )
+        .expect("host with deferred journal");
+        let (mut driver, mut port) = ChannelHostDriver::new(
+            FixedDeadlineHost::new(core),
+            ChannelHostOptions {
+                submit_deadline: Duration::from_secs(5),
+                ..fast_options()
+            },
+        )
+        .expect("driver");
+
+        let client = std::thread::spawn(move || {
+            let admitted = port
+                .submit(CommandEnvelope::new(CommandId::new(82), HostCommand::Step))
+                .expect("step admission");
+            (port, admitted)
+        });
+        let mut observations = [10_u64, 9, 8].into_iter();
+        let error = driver
+            .run(|| {
+                ManualInstant::from_nanos(
+                    observations
+                        .next()
+                        .expect("backwards-clock run must fail promptly"),
+                )
+            })
+            .expect_err("backwards clock must fail the run");
+        assert!(matches!(
+            error,
+            ChannelDriveError::Schedule(NativeScheduleError::ClockMovedBackwards { .. })
+        ));
+
+        let (mut port, admitted) = client.join().expect("client thread");
+        assert_eq!(admitted.journal(), &crate::JournalState::Pending);
+        let pending = port
+            .command_status(CommandId::new(82))
+            .expect("status lookup")
+            .expect("step status retained");
+        assert!(matches!(
+            pending.application(),
+            ApplicationState::Applied(_)
+        ));
+        assert_eq!(pending.journal(), &crate::JournalState::Pending);
+        assert!(
+            !journal_dropped.get(),
+            "run error dropped the sole-owner host and its pending journal work"
+        );
+        assert_eq!(driver.host.drive_interest(), HostDriveInterest::Draining);
+
+        {
+            let mut state = journal_state.borrow_mut();
+            let batch_id = *state.attempts.first().expect("accepted journal batch");
+            state.receipts.push_back(crate::JournalReceipt::new(
+                batch_id,
+                crate::JournalReceiptState::Durable,
+            ));
+            state.suppress_receipts = false;
+        }
+        driver
+            .step(ManualInstant::from_nanos(11))
+            .expect("retained driver settles the pending journal receipt");
+        let durable = port
+            .command_status(CommandId::new(82))
+            .expect("status lookup")
+            .expect("step status retained");
+        assert_eq!(durable.journal(), &crate::JournalState::Durable);
+
+        drop(port);
+        driver
+            .step(ManualInstant::from_nanos(12))
+            .expect("disconnect requests ordered shutdown");
+        driver
+            .step(ManualInstant::from_nanos(13))
+            .expect("ordered shutdown applies");
+        let stopped = driver
+            .step(ManualInstant::from_nanos(14))
+            .expect("ordered shutdown journal settles");
+        assert_eq!(stopped.interest, HostDriveInterest::Terminated);
+        assert!(
+            !journal_dropped.get(),
+            "retained driver must still own its settled journal"
+        );
+    }
+
+    #[test]
     fn controller_disconnect_requests_ordered_shutdown() {
-        let (driver, port) =
+        let (mut driver, port) =
             ChannelHostDriver::new(test_host(false), fast_options()).expect("driver");
         drop(port);
         let start = std::time::Instant::now();
