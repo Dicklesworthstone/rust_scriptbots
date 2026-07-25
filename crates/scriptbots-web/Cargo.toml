@@ -15,18 +15,29 @@ serde = { workspace = true }
 serde-wasm-bindgen = { workspace = true }
 wasm-bindgen = { workspace = true }
 rand = { workspace = true }
-scriptbots-core = { path = "../scriptbots-core", default-features = false, features = ["batch-brains"] }
 scriptbots-brain = { path = "../scriptbots-brain", default-features = false, features = ["mlp"] }
 scriptbots-runtime = { path = "../scriptbots-runtime", default-features = false }
 postcard = { workspace = true }
 js-sys = "0.3.73"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browser builds intentionally use core's scalar, single-thread path.
+scriptbots-core = { path = "../scriptbots-core", default-features = false, features = ["batch-brains"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native parity fixtures are the production reference lane. Spell the feature
+# set out so future default-feature drift cannot silently redefine the oracle.
+scriptbots-core = { path = "../scriptbots-core", default-features = false, features = ["batch-brains", "parallel", "simd_wide"] }
+
 [features]
 # Enables the cross-architecture parity test that compares wasm execution against
-# the committed native-generated fixture (tests/fixtures/native_parity_v1.postcard).
+# the committed native-generated fixture (tests/fixtures/native_parity_v2.postcard).
 # The authoritative CI browser lane and the documented local parity command enable
 # this explicitly so ordinary library builds do not embed test-only fixture bytes.
 native-parity-fixture = []
+# CI-only fault injection proving the browser comparison becomes red when the WASM
+# result diverges from the committed native reference.
+native-parity-fault-injection = ["native-parity-fixture"]
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.54"

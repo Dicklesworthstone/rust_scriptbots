@@ -373,6 +373,15 @@ jobs:
           bash ci/check_wasm_graph.sh --self-test
           bash ci/check_wasm_graph.sh
 
+      - name: Refresh-check native SIMD parity fixture
+        run: >-
+          cargo test
+          --locked
+          -p scriptbots-web
+          tests::committed_native_parity_fixture_matches_fresh_generation
+          --
+          --exact
+
       - name: Install wasm-pack
         run: cargo install wasm-pack --version 0.15.0 --locked
 
@@ -407,7 +416,7 @@ jobs:
           printf 'webdriver_json=%s\n' "$WEBDRIVER_JSON" >> "$GITHUB_OUTPUT"
 
       - name: Verify committed native parity fixture
-        run: test -s crates/scriptbots-web/tests/fixtures/native_parity_v1.postcard
+        run: test -s crates/scriptbots-web/tests/fixtures/native_parity_v2.postcard
 
       - name: wasm-pack build (web target)
         run: >-
@@ -417,6 +426,34 @@ jobs:
           --
           --locked
           --features native-parity-fixture
+
+      - name: Prove injected WASM divergence is red
+        shell: bash
+        env:
+          CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver }}
+          WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ steps.chrome.outputs.webdriver_json }}
+        run: |
+          set -o pipefail
+          LOG="$RUNNER_TEMP/scriptbots-wasm-parity-negative-control.log"
+          set +e
+          wasm-pack test \
+            --headless \
+            --chrome \
+            --chromedriver "$CHROMEDRIVER" \
+            crates/scriptbots-web \
+            --locked \
+            --features native-parity-fault-injection 2>&1 | tee "$LOG"
+          status="${PIPESTATUS[0]}"
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "::error::WASM parity negative control passed; the fixture comparison is ceremonial."
+            exit 1
+          fi
+          grep -F "NATIVE-vs-WASM divergence" "$LOG"
+          grep -F "first divergence at tick 1" "$LOG"
+          grep -F "agent[0]" "$LOG"
+          grep -F 'field `position.x`' "$LOG"
+          grep -F "config_hash=" "$LOG"
 
       - name: wasm-pack test (headless Chrome)
         env:
