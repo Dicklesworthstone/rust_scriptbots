@@ -32,16 +32,9 @@
 //! the root seed and a schema tag, so the streams are separated by construction and the property
 //! is testable rather than hoped for.
 
-// bd-tqpj: deterministic-simulation policy — pinned floating-point evaluation
-// order and fixed-width casts are part of the science contract; fma fusion,
-// reassociation, or width changes alter world digests. Function lengths mirror
+// bd-tqpj: deterministic-simulation policy — domain tags, byte order, and
+// fixed-width hashing are part of the science contract. Function lengths mirror
 // the legacy C++ parity layout and are reviewed as units.
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
 #![allow(clippy::too_many_lines)]
 
 use crate::{AgentUid, RandomStream, RandomStreamRestoreError, RandomStreamState, SmallRngStream};
