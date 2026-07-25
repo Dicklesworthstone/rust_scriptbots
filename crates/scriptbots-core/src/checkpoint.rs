@@ -2841,9 +2841,6 @@ mod tests {
     // portable across the other supported lanes.
     #[cfg(target_pointer_width = "64")]
     #[test]
-    #[ignore = "bd-16g.10.1: ActiveEffect gained a kind discriminant (GrowthScale/Embargo), \
-     Region a Rect variant, and bd-yw1j retired a positional config field; the V1.3/codec-6 \
-     wire re-pin must be recorded with fresh DSR evidence before this byte golden runs again"]
     fn checkpoint_v1_representative_wire_golden() {
         let (mut world, brain_key) = world_with_checkpoint_family();
         install_nontrivial_hydrology(&mut world);
@@ -2898,17 +2895,19 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_547,
-                "2a1483ddfdb2300cdcb5cdaf09179b1a2b0d1f0bfbc22934b057fd9d57c7fecf",
+                8_546,
+                "946e46ce043e58ef24722a4c3c5e78d02eeaea963421d884f1d4ac9daaba3daa",
             ),
-            "the reviewed V1.3/codec-5 wire must remain byte-identical: re-pinned in \
+            "the reviewed V1.3/codec-6 wire must remain byte-identical: re-pinned in \
              bd-2i1 after the locomotion model was bound, then re-pinned in \
              bd-2z0.14.3.1 after RenderSettings v2 added presentation-only fields \
              (quality tier, post stack, day/night, theme, palette) to the serialized \
              config tree (+7 bytes of Option discriminants), and re-pinned in \
              bd-2z0.8.9.8 after replay_event_tick_cap (a persistence-recording knob, \
-             default 0) joined the serialized config tree (+1 byte of usize varint); \
-             no science field changed"
+             default 0) joined the serialized config tree (+1 byte of usize varint). \
+             Re-pinned in bd-yw1j from the reviewed four-thread arm64 macOS DSR lane \
+             after ActiveEffect gained its kind discriminant, Region gained Rect, and \
+             the orphaned positional sense_max_neighbors field was retired"
         );
     }
 
