@@ -216,6 +216,49 @@ mod tests {
             .join("../../docs/rendering_reference/live_probes/bd-v9cz")
     }
 
+    /// Column span of the world canvas, found by colour diversity.
+    ///
+    /// The world raster is the only element that paints a continuously varying image;
+    /// every piece of chrome is a flat fill with text on it. So the canvas is the widest
+    /// run of adjacent columns that each carry many distinct colours. Returning a
+    /// measured span rather than a hardcoded rectangle keeps this honest when the layout
+    /// changes — which it just did, when the rail was hoisted.
+    fn world_canvas_columns(image: &RgbaImage) -> (u32, u32) {
+        const DIVERSE: usize = 12;
+        let (w, h) = (image.width(), image.height());
+        let diverse: Vec<bool> = (0..w)
+            .map(|x| {
+                let mut seen = std::collections::HashSet::new();
+                for y in (0..h).step_by(4) {
+                    let p = image.get_pixel(x, y).0;
+                    seen.insert([p[0], p[1], p[2]]);
+                }
+                seen.len() >= DIVERSE
+            })
+            .collect();
+        let (mut best, mut best_len) = ((0u32, 0u32), 0u32);
+        let mut run_start: Option<u32> = None;
+        for x in 0..w {
+            match (diverse[x as usize], run_start) {
+                (true, None) => run_start = Some(x),
+                (false, Some(s)) => {
+                    if x - s > best_len {
+                        best_len = x - s;
+                        best = (s, x);
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = run_start
+            && w - s > best_len
+        {
+            best = (s, w);
+        }
+        best
+    }
+
     fn count_color(image: &RgbaImage, rgb: [u8; 3], x0: u32, x1: u32) -> u32 {
         let mut hits = 0;
         for y in 0..image.height() {
@@ -278,8 +321,18 @@ mod tests {
             // fits one panel and the history chart legitimately does not appear. A
             // marker that can never be satisfied does not test the policy, it just
             // fails. The border is what every docked panel actually draws.
-            let centre_lo = w / 3;
-            let centre_hi = w - w / 3;
+            // Scope the "clear" assertion to the WORLD CANVAS, not the whole frame.
+            //
+            // The middle third of the frame was the wrong rectangle. The frame contains
+            // chrome margin by design — header, summary, analytics and history all stack
+            // above and beside the world — so a frame-wide check both over-reports
+            // (counting stacked chrome that overlaps nothing) and could under-report
+            // (a panel sitting over a world that is not centred in the frame).
+            //
+            // The canvas is located empirically rather than assumed: it is the only
+            // element that paints a raster, so it is the widest contiguous column span
+            // whose columns carry many distinct colours. Chrome is flat fill plus text.
+            let (centre_lo, centre_hi) = world_canvas_columns(&image);
             let centre_hits = count_color(&image, PANEL_BORDER, centre_lo, centre_hi);
 
             // Right band: the rightmost rail-width strip, where the docked rail lives.
@@ -305,7 +358,7 @@ mod tests {
                 centre_hits,
                 0,
                 "HUD chrome is covering the world centre at {w}x{h}: {centre_hits} \
-                 docked-panel border pixels between x={centre_lo} and x={centre_hi}. bd-v9cz's \
+                 docked-panel border pixels inside the world canvas span x={centre_lo}..{centre_hi}. bd-v9cz's \
                  one non-negotiable is that nothing sits over the world centre by \
                  default. Probe: {}",
                 path.display()
