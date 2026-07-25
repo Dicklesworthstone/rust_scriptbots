@@ -36,9 +36,7 @@ pub(crate) enum VfxFamily {
     Eat,
     Reproduce,
     SpikeExtend,
-    /// Dormant geometry until core defines a canonical boost event and cue.
-    ///
-    /// Render must not invent boost colors, intensity, radius, or lifetime.
+    /// Canonical movement-boost trail, painted behind the agent.
     BoostTrail,
 }
 
@@ -53,6 +51,7 @@ impl VfxFamily {
             VisualCueKind::SparkCone => Self::CombatHit,
             VisualCueKind::PulseRing => Self::Reproduce,
             VisualCueKind::Flash => Self::SpikeExtend,
+            VisualCueKind::BoostTrail => Self::BoostTrail,
         }
     }
 
@@ -159,7 +158,7 @@ impl LocatedVfx {
         })
     }
 
-    const fn is_live_at(&self, tick: u64) -> bool {
+    fn is_live_at(&self, tick: u64) -> bool {
         tick >= self.started_tick && tick - self.started_tick < u64::from(self.cue.duration_ticks)
     }
 }
@@ -221,7 +220,7 @@ impl VfxPaintCounts {
 
     /// Number of painted effects from one family.
     #[cfg(test)]
-    pub(crate) const fn family(self, family: VfxFamily) -> u32 {
+    pub(crate) fn family(self, family: VfxFamily) -> u32 {
         self.by_family[usize::from(family.rank())]
     }
 
@@ -773,6 +772,7 @@ const fn cue_kind_rank(kind: VisualCueKind) -> u8 {
         VisualCueKind::SparkCone => 4,
         VisualCueKind::PulseRing => 5,
         VisualCueKind::Flash => 6,
+        VisualCueKind::BoostTrail => 7,
     }
 }
 
@@ -967,18 +967,73 @@ mod tests {
     }
 
     #[test]
+    fn stable_key_covers_the_entire_located_event_payload() {
+        let baseline = event(4, 2, VisualCueKind::Sparkle, 8);
+        let baseline_key = stable_event_key(&baseline);
+        let assert_distinct =
+            |changed: LocatedVfx| assert_ne!(stable_event_key(&changed), baseline_key);
+
+        let mut changed = baseline;
+        changed.started_tick = 5;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.ordinal = 9;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.source = None;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.target = Some(AgentUid(3));
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.position = Position::new(11.0, 20.0);
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.direction = [0.8, 0.6];
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.family = VfxFamily::Death;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.cue.kind = VisualCueKind::Wilt;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.cue.color[0] = 0.5;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.cue.accent_color[1] = 0.4;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.cue.intensity = 0.5;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.cue.radius = 9.0;
+        assert_distinct(changed);
+        let mut changed = baseline;
+        changed.cue.duration_ticks = 9;
+        assert_distinct(changed);
+    }
+
+    #[test]
     fn paint_counts_require_success_and_merge_dual_pass_effects_once() {
         let mut underlay = VfxPaintCounts::default();
         underlay.record_if_painted(VfxFamily::Birth, false);
         assert_eq!(underlay.family(VfxFamily::Birth), 0);
         underlay.record_if_painted(VfxFamily::Birth, true);
+        underlay.record_if_painted(VfxFamily::Birth, true);
+        underlay.record_if_painted(VfxFamily::Death, true);
+        underlay.record_if_painted(VfxFamily::Death, true);
 
         let mut overlay = VfxPaintCounts::default();
         overlay.record_if_painted(VfxFamily::Birth, true);
+        overlay.record_if_painted(VfxFamily::Birth, true);
+        overlay.record_if_painted(VfxFamily::Death, true);
+        overlay.record_if_painted(VfxFamily::Death, true);
         overlay.record_if_painted(VfxFamily::CombatHit, true);
 
         underlay.merge(overlay);
-        assert_eq!(underlay.family(VfxFamily::Birth), 1);
+        assert_eq!(underlay.family(VfxFamily::Birth), 2);
+        assert_eq!(underlay.family(VfxFamily::Death), 2);
         assert_eq!(underlay.family(VfxFamily::CombatHit), 1);
     }
 
@@ -997,6 +1052,25 @@ mod tests {
 
         assert_eq!(located.family, VfxFamily::SpikeExtend);
         assert_eq!(located.cue.kind, VisualCueKind::Flash);
+        assert_eq!(located.cue, visual_cue_for_event(&world_event));
+    }
+
+    #[test]
+    fn boost_trail_uses_the_canonical_directional_core_cue() {
+        let world_event = WorldVisualEvent::Boost { magnitude: 0.75 };
+        let located = LocatedVfx::from_world_event(
+            7,
+            4,
+            Some(AgentUid(1)),
+            None,
+            Position::new(10.0, 20.0),
+            [0.0, 2.0],
+            &world_event,
+        );
+
+        assert_eq!(located.family, VfxFamily::BoostTrail);
+        assert_eq!(located.direction, [0.0, 1.0]);
+        assert_eq!(located.cue.kind, VisualCueKind::BoostTrail);
         assert_eq!(located.cue, visual_cue_for_event(&world_event));
     }
 

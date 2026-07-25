@@ -5,6 +5,7 @@ mod camera;
 /// `test-support` feature, which is a dev-dependency and must not reach production.
 #[cfg(test)]
 mod hud_capture;
+mod vfx;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
@@ -8250,9 +8251,9 @@ impl SimulationView {
                     .gap_2()
                     .text_xs()
                     .text_color(rgb(0xcbd5f5))
-                    .child(legend_item(chrome::series_population(), "Agents"))
-                    .child(legend_item(chrome::series_births(), "Births"))
-                    .child(legend_item(chrome::series_deaths(), "Deaths"));
+                    .child(legend_item(chrome::series_population().into(), "Agents"))
+                    .child(legend_item(chrome::series_births().into(), "Births"))
+                    .child(legend_item(chrome::series_deaths().into(), "Deaths"));
 
                 // Docked into the HUD rail (bd-v9cz) — see render_overlay.
                 div()
