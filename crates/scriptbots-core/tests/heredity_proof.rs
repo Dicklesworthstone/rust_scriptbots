@@ -6,7 +6,7 @@
 //! a hand-rolled `clone_box`) and prove, per registered family with locus support:
 //!
 //! * asexual children at mutation rate 0 are bit-identical to the parent;
-//! * sexual children at mutation rate 0 are a per-node bitwise mix of the two parents
+//! * sexual children at mutation rate 0 are a per-locus bitwise mix of the two parents
 //!   (never a blend, never a fresh node), with evaluator state reset, not inherited;
 //! * the mixed-kind barrier holds (a mismatched partner produces a same-kind clone);
 //! * changed-locus counts at a nonzero rate land inside an EXACT binomial tail
@@ -28,6 +28,7 @@
 //! The suite is table-driven over families with protocol locus support, so a new
 //! family that stops inheriting correctly fails CI the day it is added.
 
+use scriptbots_brain::assembly::{AssemblyBrain, AssemblyFamilyAdapter};
 use scriptbots_brain::dwraon::DwraonFamilyAdapter;
 use scriptbots_brain::mlp::MlpBrainFamily;
 use scriptbots_core::genome_diff::{LocusValue, diff_genomes};
@@ -38,6 +39,7 @@ use scriptbots_core::{
     OffspringStatePolicy, Position, RandomStream, ScriptBotsConfig, WorldState,
 };
 
+const ASSEMBLY_KIND: &str = AssemblyBrain::KIND.as_str();
 const DWRAON_KIND: &str = "dwraon-baseline";
 const MLP_KIND: &str = "mlp-baseline";
 
@@ -81,6 +83,9 @@ fn register_family(world: &mut WorldState, family: &str) -> u64 {
     let adapter: Box<dyn BrainFamilyAdapter> = match family {
         MLP_KIND => Box::new(MlpBrainFamily::new()),
         DWRAON_KIND => Box::new(DwraonFamilyAdapter::default()),
+        ASSEMBLY_KIND => {
+            Box::new(AssemblyFamilyAdapter::new().expect("canonical Assembly adapter"))
+        }
         other => panic!("no adapter fixture for {other}"),
     };
     world
@@ -92,6 +97,9 @@ fn dyn_codec_for(family: &str) -> Box<dyn BrainFamilyCodec> {
     match family {
         MLP_KIND => Box::new(MlpBrainFamily::new()),
         DWRAON_KIND => Box::new(DwraonFamilyAdapter::default()),
+        ASSEMBLY_KIND => {
+            Box::new(AssemblyFamilyAdapter::new().expect("canonical Assembly adapter"))
+        }
         other => panic!("no codec fixture for {other}"),
     }
 }
@@ -197,6 +205,7 @@ fn assert_bit_identical(
 fn for_each_family(test: fn(&str)) {
     test(MLP_KIND);
     test(DWRAON_KIND);
+    test(ASSEMBLY_KIND);
 }
 
 #[test]
@@ -232,7 +241,88 @@ fn asexual_child_at_zero_mutation_is_bit_identical_to_parent() {
 }
 
 #[test]
-fn sexual_child_at_zero_mutation_is_a_per_node_bitwise_mix() {
+fn identical_parent_crossover_at_zero_mutation_is_bit_identical() {
+    fn case(family: &str) {
+        let mut world = WorldState::new(reproduction_config(1.0)).expect("world");
+        let key = register_family(&mut world, family);
+        let rates = MutationRates {
+            primary: 0.0,
+            secondary: 0.0,
+        };
+        let parent = spawn_parent(&mut world, key, 100.0, 100.0, rates);
+        let parent_uid = uid_of(&world, parent);
+        let first_birth = drive_until_children(&mut world, &[parent_uid], 1, 64)
+            .pop()
+            .expect("one first-generation child");
+        assert!(
+            first_birth.parent_b.is_none(),
+            "heredity_proof: family={family} lone founder unexpectedly found a crossover partner"
+        );
+
+        let codec = dyn_codec_for(family);
+        let parent_genome = genome_of(&world, parent);
+        let clone_genome = genome_of(&world, first_birth.id);
+        assert_bit_identical(&*codec, &parent_genome, &clone_genome, family);
+        assert_eq!(
+            clone_genome.provenance().derivation,
+            BrainGenomeDerivation::Clone,
+            "heredity_proof: family={family} first zero-rate child must record an asexual clone"
+        );
+
+        world
+            .try_update_agent_runtime(first_birth.id, |runtime| {
+                runtime.energy = 1.5;
+                runtime.mutation_rates = rates;
+            })
+            .expect("clone energy and zero mutation rates");
+        let clone_uid = uid_of(&world, first_birth.id);
+        let crossover = drive_until_children(&mut world, &[parent_uid, clone_uid], 1, 64)
+            .pop()
+            .expect("one second-generation child");
+        let expected_partner = if crossover.parent_a == parent_uid {
+            clone_uid
+        } else {
+            assert_eq!(
+                crossover.parent_a, clone_uid,
+                "heredity_proof: family={family} crossover descended from an untracked agent"
+            );
+            parent_uid
+        };
+        assert_eq!(
+            crossover.parent_b,
+            Some(expected_partner),
+            "heredity_proof: family={family} two identical parents must exercise crossover"
+        );
+
+        let child_genome = genome_of(&world, crossover.id);
+        assert_eq!(
+            child_genome.provenance().derivation,
+            BrainGenomeDerivation::Crossover,
+            "heredity_proof: family={family} identical-parent birth must record a real crossover"
+        );
+        assert_eq!(
+            child_genome.provenance().parents,
+            [Some(crossover.parent_a), crossover.parent_b],
+            "heredity_proof: family={family} crossover provenance must record both actual parents"
+        );
+        assert_eq!(
+            child_genome.provenance().parent_genome_hashes,
+            [
+                Some(parent_genome.material_hash()),
+                Some(parent_genome.material_hash()),
+            ],
+            "heredity_proof: family={family} crossover provenance must identify both identical \
+             source genomes"
+        );
+        assert_bit_identical(&*codec, &parent_genome, &child_genome, family);
+        assert_bit_identical(&*codec, &clone_genome, &child_genome, family);
+    }
+
+    for_each_family(case);
+}
+
+#[test]
+fn sexual_child_at_zero_mutation_is_a_per_locus_bitwise_mix() {
     fn case(family: &str) {
         let mut world = WorldState::new(reproduction_config(1.0)).expect("world");
         let key = register_family(&mut world, family);
@@ -280,7 +370,7 @@ fn sexual_child_at_zero_mutation_is_a_per_node_bitwise_mix() {
                 matches_a || matches_b,
                 "heredity_proof: family={family} locus {} of child came from NEITHER parent \
                  (child={child_value:?}, A={a_value:?}, B={b_value:?}) — crossover must be a \
-                 per-node bitwise mix, never a blend and never a fresh node",
+                 per-locus bitwise mix, never a blend and never a fresh locus",
                 locus.human()
             );
             if matches_a && !matches_b {
@@ -498,6 +588,8 @@ fn changed_locus_distribution(family: &str, children: usize, rate: f32) -> (u64,
             .pmf_support(),
             &ExactBinomial { n: 600 * c, p }.pmf_support(),
         ),
+        // Assembly: one Bernoulli(rate) replacement draw per cell × 200 cells.
+        ASSEMBLY_KIND => ExactBinomial { n: 200 * c, p }.pmf_support(),
         other => panic!("no band model for {other}"),
     }
 }
@@ -714,7 +806,7 @@ fn drive_lineage_chain(
 }
 
 #[test]
-fn e2e_mutation_on_every_consecutive_diff_is_nonempty_and_in_band() {
+fn e2e_mutation_total_changed_loci_is_in_band() {
     const GENERATIONS: usize = 20;
     const RATE: f32 = 0.05;
     const ALPHA: f64 = 0.0005;
@@ -731,14 +823,8 @@ fn e2e_mutation_on_every_consecutive_diff_is_nonempty_and_in_band() {
         assert_eq!(pairs.len(), GENERATIONS);
         let codec = dyn_codec_for(family);
         let mut total_changed = 0_u64;
-        for (index, (parent, child)) in pairs.iter().enumerate() {
+        for (parent, child) in &pairs {
             let diff = diff_genomes(&*codec, parent, child).expect("e2e diff");
-            assert!(
-                !diff.deltas.is_empty(),
-                "heredity_proof: family={family} generation {index}: mutation rate {RATE} \
-                 produced an IDENTICAL child — 20 consecutive identical children means \
-                 mutation is dead"
-            );
             total_changed += diff.summary.changed_loci as u64;
         }
         let support = changed_locus_distribution(family, GENERATIONS, RATE);

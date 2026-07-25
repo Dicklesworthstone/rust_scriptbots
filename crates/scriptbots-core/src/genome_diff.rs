@@ -47,6 +47,8 @@ pub enum Locus {
     },
     /// A family-level hyperparameter locus (reserved; families name their own).
     Hyper(u8),
+    /// Scalar cell at the given index in an assembly-style genome.
+    Cell(u32),
 }
 
 impl Locus {
@@ -61,6 +63,7 @@ impl Locus {
             Self::NodeKind { node, conn } => format!("node {node} conn {conn} kind"),
             Self::NodeTarget { node, conn } => format!("node {node} conn {conn} target"),
             Self::Hyper(id) => format!("hyperparameter {id}"),
+            Self::Cell(index) => format!("cell {index}"),
         }
     }
 }
@@ -454,6 +457,7 @@ mod tests {
             Locus::NodeTarget { node: 3, conn: 0 }.human(),
             "node 3 conn 0 target"
         );
+        assert_eq!(Locus::Cell(47).human(), "cell 47");
     }
 
     #[test]

@@ -370,6 +370,25 @@ impl BrainFamilyCodec for AssemblyFamilyAdapter {
         self.decode_genome(genome).map(|_| ())
     }
 
+    fn genome_loci(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<
+        Vec<(
+            scriptbots_core::genome_diff::Locus,
+            scriptbots_core::genome_diff::LocusValue,
+        )>,
+        BrainProtocolError,
+    > {
+        use scriptbots_core::genome_diff::{Locus, LocusValue};
+
+        let cells = self.decode_genome(genome)?;
+        Ok((0_u32..)
+            .zip(cells)
+            .map(|(index, cell)| (Locus::Cell(index), LocusValue::Scalar(cell)))
+            .collect())
+    }
+
     fn validate_evaluator_state(
         &self,
         state: &BrainEvaluatorStateEnvelope,
@@ -965,6 +984,61 @@ mod tests {
             "checkpoint reconstruction must preserve every future-affecting working cell"
         );
         assert_eq!(expected[0].to_bits(), 0.875_f32.to_bits());
+    }
+
+    #[test]
+    fn protocol_genome_loci_are_canonical_and_bit_exact() {
+        use scriptbots_core::genome_diff::{GenomeDelta, Locus, LocusValue, diff_genomes};
+
+        const SIGNED_ZERO_INDEX: usize = 47;
+
+        let family = AssemblyFamilyAdapter::new().expect("canonical Assembly family");
+        let mut parent_cells = [1.25; BRAIN_SIZE];
+        parent_cells[SIGNED_ZERO_INDEX] = -0.0;
+        let mut child_cells = parent_cells;
+        child_cells[SIGNED_ZERO_INDEX] = 0.0;
+        let parent = family
+            .genome(&parent_cells, fixture_provenance())
+            .expect("parent genome");
+        let child = family
+            .genome(&child_cells, fixture_provenance())
+            .expect("child genome");
+
+        let loci = family.genome_loci(&parent).expect("Assembly loci");
+        assert_eq!(loci.len(), BRAIN_SIZE);
+        for (expected_index, ((locus, value), expected_cell)) in
+            (0_u32..).zip(loci.iter().zip(parent_cells))
+        {
+            assert_eq!(*locus, Locus::Cell(expected_index));
+            let LocusValue::Scalar(value) = value else {
+                panic!("Assembly cell {expected_index} must be a scalar locus");
+            };
+            assert_eq!(
+                value.to_bits(),
+                expected_cell.to_bits(),
+                "Assembly cell {expected_index} lost its exact f32 representation"
+            );
+        }
+
+        let diff = diff_genomes(&family, &parent, &child).expect("signed-zero diff");
+        assert_eq!(diff.summary.total_loci, BRAIN_SIZE);
+        assert_eq!(diff.summary.changed_loci, 1);
+        let [
+            GenomeDelta::Scalar {
+                locus: Locus::Cell(index),
+                before,
+                after,
+            },
+        ] = diff.deltas.as_slice()
+        else {
+            panic!("signed-zero change must be one typed Assembly cell delta");
+        };
+        assert_eq!(
+            *index,
+            u32::try_from(SIGNED_ZERO_INDEX).expect("bounded index")
+        );
+        assert_eq!(before.to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(after.to_bits(), 0.0_f32.to_bits());
     }
 
     #[test]
