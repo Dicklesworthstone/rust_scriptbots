@@ -108,6 +108,61 @@ const SLOW_SQL: &str = "SELECT COUNT(*) FROM metrics a, metrics b, metrics c";
 /// without being tight enough to flake on a loaded worker.
 const INTERRUPT_BOUND: Duration = Duration::from_secs(3);
 
+/// Standing evidence for `bd-aj12`: does an in-flight read hold the lane's only blocking slot?
+///
+/// `bd-aj12` claimed a cancelled read would wedge the lane, reasoning that
+/// `recv_sync_response` parks a blocking-pool thread on the engine worker while
+/// `AsyncReadLane::runtime` builds that pool with `.blocking_threads(1, 1)`. That was a
+/// source reading, not a measurement, so it is measured here.
+///
+/// Cancellation cannot be used to provoke it — nothing interrupts a running statement on
+/// this engine — so the slot behaviour is observed directly: time a fast query issued from a
+/// second thread while a ~6.3 s query is in flight on the same lane. If the fast query
+/// returns promptly the lane has spare capacity; if it waits out the slow one, the slot is
+/// held for the statement's full duration, and a cancellation that returned the caller early
+/// would leave that slot occupied with nothing to reclaim it.
+///
+/// Reports rather than asserts: the point is to record what the lane actually does, and an
+/// assertion here would pin today's behaviour as intended when it is the thing in question.
+#[test]
+#[ignore = "bd-aj12 evidence: run explicitly with --ignored --nocapture"]
+fn probe_whether_an_inflight_read_holds_the_lanes_only_blocking_slot() {
+    use std::sync::Arc;
+
+    let path = test_path("probe-slot");
+    let path_string = path.to_string_lossy().to_string();
+    write_fixture(&path_string, SLOW_FIXTURE_TICKS);
+    let lane = Arc::new(AsyncReadLane::open(&path_string).expect("lane opens"));
+
+    let slow_lane = Arc::clone(&lane);
+    let slow = std::thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = slow_lane.query_rows(SLOW_SQL, &[], &Cx::new());
+        (started.elapsed(), outcome.is_ok())
+    });
+
+    // Let the slow query take the slot before competing for it.
+    std::thread::sleep(Duration::from_millis(250));
+    let started = Instant::now();
+    let fast = lane.recent_metrics(1, &Cx::new());
+    let fast_elapsed = started.elapsed();
+    let (slow_elapsed, slow_ok) = slow.join().expect("slow thread joins");
+
+    println!(
+        "PROBE fast_query_elapsed={fast_elapsed:?} ok={} slow_query_elapsed={slow_elapsed:?} ok={slow_ok}",
+        fast.is_ok()
+    );
+    println!(
+        "PROBE interpretation: {}",
+        if fast_elapsed < Duration::from_secs(1) {
+            "lane served a second read while one was in flight — the slot is not exclusive"
+        } else {
+            "second read waited out the in-flight query — the slot is held for its full duration"
+        }
+    );
+    cleanup(&path);
+}
+
 /// Standing evidence for `bd-aj12`: which `Budget` dimensions bound a running statement.
 ///
 /// Kept rather than deleted because it is the cheapest way to detect an upstream fix. Run it

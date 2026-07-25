@@ -8,6 +8,23 @@
 //! mean lane readers observe only commit boundaries, as proven by
 //! `tests/durability_proofs.rs`.
 //!
+//! # One lane serves one read at a time, and that compounds the missing bound (`bd-aj12`)
+//!
+//! An `AsyncConnection` owns a single `!Send` engine connection on a single worker thread
+//! (`fsqlite::async_api::worker_loop`), pulling commands off one channel. Reads on one lane
+//! are therefore serialized at the engine, which is inherent to a thread-confined connection
+//! and not something this crate can widen — raising the blocking pool would only let more
+//! callers park, not let more statements run.
+//!
+//! Measured: with a ~6.3 s query in flight, a `recent_metrics(1)` issued on the same lane
+//! 250 ms later returned after 5.5 s. It waited out almost the whole query.
+//!
+//! On its own that is ordinary connection semantics. Combined with the unenforced budget
+//! below it is sharper than it looks: one expensive query blocks *every* read on that lane
+//! for its full duration, and nothing can interrupt it. A consumer that needs a slow
+//! analytical read and a responsive one must open separate lanes; sharing a lane makes the
+//! slow read a head-of-line block on the fast one.
+//!
 //! # The budget on a `Cx` is NOT enforced while a statement runs (`bd-aj12`)
 //!
 //! This module previously documented the opposite — that cancelling the context surfaces
