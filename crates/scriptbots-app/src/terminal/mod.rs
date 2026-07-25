@@ -12,6 +12,8 @@ use std::{
 
 pub mod subcell;
 
+use subcell::{ColorDepth, Layer, SubCellBuffer, SubCellMode, quantize};
+
 use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
     event::{
@@ -390,6 +392,10 @@ struct TerminalApp<'a> {
     last_autopause_tick: Option<u64>,
     map_scratch: Vec<CellOccupancy>,
     map_stamp: u32,
+    /// Grow-only sub-cell canvas, built on first use and reused across frames.
+    map_canvas: Option<SubCellBuffer>,
+    /// Whether the map draws through the sub-cell canvas. Toggled with `B`.
+    map_canvas_enabled: bool,
     analytics: Option<TerminalAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: AnalyticsStatus,
@@ -469,6 +475,10 @@ impl<'a> TerminalApp<'a> {
             last_autopause_tick: None,
             map_scratch: Vec::new(),
             map_stamp: 1,
+            map_canvas: None,
+            // On by default wherever it can be shown: the sub-cell canvas is the
+            // better picture, and a terminal without color falls back anyway.
+            map_canvas_enabled: true,
             analytics: None,
             analytics_revision: None,
             analytics_status: AnalyticsStatus::default(),
@@ -1396,6 +1406,19 @@ impl<'a> TerminalApp<'a> {
             if self.map_stamp == 0 {
                 self.map_stamp = 1;
             }
+            let use_canvas = self.map_canvas_enabled && self.palette.supports_sub_cell();
+            if use_canvas && self.map_canvas.is_none() {
+                self.map_canvas = Some(SubCellBuffer::new(
+                    inner.width,
+                    inner.height,
+                    SubCellMode::Braille,
+                ));
+            }
+            let canvas = if use_canvas {
+                self.map_canvas.as_mut()
+            } else {
+                None
+            };
             frame.render_widget(
                 MapWidget {
                     snapshot: &self.snapshot,
@@ -1403,6 +1426,7 @@ impl<'a> TerminalApp<'a> {
                     palette: &self.palette,
                     scratch: &mut self.map_scratch,
                     stamp: self.map_stamp,
+                    canvas,
                 },
                 inner,
             );
@@ -2506,6 +2530,23 @@ impl<'a> TerminalApp<'a> {
                         self.snapshot.tick,
                         EventKind::Info,
                         "Enable Emoji mode first (press 'e') to use narrow symbols",
+                    );
+                }
+            }
+            (KeyCode::Char('B'), _) => {
+                if self.palette.supports_sub_cell() {
+                    self.map_canvas_enabled = !self.map_canvas_enabled;
+                    let state = if self.map_canvas_enabled {
+                        "Braille sub-cell map ON (2x4 density)"
+                    } else {
+                        "Braille sub-cell map OFF (flat glyph map)"
+                    };
+                    self.push_event(self.snapshot.tick, EventKind::Info, state);
+                } else {
+                    self.push_event(
+                        self.snapshot.tick,
+                        EventKind::Info,
+                        "Sub-cell map needs a 256-color or truecolor terminal",
                     );
                 }
             }
@@ -4356,6 +4397,40 @@ fn rgb(hex: u32) -> Color {
     )
 }
 
+/// Unit-range RGB for the sub-cell canvas, which composites in float and does
+/// its own quantization. Named ANSI colors carry no channel values, so they get
+/// their conventional xterm approximation rather than being dropped to black.
+fn color_channels(color: Color) -> [f32; 3] {
+    const INV: f32 = 1.0 / 255.0;
+    let (r, g, b) = match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 0, 0),
+        Color::Green => (0, 205, 0),
+        Color::Yellow => (205, 205, 0),
+        Color::Blue => (0, 0, 238),
+        Color::Magenta => (205, 0, 205),
+        Color::Cyan => (0, 205, 205),
+        Color::Gray => (229, 229, 229),
+        Color::DarkGray => (127, 127, 127),
+        Color::LightRed => (255, 0, 0),
+        Color::LightGreen => (0, 255, 0),
+        Color::LightYellow => (255, 255, 0),
+        Color::LightBlue => (92, 92, 255),
+        Color::LightMagenta => (255, 0, 255),
+        Color::LightCyan => (0, 255, 255),
+        Color::White => (255, 255, 255),
+        Color::Indexed(_) | Color::Reset => (128, 128, 128),
+    };
+    [f32::from(r) * INV, f32::from(g) * INV, f32::from(b) * INV]
+}
+
+/// Pack unit-range RGB back into a terminal color.
+fn channels_color(rgb: [f32; 3]) -> Color {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color::Rgb(byte(rgb[0]), byte(rgb[1]), byte(rgb[2]))
+}
+
 impl Palette {
     fn test_backend_evidence() -> Self {
         Self {
@@ -4706,6 +4781,64 @@ impl Palette {
         }
     }
 
+    /// True when the terminal can render the sub-cell canvas legibly. Braille
+    /// averages several sub-pixel colors into one fg and one bg per cell, which
+    /// only reads correctly with a real color channel — under 16 colors the
+    /// averaging collapses and the flat glyph map stays the better picture.
+    fn supports_sub_cell(&self) -> bool {
+        self.level
+            .is_some_and(|level| level.has_16m || level.has_256)
+    }
+
+    /// Terrain base color for the canvas. Uses the theme's background band,
+    /// which is the field color; `terrain_fg` is the glyph ink and is far too
+    /// bright to tile a whole map with.
+    fn terrain_canvas_rgb(&self, kind: TerrainKind) -> [f32; 3] {
+        let idx = match kind {
+            TerrainKind::DeepWater => 0,
+            TerrainKind::ShallowWater => 1,
+            TerrainKind::Sand => 2,
+            TerrainKind::Grass => 3,
+            TerrainKind::Bloom => 4,
+            TerrainKind::Rock => 5,
+        };
+        color_channels(self.theme().terrain_bg[idx])
+    }
+
+    /// Food ink, brightened toward the terrain's glyph color as the cell fills.
+    fn food_canvas_rgb(&self, kind: TerrainKind, level: f32) -> [f32; 3] {
+        let idx = match kind {
+            TerrainKind::DeepWater => 0,
+            TerrainKind::ShallowWater => 1,
+            TerrainKind::Sand => 2,
+            TerrainKind::Grass => 3,
+            TerrainKind::Bloom => 4,
+            TerrainKind::Rock => 5,
+        };
+        let theme = self.theme();
+        let base = color_channels(theme.terrain_bg[idx]);
+        let ink = color_channels(theme.terrain_fg[idx]);
+        let t = level.clamp(0.0, 1.0);
+        [
+            (ink[0] - base[0]).mul_add(t, base[0]),
+            (ink[1] - base[1]).mul_add(t, base[1]),
+            (ink[2] - base[2]).mul_add(t, base[2]),
+        ]
+    }
+
+    /// Agent ink by diet, scaled by energy so dying agents read as dimmer dots.
+    fn agent_canvas_rgb(&self, diet: DietClass, energy: f32) -> [f32; 3] {
+        let idx = match diet {
+            DietClass::Herbivore => 0,
+            DietClass::Omnivore => 1,
+            DietClass::Carnivore => 2,
+        };
+        let base = color_channels(self.theme().diet[idx]);
+        // Floor the scale so a nearly-dead agent is still visible, not black.
+        let scale = 0.45_f32 + 0.55 * energy.clamp(0.0, 1.0);
+        [base[0] * scale, base[1] * scale, base[2] * scale]
+    }
+
     fn terrain_symbol(&self, kind: TerrainKind, food_level: f32) -> (char, Style) {
         let rich_color = self
             .level
@@ -4955,11 +5088,121 @@ struct MapWidget<'a> {
     palette: &'a Palette,
     scratch: &'a mut [CellOccupancy],
     stamp: u32,
+    /// Sub-cell canvas, when the view has one and the terminal can show it.
+    /// `None` selects the flat one-glyph-per-cell map.
+    canvas: Option<&'a mut SubCellBuffer>,
 }
 
-impl<'a> Widget for MapWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+/// Terrain alpha, deliberately below [`subcell::ALPHA_SOLID`]: terrain must land
+/// in a cell's background so food and agents are the lit dots. Painting it solid
+/// would light every dot and reduce the map to a field of full braille blocks.
+const CANVAS_TERRAIN_ALPHA: f32 = 0.35;
+
+/// Normalized food below this doesn't earn a dot; without a floor, grid noise
+/// lights the whole map and the density gain is wasted.
+const CANVAS_FOOD_THRESHOLD: f32 = 0.18;
+
+impl MapWidget<'_> {
+    /// Paint the world into the sub-cell buffer and blit the composed frame.
+    ///
+    /// This is the resolution win: the buffer is 2x4 sub-pixels per terminal
+    /// cell in braille mode, so terrain and food are sampled — and agents are
+    /// placed — at eight times the cell grid's density.
+    fn render_canvas(
+        canvas: &mut SubCellBuffer,
+        area: Rect,
+        buf: &mut Buffer,
+        ctx: &MapWidget<'_>,
+    ) {
+        if canvas.width_cells() != area.width || canvas.height_cells() != area.height {
+            canvas.resize(area.width, area.height);
+        }
+
+        // Repaint from world state every frame. Higher layers must be cleared
+        // first: `set` only replaces when the incoming layer is at least the
+        // stored one, so last frame's agent dots would otherwise survive.
+        canvas.clear_layer(Layer::Agents);
+        canvas.clear_layer(Layer::Food);
+
+        let sub_w = canvas.sub_width();
+        let sub_h = canvas.sub_height();
+        if sub_w == 0 || sub_h == 0 {
+            return;
+        }
+        let inv_w = 1.0 / f32::from(sub_w);
+        let inv_h = 1.0 / f32::from(sub_h);
+
+        for sy in 0..sub_h {
+            let v = (f32::from(sy) + 0.5) * inv_h;
+            for sx in 0..sub_w {
+                let u = (f32::from(sx) + 0.5) * inv_w;
+                let kind = ctx.terrain.sample(u, v);
+                let base = ctx.palette.terrain_canvas_rgb(kind);
+                canvas.set(
+                    Layer::Terrain,
+                    sx,
+                    sy,
+                    [base[0], base[1], base[2], CANVAS_TERRAIN_ALPHA],
+                );
+                let food = ctx.snapshot.food.sample(u, v);
+                if food > CANVAS_FOOD_THRESHOLD {
+                    let ink = ctx.palette.food_canvas_rgb(kind, food);
+                    canvas.set(Layer::Food, sx, sy, [ink[0], ink[1], ink[2], 1.0]);
+                }
+            }
+        }
+
+        let span_w = f32::from(sub_w);
+        let span_h = f32::from(sub_h);
+        for agent in &ctx.snapshot.agents {
+            let sx = (agent.position.0 * span_w).floor().clamp(0.0, span_w - 1.0) as u16;
+            let sy = (agent.position.1 * span_h).floor().clamp(0.0, span_h - 1.0) as u16;
+            let ink = ctx.palette.agent_canvas_rgb(agent.diet, agent.energy);
+            canvas.set(Layer::Agents, sx, sy, [ink[0], ink[1], ink[2], 1.0]);
+        }
+
+        // Quantize through the engine's own quantizer so a 256-color terminal is
+        // handed a color it can actually reproduce instead of a truecolor triple
+        // the backend will approximate on its own terms.
+        let depth = if ctx.palette.level.is_some_and(|level| level.has_16m) {
+            ColorDepth::TrueColor
+        } else {
+            ColorDepth::Ansi256
+        };
+        let to_color = |channels: [f32; 3]| {
+            let q = quantize(channels, depth);
+            Color::Rgb(q[0], q[1], q[2])
+        };
+
+        let frame = canvas.composite();
+        for cy in 0..frame.height_cells {
+            for cx in 0..frame.width_cells {
+                let Some(composed) = frame
+                    .cells
+                    .get(usize::from(cy) * usize::from(frame.width_cells) + usize::from(cx))
+                else {
+                    continue;
+                };
+                let cell = &mut buf[(area.x + cx, area.y + cy)];
+                cell.set_char(composed.glyph);
+                cell.set_style(
+                    Style::default()
+                        .fg(to_color(composed.fg))
+                        .bg(to_color(composed.bg)),
+                );
+            }
+        }
+    }
+}
+
+impl Widget for MapWidget<'_> {
+    fn render(mut self, area: Rect, buf: &mut Buffer) {
         if area.width < 2 || area.height < 2 {
+            return;
+        }
+
+        if let Some(canvas) = self.canvas.take() {
+            Self::render_canvas(canvas, area, buf, &self);
             return;
         }
 
@@ -5039,6 +5282,136 @@ impl<'a> Widget for MapWidget<'a> {
 mod tests {
     use super::*;
     use scriptbots_core::{AgentData, Position, ScriptBotsConfig};
+
+    fn canvas_test_terrain() -> TerrainView {
+        TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::Grass],
+        }
+    }
+
+    fn canvas_test_agent(x: f32, y: f32) -> AgentViz {
+        AgentViz {
+            id: 1,
+            position: (x, y),
+            heading: 0.0,
+            diet: DietClass::Herbivore,
+            energy: 1.0,
+            health: 1.0,
+            age: 0,
+            generation: 0,
+            boosted: false,
+            spike_length: 0.0,
+            tendency: 0.0,
+        }
+    }
+
+    /// The whole point of the sub-cell canvas: two agents that the flat map
+    /// collapses into one glyph must remain separately visible. A 4x2 cell area
+    /// is an 8x8 braille sub-grid, so (0.0,0.0) lands on dot (0,0) and
+    /// (0.13,0.13) on dot (1,1) — both inside terminal cell (0,0).
+    ///
+    /// Expected glyph pins the Unicode braille bit layout through the real
+    /// render path: dot(0,0)=0x01 and dot(1,1)=0x10, so U+2800+0x11 = U+2811.
+    #[test]
+    fn sub_cell_canvas_resolves_two_agents_inside_one_terminal_cell() {
+        let mut snapshot = Snapshot::default();
+        snapshot.agents = vec![canvas_test_agent(0.0, 0.0), canvas_test_agent(0.13, 0.13)];
+        let terrain = canvas_test_terrain();
+        let palette = Palette::test_backend_evidence();
+        let mut scratch = vec![CellOccupancy::default(); 8];
+        let mut canvas = SubCellBuffer::new(4, 2, SubCellMode::Braille);
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buf = Buffer::empty(area);
+
+        MapWidget {
+            snapshot: &snapshot,
+            terrain: &terrain,
+            palette: &palette,
+            scratch: &mut scratch,
+            stamp: 1,
+            canvas: Some(&mut canvas),
+        }
+        .render(area, &mut buf);
+
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "\u{2811}",
+            "two agents in one cell must occupy two distinct braille dots"
+        );
+    }
+
+    /// Terrain paints below `ALPHA_SOLID` so it lands in the cell background and
+    /// leaves the dots for agents and food. An empty cell must therefore be a
+    /// blank braille glyph with a real background color, not an unstyled cell.
+    #[test]
+    fn sub_cell_canvas_puts_terrain_in_the_background_not_the_dots() {
+        let snapshot = Snapshot::default();
+        let terrain = canvas_test_terrain();
+        let palette = Palette::test_backend_evidence();
+        let mut scratch = vec![CellOccupancy::default(); 8];
+        let mut canvas = SubCellBuffer::new(4, 2, SubCellMode::Braille);
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buf = Buffer::empty(area);
+
+        MapWidget {
+            snapshot: &snapshot,
+            terrain: &terrain,
+            palette: &palette,
+            scratch: &mut scratch,
+            stamp: 1,
+            canvas: Some(&mut canvas),
+        }
+        .render(area, &mut buf);
+
+        let cell = &buf[(1, 1)];
+        assert_eq!(
+            cell.symbol(),
+            "\u{2800}",
+            "terrain must not light braille dots"
+        );
+        assert!(
+            matches!(cell.style().bg, Some(Color::Rgb(..))),
+            "terrain must reach the cell background, got {:?}",
+            cell.style().bg
+        );
+    }
+
+    /// The flat path must still be intact and must NOT emit braille — this is
+    /// what the `B` toggle and the no-color fallback drop back to.
+    #[test]
+    fn flat_map_path_emits_no_braille_when_canvas_is_absent() {
+        let mut snapshot = Snapshot::default();
+        snapshot.agents = vec![canvas_test_agent(0.0, 0.0)];
+        let terrain = canvas_test_terrain();
+        let palette = Palette::test_backend_evidence();
+        let mut scratch = vec![CellOccupancy::default(); 8];
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buf = Buffer::empty(area);
+
+        MapWidget {
+            snapshot: &snapshot,
+            terrain: &terrain,
+            palette: &palette,
+            scratch: &mut scratch,
+            stamp: 1,
+            canvas: None,
+        }
+        .render(area, &mut buf);
+
+        for y in 0..2 {
+            for x in 0..4 {
+                let symbol = buf[(x, y)].symbol().to_string();
+                assert!(
+                    !symbol
+                        .chars()
+                        .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+                    "flat path emitted braille at ({x},{y}): {symbol:?}"
+                );
+            }
+        }
+    }
 
     /// Shared scenario identity for renderer contexts built by tests.
     fn test_scenario() -> Arc<ScenarioIdentityV0> {
