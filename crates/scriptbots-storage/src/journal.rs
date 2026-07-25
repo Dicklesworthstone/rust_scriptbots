@@ -3494,7 +3494,19 @@ mod tests {
             .drive_at(&mut core, ManualInstant::from_nanos(3))
             .expect("latched journal failure rejects later science deterministically");
         assert_eq!(blocked.scientific_steps, 0);
-        assert_eq!(blocked.blocker, Some(HostBlocker::ScientificFault));
+        // Exactly one blocker is possible here, and it is `JournalClosed`.
+        // `HostCore::current_blocker` is a `const fn` with strict precedence —
+        // `retained_blocker`, then `event_pressure`, then `health.blocker()`, then
+        // `ScientificFault` — and the receipt timeout above ran `fail_closed_batch`, which
+        // latches `retained_blocker`. The accepted timed-out batch leaves no *retryable*
+        // retained batch (asserted above), but the blocker latch is separate state and
+        // stays. Asserting `ScientificFault` here was stale: it names the fallback arm that
+        // the latch preempts.
+        assert!(
+            matches!(blocked.blocker, Some(HostBlocker::JournalClosed { .. })),
+            "a latched journal failure must block later science as JournalClosed, got {:?}",
+            blocked.blocker
+        );
         assert_eq!(core.world_tick(), Tick(1));
         let second_status = frontend
             .command_status(second.command_id())
@@ -3504,7 +3516,16 @@ mod tests {
             second_status.application(),
             ApplicationState::Failed(failure) if failure.code == "science_blocked"
         ));
-        assert_eq!(second_status.journal(), &JournalState::Pending);
+        // Same reasoning: `fail_closed_batch` writes the `journal_closed` failure, so the
+        // journal axis is deterministically `Failed`, not `Pending`.
+        assert!(
+            matches!(
+                second_status.journal(),
+                JournalState::Failed(failure) if failure.code == "journal_closed"
+            ),
+            "a latched journal failure must report journal_closed, got {:?}",
+            second_status.journal()
+        );
     }
 
     #[test]
