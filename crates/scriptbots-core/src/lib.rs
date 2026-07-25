@@ -14229,7 +14229,13 @@ mod map_sandbox {
         let mut accumulation = vec![0.0f32; len];
         let mut visited = vec![false; len];
         for idx in 0..len {
-            accumulate_flow(idx, &incoming, &mut accumulation, &mut visited);
+            accumulate_flow(
+                idx,
+                &incoming,
+                &mut accumulation,
+                &mut visited,
+                &mut NoopFlowVisitObserver,
+            );
         }
 
         let mut basin_ids = vec![u32::MAX; len];
@@ -14289,11 +14295,35 @@ mod map_sandbox {
         )
     }
 
-    fn accumulate_flow(
+    /// Observes the order in which [`accumulate_flow`] first visits each cell (bd-dz37).
+    ///
+    /// The traversal order is the thing under test -- it proves the iterative post-order walk
+    /// visits cells in the same sequence the recursive oracle does -- so it has to be
+    /// observable. It used to be observed by `#[cfg(test)]` calls woven into the loop body
+    /// backed by a thread-local, which meant the traversal under test was not the traversal
+    /// that ships.
+    ///
+    /// This mirrors the `WorldStepObserver` / `NoopWorldStepObserver` pattern already used by
+    /// the tick pipeline: generic rather than dynamic, so [`NoopFlowVisitObserver`]
+    /// monomorphizes to nothing and production pays zero for the seam.
+    trait FlowVisitObserver {
+        fn visit(&mut self, idx: usize);
+    }
+
+    /// Shipped [`FlowVisitObserver`]: records nothing and compiles away.
+    struct NoopFlowVisitObserver;
+
+    impl FlowVisitObserver for NoopFlowVisitObserver {
+        #[inline]
+        fn visit(&mut self, _idx: usize) {}
+    }
+
+    fn accumulate_flow<O: FlowVisitObserver>(
         idx: usize,
         incoming: &[Vec<usize>],
         accumulation: &mut [f32],
         visited: &mut [bool],
+        observer: &mut O,
     ) -> f32 {
         if visited[idx] {
             return accumulation[idx];
@@ -14305,8 +14335,7 @@ mod map_sandbox {
         // recursive cycle-guard behavior for back-edges.
         let mut stack: Vec<(usize, usize, f32)> = Vec::new();
         visited[idx] = true;
-        #[cfg(test)]
-        record_accumulation_visit(idx);
+        observer.visit(idx);
         accumulation[idx] = 1.0;
         stack.push((idx, 0, 1.0));
         while let Some(&(node, child_pos, _)) = stack.last() {
@@ -14319,8 +14348,7 @@ mod map_sandbox {
                 }
                 if !visited[child] {
                     visited[child] = true;
-                    #[cfg(test)]
-                    record_accumulation_visit(child);
+                    observer.visit(child);
                     accumulation[child] = 1.0;
                     stack.push((child, 0, 1.0));
                 }
@@ -14332,21 +14360,6 @@ mod map_sandbox {
             }
         }
         accumulation[idx]
-    }
-
-    #[cfg(test)]
-    thread_local! {
-        static ACCUMULATION_VISIT_TRACE: std::cell::RefCell<Option<Vec<usize>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    #[cfg(test)]
-    fn record_accumulation_visit(idx: usize) {
-        ACCUMULATION_VISIT_TRACE.with(|trace| {
-            if let Some(visits) = trace.borrow_mut().as_mut() {
-                visits.push(idx);
-            }
-        });
     }
 
     fn current_epoch_ms() -> u128 {
@@ -14559,24 +14572,34 @@ mod map_sandbox {
             (accumulation, visit_trace)
         }
 
-        fn run_iterative_production(incoming: &[Vec<usize>]) -> (Vec<f32>, Vec<usize>) {
-            ACCUMULATION_VISIT_TRACE.with(|trace| {
-                *trace.borrow_mut() = Some(Vec::with_capacity(incoming.len()));
-            });
+        /// Test double for [`FlowVisitObserver`], injected through the same generic seam
+        /// production uses, so the traversal under test is the traversal that ships.
+        struct RecordingFlowVisitObserver {
+            visits: Vec<usize>,
+        }
 
+        impl FlowVisitObserver for RecordingFlowVisitObserver {
+            fn visit(&mut self, idx: usize) {
+                self.visits.push(idx);
+            }
+        }
+
+        fn run_iterative_production(incoming: &[Vec<usize>]) -> (Vec<f32>, Vec<usize>) {
             let mut accumulation = vec![0.0; incoming.len()];
             let mut visited = vec![false; incoming.len()];
+            let mut observer = RecordingFlowVisitObserver {
+                visits: Vec::with_capacity(incoming.len()),
+            };
             for idx in 0..incoming.len() {
-                accumulate_flow(idx, incoming, &mut accumulation, &mut visited);
+                accumulate_flow(
+                    idx,
+                    incoming,
+                    &mut accumulation,
+                    &mut visited,
+                    &mut observer,
+                );
             }
-
-            let visit_trace = ACCUMULATION_VISIT_TRACE.with(|trace| {
-                trace
-                    .borrow_mut()
-                    .take()
-                    .expect("visit tracing was enabled for this traversal")
-            });
-            (accumulation, visit_trace)
+            (accumulation, observer.visits)
         }
 
         fn assert_oracle_equivalent(label: &str, incoming: &[Vec<usize>]) {
