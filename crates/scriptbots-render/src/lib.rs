@@ -8182,13 +8182,15 @@ impl SimulationView {
         // Docked into the HUD rail (bd-v9cz): no .absolute(), no top/left. It is a
         // flex sibling of the world, so it occupies reserved space instead of
         // covering the simulation. Colours unchanged — bd-f4x0/bd-9pqz own those.
+        // bd-f4x0: one shared chrome surface, hairline border, no drop shadow. The
+        // shadow implied the panel floated ABOVE the world, which is exactly the
+        // reading bd-v9cz removed structurally.
         div()
             .flex_none()
-            .bg(rgb(0x0b1120))
+            .bg(chrome::surface())
             .rounded_md()
-            .shadow_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
+            .border_color(chrome::border())
             .px_3()
             .py_3()
             .child(container)
@@ -8214,7 +8216,7 @@ impl SimulationView {
         // Docked into the HUD rail (bd-v9cz) — see render_overlay.
         div()
             .flex_none()
-            .bg(rgb(0x111b2b))
+            .bg(chrome::surface())
             .border_1()
             .border_color(rgb(0x1e293b))
             .rounded_md()
@@ -8248,17 +8250,17 @@ impl SimulationView {
                     .gap_2()
                     .text_xs()
                     .text_color(rgb(0xcbd5f5))
-                    .child(legend_item(rgb(0x38bdf8), "Agents"))
-                    .child(legend_item(rgb(0x22c55e), "Births"))
-                    .child(legend_item(rgb(0xef4444), "Deaths"));
+                    .child(legend_item(chrome::series_population(), "Agents"))
+                    .child(legend_item(chrome::series_births(), "Births"))
+                    .child(legend_item(chrome::series_deaths(), "Deaths"));
 
                 // Docked into the HUD rail (bd-v9cz) — see render_overlay.
                 div()
                     .flex_none()
                     .w(px(WIDTH))
-                    .bg(rgb(0x0a1629))
+                    .bg(chrome::surface())
                     .border_1()
-                    .border_color(rgb(0x13304e))
+                    .border_color(chrome::border())
                     .rounded_md()
                     .shadow_md()
                     .px_3()
@@ -8271,9 +8273,9 @@ impl SimulationView {
             }
             None => div()
                 .flex_none()
-                .bg(rgb(0x0a1629))
+                .bg(chrome::surface())
                 .border_1()
-                .border_color(rgb(0x13304e))
+                .border_color(chrome::border())
                 .rounded_md()
                 .shadow_md()
                 .px_3()
@@ -11387,6 +11389,81 @@ struct InspectorSnapshot {
     persistence_cached_interval: u32,
 }
 
+/// HUD chrome system (bd-f4x0), derived from the bd-9pqz art direction.
+///
+/// Three rules, and they are the whole brief:
+///
+/// 1. NO INVENTED COLOUR. Every surface here traces to `visual.rs`. The HUD used a
+///    dozen unrelated hand-picked hexes (`0x0b1120`, `0x111b2b`, `0x0a1629`, three
+///    chart colours, four text greys) that matched neither each other nor the world.
+/// 2. SURFACES ARE THE SUBSTRATE, LIFTED. Chrome sits on the same near-black
+///    blue-violet as the world, one step lighter, so panels read as the same material
+///    rather than as pasted-on cards.
+/// 3. RESTRAINT. The world is the subject. Chrome carries exactly one accent — the
+///    herbivore cyan — and otherwise moves only in value.
+mod chrome {
+    use super::{Hsla, rgb_from_triplet};
+    use scriptbots_core::visual::{
+        BIOLUMINESCENT_DARK_FIELD_V1 as STYLE, CARNIVORE_RGB, FOOD_MID_RGB, HERBIVORE_RGB,
+    };
+
+    /// Lift a substrate value toward legibility without leaving the ramp: value only,
+    /// hue preserved, so chrome can never drift off the art direction.
+    fn lifted(base: [f32; 3], lift: f32) -> Hsla {
+        rgb_from_triplet([
+            (base[0] + lift).clamp(0.0, 1.0),
+            (base[1] + lift).clamp(0.0, 1.0),
+            (base[2] + lift).clamp(0.0, 1.0),
+        ])
+        .into()
+    }
+
+    /// Panel fill. One surface for every docked panel — the old code had three.
+    pub fn surface() -> Hsla {
+        lifted(STYLE.substrate.base_srgb, 0.010)
+    }
+
+    /// Raised surface for nested content, one value step above [`surface`].
+    pub fn surface_raised() -> Hsla {
+        lifted(STYLE.substrate.depth_violet_srgb, 0.014)
+    }
+
+    /// Hairline border. Deliberately close to the surface: a panel edge should be
+    /// felt, not read.
+    pub fn border() -> Hsla {
+        lifted(STYLE.substrate.distant_haze_srgb, 0.020)
+    }
+
+    /// Type scale, expressed as colour weight rather than size — a terminal-like HUD
+    /// has one usable size, so hierarchy has to come from value.
+    pub fn text_primary() -> Hsla {
+        lifted(STYLE.substrate.distant_haze_srgb, 0.760)
+    }
+    pub fn text_secondary() -> Hsla {
+        lifted(STYLE.substrate.distant_haze_srgb, 0.520)
+    }
+    pub fn text_muted() -> Hsla {
+        lifted(STYLE.substrate.distant_haze_srgb, 0.300)
+    }
+
+    /// The single accent. One, so it still means something where it appears.
+    pub fn accent() -> Hsla {
+        rgb_from_triplet(HERBIVORE_RGB).into()
+    }
+
+    /// Chart series, on the same deliberate ramp as the world's agents and food
+    /// instead of stock blue/green/red.
+    pub fn series_population() -> Hsla {
+        rgb_from_triplet(HERBIVORE_RGB).into()
+    }
+    pub fn series_births() -> Hsla {
+        rgb_from_triplet(FOOD_MID_RGB).into()
+    }
+    pub fn series_deaths() -> Hsla {
+        rgb_from_triplet(CARNIVORE_RGB).into()
+    }
+}
+
 /// Minimum world viewport, in logical pixels. The world has absolute layout
 /// priority: chrome collapses to make room, never the other way round.
 const WORLD_MIN_WIDTH: f32 = 640.0;
@@ -13430,9 +13507,11 @@ fn paint_history_chart(bounds: Bounds<Pixels>, data: &HistoryChartData, window: 
         }
     };
 
-    draw_polyline(&data.agents, rgb(0x38bdf8));
-    draw_polyline(&data.births, rgb(0x22c55e));
-    draw_polyline(&data.deaths, rgb(0xef4444));
+    // bd-f4x0: series ride the bd-9pqz ramp (agents cyan, food mint, carnivore
+    // magenta) instead of stock blue/green/red that matched nothing on screen.
+    draw_polyline(&data.agents, chrome::series_population().into());
+    draw_polyline(&data.births, chrome::series_births().into());
+    draw_polyline(&data.deaths, chrome::series_deaths().into());
 }
 fn append_arc_polyline(
     builder: &mut PathBuilder,
