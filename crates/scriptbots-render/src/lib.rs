@@ -50,7 +50,7 @@ use kira::{
 };
 
 use image::{ImageBuffer, Rgba as ImgRgba};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "world_wgpu")]
 pub mod world_compositor {
@@ -2111,6 +2111,8 @@ struct GuiSession {
     simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
     analytics: AnalyticsSnapshotProvider,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+    selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
+    selection_submission: Arc<Mutex<()>>,
 }
 
 impl GuiSession {
@@ -2129,6 +2131,8 @@ impl GuiSession {
             ))),
             analytics,
             command_submit,
+            selection_projection: Arc::new(Mutex::new(None)),
+            selection_submission: Arc::new(Mutex::new(())),
         }
     }
 
@@ -2138,6 +2142,8 @@ impl GuiSession {
             self.analytics.clone(),
             role.view_title(),
             Arc::clone(&self.command_submit),
+            Arc::clone(&self.selection_projection),
+            Arc::clone(&self.selection_submission),
         );
         view.focus_handle = Some(focus_handle);
         if role == GuiViewRole::WorldCanvas {
@@ -2291,6 +2297,8 @@ struct SimulationView {
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     camera: Arc<Mutex<Camera>>,
     inspector: Arc<Mutex<InspectorState>>,
+    selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
+    selection_submission: Arc<Mutex<()>>,
     playback: PlaybackState,
     perf: PerfStats,
     last_perf: PerfSnapshot,
@@ -2339,6 +2347,8 @@ impl SimulationView {
         analytics_provider: AnalyticsSnapshotProvider,
         title: SharedString,
         command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+        selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
+        selection_submission: Arc<Mutex<()>>,
     ) -> Self {
         let world = {
             let driver = match simulation_driver.lock() {
@@ -2363,6 +2373,8 @@ impl SimulationView {
             command_submit,
             camera: Arc::new(Mutex::new(Camera::default())),
             inspector: Arc::new(Mutex::new(inspector_state)),
+            selection_projection,
+            selection_submission,
             playback: PlaybackState::new(240),
             perf: PerfStats::new(240),
             last_perf: PerfSnapshot::default(),
@@ -2406,12 +2418,27 @@ impl SimulationView {
         self.minimal_canvas_mode = true;
     }
 
-    fn submit_simulation_command(&self, command: SimulationCommand) -> bool {
-        let accepted = (self.command_submit.as_ref())(ControlCommand::UpdateSimulation(command));
-        if !accepted {
-            warn!("failed to enqueue simulation command from GPUI renderer");
+    fn submit_control_command(&self, command: ControlCommand) -> bool {
+        let tick = self
+            .world
+            .lock()
+            .map(|world| world.tick().0)
+            .unwrap_or_default();
+        let accepted = (self.command_submit.as_ref())(command.clone());
+        if accepted {
+            debug!(tick, source = "gui", payload = ?command, "GPUI control command enqueued");
+        } else {
+            warn!(tick, source = "gui", payload = ?command, "failed to enqueue GPUI control command");
         }
         accepted
+    }
+
+    fn submit_simulation_command(&self, command: SimulationCommand) -> bool {
+        self.submit_control_command(ControlCommand::UpdateSimulation(command))
+    }
+
+    fn submit_selection_update(&self, update: SelectionUpdate) -> bool {
+        self.submit_control_command(ControlCommand::UpdateSelection(update))
     }
 
     fn camera_snapshot(&self) -> CameraSnapshot {
@@ -2437,9 +2464,7 @@ impl SimulationView {
             let mut new_config = world.config().clone();
             drop(world);
             update(&mut new_config);
-            if !(self.command_submit.as_ref())(ControlCommand::UpdateConfig(Box::new(new_config))) {
-                warn!("failed to enqueue config update from renderer");
-            }
+            let _ = self.submit_control_command(ControlCommand::UpdateConfig(Box::new(new_config)));
         } else {
             warn!("failed to acquire world lock for config update");
         }
@@ -2510,6 +2535,26 @@ impl SimulationView {
         (world.config().bot_radius * 3.0).max(24.0)
     }
 
+    fn effective_selected_agents(
+        &self,
+        canonical: &[AgentId],
+        live_agents: &[AgentId],
+    ) -> Vec<AgentId> {
+        let Ok(mut projection) = self.selection_projection.lock() else {
+            return canonical.to_vec();
+        };
+        if let Some(projected) = projection.as_mut() {
+            projected.retain(|id| live_agents.contains(id));
+        }
+        if projection
+            .as_deref()
+            .is_some_and(|projected| projected == canonical)
+        {
+            *projection = None;
+        }
+        projection.clone().unwrap_or_else(|| canonical.to_vec())
+    }
+
     fn pick_agent_near(
         &self,
         world: &WorldState,
@@ -2538,25 +2583,48 @@ impl SimulationView {
     }
 
     fn clear_all_selections(&mut self) -> bool {
-        let mut changed = false;
-        if let Ok(mut world) = self.world.lock() {
-            let result = world.apply_selection_update(SelectionUpdate {
-                mode: SelectionMode::Clear,
-                agent_ids: Vec::new(),
-                state: SelectionState::None,
-            });
-            changed = result.cleared > 0;
+        let submission = Arc::clone(&self.selection_submission);
+        let Ok(_submission_guard) = submission.lock() else {
+            return false;
+        };
+        let (tick, canonical_selection, live_agents) = match self.world.lock() {
+            Ok(world) => (
+                world.tick().0,
+                world
+                    .runtime()
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        matches!(entry.selection, SelectionState::Selected).then_some(id)
+                    })
+                    .collect::<Vec<_>>(),
+                world.agents().iter_handles().collect::<Vec<_>>(),
+            ),
+            Err(_) => return false,
+        };
+        let selected = self.effective_selected_agents(&canonical_selection, &live_agents);
+        let presentation_changed = self
+            .inspector
+            .lock()
+            .map(|inspector| inspector.focused_agent.is_some() || inspector.hovered_agent.is_some())
+            .unwrap_or(false);
+        let changed = !selected.is_empty() || presentation_changed;
+        if !self.submit_selection_update(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: SelectionState::None,
+        }) {
+            return false;
         }
-
+        if let Ok(mut projection) = self.selection_projection.lock() {
+            *projection = Some(Vec::new());
+        }
         if let Ok(mut inspector) = self.inspector.lock() {
-            if inspector.focused_agent.take().is_some() {
-                changed = true;
-            }
-            if inspector.hovered_agent.take().is_some() {
-                changed = true;
-            }
+            inspector.focused_agent = None;
+            inspector.hovered_agent = None;
         }
-
+        if changed {
+            self.record_selection_event_with_ids(tick, SelectionEventKind::Clear, &[]);
+        }
         changed
     }
 
@@ -2566,10 +2634,11 @@ impl SimulationView {
                 return false;
             }
             let cleared = self.clear_all_selections();
-            if cleared {
-                self.record_selection_event(SelectionEventKind::Clear);
-            }
             return cleared;
+        };
+        let submission = Arc::clone(&self.selection_submission);
+        let Ok(_submission_guard) = submission.lock() else {
+            return false;
         };
 
         let prior_focus = self
@@ -2578,53 +2647,86 @@ impl SimulationView {
             .map(|state| state.focused_agent)
             .unwrap_or(None);
 
-        let mut candidate_id = None;
-
-        let mut world = match self.world.lock() {
+        let world = match self.world.lock() {
             Ok(world) => world,
             Err(_) => return false,
         };
 
         let pick_radius = self.selection_pick_radius(&world);
         let candidate = self.pick_agent_near(&world, world_point, pick_radius);
-
-        let was_selected = candidate.is_some_and(|id| {
-            world
-                .agent_runtime(id)
-                .is_some_and(|entry| matches!(entry.selection, SelectionState::Selected))
-        });
-        let (mode, state, ids) = match (extend, candidate, was_selected) {
-            (false, Some(id), _) => {
-                candidate_id = Some(id);
-                (
-                    SelectionMode::Replace,
-                    SelectionState::Selected,
-                    vec![id.raw()],
-                )
-            }
-            (false, None, _) => (SelectionMode::Clear, SelectionState::None, Vec::new()),
-            (true, Some(id), true) => (SelectionMode::Clear, SelectionState::None, vec![id.raw()]),
-            (true, Some(id), false) => {
-                candidate_id = Some(id);
-                (SelectionMode::Add, SelectionState::Selected, vec![id.raw()])
-            }
-            (true, None, _) => (SelectionMode::Add, SelectionState::Selected, Vec::new()),
-        };
-        let result = world.apply_selection_update(SelectionUpdate {
-            mode,
-            agent_ids: ids,
-            state,
-        });
-        let selection_changed = result.applied > 0 || result.cleared > 0;
-        let selected_after: Vec<AgentId> = world
+        let tick = world.tick().0;
+        let live_agents = world.agents().iter_handles().collect::<Vec<_>>();
+        let canonical_selection = world
             .runtime()
             .iter()
             .filter_map(|(id, entry)| {
                 matches!(entry.selection, SelectionState::Selected).then_some(id)
             })
-            .collect();
-
+            .collect::<Vec<_>>();
         drop(world);
+        let selected_before = self.effective_selected_agents(&canonical_selection, &live_agents);
+        let was_selected = candidate.is_some_and(|id| selected_before.contains(&id));
+
+        let (mode, state, ids, selected_after, candidate_id) =
+            match (extend, candidate, was_selected) {
+                (false, Some(id), _) => (
+                    SelectionMode::Replace,
+                    SelectionState::Selected,
+                    vec![id.raw()],
+                    vec![id],
+                    Some(id),
+                ),
+                (false, None, _) => (
+                    SelectionMode::Clear,
+                    SelectionState::None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                ),
+                (true, Some(id), true) => {
+                    let selected_after = selected_before
+                        .iter()
+                        .copied()
+                        .filter(|selected| *selected != id)
+                        .collect();
+                    (
+                        SelectionMode::Clear,
+                        SelectionState::None,
+                        vec![id.raw()],
+                        selected_after,
+                        None,
+                    )
+                }
+                (true, Some(id), false) => {
+                    let mut selected_after = selected_before.clone();
+                    selected_after.push(id);
+                    (
+                        SelectionMode::Add,
+                        SelectionState::Selected,
+                        vec![id.raw()],
+                        selected_after,
+                        Some(id),
+                    )
+                }
+                (true, None, _) => (
+                    SelectionMode::Add,
+                    SelectionState::Selected,
+                    Vec::new(),
+                    selected_before.clone(),
+                    None,
+                ),
+            };
+        let accepted = self.submit_selection_update(SelectionUpdate {
+            mode,
+            agent_ids: ids,
+            state,
+        });
+        if !accepted {
+            return false;
+        }
+        if let Ok(mut projection) = self.selection_projection.lock() {
+            *projection = Some(selected_after.clone());
+        }
 
         let mut focus_after = candidate_id.filter(|id| selected_after.contains(id));
 
@@ -2635,6 +2737,7 @@ impl SimulationView {
         }
 
         let focus_changed = focus_after != prior_focus;
+        let selection_changed = selected_after != selected_before;
 
         if let Ok(mut inspector) = self.inspector.lock() {
             inspector.focused_agent = focus_after;
@@ -2642,9 +2745,9 @@ impl SimulationView {
         }
 
         if selection_changed {
-            self.record_selection_event(SelectionEventKind::Click);
+            self.record_selection_event_with_ids(tick, SelectionEventKind::Click, &selected_after);
         } else if focus_changed {
-            self.record_selection_event(SelectionEventKind::Focus);
+            self.record_selection_event_with_ids(tick, SelectionEventKind::Focus, &selected_after);
         }
 
         selection_changed || focus_changed
@@ -2692,41 +2795,26 @@ impl SimulationView {
             return false;
         }
 
-        let mut desired = hovered;
-        let mut selection_changed = false;
-
-        if let Ok(mut world) = self.world.lock() {
-            if let Some(prev) = prev_hover
-                && world
-                    .agent_runtime(prev)
-                    .is_some_and(|entry| matches!(entry.selection, SelectionState::Hovered))
-            {
-                let result = world.apply_selection_update(SelectionUpdate {
-                    mode: SelectionMode::Clear,
-                    agent_ids: vec![prev.raw()],
-                    state: SelectionState::None,
-                });
-                selection_changed |= result.cleared > 0;
-            }
-
-            if let Some(curr) = hovered {
-                if world
-                    .agent_runtime(curr)
-                    .is_some_and(|entry| matches!(entry.selection, SelectionState::Selected))
-                {
-                    desired = None;
-                } else {
-                    let result = world.apply_selection_update(SelectionUpdate {
-                        mode: SelectionMode::Add,
-                        agent_ids: vec![curr.raw()],
-                        state: SelectionState::Hovered,
-                    });
-                    selection_changed |= result.applied > 0;
-                }
-            }
+        let desired = if let Some(curr) = hovered {
+            let Ok(world) = self.world.lock() else {
+                return false;
+            };
+            let live_agents = world.agents().iter_handles().collect::<Vec<_>>();
+            let canonical_selection = world
+                .runtime()
+                .iter()
+                .filter_map(|(id, entry)| {
+                    matches!(entry.selection, SelectionState::Selected).then_some(id)
+                })
+                .collect::<Vec<_>>();
+            drop(world);
+            (!self
+                .effective_selected_agents(&canonical_selection, &live_agents)
+                .contains(&curr))
+            .then_some(curr)
         } else {
-            return false;
-        }
+            None
+        };
 
         let mut inspector_changed = false;
         if let Ok(mut inspector) = self.inspector.lock() {
@@ -2734,14 +2822,36 @@ impl SimulationView {
             inspector.hovered_agent = desired;
         }
 
-        selection_changed || inspector_changed
+        inspector_changed
     }
     fn snapshot(&mut self) -> HudSnapshot {
         let mut snapshot = HudSnapshot::default();
+        let (canonical_selection, live_agents) = self
+            .world
+            .lock()
+            .map(|world| {
+                (
+                    world
+                        .runtime()
+                        .iter()
+                        .filter_map(|(id, entry)| {
+                            matches!(entry.selection, SelectionState::Selected).then_some(id)
+                        })
+                        .collect::<Vec<_>>(),
+                    world.agents().iter_handles().collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        let _ = self.effective_selected_agents(&canonical_selection, &live_agents);
         let inspector_state = self
             .inspector
             .lock()
             .map(|state| state.clone())
+            .unwrap_or_default();
+        let selection_projection = self
+            .selection_projection
+            .lock()
+            .map(|projection| projection.clone())
             .unwrap_or_default();
         let brain_request = (!self.minimal_canvas_mode
             && matches!(self.playback.mode(), PlaybackMode::Live))
@@ -2772,6 +2882,29 @@ impl SimulationView {
                 snapshot.narrative_dropped = world.narrative_dropped_events();
                 snapshot.narrative_capacity = config.narrative_capacity;
                 snapshot.render_frame = RenderFrame::from_world(&world, self.accessibility.palette);
+                if let Some(frame) = snapshot.render_frame.as_mut() {
+                    for agent in &mut frame.agents {
+                        agent.selection = if selection_projection
+                            .as_ref()
+                            .is_some_and(|selected| selected.contains(&agent.agent_id))
+                            || (selection_projection.is_none()
+                                && matches!(agent.selection, SelectionState::Selected))
+                        {
+                            SelectionState::Selected
+                        } else {
+                            SelectionState::None
+                        };
+                    }
+                    if let Some(hovered_agent) = inspector_state.hovered_agent
+                        && let Some(agent) = frame
+                            .agents
+                            .iter_mut()
+                            .find(|agent| agent.agent_id == hovered_agent)
+                        && !matches!(agent.selection, SelectionState::Selected)
+                    {
+                        agent.selection = SelectionState::Hovered;
+                    }
+                }
 
                 let mut ring: VecDeque<TickSummary> = VecDeque::with_capacity(12);
                 for summary in world.history() {
@@ -2787,6 +2920,7 @@ impl SimulationView {
                 let (inspector, cache, issued) = InspectorSnapshot::from_world(
                     &world,
                     &inspector_state,
+                    selection_projection.as_deref(),
                     cached_brain_inspection.as_ref(),
                     brain_request,
                 );
@@ -4135,15 +4269,6 @@ impl SimulationView {
         if let Ok(mut inspector) = self.inspector.lock() {
             inspector.focused_agent = Some(agent_id);
         }
-
-        if let Ok(mut world) = self.world.lock() {
-            let _ = world.apply_selection_update(SelectionUpdate {
-                mode: SelectionMode::Add,
-                agent_ids: vec![agent_id.raw()],
-                state: SelectionState::Selected,
-            });
-        }
-
         cx.notify();
     }
 
@@ -4185,26 +4310,32 @@ impl SimulationView {
         cx.notify();
     }
 
-    fn record_selection_event(&mut self, kind: SelectionEventKind) {
-        let (tick, selected) = if let Ok(world) = self.world.lock() {
-            let mut ids = Vec::new();
-            for (id, entry) in world.runtime().iter() {
-                if matches!(entry.selection, SelectionState::Selected) {
-                    ids.push(id);
-                }
-            }
-            (world.tick().0, ids)
-        } else {
-            (0, Vec::<AgentId>::new())
-        };
+    fn record_selection_event_with_ids(
+        &mut self,
+        tick: u64,
+        kind: SelectionEventKind,
+        selected: &[AgentId],
+    ) {
+        self.push_selection_event(
+            tick,
+            kind,
+            selected.len(),
+            selected.iter().copied().take(5).collect(),
+        );
+    }
 
-        let total = selected.len();
-        let sample = selected.iter().copied().take(5).collect::<Vec<AgentId>>();
+    fn push_selection_event(
+        &mut self,
+        tick: u64,
+        kind: SelectionEventKind,
+        total_selected: usize,
+        sample_ids: Vec<AgentId>,
+    ) {
         let event = SelectionEvent {
             tick,
             kind,
-            total_selected: total,
-            sample_ids: sample,
+            total_selected,
+            sample_ids,
         };
         if self.selection_events.len() >= MAX_SELECTION_EVENTS {
             self.selection_events.pop_front();
@@ -4213,53 +4344,78 @@ impl SimulationView {
     }
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
         if self.clear_all_selections() {
-            self.record_selection_event(SelectionEventKind::Clear);
             cx.notify();
         }
     }
     fn select_all_agents(&mut self, cx: &mut Context<Self>) {
-        let mut changed = false;
-        let mut first_selected: Option<AgentId> = None;
-        {
-            if let Ok(mut world) = self.world.lock() {
-                let ids = world.agents().iter_handles().collect::<Vec<_>>();
-                first_selected = ids.first().copied();
-                let result = world.apply_selection_update(SelectionUpdate {
-                    mode: SelectionMode::Replace,
-                    agent_ids: ids.into_iter().map(AgentId::raw).collect(),
-                    state: SelectionState::Selected,
-                });
-                changed = result.applied > 0 || result.cleared > 0;
-            }
+        let submission = Arc::clone(&self.selection_submission);
+        let Ok(_submission_guard) = submission.lock() else {
+            return;
+        };
+        let (tick, ids, canonical_selection) = match self.world.lock() {
+            Ok(world) => (
+                world.tick().0,
+                world.agents().iter_handles().collect::<Vec<_>>(),
+                world
+                    .runtime()
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        matches!(entry.selection, SelectionState::Selected).then_some(id)
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Err(_) => return,
+        };
+        let selected_before = self.effective_selected_agents(&canonical_selection, &ids);
+        let prior_presentation = self
+            .inspector
+            .lock()
+            .map(|inspector| (inspector.focused_agent, inspector.hovered_agent))
+            .unwrap_or_default();
+        let changed = selected_before != ids
+            || prior_presentation.0 != ids.first().copied()
+            || prior_presentation.1.is_some();
+        if !self.submit_selection_update(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: ids.iter().copied().map(AgentId::raw).collect(),
+            state: SelectionState::Selected,
+        }) {
+            return;
+        }
+        if let Ok(mut projection) = self.selection_projection.lock() {
+            *projection = Some(ids.clone());
+        }
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector.focused_agent = ids.first().copied();
+            inspector.hovered_agent = None;
         }
         if changed {
-            self.record_selection_event(SelectionEventKind::SelectAll);
-            if let Some(id) = first_selected {
-                self.focus_agent(id, cx);
-            } else {
-                cx.notify();
-            }
+            self.record_selection_event_with_ids(tick, SelectionEventKind::SelectAll, &ids);
+            cx.notify();
         }
     }
 
     fn focus_first_selected(&mut self, cx: &mut Context<Self>) {
-        let selected_id = {
-            if let Ok(world) = self.world.lock() {
-                world.runtime().iter().find_map(|(id, entry)| {
-                    if matches!(entry.selection, SelectionState::Selected) {
-                        Some(id)
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
+        let (tick, canonical_selection, live_agents) = match self.world.lock() {
+            Ok(world) => (
+                world.tick().0,
+                world
+                    .runtime()
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        matches!(entry.selection, SelectionState::Selected).then_some(id)
+                    })
+                    .collect::<Vec<_>>(),
+                world.agents().iter_handles().collect::<Vec<_>>(),
+            ),
+            Err(_) => return,
         };
+        let selected = self.effective_selected_agents(&canonical_selection, &live_agents);
+        let selected_id = selected.first().copied();
 
         if let Some(id) = selected_id {
             self.focus_agent(id, cx);
-            self.record_selection_event(SelectionEventKind::Focus);
+            self.record_selection_event_with_ids(tick, SelectionEventKind::Focus, &selected);
         }
     }
 
@@ -5077,8 +5233,7 @@ impl SimulationView {
     }
 
     fn step_simulation_once(&mut self, cx: &mut Context<Self>) {
-        if !(self.command_submit.as_ref())(ControlCommand::Step) {
-            warn!("failed to enqueue single-step command from GPUI renderer");
+        if !self.submit_control_command(ControlCommand::Step) {
             return;
         }
         self.playback.go_live();
@@ -11005,6 +11160,7 @@ impl InspectorSnapshot {
     fn from_world(
         world: &WorldState,
         inspector: &InspectorState,
+        selection_projection: Option<&[AgentId]>,
         cached_brain: Option<&BrainInspectorCapture>,
         brain_request: Option<(BrainInspectionClientId, BrainInspectionRevision)>,
     ) -> (Self, Option<BrainInspectorCapture>, bool) {
@@ -11034,10 +11190,14 @@ impl InspectorSnapshot {
         for (row, agent_id) in arena.iter_handles().enumerate() {
             if let Some(agent_runtime) = runtime.get(agent_id) {
                 let entry = AgentListEntry::from_world(row, agent_id, agent_runtime, columns);
-                match agent_runtime.selection {
-                    SelectionState::Selected => selected.push(entry),
-                    SelectionState::Hovered => hovered = Some(entry),
-                    SelectionState::None => {}
+                let is_selected = selection_projection.map_or_else(
+                    || matches!(agent_runtime.selection, SelectionState::Selected),
+                    |projected| projected.contains(&agent_id),
+                );
+                if is_selected {
+                    selected.push(entry);
+                } else if inspector.hovered_agent.is_some_and(|id| id == agent_id) {
+                    hovered = Some(entry);
                 }
             }
         }
@@ -14963,6 +15123,17 @@ mod command_characterization_tests {
     use std::time::Duration;
 
     #[test]
+    fn production_renderer_has_no_direct_world_selection_writes() {
+        let (production, _) = include_str!("lib.rs")
+            .split_once("#[cfg(test)]\nmod command_characterization_tests")
+            .expect("command characterization test boundary");
+        assert!(
+            !production.contains(".apply_selection_update("),
+            "GPUI selection must be admitted through ControlCommand, never written to WorldState"
+        );
+    }
+
+    #[test]
     fn readme_gui_shortcuts_match_production_bindings() {
         let bindings = InputBindings::default();
         let entries = bindings.iter();
@@ -15248,6 +15419,8 @@ mod command_characterization_tests {
             AnalyticsSnapshotProvider::empty(),
             "command characterization".into(),
             Arc::new(|_command: ControlCommand| true),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(())),
         )
     }
 
@@ -15848,6 +16021,470 @@ mod command_characterization_tests {
             "a single-step must not schedule a second scientific tick"
         );
         app.update(|app| app.shutdown());
+    }
+
+    #[test]
+    fn gpui_closed_world_shortcut_submits_one_intent_without_direct_mutation() {
+        let world = command_characterization_world();
+        let submitted_commands = Arc::new(Mutex::new(Vec::new()));
+        let captured_commands = Arc::clone(&submitted_commands);
+        let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+            Arc::new(move |command| {
+                captured_commands
+                    .lock()
+                    .expect("closed-world submitted command queue")
+                    .push(command);
+                true
+            });
+        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let session = Arc::new(GuiSession::new(
+            Arc::clone(&world),
+            disabled_persistence_step_driver(&world),
+            AnalyticsSnapshotProvider::empty(),
+            command_drain,
+            command_submit,
+        ));
+
+        let mut app = gpui::TestApp::new();
+        let windows = app
+            .update(|app| session.install(app))
+            .expect("install production GPUI closed-world session");
+        assert!(!world.lock().expect("closed-world world lock").is_closed());
+
+        app.update(|app| {
+            app.update_window(windows.hud.into(), |_, window, app| {
+                window.dispatch_keystroke(
+                    Keystroke::parse("c").expect("valid closed-world shortcut"),
+                    app,
+                );
+            })
+            .expect("dispatch production HUD closed-world shortcut");
+        });
+
+        assert_eq!(
+            submitted_commands
+                .lock()
+                .expect("closed-world submitted command queue")
+                .len(),
+            1,
+            "one C keypress must enqueue exactly one canonical scientific intent"
+        );
+        assert!(
+            !world.lock().expect("closed-world world lock").is_closed(),
+            "the GPUI handler must not mutate scientific world state before the intent is drained"
+        );
+        app.update(|app| app.shutdown());
+    }
+
+    #[test]
+    fn gpui_select_all_shortcut_submits_selection_intent_without_direct_mutation() {
+        let world = command_characterization_world();
+        let agent_id = world
+            .lock()
+            .expect("select-all world lock")
+            .try_spawn_agent(AgentData::default())
+            .expect("spawn select-all fixture agent");
+        let submitted_commands = Arc::new(Mutex::new(Vec::new()));
+        let captured_commands = Arc::clone(&submitted_commands);
+        let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+            Arc::new(move |command| {
+                captured_commands
+                    .lock()
+                    .expect("select-all submitted command queue")
+                    .push(command);
+                true
+            });
+        let drain_commands = Arc::clone(&submitted_commands);
+        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
+            Arc::new(move || {
+                let mut commands = drain_commands
+                    .lock()
+                    .expect("select-all submitted command queue");
+                std::mem::take(&mut *commands)
+            });
+        let session = Arc::new(GuiSession::new(
+            Arc::clone(&world),
+            disabled_persistence_step_driver(&world),
+            AnalyticsSnapshotProvider::empty(),
+            command_drain,
+            command_submit,
+        ));
+
+        let mut app = gpui::TestApp::new();
+        let windows = app
+            .update(|app| session.install(app))
+            .expect("install production GPUI select-all session");
+
+        app.update(|app| {
+            app.update_window(windows.hud.into(), |_, window, app| {
+                window.dispatch_keystroke(
+                    Keystroke::parse("ctrl-a").expect("valid select-all shortcut"),
+                    app,
+                );
+            })
+            .expect("dispatch production HUD select-all shortcut");
+        });
+
+        assert_eq!(
+            submitted_commands
+                .lock()
+                .expect("select-all submitted command queue")
+                .as_slice(),
+            &[ControlCommand::UpdateSelection(SelectionUpdate {
+                mode: SelectionMode::Replace,
+                agent_ids: vec![agent_id.raw()],
+                state: SelectionState::Selected,
+            })],
+            "one Ctrl-A keypress must enqueue the exact canonical selection intent"
+        );
+        assert!(
+            matches!(
+                world
+                    .lock()
+                    .expect("select-all world lock")
+                    .agent_runtime(agent_id)
+                    .expect("select-all fixture runtime")
+                    .selection,
+                SelectionState::None
+            ),
+            "the GPUI handler must not mutate selection before the intent is drained"
+        );
+        assert_eq!(
+            session
+                .selection_projection
+                .lock()
+                .expect("select-all selection projection")
+                .as_deref(),
+            Some(&[agent_id][..]),
+            "the HUD and canvas must share the admitted pre-drain selection projection"
+        );
+        app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
+        app.run_until_parked();
+        assert!(
+            submitted_commands
+                .lock()
+                .expect("select-all submitted command queue")
+                .is_empty(),
+            "the production driver must drain the admitted selection intent"
+        );
+        assert!(
+            matches!(
+                world
+                    .lock()
+                    .expect("select-all world lock")
+                    .agent_runtime(agent_id)
+                    .expect("select-all fixture runtime")
+                    .selection,
+                SelectionState::Selected
+            ),
+            "the shared command application path must apply the GPUI selection intent"
+        );
+        app.update(|app| app.shutdown());
+    }
+
+    #[test]
+    fn rejected_selection_clear_preserves_scientific_and_presentation_state() {
+        let world = command_characterization_world();
+        let agent_id = {
+            let mut world = world.lock().expect("rejected-clear world lock");
+            let agent_id = world
+                .try_spawn_agent(AgentData::default())
+                .expect("spawn rejected-clear fixture agent");
+            let _ = world.apply_selection_update(SelectionUpdate {
+                mode: SelectionMode::Replace,
+                agent_ids: vec![agent_id.raw()],
+                state: SelectionState::Selected,
+            });
+            agent_id
+        };
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured_attempts = Arc::clone(&attempts);
+        let driver = gui_simulation_driver(&world, Arc::new(Vec::new));
+        let projection = Arc::new(Mutex::new(None));
+        let mut view = SimulationView::new(
+            driver,
+            AnalyticsSnapshotProvider::empty(),
+            "rejected selection".into(),
+            Arc::new(move |_command| {
+                captured_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                false
+            }),
+            Arc::clone(&projection),
+            Arc::new(Mutex::new(())),
+        );
+        view.inspector
+            .lock()
+            .expect("rejected-clear inspector")
+            .focused_agent = Some(agent_id);
+
+        assert!(!view.clear_all_selections());
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 1);
+        assert!(
+            matches!(
+                world
+                    .lock()
+                    .expect("rejected-clear world lock")
+                    .agent_runtime(agent_id)
+                    .expect("rejected-clear fixture runtime")
+                    .selection,
+                SelectionState::Selected
+            ),
+            "rejected admission must leave canonical selection untouched"
+        );
+        assert_eq!(
+            view.inspector
+                .lock()
+                .expect("rejected-clear inspector")
+                .focused_agent,
+            Some(agent_id),
+            "rejected admission must leave presentation focus untouched"
+        );
+        assert!(
+            projection
+                .lock()
+                .expect("rejected-clear projection")
+                .is_none(),
+            "rejected admission must not create an optimistic selection projection"
+        );
+        assert!(
+            view.selection_events.is_empty(),
+            "rejected admission must not append an applied-selection event"
+        );
+    }
+
+    #[test]
+    fn rapid_shift_clicks_project_pending_selection_in_fifo_order() {
+        let world = command_characterization_world();
+        let agent_id = world
+            .lock()
+            .expect("rapid-selection world lock")
+            .try_spawn_agent(AgentData {
+                position: Position::new(50.0, 50.0),
+                ..AgentData::default()
+            })
+            .expect("spawn rapid-selection fixture agent");
+        let pending_commands = Arc::new(Mutex::new(Vec::new()));
+        let drain_commands = Arc::clone(&pending_commands);
+        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
+            Arc::new(move || {
+                let mut commands = drain_commands
+                    .lock()
+                    .expect("rapid-selection command queue");
+                std::mem::take(&mut *commands)
+            });
+        let driver = gui_simulation_driver(&world, command_drain);
+        let submit_commands = Arc::clone(&pending_commands);
+        let projection = Arc::new(Mutex::new(None));
+        let mut view = SimulationView::new(
+            Arc::clone(&driver),
+            AnalyticsSnapshotProvider::empty(),
+            "rapid selection".into(),
+            Arc::new(move |command| {
+                submit_commands
+                    .lock()
+                    .expect("rapid-selection command queue")
+                    .push(command);
+                true
+            }),
+            Arc::clone(&projection),
+            Arc::new(Mutex::new(())),
+        );
+        {
+            let mut camera = view.camera.lock().expect("rapid-selection camera");
+            camera.ensure_default_zoom(1.0);
+            camera.record_render_metrics((0.0, 0.0), (100.0, 100.0), (100.0, 100.0), 1.0);
+        }
+        let agent_screen_position = point(px(50.0), px(50.0));
+
+        assert!(view.update_selection_from_point(agent_screen_position, true));
+        assert!(view.update_selection_from_point(agent_screen_position, true));
+
+        assert_eq!(
+            pending_commands
+                .lock()
+                .expect("rapid-selection command queue")
+                .as_slice(),
+            &[
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Add,
+                    agent_ids: vec![agent_id.raw()],
+                    state: SelectionState::Selected,
+                }),
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: vec![agent_id.raw()],
+                    state: SelectionState::None,
+                }),
+            ],
+            "the second pre-drain shift-click must toggle the projected state back off"
+        );
+        assert!(
+            matches!(
+                world
+                    .lock()
+                    .expect("rapid-selection world lock")
+                    .agent_runtime(agent_id)
+                    .expect("rapid-selection fixture runtime")
+                    .selection,
+                SelectionState::None
+            ),
+            "the GUI must not mutate canonical selection before command drain"
+        );
+        assert!(
+            projection
+                .lock()
+                .expect("rapid-selection projection")
+                .as_deref()
+                .is_some_and(|selected| selected.is_empty())
+        );
+        assert_eq!(view.selection_events.len(), 2);
+        assert_eq!(view.selection_events[0].tick, 0);
+        assert_eq!(view.selection_events[0].total_selected, 1);
+        assert_eq!(view.selection_events[0].sample_ids, vec![agent_id]);
+        assert_eq!(view.selection_events[1].tick, 0);
+        assert_eq!(view.selection_events[1].total_selected, 0);
+
+        driver
+            .lock()
+            .expect("rapid-selection driver")
+            .drive_at(Instant::now());
+        assert!(
+            pending_commands
+                .lock()
+                .expect("rapid-selection command queue")
+                .is_empty()
+        );
+        assert!(
+            matches!(
+                world
+                    .lock()
+                    .expect("rapid-selection world lock")
+                    .agent_runtime(agent_id)
+                    .expect("rapid-selection fixture runtime")
+                    .selection,
+                SelectionState::None
+            ),
+            "FIFO application of Add then Clear must reproduce the projected final state"
+        );
+        let _ = view.snapshot();
+        assert!(
+            projection
+                .lock()
+                .expect("rapid-selection projection")
+                .is_none(),
+            "a canonical state matching the projection must clear pending presentation state"
+        );
+    }
+
+    #[test]
+    fn hover_is_view_local_command_free_and_digest_neutral() {
+        let world = command_characterization_world();
+        let agent_id = world
+            .lock()
+            .expect("hover-isolation world lock")
+            .try_spawn_agent(AgentData::default())
+            .expect("spawn hover-isolation fixture agent");
+        let driver = gui_simulation_driver(&world, Arc::new(Vec::new));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let projection = Arc::new(Mutex::new(None));
+        let submission = Arc::new(Mutex::new(()));
+        let make_view = |title: &'static str| {
+            let captured_attempts = Arc::clone(&attempts);
+            SimulationView::new(
+                Arc::clone(&driver),
+                AnalyticsSnapshotProvider::empty(),
+                title.into(),
+                Arc::new(move |_command| {
+                    captured_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                    true
+                }),
+                Arc::clone(&projection),
+                Arc::clone(&submission),
+            )
+        };
+        let mut hud_view = make_view("hover HUD");
+        let mut canvas_view = make_view("hover canvas");
+        let digest_before = world
+            .lock()
+            .expect("hover-isolation world lock")
+            .world_digest_v1()
+            .expect("hover-isolation digest");
+
+        assert!(hud_view.apply_hover_change(Some(agent_id)));
+        assert_eq!(
+            attempts.load(AtomicOrdering::Relaxed),
+            0,
+            "hover must not enter the scientific command bus"
+        );
+        assert!(
+            matches!(
+                world
+                    .lock()
+                    .expect("hover-isolation world lock")
+                    .agent_runtime(agent_id)
+                    .expect("hover-isolation fixture runtime")
+                    .selection,
+                SelectionState::None
+            ),
+            "hover must not write canonical selection state"
+        );
+        assert_eq!(
+            world
+                .lock()
+                .expect("hover-isolation world lock")
+                .world_digest_v1()
+                .expect("hover-isolation digest"),
+            digest_before,
+            "presentation-only hover must be science-digest neutral"
+        );
+
+        let hud_snapshot = hud_view.snapshot();
+        assert_eq!(
+            hud_snapshot
+                .inspector
+                .hovered
+                .as_ref()
+                .map(|entry| entry.agent_id),
+            Some(agent_id)
+        );
+        assert!(
+            hud_snapshot
+                .render_frame
+                .as_ref()
+                .and_then(|frame| { frame.agents.iter().find(|agent| agent.agent_id == agent_id) })
+                .is_some_and(|agent| matches!(agent.selection, SelectionState::Hovered))
+        );
+
+        let canvas_snapshot = canvas_view.snapshot();
+        assert!(canvas_snapshot.inspector.hovered.is_none());
+        assert!(
+            canvas_snapshot
+                .render_frame
+                .as_ref()
+                .and_then(|frame| { frame.agents.iter().find(|agent| agent.agent_id == agent_id) })
+                .is_some_and(|agent| matches!(agent.selection, SelectionState::None)),
+            "hover in one GPUI view must not leak into the other view"
+        );
+
+        let _ = world
+            .lock()
+            .expect("hover-isolation world lock")
+            .apply_selection_update(SelectionUpdate {
+                mode: SelectionMode::Replace,
+                agent_ids: vec![agent_id.raw()],
+                state: SelectionState::Selected,
+            });
+        let selected_snapshot = hud_view.snapshot();
+        assert!(selected_snapshot.inspector.hovered.is_none());
+        assert!(
+            selected_snapshot
+                .render_frame
+                .as_ref()
+                .and_then(|frame| { frame.agents.iter().find(|agent| agent.agent_id == agent_id) })
+                .is_some_and(|agent| matches!(agent.selection, SelectionState::Selected)),
+            "canonical Selected must dominate local hover presentation"
+        );
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 0);
     }
 
     fn seeded_digest_trace_after_production_repaints(
