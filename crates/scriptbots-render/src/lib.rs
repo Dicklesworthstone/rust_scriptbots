@@ -8,10 +8,11 @@ mod hud_capture;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
-    AlignItems, App, Background, Bounds, Context, Div, FocusHandle, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
-    QuitMode, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement, Window,
-    WindowBounds, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    AlignItems, App, Background, Bounds, Context, Corners, Div, FocusHandle, KeyDownEvent,
+    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
+    Point, QuitMode, RenderImage, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
+    StyleRefinement, Window, WindowBounds, WindowOptions, canvas, div, fill, point, prelude::*, px,
+    rgb, size,
 };
 use gpui_platform::application;
 use rand::Rng;
@@ -57,7 +58,7 @@ use kira::{
     sound::static_sound::{StaticSoundData, StaticSoundSettings},
 };
 
-use image::{ImageBuffer, Rgba as ImgRgba};
+use image::{Frame as ImageFrame, ImageBuffer, Rgba as ImgRgba};
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "world_wgpu")]
@@ -2309,6 +2310,15 @@ struct SimulationView {
     title: SharedString,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     camera: Arc<Mutex<Camera>>,
+    /// Window-local GPUI atlas images for the continuously sampled world field.
+    ///
+    /// This must not be shared between the HUD and world windows: GPUI atlas
+    /// eviction is window-scoped, and one view dropping another view's image
+    /// would intermittently reveal stale terrain.
+    world_raster_cache: Arc<Mutex<WorldRasterCache>>,
+    world_raster_cleanup_registered: bool,
+    #[cfg(test)]
+    force_legacy_world_painter: bool,
     inspector: Arc<Mutex<InspectorState>>,
     selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
     selection_submission: Arc<Mutex<()>>,
@@ -2391,6 +2401,10 @@ impl SimulationView {
             title,
             command_submit,
             camera: Arc::new(Mutex::new(Camera::default())),
+            world_raster_cache: Arc::new(Mutex::new(WorldRasterCache::default())),
+            world_raster_cleanup_registered: false,
+            #[cfg(test)]
+            force_legacy_world_painter: false,
             inspector: Arc::new(Mutex::new(inspector_state)),
             selection_projection,
             selection_submission,
@@ -4123,6 +4137,9 @@ impl SimulationView {
         let canvas_state = CanvasState {
             frame: frame.clone(),
             camera: Arc::clone(&self.camera),
+            world_raster_cache: Arc::clone(&self.world_raster_cache),
+            #[cfg(test)]
+            force_legacy_world_painter: self.force_legacy_world_painter,
             focus_agent: snapshot.inspector.focus_id,
             controls: snapshot.controls,
             debug: self.debug,
@@ -10163,6 +10180,22 @@ mod srgb_ownership_tests {
 
 impl Render for SimulationView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.world_raster_cleanup_registered {
+            cx.on_release_in(window, |this, window, _| {
+                let images = match this.world_raster_cache.lock() {
+                    Ok(mut cache) => cache.drain(),
+                    Err(poisoned) => poisoned.into_inner().drain(),
+                };
+                for image in images {
+                    if let Err(error) = window.drop_image(image) {
+                        debug!(?error, "could not evict released world raster image");
+                    }
+                }
+            })
+            .detach();
+            self.world_raster_cleanup_registered = true;
+        }
+
         self.perf.begin_frame();
 
         let live_snapshot = self.snapshot();
@@ -12522,9 +12555,74 @@ struct TerrainTileVisual {
     kind: TerrainKind,
     elevation: f32,
     moisture: f32,
+    fertility_bias: f32,
     accent: f32,
     slope: f32,
     water_depth: f32,
+    elevation_gradient: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorldRasterKey {
+    field_fingerprint: u64,
+    tick: u64,
+    daylight_bits: u32,
+    palette: ColorPaletteMode,
+    draw_food: bool,
+}
+
+struct CachedWorldRaster {
+    key: WorldRasterKey,
+    image: Arc<RenderImage>,
+}
+
+/// Bounded GPUI atlas ownership for a single [`SimulationView`].
+///
+/// GPUI caches a render image by its generated ID and does not evict it when
+/// the last application `Arc` is dropped. Keeping the current and immediately
+/// previous images gives the compositor one complete frame of overlap; the
+/// image older than that is explicitly retired after the replacement paints.
+#[derive(Default)]
+struct WorldRasterCache {
+    current: Option<CachedWorldRaster>,
+    previous: Option<Arc<RenderImage>>,
+}
+
+impl WorldRasterCache {
+    fn image_for(&self, key: WorldRasterKey) -> Option<Arc<RenderImage>> {
+        self.current
+            .as_ref()
+            .filter(|entry| entry.key == key)
+            .map(|entry| Arc::clone(&entry.image))
+    }
+
+    fn commit(&mut self, key: WorldRasterKey, image: Arc<RenderImage>) -> Option<Arc<RenderImage>> {
+        let retired = self.previous.take();
+        self.previous = self
+            .current
+            .replace(CachedWorldRaster { key, image })
+            .map(|entry| entry.image);
+        retired
+    }
+
+    fn drain(&mut self) -> Vec<Arc<RenderImage>> {
+        let mut images = Vec::with_capacity(2);
+        if let Some(entry) = self.current.take() {
+            images.push(entry.image);
+        }
+        if let Some(previous) = self.previous.take()
+            && images.iter().all(|image| image.id != previous.id)
+        {
+            images.push(previous);
+        }
+        images
+    }
+}
+
+struct WorldRasterPixels {
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -12651,6 +12749,9 @@ struct AgentRenderData {
 struct CanvasState {
     frame: RenderFrame,
     camera: Arc<Mutex<Camera>>,
+    world_raster_cache: Arc<Mutex<WorldRasterCache>>,
+    #[cfg(test)]
+    force_legacy_world_painter: bool,
     focus_agent: Option<AgentId>,
     controls: ControlsSnapshot,
     debug: DebugOverlayState,
@@ -12880,17 +12981,23 @@ fn build_terrain_frame(layer: &TerrainLayer, water_depth: Option<&[f32]>) -> Ter
                 + (tile.elevation - down.elevation).abs())
                 * 0.25;
             let slope = slope.min(1.0);
+            let cell_size = layer.cell_size() as f32;
+            let world_x = (x as f32 + 0.5) * cell_size;
+            let world_y = (y as f32 + 0.5) * cell_size;
+            let (gradient_x, gradient_y) = layer.gradient_world(world_x, world_y, cell_size);
 
             tiles.push(TerrainTileVisual {
                 kind: tile.kind,
                 elevation: tile.elevation,
                 moisture: tile.moisture,
+                fertility_bias: tile.fertility_bias,
                 accent: tile.accent,
                 slope,
                 water_depth: water_depth
                     .and_then(|depths| depths.get(idx))
                     .copied()
                     .unwrap_or(0.0),
+                elevation_gradient: [gradient_x, gradient_y],
             });
         }
     }
@@ -13855,6 +13962,502 @@ fn terrain_surface_color(
     apply_palette(rgba_from_triplet_with_alpha(blended, 1.0), palette)
 }
 
+const WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL: u32 = 4;
+const MAX_WORLD_RASTER_TEXELS: u64 = 1_048_576;
+
+fn world_raster_key(frame: &RenderFrame, daylight: f32, draw_food: bool) -> WorldRasterKey {
+    WorldRasterKey {
+        field_fingerprint: world_field_fingerprint(frame),
+        tick: frame.tick,
+        daylight_bits: daylight.to_bits(),
+        palette: frame.palette,
+        draw_food,
+    }
+}
+
+fn world_field_fingerprint(frame: &RenderFrame) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn push(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    let mut hash = FNV_OFFSET;
+    for value in [
+        frame.terrain.dimensions.0,
+        frame.terrain.dimensions.1,
+        frame.terrain.cell_size,
+        frame.food_dimensions.0,
+        frame.food_dimensions.1,
+        frame.food_cell_size,
+        frame.food_max.to_bits(),
+    ] {
+        push(&mut hash, &value.to_le_bytes());
+    }
+    for tile in &frame.terrain.tiles {
+        push(&mut hash, &[terrain_kind_index(tile.kind) as u8]);
+        for value in [
+            tile.elevation,
+            tile.moisture,
+            tile.fertility_bias,
+            tile.accent,
+            tile.slope,
+            tile.water_depth,
+            tile.elevation_gradient[0],
+            tile.elevation_gradient[1],
+        ] {
+            push(&mut hash, &value.to_bits().to_le_bytes());
+        }
+    }
+    for value in &frame.food_cells {
+        push(&mut hash, &value.to_bits().to_le_bytes());
+    }
+    hash
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn world_raster_dimensions(terrain: &TerrainFrame) -> Option<(u32, u32)> {
+    let (grid_width, grid_height) = terrain.dimensions;
+    if grid_width == 0 || grid_height == 0 || terrain.tiles.is_empty() {
+        return None;
+    }
+
+    let mut width = grid_width
+        .saturating_mul(WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL)
+        .max(1);
+    let mut height = grid_height
+        .saturating_mul(WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL)
+        .max(1);
+    let texels = u64::from(width).saturating_mul(u64::from(height));
+    if texels > MAX_WORLD_RASTER_TEXELS {
+        let scale = (MAX_WORLD_RASTER_TEXELS as f64 / texels as f64).sqrt();
+        width = ((f64::from(width) * scale).floor() as u32).max(1);
+        height = ((f64::from(height) * scale).floor() as u32).max(1);
+    }
+    Some((width, height))
+}
+
+#[inline]
+fn blend_scalar(values: &[f32], corners: &visual::TerrainSampleCorners) -> f32 {
+    corners
+        .indices
+        .iter()
+        .zip(corners.weights)
+        .map(|(index, weight)| values.get(*index).copied().unwrap_or(0.0) * weight)
+        .sum()
+}
+
+#[inline]
+fn blend_channels<const N: usize>(
+    values: &[[f32; N]],
+    corners: &visual::TerrainSampleCorners,
+) -> [f32; N] {
+    let mut blended = [0.0; N];
+    for (index, weight) in corners.indices.iter().zip(corners.weights) {
+        if let Some(value) = values.get(*index) {
+            for channel in 0..N {
+                blended[channel] += value[channel] * weight;
+            }
+        }
+    }
+    blended
+}
+
+fn sampling_topology(width: u32, height: u32, cell_size: f32) -> visual::TerrainFieldView<'static> {
+    visual::TerrainFieldView {
+        width,
+        height,
+        cell_size,
+        kinds: &[],
+        moisture: &[],
+        elevation: &[],
+        slope: &[],
+        water_depth: &[],
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn rasterize_world_fields(
+    frame: &RenderFrame,
+    daylight: f32,
+    draw_food: bool,
+) -> Option<WorldRasterPixels> {
+    let (raster_width, raster_height) = world_raster_dimensions(&frame.terrain)?;
+    let expected_tiles =
+        (frame.terrain.dimensions.0 as usize).saturating_mul(frame.terrain.dimensions.1 as usize);
+    if frame.terrain.tiles.len() < expected_tiles {
+        return None;
+    }
+
+    let mut kinds = Vec::with_capacity(expected_tiles);
+    let mut moisture = Vec::with_capacity(expected_tiles);
+    let mut fertility = Vec::with_capacity(expected_tiles);
+    let mut elevation = Vec::with_capacity(expected_tiles);
+    let mut slope = Vec::with_capacity(expected_tiles);
+    let mut water_depth = Vec::with_capacity(expected_tiles);
+    let mut accent = Vec::with_capacity(expected_tiles);
+    let mut gradients = Vec::with_capacity(expected_tiles);
+    let mut splats = Vec::with_capacity(expected_tiles);
+    for tile in frame.terrain.tiles.iter().take(expected_tiles) {
+        kinds.push(tile.kind);
+        moisture.push(tile.moisture);
+        fertility.push(tile.fertility_bias);
+        elevation.push(tile.elevation);
+        slope.push(tile.slope);
+        water_depth.push(tile.water_depth);
+        accent.push(tile.accent);
+        gradients.push(tile.elevation_gradient);
+        splats.push(visual::splat_weights(&SplatInput {
+            kind: tile.kind,
+            elevation: tile.elevation,
+            slope: tile.slope,
+            water_depth: tile.water_depth,
+        }));
+    }
+
+    let terrain_field = visual::TerrainFieldView {
+        width: frame.terrain.dimensions.0,
+        height: frame.terrain.dimensions.1,
+        cell_size: frame.terrain.cell_size as f32,
+        kinds: &kinds,
+        moisture: &moisture,
+        elevation: &elevation,
+        slope: &slope,
+        water_depth: &water_depth,
+    };
+    let food_field = sampling_topology(
+        frame.food_dimensions.0,
+        frame.food_dimensions.1,
+        frame.food_cell_size as f32,
+    );
+    let max_food = frame.food_max.max(f32::EPSILON);
+    let mut bgra = Vec::with_capacity(
+        (raster_width as usize)
+            .saturating_mul(raster_height as usize)
+            .saturating_mul(4),
+    );
+
+    for raster_y in 0..raster_height {
+        let world_y = (raster_y as f32 + 0.5) / raster_height as f32 * frame.world_size.1;
+        for raster_x in 0..raster_width {
+            let world_x = (raster_x as f32 + 0.5) / raster_width as f32 * frame.world_size.0;
+            let corners = terrain_field.sample_corners(world_x, world_y);
+            let weights = blend_channels(&splats, &corners);
+            let sampled_moisture = blend_scalar(&moisture, &corners);
+            let _sampled_fertility = blend_scalar(&fertility, &corners);
+            let sampled_elevation = blend_scalar(&elevation, &corners);
+            let sampled_slope = blend_scalar(&slope, &corners);
+            let sampled_accent = blend_scalar(&accent, &corners);
+            let _sampled_gradient = blend_channels(&gradients, &corners);
+
+            let mut terrain_rgb = [0.0_f32; 3];
+            for (layer, weight) in TERRAIN_SPLAT_KINDS.into_iter().zip(weights) {
+                let shaded = visual::terrain_shaded_color(&TerrainShadeInput {
+                    kind: layer,
+                    moisture: sampled_moisture,
+                    elevation: sampled_elevation,
+                    slope: sampled_slope,
+                    accent: sampled_accent,
+                    daylight,
+                });
+                terrain_rgb[0] += shaded[0] * weight;
+                terrain_rgb[1] += shaded[1] * weight;
+                terrain_rgb[2] += shaded[2] * weight;
+            }
+
+            let terrain_color = apply_palette(
+                rgba_from_triplet_with_alpha(terrain_rgb, 1.0),
+                frame.palette,
+            );
+            let mut display_rgb = [terrain_color.r, terrain_color.g, terrain_color.b];
+
+            if draw_food && !frame.food_cells.is_empty() {
+                let food_corners = food_field.sample_corners(world_x, world_y);
+                let food_density =
+                    (blend_scalar(&frame.food_cells, &food_corners) / max_food).clamp(0.0, 1.0);
+                if food_density > f32::EPSILON {
+                    let food_visuals = visual::food_visual_params(food_density);
+                    let food_cell_x = (world_x / frame.food_cell_size.max(1) as f32).floor() as u32;
+                    let food_cell_y = (world_y / frame.food_cell_size.max(1) as f32).floor() as u32;
+                    let shimmer = visual::shimmer(frame.tick, food_cell_x, food_cell_y);
+                    let gain = food_visuals.emissive_gain
+                        / visual::visual_style().food.dense_emissive_gain;
+                    let shade = (0.78 + 0.18 * shimmer + 0.22 * gain).clamp(0.0, 1.3);
+                    let food_rgb = visual::food_density_color(food_density);
+                    let food_color = apply_palette(
+                        rgba_from_triplet_with_alpha(
+                            [
+                                food_rgb[0] * shade,
+                                food_rgb[1] * shade,
+                                food_rgb[2] * shade,
+                            ],
+                            food_visuals.alpha,
+                        ),
+                        frame.palette,
+                    );
+                    let alpha = (food_color.a * food_density).clamp(0.0, 1.0);
+                    for channel in 0..3 {
+                        display_rgb[channel] = display_rgb[channel] * (1.0 - alpha)
+                            + [food_color.r, food_color.g, food_color.b][channel] * alpha;
+                    }
+                }
+            }
+
+            let to_byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+            bgra.extend_from_slice(&[
+                to_byte(display_rgb[2]),
+                to_byte(display_rgb[1]),
+                to_byte(display_rgb[0]),
+                u8::MAX,
+            ]);
+        }
+    }
+
+    Some(WorldRasterPixels {
+        width: raster_width,
+        height: raster_height,
+        bgra,
+    })
+}
+
+fn render_image_from_world_raster(pixels: WorldRasterPixels) -> Option<Arc<RenderImage>> {
+    let buffer = ImageBuffer::<ImgRgba<u8>, _>::from_raw(pixels.width, pixels.height, pixels.bgra)?;
+    Some(Arc::new(RenderImage::new(vec![ImageFrame::new(buffer)])))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_continuous_world_fields(
+    state: &CanvasState,
+    offset_x: f32,
+    offset_y: f32,
+    scale: f32,
+    daylight: f32,
+    window: &mut Window,
+) -> bool {
+    let frame = &state.frame;
+    let key = world_raster_key(frame, daylight, state.controls.draw_food);
+    let cached = match state.world_raster_cache.lock() {
+        Ok(cache) => cache.image_for(key),
+        Err(poisoned) => poisoned.into_inner().image_for(key),
+    };
+    let (image, newly_built) = if let Some(image) = cached {
+        (image, false)
+    } else {
+        let Some(pixels) = rasterize_world_fields(frame, daylight, state.controls.draw_food) else {
+            return false;
+        };
+        let Some(image) = render_image_from_world_raster(pixels) else {
+            return false;
+        };
+        (image, true)
+    };
+
+    let world_bounds = Bounds::new(
+        point(px(offset_x), px(offset_y)),
+        size(
+            px((frame.world_size.0 * scale).max(1.0)),
+            px((frame.world_size.1 * scale).max(1.0)),
+        ),
+    );
+    let paint_result = window.paint_layer(world_bounds, |window| {
+        window.paint_image(
+            world_bounds,
+            Corners::default(),
+            Arc::clone(&image),
+            0,
+            false,
+        )
+    });
+
+    if let Err(error) = paint_result {
+        if newly_built {
+            let _ = window.drop_image(image);
+        }
+        warn!(
+            ?error,
+            "continuous world raster upload failed; using cell fallback"
+        );
+        return false;
+    }
+
+    if newly_built {
+        let retired = match state.world_raster_cache.lock() {
+            Ok(mut cache) => cache.commit(key, image),
+            Err(poisoned) => poisoned.into_inner().commit(key, image),
+        };
+        if let Some(retired) = retired
+            && let Err(error) = window.drop_image(retired)
+        {
+            debug!(?error, "could not evict retired world raster image");
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod continuous_world_raster_tests {
+    use super::*;
+
+    fn tile(kind: TerrainKind) -> TerrainTileVisual {
+        TerrainTileVisual {
+            kind,
+            elevation: 0.5,
+            moisture: 0.5,
+            fertility_bias: 0.5,
+            accent: 0.25,
+            slope: 0.0,
+            water_depth: 0.0,
+            elevation_gradient: [0.0, 0.0],
+        }
+    }
+
+    fn frame(
+        dimensions: (u32, u32),
+        cell_size: u32,
+        tiles: Vec<TerrainTileVisual>,
+        food_dimensions: (u32, u32),
+        food_cell_size: u32,
+        food_cells: Vec<f32>,
+    ) -> RenderFrame {
+        RenderFrame {
+            tick: 17,
+            tonemap_mode: None,
+            day_night_cycle_ticks: 0,
+            day_night_start_phase: 0.25,
+            world_size: (
+                dimensions.0 as f32 * cell_size as f32,
+                dimensions.1 as f32 * cell_size as f32,
+            ),
+            terrain: TerrainFrame {
+                dimensions,
+                cell_size,
+                tiles,
+            },
+            food_dimensions,
+            food_cell_size,
+            food_cells,
+            food_max: 1.0,
+            agents: Vec::new(),
+            agent_reference_age: 1,
+            agent_base_radius: 1.0,
+            sense_radius: 1.0,
+            post_stack: PostProcessStack { passes: Vec::new() },
+            palette: ColorPaletteMode::Natural,
+        }
+    }
+
+    fn rgb_at(pixels: &WorldRasterPixels, x: u32, y: u32) -> [f32; 3] {
+        let offset = ((y * pixels.width + x) * 4) as usize;
+        [
+            f32::from(pixels.bgra[offset + 2]) / 255.0,
+            f32::from(pixels.bgra[offset + 1]) / 255.0,
+            f32::from(pixels.bgra[offset]) / 255.0,
+        ]
+    }
+
+    fn rgb_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
+        (left[0] - right[0]).abs() + (left[1] - right[1]).abs() + (left[2] - right[2]).abs()
+    }
+
+    #[test]
+    fn continuous_raster_blends_biome_boundaries_and_toroidal_seam() {
+        let frame = frame(
+            (2, 1),
+            10,
+            vec![tile(TerrainKind::DeepWater), tile(TerrainKind::Bloom)],
+            (1, 1),
+            20,
+            vec![0.0],
+        );
+        let pixels =
+            rasterize_world_fields(&frame, visual::DAYLIGHT_STATIC, false).expect("world raster");
+
+        let left = rgb_at(&pixels, 1, 1);
+        let right = rgb_at(&pixels, 5, 1);
+        let interior_step = rgb_distance(rgb_at(&pixels, 3, 1), rgb_at(&pixels, 4, 1));
+        let seam_step = rgb_distance(rgb_at(&pixels, 7, 1), rgb_at(&pixels, 0, 1));
+        let endpoint_distance = rgb_distance(left, right);
+
+        assert!(
+            endpoint_distance > 0.05,
+            "fixture must contain visibly different biome endpoints"
+        );
+        assert!(
+            interior_step < endpoint_distance * 0.6,
+            "the cell boundary remained a hard color step: {interior_step} vs endpoints \
+             {endpoint_distance}"
+        );
+        assert!(
+            seam_step < endpoint_distance * 0.6,
+            "the wrapped seam remained a hard color step: {seam_step} vs endpoints \
+             {endpoint_distance}"
+        );
+    }
+
+    #[test]
+    fn food_field_tapers_away_from_a_hotspot_instead_of_filling_a_cell() {
+        let terrain = vec![tile(TerrainKind::Grass); 4];
+        let without_food = frame((4, 1), 10, terrain.clone(), (2, 1), 20, vec![1.0, 0.0]);
+        let with_food = without_food.clone();
+        let base = rasterize_world_fields(&without_food, visual::DAYLIGHT_STATIC, false)
+            .expect("terrain raster");
+        let food =
+            rasterize_world_fields(&with_food, visual::DAYLIGHT_STATIC, true).expect("food raster");
+
+        let hotspot = rgb_distance(rgb_at(&food, 3, 1), rgb_at(&base, 3, 1));
+        let transition = rgb_distance(rgb_at(&food, 7, 1), rgb_at(&base, 7, 1));
+        let sparse = rgb_distance(rgb_at(&food, 11, 1), rgb_at(&base, 11, 1));
+
+        assert!(
+            hotspot > transition && transition > sparse,
+            "food must taper continuously: hotspot={hotspot}, transition={transition}, \
+             sparse={sparse}"
+        );
+    }
+
+    fn image(byte: u8) -> Arc<RenderImage> {
+        render_image_from_world_raster(WorldRasterPixels {
+            width: 1,
+            height: 1,
+            bgra: vec![byte, byte, byte, u8::MAX],
+        })
+        .expect("one-pixel render image")
+    }
+
+    fn key(tick: u64) -> WorldRasterKey {
+        WorldRasterKey {
+            field_fingerprint: tick,
+            tick,
+            daylight_bits: visual::DAYLIGHT_STATIC.to_bits(),
+            palette: ColorPaletteMode::Natural,
+            draw_food: true,
+        }
+    }
+
+    #[test]
+    fn raster_cache_reuses_keys_and_retires_only_two_generations_old() {
+        let mut cache = WorldRasterCache::default();
+        let a = image(1);
+        let b = image(2);
+        let c = image(3);
+
+        assert!(cache.commit(key(1), Arc::clone(&a)).is_none());
+        assert!(Arc::ptr_eq(&cache.image_for(key(1)).expect("cached A"), &a));
+        assert!(cache.commit(key(2), Arc::clone(&b)).is_none());
+        let retired = cache.commit(key(3), Arc::clone(&c)).expect("retired A");
+        assert!(Arc::ptr_eq(&retired, &a));
+
+        let drained = cache.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().any(|image| image.id == b.id));
+        assert!(drained.iter().any(|image| image.id == c.id));
+    }
+}
+
 fn terrain_slope_accent_color(
     tile: TerrainTileVisual,
     highlight_shift: f32,
@@ -14601,163 +15204,178 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         window.paint_quad(fill(aurora_bounds, Background::from(aurora_color)));
     }
 
-    let food_w = frame.food_dimensions.0 as usize;
-    let food_h = frame.food_dimensions.1 as usize;
-    paint_terrain_layer(
-        &frame.terrain,
-        offset_x,
-        offset_y,
-        scale,
-        daylight,
-        frame.palette,
-        view_left,
-        view_top,
-        view_right,
-        view_bottom,
-        window,
-    );
-    let cell_world = frame.food_cell_size as f32;
-    let _cell_px = (cell_world * scale).max(1.0);
-    let max_food = frame.food_max.max(f32::EPSILON);
-    let inv_max_food: f32 = if max_food > 0.0 {
-        1.0_f32 / max_food
-    } else {
-        0.0_f32
+    let use_continuous_world_fields = {
+        #[cfg(test)]
+        {
+            !state.force_legacy_world_painter
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
     };
-
-    if controls.draw_food {
-        // Compute visible cell range to cull off-screen food cells
+    if !use_continuous_world_fields
+        || !paint_continuous_world_fields(state, offset_x, offset_y, scale, daylight, window)
+    {
+        let food_w = frame.food_dimensions.0 as usize;
+        let food_h = frame.food_dimensions.1 as usize;
+        paint_terrain_layer(
+            &frame.terrain,
+            offset_x,
+            offset_y,
+            scale,
+            daylight,
+            frame.palette,
+            view_left,
+            view_top,
+            view_right,
+            view_bottom,
+            window,
+        );
         let cell_world = frame.food_cell_size as f32;
-        let cell_px = (cell_world * scale).max(1.0);
-        let inv_cell_px = if cell_px > f32::EPSILON {
-            1.0 / cell_px
+        let _cell_px = (cell_world * scale).max(1.0);
+        let max_food = frame.food_max.max(f32::EPSILON);
+        let inv_max_food: f32 = if max_food > 0.0 {
+            1.0_f32 / max_food
         } else {
-            0.0
+            0.0_f32
         };
-        let mut x_min = ((view_left - offset_x) * inv_cell_px).floor() as isize;
-        let mut x_max = ((view_right - offset_x) * inv_cell_px).ceil() as isize;
-        let mut y_min = ((view_top - offset_y) * inv_cell_px).floor() as isize;
-        let mut y_max = ((view_bottom - offset_y) * inv_cell_px).ceil() as isize;
-        x_min = x_min.clamp(0, food_w as isize - 1);
-        x_max = x_max.clamp(0, food_w as isize - 1);
-        y_min = y_min.clamp(0, food_h as isize - 1);
-        y_max = y_max.clamp(0, food_h as isize - 1);
 
-        if very_low_fps {
-            // Quantized batching: approximate per-cell shading by grouping into bins, reducing draw calls
-            const FOOD_BINS: usize = 24;
-            for y in y_min as usize..=y_max as usize {
-                let mut builders: [Option<PathBuilder>; FOOD_BINS] = [
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                ];
-                let mut colors: [Option<Rgba>; FOOD_BINS] = [None; FOOD_BINS];
-                for x in x_min as usize..=x_max as usize {
-                    let idx = y * food_w + x;
-                    let value = frame.food_cells.get(idx).copied().unwrap_or_default();
-                    if value <= 0.001 {
-                        continue;
-                    }
-                    let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
-                    let food_visuals = visual::food_visual_params(intensity);
-                    let mut color = food_color(intensity);
-                    let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
-                    let gain = food_visuals.emissive_gain
-                        / visual::visual_style().food.dense_emissive_gain;
-                    let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
-                    color = scale_rgb(color, shade);
-                    if !palette_is_natural {
-                        color = apply_palette(color, frame.palette);
-                    }
+        if controls.draw_food {
+            // Compute visible cell range to cull off-screen food cells
+            let cell_world = frame.food_cell_size as f32;
+            let cell_px = (cell_world * scale).max(1.0);
+            let inv_cell_px = if cell_px > f32::EPSILON {
+                1.0 / cell_px
+            } else {
+                0.0
+            };
+            let mut x_min = ((view_left - offset_x) * inv_cell_px).floor() as isize;
+            let mut x_max = ((view_right - offset_x) * inv_cell_px).ceil() as isize;
+            let mut y_min = ((view_top - offset_y) * inv_cell_px).floor() as isize;
+            let mut y_max = ((view_bottom - offset_y) * inv_cell_px).ceil() as isize;
+            x_min = x_min.clamp(0, food_w as isize - 1);
+            x_max = x_max.clamp(0, food_w as isize - 1);
+            y_min = y_min.clamp(0, food_h as isize - 1);
+            y_max = y_max.clamp(0, food_h as isize - 1);
 
-                    // Quantize based on luminance to group similar colors
-                    let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-                    let mut bin = ((luma * (FOOD_BINS as f32)) as isize)
-                        .clamp(0, (FOOD_BINS as isize) - 1)
-                        as usize;
-                    // Avoid bin 0 swallowing very dark but present cells when alpha is tiny
-                    if bin == 0 && luma > 0.0 {
-                        bin = 1;
-                    }
+            if very_low_fps {
+                // Quantized batching: approximate per-cell shading by grouping into bins, reducing draw calls
+                const FOOD_BINS: usize = 24;
+                for y in y_min as usize..=y_max as usize {
+                    let mut builders: [Option<PathBuilder>; FOOD_BINS] = [
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                        Some(PathBuilder::fill()),
+                    ];
+                    let mut colors: [Option<Rgba>; FOOD_BINS] = [None; FOOD_BINS];
+                    for x in x_min as usize..=x_max as usize {
+                        let idx = y * food_w + x;
+                        let value = frame.food_cells.get(idx).copied().unwrap_or_default();
+                        if value <= 0.001 {
+                            continue;
+                        }
+                        let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
+                        let food_visuals = visual::food_visual_params(intensity);
+                        let mut color = food_color(intensity);
+                        let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
+                        let gain = food_visuals.emissive_gain
+                            / visual::visual_style().food.dense_emissive_gain;
+                        let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
+                        color = scale_rgb(color, shade);
+                        if !palette_is_natural {
+                            color = apply_palette(color, frame.palette);
+                        }
 
-                    let px_x = offset_x + (x as f32 * cell_world * scale);
-                    let px_y = offset_y + (y as f32 * cell_world * scale);
-                    if let Some(builder) = builders[bin].as_mut() {
-                        // Stable-hue motes shrink sparse food away from the cell edges.
+                        // Quantize based on luminance to group similar colors
+                        let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+                        let mut bin = ((luma * (FOOD_BINS as f32)) as isize)
+                            .clamp(0, (FOOD_BINS as isize) - 1)
+                            as usize;
+                        // Avoid bin 0 swallowing very dark but present cells when alpha is tiny
+                        if bin == 0 && luma > 0.0 {
+                            bin = 1;
+                        }
+
+                        let px_x = offset_x + (x as f32 * cell_world * scale);
+                        let px_y = offset_y + (y as f32 * cell_world * scale);
+                        if let Some(builder) = builders[bin].as_mut() {
+                            // Stable-hue motes shrink sparse food away from the cell edges.
+                            let mote_px =
+                                (cell_px * food_visuals.relative_radius.min(1.0)).max(1.0);
+                            let inset = (cell_px - mote_px) * 0.5;
+                            let x0 = px(px_x + inset);
+                            let y0 = px(px_y + inset);
+                            let x1 = px(px_x + inset + mote_px);
+                            let y1 = px(px_y + inset + mote_px);
+                            builder.move_to(point(x0, y0));
+                            builder.line_to(point(x1, y0));
+                            builder.line_to(point(x1, y1));
+                            builder.line_to(point(x0, y1));
+                            builder.close();
+                        }
+                        if colors[bin].is_none() {
+                            colors[bin] = Some(color);
+                        }
+                    }
+                    for b in 0..FOOD_BINS {
+                        if let (Some(builder), Some(col)) = (builders[b].take(), colors[b])
+                            && let Ok(path) = builder.build()
+                        {
+                            window.paint_path(path, col);
+                        }
+                    }
+                }
+            } else {
+                for y in y_min as usize..=y_max as usize {
+                    for x in x_min as usize..=x_max as usize {
+                        let idx = y * food_w + x;
+                        let value = frame.food_cells.get(idx).copied().unwrap_or_default();
+                        if value <= 0.001 {
+                            continue;
+                        }
+                        let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
+                        let food_visuals = visual::food_visual_params(intensity);
+                        let mut color = food_color(intensity);
+                        let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
+                        let gain = food_visuals.emissive_gain
+                            / visual::visual_style().food.dense_emissive_gain;
+                        let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
+                        color = scale_rgb(color, shade);
+                        if !palette_is_natural {
+                            color = apply_palette(color, frame.palette);
+                        }
+                        let px_x = offset_x + (x as f32 * cell_world * scale);
+                        let px_y = offset_y + (y as f32 * cell_world * scale);
                         let mote_px = (cell_px * food_visuals.relative_radius.min(1.0)).max(1.0);
                         let inset = (cell_px - mote_px) * 0.5;
-                        let x0 = px(px_x + inset);
-                        let y0 = px(px_y + inset);
-                        let x1 = px(px_x + inset + mote_px);
-                        let y1 = px(px_y + inset + mote_px);
-                        builder.move_to(point(x0, y0));
-                        builder.line_to(point(x1, y0));
-                        builder.line_to(point(x1, y1));
-                        builder.line_to(point(x0, y1));
-                        builder.close();
+                        let cell_bounds = Bounds::new(
+                            point(px(px_x + inset), px(px_y + inset)),
+                            size(px(mote_px), px(mote_px)),
+                        );
+                        window.paint_quad(fill(cell_bounds, Background::from(color)));
                     }
-                    if colors[bin].is_none() {
-                        colors[bin] = Some(color);
-                    }
-                }
-                for b in 0..FOOD_BINS {
-                    if let (Some(builder), Some(col)) = (builders[b].take(), colors[b])
-                        && let Ok(path) = builder.build()
-                    {
-                        window.paint_path(path, col);
-                    }
-                }
-            }
-        } else {
-            for y in y_min as usize..=y_max as usize {
-                for x in x_min as usize..=x_max as usize {
-                    let idx = y * food_w + x;
-                    let value = frame.food_cells.get(idx).copied().unwrap_or_default();
-                    if value <= 0.001 {
-                        continue;
-                    }
-                    let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
-                    let food_visuals = visual::food_visual_params(intensity);
-                    let mut color = food_color(intensity);
-                    let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
-                    let gain = food_visuals.emissive_gain
-                        / visual::visual_style().food.dense_emissive_gain;
-                    let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
-                    color = scale_rgb(color, shade);
-                    if !palette_is_natural {
-                        color = apply_palette(color, frame.palette);
-                    }
-                    let px_x = offset_x + (x as f32 * cell_world * scale);
-                    let px_y = offset_y + (y as f32 * cell_world * scale);
-                    let mote_px = (cell_px * food_visuals.relative_radius.min(1.0)).max(1.0);
-                    let inset = (cell_px - mote_px) * 0.5;
-                    let cell_bounds = Bounds::new(
-                        point(px(px_x + inset), px(px_y + inset)),
-                        size(px(mote_px), px(mote_px)),
-                    );
-                    window.paint_quad(fill(cell_bounds, Background::from(color)));
                 }
             }
         }

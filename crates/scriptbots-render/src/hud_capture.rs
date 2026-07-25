@@ -33,6 +33,16 @@ pub(crate) fn capture_view(
     width: f32,
     height: f32,
 ) -> Result<RgbaImage, String> {
+    capture_view_with_world_painter(world, role, width, height, false)
+}
+
+fn capture_view_with_world_painter(
+    world: Arc<Mutex<WorldState>>,
+    role: GuiViewRole,
+    width: f32,
+    height: f32,
+    force_legacy_world_painter: bool,
+) -> Result<RgbaImage, String> {
     // `headless = true`: no window server is contacted. The text system still comes from
     // the real platform, so glyph rasterization matches what a user sees.
     let platform = gpui_platform::current_platform(true);
@@ -67,7 +77,9 @@ pub(crate) fn capture_view(
             app.new(|cx| {
                 let focus_handle = cx.focus_handle();
                 focus_handle.focus(window, cx);
-                session.new_view(role, focus_handle)
+                let mut view = session.new_view(role, focus_handle);
+                view.force_legacy_world_painter = force_legacy_world_painter;
+                view
             })
         })
         .map_err(|error| format!("open headless GPUI window: {error:?}"))?;
@@ -180,5 +192,76 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn continuous_world_painter_changes_real_gpui_pixels_without_changing_science() {
+        let probe_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/rendering_reference/live_probes/bd-1lls");
+        std::fs::create_dir_all(&probe_dir).expect("bd-1lls probe output directory");
+
+        let world = capture_world();
+        let digest_before = world
+            .lock()
+            .expect("capture world lock")
+            .world_digest_v1()
+            .expect("pre-capture world digest");
+        let legacy = capture_view_with_world_painter(
+            Arc::clone(&world),
+            GuiViewRole::WorldCanvas,
+            1280.0,
+            720.0,
+            true,
+        )
+        .unwrap_or_else(|error| panic!("headless legacy world capture failed: {error:#}"));
+        let digest_after_legacy = world
+            .lock()
+            .expect("capture world lock")
+            .world_digest_v1()
+            .expect("post-legacy-capture world digest");
+        let continuous = capture_view_with_world_painter(
+            Arc::clone(&world),
+            GuiViewRole::WorldCanvas,
+            1280.0,
+            720.0,
+            false,
+        )
+        .unwrap_or_else(|error| panic!("headless continuous world capture failed: {error:#}"));
+        let digest_after_continuous = world
+            .lock()
+            .expect("capture world lock")
+            .world_digest_v1()
+            .expect("post-continuous-capture world digest");
+
+        assert_eq!(legacy.dimensions(), (1280, 720));
+        assert_eq!(continuous.dimensions(), (1280, 720));
+        assert_eq!(
+            digest_before, digest_after_legacy,
+            "legacy repaint mutated scientific state"
+        );
+        assert_eq!(
+            digest_before, digest_after_continuous,
+            "continuous repaint mutated scientific state"
+        );
+
+        let differing_pixels = legacy
+            .pixels()
+            .zip(continuous.pixels())
+            .filter(|(left, right)| left != right)
+            .count();
+        let minimum_changed = (legacy.width() as usize * legacy.height() as usize) / 100;
+        assert!(
+            differing_pixels > minimum_changed,
+            "production GPUI capture did not exercise the continuous world painter: only \
+             {differing_pixels} pixels changed (minimum {minimum_changed})"
+        );
+
+        legacy
+            .save(probe_dir.join("before_per_cell_quads_1280x720.png"))
+            .expect("write bd-1lls baseline probe");
+        continuous
+            .save(probe_dir.join("after_continuous_fields_1280x720.png"))
+            .expect("write bd-1lls continuous-field probe");
     }
 }
