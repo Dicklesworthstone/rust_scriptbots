@@ -404,7 +404,7 @@ pub struct ChannelHostDriver {
     pending_ingress: Option<IngressMessage>,
     statuses: Arc<RwLock<StatusBoard>>,
     protocol_events: Arc<RwLock<ProtocolEventBoard>>,
-    tracked: VecDeque<CommandId>,
+    mirror_poll_ids: Vec<CommandId>,
     last_protocol_event: ProtocolEventSequence,
     ingress_drain_budget: usize,
     status_board_capacity: usize,
@@ -446,7 +446,7 @@ impl ChannelHostDriver {
             pending_ingress: None,
             statuses,
             protocol_events,
-            tracked: VecDeque::new(),
+            mirror_poll_ids: Vec::new(),
             last_protocol_event,
             ingress_drain_budget: options.ingress_drain_budget,
             status_board_capacity: options.status_board_capacity,
@@ -458,16 +458,6 @@ impl ChannelHostDriver {
         Ok((driver, port))
     }
 
-    fn track(&mut self, command_id: CommandId) {
-        if self.tracked.contains(&command_id) {
-            return;
-        }
-        self.tracked.push_back(command_id);
-        while self.tracked.len() > self.status_board_capacity {
-            self.tracked.pop_front();
-        }
-    }
-
     fn mirror_one(&mut self, command_id: CommandId) {
         let Ok(Some(status)) = self.port.command_status(command_id) else {
             return;
@@ -477,11 +467,16 @@ impl ChannelHostDriver {
         }
     }
 
-    fn mirror_tracked(&mut self) {
-        for index in 0..self.tracked.len() {
-            let Some(command_id) = self.tracked.get(index).copied() else {
-                continue;
-            };
+    fn mirror_retained_statuses(&mut self) {
+        self.mirror_poll_ids.clear();
+        let Ok(board) = self.statuses.read() else {
+            return;
+        };
+        self.mirror_poll_ids.extend(board.order.iter().copied());
+        drop(board);
+
+        for index in 0..self.mirror_poll_ids.len() {
+            let command_id = self.mirror_poll_ids[index];
             self.mirror_one(command_id);
         }
     }
@@ -503,10 +498,8 @@ impl ChannelHostDriver {
     fn process_ingress(&mut self, message: IngressMessage) -> usize {
         match message {
             IngressMessage::Command { envelope, reply } => {
-                let command_id = envelope.command_id;
                 let result = self.host.submit(envelope);
                 if let Ok(status) = &result {
-                    self.track(command_id);
                     if let Ok(mut board) = self.statuses.write() {
                         board.insert(status.clone(), self.status_board_capacity);
                     }
@@ -590,7 +583,7 @@ impl ChannelHostDriver {
             let _ = self.host.request_shutdown()?;
             self.shutdown_requested = true;
         }
-        self.mirror_tracked();
+        self.mirror_retained_statuses();
         self.mirror_protocol_events();
         interest = self.host.drive_interest();
         Ok(ChannelStepReport {
@@ -1322,6 +1315,98 @@ mod tests {
         assert!(board.get(CommandId::new(71)).is_none());
         assert!(board.get(CommandId::new(72)).is_some());
         assert!(board.get(CommandId::new(73)).is_some());
+    }
+
+    #[test]
+    fn archived_retry_cannot_strand_a_retained_admitted_status() {
+        let (mut driver, mut port) = ChannelHostDriver::new(
+            test_host(false),
+            ChannelHostOptions {
+                status_board_capacity: 1,
+                ..fast_options()
+            },
+        )
+        .expect("driver");
+
+        fn process(driver: &mut ChannelHostDriver, envelope: CommandEnvelope) -> CommandStatus {
+            let (reply, receipt) = std::sync::mpsc::channel();
+            assert_eq!(
+                driver.process_ingress(IngressMessage::Command { envelope, reply }),
+                1
+            );
+            receipt
+                .recv()
+                .expect("authoritative admission reply")
+                .expect("host remains available")
+        }
+
+        let archived_id = CommandId::new(74);
+        let archived_envelope = CommandEnvelope::new(archived_id, HostCommand::Pause);
+        let admitted = process(&mut driver, archived_envelope.clone());
+        assert!(matches!(admitted.application(), ApplicationState::Admitted));
+
+        driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("pause applies");
+        driver
+            .step(ManualInstant::from_nanos(2))
+            .expect("volatile journal receipt settles");
+        let archived = port
+            .command_status(archived_id)
+            .expect("mirrored lookup")
+            .expect("settled pause retained");
+        assert!(matches!(
+            archived.application(),
+            ApplicationState::Applied(_)
+        ));
+        assert!(status_is_finished(&archived));
+
+        // Fresh A displaces terminal B from both retention structures. An
+        // archived retry of B then made the old FIFO drop A while the board
+        // protected admitted A by immediately evicting terminal B again.
+        let retained_id = CommandId::new(75);
+        let retained = process(
+            &mut driver,
+            CommandEnvelope::new(retained_id, HostCommand::SetSpeed(2.0)),
+        );
+        assert!(matches!(retained.application(), ApplicationState::Admitted));
+
+        let retry = process(&mut driver, archived_envelope);
+        assert_eq!(retry, archived);
+        assert!(
+            port.command_status(archived_id)
+                .expect("mirrored lookup")
+                .is_none(),
+            "the terminal retry must evict itself before the retained admission"
+        );
+        assert!(matches!(
+            port.command_status(retained_id)
+                .expect("mirrored lookup")
+                .expect("admitted status retained")
+                .application(),
+            ApplicationState::Admitted
+        ));
+
+        let report = driver
+            .step(ManualInstant::from_nanos(3))
+            .expect("retained command applies");
+        assert!(report.drove);
+        assert!(matches!(
+            driver
+                .port
+                .command_status(retained_id)
+                .expect("authoritative lookup")
+                .expect("authoritative status retained")
+                .application(),
+            ApplicationState::Applied(_)
+        ));
+        let mirrored = port.command_status(retained_id).expect("mirrored lookup");
+        assert!(
+            !mirrored
+                .as_ref()
+                .is_some_and(|status| matches!(status.application(), ApplicationState::Admitted)),
+            "a board-retained status must not stay admitted after its authoritative application"
+        );
     }
 
     #[test]
