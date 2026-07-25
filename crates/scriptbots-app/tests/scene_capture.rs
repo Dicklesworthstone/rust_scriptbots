@@ -10,9 +10,11 @@
 
 use scriptbots_app::scene::{
     BevyOffscreenDriver, CapturePoint, Expectation, FrontendKind, GoldenOutcome, SceneDriver,
-    SceneManifest, process_golden,
+    SceneError, SceneManifest, process_golden,
 };
-use scriptbots_bevy::capture::{CapturedFrame, CompareThresholds, compare_frames, encode_png};
+use scriptbots_bevy::capture::{
+    CapturedFrame, CompareThresholds, compare_frames, encode_png, rgba8_is_visually_blank,
+};
 use serial_test::serial;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
@@ -20,6 +22,37 @@ use std::sync::{LazyLock, Mutex};
 /// One GPU context at a time: parallel capture contexts would race the
 /// adapter and flake the determinism assertions.
 static GPU_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct ScopedEnvOverride {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvOverride {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: every GPU/environment-sensitive test in this module is
+        // serialized by GPU_GUARD, and Drop restores the exact prior value.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvOverride {
+    fn drop(&mut self) {
+        // SAFETY: GPU_GUARD serializes this process-wide mutation. Restoring
+        // in Drop also covers panics inside the capture path.
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
 
 fn tiny_manifest(name: &str) -> SceneManifest {
     SceneManifest {
@@ -49,8 +82,22 @@ world_height = 600
     }
 }
 
+const ADAPTER_UNAVAILABLE_PROBLEM: &str = "offscreen capture: no GPU adapter available for offscreen capture \
+     (software lane requires llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)";
+
+fn is_adapter_unavailable(error: &SceneError) -> bool {
+    matches!(
+        error.problems.as_slice(),
+        [problem] if problem == ADAPTER_UNAVAILABLE_PROBLEM
+    )
+}
+
 /// Render the tiny scene once, returning the capture hash + frame, or `None`
-/// (loudly) when no GPU adapter exists on this host.
+/// only when the capture backend explicitly reports that no adapter exists.
+///
+/// Device, map, timeout, encode, artifact, and metadata failures are harness
+/// failures. Treating all of them as "no GPU here" made broken render paths
+/// disappear behind a green skipped test.
 fn render_tiny(
     name: &str,
     artifacts_dir: Option<&Path>,
@@ -63,20 +110,29 @@ fn render_tiny(
     };
     let facts = match driver.run(&manifest) {
         Ok(facts) => facts,
-        Err(error) => {
+        Err(error) if is_adapter_unavailable(&error) => {
             eprintln!("SKIP: offscreen capture unavailable on this host: {error}");
             return None;
         }
+        Err(error) => panic!("offscreen capture failed instead of producing evidence: {error}"),
     };
-    let (_, _, hash, _) = facts.captures.first()?.clone();
+    let (_, _, hash, _) = facts
+        .captures
+        .first()
+        .cloned()
+        .expect("capture driver succeeded without recording the requested capture");
     // Re-read the frame from disk artifacts when available; otherwise
     // re-render for the frame (artifacts keep the honest path).
-    let dir = artifacts_dir?;
-    let png = std::fs::read(dir.join("mid.png")).ok()?;
-    let (width, height, rgba8) = scriptbots_bevy::capture::decode_png(&png).ok()?;
-    let provenance =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("mid.provenance.json")).ok()?)
-            .ok()?;
+    let dir = artifacts_dir.expect("render_tiny requires an artifact directory");
+    let png = std::fs::read(dir.join("mid.png"))
+        .expect("successful capture must materialize its requested PNG");
+    let (width, height, rgba8) =
+        scriptbots_bevy::capture::decode_png(&png).expect("successful capture PNG must decode");
+    let provenance = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("mid.provenance.json"))
+            .expect("successful capture must materialize its provenance"),
+    )
+    .expect("successful capture provenance must decode");
     Some((
         hash,
         CapturedFrame {
@@ -90,20 +146,74 @@ fn render_tiny(
 }
 
 #[test]
+fn only_explicit_adapter_unavailability_may_skip_capture_evidence() {
+    assert!(is_adapter_unavailable(&SceneError {
+        problems: vec![ADAPTER_UNAVAILABLE_PROBLEM.to_string()],
+    }));
+    for failure in [
+        "offscreen capture: render device unavailable",
+        "offscreen capture: device poll during readback: lost",
+        "offscreen capture: readback map timed out",
+        "offscreen capture: readback buffer map failed",
+        "offscreen capture: capture target metadata mismatch",
+        "offscreen capture: offscreen render at tick 2: no GPU adapter available for offscreen capture",
+        "offscreen capture: no GPU adapter available for offscreen capture (extra context)",
+    ] {
+        assert!(
+            !is_adapter_unavailable(&SceneError {
+                problems: vec![failure.to_string()],
+            }),
+            "real GPU failure was incorrectly made skippable: {failure}"
+        );
+    }
+    assert!(
+        !is_adapter_unavailable(&SceneError {
+            problems: vec![
+                ADAPTER_UNAVAILABLE_PROBLEM.to_string(),
+                "a second failure must not disappear".to_string(),
+            ],
+        }),
+        "a compound harness failure cannot be reduced to adapter unavailability"
+    );
+}
+
+#[test]
 #[serial]
 fn offscreen_capture_is_deterministic_on_the_same_adapter() {
     let _guard = GPU_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let first = render_tiny("det_a", Some(temp.path()));
     let second = render_tiny("det_b", Some(temp.path()));
-    let (Some((hash_a, frame_a, _)), Some((hash_b, frame_b, _))) = (first, second) else {
-        return; // SKIP already logged.
+    let ((hash_a, frame_a, _), (hash_b, frame_b, _)) = match (first, second) {
+        (Some(first), Some(second)) => (first, second),
+        (None, None) => return, // SKIP already logged for an adapterless host.
+        (first, second) => panic!(
+            "adapter availability changed across identical captures: first={}, second={}",
+            first.is_some(),
+            second.is_some()
+        ),
     };
     assert_eq!(
         hash_a, hash_b,
         "same scene, same adapter: capture hashes must be byte-identical"
     );
     assert_eq!(frame_a.rgba8, frame_b.rgba8, "pixel bytes identical");
+    assert_eq!(
+        frame_a.provenance.adapter_name,
+        frame_b.provenance.adapter_name
+    );
+    assert_eq!(frame_a.provenance.backend, frame_b.provenance.backend);
+    assert_eq!(
+        frame_a.provenance.device_type,
+        frame_b.provenance.device_type
+    );
+    assert_eq!(
+        frame_a.provenance.quality_tier,
+        frame_b.provenance.quality_tier
+    );
+    assert_eq!(frame_a.provenance.viewport, frame_b.provenance.viewport);
+    assert_eq!(frame_a.provenance.seed, frame_b.provenance.seed);
+    assert_eq!(frame_a.provenance.tick, frame_b.provenance.tick);
     // Provenance contract: real adapter identity, never blank.
     assert_eq!(
         frame_a.provenance.schema,
@@ -113,11 +223,9 @@ fn offscreen_capture_is_deterministic_on_the_same_adapter() {
     assert_eq!(frame_a.provenance.viewport, [256, 256]);
     assert_eq!(frame_a.provenance.colorspace, "rgba8-srgb");
     // A real frame of a lit world is not black and not uniform.
-    let distinct: std::collections::HashSet<u8> = frame_a.rgba8.iter().copied().collect();
     assert!(
-        distinct.len() > 16,
-        "a live render has color variety (got {} distinct bytes)",
-        distinct.len()
+        !rgba8_is_visually_blank(&frame_a.rgba8),
+        "a live render must contain varying, nonzero RGB pixels"
     );
 }
 
@@ -126,22 +234,19 @@ fn offscreen_capture_is_deterministic_on_the_same_adapter() {
 fn corrupted_pipeline_fails_the_harness() {
     let _guard = GPU_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
-    let Some((_, honest, _)) = render_tiny("alarm_honest", Some(temp.path())) else {
-        return;
+    let honest = match render_tiny("alarm_honest", Some(temp.path())) {
+        Some((_, honest, _)) => honest,
+        None => return,
     };
     // The alarm: corruption mode blacks out sun + ambient light. A golden
     // comparison between the honest and corrupted frames MUST fail — this is
     // the proof that a broken lighting/post path cannot ship green.
-    unsafe {
-        std::env::set_var("SCRIPTBOTS_CAPTURE_CORRUPT", "1");
-    }
+    let corrupt_env = ScopedEnvOverride::set("SCRIPTBOTS_CAPTURE_CORRUPT", "1");
     let corrupted = render_tiny("alarm_corrupt", Some(temp.path()));
-    unsafe {
-        std::env::remove_var("SCRIPTBOTS_CAPTURE_CORRUPT");
-    }
-    let Some((_, corrupted, _)) = corrupted else {
-        return;
-    };
+    drop(corrupt_env);
+    let (_, corrupted, _) = corrupted.expect(
+        "the honest capture succeeded, so adapter unavailability on the corruption pass is a failure",
+    );
     assert!(
         corrupted.provenance.corrupt,
         "corruption is labeled in provenance"
@@ -262,26 +367,36 @@ fn missing_scene_manifest_fails_closed() {
 
 #[test]
 fn bevy_offscreen_driver_honors_manifest_quality() {
-    // No-GPU path: the stub/feature-disabled driver must fail closed. With
-    // the feature on but no adapter, OffscreenCapture::new fails honestly.
+    // No-GPU path: only explicit adapter unavailability may skip. A successful
+    // run must render a real frame whose provenance proves the requested tier
+    // reached the renderer.
     let mut manifest = tiny_manifest("quality_gate");
-    manifest.captures.clear();
     manifest.quality = Some("ultra".to_string());
+    let temp = tempfile::tempdir().expect("quality proof tempdir");
     let mut driver = BevyOffscreenDriver {
         seed_agents: 4,
         viewport: (64, 64),
-        artifacts_dir: None,
+        artifacts_dir: Some(temp.path().to_path_buf()),
     };
     match driver.run(&manifest) {
         Ok(facts) => {
             assert_eq!(facts.agent_counts.len(), 5, "ticks 0..=4");
             assert!(facts.world_digest.is_some());
+            assert_eq!(facts.captures.len(), 1, "the quality proof must render");
+            let provenance: scriptbots_bevy::capture::CaptureProvenance = serde_json::from_str(
+                &std::fs::read_to_string(temp.path().join("mid.provenance.json"))
+                    .expect("quality proof provenance"),
+            )
+            .expect("decode quality proof provenance");
+            assert_eq!(
+                provenance.quality_tier, "Ultra",
+                "an explicit Ultra request must be consumed by the actual renderer"
+            );
         }
         Err(error) => {
-            let text = error.to_string();
             assert!(
-                text.contains("no GPU adapter") || text.contains("offscreen capture init"),
-                "honest adapter failure, got: {text}"
+                is_adapter_unavailable(&error),
+                "only explicit adapter unavailability may skip this GPU proof, got: {error}"
             );
         }
     }
