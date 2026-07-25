@@ -5541,6 +5541,9 @@ mod tests {
             deaths: vec![death.clone()],
             replay_events: vec![ReplayEvent {
                 agent_uid: Some(AgentUid(1)),
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
                 kind: ReplayEventKind::BrainOutputs {
                     outputs: vec![0.0; replay_outputs],
                 },
