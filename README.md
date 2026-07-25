@@ -541,7 +541,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 
 ### Brains & evolution
 - **Brain trait** with `tick`/`mutate`/`crossover`; implementations include MLP and DWRAON by default, plus experimental Assembly.
-- **Brain registry**: per-run registry attaches runners by key, enabling hybrid populations and runtime selection. Random spawns draw from `BrainRegistry::random_key` for mixed-species runs; sexual crossover is gated to same-kind brains (species barrier). Brains can optionally expose activation snapshots for visualization.
+- **Brain registry**: per-run registry attaches runners by key, enabling hybrid populations and runtime selection. Random spawns draw from `BrainRegistry::random_key` for mixed-species runs. Brain-material crossover is gated to same-family brains (species barrier): scheduled cross-family crossover attempts become fresh random spawns, while natural cross-family mating may blend body/runtime traits but keeps brain heredity unary in the primary parent's family. Brains can optionally expose activation snapshots for visualization.
 - **Genome & genetics**: genomes capture topology/activations; mutation/crossover create hybrid births with lineage tracking and tests.
 - **NeuroFlow** (optional): deterministic CPU MLP with runtime toggles; seed-stable outputs verified in tests.
 
@@ -1044,5 +1044,6 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 ### Mixed brain families (default)
 - The app now registers multiple brain families by default (MLP, DWRAON, Assembly experimental, NeuroFlow) and seeds mixed populations automatically. Random spawns are bound to a sampled brain family.
 - NeuroFlow is enabled in the default config; edit at runtime via REST/CLI or env (e.g., SCRIPTBOTS_NEUROFLOW_*).
-- Sexual reproduction only occurs within the same brain kind (species barrier). Cross-kind parents fall back to random spawns. This allows fair A/B comparisons between families.
+- Brain-material crossover only occurs within the same family (species barrier). On the scheduled population-crossover path, incompatible selected parents cause that arrival to become a fresh spawn sampled from the brain registry.
+- Natural reproduction does not use that fallback: a cross-family partner may contribute body/runtime traits and whole-agent lineage, while the child's brain clones and mutates only the primary parent's genome. The incompatible partner is excluded from brain provenance, so no hybrid brain is fabricated.
 - To force a single brain for new agents, bind a chosen `brain_key` to agents via `WorldState::bind_agent_brain` or modify the seeding function to always pick that key.

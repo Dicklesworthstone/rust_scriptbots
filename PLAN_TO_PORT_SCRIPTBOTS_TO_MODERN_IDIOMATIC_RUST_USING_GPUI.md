@@ -1181,7 +1181,7 @@ Knobs gate work under `SB_WGPU_MAX_FPS` and reuse last‑ready frame when budget
 ### [Completed - 2025-10-24] Brain families default-on and mixed-species evolution
 - Enabled all brain families by default: MLP (baseline), DWRAON, Assembly (experimental), NeuroFlow (optional crate), and register them at app startup. Mixed populations are now the default.
 - Random new spawns receive a brain binding sampled from the BrainRegistry.
-- Sexual reproduction enforces a species barrier: crossover only occurs when both parents share the same brain kind; otherwise, the spawn falls back to random seeding. This makes differing brain kinds act as distinct species while fairly competing in the same environment.
+- Brain-material crossover enforces a species barrier. An incompatible pair chosen by the scheduled population spawner falls back to a fresh random-registry arrival. Natural cross-family mating still creates a two-parent body/runtime lineage, but the child's brain clones and mutates only the primary parent's compatible genome and records unary brain provenance.
 - NeuroFlow is enabled in default `ScriptBotsConfig` and still configurable at runtime (layers/activation).
 - Control/CLI/REST remain unchanged; analytics/inspector now implicitly reflect multiple brain kinds (brain_kind, brain_key already surfaced).
 

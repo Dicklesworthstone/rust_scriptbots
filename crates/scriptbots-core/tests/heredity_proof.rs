@@ -479,6 +479,103 @@ fn mixed_kind_mating_falls_back_to_same_kind_clone() {
     );
 }
 
+#[test]
+fn scheduled_cross_kind_crossover_falls_back_to_a_fresh_random_registry_founder() {
+    fn scheduled_world(crossover_chance: f32) -> WorldState {
+        let mut config = reproduction_config(0.0);
+        config.closed = false;
+        config.population_spawn_interval = 1;
+        config.population_spawn_count = 1;
+        config.population_crossover_chance = crossover_chance;
+        config.reproduction_energy_threshold = 0.0;
+
+        let mut world = WorldState::new(config).expect("scheduled population world");
+        let mlp_key = register_family(&mut world, MLP_KIND);
+        let dwraon_key = register_family(&mut world, DWRAON_KIND);
+        let rates = MutationRates {
+            primary: 0.0,
+            secondary: 0.0,
+        };
+        spawn_parent(&mut world, mlp_key, 60.0, 100.0, rates);
+        spawn_parent(&mut world, dwraon_key, 140.0, 100.0, rates);
+        world
+    }
+
+    let mut fallback_world = scheduled_world(1.0);
+    let mut direct_random_world = scheduled_world(0.0);
+    let fallback_outcome = fallback_world
+        .step_outcome()
+        .expect("cross-family scheduled fallback");
+    let direct_random_outcome = direct_random_world
+        .step_outcome()
+        .expect("direct scheduled random spawn");
+
+    let mut fallback_births = fallback_outcome
+        .outcome
+        .births
+        .iter()
+        .filter(|birth| birth.origin == BirthOrigin::Injected);
+    let fallback_birth = fallback_births
+        .next()
+        .expect("scheduled fallback must record one injected arrival");
+    assert!(
+        fallback_births.next().is_none(),
+        "one scheduled attempt must produce exactly one fallback arrival"
+    );
+    let mut direct_random_births = direct_random_outcome
+        .outcome
+        .births
+        .iter()
+        .filter(|birth| birth.origin == BirthOrigin::Injected);
+    let direct_random_birth = direct_random_births
+        .next()
+        .expect("direct random path must record one injected arrival");
+    assert!(
+        direct_random_births.next().is_none(),
+        "one direct scheduled spawn must produce exactly one arrival"
+    );
+    assert_eq!(
+        [fallback_birth.parent_a, fallback_birth.parent_b],
+        [None, None]
+    );
+    assert!(
+        !fallback_birth.is_hybrid,
+        "a rejected scheduled brain crossover must not fabricate hybrid lineage"
+    );
+    assert_eq!(
+        fallback_birth.brain_key, direct_random_birth.brain_key,
+        "cross-family scheduled fallback must use the same random registry selection as a \
+         direct scheduled random spawn"
+    );
+
+    let fallback_child = fallback_world
+        .agents()
+        .iter_handles()
+        .find(|id| fallback_world.agent_uid(*id) == Some(fallback_birth.agent_uid))
+        .expect("fallback arrival uid resolves to one live agent");
+    let direct_random_child = direct_random_world
+        .agents()
+        .iter_handles()
+        .find(|id| direct_random_world.agent_uid(*id) == Some(direct_random_birth.agent_uid))
+        .expect("direct random arrival uid resolves to one live agent");
+    let fallback_genome = genome_of(&fallback_world, fallback_child);
+    let direct_random_genome = genome_of(&direct_random_world, direct_random_child);
+    assert_eq!(
+        fallback_genome, direct_random_genome,
+        "scheduled cross-family fallback must construct a fresh registry founder, not clone \
+         either incompatible parent"
+    );
+    assert_eq!(
+        fallback_genome.provenance().derivation,
+        BrainGenomeDerivation::Founder
+    );
+    assert_eq!(fallback_genome.provenance().parents, [None, None]);
+    assert_eq!(
+        fallback_genome.provenance().parent_genome_hashes,
+        [None, None]
+    );
+}
+
 /// Exact binomial tail probabilities via a mode-anchored recurrence: unnormalized
 /// weights are expanded outward from the mode with the exact PMF ratio and then
 /// normalized, which stays numerically stable for the n and p used here.
