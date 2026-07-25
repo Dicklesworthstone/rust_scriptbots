@@ -32,11 +32,12 @@ const MAX_HIDDEN_LAYERS: usize = 8;
 const MAX_LAYER_WIDTH: usize = 256;
 const GENOME_FIXED_HEADER_BYTES: usize = 16;
 const STATE_PAYLOAD_BYTES: usize = STATE_MAGIC.len() + 32;
-const ADAPTER_SEMANTIC_VERSION: u32 = 1;
+const ADAPTER_SEMANTIC_VERSION: u32 = 2;
 const ADAPTER_SEMANTIC_PREFIX: &[u8] = b"dense-f32;ft-kernel-cpu::linear_tensor_f32;\
     layer-order=weight[out,in],bias[out];hidden=tanh;heads=typed-all-sigmoid;\
     scalar=batch-loop-identical;state=genome-digest-only;layout=v1;\
-    founder=xavier-uniform-next-u32-bias-zero;mutation=per-gene-box-muller;\
+    founder=xavier-uniform-next-u32-bias-zero;\
+    mutation=per-gene-box-muller-draw-preserving-zero-sigma-identity;\
     crossover=per-gene-uniform-next-u32";
 
 /// Dense FtBrain architecture configuration.
@@ -699,7 +700,10 @@ impl BrainFamilyCodec for FtBrainFamily {
         let mut decoded = self.decode_genome(genome)?;
         for parameter in &mut decoded.parameters {
             if unit_f32(rng) < rates.primary {
-                *parameter += gaussian_f32(rng) * rates.secondary;
+                let gaussian = gaussian_f32(rng);
+                if rates.secondary > 0.0 {
+                    *parameter += gaussian * rates.secondary;
+                }
             }
         }
         self.genome_material(&decoded.config, &decoded.parameters)
@@ -895,9 +899,72 @@ fn state_from_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
     use scriptbots_core::{
-        AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, BrainProvenance, SmallRngStream, Tick,
+        AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, BrainProvenance,
+        RANDOM_STREAM_STATE_VERSION, RandomStreamState, SmallRngStream, Tick,
     };
+
+    #[derive(Debug)]
+    struct ScriptedStream {
+        draws: Vec<u32>,
+        cursor: usize,
+    }
+
+    impl ScriptedStream {
+        fn selected_positive_gaussian(parameter_count: usize) -> Self {
+            let mut draws = Vec::with_capacity(parameter_count * 3);
+            for _ in 0..parameter_count {
+                draws.extend_from_slice(&[0, 1_u32 << 31, 0]);
+            }
+            Self { draws, cursor: 0 }
+        }
+
+        const fn consumed(&self) -> usize {
+            self.cursor
+        }
+
+        const fn remaining(&self) -> usize {
+            self.draws.len() - self.cursor
+        }
+    }
+
+    impl RngCore for ScriptedStream {
+        fn next_u32(&mut self) -> u32 {
+            let draw = *self
+                .draws
+                .get(self.cursor)
+                .expect("FtBrain consumed more next_u32 draws than scripted");
+            self.cursor += 1;
+            draw
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            panic!("FtBrain mutation must preserve its next_u32 draw schedule")
+        }
+
+        fn fill_bytes(&mut self, _destination: &mut [u8]) {
+            panic!("FtBrain mutation must preserve its next_u32 draw schedule")
+        }
+    }
+
+    impl RandomStream for ScriptedStream {
+        fn algorithm_id(&self) -> &'static str {
+            "test.ft-scripted-next-u32"
+        }
+
+        fn checkpoint(&self) -> RandomStreamState {
+            RandomStreamState {
+                version: RANDOM_STREAM_STATE_VERSION,
+                algorithm: self.algorithm_id().to_owned(),
+                codec_version: 1,
+                state: u64::try_from(self.cursor)
+                    .expect("script cursor fits in u64")
+                    .to_le_bytes()
+                    .to_vec(),
+            }
+        }
+    }
 
     fn founder(
         family: &FtBrainFamily,
@@ -1101,22 +1168,29 @@ mod tests {
     }
 
     #[test]
-    fn zero_sigma_mutation_is_material_stable_and_consumes_each_gene_draw() {
+    fn zero_sigma_mutation_preserves_negative_zero_bits_and_each_gene_draw() {
         let family =
             FtBrainFamily::new(FtBrainConfig::new(vec![1]).expect("config")).expect("family");
-        let (genome, _) = founder(&family, 101);
-        let parameter_count = family
-            .decode_genome(&genome)
-            .expect("decode parent")
-            .parameters
-            .len();
+        let parameter_count = validate_config(&family.config).expect("parameter count");
+        let signed_zero_index = parameter_count / 2;
+        let mut parameters = vec![0.25; parameter_count];
+        parameters[signed_zero_index] = -0.0;
+        let genome = genome_with_parameters(&family, &parameters);
+        assert_eq!(
+            family
+                .decode_genome(&genome)
+                .expect("decode signed-zero parent")
+                .parameters[signed_zero_index]
+                .to_bits(),
+            (-0.0_f32).to_bits()
+        );
         let provenance = BrainProvenance {
             parents: [Some(AgentUid(1)), None],
             parent_genome_hashes: [Some(genome.material_hash()), None],
             created_at: Tick(1),
             derivation: BrainGenomeDerivation::MutationOnly,
         };
-        let mut actual_rng = SmallRngStream::seed_from_u64(102);
+        let mut actual_rng = ScriptedStream::selected_positive_gaussian(parameter_count);
         let child = family
             .mutate_genome(
                 &genome,
@@ -1129,13 +1203,17 @@ mod tests {
             )
             .expect("zero-sigma mutation");
         assert_eq!(child.material_hash(), genome.material_hash());
-
-        let mut oracle_rng = SmallRngStream::seed_from_u64(102);
-        for _ in 0..parameter_count {
-            let _probability = unit_f32(&mut oracle_rng);
-            let _gaussian = gaussian_f32(&mut oracle_rng);
-        }
-        assert_eq!(actual_rng.checkpoint(), oracle_rng.checkpoint());
+        assert_eq!(child.payload(), genome.payload());
+        assert_eq!(
+            family
+                .decode_genome(&child)
+                .expect("decode zero-sigma child")
+                .parameters[signed_zero_index]
+                .to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        assert_eq!(actual_rng.consumed(), parameter_count * 3);
+        assert_eq!(actual_rng.remaining(), 0);
     }
 
     #[test]

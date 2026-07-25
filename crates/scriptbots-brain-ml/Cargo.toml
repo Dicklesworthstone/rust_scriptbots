@@ -16,6 +16,9 @@ ft-kernel-cpu = { workspace = true, optional = true }
 ft-nn = { workspace = true, optional = true }
 ft-optim = { workspace = true, optional = true }
 
+[dev-dependencies]
+rand = { workspace = true }
+
 [features]
 default = []
 candle = ["candle-core", "candle-nn"]
