@@ -27,9 +27,12 @@
 //! command ports (a `HostCore`'s `local_port()` can enqueue commands even
 //! through `&self`, so no `&HostCore` accessor exists at all), and
 //! [`Archipelago::island_snapshot`] serves only snapshots captured after a
-//! completed barrier. A mid-barrier island fault latches the whole archipelago
-//! with a typed error naming the island; the exposed views and digests remain
-//! at the prior barrier rather than leaking a silently uneven epoch.
+//! completed barrier. Transient journal-capacity backpressure leaves the exact
+//! partial barrier private and is retried once by the next explicit barrier
+//! call. A terminal mid-barrier island fault latches the whole archipelago
+//! with a typed error naming the island; in either case exposed views and
+//! digests remain at the prior barrier rather than leaking a silently uneven
+//! epoch.
 //!
 //! # Step topology (the parallelism dial)
 //!
@@ -410,7 +413,8 @@ pub enum ArchipelagoError {
     },
     /// An island's journal adapter refused or retained a batch, blocking
     /// science. The host retains the exact batch for retry; the archipelago
-    /// surfaces the blocker instead of silently spinning against it.
+    /// surfaces the blocker instead of silently spinning against it. A later
+    /// explicit barrier call retries transient capacity backpressure once.
     #[error("island {island} journal is blocking science: {detail}")]
     JournalBlocked {
         /// The blocked island.
@@ -859,6 +863,8 @@ impl Archipelago {
     /// # Errors
     ///
     /// Returns [`ArchipelagoError::UnknownIsland`] for an unknown identity,
+    /// [`ArchipelagoError::JournalBlocked`] while transient journal
+    /// backpressure retains a partially-stepped barrier,
     /// [`ArchipelagoError::Latched`] once an island fault has latched the
     /// archipelago (a digest taken then would expose a partially-stepped
     /// epoch; the fault error already names the failed island and tick), and
@@ -872,6 +878,9 @@ impl Archipelago {
         let index = self
             .island_index(island)
             .ok_or(ArchipelagoError::UnknownIsland { island })?;
+        if let Some(blocked) = self.islands.iter().find_map(Self::journal_full_error) {
+            return Err(blocked);
+        }
         self.islands[index]
             .core
             .scientific_digest_v1()
@@ -882,10 +891,11 @@ impl Archipelago {
     ///
     /// Islands step in ascending island-id order ([`StepTopology`] records the
     /// policy in the report). Every island reaches the barrier tick before the
-    /// method returns; on any island fault the archipelago latches, the
-    /// barrier tick does not advance, and every later call returns
-    /// [`ArchipelagoError::Latched`] so a partially-stepped epoch can never be
-    /// observed or extended.
+    /// method returns. Transient journal-capacity backpressure keeps the
+    /// barrier tick unchanged and the exact pending batch private; the next
+    /// explicit call retries that batch once and resumes the same target
+    /// without duplicating science. Any terminal island fault latches the
+    /// archipelago, and every later call returns [`ArchipelagoError::Latched`].
     ///
     /// # Errors
     ///
@@ -922,6 +932,23 @@ impl Archipelago {
         for &index in order {
             if let Err(error) = Self::step_island_to(&mut self.islands[index], target) {
                 let island = &self.islands[index];
+                if matches!(
+                    &error,
+                    ArchipelagoError::JournalBlocked {
+                        island: blocked_island,
+                        ..
+                    } if *blocked_island == island.meta.id
+                ) && Self::journal_full_error(island).is_some()
+                {
+                    tracing::warn!(
+                        island = %island.meta.id,
+                        label = %island.meta.label,
+                        tick = island.core.world_tick().0,
+                        error = %error,
+                        "island barrier paused by retryable journal backpressure"
+                    );
+                    return Err(error);
+                }
                 tracing::error!(
                     island = %island.meta.id,
                     label = %island.meta.label,
@@ -963,6 +990,16 @@ impl Archipelago {
     /// Step one island to the target tick through explicit step commands.
     fn step_island_to(island: &mut Island, target: Tick) -> Result<(), ArchipelagoError> {
         let island_id = island.meta.id;
+        if Self::journal_full_error(island).is_some() {
+            island
+                .core
+                .retry_retained_journal()
+                .map_err(|source| ArchipelagoError::Access {
+                    island: island_id,
+                    source,
+                })?;
+            Self::verify_island_health(island)?;
+        }
         while island.core.world_tick().0 < target.0 {
             let before = island.core.world_tick();
             let command_id = island.next_command_id()?;
@@ -1094,6 +1131,18 @@ impl Archipelago {
         }
     }
 
+    fn journal_full_error(island: &Island) -> Option<ArchipelagoError> {
+        match island.core.health() {
+            HostHealth::Blocked(blocker @ HostBlocker::JournalFull { .. }) => {
+                Some(ArchipelagoError::JournalBlocked {
+                    island: island.meta.id,
+                    detail: format!("{blocker:?}"),
+                })
+            }
+            HostHealth::Healthy | HostHealth::Blocked(_) | HostHealth::Faulted(_) => None,
+        }
+    }
+
     fn island_index(&self, island: IslandId) -> Option<usize> {
         self.islands
             .binary_search_by_key(&island, |entry| entry.meta.id)
@@ -1157,10 +1206,11 @@ const fn ordered_edge(a: IslandId, b: IslandId) -> (IslandId, IslandId) {
 mod tests {
     use super::*;
     use crate::{
-        EventJournalReader, JournalAdmission, JournalBatch, JournalReceipt,
+        EventJournalReader, JournalAdmission, JournalBatch, JournalReceipt, JournalReceiptState,
         ShutdownCommitRequirement,
     };
     use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     const TEST_BRAIN_KIND: &str = "archi-test-brain";
     const TEST_BRAIN_FACTORY_DIGEST: u64 = 0xA5C1_1A60_7E57_0001;
@@ -1633,6 +1683,177 @@ mod tests {
         fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
             ShutdownCommitRequirement::CommittedVolatile
         }
+    }
+
+    #[derive(Default)]
+    struct FullOnceJournalState {
+        attempts: Vec<Arc<JournalBatch>>,
+        receipts: VecDeque<JournalReceipt>,
+    }
+
+    struct FullOnceJournal {
+        state: Rc<RefCell<FullOnceJournalState>>,
+    }
+
+    impl JournalPort for FullOnceJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            let mut state = self.state.borrow_mut();
+            state.attempts.push(Arc::clone(batch));
+            if state.attempts.len() == 1 {
+                return JournalAdmission::Full {
+                    batch_id: batch.id(),
+                    capacity: 1,
+                };
+            }
+            state.receipts.push_back(JournalReceipt::new(
+                batch.id(),
+                JournalReceiptState::Durable,
+            ));
+            JournalAdmission::Accepted {
+                batch_id: batch.id(),
+            }
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            let mut state = self.state.borrow_mut();
+            let count = limit.min(state.receipts.len());
+            state.receipts.drain(..count).collect()
+        }
+
+        fn event_reader(&self, _session_id: HostSessionId) -> Option<Arc<dyn EventJournalReader>> {
+            None
+        }
+
+        fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+            ShutdownCommitRequirement::CommittedVolatile
+        }
+    }
+
+    #[test]
+    fn transient_journal_full_retries_same_barrier_without_duplicate_science() {
+        let state = Rc::new(RefCell::new(FullOnceJournalState::default()));
+        let journal_state = Rc::clone(&state);
+        let islands = vec![spec(0, test_config(None)), spec(1, test_config(None))];
+        let mut archipelago = Archipelago::with_factories(
+            archipelago_config(islands, 5),
+            |meta| WorldState::new(meta.effective_config.clone()),
+            move |meta| {
+                (meta.id == IslandId(1)).then(|| {
+                    Box::new(FullOnceJournal {
+                        state: Rc::clone(&journal_state),
+                    }) as Box<dyn JournalPort>
+                })
+            },
+        )
+        .expect("archipelago with transient journal backpressure");
+
+        let first_error = archipelago
+            .step_to_barrier()
+            .expect_err("the first admission attempt is full");
+        assert!(matches!(
+            first_error,
+            ArchipelagoError::JournalBlocked {
+                island: IslandId(1),
+                ..
+            }
+        ));
+        assert_eq!(archipelago.barrier_tick(), Tick(0));
+        assert_eq!(archipelago.epoch(), 0);
+        assert!(
+            archipelago.latched().is_none(),
+            "transient capacity backpressure must remain retryable"
+        );
+        assert_eq!(
+            archipelago
+                .islands
+                .iter()
+                .map(|island| island.core.world_tick())
+                .collect::<Vec<_>>(),
+            vec![Tick(5), Tick(1)],
+            "the failed barrier retains exact partial owner state"
+        );
+        for id in [IslandId(0), IslandId(1)] {
+            assert_eq!(
+                archipelago
+                    .island_snapshot(id)
+                    .expect("committed snapshot")
+                    .world
+                    .tick,
+                0,
+                "partial live state must not advance a committed snapshot"
+            );
+            assert!(matches!(
+                archipelago.island_digest(id),
+                Err(ArchipelagoError::JournalBlocked {
+                    island: IslandId(1),
+                    ..
+                })
+            ));
+        }
+
+        let first_batch = {
+            let state = state.borrow();
+            assert_eq!(state.attempts.len(), 1);
+            let batch = Arc::clone(&state.attempts[0]);
+            assert_eq!(
+                batch
+                    .scientific()
+                    .expect("scientific boundary")
+                    .summary()
+                    .tick,
+                Tick(1)
+            );
+            batch
+        };
+        let first_batch_id = first_batch.id();
+
+        let report = archipelago
+            .step_to_barrier()
+            .expect("the next explicit barrier retries retained backpressure");
+        assert_eq!(report.epoch, 1);
+        assert_eq!(report.barrier_tick, Tick(5));
+        assert_eq!(archipelago.barrier_tick(), Tick(5));
+        assert_eq!(archipelago.epoch(), 1);
+        assert!(archipelago.latched().is_none());
+        assert_eq!(
+            archipelago
+                .islands
+                .iter()
+                .map(|island| island.core.world_tick())
+                .collect::<Vec<_>>(),
+            vec![Tick(5), Tick(5)]
+        );
+        assert_eq!(
+            archipelago.islands[1].next_command_sequence, 6,
+            "retrying the retained batch must not duplicate the applied tick"
+        );
+        for id in [IslandId(0), IslandId(1)] {
+            assert_eq!(
+                archipelago
+                    .island_snapshot(id)
+                    .expect("committed snapshot")
+                    .world
+                    .tick,
+                5
+            );
+            archipelago.island_digest(id).expect("committed digest");
+        }
+
+        let state = state.borrow();
+        assert_eq!(
+            state.attempts.len(),
+            6,
+            "one retained retry plus four remaining step batches"
+        );
+        assert!(Arc::ptr_eq(&first_batch, &state.attempts[1]));
+        assert_eq!(state.attempts[1].id(), first_batch_id);
+        assert!(
+            state.attempts[2..]
+                .windows(2)
+                .all(|pair| pair[0].id().sequence() < pair[1].id().sequence()),
+            "new step batches must continue the journal sequence monotonically"
+        );
+        assert!(state.attempts[2].id().sequence() > first_batch_id.sequence());
     }
 
     #[test]
