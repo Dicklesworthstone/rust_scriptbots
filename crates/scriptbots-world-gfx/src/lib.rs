@@ -136,8 +136,8 @@ impl WorldRenderer {
             })?;
 
         let format = WORLD_COLOR_FORMAT;
-        let (color, color_view) = create_color(&device, format, size);
         let readback = ReadbackRing::new(&device, size, format)?;
+        let (color, color_view) = create_color(&device, format, size);
         let view = ViewUniforms::new(&device, &queue, size);
         let mut terrain = TerrainPipeline::new(&device, format, &view);
         terrain.init_atlas(&device, &queue);
@@ -183,11 +183,19 @@ impl WorldRenderer {
                 height: new_size.1,
             });
         }
+        let next_generation = self
+            .frame_generation
+            .checked_add(1)
+            .ok_or_else(|| ReadbackError::Device("render generation overflow".to_owned()))?;
+        // Complete typed device-limit validation and the fallible readback constructor before
+        // replacing any live renderer resource. An invalid extent must leave the prior frame
+        // size and generation usable rather than partially installing the requested extent.
+        let readback = ReadbackRing::new(&self.device, new_size, self.format)?;
         let (tex, view) = create_color(&self.device, self.format, new_size);
         self.color = tex;
         self.color_view = view;
+        self.readback = readback;
         self.size = new_size;
-        self.readback = ReadbackRing::new(&self.device, new_size, self.format)?;
         // keep time monotonic across resizes: reuse the last tick-derived animation time
         self.view.update(
             &self.queue,
@@ -199,10 +207,7 @@ impl WorldRenderer {
         if let Some(post) = self.post.as_mut() {
             post.resize(&self.device, self.format, new_size);
         }
-        self.frame_generation = self
-            .frame_generation
-            .checked_add(1)
-            .ok_or_else(|| ReadbackError::Device("render generation overflow".to_owned()))?;
+        self.frame_generation = next_generation;
         Ok(())
     }
 
@@ -577,6 +582,12 @@ pub struct ReadbackRing {
     extent: (u32, u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadbackLayout {
+    bytes_per_row: u32,
+    size_bytes: u64,
+}
+
 /// Typed failures for the adapter/device/readback/capture surface (bd-2z0.7.11).
 /// No failure on this surface may be reported as an empty vector or a silent success.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,7 +596,7 @@ pub enum ReadbackError {
     AdapterUnavailable,
     /// Device-level failure (poll, submit, lost device).
     Device(String),
-    /// Resize/readback-buffer allocation failure.
+    /// Unsupported resize extent or readback layout.
     Resize(String),
     /// Buffer map request failed.
     Map(String),
@@ -656,6 +667,61 @@ impl ReadbackView {
     }
 }
 
+fn validate_readback_layout(
+    extent: (u32, u32),
+    limits: &wgpu::Limits,
+) -> Result<ReadbackLayout, ReadbackError> {
+    if extent.0 == 0 || extent.1 == 0 {
+        return Err(ReadbackError::ZeroDimensions {
+            width: extent.0,
+            height: extent.1,
+        });
+    }
+    if extent.0 > limits.max_texture_dimension_2d || extent.1 > limits.max_texture_dimension_2d {
+        return Err(ReadbackError::Resize(format!(
+            "requested extent {}x{} exceeds device max_texture_dimension_2d {}",
+            extent.0, extent.1, limits.max_texture_dimension_2d
+        )));
+    }
+
+    let unpadded_bytes_per_row = u64::from(extent.0) * 4;
+    let alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let bytes_per_row_u64 = unpadded_bytes_per_row
+        .checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+        .ok_or_else(|| {
+            ReadbackError::Resize(format!(
+                "RGBA8 row-pitch alignment overflow for extent {}x{}",
+                extent.0, extent.1
+            ))
+        })?;
+    let bytes_per_row = u32::try_from(bytes_per_row_u64).map_err(|_| {
+        ReadbackError::Resize(format!(
+            "aligned RGBA8 row pitch {bytes_per_row_u64} for extent {}x{} exceeds the u32 copy-layout limit",
+            extent.0, extent.1
+        ))
+    })?;
+    let size_bytes = bytes_per_row_u64
+        .checked_mul(u64::from(extent.1))
+        .ok_or_else(|| {
+            ReadbackError::Resize(format!(
+                "readback buffer size overflow for extent {}x{}",
+                extent.0, extent.1
+            ))
+        })?;
+    if size_bytes > limits.max_buffer_size {
+        return Err(ReadbackError::Resize(format!(
+            "readback buffer for extent {}x{} requires {size_bytes} bytes, exceeding device max_buffer_size {}",
+            extent.0, extent.1, limits.max_buffer_size
+        )));
+    }
+
+    Ok(ReadbackLayout {
+        bytes_per_row,
+        size_bytes,
+    })
+}
+
 impl ReadbackRing {
     pub fn new(
         device: &wgpu::Device,
@@ -668,18 +734,11 @@ impl ReadbackRing {
                 actual: format!("{format:?}"),
             });
         }
-        if extent.0 == 0 || extent.1 == 0 {
-            return Err(ReadbackError::ZeroDimensions {
-                width: extent.0,
-                height: extent.1,
-            });
-        }
-        let bytes_per_row = align_256(extent.0 * 4);
-        let size_bytes = bytes_per_row as u64 * extent.1 as u64;
+        let layout = validate_readback_layout(extent, &device.limits())?;
         let mk = || {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("world.readback"),
-                size: size_bytes,
+                size: layout.size_bytes,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
@@ -694,7 +753,7 @@ impl ReadbackRing {
         Ok(Self {
             slots,
             curr: 0,
-            bytes_per_row,
+            bytes_per_row: layout.bytes_per_row,
             extent,
         })
     }
@@ -819,18 +878,14 @@ fn parse_fxaa_env(previous: u32) -> Result<u32, ReadbackError> {
     }
 }
 
-fn align_256(n: u32) -> u32 {
-    n.div_ceil(256) * 256
-}
-
 // ---------------- View uniforms (viewport size) ----------------
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentInstance, PostControls, RenderFrame, TerrainView, WorldSnapshot, align_256,
-        parse_control_f32, parse_toggle, resolve_bloom_intensity, terrain_atlas_palette,
-        validate_frame_token, validate_snapshot,
+        AgentInstance, PostControls, ReadbackError, ReadbackLayout, RenderFrame, TerrainView,
+        WorldSnapshot, parse_control_f32, parse_toggle, resolve_bloom_intensity,
+        terrain_atlas_palette, validate_frame_token, validate_readback_layout, validate_snapshot,
     };
     use bytemuck::Zeroable;
     use scriptbots_core::{
@@ -841,9 +896,14 @@ mod tests {
     #[test]
     fn stride_alignment_is_multiple_of_256() {
         let widths = [1u32, 2, 63, 64, 65, 257, 1023, 1920, 2560, 3840];
+        let limits = wgpu::Limits::default();
         for w in widths {
-            let raw = w * 4; // RGBA8 bytes per row without alignment
-            let aligned = align_256(raw);
+            let raw = u64::from(w) * 4; // RGBA8 bytes per row without alignment
+            let aligned = u64::from(
+                validate_readback_layout((w, 1), &limits)
+                    .unwrap()
+                    .bytes_per_row,
+            );
             assert_eq!(
                 aligned % 256,
                 0,
@@ -855,6 +915,54 @@ mod tests {
                 "aligned stride must not exceed raw+255"
             );
         }
+    }
+
+    #[test]
+    fn resize_layout_failures_are_typed_before_gpu_allocation() {
+        let mut limits = wgpu::Limits::default();
+        limits.max_texture_dimension_2d = 128;
+        limits.max_buffer_size = 1_024;
+
+        assert_eq!(
+            validate_readback_layout((65, 2), &limits),
+            Ok(ReadbackLayout {
+                bytes_per_row: 512,
+                size_bytes: 1_024,
+            })
+        );
+        assert_eq!(
+            validate_readback_layout((0, 2), &limits),
+            Err(ReadbackError::ZeroDimensions {
+                width: 0,
+                height: 2,
+            })
+        );
+
+        let texture_error = validate_readback_layout((129, 1), &limits)
+            .expect_err("oversized texture must be rejected before create_texture");
+        assert!(
+            matches!(texture_error, ReadbackError::Resize(ref detail) if detail.contains("max_texture_dimension_2d")),
+            "unexpected texture-limit attribution: {texture_error}"
+        );
+
+        let buffer_error = validate_readback_layout((65, 3), &limits)
+            .expect_err("oversized readback buffer must be rejected before create_buffer");
+        assert!(
+            matches!(buffer_error, ReadbackError::Resize(ref detail) if detail.contains("max_buffer_size")),
+            "unexpected buffer-limit attribution: {buffer_error}"
+        );
+
+        let unrestricted_limits = wgpu::Limits {
+            max_texture_dimension_2d: u32::MAX,
+            max_buffer_size: u64::MAX,
+            ..wgpu::Limits::default()
+        };
+        let pitch_error = validate_readback_layout((u32::MAX, 1), &unrestricted_limits)
+            .expect_err("an unrepresentable copy row pitch must return a typed error");
+        assert!(
+            matches!(pitch_error, ReadbackError::Resize(ref detail) if detail.contains("u32 copy-layout limit")),
+            "unexpected row-pitch attribution: {pitch_error}"
+        );
     }
 
     #[test]
