@@ -798,6 +798,49 @@ mod tests {
         );
     }
 
+    /// bd-c7pg: does DISPATCHING AT ALL perturb the frame?
+    ///
+    /// Six hypotheses eliminated so far all assumed the floor came from something
+    /// differing between the two captures. The no-op-key control disproved that: a key
+    /// that changes nothing still moved ~14.8k px. The one remaining difference between
+    /// the byte-identical test (0 px) and the audit (~14.8k) is that the audit
+    /// dispatches a keystroke at all.
+    ///
+    /// A: two captures, neither dispatching.   B: one dispatching an unbound key.
+    /// If A is 0 and B is nonzero, the dispatch machinery itself is the source.
+    #[test]
+    #[ignore = "bd-c7pg diagnostic; run explicitly with --ignored"]
+    fn diagnose_whether_dispatch_alone_perturbs_the_frame() {
+        let (w, h) = (
+            1280.0 * HEADLESS_DEVICE_SCALE,
+            720.0 * HEADLESS_DEVICE_SCALE,
+        );
+        let world = capture_world();
+        let none = CaptureOverrides {
+            forced_perf: Some(pinned_perf()),
+            ..CaptureOverrides::default()
+        };
+        let zed = CaptureOverrides {
+            forced_perf: Some(pinned_perf()),
+            keystrokes: &["z"],
+            ..CaptureOverrides::default()
+        };
+        let cap = |o| {
+            capture_view_with_overrides(Arc::clone(&world), GuiViewRole::Hud, w, h, o)
+                .expect("capture")
+        };
+        let a1 = cap(none);
+        let a2 = cap(none);
+        let b1 = cap(zed);
+        let b2 = cap(zed);
+        let diff = |x: &RgbaImage, y: &RgbaImage| {
+            x.pixels().zip(y.pixels()).filter(|(p, q)| p != q).count()
+        };
+        println!("  A none-vs-none : {}", diff(&a1, &a2));
+        println!("  B z-vs-z       : {}", diff(&b1, &b2));
+        println!("  C none-vs-z    : {}", diff(&a1, &b1));
+    }
+
     /// bd-c7pg CAUSATION PROBE — is the ~10k floor measurement noise, or two different
     /// worlds?
     ///
