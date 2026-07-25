@@ -15525,6 +15525,31 @@ impl fmt::Debug for WorldState {
             .finish()
     }
 }
+/// Legacy epoch length in ticks.
+///
+/// C++ `World::update` resets `modcounter` to zero once it reaches this value
+/// (World.cpp:54-56), so the clock sensor channels are periodic with this period. Rust keeps
+/// `tick` monotonic and tracks `epoch` separately, so the reset has to be reapplied where the
+/// legacy counter is consumed rather than by rewinding time.
+const LEGACY_EPOCH_TICKS: u64 = 10_000;
+
+/// The counter C++ presents to clock sensor channels 16/17 during the transition to `next_tick`.
+///
+/// Two things about `World::update` that Rust did not honour (bd-drhs):
+///
+/// 1. `modcounter++` happens at World.cpp:36, BEFORE `setInputs` reads it at :298-299, so the
+///    value belongs to the transition being computed — not the one already completed.
+///    `stage_sense` reads `self.tick`, which is still the completed tick, so every reading was
+///    one transition stale.
+/// 2. The counter resets at :54-56, so the argument is bounded and the channel is periodic
+///    across epochs. Without the reset the argument grows without bound and the two
+///    implementations diverge permanently after the first epoch.
+///
+/// The resulting sequence matches C++ exactly: 1, 2, ..., 9999, 0, 1, ...
+const fn legacy_clock_counter(next_tick: u64) -> u64 {
+    next_tick % LEGACY_EPOCH_TICKS
+}
+
 /// Append the four behaviour metrics that summarise one signal channel (bd-mv2j).
 ///
 /// Sensors and outputs were two textually duplicated blocks differing only in the metric names
@@ -16410,7 +16435,7 @@ impl WorldState {
         let food_height = self.food.height();
         let food_cells = self.food.cells();
         let food_max = self.config.food_max;
-        let tick_value = self.tick.0 as f32;
+        let tick_value = legacy_clock_counter(self.tick.0.saturating_add(1)) as f32;
         let index = &self.index;
 
         let sensor_results: Vec<([f32; INPUT_SIZE], u32)> =
@@ -16670,7 +16695,7 @@ impl WorldState {
         let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
         let food_value = self.food.cells().get(food_idx).copied().unwrap_or(0.0) / food_max;
 
-        let tick_value = self.tick.0 as f32;
+        let tick_value = legacy_clock_counter(self.tick.0.saturating_add(1)) as f32;
         let clocks = observer.clocks;
         let env_temperature = sample_temperature(&self.config, position.x);
         let discomfort = temperature_discomfort(env_temperature, observer.temperature_preference);
@@ -29498,7 +29523,7 @@ mod tests {
 
         for seed in 0..512 {
             let mut crossover_rng = SmallRngStream::seed_from_u64(seed);
-            let mut mutation_rng = SmallRngStream::seed_from_u64(seed ^ 0xA11C_E5EED);
+            let mut mutation_rng = SmallRngStream::seed_from_u64(seed ^ 0xA_11CE_5EED);
             let child = world.build_child_runtime(
                 &primary,
                 Some(&secondary),
@@ -29577,6 +29602,72 @@ mod tests {
             child.mutation_log.iter().any(|entry| entry == &expected),
             "hybrid provenance must name both geometry sources; log was {:?}",
             child.mutation_log
+        );
+    }
+
+    #[test]
+    fn bd_l3fu_eye_geometry_draw_order_and_count_match_cpp() {
+        let world = WorldState::new(ScriptBotsConfig {
+            reproduction_mutation_scale: 0.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut primary = AgentRuntime::default();
+        primary.eye_fov = [0.25, 0.5, 0.75, 1.0];
+        primary.eye_direction = [0.1, 0.2, 0.3, 0.4];
+        let mut secondary = AgentRuntime::default();
+        secondary.eye_fov = [1.25, 1.5, 1.75, 2.0];
+        secondary.eye_direction = [1.1, 1.2, 1.3, 1.4];
+        let seed = 1;
+        let mut expected_rng = SmallRngStream::seed_from_u64(seed);
+        let _: f32 = expected_rng.random_range(0.35_f32..0.65_f32);
+        let _: f32 = expected_rng.random_range(0.0_f32..1.0_f32);
+        let _: f32 = expected_rng.random_range(0.0_f32..1.0_f32);
+        let expected_fov_from_primary = expected_rng.random_range(0.0_f32..1.0_f32) < 0.5;
+        let expected_fov = if expected_fov_from_primary {
+            primary.eye_fov
+        } else {
+            secondary.eye_fov
+        };
+        let expected_direction_from_primary = expected_rng.random_range(0.0_f32..1.0_f32) < 0.5;
+        let expected_direction = if expected_direction_from_primary {
+            primary.eye_direction
+        } else {
+            secondary.eye_direction
+        };
+        assert_ne!(
+            expected_fov_from_primary, expected_direction_from_primary,
+            "fixture seed must distinguish the FOV draw from the direction draw"
+        );
+        let expected_continuation = expected_rng.checkpoint();
+        let mut crossover_rng = SmallRngStream::seed_from_u64(seed);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0xC205_50AB);
+
+        let child = world.build_child_runtime(
+            &primary,
+            Some(&secondary),
+            8,
+            OffspringRngIdentityV1::new(AgentUid(1), Some(AgentUid(2)), 0),
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+
+        assert_eq!(
+            child.eye_fov.map(f32::to_bits),
+            expected_fov.map(f32::to_bits),
+            "FOV must consume the fourth crossover draw, after blend and both clocks"
+        );
+        assert_eq!(
+            child.eye_direction.map(f32::to_bits),
+            expected_direction.map(f32::to_bits),
+            "direction must consume the fifth crossover draw, immediately after FOV"
+        );
+        assert_eq!(
+            crossover_rng.checkpoint(),
+            expected_continuation,
+            "hybrid eye inheritance must consume exactly two additional crossover draws"
         );
     }
 
@@ -40614,6 +40705,36 @@ mod tests {
                 toroidal_delta(target, origin, EXTENT),
                 "wrap_delta({origin}, {target}) must agree with the minimum image"
             );
+        }
+    }
+
+    /// bd-drhs: the legacy clock counter must reproduce C++'s reset-at-10000 sequence.
+    ///
+    /// The integration test in tests/clock_channel_parity.rs covers the off-by-one from a real
+    /// world, but observing the epoch reset that way would need a 10,000-tick run. This pins the
+    /// arithmetic directly, including the wrap that World.cpp:54-56 performs.
+    #[test]
+    fn legacy_clock_counter_matches_the_cpp_modcounter_sequence() {
+        // C++ presents the POST-increment value, so the first transition is 1, not 0.
+        assert_eq!(legacy_clock_counter(1), 1);
+        assert_eq!(legacy_clock_counter(2), 2);
+
+        // ... up to the last tick before the reset ...
+        assert_eq!(legacy_clock_counter(9_999), 9_999);
+
+        // ... then World.cpp:54-56 resets it to zero, and it climbs again.
+        assert_eq!(
+            legacy_clock_counter(10_000),
+            0,
+            "reaching the epoch length must present 0, matching `if (modcounter>=10000) modcounter=0`"
+        );
+        assert_eq!(legacy_clock_counter(10_001), 1);
+        assert_eq!(legacy_clock_counter(20_000), 0);
+
+        // The argument stays bounded forever; without the reset it would grow without bound and
+        // diverge from C++ permanently after the first epoch.
+        for tick in [1u64, 12_345, 999_999, u64::MAX] {
+            assert!(legacy_clock_counter(tick) < LEGACY_EPOCH_TICKS);
         }
     }
 
