@@ -141,7 +141,10 @@ fn the_attenuation_curve_matches_the_legacy_normalizer() {
     let near = smell_with_neighbor_at(30.0, SEED);
     let far = smell_with_neighbor_at(90.0, SEED);
 
-    assert!(near > 0.0 && far > 0.0, "both neighbours must be in range: near={near}, far={far}");
+    assert!(
+        near > 0.0 && far > 0.0,
+        "both neighbours must be in range: near={near}, far={far}"
+    );
 
     let observed = near / far;
     let expected = (LEGACY_DIST - 30.0) / (LEGACY_DIST - 90.0);
