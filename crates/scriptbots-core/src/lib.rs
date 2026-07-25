@@ -1084,9 +1084,36 @@ const fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
+/// Minimum-image separation `a - b` on a torus of the given extent (bd-b09u).
+///
+/// The previous form applied at most ONE correction, so any pair more than one extent apart
+/// came back with the wrong magnitude and, worse, the wrong SIGN — flipping which side of an
+/// agent a neighbour appears on. That silently corrupted sense, combat and reproduction, and
+/// did so deterministically, so an affected run reproduced its own wrong answer forever.
+/// bd-p095 fixed the same defect in `scriptbots-index`; this is the second site.
+///
+/// The in-range path is deliberately left byte-identical. Coordinates are wrapped into
+/// `[0, extent)` before this is reached in normal operation, so every existing run takes the
+/// `abs() <= extent` branch and performs exactly the same f32 operations in the same order as
+/// before. Canonicalizing unconditionally through `rem_euclid` would have been tidier and
+/// would have moved world digests by a last-bit rounding difference — a science change
+/// smuggled in as a bug fix. Only the previously-wrong branch behaves differently.
 fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
-    let mut delta = a - b;
+    let delta = a - b;
+    if !(extent > 0.0) || !delta.is_finite() {
+        return delta;
+    }
     let half = extent * 0.5;
+    if delta.abs() > extent {
+        // Previously wrong: one correction could not bring this back into range.
+        let folded = delta.rem_euclid(extent);
+        return if folded > half {
+            folded - extent
+        } else {
+            folded
+        };
+    }
+    let mut delta = delta;
     if delta > half {
         delta -= extent;
     } else if delta < -half {
@@ -17182,6 +17209,12 @@ impl WorldState {
         v
     }
 
+    /// Combat's minimum-image separation, delegating to the single canonical implementation.
+    ///
+    /// This carried its own copy of the one-correction defect fixed in [`toroidal_delta`]
+    /// (bd-b09u), so spike targeting inherited the same antipodal flip. Its non-finite guard is
+    /// preserved: combat returns 0.0 for a non-finite input rather than propagating NaN into
+    /// damage resolution.
     fn wrap_delta(origin: f32, target: f32, extent: f32) -> f32 {
         if extent <= 0.0 {
             return target - origin;
@@ -17189,14 +17222,7 @@ impl WorldState {
         if !origin.is_finite() || !target.is_finite() {
             return 0.0;
         }
-        let mut delta = target - origin;
-        let half = extent * 0.5;
-        if delta > half {
-            delta -= extent;
-        } else if delta < -half {
-            delta += extent;
-        }
-        delta
+        toroidal_delta(target, origin, extent)
     }
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
@@ -20728,6 +20754,26 @@ impl WorldState {
                 runtime.temperature_preference,
             );
 
+            let (eye_fov_source, inherited_eye_fov) = if crossover_rng.random_range(0.0..1.0) < 0.5
+            {
+                ("primary", parent.eye_fov)
+            } else {
+                ("secondary", partner_runtime.eye_fov)
+            };
+            runtime.eye_fov = inherited_eye_fov;
+
+            let (eye_direction_source, inherited_eye_direction) =
+                if crossover_rng.random_range(0.0..1.0) < 0.5 {
+                    ("primary", parent.eye_direction)
+                } else {
+                    ("secondary", partner_runtime.eye_direction)
+                };
+            runtime.eye_direction = inherited_eye_direction;
+
+            runtime.push_gene_log(
+                gene_log_capacity,
+                format!("eye geometry: fov={eye_fov_source}, direction={eye_direction_source}"),
+            );
             runtime.push_gene_log(gene_log_capacity, format!("hybrid crossover ({blend:.2})"));
         } else {
             runtime.hybrid = false;
@@ -29426,6 +29472,112 @@ mod tests {
                 "a rejected mutation event must preserve the exact heritable FOV payload"
             );
         }
+    }
+
+    #[test]
+    fn bd_l3fu_hybrid_eye_geometry_can_come_from_either_parent_as_whole_vectors() {
+        let world = WorldState::new(ScriptBotsConfig {
+            reproduction_mutation_scale: 0.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut primary = AgentRuntime::default();
+        primary.eye_fov = [0.25, 0.5, 0.75, 1.0];
+        primary.eye_direction = [0.1, 0.2, 0.3, 0.4];
+        let mut secondary = AgentRuntime::default();
+        secondary.eye_fov = [1.25, 1.5, 1.75, 2.0];
+        secondary.eye_direction = [1.1, 1.2, 1.3, 1.4];
+        let primary_fov = primary.eye_fov.map(f32::to_bits);
+        let secondary_fov = secondary.eye_fov.map(f32::to_bits);
+        let primary_direction = primary.eye_direction.map(f32::to_bits);
+        let secondary_direction = secondary.eye_direction.map(f32::to_bits);
+        let identity = OffspringRngIdentityV1::new(AgentUid(1), Some(AgentUid(2)), 0);
+        let mut seen = [[false; 2]; 2];
+
+        for seed in 0..512 {
+            let mut crossover_rng = SmallRngStream::seed_from_u64(seed);
+            let mut mutation_rng = SmallRngStream::seed_from_u64(seed ^ 0xA11C_E5EED);
+            let child = world.build_child_runtime(
+                &primary,
+                Some(&secondary),
+                8,
+                identity,
+                &mut crossover_rng,
+                &mut mutation_rng,
+            );
+            let child_fov = child.eye_fov.map(f32::to_bits);
+            let fov_source = if child_fov == primary_fov {
+                0
+            } else if child_fov == secondary_fov {
+                1
+            } else {
+                panic!("FOV crossover split a parent vector at seed {seed}: {child_fov:?}");
+            };
+            let child_direction = child.eye_direction.map(f32::to_bits);
+            let direction_source = if child_direction == primary_direction {
+                0
+            } else if child_direction == secondary_direction {
+                1
+            } else {
+                panic!(
+                    "direction crossover split a parent vector at seed {seed}: {child_direction:?}"
+                );
+            };
+            seen[fov_source][direction_source] = true;
+        }
+
+        assert_eq!(
+            seen,
+            [[true, true], [true, true]],
+            "independent whole-vector choices must let either parent's FOV and direction found offspring"
+        );
+    }
+
+    #[test]
+    fn bd_l3fu_gene_log_names_both_eye_geometry_sources() {
+        let world = WorldState::new(ScriptBotsConfig {
+            reproduction_mutation_scale: 0.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut primary = AgentRuntime::default();
+        primary.eye_fov = [0.25, 0.5, 0.75, 1.0];
+        primary.eye_direction = [0.1, 0.2, 0.3, 0.4];
+        let mut secondary = AgentRuntime::default();
+        secondary.eye_fov = [1.25, 1.5, 1.75, 2.0];
+        secondary.eye_direction = [1.1, 1.2, 1.3, 1.4];
+        let mut crossover_rng = SmallRngStream::seed_from_u64(0xC205_50A8);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0xC205_50A9);
+        let child = world.build_child_runtime(
+            &primary,
+            Some(&secondary),
+            8,
+            OffspringRngIdentityV1::new(AgentUid(1), Some(AgentUid(2)), 0),
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+        let fov_source = if child.eye_fov.map(f32::to_bits) == primary.eye_fov.map(f32::to_bits) {
+            "primary"
+        } else {
+            "secondary"
+        };
+        let direction_source =
+            if child.eye_direction.map(f32::to_bits) == primary.eye_direction.map(f32::to_bits) {
+                "primary"
+            } else {
+                "secondary"
+            };
+        let expected = format!("eye geometry: fov={fov_source}, direction={direction_source}");
+
+        assert!(
+            child.mutation_log.iter().any(|entry| entry == &expected),
+            "hybrid provenance must name both geometry sources; log was {:?}",
+            child.mutation_log
+        );
     }
 
     #[test]
@@ -40393,6 +40545,76 @@ mod tests {
             0,
             "a default profiler must ship the zero-cost clock"
         );
+    }
+
+    /// bd-b09u: the minimum-image delta must be correct for coordinates more than one world
+    /// extent apart, not just for already-canonical ones.
+    ///
+    /// The naive form applied at most ONE correction, so a point that is several extents away
+    /// stayed out of range and came back with the wrong magnitude AND the wrong sign. Wrong
+    /// sign is the dangerous part: it flips which side of an agent a neighbour appears on, so
+    /// vision points the wrong way and the resulting neighbour sets feed sense, combat and
+    /// reproduction. It is fully deterministic, so a run reproduces its own corrupted result
+    /// forever. bd-p095 fixed exactly this in scriptbots-index; this is the same defect at a
+    /// second site.
+    #[test]
+    fn toroidal_delta_is_a_true_minimum_image_at_any_distance() {
+        const EXTENT: f32 = 100.0;
+
+        // Physically one unit apart: 202 canonicalizes to 2, and 2 - 1 = 1.
+        assert_eq!(
+            toroidal_delta(202.0, 1.0, EXTENT),
+            1.0,
+            "a target several extents away must reduce to its true separation"
+        );
+        // Sign must survive: 1 is one unit to the LEFT of 202-canonicalized-to-2.
+        assert_eq!(
+            toroidal_delta(1.0, 202.0, EXTENT),
+            -1.0,
+            "the minimum image must keep its direction, not just its magnitude"
+        );
+        // Several extents in both directions.
+        assert_eq!(toroidal_delta(1.0, -299.0, EXTENT), 0.0);
+        assert_eq!(toroidal_delta(-98.0, 501.0, EXTENT), 1.0);
+
+        // The result is always within the half-extent envelope.
+        for a in [-350.0f32, -1.0, 0.0, 49.0, 51.0, 250.0, 1000.0] {
+            for b in [-275.0f32, 0.0, 3.0, 99.0, 404.0] {
+                let delta = toroidal_delta(a, b, EXTENT);
+                assert!(
+                    delta.abs() <= EXTENT * 0.5,
+                    "delta({a}, {b}) = {delta} escaped the half-extent envelope"
+                );
+            }
+        }
+
+        // Already-canonical inputs must be untouched: this is the path every existing run
+        // takes, so it must stay bit-identical or the fix would move world digests.
+        assert_eq!(toroidal_delta(30.0, 10.0, EXTENT), 20.0);
+        assert_eq!(toroidal_delta(10.0, 30.0, EXTENT), -20.0);
+        assert_eq!(toroidal_delta(5.0, 95.0, EXTENT), 10.0);
+        assert_eq!(toroidal_delta(95.0, 5.0, EXTENT), -10.0);
+    }
+
+    /// bd-b09u: combat's wrap_delta had the same one-correction defect as `toroidal_delta`,
+    /// so spike targeting inherited the same antipodal flip.
+    #[test]
+    fn combat_wrap_delta_agrees_with_the_minimum_image_at_any_distance() {
+        const EXTENT: f32 = 100.0;
+        for (origin, target) in [
+            (1.0f32, 202.0f32),
+            (202.0, 1.0),
+            (-299.0, 1.0),
+            (501.0, -98.0),
+            (10.0, 30.0),
+            (95.0, 5.0),
+        ] {
+            assert_eq!(
+                WorldState::wrap_delta(origin, target, EXTENT),
+                toroidal_delta(target, origin, EXTENT),
+                "wrap_delta({origin}, {target}) must agree with the minimum image"
+            );
+        }
     }
 
     fn quiet_trace_config(seed: u64, persistence_interval: u32) -> ScriptBotsConfig {
