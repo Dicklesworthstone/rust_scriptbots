@@ -198,6 +198,15 @@ jobs:
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
+      - name: Prove actual Windows User32 session selection
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test -p scriptbots-app --bin scriptbots-app
+          tests::windows_auto_mode_queries_the_actual_process_window_station
+          -- --exact --nocapture
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
   # Security audit for dependencies
   security:
     name: Security Audit

@@ -1396,6 +1396,16 @@ mod windows_graphical_session {
         flags: u32,
     }
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct WindowStationEvidence {
+        pub station_present: bool,
+        pub query_succeeded: bool,
+        pub flags: u32,
+        pub buffer_size: u32,
+        pub bytes_needed: u32,
+        pub visible: bool,
+    }
+
     #[link(name = "User32")]
     unsafe extern "system" {
         fn GetProcessWindowStation() -> *mut c_void;
@@ -1408,16 +1418,17 @@ mod windows_graphical_session {
         ) -> i32;
     }
 
-    pub(super) fn process_window_station_visible() -> bool {
+    pub(super) fn process_window_station_evidence() -> WindowStationEvidence {
         // SAFETY: `GetProcessWindowStation` takes no arguments and returns a
         // borrowed process-owned handle which Microsoft says must not be closed.
         let station = unsafe { GetProcessWindowStation() };
         if station.is_null() {
-            return false;
+            return WindowStationEvidence::default();
         }
 
         let mut flags = UserObjectFlags::default();
         let mut bytes_needed = 0;
+        let buffer_size = size_of::<UserObjectFlags>() as u32;
         // SAFETY: `flags` is a correctly laid-out writable USEROBJECTFLAGS
         // buffer for UOI_FLAGS and both sizes match the Win32 declarations.
         let succeeded = unsafe {
@@ -1425,12 +1436,23 @@ mod windows_graphical_session {
                 station,
                 UOI_FLAGS,
                 (&raw mut flags).cast(),
-                size_of::<UserObjectFlags>() as u32,
+                buffer_size,
                 &raw mut bytes_needed,
             )
         } != 0;
 
-        succeeded && super::window_station_is_visible(flags.flags)
+        WindowStationEvidence {
+            station_present: true,
+            query_succeeded: succeeded,
+            flags: flags.flags,
+            buffer_size,
+            bytes_needed,
+            visible: succeeded && super::window_station_is_visible(flags.flags),
+        }
+    }
+
+    pub(super) fn process_window_station_visible() -> bool {
+        process_window_station_evidence().visible
     }
 }
 
@@ -2862,6 +2884,64 @@ mod tests {
         assert!(window_station_is_visible(0x0001));
         assert!(window_station_is_visible(0x0001 | 0x4000));
         assert!(!window_station_is_visible(0x4000));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_auto_mode_queries_the_actual_process_window_station() {
+        let evidence = windows_graphical_session::process_window_station_evidence();
+        assert_eq!(
+            evidence.visible,
+            evidence.query_succeeded && window_station_is_visible(evidence.flags),
+            "the production User32 result must drive the same visibility policy as Auto mode"
+        );
+        assert_eq!(
+            evidence.buffer_size, 12,
+            "Win32 USEROBJECTFLAGS must remain three 32-bit fields: {evidence:?}"
+        );
+        if evidence.query_succeeded {
+            assert!(
+                evidence.station_present,
+                "GetUserObjectInformationW cannot succeed without a process window station"
+            );
+            assert!(
+                evidence.bytes_needed == evidence.buffer_size,
+                "User32 must report the exact USEROBJECTFLAGS buffer size on a successful \
+                 UOI_FLAGS query: {evidence:?}"
+            );
+        }
+
+        let selected = select_renderer_mode(
+            RendererMode::Auto,
+            RendererAvailability {
+                gui: true,
+                bevy: true,
+            },
+            RendererEnvironment {
+                graphical_session: evidence.visible,
+                ..RendererEnvironment::default()
+            },
+        )
+        .expect("actual Windows session evidence must select a compiled renderer");
+        assert_eq!(
+            selected,
+            if evidence.visible {
+                RendererMode::Gui
+            } else {
+                RendererMode::Terminal
+            }
+        );
+        eprintln!(
+            "SCRIPTBOTS_WINDOWS_SESSION_EVIDENCE station_present={} query_succeeded={} \
+             flags=0x{:08x} buffer_size={} bytes_needed={} visible={} selected={}",
+            evidence.station_present,
+            evidence.query_succeeded,
+            evidence.flags,
+            evidence.buffer_size,
+            evidence.bytes_needed,
+            evidence.visible,
+            selected
+        );
     }
 
     #[cfg(target_os = "macos")]
