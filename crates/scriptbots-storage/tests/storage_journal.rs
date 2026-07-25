@@ -50,7 +50,11 @@ fn command_replay_world() -> WorldState {
         population_minimum: 0,
         population_spawn_interval: 0,
         reproduction_attempt_chance: 0.0,
-        persistence_interval: 1,
+        // The first Step makes the injected parents eligible for crossover, while
+        // the second Step still exercises a real sealed persistence boundary.
+        // Sealing every tick would correctly reject the intervening external GUI
+        // edits rather than testing their journal/replay ordering.
+        persistence_interval: 2,
         rng_seed: Some(0x37C0_1100),
         closed: false,
         history_capacity: 8,
