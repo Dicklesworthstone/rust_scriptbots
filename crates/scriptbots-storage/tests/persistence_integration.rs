@@ -1,12 +1,13 @@
 use fsqlite::compat::{OpenFlags, RowExt, open_with_flags};
 use scriptbots_core::{
-    AgentData, PersistenceBatch, ReplayEvent, ReplayEventKind, ReplayInteractionKind,
-    ScriptBotsConfig, Tick, TickSummary, WorldState,
+    AgentData, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, PersistenceBatch, Position, ReplayEvent,
+    ReplayEventKind, ReplayInteractionKind, ScriptBotsConfig, Tick, TickSummary, WorldState,
+    channels::OutputChannel,
 };
-use scriptbots_storage::{StoragePipeline, StorageReader};
+use scriptbots_storage::{StorageDeadlines, StoragePipeline, StorageReader};
 use std::{
     fs,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[test]
@@ -241,6 +242,28 @@ fn narrative_events_persisted_online_are_readable_offline() {
 
 /// Build a batch carrying exactly the supplied replay events at `tick`.
 fn batch_with_replay_events(tick: u64, replay_events: Vec<ReplayEvent>) -> PersistenceBatch {
+    let interaction_count = replay_events
+        .iter()
+        .filter(|event| matches!(event.kind, ReplayEventKind::Interaction { .. }))
+        .count();
+    let events = if interaction_count == 0 {
+        Vec::new()
+    } else {
+        vec![
+            scriptbots_core::PersistenceEvent::new(
+                scriptbots_core::PersistenceEventKind::Custom(std::borrow::Cow::Borrowed(
+                    scriptbots_core::INTERACTION_EVENTS_OBSERVED_KIND,
+                )),
+                interaction_count,
+            ),
+            scriptbots_core::PersistenceEvent::new(
+                scriptbots_core::PersistenceEventKind::Custom(std::borrow::Cow::Borrowed(
+                    scriptbots_core::INTERACTION_EVENTS_PERSISTED_KIND,
+                )),
+                interaction_count,
+            ),
+        ]
+    };
     PersistenceBatch {
         summary: TickSummary {
             tick: Tick(tick),
@@ -256,7 +279,7 @@ fn batch_with_replay_events(tick: u64, replay_events: Vec<ReplayEvent>) -> Persi
         epoch: 0,
         closed: false,
         metrics: Vec::new(),
-        events: Vec::new(),
+        events,
         agents: Vec::new(),
         births: Vec::new(),
         deaths: Vec::new(),
@@ -275,6 +298,206 @@ fn temp_run_path(label: &str) -> std::path::PathBuf {
         std::process::id(),
         timestamp
     ))
+}
+
+#[derive(Debug)]
+struct GiveIntentBrain {
+    give: bool,
+}
+
+impl BrainRunner for GiveIntentBrain {
+    fn kind(&self) -> &'static str {
+        if self.give {
+            "test.storage.give"
+        } else {
+            "test.storage.receive"
+        }
+    }
+
+    fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        let mut outputs = [0.0; OUTPUT_SIZE];
+        outputs[OutputChannel::GiveIntent.index()] = f32::from(u8::from(self.give));
+        outputs
+    }
+}
+
+/// A seeded 2k world must preserve the exact core interaction count through durable SQL.
+#[test]
+fn seeded_2k_world_interaction_count_matches_durable_rows() {
+    const AGENTS: usize = 2_000;
+    const PAIRS: usize = AGENTS / 2;
+
+    let path = temp_run_path("seeded_2k_interactions");
+    let path_str = path.to_str().expect("utf8 path");
+    let proof_deadline = Duration::from_secs(10 * 60);
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds_and_deadlines(
+        path_str,
+        1,
+        1,
+        1,
+        1,
+        StorageDeadlines {
+            flush_ack: proof_deadline,
+            shutdown_ack: proof_deadline,
+            ..StorageDeadlines::default()
+        },
+    )
+    .expect("2k durable pipeline");
+    let (mut world, mut persistence) = WorldState::with_persistence(
+        ScriptBotsConfig {
+            world_width: 5_100,
+            world_height: 2_100,
+            food_cell_size: 50,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            food_transfer_rate: 0.01,
+            food_sharing_distance: 2.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            reproduction_attempt_chance: 0.0,
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 1,
+            interaction_event_tick_cap: PAIRS,
+            interaction_event_tick_stride: 1,
+            rng_seed: Some(0x2000_5EED),
+            ..ScriptBotsConfig::default()
+        },
+        Box::new(pipeline.sink()),
+    )
+    .expect("2k seeded world");
+
+    let giver_brain = world
+        .brain_registry_mut()
+        .expect("giver brain registry")
+        .register("test.storage.give", |_rng| {
+            Ok(Box::new(GiveIntentBrain { give: true }))
+        });
+    let receiver_brain = world
+        .brain_registry_mut()
+        .expect("receiver brain registry")
+        .register("test.storage.receive", |_rng| {
+            Ok(Box::new(GiveIntentBrain { give: false }))
+        });
+
+    for pair in 0..PAIRS {
+        let grid_x = u16::try_from(pair % 50).expect("2k grid x fits u16");
+        let grid_y = u16::try_from(pair / 50).expect("2k grid y fits u16");
+        let x = 50.0 + f32::from(grid_x) * 100.0;
+        let y = 50.0 + f32::from(grid_y) * 100.0;
+        let giver = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(x, y),
+                ..AgentData::default()
+            })
+            .expect("seed giver");
+        let receiver = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(x + 1.0, y),
+                ..AgentData::default()
+            })
+            .expect("seed receiver");
+        assert!(
+            world
+                .bind_agent_brain(giver, giver_brain)
+                .expect("bind giver brain")
+        );
+        assert!(
+            world
+                .bind_agent_brain(receiver, receiver_brain)
+                .expect("bind receiver brain")
+        );
+    }
+
+    let completion = persistence
+        .step_outcome(&mut world)
+        .expect("run the seeded interaction tick");
+    assert!(
+        completion.fault.is_none(),
+        "the seeded science boundary must complete without a contained fault"
+    );
+    let batch = persistence
+        .pending_batch()
+        .expect("the interval-one boundary stages a persistence batch");
+    let core_edges = batch
+        .replay_events
+        .iter()
+        .filter(|event| matches!(event.kind, ReplayEventKind::Interaction { .. }))
+        .count();
+    let counter = |kind: &str| {
+        batch
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                scriptbots_core::PersistenceEventKind::Custom(name) if name == kind => {
+                    Some(event.count)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    };
+    let core_observed = counter(scriptbots_core::INTERACTION_EVENTS_OBSERVED_KIND);
+    let core_persisted = counter(scriptbots_core::INTERACTION_EVENTS_PERSISTED_KIND);
+    let core_sampled_out = counter(scriptbots_core::INTERACTION_EVENTS_SAMPLED_OUT_KIND);
+    let core_truncated = counter(scriptbots_core::INTERACTION_EVENTS_TRUNCATED_KIND);
+    assert_eq!(batch.summary.agent_count, AGENTS);
+    assert_eq!(core_edges, PAIRS);
+    assert_eq!(
+        (
+            core_observed,
+            core_persisted,
+            core_sampled_out,
+            core_truncated
+        ),
+        (PAIRS, PAIRS, 0, 0)
+    );
+    assert!(
+        persistence
+            .admit_pending(&mut world)
+            .expect("admit the exact staged 2k batch")
+    );
+    pipeline
+        .flush_and_wait()
+        .expect("durably flush the 2k batch");
+    pipeline.shutdown().expect("durable pipeline shutdown");
+
+    let reader = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("independent read-only reader opens");
+    let durable = reader
+        .query(
+            "SELECT
+               (SELECT COUNT(*) FROM interactions),
+               COALESCE(SUM(CASE WHEN kind = 'interaction_events_observed' THEN count ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN kind = 'interaction_events_persisted' THEN count ELSE 0 END), 0)
+             FROM events",
+        )
+        .expect("durable accounting query runs");
+    let durable_edges: i64 = durable[0].get_typed(0).expect("edge count");
+    let durable_observed: i64 = durable[0].get_typed(1).expect("observed count");
+    let durable_persisted: i64 = durable[0].get_typed(2).expect("persisted count");
+    assert_eq!(
+        usize::try_from(durable_edges).expect("edge count is non-negative"),
+        core_edges,
+        "the durable interaction graph must contain every world-emitted edge exactly once"
+    );
+    assert_eq!(
+        usize::try_from(durable_observed).expect("observed count is non-negative"),
+        core_observed
+    );
+    assert_eq!(
+        usize::try_from(durable_persisted).expect("persisted count is non-negative"),
+        core_persisted
+    );
+    reader.close().expect("read-only reader closes");
+
+    let _ = fs::remove_file(&path);
 }
 
 /// Typed combat and food-share facts must retain their source tick, stable participants,
@@ -430,6 +653,26 @@ fn typed_pairwise_events_persist_as_queryable_interaction_edges() {
     assert_eq!(kind, "combat");
     assert_eq!(value, 0.375);
 
+    let completeness = reader
+        .query(&format!(
+            "SELECT
+               COALESCE(SUM(CASE WHEN kind = '{}' THEN count ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN kind = '{}' THEN count ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN kind = '{}' THEN count ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN kind = '{}' THEN count ELSE 0 END), 0)
+             FROM events",
+            scriptbots_core::INTERACTION_EVENTS_OBSERVED_KIND,
+            scriptbots_core::INTERACTION_EVENTS_PERSISTED_KIND,
+            scriptbots_core::INTERACTION_EVENTS_SAMPLED_OUT_KIND,
+            scriptbots_core::INTERACTION_EVENTS_TRUNCATED_KIND,
+        ))
+        .expect("persisted interaction completeness counters are queryable");
+    let observed: i64 = completeness[0].get_typed(0).expect("observed count");
+    let projected: i64 = completeness[0].get_typed(1).expect("projected count");
+    let sampled_out: i64 = completeness[0].get_typed(2).expect("sampled count");
+    let truncated: i64 = completeness[0].get_typed(3).expect("truncated count");
+    assert_eq!((observed, projected, sampled_out, truncated), (2, 2, 0, 0));
+
     // The accounting identity bd-2z0.5.9 asks for: an interaction row exists for exactly the
     // replay events that name two participants -- no edge without an event, no pairwise event
     // without an edge. Expressed as SQL over both tables rather than as two Rust counts, so it
@@ -458,6 +701,16 @@ fn typed_pairwise_events_persist_as_queryable_interaction_edges() {
     assert_eq!(
         pairwise_events_without_edges, 0,
         "a pairwise event was persisted without its interaction edge"
+    );
+    assert_eq!(
+        observed,
+        projected + sampled_out + truncated,
+        "persisted completeness counters must account for every observed interaction"
+    );
+    assert_eq!(
+        projected,
+        i64::try_from(rows.len()).expect("row count fits i64"),
+        "the projected counter must equal the durable SQL edge count"
     );
 
     reader.close().expect("read-only reader closes");

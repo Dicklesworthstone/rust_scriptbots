@@ -40,6 +40,13 @@ use crate::{
 };
 
 impl WorldState {
+    fn replay_interaction_tick_selected(&self, tick: Tick) -> bool {
+        let stride = self.config.interaction_event_tick_stride;
+        self.config.interaction_event_tick_cap > 0
+            && stride > 0
+            && tick.0.is_multiple_of(u64::from(stride))
+    }
+
     fn begin_replay_tick(&mut self, tick: Tick) {
         if self.replay_tick != tick.0 {
             self.replay_tick = tick.0;
@@ -50,6 +57,9 @@ impl WorldState {
     /// Number of pairwise interaction slots still available for this simulation tick.
     pub(crate) fn replay_interaction_slots(&mut self, tick: Tick) -> usize {
         self.begin_replay_tick(tick);
+        if !self.replay_interaction_tick_selected(tick) {
+            return 0;
+        }
         self.config
             .interaction_event_tick_cap
             .saturating_sub(self.replay_interactions_this_tick)
@@ -63,11 +73,26 @@ impl WorldState {
         dropped: usize,
     ) {
         self.begin_replay_tick(tick);
-        let remaining = self
-            .config
-            .interaction_event_tick_cap
-            .saturating_sub(self.replay_interactions_this_tick);
-        for event in events.into_iter().take(remaining) {
+        let remaining = self.replay_interaction_slots(tick);
+        let observed = events.len().saturating_add(dropped);
+        let persisted = events.len().min(remaining);
+        let omitted = observed.saturating_sub(persisted);
+        self.replay_interactions_observed_pending = self
+            .replay_interactions_observed_pending
+            .saturating_add(observed);
+        self.replay_interactions_persisted_pending = self
+            .replay_interactions_persisted_pending
+            .saturating_add(persisted);
+        if self.replay_interaction_tick_selected(tick) {
+            self.replay_interactions_truncated_pending = self
+                .replay_interactions_truncated_pending
+                .saturating_add(omitted);
+        } else {
+            self.replay_interactions_sampled_out_pending = self
+                .replay_interactions_sampled_out_pending
+                .saturating_add(omitted);
+        }
+        for event in events.into_iter().take(persisted) {
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "usize is at most u64 on every supported ScriptBots target"
@@ -87,7 +112,7 @@ impl WorldState {
             });
             self.replay_interactions_this_tick += 1;
         }
-        let dropped = u64::try_from(dropped).unwrap_or(u64::MAX);
+        let dropped = u64::try_from(omitted).unwrap_or(u64::MAX);
         self.replay_interactions_dropped_total = self
             .replay_interactions_dropped_total
             .saturating_add(dropped);
@@ -97,12 +122,13 @@ impl WorldState {
                 emitted = self.replay_interactions_this_tick,
                 dropped,
                 cap = self.config.interaction_event_tick_cap,
-                "pairwise interaction replay sample reached its per-tick cap"
+                stride = self.config.interaction_event_tick_stride,
+                "pairwise interaction replay sample omitted events under its configured policy"
             );
         }
     }
 
-    /// Total pairwise facts omitted by the deterministic per-tick interaction cap.
+    /// Total pairwise facts omitted by the configured stride or hard cap.
     #[must_use]
     pub const fn replay_interaction_events_dropped(&self) -> u64 {
         self.replay_interactions_dropped_total
@@ -209,9 +235,9 @@ impl WorldState {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AgentData, AgentId, AgentUid, PersistenceAdmissionError, PersistenceBatch, Position,
-        ReplayEvent, ReplayEventKind, ReplayInteractionKind, ScriptBotsConfig, WorldPersistence,
-        WorldState, channels::OutputChannel,
+        AgentData, AgentId, AgentUid, PendingReplayInteraction, PersistenceAdmissionError,
+        PersistenceBatch, Position, ReplayEvent, ReplayEventKind, ReplayInteractionKind,
+        ScriptBotsConfig, Tick, WorldPersistence, WorldState, channels::OutputChannel,
     };
     use std::sync::{Arc, Mutex};
 
@@ -507,6 +533,7 @@ mod tests {
             closed: true,
             population_minimum: 0,
             population_spawn_interval: 0,
+            rng_seed: Some(0x1A7E_2AC7),
             ..ScriptBotsConfig::default()
         };
         let mut world = WorldState::new(config).expect("pairwise fixture world");
@@ -628,6 +655,273 @@ mod tests {
         assert_eq!(
             ScriptBotsConfig::default().interaction_event_tick_cap,
             crate::DEFAULT_INTERACTION_EVENT_TICK_CAP
+        );
+    }
+
+    #[test]
+    fn interaction_edges_keep_stable_uids_when_slotmap_storage_recycles() {
+        let (mut world, actor_id, removed_id, actor_uid, removed_uid) = pairwise_world(8);
+        world
+            .remove_agent(removed_id)
+            .expect("remove the original target");
+        let replacement_id = world
+            .try_spawn_agent(AgentData::default())
+            .expect("spawn replacement target");
+        let replacement_uid = world.agent_uid(replacement_id).expect("replacement uid");
+        assert_ne!(removed_id, replacement_id, "slot generation must advance");
+        assert_eq!(
+            removed_id.raw() & u64::from(u32::MAX),
+            replacement_id.raw() & u64::from(u32::MAX),
+            "the test premise requires the replacement to reuse the removed slot"
+        );
+        assert_ne!(
+            removed_uid, replacement_uid,
+            "stable UIDs must never recycle"
+        );
+
+        let actor_index = world.agents.index_of(actor_id).expect("actor index");
+        let replacement_index = world
+            .agents
+            .index_of(replacement_id)
+            .expect("replacement index");
+        {
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[actor_index] = Position::new(10.0, 10.0);
+            columns.positions_mut()[replacement_index] = Position::new(12.0, 10.0);
+            columns.headings_mut()[actor_index] = 0.0;
+            columns.spike_lengths_mut()[actor_index] = 1.0;
+            columns.health_mut()[replacement_index] = 2.0;
+        }
+        {
+            let actor = world.runtime.get_mut(actor_id).expect("actor runtime");
+            actor.energy = 1.0;
+            actor.give_intent = 1.0;
+            actor.herbivore_tendency = 0.1;
+            actor.outputs[OutputChannel::SpikeTarget.index()] = 1.0;
+        }
+        {
+            let replacement = world
+                .runtime
+                .get_mut(replacement_id)
+                .expect("replacement runtime");
+            replacement.energy = 1.0;
+            replacement.give_intent = 0.0;
+            replacement.herbivore_tendency = 0.2;
+        }
+
+        world.stage_food();
+        world.stage_combat();
+
+        let interactions = world
+            .replay_events
+            .iter()
+            .filter(|event| matches!(event.kind, ReplayEventKind::Interaction { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(interactions.len(), 2);
+        assert!(
+            interactions.iter().all(|event| {
+                event.agent_uid == Some(actor_uid)
+                    && event.counterpart == Some(replacement_uid)
+                    && event.counterpart != Some(removed_uid)
+            }),
+            "interaction rows must name stable live UIDs, never a recycled slot's former owner"
+        );
+    }
+
+    #[test]
+    fn interaction_stride_resets_ordinals_and_persists_completeness_counts() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 1,
+            interaction_event_tick_cap: 1,
+            interaction_event_tick_stride: 2,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("sampling world");
+        assert!(
+            !world.has_pending_persistence_material(),
+            "the empty sampling world starts without a persistence tail"
+        );
+        let pending = || PendingReplayInteraction {
+            actor: AgentUid(1),
+            actor_position: Position::new(1.0, 2.0),
+            target: AgentUid(2),
+            target_position: Position::new(3.0, 4.0),
+            kind: ReplayInteractionKind::Combat,
+            magnitude: 0.25,
+        };
+
+        for tick in 1..=4 {
+            let tick = Tick(tick);
+            if world.replay_interaction_slots(tick) == 0 {
+                world.record_replay_interaction_events(tick, Vec::new(), 1);
+            } else {
+                world.record_replay_interaction_events(tick, vec![pending(), pending()], 0);
+            }
+        }
+        assert!(
+            world.has_pending_persistence_material(),
+            "sampled-out interaction accounting is persistence material even when a tick emits no \
+             edge row"
+        );
+
+        let projection = world.prepare_persistence(Tick(4), true);
+        let batch = projection.batch().expect("forced persistence batch");
+        assert!(
+            !world.has_pending_persistence_material(),
+            "projection drains the exact interaction accounting tail"
+        );
+        let sampled = batch
+            .replay_events
+            .iter()
+            .filter_map(|event| match event.kind {
+                ReplayEventKind::Interaction { tick, ordinal, .. } => Some((tick, ordinal)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sampled,
+            vec![(Tick(2), 0), (Tick(4), 0)],
+            "stride two retains complete selected windows and resets the source-tick ordinal"
+        );
+        let count = |kind: &str| {
+            batch
+                .events
+                .iter()
+                .find_map(|event| match &event.kind {
+                    crate::PersistenceEventKind::Custom(name) if name == kind => Some(event.count),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        let observed = count(crate::INTERACTION_EVENTS_OBSERVED_KIND);
+        let persisted = count(crate::INTERACTION_EVENTS_PERSISTED_KIND);
+        let sampled_out = count(crate::INTERACTION_EVENTS_SAMPLED_OUT_KIND);
+        let truncated = count(crate::INTERACTION_EVENTS_TRUNCATED_KIND);
+        assert_eq!(observed, 6);
+        assert_eq!(persisted, 2);
+        assert_eq!(sampled_out, 2);
+        assert_eq!(truncated, 2);
+        assert_eq!(
+            observed.saturating_sub(sampled_out),
+            persisted + truncated,
+            "every selected-tick interaction is either persisted or explicitly truncated"
+        );
+        assert_eq!(observed, persisted + sampled_out + truncated);
+        assert_eq!(world.replay_interaction_events_dropped(), 4);
+    }
+
+    #[test]
+    fn interaction_stride_roundtrips_zero_and_refuses_the_digest_sentinel() {
+        for stride in [0, 1, 7] {
+            let config = ScriptBotsConfig {
+                interaction_event_tick_stride: stride,
+                ..ScriptBotsConfig::default()
+            };
+            let json = serde_json::to_value(&config).expect("serialize config JSON");
+            assert_eq!(
+                json.get("interaction_event_tick_stride"),
+                Some(&serde_json::json!(stride)),
+                "every real stride, including aggregates-only zero, belongs in provenance"
+            );
+            let from_json: ScriptBotsConfig =
+                serde_json::from_value(json).expect("deserialize config JSON");
+            assert_eq!(from_json.interaction_event_tick_stride, stride);
+
+            let postcard = postcard::to_allocvec(&config).expect("serialize config postcard");
+            let from_postcard: ScriptBotsConfig =
+                postcard::from_bytes(&postcard).expect("deserialize config postcard");
+            assert_eq!(from_postcard.interaction_event_tick_stride, stride);
+        }
+
+        let sentinel = ScriptBotsConfig {
+            interaction_event_tick_stride: u32::MAX,
+            ..ScriptBotsConfig::default()
+        };
+        assert!(matches!(
+            WorldState::new(sentinel),
+            Err(crate::WorldStateError::InvalidConfig(
+                "interaction_event_tick_stride must be less than u32::MAX"
+            ))
+        ));
+    }
+
+    #[test]
+    fn seeded_2k_food_share_stage_has_exact_interaction_accounting() {
+        const AGENTS: usize = 2_000;
+        const PAIRS: usize = AGENTS / 2;
+        let mut world = WorldState::new(ScriptBotsConfig {
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 1,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            food_transfer_rate: 0.01,
+            food_sharing_distance: 2.0,
+            interaction_event_tick_cap: PAIRS,
+            interaction_event_tick_stride: 1,
+            rng_seed: Some(0x2000_5EED),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("2k seeded world");
+
+        for pair in 0..PAIRS {
+            let grid_x = u16::try_from(pair % 50).expect("2k grid x fits u16");
+            let grid_y = u16::try_from(pair / 50).expect("2k grid y fits u16");
+            let x = 50.0 + f32::from(grid_x) * 100.0;
+            let y = 50.0 + f32::from(grid_y) * 100.0;
+            let giver = world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(x, y),
+                    ..AgentData::default()
+                })
+                .expect("seed giver");
+            let recipient = world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(x + 1.0, y),
+                    ..AgentData::default()
+                })
+                .expect("seed recipient");
+            let giver_runtime = world.runtime.get_mut(giver).expect("giver runtime");
+            giver_runtime.energy = 1.0;
+            giver_runtime.give_intent = 1.0;
+            let recipient_runtime = world.runtime.get_mut(recipient).expect("recipient runtime");
+            recipient_runtime.energy = 1.0;
+            recipient_runtime.give_intent = 0.0;
+        }
+
+        world.stage_food();
+        assert_eq!(world.agents.len(), AGENTS);
+        assert_eq!(world.replay_interactions_observed_pending, PAIRS);
+        assert_eq!(world.replay_interactions_persisted_pending, PAIRS);
+        assert_eq!(world.replay_interactions_sampled_out_pending, 0);
+        assert_eq!(world.replay_interactions_truncated_pending, 0);
+
+        let projection = world.prepare_persistence(Tick(1), true);
+        let batch = projection.batch().expect("2k persistence batch");
+        let persisted_edges = batch
+            .replay_events
+            .iter()
+            .filter(|event| matches!(event.kind, ReplayEventKind::Interaction { .. }))
+            .count();
+        assert_eq!(batch.summary.agent_count, AGENTS);
+        assert_eq!(
+            persisted_edges, PAIRS,
+            "the persisted edge stream must exactly match the in-sim interaction counter"
+        );
+        assert_eq!(
+            batch.events.iter().find_map(|event| match &event.kind {
+                crate::PersistenceEventKind::Custom(name)
+                    if name == crate::INTERACTION_EVENTS_PERSISTED_KIND =>
+                {
+                    Some(event.count)
+                }
+                _ => None,
+            }),
+            Some(PAIRS)
         );
     }
 }

@@ -7620,6 +7620,31 @@ pub const DEFAULT_REPLAY_EVENT_TICK_CAP: usize = 512;
 /// the tick's interaction count records full fidelity.
 pub const DEFAULT_INTERACTION_EVENT_TICK_CAP: usize = 512;
 
+/// Default cadence for retaining pairwise interaction events.
+///
+/// One records every simulation tick. Larger values retain only ticks divisible by the
+/// configured stride, while zero selects the aggregates-only fallback.
+pub const DEFAULT_INTERACTION_EVENT_TICK_STRIDE: u32 = 1;
+
+const fn default_interaction_event_tick_stride() -> u32 {
+    DEFAULT_INTERACTION_EVENT_TICK_STRIDE
+}
+
+const DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE: u32 = u32::MAX;
+
+const fn interaction_event_tick_stride_is_digest_sentinel(value: &u32) -> bool {
+    *value == DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE
+}
+
+/// Persistence event kind recording pairwise interactions observed by the simulation.
+pub const INTERACTION_EVENTS_OBSERVED_KIND: &str = "interaction_events_observed";
+/// Persistence event kind recording pairwise interactions emitted to durable projection.
+pub const INTERACTION_EVENTS_PERSISTED_KIND: &str = "interaction_events_persisted";
+/// Persistence event kind recording pairwise interactions skipped by the tick-window policy.
+pub const INTERACTION_EVENTS_SAMPLED_OUT_KIND: &str = "interaction_events_sampled_out";
+/// Persistence event kind recording pairwise interactions cut by the selected tick's hard cap.
+pub const INTERACTION_EVENTS_TRUNCATED_KIND: &str = "interaction_events_truncated";
+
 /// Lightweight wrapper pairing an agent context with a replay event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayEvent {
@@ -11582,6 +11607,18 @@ pub struct ScriptBotsConfig {
     /// Renderer configuration shared across front-ends.
     #[serde(default)]
     pub render: RenderSettings,
+    /// Tick cadence for pairwise interaction persistence.
+    ///
+    /// `1` records every tick, `N` in `2..u32::MAX` records ticks divisible by `N`, and `0`
+    /// selects the aggregates-only fallback. `u32::MAX` is reserved for digest compatibility.
+    /// The per-tick cap remains a hard ceiling on selected ticks.
+    /// This trailing field is serialized with the run configuration so offline graph consumers
+    /// can distinguish complete windows from deliberate sampling.
+    #[serde(
+        default = "default_interaction_event_tick_stride",
+        skip_serializing_if = "interaction_event_tick_stride_is_digest_sentinel"
+    )]
+    pub interaction_event_tick_stride: u32,
 }
 
 // `f32::cos` is supplied by each target's math runtime and may round the last bit
@@ -11688,6 +11725,7 @@ impl Default for ScriptBotsConfig {
             persistence_interval: 0,
             replay_event_tick_cap: DEFAULT_REPLAY_EVENT_TICK_CAP,
             interaction_event_tick_cap: DEFAULT_INTERACTION_EVENT_TICK_CAP,
+            interaction_event_tick_stride: DEFAULT_INTERACTION_EVENT_TICK_STRIDE,
             analytics_stride: AnalyticsStride::default(),
             neuroflow: NeuroflowSettings {
                 enabled: true,
@@ -11830,6 +11868,10 @@ impl ScriptBotsConfig {
         reject_unless!(self.world_width != 0, "world_width must be non-zero");
         reject_unless!(self.world_height != 0, "world_height must be non-zero");
         reject_unless!(self.food_cell_size != 0, "food_cell_size must be non-zero");
+        reject_unless!(
+            self.interaction_event_tick_stride != DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE,
+            "interaction_event_tick_stride must be less than u32::MAX"
+        );
         reject_unless!(
             self.food_cell_size <= MAX_EXACT_F32_INTEGER,
             "food_cell_size must not exceed 16777216 for exact f32 world geometry"
@@ -15925,6 +15967,10 @@ pub struct WorldState {
     replay_tick: u64,
     replay_interactions_this_tick: usize,
     replay_interactions_dropped_total: u64,
+    replay_interactions_observed_pending: usize,
+    replay_interactions_persisted_pending: usize,
+    replay_interactions_sampled_out_pending: usize,
+    replay_interactions_truncated_pending: usize,
     replay_events: Vec<ReplayEvent>,
     /// Transient driver request to bind the canonical world digest into the next projected
     /// batch's replay stream; consumed by `prepare_persistence`. Never serialized: it is a
@@ -16140,6 +16186,10 @@ struct BoundaryReady {
     deaths: usize,
     spike_attempts: u32,
     spike_hits: u32,
+    interaction_events_observed: usize,
+    interaction_events_persisted: usize,
+    interaction_events_sampled_out: usize,
+    interaction_events_truncated: usize,
     total_energy: f32,
     average_energy: f32,
     average_health: f32,
@@ -16506,8 +16556,12 @@ fn project_persistence_events(
     summary: &TickSummary,
     spike_attempts: u32,
     spike_hits: u32,
+    interaction_events_observed: usize,
+    interaction_events_persisted: usize,
+    interaction_events_sampled_out: usize,
+    interaction_events_truncated: usize,
 ) -> Vec<PersistenceEvent> {
-    let mut events = Vec::with_capacity(4);
+    let mut events = Vec::with_capacity(8);
     if summary.births > 0 {
         events.push(PersistenceEvent::new(
             PersistenceEventKind::Births,
@@ -16530,6 +16584,30 @@ fn project_persistence_events(
         events.push(PersistenceEvent::new(
             PersistenceEventKind::Custom(Cow::Borrowed("spike_hits")),
             spike_hits as usize,
+        ));
+    }
+    if interaction_events_observed > 0 {
+        events.push(PersistenceEvent::new(
+            PersistenceEventKind::Custom(Cow::Borrowed(INTERACTION_EVENTS_OBSERVED_KIND)),
+            interaction_events_observed,
+        ));
+    }
+    if interaction_events_persisted > 0 {
+        events.push(PersistenceEvent::new(
+            PersistenceEventKind::Custom(Cow::Borrowed(INTERACTION_EVENTS_PERSISTED_KIND)),
+            interaction_events_persisted,
+        ));
+    }
+    if interaction_events_sampled_out > 0 {
+        events.push(PersistenceEvent::new(
+            PersistenceEventKind::Custom(Cow::Borrowed(INTERACTION_EVENTS_SAMPLED_OUT_KIND)),
+            interaction_events_sampled_out,
+        ));
+    }
+    if interaction_events_truncated > 0 {
+        events.push(PersistenceEvent::new(
+            PersistenceEventKind::Custom(Cow::Borrowed(INTERACTION_EVENTS_TRUNCATED_KIND)),
+            interaction_events_truncated,
         ));
     }
     events
@@ -16618,7 +16696,15 @@ fn project_persistence_batch(drain: BoundaryDrain) -> PersistenceProjection {
         );
     }
 
-    let events = project_persistence_events(&summary, ready.spike_attempts, ready.spike_hits);
+    let events = project_persistence_events(
+        &summary,
+        ready.spike_attempts,
+        ready.spike_hits,
+        ready.interaction_events_observed,
+        ready.interaction_events_persisted,
+        ready.interaction_events_sampled_out,
+        ready.interaction_events_truncated,
+    );
 
     project_mortality_metrics(ready.mortality.as_ref(), &mut metrics);
     project_birth_metrics(ready.birth_composition.as_ref(), &mut metrics);
@@ -16731,6 +16817,10 @@ impl WorldState {
             replay_tick: 0,
             replay_interactions_this_tick: 0,
             replay_interactions_dropped_total: 0,
+            replay_interactions_observed_pending: 0,
+            replay_interactions_persisted_pending: 0,
+            replay_interactions_sampled_out_pending: 0,
+            replay_interactions_truncated_pending: 0,
             replay_events: Vec::new(),
             replay_world_digest_pending: false,
             persistence_binding: Arc::new(PersistenceSessionToken::default()),
@@ -22347,6 +22437,10 @@ impl WorldState {
             self.pending_death_events = 0;
             self.pending_spike_attempt_events = 0;
             self.pending_spike_hit_events = 0;
+            self.replay_interactions_observed_pending = 0;
+            self.replay_interactions_persisted_pending = 0;
+            self.replay_interactions_sampled_out_pending = 0;
+            self.replay_interactions_truncated_pending = 0;
             self.pending_persistence_runtime_tail.clear();
             return BoundaryDrain::Disabled;
         }
@@ -22655,6 +22749,10 @@ impl WorldState {
             deaths: self.pending_death_events,
             spike_attempts: self.pending_spike_attempt_events,
             spike_hits: self.pending_spike_hit_events,
+            interaction_events_observed: self.replay_interactions_observed_pending,
+            interaction_events_persisted: self.replay_interactions_persisted_pending,
+            interaction_events_sampled_out: self.replay_interactions_sampled_out_pending,
+            interaction_events_truncated: self.replay_interactions_truncated_pending,
             total_energy,
             average_energy,
             average_health,
@@ -22676,6 +22774,10 @@ impl WorldState {
         self.pending_death_events = 0;
         self.pending_spike_attempt_events = 0;
         self.pending_spike_hit_events = 0;
+        self.replay_interactions_observed_pending = 0;
+        self.replay_interactions_persisted_pending = 0;
+        self.replay_interactions_sampled_out_pending = 0;
+        self.replay_interactions_truncated_pending = 0;
         self.carcass_health_distributed = 0.0;
         self.carcass_reproduction_bonus = 0.0;
         BoundaryDrain::Ready(Box::new(ready))
@@ -23628,6 +23730,12 @@ impl WorldState {
         // cannot match the production run it exists to verify, which defeats the anchor.
         scientific_config.replay_event_tick_cap = 0;
         scientific_config.interaction_event_tick_cap = 0;
+        // This impossible runtime value is skipped only for the digest clone. Keeping the new
+        // field trailing and absent here preserves the canonical V1.7 postcard field sequence,
+        // while every real value (including explicit aggregates-only zero) remains serialized
+        // in run configuration and provenance.
+        scientific_config.interaction_event_tick_stride =
+            DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE;
         scientific_config.analytics_stride = AnalyticsStride {
             macro_metrics: 0,
             behavior_metrics: 0,
@@ -23897,6 +24005,22 @@ impl WorldState {
         encoder.u64(self.config_revision);
         encoder.postcard("tick history", &self.history)?;
         self.narrative.encode_world_step_trace(&mut encoder)?;
+        // Preserve the fixed trace hash for worlds predating interaction accounting while making
+        // every non-empty completeness tail observable. Appending these counters as a suffix
+        // keeps the legacy field stream byte-identical when they are absent and structurally
+        // unambiguous when present. The replay stream covers persisted rows and
+        // `replay_interactions_dropped_total` covers their aggregate complement, but neither
+        // distinguishes deliberate stride sampling from per-tick cap truncation.
+        if self.replay_interactions_observed_pending != 0
+            || self.replay_interactions_persisted_pending != 0
+            || self.replay_interactions_sampled_out_pending != 0
+            || self.replay_interactions_truncated_pending != 0
+        {
+            encoder.usize(self.replay_interactions_observed_pending);
+            encoder.usize(self.replay_interactions_persisted_pending);
+            encoder.usize(self.replay_interactions_sampled_out_pending);
+            encoder.usize(self.replay_interactions_truncated_pending);
+        }
         Ok(encoder.finish())
     }
 
@@ -23980,6 +24104,10 @@ impl WorldState {
             || self.pending_death_events != 0
             || self.pending_spike_attempt_events != 0
             || self.pending_spike_hit_events != 0
+            || self.replay_interactions_observed_pending != 0
+            || self.replay_interactions_persisted_pending != 0
+            || self.replay_interactions_sampled_out_pending != 0
+            || self.replay_interactions_truncated_pending != 0
             || self.last_births != 0
             || self.last_deaths != 0
             || self.combat_spike_attempts != 0
@@ -43783,6 +43911,27 @@ mod tests {
         assert_ne!(tail_before.output_tail, tail_after.output_tail);
         assert_eq!(tail_before.resource, tail_after.resource);
 
+        let interaction_accounting_before = capture(&world);
+        world.replay_interactions_observed_pending = 1;
+        world.replay_interactions_sampled_out_pending = 1;
+        let interaction_accounting_after = capture(&world);
+        assert_eq!(
+            interaction_accounting_before.world,
+            interaction_accounting_after.world
+        );
+        assert_eq!(
+            interaction_accounting_before.transition,
+            interaction_accounting_after.transition
+        );
+        assert_ne!(
+            interaction_accounting_before.output_tail,
+            interaction_accounting_after.output_tail
+        );
+        assert_eq!(
+            interaction_accounting_before.resource,
+            interaction_accounting_after.resource
+        );
+
         world.resource_ledger.set_enabled(true);
         world
             .resource_ledger
@@ -44707,6 +44856,8 @@ mod tests {
         world.config.narrative_interval = 2;
         world.config.narrative_capacity = 4;
         world.config.persistence_interval = 9;
+        world.config.interaction_event_tick_cap = 3;
+        world.config.interaction_event_tick_stride = 7;
         world.config.analytics_stride = AnalyticsStride {
             macro_metrics: 8,
             behavior_metrics: 7,

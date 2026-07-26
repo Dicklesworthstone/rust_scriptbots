@@ -6,15 +6,16 @@
 //! memory is gone by the time anyone gets a say.
 
 use scriptbots_core::{
-    AgentUid, MetricSample, PersistenceBatch, PersistenceEvent, PersistenceEventKind, Position,
-    ReplayEvent, ReplayEventKind, ReplayInteractionKind, Tick, TickSummary,
+    AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, MetricSample, PersistenceBatch,
+    PersistenceEvent, PersistenceEventKind, Position, ReplayEvent, ReplayEventKind,
+    ReplayInteractionKind, Tick, TickSummary,
 };
 use scriptbots_storage::{
-    PayloadBudget, StorageError, StoragePipeline, StorageReader, estimate_batch_size,
-    estimate_narrative_size,
+    PayloadBudget, StorageDeadlines, StorageError, StoragePipeline, StorageReader,
+    estimate_batch_size, estimate_narrative_size,
 };
 use std::borrow::Cow;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temp_db(label: &str) -> String {
     let nonce = SystemTime::now()
@@ -306,6 +307,142 @@ fn derived_interaction_rows_are_charged_to_the_scientific_budget() {
         pipeline.submit(&pairwise),
         Err(StorageError::PayloadTooLarge { .. })
     ));
+    pipeline.shutdown().expect("shutdown");
+}
+
+#[test]
+fn five_k_agent_interaction_window_fits_and_flushes_under_default_budget() {
+    const AGENT_COUNT: usize = 5_000;
+    const WINDOW_EDGES: usize = scriptbots_core::DEFAULT_INTERACTION_EVENT_TICK_CAP;
+
+    let mut five_k = batch(1, 0);
+    five_k.summary.agent_count = AGENT_COUNT;
+    five_k.agents = (0..AGENT_COUNT)
+        .map(|index| {
+            let ordinal = u64::try_from(index).expect("5k agent ordinal fits u64");
+            AgentState {
+                id: scriptbots_core::AgentId::default(),
+                identity: AgentIdentity {
+                    uid: AgentUid(ordinal + 1),
+                    spawn_ordinal: ordinal,
+                    birth_ordinal: None,
+                },
+                data: AgentData {
+                    position: Position::new(
+                        f32::from(u16::try_from(index % 1_000).expect("x fits u16")),
+                        f32::from(u16::try_from(index / 1_000).expect("y fits u16")),
+                    ),
+                    ..AgentData::default()
+                },
+                runtime: AgentRuntime::default(),
+            }
+        })
+        .collect();
+    five_k.events.extend([
+        PersistenceEvent::new(
+            PersistenceEventKind::Custom(Cow::Borrowed(
+                scriptbots_core::INTERACTION_EVENTS_OBSERVED_KIND,
+            )),
+            WINDOW_EDGES,
+        ),
+        PersistenceEvent::new(
+            PersistenceEventKind::Custom(Cow::Borrowed(
+                scriptbots_core::INTERACTION_EVENTS_PERSISTED_KIND,
+            )),
+            WINDOW_EDGES,
+        ),
+    ]);
+    five_k.replay_events = (0..WINDOW_EDGES)
+        .map(|ordinal| {
+            let ordinal_u16 = u16::try_from(ordinal).expect("window ordinal fits u16");
+            let ordinal_u64 = u64::from(ordinal_u16);
+            ReplayEvent {
+                agent_uid: Some(AgentUid(ordinal_u64 + 1)),
+                position: Some(Position::new(f32::from(ordinal_u16), 1.0)),
+                counterpart: Some(AgentUid(
+                    ordinal_u64 + u64::try_from(WINDOW_EDGES).expect("window fits u64") + 1,
+                )),
+                counterpart_position: Some(Position::new(f32::from(ordinal_u16), 2.0)),
+                kind: ReplayEventKind::Interaction {
+                    tick: Tick(1),
+                    ordinal: ordinal_u64,
+                    kind: if ordinal.is_multiple_of(2) {
+                        ReplayInteractionKind::Combat
+                    } else {
+                        ReplayInteractionKind::FoodShare
+                    },
+                    magnitude: 0.125,
+                },
+            }
+        })
+        .collect();
+    five_k
+        .replay_events
+        .extend(
+            (0..scriptbots_core::DEFAULT_REPLAY_EVENT_TICK_CAP).map(|ordinal| {
+                let ordinal_u16 = u16::try_from(ordinal).expect("action ordinal fits u16");
+                ReplayEvent {
+                    agent_uid: Some(AgentUid(u64::from(ordinal_u16) + 1)),
+                    position: Some(Position::new(f32::from(ordinal_u16), 3.0)),
+                    counterpart: None,
+                    counterpart_position: None,
+                    kind: ReplayEventKind::Action {
+                        left_wheel: 0.25,
+                        right_wheel: -0.25,
+                        boost: false,
+                        spike_target: None,
+                        sound_level: 0.0,
+                        give_intent: 0.5,
+                    },
+                }
+            }),
+        );
+
+    let default_budget = PayloadBudget::default();
+    let (estimated_bytes, estimated_events) = estimate_batch_size(&five_k);
+    assert!(
+        estimated_bytes <= default_budget.max_batch_bytes,
+        "the documented 5k/default-window shape exceeds the default byte budget: \
+         {estimated_bytes} > {}",
+        default_budget.max_batch_bytes
+    );
+    assert!(
+        estimated_events <= default_budget.max_batch_events,
+        "the documented 5k/default-window shape exceeds the default event budget: \
+         {estimated_events} > {}",
+        default_budget.max_batch_events
+    );
+
+    // The proof writes 5,000 complete agent snapshots under the unoptimized test profile.
+    // Keep that evidence lane explicitly bounded without changing the 120-second production
+    // default; the measured flush duration is printed below for the bead record.
+    let proof_ack_deadline = Duration::from_secs(10 * 60);
+    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds_and_deadlines(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        StorageDeadlines {
+            flush_ack: proof_ack_deadline,
+            shutdown_ack: proof_ack_deadline,
+            ..StorageDeadlines::default()
+        },
+    )
+    .expect("memory pipeline");
+    pipeline.set_payload_budget(default_budget);
+    pipeline
+        .submit(&five_k)
+        .expect("the 5k/default-window batch must be admitted");
+    let flush_started = Instant::now();
+    pipeline
+        .flush_and_wait()
+        .expect("the 5k/default-window batch must flush");
+    let flush_elapsed = flush_started.elapsed();
+    eprintln!(
+        "bd-2z0.5.9 5k window: edges={WINDOW_EDGES} estimated_bytes={estimated_bytes} \
+         estimated_events={estimated_events} flush_ms={}",
+        flush_elapsed.as_millis()
+    );
     pipeline.shutdown().expect("shutdown");
 }
 

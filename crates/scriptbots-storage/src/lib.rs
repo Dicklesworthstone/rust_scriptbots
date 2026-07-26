@@ -40,7 +40,9 @@ use journal::{
 };
 use scriptbots_core::{
     AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding,
-    DeathCause, DeathRecord, Generation, PersistenceAdmissionError, PersistenceAdmissionState,
+    DeathCause, DeathRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
+    INTERACTION_EVENTS_PERSISTED_KIND, INTERACTION_EVENTS_SAMPLED_OUT_KIND,
+    INTERACTION_EVENTS_TRUNCATED_KIND, PersistenceAdmissionError, PersistenceAdmissionState,
     PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase, ReplayEvent,
     ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
@@ -13076,10 +13078,71 @@ impl Storage {
         Ok(())
     }
 
+    fn log_interaction_run_summary(&self) -> Result<(), StorageError> {
+        let run_id = sqlite_run_id(self.run_id);
+        let row = self.connection()?.query_row_with_params(
+            "SELECT
+                (SELECT COUNT(*) FROM interactions WHERE run_id = ?1),
+                (SELECT COALESCE(SUM(count), 0) FROM events
+                 WHERE run_id = ?1 AND kind = ?2),
+                (SELECT COALESCE(SUM(count), 0) FROM events
+                 WHERE run_id = ?1 AND kind = ?3),
+                (SELECT COALESCE(SUM(count), 0) FROM events
+                 WHERE run_id = ?1 AND kind = ?4),
+                (SELECT COALESCE(SUM(count), 0) FROM events
+                 WHERE run_id = ?1 AND kind = ?5)",
+            &[
+                run_id,
+                INTERACTION_EVENTS_OBSERVED_KIND.into(),
+                INTERACTION_EVENTS_PERSISTED_KIND.into(),
+                INTERACTION_EVENTS_SAMPLED_OUT_KIND.into(),
+                INTERACTION_EVENTS_TRUNCATED_KIND.into(),
+            ],
+        )?;
+        let persisted_rows = checked_u64(
+            "interactions.run_summary.count",
+            decode(&row, 0, "interactions.run_summary.count")?,
+        )?;
+        let observed = checked_u64(
+            "events.interactions_observed",
+            decode(&row, 1, "events.interactions_observed")?,
+        )?;
+        let projected = checked_u64(
+            "events.interactions_persisted",
+            decode(&row, 2, "events.interactions_persisted")?,
+        )?;
+        let sampled_out = checked_u64(
+            "events.interactions_sampled_out",
+            decode(&row, 3, "events.interactions_sampled_out")?,
+        )?;
+        let truncated = checked_u64(
+            "events.interactions_truncated",
+            decode(&row, 4, "events.interactions_truncated")?,
+        )?;
+        let accounting_complete = observed
+            == projected
+                .saturating_add(sampled_out)
+                .saturating_add(truncated)
+            && projected == persisted_rows;
+        info!(
+            path = %self.path,
+            run_id = self.run_id.get(),
+            observed,
+            projected,
+            sampled_out,
+            truncated,
+            persisted_rows,
+            accounting_complete,
+            "pairwise interaction persistence run summary"
+        );
+        Ok(())
+    }
+
     /// Flush, checkpoint, and explicitly close the FrankenSQLite connection.
     pub fn close(mut self) -> Result<(), StorageError> {
         self.flush()?;
         self.finalize_applied_outbox()?;
+        self.log_interaction_run_summary()?;
         let connection = self.conn.take().ok_or(StorageError::Closed)?;
         Self::truncate_wal_before_close(&connection, &self.path);
         connection.close()?;
