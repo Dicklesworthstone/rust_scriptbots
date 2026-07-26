@@ -1289,6 +1289,77 @@ mod tests {
         assert_eq!(rows.get(), 360);
     }
 
+    /// The agent shader must CONSUME the core palette, not restate it.
+    ///
+    /// Asserting on the generated source is the whole point: a constant that
+    /// merely happens to match today would drift the moment core's palette
+    /// changed, and nothing would notice until someone compared two backends by
+    /// eye. Generating from core means the drift cannot happen; this test proves
+    /// the generation is actually wired.
+    #[test]
+    fn the_agent_shader_consumes_the_core_food_palette() {
+        let source = super::agent_shader_source();
+        let halo = visual::BIOLUMINESCENT_DARK_FIELD_V1.food.halo_srgb;
+        let core = visual::BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb;
+
+        for (label, value) in [("halo", halo), ("core", core)] {
+            let rendered = format!("vec3<f32>({:?}, {:?}, {:?})", value[0], value[1], value[2]);
+            assert!(
+                source.contains(&rendered),
+                "the generated shader must carry core's {label} colour verbatim; expected \
+                 {rendered}"
+            );
+        }
+
+        assert!(
+            source.contains("mix(CORE_FOOD_HALO_SRGB, CORE_FOOD_CORE_SRGB"),
+            "the nose must be derived from the core endpoints, not from a literal"
+        );
+        assert!(
+            !source.contains("vec3<f32>(0.92, 0.6, 0.28)"),
+            "the hand-authored nose literal must be gone, or the shader still \
+             disagrees with core while looking like it does not"
+        );
+    }
+
+    /// Where the backends still DISAGREE, say so here rather than leaving it to
+    /// be discovered by comparing frames.
+    ///
+    /// bd-2z0.7.11 asks that the shipped backends agree on what they produce, or
+    /// that the difference be declared. Terrain, agent body and the nose are now
+    /// routed through `scriptbots_core::visual`. These are not, and each is a
+    /// colour this shader still authors locally. The list is asserted so it
+    /// cannot silently grow, and so removing an entry is a deliberate act that
+    /// shows up in a diff.
+    #[test]
+    fn backend_local_agent_chroma_is_declared_not_discovered() {
+        const STILL_BACKEND_LOCAL: [&str; 4] = [
+            "stripe: mixed from local carn/herb colours",
+            "wheels: local speed brightening",
+            "mouth: local hot-event interpolation",
+            "selection rim: local white",
+        ];
+        let source = super::agent_shader_source();
+
+        // The declaration is only honest if these really are still local.
+        assert!(
+            source.contains("var stripe = mix(carn_color, herb_color, herbivore);"),
+            "stripe is declared backend-local; if it has been routed through core, \
+             remove it from STILL_BACKEND_LOCAL rather than leaving a stale claim"
+        );
+        assert!(
+            source.contains("let rim_color = vec3<f32>(1.0, 1.0, 1.0)"),
+            "the selection rim is declared backend-local; update the declaration if \
+             that changed"
+        );
+        assert_eq!(
+            STILL_BACKEND_LOCAL.len(),
+            4,
+            "shrinking this list is the goal; growing it means a new divergence was \
+             introduced without routing it through core"
+        );
+    }
+
     /// Every shipped WGSL source must parse and pass naga semantic validation.
     ///
     /// These four shaders are compiled by wgpu at PIPELINE CREATION, on a real
@@ -1308,9 +1379,12 @@ mod tests {
     /// nothing can validate is how that lands broken.
     #[test]
     fn every_world_gfx_wgsl_source_parses_and_validates() {
+        let agents_source = super::agent_shader_source();
         for (name, source) in [
             ("TERRAIN_WGSL", super::TERRAIN_WGSL),
-            ("AGENTS_WGSL", super::AGENTS_WGSL),
+            // The GENERATED source, because that is what wgpu compiles. Checking
+            // the raw literal would validate something the product never uses.
+            ("AGENTS_WGSL", agents_source.as_str()),
             ("POST_WGSL", super::POST_WGSL),
             ("BLOOM_WGSL", super::BLOOM_WGSL),
         ] {
@@ -1333,9 +1407,12 @@ mod tests {
     /// "compiles" from "compiles because there is nothing left".
     #[test]
     fn every_world_gfx_wgsl_source_declares_entry_points() {
+        let agents_source = super::agent_shader_source();
         for (name, source) in [
             ("TERRAIN_WGSL", super::TERRAIN_WGSL),
-            ("AGENTS_WGSL", super::AGENTS_WGSL),
+            // The GENERATED source, because that is what wgpu compiles. Checking
+            // the raw literal would validate something the product never uses.
+            ("AGENTS_WGSL", agents_source.as_str()),
             ("POST_WGSL", super::POST_WGSL),
             ("BLOOM_WGSL", super::BLOOM_WGSL),
         ] {
@@ -2356,11 +2433,44 @@ fn agent_instance_gpu(agent: &AgentInstance) -> AgentInstanceGpu {
     }
 }
 
+/// The agent shader, with the canonical palette values it must not re-author
+/// prepended as WGSL constants (bd-2z0.7.11).
+///
+/// The backend-correctness half of this bead asks that the shipped backends
+/// agree on what they produce, or that a difference be DECLARED rather than
+/// discovered. The nose tint was discovered: the shader painted a bare
+/// `vec3<f32>(0.92, 0.6, 0.28)` while `scriptbots_core::visual` derives
+/// `nose_color` by mixing the canonical food halo and core colours by
+/// `trait_smell` — a value the shader already receives per instance. It had the
+/// input and invented the endpoints, so GPUI and world-gfx disagreed on the
+/// same agent for no reason anyone had recorded.
+///
+/// Generating the constants from core rather than retyping them means the two
+/// cannot drift: a palette edit in core reaches the GPU without anybody
+/// remembering that this shader exists. Only the small prelude is formatted;
+/// the shader body stays a raw literal, so no brace in it needs escaping.
+fn agent_shader_source() -> String {
+    let halo = scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1
+        .food
+        .halo_srgb;
+    let core = scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1
+        .food
+        .core_srgb;
+    format!(
+        "// GENERATED from scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1 (bd-2z0.7.11).\n\
+         // Do not hand-edit these values; change the palette in core instead.\n\
+         const CORE_FOOD_HALO_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_FOOD_CORE_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         {AGENTS_WGSL}",
+        halo[0], halo[1], halo[2], core[0], core[1], core[2],
+    )
+}
+
 impl AgentPipeline {
     fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat, view: &ViewUniforms) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("agents.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(AGENTS_WGSL)),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(agent_shader_source())),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("agents.layout"),
@@ -2693,7 +2803,12 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let nose_radius = max(body_radius * 0.12, 1.0) * (0.6 + trait_smell * 0.8);
   let nose_center = vec2<f32>(0.0, body_half_length - body_radius * 0.2);
   let nose_dist = circle_distance(local - nose_center, nose_radius);
-  layer(&accum_rgb, &accum_alpha, vec3<f32>(0.92, 0.6, 0.28), smooth_mask(nose_dist));
+  // Core authority: visual::agent_visual_params derives nose_color as
+  // mix(food.halo, food.core, clamp01(trait_smell * 0.4)). WGSL mix is
+  // a + (b - a) * t, identical to core's mix_vec3, so this is the same value
+  // rather than a lookalike (bd-2z0.7.11).
+  let nose_tint = mix(CORE_FOOD_HALO_SRGB, CORE_FOOD_CORE_SRGB, clamp(trait_smell * 0.4, 0.0, 1.0));
+  layer(&accum_rgb, &accum_alpha, nose_tint, smooth_mask(nose_dist));
 
   // Ears (sound/hearing)
   let ear_scale = clamp(0.6 + trait_hearing * 0.45, 0.6, 1.6);
