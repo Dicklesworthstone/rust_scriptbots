@@ -6898,6 +6898,197 @@ mod tests {
         );
     }
 
+    /// Self-exclusion marker: this guard's own text must never feed itself.
+    /// bd-ikts.5 lost time twice to guards that matched their own literals.
+    const TERMINAL_DUPLICATE_GUARD_MARKER: &str = "fn no_two_terminal_modules_define_the_same_item";
+
+    /// The one duplicate pair this guard cannot fail on yet, and why.
+    ///
+    /// `paint.rs` is a second, entirely dead sub-cell painter engine. `subcell.rs`
+    /// is the canonical one — it is wired into the live `MapWidget` canvas path
+    /// and covered by the bd-2z0.14.2.1 tests, while every identifier `paint.rs`
+    /// exports is referenced only inside `paint.rs` itself. Removing the file
+    /// needs the user's explicit written permission under AGENTS.md Rule 1, which
+    /// bd-c1z8 has been waiting on. Listing it here rather than weakening the
+    /// predicate keeps the guard live for every NEW duplicate in the meantime;
+    /// this entry is deleted together with the file.
+    const KNOWN_DUPLICATE_MODULES: &[&str] = &["paint.rs"];
+
+    /// No two sibling modules under `terminal/` may define the same item name.
+    ///
+    /// THE DEFECT THIS EXISTS FOR (bd-c1z8): `subcell.rs` and `paint.rs` are two
+    /// independent implementations of one sub-cell painter, shipped by one task,
+    /// both carrying the same bead ID in their headers. They are the same class
+    /// bd-ikts.4 found in core, where `toroidal_delta` had THREE divergent copies
+    /// that silently disagreed at exactly half a world until it broke.
+    ///
+    /// WHY bd-ikts.5's GUARD DOES NOT COVER THIS, checked before writing another.
+    /// That guard asks "does a consumer crate re-implement a `scriptbots-core` pub
+    /// authority" — cross-crate, against a named owner. Here both modules live in
+    /// one crate and neither is a core authority, so it cannot fire. Worse, the
+    /// two engines mostly use DIFFERENT names for the same concepts
+    /// (`SubCellBuffer`/`PixelBuffer`, `FrameCell`/`CellGlyph`,
+    /// `DirtyTracker`/`DirtyCell`), so a pure concept-duplication detector would
+    /// need to reason about shape. What they DO collide on is four exact names —
+    /// `ColorDepth`, `SubCellMode`, `SubPixel`, `quantize` — and that is a crisp,
+    /// cheap predicate: within one directory, one name means one definition.
+    ///
+    /// Scoped to `terminal/` deliberately. A workspace-wide "no repeated type
+    /// name" rule would be noise; sibling modules of one subsystem sharing an
+    /// identifier is a genuine smell.
+    #[test]
+    fn no_two_terminal_modules_define_the_same_item() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal");
+        let mut owners: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut scanned = 0_usize;
+
+        let entries = std::fs::read_dir(&dir).expect("terminal module directory");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "rs") {
+                continue;
+            }
+            let file = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if KNOWN_DUPLICATE_MODULES.contains(&file.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read terminal module");
+            // Cut this guard's own body so its prose cannot define anything.
+            let text = text
+                .split_once(TERMINAL_DUPLICATE_GUARD_MARKER)
+                .map_or(text.as_str(), |(before, _)| before);
+            scanned += 1;
+
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                // Strip comments so prose naming a type is not read as defining it.
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                let after = ["pub struct ", "struct ", "pub enum ", "enum "]
+                    .iter()
+                    .find_map(|prefix| trimmed.strip_prefix(prefix));
+                if let Some(rest) = after
+                    && let Some(name) = rest.split(['<', '{', '(', ';', ' ']).next()
+                {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        owners
+                            .entry(name.to_owned())
+                            .or_default()
+                            .push(file.clone());
+                    }
+                }
+            }
+        }
+
+        // Positive anchor: a scan that matched nothing is indistinguishable from
+        // a scan that found nothing wrong.
+        assert!(
+            scanned >= 5,
+            "only {scanned} terminal modules scanned; the sweep is broken, not the tree"
+        );
+        assert!(
+            owners.len() > 20,
+            "only {} type definitions found across terminal/; the extraction is broken",
+            owners.len()
+        );
+
+        let collisions: Vec<String> = owners
+            .iter()
+            .filter(|(_, files)| {
+                let mut distinct: Vec<&String> = files.iter().collect();
+                distinct.sort_unstable();
+                distinct.dedup();
+                distinct.len() > 1
+            })
+            .map(|(name, files)| format!("{name} defined in {files:?}"))
+            .collect();
+
+        assert!(
+            collisions.is_empty(),
+            "two terminal modules define the same item, which is how one subsystem \
+             ends up with two divergent engines (bd-c1z8, and bd-ikts.4 in core):\n  {}\n\
+             Pick one owner and have the other call it, or if these are genuinely \
+             unrelated helpers give one a distinct name.",
+            collisions.join("\n  ")
+        );
+    }
+
+    /// The guard above must actually fire. A detector that cannot fail is worth
+    /// nothing, and bd-ikts.5 records two guards that passed vacuously the same
+    /// day. This replays the collision predicate against a synthetic pair.
+    #[test]
+    fn the_duplicate_module_guard_detects_an_injected_duplicate() {
+        let mut owners: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        owners.insert(
+            "ColorDepth".into(),
+            vec!["subcell.rs".into(), "paint.rs".into()],
+        );
+        owners.insert("MapWidget".into(), vec!["mod.rs".into()]);
+
+        let collisions: Vec<&String> = owners
+            .iter()
+            .filter(|(_, files)| {
+                let mut distinct: Vec<&String> = files.iter().collect();
+                distinct.sort_unstable();
+                distinct.dedup();
+                distinct.len() > 1
+            })
+            .map(|(name, _)| name)
+            .collect();
+
+        assert_eq!(
+            collisions,
+            vec!["ColorDepth"],
+            "the predicate must flag exactly the duplicated name and leave singles alone"
+        );
+    }
+
+    /// `paint.rs` is exempt only because it is DEAD. If anything ever imports it,
+    /// the exemption is wrong and this fails — an allowlist that silently starts
+    /// covering live code is worse than no allowlist.
+    #[test]
+    fn the_exempt_duplicate_painter_is_still_entirely_unreferenced() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal");
+        let exports = [
+            "PixelBuffer",
+            "CellGlyph",
+            "DirtyCell",
+            "DitherMode",
+            "braille_char",
+        ];
+
+        let entries = std::fs::read_dir(&dir).expect("terminal module directory");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !path.extension().is_some_and(|ext| ext == "rs") || file == "paint.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read terminal module");
+            let text = text
+                .split_once(TERMINAL_DUPLICATE_GUARD_MARKER)
+                .map_or(text.as_str(), |(before, _)| before);
+            for export in exports {
+                assert!(
+                    !text.contains(export),
+                    "{file} references {export} from the dead painter paint.rs. \
+                     It is exempt from the duplicate guard ONLY because nothing uses it; \
+                     if it is live, converge the two engines instead (bd-c1z8)."
+                );
+            }
+        }
+    }
+
     /// Shared scenario identity for renderer contexts built by tests.
     fn test_scenario() -> Arc<ScenarioIdentityV0> {
         Arc::new(ScenarioIdentityV0::caller_seeded("terminal-test-scenario"))
