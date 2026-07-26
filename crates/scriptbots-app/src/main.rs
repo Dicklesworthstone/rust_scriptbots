@@ -3184,7 +3184,9 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
     let storage = StorageReader::open(&db_display)
         .with_context(|| format!("failed to open replay database {db_display}"))?;
     let recorded_max_tick = storage.max_tick()?.unwrap_or(0);
-    let persisted_events = storage.load_replay_events()?;
+    let mut persisted_events = storage.load_replay_events()?;
+    canonicalize_replay_event_order(&mut persisted_events)
+        .context("recorded replay stream contains an invalid or duplicate identity")?;
     let recorded_counts = storage.replay_event_counts()?;
     let latest_checkpoint = storage.load_latest_checkpoint()?;
     if let Some(ref cp) = latest_checkpoint {
@@ -3287,7 +3289,9 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
         let compare_display = compare_path.display().to_string();
         let other = StorageReader::open(&compare_display)
             .with_context(|| format!("failed to open comparison database {compare_display}"))?;
-        let other_events = other.load_replay_events()?;
+        let mut other_events = other.load_replay_events()?;
+        canonicalize_replay_event_order(&mut other_events)
+            .context("comparison replay stream contains an invalid or duplicate identity")?;
         let other_counts = other.replay_event_counts()?;
         other.close()?;
 
@@ -3392,10 +3396,155 @@ struct ReplayRun {
     final_digest: WorldDigestV1,
 }
 
-fn canonicalize_replay_event_order(events: &mut [PersistedReplayEvent]) {
-    // `sort_by_key` is stable, so an invalid duplicate identity still retains its
-    // deterministic emission order for the later divergence report.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+enum ReplayIdentityError {
+    #[error(
+        "ordinary replay event at enclosing tick {tick} uses sequence {seq}, entering the reserved narrative namespace beginning at {reserved_from}"
+    )]
+    OrdinarySequenceReserved {
+        tick: u64,
+        seq: u64,
+        reserved_from: u64,
+    },
+    #[error("interaction replay identity overflow at tick {tick}, ordinal {ordinal}")]
+    InteractionSequenceOverflow { tick: u64, ordinal: u64 },
+    #[error(
+        "interaction replay identity at tick {tick}, ordinal {ordinal} produces sequence {seq}, exceeding the durable SQLite identity limit {max}"
+    )]
+    InteractionSequenceOutOfRange {
+        tick: u64,
+        ordinal: u64,
+        seq: u64,
+        max: u64,
+    },
+    #[error(
+        "{kind} replay source tick {source_tick} exceeds its enclosing persistence tick {enclosing_tick}"
+    )]
+    SourceTickAfterEnclosing {
+        kind: &'static str,
+        source_tick: u64,
+        enclosing_tick: u64,
+    },
+    #[error(
+        "narrative replay identity at tick {tick} is invalid (record_schema_version={record_schema_version}, input_schema_version={input_schema_version}): {reason}"
+    )]
+    InvalidNarrativeRecord {
+        tick: u64,
+        record_schema_version: u32,
+        input_schema_version: u32,
+        reason: String,
+    },
+    #[error(
+        "replay row identity ({actual_tick}, {actual_seq}) aliases event identity ({expected_tick}, {expected_seq}): {event}"
+    )]
+    IdentityMismatch {
+        actual_tick: u64,
+        actual_seq: u64,
+        expected_tick: u64,
+        expected_seq: u64,
+        event: String,
+    },
+    #[error(
+        "duplicate replay identity at tick {tick}, sequence {seq}: first={first}; duplicate={duplicate}"
+    )]
+    Duplicate {
+        tick: u64,
+        seq: u64,
+        first: String,
+        duplicate: String,
+    },
+}
+
+fn replay_event_identity(
+    enclosing_tick: u64,
+    fallback_seq: u64,
+    event: &scriptbots_core::ReplayEvent,
+) -> std::result::Result<(u64, u64), ReplayIdentityError> {
+    match &event.kind {
+        ReplayEventKind::Interaction { tick, ordinal, .. } => {
+            if tick.0 > enclosing_tick {
+                return Err(ReplayIdentityError::SourceTickAfterEnclosing {
+                    kind: "interaction",
+                    source_tick: tick.0,
+                    enclosing_tick,
+                });
+            }
+            let seq = INTERACTION_REPLAY_SEQ_BASE.checked_add(*ordinal).ok_or(
+                ReplayIdentityError::InteractionSequenceOverflow {
+                    tick: tick.0,
+                    ordinal: *ordinal,
+                },
+            )?;
+            let max = i64::MAX as u64;
+            if seq > max {
+                return Err(ReplayIdentityError::InteractionSequenceOutOfRange {
+                    tick: tick.0,
+                    ordinal: *ordinal,
+                    seq,
+                    max,
+                });
+            }
+            Ok((tick.0, seq))
+        }
+        ReplayEventKind::NarrativeInputV1 { record } => {
+            record
+                .validate()
+                .map_err(|error| ReplayIdentityError::InvalidNarrativeRecord {
+                    tick: record.input.tick.0,
+                    record_schema_version: record.record_schema_version,
+                    input_schema_version: record.input.schema_version,
+                    reason: error.to_string(),
+                })?;
+            if record.input.tick.0 > enclosing_tick {
+                return Err(ReplayIdentityError::SourceTickAfterEnclosing {
+                    kind: "narrative",
+                    source_tick: record.input.tick.0,
+                    enclosing_tick,
+                });
+            }
+            Ok((record.input.tick.0, NARRATIVE_INPUT_REPLAY_SEQ))
+        }
+        _ if fallback_seq >= NARRATIVE_INPUT_REPLAY_SEQ => {
+            Err(ReplayIdentityError::OrdinarySequenceReserved {
+                tick: enclosing_tick,
+                seq: fallback_seq,
+                reserved_from: NARRATIVE_INPUT_REPLAY_SEQ,
+            })
+        }
+        _ => Ok((enclosing_tick, fallback_seq)),
+    }
+}
+
+fn canonicalize_replay_event_order(
+    events: &mut [PersistedReplayEvent],
+) -> std::result::Result<(), ReplayIdentityError> {
+    for entry in events.iter() {
+        let expected = replay_event_identity(entry.tick, entry.seq, &entry.event)?;
+        if expected != (entry.tick, entry.seq) {
+            return Err(ReplayIdentityError::IdentityMismatch {
+                actual_tick: entry.tick,
+                actual_seq: entry.seq,
+                expected_tick: expected.0,
+                expected_seq: expected.1,
+                event: format_replay_event(&entry.event),
+            });
+        }
+    }
+
+    // Stable ordering keeps duplicate diagnostics deterministic.
     events.sort_by_key(|entry| (entry.tick, entry.seq));
+    if let Some(pair) = events
+        .windows(2)
+        .find(|pair| (pair[0].tick, pair[0].seq) == (pair[1].tick, pair[1].seq))
+    {
+        return Err(ReplayIdentityError::Duplicate {
+            tick: pair[0].tick,
+            seq: pair[0].seq,
+            first: format_replay_event(&pair[0].event),
+            duplicate: format_replay_event(&pair[1].event),
+        });
+    }
+    Ok(())
 }
 
 fn run_headless_simulation(
@@ -3443,22 +3592,13 @@ fn run_headless_simulation(
     for record in records {
         summaries.push(record.summary);
         for (fallback_seq, event) in record.events.into_iter().enumerate() {
-            let (tick, seq) = match &event.kind {
-                ReplayEventKind::Interaction { tick, ordinal, .. } => (
-                    tick.0,
-                    INTERACTION_REPLAY_SEQ_BASE
-                        .checked_add(*ordinal)
-                        .ok_or_else(|| anyhow::anyhow!("interaction replay ordinal overflow"))?,
-                ),
-                ReplayEventKind::NarrativeInputV1 { record } => {
-                    (record.input.tick.0, NARRATIVE_INPUT_REPLAY_SEQ)
-                }
-                _ => (record.tick, fallback_seq as u64),
-            };
+            let fallback_seq = u64::try_from(fallback_seq)
+                .context("replay enumeration exceeds the u64 identity domain")?;
+            let (tick, seq) = replay_event_identity(record.tick, fallback_seq, &event)?;
             events.push(PersistedReplayEvent { tick, seq, event });
         }
     }
-    canonicalize_replay_event_order(&mut events);
+    canonicalize_replay_event_order(&mut events)?;
 
     Ok(ReplayRun {
         events,
@@ -4055,7 +4195,9 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
             tick.0, event.agent_uid, event.counterpart
         ),
         ReplayEventKind::NarrativeInputV1 { record } => format!(
-            "NarrativeInputV1(tick={}, agents={}, average_energy_bits={:08x}, spike_hits={}, config_revision={}, interval={}, history_capacity={}, event_capacity={})",
+            "NarrativeInputV1(record_schema_version={}, input_schema_version={}, tick={}, agents={}, average_energy_bits={:08x}, spike_hits={}, config_revision={}, interval={}, history_capacity={}, event_capacity={})",
+            record.record_schema_version,
+            record.input.schema_version,
             record.input.tick.0,
             record.input.agent_count,
             record.input.average_energy.to_bits(),
@@ -5529,9 +5671,9 @@ activation = "Sigmoid"
     }
 
     #[test]
-    fn canonical_replay_order_places_narrative_before_interactions_and_preserves_ties() {
+    fn canonical_replay_order_places_narrative_before_interactions() {
         let tick = scriptbots_core::Tick(7);
-        let ordinary = |overall| PersistedReplayEvent {
+        let ordinary = PersistedReplayEvent {
             tick: tick.0,
             seq: 0,
             event: scriptbots_core::ReplayEvent {
@@ -5540,7 +5682,7 @@ activation = "Sigmoid"
                 counterpart: None,
                 counterpart_position: None,
                 kind: ReplayEventKind::WorldDigest {
-                    overall: overall.to_owned(),
+                    overall: "1111111111111111".to_owned(),
                 },
             },
         };
@@ -5589,14 +5731,9 @@ activation = "Sigmoid"
                 },
             },
         };
-        let mut events = vec![
-            interaction,
-            ordinary("1111111111111111"),
-            narrative,
-            ordinary("2222222222222222"),
-        ];
+        let mut events = vec![interaction, narrative, ordinary];
 
-        canonicalize_replay_event_order(&mut events);
+        canonicalize_replay_event_order(&mut events).expect("unique replay identities");
 
         assert_eq!(
             events
@@ -5605,19 +5742,188 @@ activation = "Sigmoid"
                 .collect::<Vec<_>>(),
             [
                 (tick.0, 0),
-                (tick.0, 0),
                 (tick.0, NARRATIVE_INPUT_REPLAY_SEQ),
                 (tick.0, INTERACTION_REPLAY_SEQ_BASE),
             ]
         );
-        let ReplayEventKind::WorldDigest { overall: first } = &events[0].event.kind else {
-            panic!("first tied event changed kind");
+    }
+
+    #[test]
+    fn canonical_replay_order_rejects_duplicate_narrative_identities_and_aliases() {
+        let tick = scriptbots_core::Tick(7);
+        let event = |config_revision| {
+            let record = scriptbots_core::narrative::NarrativeInputRecordV1::from_summary(
+                &TickSummary {
+                    tick,
+                    agent_count: 2,
+                    births: 0,
+                    deaths: 0,
+                    total_energy: 2.0,
+                    average_energy: 1.0,
+                    average_health: 1.0,
+                    max_age: 0,
+                    spike_hits: 1,
+                },
+                config_revision,
+                &ScriptBotsConfig::default(),
+            )
+            .expect("canonical narrative record");
+            PersistedReplayEvent {
+                tick: tick.0,
+                seq: NARRATIVE_INPUT_REPLAY_SEQ,
+                event: scriptbots_core::ReplayEvent {
+                    agent_uid: None,
+                    position: None,
+                    counterpart: None,
+                    counterpart_position: None,
+                    kind: ReplayEventKind::NarrativeInputV1 { record },
+                },
+            }
         };
-        let ReplayEventKind::WorldDigest { overall: second } = &events[1].event.kind else {
-            panic!("second tied event changed kind");
+        let mut events = vec![event(1), event(2)];
+
+        let error = canonicalize_replay_event_order(&mut events)
+            .expect_err("duplicate replay identity must be rejected");
+
+        assert!(matches!(
+            &error,
+            ReplayIdentityError::Duplicate { tick, seq, .. }
+                if *tick == 7 && *seq == NARRATIVE_INPUT_REPLAY_SEQ
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains("config_revision=1"), "{rendered}");
+        assert!(rendered.contains("config_revision=2"), "{rendered}");
+        assert!(
+            rendered.contains("record_schema_version=1")
+                && rendered.contains("input_schema_version=1"),
+            "{rendered}"
+        );
+
+        let mut aliased = vec![event(3)];
+        aliased[0].tick = 8;
+        let error = canonicalize_replay_event_order(&mut aliased)
+            .expect_err("row tick must not alias the embedded narrative tick");
+        assert!(matches!(
+            error,
+            ReplayIdentityError::IdentityMismatch {
+                actual_tick: 8,
+                actual_seq: NARRATIVE_INPUT_REPLAY_SEQ,
+                expected_tick: 7,
+                expected_seq: NARRATIVE_INPUT_REPLAY_SEQ,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_identity_guards_reserved_sequences_and_reports_narrative_versions() {
+        let tick = scriptbots_core::Tick(7);
+        let ordinary = scriptbots_core::ReplayEvent {
+            agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::WorldDigest {
+                overall: "1111111111111111".to_owned(),
+            },
         };
-        assert_eq!(first, "1111111111111111");
-        assert_eq!(second, "2222222222222222");
+        assert!(matches!(
+            replay_event_identity(tick.0, NARRATIVE_INPUT_REPLAY_SEQ, &ordinary),
+            Err(ReplayIdentityError::OrdinarySequenceReserved {
+                tick: 7,
+                seq: NARRATIVE_INPUT_REPLAY_SEQ,
+                ..
+            })
+        ));
+
+        let mut record = scriptbots_core::narrative::NarrativeInputRecordV1::from_summary(
+            &TickSummary {
+                tick,
+                agent_count: 2,
+                births: 0,
+                deaths: 0,
+                total_energy: 2.0,
+                average_energy: 1.0,
+                average_health: 1.0,
+                max_age: 0,
+                spike_hits: 1,
+            },
+            3,
+            &ScriptBotsConfig::default(),
+        )
+        .expect("canonical narrative record");
+        let valid_narrative = scriptbots_core::ReplayEvent {
+            agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::NarrativeInputV1 { record },
+        };
+        assert!(matches!(
+            replay_event_identity(tick.0 - 1, 0, &valid_narrative),
+            Err(ReplayIdentityError::SourceTickAfterEnclosing {
+                kind: "narrative",
+                source_tick: 7,
+                enclosing_tick: 6,
+            })
+        ));
+
+        record.input.schema_version = 3;
+        let narrative = scriptbots_core::ReplayEvent {
+            agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::NarrativeInputV1 { record },
+        };
+
+        let error = replay_event_identity(tick.0, 0, &narrative)
+            .expect_err("unknown narrative versions must be rejected");
+        let rendered = error.to_string();
+        assert!(rendered.contains("record_schema_version=1"), "{rendered}");
+        assert!(rendered.contains("input_schema_version=3"), "{rendered}");
+    }
+
+    #[test]
+    fn interaction_identity_matches_the_durable_sqlite_domain() {
+        let tick = scriptbots_core::Tick(7);
+        let interaction = |ordinal| scriptbots_core::ReplayEvent {
+            agent_uid: Some(scriptbots_core::AgentUid(1)),
+            position: None,
+            counterpart: Some(scriptbots_core::AgentUid(2)),
+            counterpart_position: None,
+            kind: ReplayEventKind::Interaction {
+                tick,
+                ordinal,
+                kind: ReplayInteractionKind::Combat,
+                magnitude: 0.5,
+            },
+        };
+        let max_ordinal = (i64::MAX as u64) - INTERACTION_REPLAY_SEQ_BASE;
+        assert_eq!(
+            replay_event_identity(tick.0, 0, &interaction(max_ordinal))
+                .expect("maximum durable interaction identity"),
+            (tick.0, i64::MAX as u64)
+        );
+        assert!(matches!(
+            replay_event_identity(tick.0 - 1, 0, &interaction(0)),
+            Err(ReplayIdentityError::SourceTickAfterEnclosing {
+                kind: "interaction",
+                source_tick: 7,
+                enclosing_tick: 6,
+            })
+        ));
+        assert!(matches!(
+            replay_event_identity(tick.0, 0, &interaction(max_ordinal + 1)),
+            Err(ReplayIdentityError::InteractionSequenceOutOfRange {
+                tick: 7,
+                ordinal,
+                seq,
+                max,
+            }) if ordinal == max_ordinal + 1
+                && seq == (i64::MAX as u64) + 1
+                && max == i64::MAX as u64
+        ));
     }
 
     #[test]
@@ -5647,7 +5953,10 @@ activation = "Sigmoid"
             let keys = install_brains(&mut world, BrainPreset::Mixed)
                 .expect("install replay-fixture brains");
             seed_agents(&mut world, &keys.population).expect("seed replay-fixture brains");
-            for _ in 0..16 {
+            for index in 0..16 {
+                if index + 1 == 16 {
+                    world.request_replay_world_digest();
+                }
                 persistence
                     .step(&mut world)
                     .expect("durable replay fixture step");
@@ -5658,9 +5967,11 @@ activation = "Sigmoid"
         }
 
         let storage = StorageReader::open(&db_str).expect("open storage read-only");
-        let recorded_events = storage.load_replay_events().expect("load events");
+        let mut recorded_events = storage.load_replay_events().expect("load events");
         let max_tick = storage.max_tick().expect("max tick").unwrap_or(0);
         storage.close().expect("close storage reader");
+        canonicalize_replay_event_order(&mut recorded_events)
+            .expect("durable replay rows must have unique canonical identities");
         assert_eq!(max_tick, 16, "fixture must persist its partial final tail");
 
         let replay =
@@ -5674,18 +5985,42 @@ activation = "Sigmoid"
                 .collect::<Vec<_>>(),
             [5, 10, 15, 16]
         );
-        let narrative_ticks = |events: &[PersistedReplayEvent]| {
+        let narrative_identities = |events: &[PersistedReplayEvent]| {
             events
                 .iter()
                 .filter_map(|entry| match &entry.event.kind {
-                    ReplayEventKind::NarrativeInputV1 { record } => Some(record.input.tick.0),
+                    ReplayEventKind::NarrativeInputV1 { record } => Some((
+                        entry.tick,
+                        entry.seq,
+                        record.input.tick.0,
+                        record.record_schema_version,
+                        record.input.schema_version,
+                    )),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         };
-        let expected_ticks = (1..=16).collect::<Vec<_>>();
-        assert_eq!(narrative_ticks(&recorded_events), expected_ticks);
-        assert_eq!(narrative_ticks(&replay.events), expected_ticks);
+        let expected_identities = (1..=16)
+            .map(|tick| {
+                (
+                    tick,
+                    NARRATIVE_INPUT_REPLAY_SEQ,
+                    tick,
+                    scriptbots_core::narrative::NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                    scriptbots_core::narrative::NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            narrative_identities(&recorded_events),
+            expected_identities,
+            "production persistence must retain one exact narrative identity per tick"
+        );
+        assert_eq!(
+            narrative_identities(&replay.events),
+            expected_identities,
+            "production replay must reconstruct the same narrative identities"
+        );
         assert!(
             replay
                 .events
@@ -5696,7 +6031,7 @@ activation = "Sigmoid"
         let diff = diff_event_stream(&recorded_events, &replay.events);
         assert!(
             diff.is_none(),
-            "non-aligned finalization must preserve the complete replay stream"
+            "non-aligned finalization must preserve the complete replay stream: {diff:#?}"
         );
     }
 
