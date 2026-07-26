@@ -267,6 +267,81 @@ pub struct DiffStats {
     pub pass: bool,
 }
 
+/// Whether a lane may certify PIXELS, as opposed to merely proving the capture
+/// path compiles and runs.
+///
+/// This is the bd-2z0.14.3.10 item 4 decision made explicit and given one home,
+/// instead of an `eprintln!` inside a test helper that produced no record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PixelEvidenceVerdict {
+    /// The adapter may produce pixel evidence: goldens rendered here mean something.
+    Admissible,
+    /// The lane may run as a smoke check but must never certify pixels. The
+    /// payload is actionable text naming what was found and what to do.
+    SmokeOnly(String),
+}
+
+impl PixelEvidenceVerdict {
+    /// Whether pixel evidence from this lane can be trusted.
+    #[must_use]
+    pub const fn admissible(&self) -> bool {
+        matches!(self, Self::Admissible)
+    }
+}
+
+/// Decide whether an adapter may certify pixels (bd-2z0.14.3.10 item 4).
+///
+/// THE DECISION, and the evidence behind it. bd-2z0.14.3.4 scope item 4 made the
+/// llvmpipe/lavapipe software lane the PR gate and asserted the unmodified
+/// pipeline would pass on it. It does not. Measured on the Linux rch workers,
+/// both live capture tests failed with the typed error "offscreen capture
+/// produced a blank or uniform RGB frame".
+///
+/// The failure is NOT an obvious capability wall, which is what makes the
+/// verdict "smoke only" rather than "abandon the lane". llvmpipe probes with
+/// full capability — Vulkan backend, `max_texture_2d` 16384, timestamp queries
+/// available — and `OffscreenCapture` configures a session on it successfully at
+/// tier Potato. Only the READBACK comes back uniform. That is the signature of
+/// bd-x6v6, which also looked like a hardware limit and turned out to be a
+/// camera-lifecycle bug, so the lane is worth one real investigation before it
+/// is written off (the capture session takes exactly two warmup frames before
+/// reading back, an assumption never validated against a rasterizer this slow).
+///
+/// Until that investigation succeeds, a software adapter may run the capture
+/// path as a smoke check and may NOT certify pixels. Gating goldens on a lane
+/// that returns uniform frames would either fail every PR or, if the blank guard
+/// were relaxed to accommodate it, certify blank images as evidence — which is
+/// precisely the bd-2z0.14.3.8 failure this harness exists to prevent.
+///
+/// Scope note: `Virtual` and `Unknown` adapters stay admissible, preserving the
+/// behaviour this replaced rather than quietly widening the refusal. Neither has
+/// been measured returning blank frames. Whether an unclassifiable adapter should
+/// be trusted to certify pixels is a real question, but it is a different one
+/// than this bead asked, and answering it by side effect would be the same
+/// overreach the decision above declines to make about llvmpipe.
+#[must_use]
+pub fn pixel_evidence_verdict(gpu: Option<&scriptbots_core::GpuInfo>) -> PixelEvidenceVerdict {
+    match gpu {
+        None => PixelEvidenceVerdict::SmokeOnly(
+            "no GPU adapter was found, so nothing rendered; a capture from this lane \
+             proves the code path runs, never what it looks like (bd-2z0.14.3.10)"
+                .to_string(),
+        ),
+        Some(info) if info.class == scriptbots_core::GpuClass::Software => {
+            PixelEvidenceVerdict::SmokeOnly(format!(
+                "software rasterizer ({}) returns blank or uniform frames from this \
+                 capture path, so it may run as a smoke check but must not certify \
+                 pixels. It probes fully capable and configures a session, so the \
+                 blank readback is a candidate camera-lifecycle or warmup-frame bug \
+                 (bd-x6v6 shape), not a proven hardware limit — investigate before \
+                 demoting the lane permanently (bd-2z0.14.3.10 item 4)",
+                info.name
+            ))
+        }
+        Some(_) => PixelEvidenceVerdict::Admissible,
+    }
+}
+
 /// Side length of the SSIM window, in pixels.
 const SSIM_WINDOW: usize = 8;
 
@@ -1672,20 +1747,14 @@ mod tests {
     /// this, rather than passing on blank frames or failing on a defect that
     /// is not in the code under test. Real GPU hosts still run these.
     fn live_gpu_evidence_available(label: &str) -> bool {
-        match crate::probe_gpu_capability() {
-            None => {
-                eprintln!("no GPU adapter; skipping {label}");
+        // One authority for "may this lane certify pixels", shared with any
+        // non-test consumer, rather than a second copy of the rule here.
+        match pixel_evidence_verdict(crate::probe_gpu_capability().as_ref()) {
+            PixelEvidenceVerdict::Admissible => true,
+            PixelEvidenceVerdict::SmokeOnly(reason) => {
+                eprintln!("skipping {label}: {reason}");
                 false
             }
-            Some(info) if info.class == scriptbots_core::GpuClass::Software => {
-                eprintln!(
-                    "software rasterizer ({}); skipping {label} — it cannot produce \
-                     trustworthy live GPU evidence (bd-2z0.14.3.8)",
-                    info.name
-                );
-                false
-            }
-            Some(_) => true,
         }
     }
 
@@ -2048,6 +2117,77 @@ mod tests {
         }
         assert_eq!(json["schema"], PROVENANCE_SCHEMA);
         assert_eq!(json["world_digest"], "blake3:deadbeef");
+    }
+
+    fn gpu_info(name: &str, class: scriptbots_core::GpuClass) -> scriptbots_core::GpuInfo {
+        scriptbots_core::GpuInfo {
+            name: name.to_string(),
+            backend: "Vulkan".to_string(),
+            class,
+            vram_bytes: None,
+            max_texture_2d: Some(16_384),
+            timestamp_queries: true,
+        }
+    }
+
+    /// The item 4 decision, pinned: a software rasterizer may smoke-test the
+    /// capture path but must never certify pixels.
+    ///
+    /// Full reported capability must NOT buy admissibility. llvmpipe advertises a
+    /// Vulkan backend, 16384 max texture size and timestamp queries, and still
+    /// returns uniform frames from this path — so a verdict keyed on capability
+    /// flags rather than device class would wave it straight through.
+    #[test]
+    fn a_software_rasterizer_may_smoke_test_but_never_certify_pixels() {
+        let verdict = pixel_evidence_verdict(Some(&gpu_info(
+            "llvmpipe (LLVM 21.1.8, 256 bits)",
+            scriptbots_core::GpuClass::Software,
+        )));
+        assert!(
+            !verdict.admissible(),
+            "a software rasterizer must not certify pixel evidence"
+        );
+        let PixelEvidenceVerdict::SmokeOnly(reason) = verdict else {
+            panic!("expected a smoke-only verdict");
+        };
+        assert!(
+            reason.contains("llvmpipe"),
+            "the refusal must name what it found: {reason}"
+        );
+        assert!(
+            reason.contains("investigate"),
+            "the refusal must stay actionable rather than final: {reason}"
+        );
+    }
+
+    /// A missing adapter is smoke-only for a different reason, and must say so
+    /// rather than reusing the software-rasterizer text.
+    #[test]
+    fn an_absent_adapter_is_smoke_only_and_says_why() {
+        let verdict = pixel_evidence_verdict(None);
+        assert!(!verdict.admissible());
+        let PixelEvidenceVerdict::SmokeOnly(reason) = verdict else {
+            panic!("expected a smoke-only verdict");
+        };
+        assert!(
+            reason.contains("no GPU adapter"),
+            "an absent adapter must not be reported as a software rasterizer: {reason}"
+        );
+    }
+
+    /// Real hardware stays admissible, so this decision narrows nothing that
+    /// currently works.
+    #[test]
+    fn real_hardware_still_certifies_pixels() {
+        for class in [
+            scriptbots_core::GpuClass::Discrete,
+            scriptbots_core::GpuClass::Integrated,
+        ] {
+            assert!(
+                pixel_evidence_verdict(Some(&gpu_info("Apple M4", class))).admissible(),
+                "{class:?} must still be able to certify pixels"
+            );
+        }
     }
 
     /// Build a frame from a per-pixel closure, for structural comparison tests.
