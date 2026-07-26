@@ -608,6 +608,92 @@ mod capture_smoke_test {
             "same snapshot, controls, adapter, and tick-derived animation time must be byte-identical"
         );
     }
+
+    /// Deterministic ACROSS RENDERER INSTANCES, not merely across two draws.
+    ///
+    /// The test above renders twice through the SAME `WorldRenderer`, so it
+    /// shares one device, one pipeline set, one readback ring and one set of
+    /// GPU allocations. That proves a repeated draw is stable; it cannot
+    /// distinguish "the pipeline is deterministic" from "the second draw
+    /// happened to observe the state the first draw left behind". Anything
+    /// that depends on residual buffer contents, allocation addresses or
+    /// first-use initialisation is invisible to it and would only appear on a
+    /// fresh process — which is where a golden comparison actually lives.
+    ///
+    /// This builds two INDEPENDENT renderers from the same adapter, each with
+    /// its own device, pipelines and readback ring, and requires their frames
+    /// to be byte-identical. That is as close to run-to-run as an in-process
+    /// test can get.
+    ///
+    /// HONEST LIMITS, so this is not read as more than it is: two devices from
+    /// one adapter in one process is not a second process, and it says nothing
+    /// about a DIFFERENT adapter, driver or backend — cross-backend agreement
+    /// is a separate open remainder of bd-2z0.7.11, and cross-platform live
+    /// evidence needs the DSR lanes this machine does not have.
+    #[test]
+    fn independent_renderers_produce_byte_identical_frames() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("adapter");
+        let size = (320, 180);
+        let dims = (64u32, 32u32);
+        let tiles = vec![3u32; (dims.0 * dims.1) as usize];
+        let colors = vec![[0.15, 0.45, 0.2, 1.0]; tiles.len()];
+        let snapshot = WorldSnapshot {
+            world_size: (3200.0, 1600.0),
+            terrain: TerrainView {
+                dims,
+                cell_size: 50,
+                tiles: &tiles,
+                colors: &colors,
+                elevation: None,
+            },
+            agents: &[],
+            anim_seconds: 0.0,
+            tonemap_mode: None,
+        };
+
+        // Each closure owns its renderer for its whole lifetime, so the second
+        // cannot observe anything the first allocated or left mapped.
+        let render_once = |label: &str| -> Vec<u8> {
+            let mut renderer = pollster::block_on(WorldRenderer::new(&adapter, size))
+                .unwrap_or_else(|error| panic!("{label} renderer must initialise: {error:?}"));
+            let frame = renderer
+                .render(&snapshot)
+                .unwrap_or_else(|error| panic!("{label} render: {error:?}"));
+            renderer
+                .copy_to_readback(&frame)
+                .unwrap_or_else(|error| panic!("{label} copy: {error:?}"));
+            renderer
+                .mapped_rgba()
+                .unwrap_or_else(|error| panic!("{label} readback: {error:?}"))
+                .bytes()
+                .to_vec()
+        };
+
+        let first = render_once("first");
+        let second = render_once("second");
+
+        assert!(
+            first.iter().any(|byte| *byte != 0),
+            "a determinism claim over two blank frames would be vacuous"
+        );
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "independent renderers must agree on readback shape"
+        );
+        assert_eq!(
+            first, second,
+            "the same snapshot rendered by two independently constructed renderers must be \
+             byte-identical; a difference here means the GPU path carries state across \
+             construction and no golden can be trusted run to run"
+        );
+    }
 }
 
 fn create_color(
