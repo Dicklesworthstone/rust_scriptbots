@@ -1257,11 +1257,47 @@ fn refuse_ambiguous_command_claim_migration(connection: &Connection) -> Result<(
     })
 }
 
+fn refuse_lossy_command_claim_migration(connection: &Connection) -> Result<(), StorageError> {
+    let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+    if !(SCRIPTBOTS_SCHEMA_V9_VERSION..SCRIPTBOTS_SCHEMA_VERSION).contains(&user_version) {
+        return Ok(());
+    }
+
+    let page_limit = checked_query_limit(
+        "host_command_claims.migration_page_limit",
+        MAX_STORAGE_QUERY_PAGE,
+    )?;
+    let mut run_cursor = String::new();
+    loop {
+        let runs = connection.query_with_params(
+            "SELECT run_id
+             FROM runs
+             WHERE run_id > ?1
+             ORDER BY run_id ASC
+             LIMIT ?2",
+            &[run_cursor.as_str().into(), page_limit.into()],
+        )?;
+        if runs.is_empty() {
+            break;
+        }
+        for row in &runs {
+            let encoded_run_id: String = decode(row, 0, "runs.run_id")?;
+            let run_id = decode_run_id(row, 0, "runs.run_id")?;
+            Storage::validate_host_journal_invariants_for_connection(
+                connection, run_id, true, true,
+            )?;
+            run_cursor = encoded_run_id;
+        }
+    }
+    Ok(())
+}
+
 fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
     // This preflight must precede MigrationRunner: its ledger, DDL, and user-version writes are
     // intentionally never attempted when old envelope-only archives cannot populate V9 exactly.
     refuse_lossy_command_lifecycle_migration(connection)?;
     refuse_ambiguous_command_claim_migration(connection)?;
+    refuse_lossy_command_claim_migration(connection)?;
     let result = scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_VERSION).run(connection)?;
     // Every suffix of the chain is a legal lineage: a database joins at whatever version it
     // was left at and runs forward from there. Enumerated rather than computed so that adding
@@ -6358,7 +6394,7 @@ impl StorageReader {
             .and_then(|()| Storage::validate_all_persistence_invariants(&conn, true))
             .and_then(|()| Self::resolve_run_id(&conn, requested_run_id))
             .and_then(|run_id| {
-                Storage::validate_host_journal_invariants_for_connection(&conn, run_id, true)
+                Storage::validate_host_journal_invariants_for_connection(&conn, run_id, true, false)
                     .map(|()| run_id)
             })
             .and_then(|run_id| existing_lease.verify_path(path).map(|()| run_id));
@@ -10326,7 +10362,7 @@ impl Storage {
             });
         }
         for run_id in run_ids {
-            Self::validate_host_journal_invariants_for_connection(connection, run_id, true)?;
+            Self::validate_host_journal_invariants_for_connection(connection, run_id, true, false)?;
         }
         Ok(())
     }
@@ -10336,6 +10372,7 @@ impl Storage {
             self.connection()?,
             self.run_id,
             self.file_backed(),
+            false,
         )
     }
 
@@ -10343,12 +10380,36 @@ impl Storage {
         connection: &Connection,
         file_backed: bool,
     ) -> Result<(), StorageError> {
+        let orphan_claims = connection.query(
+            "SELECT claim.run_id, claim.host_session_id, claim.command_id
+             FROM host_command_claims AS claim
+             LEFT JOIN runs AS registered
+               ON registered.run_id = claim.run_id
+             LEFT JOIN host_journal_progress AS progress
+               ON progress.run_id = claim.run_id
+              AND progress.host_session_id = claim.host_session_id
+             WHERE registered.run_id IS NULL OR progress.host_session_id IS NULL
+             ORDER BY claim.run_id ASC, claim.command_id ASC
+             LIMIT 1",
+        )?;
+        if let Some(row) = orphan_claims.first() {
+            let run_id: String = decode(row, 0, "host_command_claims.run_id")?;
+            let session: String = decode(row, 1, "host_command_claims.host_session_id")?;
+            let command_id: String = decode(row, 2, "host_command_claims.command_id")?;
+            return Err(StorageError::InvalidData {
+                context: "host_command_claims.run_id",
+                reason: format!(
+                    "command claim ({run_id}, {session}, {command_id}) has no matching registered run and journal session"
+                ),
+            });
+        }
         let rows = connection.query("SELECT run_id FROM runs ORDER BY run_id ASC")?;
         for row in rows {
             Self::validate_host_journal_invariants_for_connection(
                 connection,
                 decode_run_id(&row, 0, "runs.run_id")?,
                 file_backed,
+                false,
             )?;
         }
         Ok(())
@@ -10358,6 +10419,7 @@ impl Storage {
         connection: &Connection,
         run_id: RunId,
         file_backed: bool,
+        pre_v13_claim_migration: bool,
     ) -> Result<(), StorageError> {
         let page_limit =
             checked_query_limit("host_journal_invariants.page_limit", MAX_STORAGE_QUERY_PAGE)?;
@@ -10391,6 +10453,7 @@ impl Storage {
                     session_id,
                     file_backed,
                     page_limit,
+                    pre_v13_claim_migration,
                 )?;
                 session_cursor = encoded_session;
             }
@@ -10520,94 +10583,98 @@ impl Storage {
                 ),
             });
         }
-        let command_claim_mismatch = connection.query_with_params(
-            "SELECT command.host_session_id, command.command_id
-             FROM host_command_records AS command
-             LEFT JOIN host_command_claims AS claim
-               ON claim.run_id = command.run_id
-              AND claim.command_id = command.command_id
-             WHERE command.run_id = ?1
-               AND (
-                    claim.command_id IS NULL
-                    OR claim.host_session_id <> command.host_session_id
-                    OR claim.envelope_postcard_hex <> command.envelope_postcard_hex
-               )
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = command_claim_mismatch.first() {
-            let session: String = decode(row, 0, "host_command_records.host_session_id")?;
-            let command_id: String = decode(row, 1, "host_command_records.command_id")?;
-            return Err(StorageError::InvalidData {
-                context: "host_command_claims.terminal_binding",
-                reason: format!(
-                    "command record ({session}, {command_id}) has no exact durable command claim"
-                ),
-            });
-        }
-        let claim_orphan = connection.query_with_params(
-            "SELECT claim.host_session_id, claim.command_id
-             FROM host_command_claims AS claim
-             LEFT JOIN host_journal_progress AS progress
-               ON progress.run_id = claim.run_id
-              AND progress.host_session_id = claim.host_session_id
-             WHERE claim.run_id = ?1 AND progress.host_session_id IS NULL
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = claim_orphan.first() {
-            let session: String = decode(row, 0, "host_command_claims.host_session_id")?;
-            let command_id: String = decode(row, 1, "host_command_claims.command_id")?;
-            return Err(StorageError::InvalidData {
-                context: "host_command_claims.host_session_id",
-                reason: format!(
-                    "command claim ({session}, {command_id}) has no matching journal session"
-                ),
-            });
-        }
-        let mut claim_cursor = String::new();
-        loop {
-            let claims = connection.query_with_params(
-                "SELECT command_id, envelope_postcard_hex
-                 FROM host_command_claims
-                 WHERE run_id = ?1 AND command_id > ?2
-                 ORDER BY command_id ASC
-                 LIMIT ?3",
-                &[
-                    sqlite_run_id(run_id),
-                    claim_cursor.as_str().into(),
-                    page_limit.into(),
-                ],
+        if !pre_v13_claim_migration {
+            let command_claim_mismatch = connection.query_with_params(
+                "SELECT command.host_session_id, command.command_id
+                 FROM host_command_records AS command
+                 LEFT JOIN host_command_claims AS claim
+                   ON claim.run_id = command.run_id
+                  AND claim.command_id = command.command_id
+                 WHERE command.run_id = ?1
+                   AND (
+                        claim.command_id IS NULL
+                        OR claim.host_session_id <> command.host_session_id
+                        OR claim.envelope_postcard_hex <> command.envelope_postcard_hex
+                   )
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
             )?;
-            if claims.is_empty() {
-                break;
+            if let Some(row) = command_claim_mismatch.first() {
+                let session: String = decode(row, 0, "host_command_records.host_session_id")?;
+                let command_id: String = decode(row, 1, "host_command_records.command_id")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_command_claims.terminal_binding",
+                    reason: format!(
+                        "command record ({session}, {command_id}) has no exact durable command claim"
+                    ),
+                });
             }
-            for row in &claims {
-                let command_id_text: String = decode(row, 0, "host_command_claims.command_id")?;
-                let command_id: CommandId = serde_json::from_str(&format!("\"{command_id_text}\""))
+            let claim_orphan = connection.query_with_params(
+                "SELECT claim.host_session_id, claim.command_id
+                 FROM host_command_claims AS claim
+                 LEFT JOIN host_journal_progress AS progress
+                   ON progress.run_id = claim.run_id
+                  AND progress.host_session_id = claim.host_session_id
+                 WHERE claim.run_id = ?1 AND progress.host_session_id IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if let Some(row) = claim_orphan.first() {
+                let session: String = decode(row, 0, "host_command_claims.host_session_id")?;
+                let command_id: String = decode(row, 1, "host_command_claims.command_id")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_command_claims.host_session_id",
+                    reason: format!(
+                        "command claim ({session}, {command_id}) has no matching journal session"
+                    ),
+                });
+            }
+            let mut claim_cursor = String::new();
+            loop {
+                let claims = connection.query_with_params(
+                    "SELECT command_id, envelope_postcard_hex
+                     FROM host_command_claims
+                     WHERE run_id = ?1 AND command_id > ?2
+                     ORDER BY command_id ASC
+                     LIMIT ?3",
+                    &[
+                        sqlite_run_id(run_id),
+                        claim_cursor.as_str().into(),
+                        page_limit.into(),
+                    ],
+                )?;
+                if claims.is_empty() {
+                    break;
+                }
+                for row in &claims {
+                    let command_id_text: String = decode(row, 0, "host_command_claims.command_id")?;
+                    let command_id: CommandId = serde_json::from_str(&format!(
+                        "\"{command_id_text}\""
+                    ))
                     .map_err(|error| StorageError::InvalidData {
                         context: "host_command_claims.command_id",
                         reason: error.to_string(),
                     })?;
-                let envelope_hex: String =
-                    decode(row, 1, "host_command_claims.envelope_postcard_hex")?;
-                let envelope = decode_command_envelope_postcard_hex(
-                    "host_command_claims.envelope_postcard_hex",
-                    &envelope_hex,
-                )?;
-                let canonical = encode_command_envelope_postcard_hex(
-                    "host_command_claims.envelope_postcard_hex",
-                    &envelope,
-                )?;
-                if envelope.command_id != command_id || canonical != envelope_hex {
-                    return Err(StorageError::InvalidData {
-                        context: "host_command_claims.envelope_postcard_hex",
-                        reason: format!(
-                            "command {command_id} claim is not its canonical envelope encoding"
-                        ),
-                    });
+                    let envelope_hex: String =
+                        decode(row, 1, "host_command_claims.envelope_postcard_hex")?;
+                    let envelope = decode_command_envelope_postcard_hex(
+                        "host_command_claims.envelope_postcard_hex",
+                        &envelope_hex,
+                    )?;
+                    let canonical = encode_command_envelope_postcard_hex(
+                        "host_command_claims.envelope_postcard_hex",
+                        &envelope,
+                    )?;
+                    if envelope.command_id != command_id || canonical != envelope_hex {
+                        return Err(StorageError::InvalidData {
+                            context: "host_command_claims.envelope_postcard_hex",
+                            reason: format!(
+                                "command {command_id} claim is not its canonical envelope encoding"
+                            ),
+                        });
+                    }
+                    claim_cursor = command_id_text;
                 }
-                claim_cursor = command_id_text;
             }
         }
         let application_orphan = connection.query_with_params(
@@ -10679,6 +10746,7 @@ impl Storage {
         session_id: HostSessionId,
         file_backed: bool,
         page_limit: i64,
+        pre_v13_claim_migration: bool,
     ) -> Result<(), StorageError> {
         let session = encode_journal_u64(session_id.get());
         let progress_rows = connection.query_with_params(
@@ -10943,6 +11011,21 @@ impl Storage {
                     expected_domain_events.as_ref(),
                 )?;
                 let expected_command = archive.prepare_command_projection(&payload_digest)?;
+                if pre_v13_claim_migration
+                    && state < HostJournalState::Applied
+                    && expected_command.is_some()
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "_schema_migrations.command_claims",
+                        reason: format!(
+                            "refusing pre-v13 migration of {} command-bearing journal batch {batch_id:?}: no durable pre-admission claim can be reconstructed",
+                            state.as_str()
+                        ),
+                    });
+                }
+                if !pre_v13_claim_migration && let Some(projection) = expected_command.as_ref() {
+                    Self::require_command_claim_for_connection(connection, run_id, projection)?;
+                }
                 Self::validate_command_projection_for_connection(
                     connection,
                     run_id,
@@ -11756,6 +11839,28 @@ impl Storage {
         request: &CommandAuthorityRequest,
     ) -> Result<CommandAuthorityLookup, StorageError> {
         let command_id_text = command_id.to_string();
+        if let CommandAuthorityRequest::Submit {
+            envelope_postcard_hex,
+            ..
+        } = request
+        {
+            let envelope = decode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                envelope_postcard_hex,
+            )?;
+            let canonical = encode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &envelope,
+            )?;
+            if envelope.command_id != command_id || canonical != *envelope_postcard_hex {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_claims.envelope_postcard_hex",
+                    reason: format!(
+                        "submitted command {command_id} is not its canonical envelope encoding"
+                    ),
+                });
+            }
+        }
         let claim_rows = self.connection()?.query_with_params(
             "SELECT host_session_id, envelope_postcard_hex
              FROM host_command_claims
@@ -11987,6 +12092,13 @@ impl Storage {
                 context: "host_journal_archive.journal_sequence",
                 reason: "journal and scientific-event sequences must be nonzero".to_owned(),
             });
+        }
+        if let Some(projection) = prepared.command.as_ref() {
+            Self::require_command_claim_for_connection(
+                self.connection()?,
+                self.run_id,
+                projection,
+            )?;
         }
         let session = encode_journal_u64(session_id.get());
         let journal_sequence = encode_journal_u64(sequence);
@@ -12504,48 +12616,55 @@ impl Storage {
     ) -> Result<(), FrankenError> {
         let command_id = projection.command_id().to_string();
         let session = encode_journal_u64(projection.batch_id.session_id().get());
-        let rows = transaction.query_with_params(
-            "SELECT host_session_id, envelope_postcard_hex
+        let row = transaction.query_row_with_params(
+            "SELECT COUNT(*)
              FROM host_command_claims
-             WHERE run_id = ?1 AND command_id = ?2",
-            &[sqlite_run_id(run_id), command_id.as_str().into()],
+             WHERE run_id = ?1 AND command_id = ?2
+               AND host_session_id = ?3 AND envelope_postcard_hex = ?4",
+            &[
+                sqlite_run_id(run_id),
+                command_id.as_str().into(),
+                session.as_str().into(),
+                projection.envelope_postcard_hex.as_str().into(),
+            ],
         )?;
-        match rows.as_slice() {
-            [] => {
-                let inserted = transaction.execute_with_params(
-                    "INSERT INTO host_command_claims (
-                        run_id, command_id, host_session_id, envelope_postcard_hex
-                     ) VALUES (?1, ?2, ?3, ?4)",
-                    &[
-                        sqlite_run_id(run_id),
-                        command_id.as_str().into(),
-                        session.as_str().into(),
-                        projection.envelope_postcard_hex.as_str().into(),
-                    ],
-                )?;
-                if inserted != 1 {
-                    return Err(FrankenError::Internal(format!(
-                        "terminal command claim inserted {inserted} rows"
-                    )));
-                }
-            }
-            [row] => {
-                let claimed_session: String = row.get_typed(0)?;
-                let claimed_envelope: String = row.get_typed(1)?;
-                if claimed_session != session
-                    || claimed_envelope.as_str() != projection.envelope_postcard_hex.as_str()
-                {
-                    return Err(FrankenError::Internal(format!(
-                        "terminal command {command_id} conflicts with its durable pre-admission claim"
-                    )));
-                }
-            }
-            _ => {
-                return Err(FrankenError::Internal(format!(
-                    "terminal command {command_id} has {} durable claims",
-                    rows.len()
-                )));
-            }
+        let matches: i64 = row.get_typed(0)?;
+        if matches != 1 {
+            return Err(FrankenError::Internal(format!(
+                "terminal command {command_id} has no exact durable pre-admission claim"
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_command_claim_for_connection(
+        connection: &Connection,
+        run_id: RunId,
+        projection: &PreparedCommandProjection,
+    ) -> Result<(), StorageError> {
+        let command_id = projection.command_id().to_string();
+        let session = encode_journal_u64(projection.batch_id.session_id().get());
+        let row = connection.query_row_with_params(
+            "SELECT COUNT(*)
+             FROM host_command_claims
+             WHERE run_id = ?1 AND command_id = ?2
+               AND host_session_id = ?3 AND envelope_postcard_hex = ?4",
+            &[
+                sqlite_run_id(run_id),
+                command_id.as_str().into(),
+                session.as_str().into(),
+                projection.envelope_postcard_hex.as_str().into(),
+            ],
+        )?;
+        let matches: i64 = decode(&row, 0, "host_command_claims.count")?;
+        if matches != 1 {
+            return Err(StorageError::InvalidData {
+                context: "host_command_claims.terminal_binding",
+                reason: format!(
+                    "command {command_id} has no exact durable pre-admission claim for journal batch {:?}",
+                    projection.batch_id
+                ),
+            });
         }
         Ok(())
     }
@@ -20434,6 +20553,96 @@ mod tests {
     }
 
     #[test]
+    fn production_recovery_refuses_admitted_v12_command_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-v12-admitted-command-claim-refusal");
+        let path_string = path.to_string_lossy().to_string();
+        let session_id = HostSessionId::new(0x515);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
+        arm_host_journal_fault(
+            &path_string,
+            HostJournalFaultPoint::AfterArchiveBeforeApplication,
+        );
+        let command = frontend.step()?;
+        let mut next_nanos = 0;
+        let status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert_journal_fault_status(
+            &pipeline,
+            &status,
+            HostJournalFaultPoint::AfterArchiveBeforeApplication,
+            FailureCommitState::Committed,
+        );
+        drop_fault_host(pipeline, core, frontend);
+        assert_eq!(
+            journal_database_snapshot(&path_string)
+                .ledger_state
+                .as_deref(),
+            Some("admitted")
+        );
+
+        let connection = Connection::open(&path_string)?;
+        connection.execute_batch(
+            "DROP TABLE host_command_claims;
+             DELETE FROM _schema_migrations WHERE version = 13;
+             PRAGMA user_version = 12;",
+        )?;
+        assert_eq!(
+            read_schema_objects(&connection)?,
+            canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?,
+            "admitted fixture must remain the exact supported V12 schema"
+        );
+        connection.close()?;
+
+        assert_recovery_refused_without_database_mutation(
+            &path,
+            "no durable pre-admission claim can be reconstructed",
+        )
+    }
+
+    #[test]
+    fn production_recovery_refuses_noncanonical_v12_command_projection_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-v12-noncanonical-command-projection");
+        let path_string = path.to_string_lossy().to_string();
+        let session_id = HostSessionId::new(0x516);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
+        let command = frontend.step()?;
+        let mut next_nanos = 0;
+        let terminal = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert_eq!(terminal.journal(), &JournalState::Durable);
+        drop_fault_host(pipeline, core, frontend);
+
+        let connection = Connection::open(&path_string)?;
+        connection.execute_batch(
+            "DROP TABLE host_command_claims;
+             DELETE FROM _schema_migrations WHERE version = 13;
+             PRAGMA user_version = 12;
+             UPDATE host_command_records SET envelope_postcard_hex = '00';",
+        )?;
+        assert_eq!(
+            read_schema_objects(&connection)?,
+            canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?,
+            "noncanonical fixture must remain the exact supported V12 schema"
+        );
+        connection.close()?;
+
+        assert_recovery_refused_without_database_mutation(
+            &path,
+            "host_command_records.envelope_postcard_hex",
+        )
+    }
+
+    #[test]
     fn production_recovery_refuses_ambiguous_v12_command_claims_without_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-v12-ambiguous-command-claims");
@@ -20481,6 +20690,69 @@ mod tests {
         assert_recovery_refused_without_database_mutation(
             &path,
             "refusing run-scoped command-claim migration",
+        )
+    }
+
+    #[test]
+    fn recovery_refuses_missing_preclaim_and_unknown_run_claim_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let missing = temp_db_path("storage-current-missing-command-preclaim");
+        let missing_string = missing.to_string_lossy().to_string();
+        let session_id = HostSessionId::new(0x517);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&missing_string, session_id);
+        arm_host_journal_fault(
+            &missing_string,
+            HostJournalFaultPoint::AfterArchiveBeforeApplication,
+        );
+        let command = frontend.step()?;
+        let mut next_nanos = 0;
+        let status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert_journal_fault_status(
+            &pipeline,
+            &status,
+            HostJournalFaultPoint::AfterArchiveBeforeApplication,
+            FailureCommitState::Committed,
+        );
+        drop_fault_host(pipeline, core, frontend);
+        let connection = Connection::open(&missing_string)?;
+        connection.execute("DELETE FROM host_command_claims")?;
+        connection.close()?;
+        assert_recovery_refused_without_database_mutation(
+            &missing,
+            "no exact durable pre-admission claim",
+        )?;
+
+        let orphan = temp_db_path("storage-current-unknown-run-command-claim");
+        create_valid_database(&orphan)?;
+        let orphan_string = orphan.to_string_lossy().to_string();
+        let command_id = CommandId::from_client_sequence(0x4f52_5048_414e, 1);
+        let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+        let envelope = encode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            &envelope,
+        )?;
+        let connection = Connection::open(&orphan_string)?;
+        connection.execute("PRAGMA foreign_keys = OFF")?;
+        connection.execute_with_params(
+            "INSERT INTO host_command_claims (
+                run_id, command_id, host_session_id, envelope_postcard_hex
+             ) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                "unknown-run".into(),
+                command_id.to_string().into(),
+                encode_journal_u64(1).into(),
+                envelope.into(),
+            ],
+        )?;
+        connection.close()?;
+        assert_recovery_refused_without_database_mutation(
+            &orphan,
+            "has no matching registered run and journal session",
         )
     }
 

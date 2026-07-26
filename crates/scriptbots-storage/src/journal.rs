@@ -2559,10 +2559,9 @@ impl StorageCommandAuthorityReader {
                 }
             }
         }
-        pending.retain(|_, existing| {
-            matches!(existing.reply.try_recv(), Err(xchan::TryRecvError::Empty))
-                && existing.requested_at.elapsed() < self.timeout
-        });
+        // Polling another key's one-shot reply here would consume its ready authority truth.
+        // Only the exact-key branch above may observe that outcome; this sweep expires deadlines.
+        pending.retain(|_, existing| existing.requested_at.elapsed() < self.timeout);
         if pending.len() >= self.capacity {
             return CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Capacity {
                 capacity: self.capacity,
@@ -3188,6 +3187,54 @@ mod tests {
         let second = admitted_journal_batch(second_queued)
             .expect("measurement worker lane returns the second journal admission");
         (first.retained_bytes(), second.retained_bytes())
+    }
+
+    #[test]
+    fn command_authority_sweep_preserves_ready_outcome_for_exact_key() {
+        let session_id = HostSessionId::new(0x407);
+        let first_id = CommandId::new(1);
+        let second_id = CommandId::new(2);
+        let (worker_tx, worker_rx) = xchan::bounded(2);
+        let reader = StorageCommandAuthorityReader::new(
+            session_id,
+            worker_tx,
+            1,
+            Duration::from_secs(60),
+            1_024,
+        );
+
+        assert_eq!(
+            reader.resolve_status(first_id),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending)
+        );
+        let first_reply = match worker_rx
+            .try_recv()
+            .expect("first authority lookup reaches the storage worker")
+        {
+            StorageCommand::ResolveCommandAuthority {
+                command_id, reply, ..
+            } => {
+                assert_eq!(command_id, first_id);
+                reply
+            }
+            other => panic!("unexpected storage command: {other:?}"),
+        };
+        first_reply
+            .try_send(CommandAuthorityLookup::Collision)
+            .expect("worker publishes first authority outcome");
+
+        assert_eq!(
+            reader.resolve_status(second_id),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Capacity { capacity: 1 })
+        );
+        assert!(
+            matches!(worker_rx.try_recv(), Err(xchan::TryRecvError::Empty)),
+            "an unrelated lookup must not replace the ready first outcome"
+        );
+        assert_eq!(
+            reader.resolve_status(first_id),
+            CommandAuthorityLookup::Collision
+        );
     }
 
     #[test]
