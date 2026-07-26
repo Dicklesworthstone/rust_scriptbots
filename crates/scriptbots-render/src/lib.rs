@@ -11457,6 +11457,70 @@ mod hud_layout_store {
             cleanup(&dir);
         }
 
+        /// The saved file must contain EXACTLY the durable disclosure intent and
+        /// nothing else.
+        ///
+        /// bd-v9cz's policy names what must never be persisted: dock site (sites
+        /// are fixed), the resize rule's transient auto-collapse
+        /// (`hud_rail_forced_closed`, which is window geometry rather than
+        /// intent, and would let one narrow resize destroy a saved layout),
+        /// scroll offsets, and modal open state (settings always opens closed).
+        ///
+        /// Every one of those creeps in the same way — a field quietly added to
+        /// `PersistedHudLayout` because it was convenient — and none of them
+        /// would fail any other test here, because the round-trip and fallback
+        /// tests are all satisfied by a struct that carries too much. Asserting
+        /// on the exact key set is what makes an addition visible.
+        #[test]
+        fn the_saved_file_contains_only_durable_disclosure_intent() {
+            let dir = scratch("schema");
+            cleanup(&dir);
+            let path = dir.join("hud_layout.json");
+
+            save_to(
+                &path,
+                &HudLayout {
+                    stats_open: true,
+                    history_open: true,
+                    perf_open: true,
+                },
+            )
+            .expect("save must succeed to a temp dir");
+            let text = std::fs::read_to_string(&path).expect("read the saved file back");
+
+            let value: serde_json::Value =
+                serde_json::from_str(&text).expect("the saved file must be valid JSON");
+            let object = value.as_object().expect("the saved file must be an object");
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["history_open", "perf_open", "stats_open", "version"],
+                "the preference file must carry the three disclosure booleans and a \
+                 schema version, nothing more"
+            );
+
+            // Named explicitly so a failure says WHICH forbidden thing appeared,
+            // rather than only that the key set changed.
+            for forbidden in [
+                "rail_forced_closed",
+                "scroll",
+                "settings",
+                "modal",
+                "width",
+                "height",
+                "dock",
+                "bounds",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "the preference file must never persist {forbidden}: it is window \
+                     geometry or transient state, not durable user intent"
+                );
+            }
+            cleanup(&dir);
+        }
+
         /// The path must be a preference file, distinct from anything the
         /// simulation reads. UI state reaching ScriptBotsConfig would perturb
         /// science and determinism.
