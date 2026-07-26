@@ -1003,6 +1003,24 @@ fn wrap_signed_angle(mut angle: f32) -> f32 {
     angle
 }
 
+/// Mutation spread for `herbivore_tendency`, from C++ `Agent.cpp:111` (bd-hgxt).
+///
+/// C++ gives this gene its own fixed spread rather than the shared `MR2` mutation scale, so an
+/// agent whose evolved `mutation_rates.secondary` has drifted upward does NOT thereby mutate its
+/// diet more aggressively. Driving it from `mutation_scale` coupled a selection-relevant trait to
+/// an unrelated evolving parameter.
+///
+/// CAVEAT, tracked separately: C++ `randn` (helpers.h) is a Gaussian variate and `0.03` is its
+/// standard deviation, whereas [`WorldState::mutate_value`] draws uniformly from `-spread..spread`.
+/// Adopting the constant removes the mutation-scale coupling and puts the magnitude in the right
+/// range, but it does not make the two bit-comparable -- that needs the distribution itself.
+const HERBIVORE_MUTATION_SPREAD: f32 = 0.03;
+
+/// Mutation spread for `temperature_preference`, from C++ `Agent.cpp:139` (bd-hgxt).
+///
+/// Same reasoning and the same Gaussian-versus-uniform caveat as [`HERBIVORE_MUTATION_SPREAD`].
+const TEMPERATURE_MUTATION_SPREAD: f32 = 0.005;
+
 // bd-tqpj: while-on-float mirrors the legacy C++ wrap loop; a modulo rewrite would change
 // evaluation order for large angles and shift world digests.
 #[allow(clippy::while_float)]
@@ -22117,7 +22135,7 @@ impl WorldState {
             runtime.herbivore_tendency = Self::mutate_value(
                 mutation_rng,
                 runtime.herbivore_tendency,
-                mutation_scale,
+                HERBIVORE_MUTATION_SPREAD,
                 0.0,
                 1.0,
             );
@@ -22276,12 +22294,14 @@ impl WorldState {
             }
 
             // bd-fba5: temperature is drawn LAST, after the eyes, matching C++ Agent.cpp:139.
+            // bd-hgxt: and UNCONDITIONALLY. C++ line 139 carries no `randf(0,1) < MR*5` gate, so
+            // gating it here both changed the trait's dynamics and desynchronised the offspring
+            // substream against the reference by a variable number of draws.
             let before_temp = runtime.temperature_preference;
-            runtime.temperature_preference = Self::mutate_value_with_probability(
+            runtime.temperature_preference = Self::mutate_value(
                 mutation_rng,
                 runtime.temperature_preference,
-                primary_rate,
-                mutation_scale,
+                TEMPERATURE_MUTATION_SPREAD,
                 0.0,
                 1.0,
             );
@@ -31121,10 +31141,14 @@ mod tests {
             "a zero per-gene probability must inherit every sensory modifier bit-exactly"
         );
 
-        // The herbivore draw is the only unconditional trait mutation in the pass, so a disabled
-        // probability must leave the mutation stream exactly one draw past its seed.
+        // bd-hgxt: herbivore and temperature are the two UNCONDITIONAL trait mutations, so a
+        // disabled probability leaves the stream exactly two draws past its seed -- one each,
+        // at their own fixed C++ spreads rather than the shared mutation scale.
         let mut expected = SmallRngStream::seed_from_u64(0x5EED_0002);
-        let _herbivore_delta: f32 = expected.random_range(-1.0_f32..1.0_f32);
+        let _herbivore_delta: f32 =
+            expected.random_range(-HERBIVORE_MUTATION_SPREAD..HERBIVORE_MUTATION_SPREAD);
+        let _temperature_delta: f32 =
+            expected.random_range(-TEMPERATURE_MUTATION_SPREAD..TEMPERATURE_MUTATION_SPREAD);
         assert_eq!(
             mutation_rng.checkpoint(),
             expected.checkpoint(),
@@ -31142,7 +31166,8 @@ mod tests {
 
         let mut expected_rng = SmallRngStream::seed_from_u64(0x5EED_0004);
         let expected_modifiers = {
-            let _herbivore_delta: f32 = expected_rng.random_range(-1.0_f32..1.0_f32);
+            let _herbivore_delta: f32 =
+                expected_rng.random_range(-HERBIVORE_MUTATION_SPREAD..HERBIVORE_MUTATION_SPREAD);
             // bd-fba5: both clocks are drawn between herbivore and the modifiers, mirroring
             // C++ Agent.cpp:112-115. This fixture pins the modifiers' gate-then-delta pairing,
             // not their absolute position, so it consumes the intervening clock draws rather
@@ -31221,14 +31246,19 @@ mod tests {
         // is enforced by `bd_fba5_draw_order_matches_the_cpp_reference` below, which accepts every
         // gate and therefore sees a distinct delta per gene.
         let mut expected = SmallRngStream::seed_from_u64(0x5EED_0006);
-        let _herbivore_delta: f32 = expected.random_range(-1.0_f32..1.0_f32);
-        for gene in 0..(5 + 2 + 1 + 2 * NUM_EYES) {
+        let _herbivore_delta: f32 =
+            expected.random_range(-HERBIVORE_MUTATION_SPREAD..HERBIVORE_MUTATION_SPREAD);
+        // bd-hgxt: temperature is no longer gated, so the gated set is the five modifiers, both
+        // clocks, and two per eye -- temperature's unconditional draw comes after them.
+        for gene in 0..(5 + 2 + 2 * NUM_EYES) {
             let gate: f32 = expected.random_range(0.0_f32..1.0_f32);
             assert!(
                 gate >= rate * 5.0,
                 "fixture requires every gate to reject; gene {gene} drew {gate}"
             );
         }
+        let _temperature_delta: f32 =
+            expected.random_range(-TEMPERATURE_MUTATION_SPREAD..TEMPERATURE_MUTATION_SPREAD);
         assert_eq!(
             mutation_rng.checkpoint(),
             expected.checkpoint(),
@@ -31257,8 +31287,9 @@ mod tests {
 
         let scale = 1.0_f32;
         let mut expected = SmallRngStream::seed_from_u64(0xFBA5_0002);
-        // Agent.cpp:111 -- herbivore, unconditional.
-        let _herbivore: f32 = expected.random_range(-scale..scale);
+        // Agent.cpp:111 -- herbivore, unconditional, at its own fixed spread (bd-hgxt).
+        let _herbivore: f32 =
+            expected.random_range(-HERBIVORE_MUTATION_SPREAD..HERBIVORE_MUTATION_SPREAD);
         // Agent.cpp:112,114 -- both clocks, immediately after herbivore.
         let mut gated = |before: f32, min: f32, max: f32| -> f32 {
             let gate: f32 = expected.random_range(0.0_f32..1.0_f32);
@@ -31287,10 +31318,10 @@ mod tests {
             let dir_delta: f32 = expected.random_range(-scale..scale);
             expected_dir[i] = wrap_unsigned_angle(parent.eye_direction[i] + dir_delta);
         }
-        // Agent.cpp:139 -- temperature, last.
-        let temp_gate: f32 = expected.random_range(0.0_f32..1.0_f32);
-        assert!(temp_gate < 5.0);
-        let temp_delta: f32 = expected.random_range(-scale..scale);
+        // Agent.cpp:139 -- temperature, last, UNCONDITIONAL and at its own fixed spread (bd-hgxt):
+        // no gate draw, one delta.
+        let temp_delta: f32 =
+            expected.random_range(-TEMPERATURE_MUTATION_SPREAD..TEMPERATURE_MUTATION_SPREAD);
         let expected_temp = (parent.temperature_preference + temp_delta).clamp(0.0, 1.0);
 
         let child = world.build_child_runtime(
