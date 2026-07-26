@@ -7,11 +7,12 @@ use scriptbots_core::{
     WorldState, channels::OutputChannel,
 };
 use scriptbots_runtime::{
-    ApplicationState, CommandEnvelope, CommandId, CommandStatus, ControlRevision, EventCatchUp,
-    EventCatchUpGuarantee, EventCatchUpState, EventCommitment, EventJournalReader, EventPageSource,
-    EventPoll, EventSequence, HostBlocker, HostCommand, HostCore, HostCoreOptions, HostLifecycle,
-    HostSessionId, JournalAdmission, JournalBatchId, JournalState, LocalHostPort, ManualInstant,
-    NullFrontend, PlaybackSnapshot, RejectionReason,
+    ApplicationState, CommandAuthorityLookupFailure, CommandEnvelope, CommandId, CommandStatus,
+    ControlRevision, EventCatchUp, EventCatchUpGuarantee, EventCatchUpState, EventCommitment,
+    EventJournalReader, EventPageSource, EventPoll, EventSequence, HostAccessError, HostBlocker,
+    HostCommand, HostCore, HostCoreOptions, HostLifecycle, HostSessionId, JournalAdmission,
+    JournalBatchId, JournalState, LocalHostPort, ManualInstant, NullFrontend,
+    NullFrontendSubmissionError, PlaybackSnapshot, RejectionReason,
 };
 use scriptbots_storage::{
     CommandJournalCursor, CommandStorageTransitionKind, DomainEventExpectation, DomainEventPayload,
@@ -215,9 +216,7 @@ fn submit_envelope_durably(
     envelope: &CommandEnvelope,
     next_nanos: &mut u64,
 ) -> (CommandStatus, WorldDigestV1) {
-    let submitted = frontend
-        .submit_envelope(envelope.clone())
-        .expect("GUI-equivalent envelope enters the production host boundary");
+    let submitted = submit_envelope_with_authority(frontend, core, envelope.clone(), next_nanos);
     assert_eq!(submitted.command_id(), envelope.command_id);
     let status = drive_until_journal_state(
         frontend,
@@ -236,6 +235,167 @@ fn submit_envelope_durably(
         .world_digest_v1()
         .expect("command leaves a canonical world digest");
     (status, digest)
+}
+
+fn retryable_authority_envelope(error: NullFrontendSubmissionError) -> CommandEnvelope {
+    match error {
+        NullFrontendSubmissionError::HostAccess {
+            envelope,
+            source:
+                HostAccessError::CommandAuthorityLookup {
+                    failure:
+                        CommandAuthorityLookupFailure::Pending
+                        | CommandAuthorityLookupFailure::Busy
+                        | CommandAuthorityLookupFailure::Capacity { .. },
+                    ..
+                },
+        } => envelope,
+        other => panic!("fresh durable command returned a terminal submission error: {other:?}"),
+    }
+}
+
+fn resolve_authority_submission(
+    frontend: &mut NullFrontend<LocalHostPort>,
+    core: &mut HostCore,
+    initial: Result<CommandStatus, NullFrontendSubmissionError>,
+    next_nanos: &mut u64,
+) -> CommandStatus {
+    let mut envelope = match initial {
+        Ok(status) => return status,
+        Err(error) => retryable_authority_envelope(error),
+    };
+    for _ in 0..WORKER_RETRY_LIMIT {
+        frontend
+            .drive_at(core, ManualInstant::from_nanos(*next_nanos))
+            .expect("authority retry drives the matching production host");
+        *next_nanos = next_nanos
+            .checked_add(1)
+            .expect("authority retry clock does not overflow");
+        match frontend.submit_envelope(envelope.clone()) {
+            Ok(status) => return status,
+            Err(error) => envelope = retryable_authority_envelope(error),
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!(
+        "durable command authority did not resolve within {WORKER_RETRY_LIMIT} nonblocking polls"
+    );
+}
+
+fn resolve_authority_status(
+    frontend: &mut NullFrontend<LocalHostPort>,
+    core: &mut HostCore,
+    command_id: CommandId,
+    initial: Result<Option<CommandStatus>, HostAccessError>,
+    next_nanos: &mut u64,
+) -> CommandStatus {
+    let mut attempt = initial;
+    for _ in 0..WORKER_RETRY_LIMIT {
+        match attempt {
+            Ok(Some(status)) => return status,
+            Ok(None) => panic!("durable command authority reported {command_id:?} absent"),
+            Err(HostAccessError::CommandAuthorityLookup {
+                command_id: pending_id,
+                failure:
+                    CommandAuthorityLookupFailure::Pending
+                    | CommandAuthorityLookupFailure::Busy
+                    | CommandAuthorityLookupFailure::Capacity { .. },
+            }) if pending_id == command_id => {
+                frontend
+                    .drive_at(core, ManualInstant::from_nanos(*next_nanos))
+                    .expect("status authority retry drives the matching production host");
+                *next_nanos = next_nanos
+                    .checked_add(1)
+                    .expect("status authority retry clock does not overflow");
+                thread::sleep(Duration::from_millis(1));
+                attempt = frontend.command_status(command_id);
+            }
+            Err(error) => panic!("durable status authority failed for {command_id:?}: {error}"),
+        }
+    }
+    panic!(
+        "durable status authority did not resolve within {WORKER_RETRY_LIMIT} nonblocking polls"
+    );
+}
+
+fn resolve_authority_collision(
+    frontend: &mut NullFrontend<LocalHostPort>,
+    core: &mut HostCore,
+    command_id: CommandId,
+    initial: Result<CommandStatus, NullFrontendSubmissionError>,
+    next_nanos: &mut u64,
+) {
+    let mut attempt = initial;
+    for _ in 0..WORKER_RETRY_LIMIT {
+        let envelope = match attempt {
+            Err(NullFrontendSubmissionError::HostAccess {
+                source:
+                    HostAccessError::CommandIdCollision {
+                        command_id: collision_id,
+                    },
+                ..
+            }) if collision_id == command_id => return,
+            Err(error) => retryable_authority_envelope(error),
+            Ok(status) => {
+                panic!("changed envelope unexpectedly returned authoritative status {status:?}")
+            }
+        };
+        frontend
+            .drive_at(core, ManualInstant::from_nanos(*next_nanos))
+            .expect("collision authority retry drives the matching production host");
+        *next_nanos = next_nanos
+            .checked_add(1)
+            .expect("collision authority retry clock does not overflow");
+        thread::sleep(Duration::from_millis(1));
+        attempt = frontend.submit_envelope(envelope);
+    }
+    panic!(
+        "durable collision authority did not resolve within {WORKER_RETRY_LIMIT} nonblocking polls"
+    );
+}
+
+fn submit_envelope_with_authority(
+    frontend: &mut NullFrontend<LocalHostPort>,
+    core: &mut HostCore,
+    envelope: CommandEnvelope,
+    next_nanos: &mut u64,
+) -> CommandStatus {
+    let initial = frontend.submit_envelope(envelope);
+    resolve_authority_submission(frontend, core, initial, next_nanos)
+}
+
+fn submit_command_with_authority(
+    frontend: &mut NullFrontend<LocalHostPort>,
+    core: &mut HostCore,
+    command: HostCommand,
+    expected_control_revision: Option<ControlRevision>,
+    next_nanos: &mut u64,
+) -> CommandStatus {
+    let initial = frontend.submit(command, expected_control_revision);
+    resolve_authority_submission(frontend, core, initial, next_nanos)
+}
+
+fn submit_command_with_authority_before_owner_drive(
+    frontend: &mut NullFrontend<LocalHostPort>,
+    command: HostCommand,
+    expected_control_revision: Option<ControlRevision>,
+) -> CommandStatus {
+    let initial = frontend.submit(command, expected_control_revision);
+    let mut envelope = match initial {
+        Ok(status) => return status,
+        Err(error) => retryable_authority_envelope(error),
+    };
+    for _ in 0..WORKER_RETRY_LIMIT {
+        thread::sleep(Duration::from_millis(1));
+        match frontend.submit_envelope(envelope.clone()) {
+            Ok(status) => return status,
+            Err(error) => envelope = retryable_authority_envelope(error),
+        }
+    }
+    panic!(
+        "durable command authority did not resolve before the owner drive within \
+         {WORKER_RETRY_LIMIT} nonblocking polls"
+    );
 }
 
 fn sorted_agent_identities(core: &HostCore) -> Vec<(AgentUid, u64)> {
@@ -277,7 +437,13 @@ fn memory_journal_accepts_zero_session_and_repairs_a_hot_ring_gap() {
     let mut frontend = NullFrontend::new(core.local_port(), 0x2001);
     let mut next_nanos = 0;
 
-    let first = frontend.step().expect("first explicit step");
+    let first = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Step,
+        None,
+        &mut next_nanos,
+    );
     let first = drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -287,7 +453,13 @@ fn memory_journal_accepts_zero_session_and_repairs_a_hot_ring_gap() {
     );
     assert_eq!(first.journal(), &JournalState::CommittedVolatile);
 
-    let second = frontend.step().expect("second explicit step");
+    let second = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Step,
+        None,
+        &mut next_nanos,
+    );
     let second = drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -349,7 +521,13 @@ fn memory_journal_accepts_zero_session_and_repairs_a_hot_ring_gap() {
     assert_eq!(hot_suffix.events.len(), 1);
     assert_eq!(hot_suffix.events[0].event.sequence, EventSequence::new(2));
 
-    let shutdown = frontend.shutdown().expect("ordered memory shutdown");
+    let shutdown = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Shutdown,
+        None,
+        &mut next_nanos,
+    );
     drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -390,7 +568,13 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     let mut frontend = NullFrontend::new(core.local_port(), 0x2002);
     let mut next_nanos = 0;
 
-    let first_submission = frontend.step().expect("first durable step");
+    let first_submission = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Step,
+        None,
+        &mut next_nanos,
+    );
     let first_command_id = first_submission.command_id();
     let first_status = drive_until_journal_state(
         &mut frontend,
@@ -408,7 +592,13 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     };
     let first_applied = *first_applied;
 
-    let second_submission = frontend.step().expect("second durable step");
+    let second_submission = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Step,
+        None,
+        &mut next_nanos,
+    );
     let second_command_id = second_submission.command_id();
     let second_status = drive_until_journal_state(
         &mut frontend,
@@ -486,7 +676,13 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
     );
     let expected_second_event = live_hot_suffix.events[0].clone();
 
-    let shutdown_submission = frontend.shutdown().expect("ordered durable shutdown");
+    let shutdown_submission = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Shutdown,
+        None,
+        &mut next_nanos,
+    );
     let shutdown_command_id = shutdown_submission.command_id();
     let shutdown_status = drive_until_journal_state(
         &mut frontend,
@@ -868,6 +1064,390 @@ fn file_journal_orders_durable_shutdown_and_reopens_a_detached_reader() {
 #[allow(
     clippy::drop_non_drop,
     clippy::too_many_lines,
+    reason = "one mock-free proof keeps cache eviction, durable authority, restart, and exactly-once progress observable together"
+)]
+fn file_command_authority_survives_cache_eviction_and_restart() {
+    const CLIENT_NAMESPACE: u64 = 0x2a_75_74_68;
+    const FIRST_SESSION: HostSessionId = HostSessionId::new(0x2a_01);
+    const STATUS_SESSION: HostSessionId = HostSessionId::new(0x2a_02);
+    const EXACT_SESSION: HostSessionId = HostSessionId::new(0x2a_03);
+    const RECOVERED_SESSION: HostSessionId = HostSessionId::new(0x2a_04);
+
+    let path = unique_database_path("command_authority_eviction_restart");
+    let journal_options = StorageJournalOptions::default();
+    let host_options = HostCoreOptions {
+        archived_command_capacity: 2,
+        ..host_options(8)
+    };
+    let mut pipeline = StoragePipeline::create_unattributed_file(&path)
+        .expect("new file-backed command-authority journal");
+    let run_id = pipeline.run_id();
+    let journal = pipeline
+        .journal_port(FIRST_SESSION, journal_options)
+        .expect("first command-authority journal port");
+    let mut core = HostCore::with_journal(
+        FIRST_SESSION,
+        compact_world(),
+        host_options,
+        Box::new(journal),
+    )
+    .expect("first command-authority host");
+    let mut frontend = NullFrontend::new(core.local_port(), CLIENT_NAMESPACE);
+    let mut next_nanos = 0;
+
+    let settled_envelopes = [1, 2, 3].map(|sequence| {
+        CommandEnvelope::new(
+            CommandId::from_client_sequence(CLIENT_NAMESPACE, sequence),
+            HostCommand::Step,
+        )
+    });
+    let mut settled_statuses = Vec::with_capacity(settled_envelopes.len());
+    for envelope in &settled_envelopes {
+        let (status, _) =
+            submit_envelope_durably(&mut frontend, &mut core, envelope, &mut next_nanos);
+        settled_statuses.push(status);
+    }
+    assert_eq!(core.world_tick(), Tick(3));
+
+    let first_envelope = settled_envelopes[0].clone();
+    let first_status = settled_statuses[0].clone();
+    let first_id = first_envelope.command_id;
+    let before_evicted_retry_tick = core.world_tick();
+    let before_evicted_retry_digest = core
+        .world()
+        .world_digest_v1()
+        .expect("world digest before evicted authority probes");
+
+    let exact_initial = frontend.submit_envelope(first_envelope.clone());
+    assert!(
+        matches!(
+            &exact_initial,
+            Err(NullFrontendSubmissionError::HostAccess {
+                source:
+                    HostAccessError::CommandAuthorityLookup {
+                        command_id,
+                        failure: CommandAuthorityLookupFailure::Pending,
+                    },
+                ..
+            }) if *command_id == first_id
+        ),
+        "the exact evicted retry must consult durable authority"
+    );
+    let exact_replay =
+        resolve_authority_submission(&mut frontend, &mut core, exact_initial, &mut next_nanos);
+    assert_eq!(exact_replay, first_status);
+    assert_eq!(core.world_tick(), before_evicted_retry_tick);
+    assert_eq!(
+        core.world()
+            .world_digest_v1()
+            .expect("world digest after exact evicted replay"),
+        before_evicted_retry_digest
+    );
+
+    let changed = frontend.submit_envelope(CommandEnvelope::new(first_id, HostCommand::Pause));
+    assert!(
+        matches!(
+            changed,
+            Err(NullFrontendSubmissionError::HostAccess {
+                source: HostAccessError::CommandIdCollision { command_id },
+                ..
+            }) if command_id == first_id
+        ),
+        "the authority cache warmed by the exact durable replay must reject a changed payload"
+    );
+    assert_eq!(
+        frontend
+            .command_status(first_id)
+            .expect("cached authoritative status lookup"),
+        Some(first_status.clone())
+    );
+    assert_eq!(core.world_tick(), before_evicted_retry_tick);
+    assert_eq!(
+        core.world()
+            .world_digest_v1()
+            .expect("world digest after evicted authority replay and collision"),
+        before_evicted_retry_digest
+    );
+
+    let shutdown_envelope = CommandEnvelope::new(
+        CommandId::from_client_sequence(CLIENT_NAMESPACE, 4),
+        HostCommand::Shutdown,
+    );
+    submit_envelope_durably(
+        &mut frontend,
+        &mut core,
+        &shutdown_envelope,
+        &mut next_nanos,
+    );
+    assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+    assert_eq!(
+        pipeline
+            .shutdown()
+            .expect("first command-authority writer shuts down")
+            .guarantee,
+        PersistenceGuarantee::Durable
+    );
+    drop(frontend);
+    drop(core);
+    drop(pipeline);
+
+    let mut status_pipeline =
+        StoragePipeline::recover_existing(&path).expect("recover the same authority database");
+    assert_eq!(status_pipeline.run_id(), run_id);
+    let status_journal = status_pipeline
+        .journal_port(STATUS_SESSION, journal_options)
+        .expect("cold recovered status journal port");
+    let mut status_core = HostCore::with_journal(
+        STATUS_SESSION,
+        compact_world(),
+        host_options,
+        Box::new(status_journal),
+    )
+    .expect("fresh status host over recovered durable authority");
+    let mut status_frontend = NullFrontend::new(status_core.local_port(), CLIENT_NAMESPACE);
+    let mut status_next_nanos = 0;
+    let status_before_tick = status_core.world_tick();
+    let status_before_digest = status_core
+        .world()
+        .world_digest_v1()
+        .expect("fresh world digest before cold recovered status lookup");
+
+    let recovered_status_initial = status_frontend.command_status(first_id);
+    assert!(
+        matches!(
+            &recovered_status_initial,
+            Err(HostAccessError::CommandAuthorityLookup {
+                command_id,
+                failure: CommandAuthorityLookupFailure::Pending,
+            }) if *command_id == first_id
+        ),
+        "a fresh host status lookup must consult recovered durable authority"
+    );
+    let recovered_status = resolve_authority_status(
+        &mut status_frontend,
+        &mut status_core,
+        first_id,
+        recovered_status_initial,
+        &mut status_next_nanos,
+    );
+    assert_eq!(recovered_status, first_status);
+    assert_eq!(status_core.world_tick(), status_before_tick);
+    assert_eq!(
+        status_core
+            .world()
+            .world_digest_v1()
+            .expect("fresh world digest after cold recovered status lookup"),
+        status_before_digest
+    );
+    drop(status_frontend);
+    drop(status_core);
+    assert_eq!(
+        status_pipeline
+            .shutdown()
+            .expect("close cold status authority writer")
+            .guarantee,
+        PersistenceGuarantee::Durable
+    );
+    drop(status_pipeline);
+
+    let mut exact_pipeline =
+        StoragePipeline::recover_existing(&path).expect("reopen authority for cold exact retry");
+    assert_eq!(exact_pipeline.run_id(), run_id);
+    let exact_journal = exact_pipeline
+        .journal_port(EXACT_SESSION, journal_options)
+        .expect("cold exact-retry journal port");
+    let mut exact_core = HostCore::with_journal(
+        EXACT_SESSION,
+        compact_world(),
+        host_options,
+        Box::new(exact_journal),
+    )
+    .expect("fresh exact-retry host over recovered durable authority");
+    let mut exact_frontend = NullFrontend::new(exact_core.local_port(), CLIENT_NAMESPACE);
+    let mut exact_next_nanos = 0;
+    let exact_before_tick = exact_core.world_tick();
+    let exact_before_digest = exact_core
+        .world()
+        .world_digest_v1()
+        .expect("fresh world digest before cold exact retry");
+
+    let recovered_exact_initial = exact_frontend.submit_envelope(first_envelope.clone());
+    assert!(
+        matches!(
+            &recovered_exact_initial,
+            Err(NullFrontendSubmissionError::HostAccess {
+                source:
+                    HostAccessError::CommandAuthorityLookup {
+                        command_id,
+                        failure: CommandAuthorityLookupFailure::Pending,
+                    },
+                ..
+            }) if *command_id == first_id
+        ),
+        "a fresh host exact retry must consult recovered durable authority"
+    );
+    let recovered_exact = resolve_authority_submission(
+        &mut exact_frontend,
+        &mut exact_core,
+        recovered_exact_initial,
+        &mut exact_next_nanos,
+    );
+    assert_eq!(recovered_exact, first_status);
+    assert_eq!(exact_core.world_tick(), exact_before_tick);
+    assert_eq!(
+        exact_core
+            .world()
+            .world_digest_v1()
+            .expect("fresh world digest after cold recovered exact replay"),
+        exact_before_digest
+    );
+    drop(exact_frontend);
+    drop(exact_core);
+    assert_eq!(
+        exact_pipeline
+            .shutdown()
+            .expect("close cold exact-retry authority writer")
+            .guarantee,
+        PersistenceGuarantee::Durable
+    );
+    drop(exact_pipeline);
+
+    let mut recovered =
+        StoragePipeline::recover_existing(&path).expect("reopen authority for cold collision");
+    assert_eq!(recovered.run_id(), run_id);
+    let recovered_journal = recovered
+        .journal_port(RECOVERED_SESSION, journal_options)
+        .expect("cold collision journal port");
+    let mut recovered_core = HostCore::with_journal(
+        RECOVERED_SESSION,
+        compact_world(),
+        host_options,
+        Box::new(recovered_journal),
+    )
+    .expect("fresh collision host over recovered durable authority");
+    let mut recovered_frontend = NullFrontend::new(recovered_core.local_port(), CLIENT_NAMESPACE);
+    let mut recovered_next_nanos = 0;
+    let recovered_before_tick = recovered_core.world_tick();
+    let recovered_before_digest = recovered_core
+        .world()
+        .world_digest_v1()
+        .expect("fresh world digest before cold recovered collision");
+
+    let recovered_changed =
+        recovered_frontend.submit_envelope(CommandEnvelope::new(first_id, HostCommand::Pause));
+    assert!(
+        matches!(
+            &recovered_changed,
+            Err(NullFrontendSubmissionError::HostAccess {
+                source:
+                    HostAccessError::CommandAuthorityLookup {
+                        command_id,
+                        failure: CommandAuthorityLookupFailure::Pending,
+                    },
+                ..
+            }) if *command_id == first_id
+        ),
+        "a fresh host changed envelope must consult recovered durable authority"
+    );
+    resolve_authority_collision(
+        &mut recovered_frontend,
+        &mut recovered_core,
+        first_id,
+        recovered_changed,
+        &mut recovered_next_nanos,
+    );
+    assert_eq!(
+        recovered_frontend
+            .command_status(first_id)
+            .expect("recovered authoritative status lookup"),
+        Some(first_status.clone())
+    );
+    assert_eq!(recovered_core.world_tick(), recovered_before_tick);
+    assert_eq!(
+        recovered_core
+            .world()
+            .world_digest_v1()
+            .expect("fresh world digest after recovered replay and collision"),
+        recovered_before_digest
+    );
+
+    let recovered_exact = recovered_frontend
+        .submit_envelope(first_envelope)
+        .expect("exact retry uses authority warmed by cold collision resolution");
+    assert_eq!(recovered_exact, first_status);
+    assert_eq!(recovered_core.world_tick(), recovered_before_tick);
+    assert_eq!(
+        recovered_core
+            .world()
+            .world_digest_v1()
+            .expect("fresh world digest after recovered collision and exact replay"),
+        recovered_before_digest
+    );
+
+    let before_fresh_revisions = recovered_core.latest_snapshot().revisions;
+    let fresh_envelope = CommandEnvelope::new(
+        CommandId::from_client_sequence(CLIENT_NAMESPACE, 5),
+        HostCommand::Pause,
+    );
+    let (fresh_status, fresh_digest) = submit_envelope_durably(
+        &mut recovered_frontend,
+        &mut recovered_core,
+        &fresh_envelope,
+        &mut recovered_next_nanos,
+    );
+    let after_fresh_revisions = recovered_core.latest_snapshot().revisions;
+    assert_ne!(
+        after_fresh_revisions.control, before_fresh_revisions.control,
+        "the genuinely fresh control command applies exactly one control boundary"
+    );
+    assert_eq!(
+        after_fresh_revisions.scientific, before_fresh_revisions.scientific,
+        "recovery does not pretend to reconstruct or resume the old scientific world"
+    );
+    assert_eq!(recovered_core.world_tick(), recovered_before_tick);
+    let fresh_replay = recovered_frontend
+        .submit_envelope(fresh_envelope)
+        .expect("fresh durable command exact retry");
+    assert_eq!(fresh_replay, fresh_status);
+    assert_eq!(
+        recovered_core.latest_snapshot().revisions,
+        after_fresh_revisions,
+        "the exact retry must not apply a second control boundary"
+    );
+    assert_eq!(recovered_core.world_tick(), recovered_before_tick);
+    assert_eq!(
+        recovered_core
+            .world()
+            .world_digest_v1()
+            .expect("fresh command exact retry digest"),
+        fresh_digest
+    );
+
+    let recovered_shutdown = CommandEnvelope::new(
+        CommandId::from_client_sequence(CLIENT_NAMESPACE, 6),
+        HostCommand::Shutdown,
+    );
+    submit_envelope_durably(
+        &mut recovered_frontend,
+        &mut recovered_core,
+        &recovered_shutdown,
+        &mut recovered_next_nanos,
+    );
+    assert_eq!(
+        recovered
+            .shutdown()
+            .expect("recovered command-authority writer shuts down")
+            .guarantee,
+        PersistenceGuarantee::Durable
+    );
+
+    // The uniquely named database is intentionally retained; this test performs no file deletion.
+}
+
+#[test]
+#[allow(
+    clippy::drop_non_drop,
+    clippy::too_many_lines,
     reason = "the mock-free two-run proof keeps command order, durable readback, replay, and per-boundary science digests visible in one audit"
 )]
 fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
@@ -1186,9 +1766,13 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     let mut next_nanos = 0;
 
     let nan_bits = 0x7fc0_5252_u32;
-    let pre_admission_rejection = frontend
-        .set_speed(f32::from_bits(nan_bits))
-        .expect("invalid nonfinite speed remains a queryable rejected command");
+    let pre_admission_rejection = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::SetSpeed(f32::from_bits(nan_bits)),
+        None,
+        &mut next_nanos,
+    );
     let pre_admission_id = pre_admission_rejection.command_id();
     let pre_admission_status = drive_until_journal_state(
         &mut frontend,
@@ -1202,9 +1786,13 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         ApplicationState::Rejected(RejectionReason::Validation { .. })
     ));
 
-    let rejected_shutdown = frontend
-        .submit(HostCommand::Shutdown, Some(ControlRevision::new(u64::MAX)))
-        .expect("revision-conflicting shutdown enters ordered command audit");
+    let rejected_shutdown = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Shutdown,
+        Some(ControlRevision::new(u64::MAX)),
+        &mut next_nanos,
+    );
     let rejected_shutdown_id = rejected_shutdown.command_id();
     let rejected_shutdown_status = drive_until_journal_state(
         &mut frontend,
@@ -1219,7 +1807,13 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     ));
     assert_ne!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
 
-    let pause = frontend.pause().expect("applied control-only pause");
+    let pause = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Pause,
+        None,
+        &mut next_nanos,
+    );
     let pause_id = pause.command_id();
     let pause_status = drive_until_journal_state(
         &mut frontend,
@@ -1253,9 +1847,7 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     .expecting_control_revision(pause_boundary.revisions.control)
     .expecting_scientific_revision(pause_boundary.revisions.scientific)
     .expecting_config_revision(pause_boundary.revisions.config);
-    frontend
-        .submit_envelope(update_envelope)
-        .expect("applied command-only configuration replacement");
+    submit_envelope_with_authority(&mut frontend, &mut core, update_envelope, &mut next_nanos);
     let update_status = drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -1279,9 +1871,12 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
     .expecting_control_revision(update_boundary.revisions.control)
     .expecting_scientific_revision(update_boundary.revisions.scientific)
     .expecting_config_revision(update_boundary.revisions.config);
-    frontend
-        .submit_envelope(failed_config_envelope)
-        .expect("valid live-geometry change is admitted before application failure");
+    submit_envelope_with_authority(
+        &mut frontend,
+        &mut core,
+        failed_config_envelope,
+        &mut next_nanos,
+    );
     let failed_config_status = drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -1304,9 +1899,7 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         .expecting_control_revision(update_boundary.revisions.control)
         .expecting_scientific_revision(update_boundary.revisions.scientific)
         .expecting_config_revision(update_boundary.revisions.config);
-    frontend
-        .submit_envelope(step_envelope)
-        .expect("applied scientific step");
+    submit_envelope_with_authority(&mut frontend, &mut core, step_envelope, &mut next_nanos);
     let step_status = drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -1325,9 +1918,7 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
         .expecting_control_revision(step_boundary.revisions.control)
         .expecting_scientific_revision(step_boundary.revisions.scientific)
         .expecting_config_revision(step_boundary.revisions.config);
-    frontend
-        .submit_envelope(shutdown_envelope)
-        .expect("final applied shutdown");
+    submit_envelope_with_authority(&mut frontend, &mut core, shutdown_envelope, &mut next_nanos);
     drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -1757,9 +2348,13 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
     let mut frontend = NullFrontend::new(core.local_port(), 0x2004);
     let mut next_nanos = 0;
 
-    let first = frontend
-        .step()
-        .expect("first pre-cadence scientific boundary");
+    let first = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Step,
+        None,
+        &mut next_nanos,
+    );
     drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -1767,9 +2362,13 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
         &JournalState::Durable,
         &mut next_nanos,
     );
-    let second = frontend
-        .step()
-        .expect("second pre-cadence scientific boundary");
+    let second = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Step,
+        None,
+        &mut next_nanos,
+    );
     drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -1779,7 +2378,13 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
     );
     assert_eq!(core.world_tick(), Tick(2));
 
-    let shutdown = frontend.shutdown().expect("ordered durable shutdown");
+    let shutdown = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Shutdown,
+        None,
+        &mut next_nanos,
+    );
     drive_until_journal_state(
         &mut frontend,
         &mut core,
@@ -2009,8 +2614,10 @@ fn capacity_one_backpressure_retries_the_exact_retained_batch() {
     .expect("host backed by the bounded storage journal");
     let mut frontend = NullFrontend::new(core.local_port(), 0x2003);
 
-    let first = frontend.step().expect("first bounded step");
-    let second = frontend.step().expect("second bounded step");
+    let first =
+        submit_command_with_authority_before_owner_drive(&mut frontend, HostCommand::Step, None);
+    let second =
+        submit_command_with_authority_before_owner_drive(&mut frontend, HostCommand::Step, None);
     let blocked = frontend
         .drive_at(&mut core, ManualInstant::from_nanos(0))
         .expect("both steps finish science before the second journal admission blocks");
@@ -2099,7 +2706,13 @@ fn capacity_one_backpressure_retries_the_exact_retained_batch() {
         &mut next_nanos,
     );
 
-    let shutdown = frontend.shutdown().expect("bounded ordered shutdown");
+    let shutdown = submit_command_with_authority(
+        &mut frontend,
+        &mut core,
+        HostCommand::Shutdown,
+        None,
+        &mut next_nanos,
+    );
     drive_until_journal_state(
         &mut frontend,
         &mut core,

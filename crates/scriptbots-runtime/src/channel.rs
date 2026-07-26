@@ -260,6 +260,13 @@ impl ChannelHostPort {
         }
     }
 
+    fn command_authority_timeout(command_id: CommandId, waited: Duration) -> HostAccessError {
+        HostAccessError::CommandAuthorityLookup {
+            command_id,
+            failure: crate::CommandAuthorityLookupFailure::Timeout { waited },
+        }
+    }
+
     fn enqueue(&self, message: IngressMessage, started: Instant) -> Result<(), HostAccessError> {
         // `SyncSender::send_timeout` is unstable; park briefly between retries inside the
         // caller's original deadline instead of blocking without bound or resetting the budget.
@@ -294,20 +301,34 @@ impl HostPort for ChannelHostPort {
 
     fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
         const RETRY_PARK: Duration = Duration::from_millis(2);
+        let command_id = envelope.command_id;
         let started = Instant::now();
+        let mut retrying_authority = false;
         loop {
             let (reply, reply_rx) = std::sync::mpsc::channel();
-            self.enqueue(
+            if let Err(error) = self.enqueue(
                 IngressMessage::Command {
                     envelope: envelope.clone(),
                     reply,
                 },
                 started,
-            )?;
+            ) {
+                if retrying_authority && matches!(&error, HostAccessError::ProtocolViolation { .. })
+                {
+                    return Err(Self::command_authority_timeout(
+                        command_id,
+                        self.submit_deadline,
+                    ));
+                }
+                return Err(error);
+            }
             let remaining = self.submit_deadline.saturating_sub(started.elapsed());
             let result = reply_rx
                 .recv_timeout(remaining)
                 .map_err(|error| match error {
+                    RecvTimeoutError::Timeout if retrying_authority => {
+                        Self::command_authority_timeout(command_id, self.submit_deadline)
+                    }
                     RecvTimeoutError::Timeout => Self::protocol_violation(format!(
                         "channel host admission reply exceeded {:?}",
                         self.submit_deadline
@@ -322,12 +343,13 @@ impl HostPort for ChannelHostPort {
                         | crate::CommandAuthorityLookupFailure::Capacity { .. },
                     ..
                 }) => {
+                    retrying_authority = true;
                     let remaining = self.submit_deadline.saturating_sub(started.elapsed());
                     if remaining.is_zero() {
-                        return Err(Self::protocol_violation(format!(
-                            "channel host admission did not resolve within {:?}",
-                            self.submit_deadline
-                        )));
+                        return Err(Self::command_authority_timeout(
+                            command_id,
+                            self.submit_deadline,
+                        ));
                     }
                     std::thread::park_timeout(RETRY_PARK.min(remaining));
                 }
@@ -352,15 +374,24 @@ impl HostPort for ChannelHostPort {
         let started = Instant::now();
         loop {
             let (reply, reply_rx) = std::sync::mpsc::channel();
-            self.enqueue(IngressMessage::CommandStatus { command_id, reply }, started)?;
+            if let Err(error) =
+                self.enqueue(IngressMessage::CommandStatus { command_id, reply }, started)
+            {
+                if matches!(&error, HostAccessError::ProtocolViolation { .. }) {
+                    return Err(Self::command_authority_timeout(
+                        command_id,
+                        self.submit_deadline,
+                    ));
+                }
+                return Err(error);
+            }
             let remaining = self.submit_deadline.saturating_sub(started.elapsed());
             let result = reply_rx
                 .recv_timeout(remaining)
                 .map_err(|error| match error {
-                    RecvTimeoutError::Timeout => Self::protocol_violation(format!(
-                        "channel host status reply exceeded {:?}",
-                        self.submit_deadline
-                    )),
+                    RecvTimeoutError::Timeout => {
+                        Self::command_authority_timeout(command_id, self.submit_deadline)
+                    }
                     RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
                 })?;
             match result {
@@ -373,10 +404,10 @@ impl HostPort for ChannelHostPort {
                 }) => {
                     let remaining = self.submit_deadline.saturating_sub(started.elapsed());
                     if remaining.is_zero() {
-                        return Err(Self::protocol_violation(format!(
-                            "channel host status lookup did not resolve within {:?}",
-                            self.submit_deadline
-                        )));
+                        return Err(Self::command_authority_timeout(
+                            command_id,
+                            self.submit_deadline,
+                        ));
                     }
                     std::thread::park_timeout(RETRY_PARK.min(remaining));
                 }
@@ -1519,6 +1550,128 @@ mod tests {
             .submit(CommandEnvelope::new(CommandId::new(61), HostCommand::Pause))
             .expect_err("stalled owner must fail truthfully");
         assert!(matches!(error, HostAccessError::ProtocolViolation { .. }));
+    }
+
+    #[test]
+    fn submit_reply_timeout_after_pending_authority_is_typed_and_keeps_command_id() {
+        let command_id = CommandId::new(611);
+        let submit_deadline = Duration::from_millis(500);
+        let (driver, mut port) = ChannelHostDriver::new(
+            test_host(true),
+            ChannelHostOptions {
+                submit_deadline,
+                ..fast_options()
+            },
+        )
+        .expect("driver");
+        let caller = std::thread::spawn(move || {
+            port.submit(CommandEnvelope::new(command_id, HostCommand::Pause))
+        });
+
+        let first = driver
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial authority submission");
+        match first {
+            IngressMessage::Command { envelope, reply } => {
+                assert_eq!(envelope.command_id, command_id);
+                reply
+                    .send(Err(HostAccessError::CommandAuthorityLookup {
+                        command_id,
+                        failure: crate::CommandAuthorityLookupFailure::Pending,
+                    }))
+                    .expect("pending authority reply");
+            }
+            IngressMessage::CommandStatus { .. } | IngressMessage::Wake => {
+                panic!("expected command submission")
+            }
+        }
+
+        let stalled_retry = driver
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exact authority retry");
+        assert!(matches!(
+            &stalled_retry,
+            IngressMessage::Command { envelope, .. } if envelope.command_id == command_id
+        ));
+        let error = caller
+            .join()
+            .expect("submission caller")
+            .expect_err("stalled authority reply must time out");
+        assert_eq!(
+            error,
+            HostAccessError::CommandAuthorityLookup {
+                command_id,
+                failure: crate::CommandAuthorityLookupFailure::Timeout {
+                    waited: submit_deadline,
+                },
+            }
+        );
+        drop(stalled_retry);
+    }
+
+    #[test]
+    fn status_reply_timeout_after_busy_authority_is_typed_and_keeps_command_id() {
+        let command_id = CommandId::new(612);
+        let submit_deadline = Duration::from_millis(500);
+        let (driver, mut port) = ChannelHostDriver::new(
+            test_host(true),
+            ChannelHostOptions {
+                submit_deadline,
+                ..fast_options()
+            },
+        )
+        .expect("driver");
+        let caller = std::thread::spawn(move || port.command_status(command_id));
+
+        let first = driver
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial authority lookup");
+        match first {
+            IngressMessage::CommandStatus {
+                command_id: requested_id,
+                reply,
+            } => {
+                assert_eq!(requested_id, command_id);
+                reply
+                    .send(Err(HostAccessError::CommandAuthorityLookup {
+                        command_id,
+                        failure: crate::CommandAuthorityLookupFailure::Busy,
+                    }))
+                    .expect("busy authority reply");
+            }
+            IngressMessage::Command { .. } | IngressMessage::Wake => {
+                panic!("expected command-status lookup")
+            }
+        }
+
+        let stalled_retry = driver
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exact status retry");
+        assert!(matches!(
+            &stalled_retry,
+            IngressMessage::CommandStatus {
+                command_id: requested_id,
+                ..
+            } if *requested_id == command_id
+        ));
+        let error = caller
+            .join()
+            .expect("status caller")
+            .expect_err("stalled authority lookup must time out");
+        assert_eq!(
+            error,
+            HostAccessError::CommandAuthorityLookup {
+                command_id,
+                failure: crate::CommandAuthorityLookupFailure::Timeout {
+                    waited: submit_deadline,
+                },
+            }
+        );
+        drop(stalled_retry);
     }
 
     #[test]

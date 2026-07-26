@@ -3369,7 +3369,7 @@ mod tests {
         let (_receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
         let publisher =
             JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
-        let journal = StorageJournalPort::new(
+        let mut journal = StorageJournalPort::new(
             worker_tx,
             admission,
             shared,
@@ -3378,6 +3378,7 @@ mod tests {
             options,
             ShutdownCommitRequirement::CommittedVolatile,
         );
+        journal.command_reader = None;
         let mut core = HostCore::with_journal(
             session_id,
             timeout_test_world(),
@@ -3656,7 +3657,7 @@ mod tests {
         let (_receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
         let publisher =
             JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
-        let journal = StorageJournalPort::new(
+        let mut journal = StorageJournalPort::new(
             worker_tx,
             admission,
             shared,
@@ -3665,6 +3666,7 @@ mod tests {
             options,
             ShutdownCommitRequirement::CommittedVolatile,
         );
+        journal.command_reader = None;
         let inflight_bytes = Arc::clone(&journal.inflight_bytes);
         let mut core = HostCore::with_journal(
             session_id,
@@ -3783,7 +3785,7 @@ mod tests {
         let (receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
         let publisher =
             JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
-        let journal = StorageJournalPort::new(
+        let mut journal = StorageJournalPort::new(
             worker_tx,
             admission,
             shared,
@@ -3792,6 +3794,7 @@ mod tests {
             options,
             ShutdownCommitRequirement::CommittedVolatile,
         );
+        journal.command_reader = None;
         let inflight_bytes = Arc::clone(&journal.inflight_bytes);
         let mut core = HostCore::with_journal(
             session_id,
@@ -3941,7 +3944,7 @@ mod tests {
         let (receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
         let publisher =
             JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
-        let journal = StorageJournalPort::new(
+        let mut journal = StorageJournalPort::new(
             worker_tx,
             admission,
             Arc::clone(&shared),
@@ -3950,6 +3953,7 @@ mod tests {
             options,
             ShutdownCommitRequirement::CommittedVolatile,
         );
+        journal.command_reader = None;
         let inflight_bytes = Arc::clone(&journal.inflight_bytes);
         let mut core = HostCore::with_journal(
             session_id,
@@ -4088,7 +4092,7 @@ mod tests {
         let (receipt_tx, receipt_rx) = xchan::bounded(options.admission_capacity);
         let publisher =
             JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
-        let journal = StorageJournalPort::new(
+        let mut journal = StorageJournalPort::new(
             worker_tx,
             admission,
             Arc::clone(&shared),
@@ -4097,6 +4101,7 @@ mod tests {
             options,
             ShutdownCommitRequirement::CommittedVolatile,
         );
+        journal.command_reader = None;
         let inflight_bytes = Arc::clone(&journal.inflight_bytes);
         let mut core = HostCore::with_journal(
             session_id,

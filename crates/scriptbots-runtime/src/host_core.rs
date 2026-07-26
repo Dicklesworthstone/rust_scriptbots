@@ -38,6 +38,7 @@ use thiserror::Error;
 const SPEED_SCALE: u128 = 1_000_000;
 const DEFAULT_TICK_PERIOD_NANOS: u64 = 16_666_667;
 const DEFAULT_COMMAND_CAPACITY: usize = 32;
+const DEFAULT_ARCHIVED_COMMAND_CAPACITY: usize = 4_096;
 const DEFAULT_MAX_AUTOMATIC_STEPS: usize = 8;
 const DEFAULT_SNAPSHOT_INTERVAL_TICKS: u64 = 1;
 const DEFAULT_PROTOCOL_EVENT_CAPACITY: usize = 256;
@@ -53,6 +54,10 @@ pub struct HostCoreOptions {
     pub initial_playback: PlaybackSnapshot,
     /// Maximum number of admitted envelopes waiting for ordered application.
     pub command_capacity: usize,
+    /// Maximum terminal command identities retained as the in-memory retry accelerator.
+    ///
+    /// File-backed journals remain the canonical authority after oldest-first eviction.
+    pub archived_command_capacity: usize,
     /// Nominal duration of one automatic scientific step.
     pub tick_period_nanos: u64,
     /// Maximum automatic catch-up work performed by one drive call.
@@ -75,6 +80,7 @@ impl Default for HostCoreOptions {
         Self {
             initial_playback: PlaybackSnapshot::default(),
             command_capacity: DEFAULT_COMMAND_CAPACITY,
+            archived_command_capacity: DEFAULT_ARCHIVED_COMMAND_CAPACITY,
             tick_period_nanos: DEFAULT_TICK_PERIOD_NANOS,
             max_automatic_steps_per_drive: DEFAULT_MAX_AUTOMATIC_STEPS,
             snapshot_interval_ticks: DEFAULT_SNAPSHOT_INTERVAL_TICKS,
@@ -506,11 +512,6 @@ struct ResolvedCommandAuthorityFailure {
     envelope_digest: [u8; blake3::OUT_LEN],
     error: HostAccessError,
 }
-
-/// Maximum archived terminal commands retained for idempotent retry answers. Beyond
-/// this bound the oldest archived records are evicted and the durable journal is the
-/// only authority (bd-2z0.5.2.1).
-const ARCHIVED_IDEMPOTENCY_RETENTION: usize = 4_096;
 
 impl SharedHostState {
     fn retain_authority_failure(
@@ -1757,7 +1758,7 @@ impl HostCore {
             commands: HashMap::new(),
             archived_idempotency: HashMap::new(),
             archived_order: VecDeque::new(),
-            archived_retention: ARCHIVED_IDEMPOTENCY_RETENTION,
+            archived_retention: options.archived_command_capacity,
             command_authority_reader,
             command_authority_required,
             command_archive_requirement,
@@ -3511,6 +3512,11 @@ fn validate_options(options: HostCoreOptions) -> Result<(), HostCoreBuildError> 
             message: "command_capacity must be nonzero".to_owned(),
         });
     }
+    if options.archived_command_capacity == 0 {
+        return Err(HostCoreBuildError::InvalidOptions {
+            message: "archived_command_capacity must be nonzero".to_owned(),
+        });
+    }
     if options.tick_period_nanos == 0 {
         return Err(HostCoreBuildError::InvalidOptions {
             message: "tick_period_nanos must be nonzero".to_owned(),
@@ -3714,6 +3720,7 @@ mod tests {
                 speed_multiplier: 1.0,
             },
             command_capacity: 32,
+            archived_command_capacity: DEFAULT_ARCHIVED_COMMAND_CAPACITY,
             tick_period_nanos: 10,
             max_automatic_steps_per_drive: 4,
             snapshot_interval_ticks: 1,

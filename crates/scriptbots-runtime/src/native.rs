@@ -983,7 +983,7 @@ mod asupersync_runner {
 
             loop {
                 if let Some(outcome) = self.check_terminal(manual_now(&cx))? {
-                    self.close_runner_cleanly()?;
+                    self.close_runner_cleanly(&cx).await?;
                     self.terminal = Some(outcome);
                     return Ok(outcome);
                 }
@@ -1413,24 +1413,33 @@ mod asupersync_runner {
             self.state.wake_runner();
         }
 
-        fn close_runner_cleanly(&mut self) -> Result<(), NativeRunError> {
+        async fn close_runner_cleanly(&mut self, cx: &Cx) -> Result<(), NativeRunError> {
+            let terminal_deadline = self
+                .shutdown_wait_started_at()
+                .unwrap_or_else(|| manual_now(cx))
+                .as_nanos()
+                .saturating_add(self.options.shutdown_timeout_nanos);
             self.seal_runner_ingress();
             let mut first_error = None;
             if let Some(envelope) = self.pending_authority_envelope.take() {
-                self.unresolved_envelopes.push(envelope);
-                first_error = Some(
-                    "native terminal boundary retained an unresolved command-authority envelope"
-                        .to_owned(),
-                );
+                if let Err(error) = self
+                    .submit_terminal_envelope(cx, &envelope, terminal_deadline)
+                    .await
+                {
+                    first_error = Some(error.to_string());
+                    self.unresolved_envelopes.push(envelope);
+                }
             }
             while let Ok(message) = self.receiver.try_recv() {
                 match message {
                     NativeMessage::Command(envelope) => {
                         self.metrics.command_wakes = self.metrics.command_wakes.saturating_add(1);
-                        let retained = envelope.clone();
-                        if let Err(error) = self.host.submit(envelope) {
+                        if let Err(error) = self
+                            .submit_terminal_envelope(cx, &envelope, terminal_deadline)
+                            .await
+                        {
                             first_error.get_or_insert_with(|| error.to_string());
-                            self.unresolved_envelopes.push(retained);
+                            self.unresolved_envelopes.push(envelope);
                         }
                     }
                     NativeMessage::Wake => {
@@ -1456,6 +1465,44 @@ mod asupersync_runner {
                 });
             }
             Ok(())
+        }
+
+        async fn submit_terminal_envelope(
+            &mut self,
+            cx: &Cx,
+            envelope: &CommandEnvelope,
+            terminal_deadline: u64,
+        ) -> Result<(), HostAccessError> {
+            loop {
+                match self.host.submit(envelope.clone()) {
+                    Ok(_) => return Ok(()),
+                    Err(HostAccessError::CommandAuthorityLookup {
+                        failure:
+                            crate::CommandAuthorityLookupFailure::Pending
+                            | crate::CommandAuthorityLookupFailure::Busy
+                            | crate::CommandAuthorityLookupFailure::Capacity { .. },
+                        ..
+                    }) => {
+                        let now = manual_now(cx);
+                        if now.as_nanos() >= terminal_deadline {
+                            return Err(HostAccessError::CommandAuthorityLookup {
+                                command_id: envelope.command_id,
+                                failure: crate::CommandAuthorityLookupFailure::Timeout {
+                                    waited: std::time::Duration::from_nanos(
+                                        self.options.shutdown_timeout_nanos,
+                                    ),
+                                },
+                            });
+                        }
+                        let remaining = terminal_deadline.saturating_sub(now.as_nanos());
+                        let retry_at = now
+                            .as_nanos()
+                            .saturating_add(self.options.maintenance_period_nanos.min(remaining));
+                        sleep_until(Time::from_nanos(retry_at)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
 
         fn cache_terminal_drain_failure(&mut self, message: String) -> NativeRunError {
@@ -2031,6 +2078,7 @@ mod tests {
                 speed_multiplier: 1.0,
             },
             command_capacity: 32,
+            archived_command_capacity: 4_096,
             tick_period_nanos: 10,
             max_automatic_steps_per_drive: 4,
             snapshot_interval_ticks: 1,

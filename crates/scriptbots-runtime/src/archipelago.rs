@@ -87,9 +87,9 @@
 //! constructed world does not match its declared effective config exactly.
 
 use crate::{
-    ApplicationState, CommandEnvelope, CommandId, HostAccessError, HostBlocker, HostCommand,
-    HostFault, HostHealth, HostPort, HostSessionId, JournalPort, ManualHostDriver, ManualInstant,
-    RenderSnapshot,
+    ApplicationState, CommandAuthorityLookupFailure, CommandEnvelope, CommandId, CommandStatus,
+    HostAccessError, HostBlocker, HostCommand, HostFault, HostHealth, HostPort, HostSessionId,
+    JournalPort, ManualHostDriver, ManualInstant, RenderSnapshot,
     host_core::{HostCore, HostCoreBuildError, HostCoreOptions},
 };
 use scriptbots_core::{
@@ -97,7 +97,11 @@ use scriptbots_core::{
     WorldStateError,
 };
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroU64, sync::Arc};
+use std::{
+    num::NonZeroU64,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 /// Maximum number of islands one archipelago may own.
@@ -124,6 +128,8 @@ const ISLAND_SESSION_TAG: &str = "scriptbots.archipelago.island-session.v1";
 /// archipelago refuses to spin. A healthy island applies an explicit step at
 /// the first boundary; a live-but-slow journal may need a few receipt polls.
 const STEP_DRIVE_ATTEMPTS: usize = 16;
+const STEP_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(30);
+const STEP_AUTHORITY_RETRY_PARK: Duration = Duration::from_millis(1);
 
 /// Configuration facets that must be uniform across islands, named in the
 /// construction log so audits can see exactly what was checked.
@@ -1004,23 +1010,14 @@ impl Archipelago {
             let before = island.core.world_tick();
             let command_id = island.next_command_id()?;
             let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
-            let submitted = island
-                .core
-                .local_port()
-                .submit(envelope)
-                .map_err(|source| ArchipelagoError::Access {
-                    island: island_id,
-                    source,
-                })?;
-            if let ApplicationState::Rejected(reason) = submitted.application() {
-                return Err(ArchipelagoError::CommandRejected {
-                    island: island_id,
-                    detail: format!("{reason:?}"),
-                });
-            }
+            let mut port = island.core.local_port();
+            let submitted = Self::submit_step_with_authority(island_id, &mut port, &envelope)?;
+            let mut applied = Self::step_status_applied(island, &submitted)?;
 
-            let mut applied = false;
             for _attempt in 0..STEP_DRIVE_ATTEMPTS {
+                if applied {
+                    break;
+                }
                 let now = island.next_instant();
                 island
                     .core
@@ -1029,9 +1026,7 @@ impl Archipelago {
                         island: island_id,
                         source,
                     })?;
-                let status = island
-                    .core
-                    .local_port()
+                let status = port
                     .command_status(command_id)
                     .map_err(|source| ArchipelagoError::Access {
                         island: island_id,
@@ -1041,28 +1036,7 @@ impl Archipelago {
                         island: island_id,
                         detail: "step command status was not retained".to_owned(),
                     })?;
-                match status.application() {
-                    ApplicationState::Applied(_) => {
-                        applied = true;
-                        break;
-                    }
-                    ApplicationState::Failed(failure) => {
-                        return Err(ArchipelagoError::IslandFault {
-                            island: island_id,
-                            label: island.meta.label.clone(),
-                            tick: island.core.world_tick(),
-                            code: failure.code.clone(),
-                            message: failure.message.clone(),
-                        });
-                    }
-                    ApplicationState::Rejected(reason) => {
-                        return Err(ArchipelagoError::CommandRejected {
-                            island: island_id,
-                            detail: format!("{reason:?}"),
-                        });
-                    }
-                    ApplicationState::Admitted => {}
-                }
+                applied = Self::step_status_applied(island, &status)?;
             }
             Self::verify_island_health(island)?;
             if !applied {
@@ -1096,6 +1070,68 @@ impl Archipelago {
                 source,
             })?;
         Self::verify_island_health(island)
+    }
+
+    fn submit_step_with_authority(
+        island: IslandId,
+        port: &mut impl HostPort,
+        envelope: &CommandEnvelope,
+    ) -> Result<CommandStatus, ArchipelagoError> {
+        let started = Instant::now();
+        loop {
+            match port.submit(envelope.clone()) {
+                Ok(status) => return Ok(status),
+                Err(source) if Self::transient_authority_lookup(&source) => {
+                    let remaining = STEP_AUTHORITY_TIMEOUT.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(ArchipelagoError::Access {
+                            island,
+                            source: HostAccessError::CommandAuthorityLookup {
+                                command_id: envelope.command_id,
+                                failure: CommandAuthorityLookupFailure::Timeout {
+                                    waited: STEP_AUTHORITY_TIMEOUT,
+                                },
+                            },
+                        });
+                    }
+                    std::thread::park_timeout(STEP_AUTHORITY_RETRY_PARK.min(remaining));
+                }
+                Err(source) => return Err(ArchipelagoError::Access { island, source }),
+            }
+        }
+    }
+
+    fn transient_authority_lookup(error: &HostAccessError) -> bool {
+        matches!(
+            error,
+            HostAccessError::CommandAuthorityLookup {
+                failure: CommandAuthorityLookupFailure::Pending
+                    | CommandAuthorityLookupFailure::Busy
+                    | CommandAuthorityLookupFailure::Capacity { .. },
+                ..
+            }
+        )
+    }
+
+    fn step_status_applied(
+        island: &Island,
+        status: &CommandStatus,
+    ) -> Result<bool, ArchipelagoError> {
+        match status.application() {
+            ApplicationState::Applied(_) => Ok(true),
+            ApplicationState::Failed(failure) => Err(ArchipelagoError::IslandFault {
+                island: island.meta.id,
+                label: island.meta.label.clone(),
+                tick: island.core.world_tick(),
+                code: failure.code.clone(),
+                message: failure.message.clone(),
+            }),
+            ApplicationState::Rejected(reason) => Err(ArchipelagoError::CommandRejected {
+                island: island.meta.id,
+                detail: format!("{reason:?}"),
+            }),
+            ApplicationState::Admitted => Ok(false),
+        }
     }
 
     /// Map island health to a typed archipelago failure.

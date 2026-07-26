@@ -12177,6 +12177,50 @@ impl Storage {
         Ok(CommandAuthorityLookup::Found(authority))
     }
 
+    fn release_unarchived_command_claim(&self, batch: &JournalBatch) -> Result<(), StorageError> {
+        let Some(lifecycle) = batch.command_lifecycle() else {
+            return Ok(());
+        };
+        let batch_id = batch.id();
+        let command_id = lifecycle.envelope().command_id.to_string();
+        let session = encode_journal_u64(batch_id.session_id().get());
+        let sequence = encode_journal_u64(batch_id.sequence());
+        let envelope = encode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            lifecycle.envelope(),
+        )?;
+        execute_transaction_with_retry(self.connection()?, |transaction| {
+            let deleted = transaction.execute_with_params(
+                "DELETE FROM host_command_claims
+                 WHERE run_id = ?1 AND command_id = ?2
+                   AND host_session_id = ?3 AND envelope_postcard_hex = ?4
+                   AND NOT EXISTS (
+                       SELECT 1 FROM host_command_records
+                       WHERE run_id = ?1 AND command_id = ?2
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM host_journal_archive
+                       WHERE run_id = ?1 AND host_session_id = ?3
+                         AND journal_sequence = ?5
+                   )",
+                &[
+                    sqlite_run_id(self.run_id),
+                    command_id.as_str().into(),
+                    session.as_str().into(),
+                    envelope.as_str().into(),
+                    sequence.as_str().into(),
+                ],
+            )?;
+            if deleted != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "definitely unadmitted journal batch {batch_id:?} released {deleted} durable command claims"
+                )));
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     fn admit_host_journal_archive(
         &self,
         batch: &JournalBatch,
@@ -17323,13 +17367,28 @@ fn storage_worker(
                         reap_cancelled_journal_sessions(&mut state);
                     }
                     Err(error) => {
-                        let worker_error = worker_error_from_storage(
+                        let mut worker_error = worker_error_from_storage(
                             StorageOperation::Persist,
                             &path,
                             tick,
                             failure_commit_state,
                             error,
                         );
+                        if failure_commit_state == FailureCommitState::NotAdmitted
+                            && let Err(release_error) =
+                                storage.release_unarchived_command_claim(&batch)
+                        {
+                            let original = worker_error.to_string();
+                            worker_error = StorageWorkerError::Internal {
+                                operation: StorageOperation::Persist,
+                                path: path.clone(),
+                                tick,
+                                commit_state: FailureCommitState::Indeterminate,
+                                detail: format!(
+                                    "{original}; durable pre-admission claim release was inconclusive: {release_error}"
+                                ),
+                            };
+                        }
                         let failure = JournalReceipt::new(
                             batch_id,
                             JournalReceiptState::Failed(JournalFailure {
@@ -18360,9 +18419,9 @@ mod tests {
         rng_domains::AgentRngCountersV1,
     };
     use scriptbots_runtime::{
-        CommandEnvelope, CommandId, CommandStatus, HostCommand, HostCore, HostCoreOptions,
-        HostLifecycle, HostSessionId, JournalState, LocalHostPort, ManualInstant, NullFrontend,
-        PlaybackSnapshot,
+        CommandAuthorityLookupFailure, CommandEnvelope, CommandId, CommandStatus, HostAccessError,
+        HostCommand, HostCore, HostCoreOptions, HostLifecycle, HostSessionId, JournalState,
+        LocalHostPort, ManualInstant, NullFrontend, NullFrontendSubmissionError, PlaybackSnapshot,
     };
     use std::{
         fs,
@@ -18372,6 +18431,8 @@ mod tests {
         sync::TryLockError,
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
+
+    const JOURNAL_WORKER_RETRY_LIMIT: usize = 2_000;
 
     fn temp_db_path(prefix: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -18445,10 +18506,67 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
             attempts += 1;
             assert!(
-                attempts < 2_000,
+                attempts < JOURNAL_WORKER_RETRY_LIMIT,
                 "journal command {command_id:?} did not reach a terminal state"
             );
         }
+    }
+
+    fn retryable_authority_envelope(error: NullFrontendSubmissionError) -> CommandEnvelope {
+        match error {
+            NullFrontendSubmissionError::HostAccess {
+                envelope,
+                source:
+                    HostAccessError::CommandAuthorityLookup {
+                        failure:
+                            CommandAuthorityLookupFailure::Pending
+                            | CommandAuthorityLookupFailure::Busy
+                            | CommandAuthorityLookupFailure::Capacity { .. },
+                        ..
+                    },
+            } => envelope,
+            other => {
+                panic!("fresh durable command returned a terminal submission error: {other:?}")
+            }
+        }
+    }
+
+    fn resolve_authority_submission(
+        frontend: &mut NullFrontend<LocalHostPort>,
+        core: &mut HostCore,
+        initial: Result<CommandStatus, NullFrontendSubmissionError>,
+        next_nanos: &mut u64,
+    ) -> CommandStatus {
+        let mut envelope = match initial {
+            Ok(status) => return status,
+            Err(error) => retryable_authority_envelope(error),
+        };
+        for _ in 0..JOURNAL_WORKER_RETRY_LIMIT {
+            frontend
+                .drive_at(core, ManualInstant::from_nanos(*next_nanos))
+                .expect("authority retry drives the matching fault-test host");
+            *next_nanos = next_nanos
+                .checked_add(1)
+                .expect("authority retry clock does not overflow");
+            match frontend.submit_envelope(envelope.clone()) {
+                Ok(status) => return status,
+                Err(error) => envelope = retryable_authority_envelope(error),
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "durable command authority did not resolve within {JOURNAL_WORKER_RETRY_LIMIT} nonblocking polls"
+        );
+    }
+
+    fn submit_fault_command(
+        frontend: &mut NullFrontend<LocalHostPort>,
+        core: &mut HostCore,
+        command: HostCommand,
+        next_nanos: &mut u64,
+    ) -> CommandStatus {
+        let initial = frontend.submit(command, None);
+        resolve_authority_submission(frontend, core, initial, next_nanos)
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -18463,6 +18581,7 @@ mod tests {
         birth_count: i64,
         death_count: i64,
         replay_event_count: i64,
+        command_claim_count: i64,
         admitted_journal: u64,
         applied_journal: u64,
         committed_volatile_journal: u64,
@@ -18532,6 +18651,11 @@ mod tests {
             .expect("replay event count row")
             .get_typed::<i64>(0)
             .expect("replay event count");
+        let command_claim_count = connection
+            .query_row("SELECT COUNT(*) FROM host_command_claims")
+            .expect("command claim count row")
+            .get_typed::<i64>(0)
+            .expect("command claim count");
         let progress = connection
             .query_row(
                 "SELECT admitted_journal_prefix, applied_journal_prefix,
@@ -18575,6 +18699,7 @@ mod tests {
             birth_count,
             death_count,
             replay_event_count,
+            command_claim_count,
             admitted_journal: decode_journal_u64("test.admitted_journal", &admitted)
                 .expect("decode admitted journal prefix"),
             applied_journal: decode_journal_u64("test.applied_journal", &applied)
@@ -18617,6 +18742,10 @@ mod tests {
         assert_eq!(snapshot.birth_count, 0);
         assert_eq!(snapshot.death_count, 0);
         assert_eq!(snapshot.replay_event_count, 0);
+        assert_eq!(
+            snapshot.command_claim_count, 0,
+            "definitely unadmitted command must release its durable preclaim"
+        );
         assert_eq!(snapshot.admitted_journal, 0);
         assert_eq!(snapshot.applied_journal, 0);
         assert_eq!(snapshot.committed_volatile_journal, 0);
@@ -18639,6 +18768,7 @@ mod tests {
             i64::try_from(expected_events).expect("test event count fits i64");
         assert_eq!(snapshot.archive_count, expected_rows);
         assert_eq!(snapshot.ledger_count, expected_rows);
+        assert_eq!(snapshot.command_claim_count, expected_rows);
         assert_eq!(snapshot.scientific_event_count, expected_event_rows);
         assert_eq!(snapshot.admitted_journal, expected_batches);
         assert_eq!(snapshot.applied_journal, expected_batches);
@@ -18819,8 +18949,9 @@ mod tests {
             let session_id = HostSessionId::new(0x200);
             let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
             arm_host_journal_fault(&path, point);
-            let command = frontend.step().expect("faulted step command");
             let mut next_nanos = 0;
+            let command =
+                submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
             let status = drive_journal_command_to_terminal(
                 &mut frontend,
                 &mut core,
@@ -18835,7 +18966,12 @@ mod tests {
 
             let (retry_pipeline, mut retry_core, mut retry_frontend) =
                 recovered_fault_test_host(&path, session_id);
-            let retry = retry_frontend.step().expect("retry exact rolled-back step");
+            let retry = submit_fault_command(
+                &mut retry_frontend,
+                &mut retry_core,
+                HostCommand::Step,
+                &mut next_nanos,
+            );
             let retry_status = drive_journal_command_to_terminal(
                 &mut retry_frontend,
                 &mut retry_core,
@@ -18858,10 +18994,13 @@ mod tests {
         let baseline_path = baseline_path.to_string_lossy().into_owned();
         let (baseline_pipeline, mut baseline_core, mut baseline_frontend) =
             fault_test_host(&baseline_path, session_id);
-        let baseline_command = baseline_frontend
-            .step()
-            .expect("unfaulted persistence baseline step command");
         let mut baseline_nanos = 0;
+        let baseline_command = submit_fault_command(
+            &mut baseline_frontend,
+            &mut baseline_core,
+            HostCommand::Step,
+            &mut baseline_nanos,
+        );
         let baseline_status = drive_journal_command_to_terminal(
             &mut baseline_frontend,
             &mut baseline_core,
@@ -18892,8 +19031,9 @@ mod tests {
             let path = path.to_string_lossy().into_owned();
             let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
             arm_host_journal_fault(&path, point);
-            let command = frontend.step().expect("faulted persistence step command");
             let mut next_nanos = 0;
+            let command =
+                submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
             let status = drive_journal_command_to_terminal(
                 &mut frontend,
                 &mut core,
@@ -18936,10 +19076,9 @@ mod tests {
             &path,
             HostJournalFaultPoint::PersistenceRollbackAcknowledgementLost,
         );
-        let command = frontend
-            .step()
-            .expect("step with lost rollback acknowledgement");
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -18981,8 +19120,9 @@ mod tests {
         let path = path.to_string_lossy().into_owned();
         let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x201));
         arm_host_journal_fault(&path, HostJournalFaultPoint::AfterArchiveBeforeApplication);
-        let command = frontend.step().expect("post-archive faulted step");
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19042,8 +19182,9 @@ mod tests {
         let path = path.to_string_lossy().into_owned();
         let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x202));
         arm_host_journal_fault(&path, HostJournalFaultPoint::AfterPublicationBeforeReceipt);
-        let command = frontend.step().expect("post-commit faulted step");
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19084,8 +19225,9 @@ mod tests {
             let (pipeline, mut core, mut frontend) =
                 fault_test_host(&path, HostSessionId::new(0x203));
             arm_host_journal_fault(&path, point);
-            let command = frontend.step().expect("faulted journal step");
             let mut next_nanos = 0;
+            let command =
+                submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
             let status = drive_journal_command_to_terminal(
                 &mut frontend,
                 &mut core,
@@ -19127,8 +19269,9 @@ mod tests {
         let path = path.to_string_lossy().into_owned();
         let (pipeline, mut core, mut frontend) =
             fault_test_host_with_interval(&path, HostSessionId::new(0x204), 4);
-        let step = frontend.step().expect("step below the persistence cadence");
         let mut next_nanos = 0;
+        let step =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let step_status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19138,9 +19281,12 @@ mod tests {
         assert_eq!(step_status.journal(), &JournalState::Durable);
 
         arm_host_journal_fault(&path, HostJournalFaultPoint::BeforePersistenceFlush);
-        let shutdown = frontend
-            .shutdown()
-            .expect("shutdown carrying the final persistence tail");
+        let shutdown = submit_fault_command(
+            &mut frontend,
+            &mut core,
+            HostCommand::Shutdown,
+            &mut next_nanos,
+        );
         let shutdown_status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19175,8 +19321,9 @@ mod tests {
         let path = path.to_string_lossy().into_owned();
         let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x206));
         arm_host_journal_fault(&path, HostJournalFaultPoint::BeforeAnalyticsPublication);
-        let command = frontend.step().expect("analytics-faulted step command");
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19208,7 +19355,8 @@ mod tests {
         let (mut pipeline, mut core, mut frontend) =
             fault_test_host_with_interval(&path, HostSessionId::new(0x207), 4);
         let mut next_nanos = 0;
-        let step = frontend.step().expect("step below persistence cadence");
+        let step =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let step_status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19216,7 +19364,12 @@ mod tests {
             &mut next_nanos,
         );
         assert_eq!(step_status.journal(), &JournalState::Durable);
-        let shutdown = frontend.shutdown().expect("durable host shutdown command");
+        let shutdown = submit_fault_command(
+            &mut frontend,
+            &mut core,
+            HostCommand::Shutdown,
+            &mut next_nanos,
+        );
         let shutdown_status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19268,8 +19421,9 @@ mod tests {
         let path = temp_db_path("host-journal-reopen-scan");
         let path = path.to_string_lossy().into_owned();
         let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x208));
-        let command = frontend.step().expect("durable step before reopen fault");
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -20624,8 +20778,9 @@ mod tests {
         let path_string = path.to_string_lossy().to_string();
         let session_id = HostSessionId::new(0x512);
         let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
-        let command = frontend.step()?;
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let terminal = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -20708,8 +20863,9 @@ mod tests {
         let session_id = HostSessionId::new(0x514);
         let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
         arm_host_journal_fault(&path_string, HostJournalFaultPoint::BeforeDurableMarker);
-        let command = frontend.step()?;
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -20759,8 +20915,9 @@ mod tests {
             &path_string,
             HostJournalFaultPoint::AfterArchiveBeforeApplication,
         );
-        let command = frontend.step()?;
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -20807,8 +20964,9 @@ mod tests {
         let path_string = path.to_string_lossy().to_string();
         let session_id = HostSessionId::new(0x516);
         let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
-        let command = frontend.step()?;
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let terminal = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -20845,8 +21003,9 @@ mod tests {
         let path_string = path.to_string_lossy().to_string();
         let session_id = HostSessionId::new(0x513);
         let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
-        let command = frontend.step()?;
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let terminal = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -20904,8 +21063,9 @@ mod tests {
             &missing_string,
             HostJournalFaultPoint::AfterArchiveBeforeApplication,
         );
-        let command = frontend.step()?;
         let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
