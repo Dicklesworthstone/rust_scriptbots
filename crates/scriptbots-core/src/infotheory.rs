@@ -30,6 +30,15 @@ pub enum InfoTheoryError {
         /// Shortest length admitting a non-degenerate circular shift.
         need: usize,
     },
+    #[error("{estimator} does not support the {requested} surrogate null: {why}")]
+    SurrogateUnsupported {
+        /// Which estimator refused.
+        estimator: &'static str,
+        /// The null the caller asked for.
+        requested: &'static str,
+        /// Why it is not meaningful here.
+        why: &'static str,
+    },
     #[error("non-finite value encountered in input series")]
     NonFiniteInput,
 }
@@ -579,6 +588,45 @@ pub struct MiParams {
     pub seed: u64,
 }
 
+/// The null distribution a p-value is tested against (bd-r4ja).
+///
+/// The two are NOT interchangeable and the right choice depends on the data, which is why this is
+/// an explicit caller decision recorded on every estimate rather than something the estimator
+/// picks. An earlier version silently substituted a permutation null for short series, so the
+/// meaning of a p-value depended on a sample-size branch no caller could see; that substitution is
+/// what bd-r4ja removed. Offering the choice openly and reporting which one ran is the opposite of
+/// that defect, not a return to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SurrogateKind {
+    /// Circularly shift the emitter against the receiver.
+    ///
+    /// Preserves each series' own autocorrelation and destroys only the cross-series alignment, so
+    /// it asks "is this dependence more than the series' own structure explains". Required for
+    /// autocorrelated data, which is most population-dynamics signal, and therefore the default.
+    #[default]
+    CircularShift,
+    /// Randomly re-pair the two series, destroying temporal structure entirely.
+    ///
+    /// The textbook permutation test. It is the more powerful null when the samples really are
+    /// i.i.d., because it does not spend any of the null's variance preserving structure that is
+    /// not there. It is ANTI-CONSERVATIVE on autocorrelated data -- see
+    /// `bd_r4ja_iid_shuffle_null_manufactures_significance_the_circular_null_avoids`, which
+    /// measures exactly that failure -- so choosing it is an assertion about the data.
+    PairingPermutation,
+}
+
+impl SurrogateKind {
+    /// Stable identity for the estimate's provenance record.
+    #[must_use]
+    pub const fn identity(self) -> &'static str {
+        match self {
+            Self::CircularShift => SURROGATE_IDENTITY,
+            Self::PairingPermutation => PAIRING_PERMUTATION_IDENTITY,
+        }
+    }
+}
+
 impl Default for MiParams {
     fn default() -> Self {
         Self {
@@ -622,6 +670,9 @@ pub const CORRECTION_IDENTITY: &str = "miller-madow";
 /// series was removed in favour of an explicit refusal, so this constant is a guarantee rather
 /// than a label on a branch.
 pub const SURROGATE_IDENTITY: &str = "circular-shift";
+
+/// Null-distribution identity for the permutation surrogate (bd-r4ja).
+pub const PAIRING_PERMUTATION_IDENTITY: &str = "pairing-permutation";
 
 /// The `bins + 1` boundaries of the uniform discretization over `[0.0, 1.0]` (bd-r4ja).
 ///
@@ -688,6 +739,24 @@ pub fn compute_mi(
     receiver: &[f64],
     params: &MiParams,
 ) -> Result<MiEstimate, InfoTheoryError> {
+    compute_mi_with_surrogate(emitter, receiver, params, SurrogateKind::CircularShift)
+}
+
+/// Mutual information tested against an explicitly chosen null (bd-r4ja).
+///
+/// The null is a positional argument rather than a field on [`MiParams`] on purpose: choosing
+/// [`SurrogateKind::PairingPermutation`] is a scientific assertion that the samples are i.i.d.,
+/// and an assertion that strong should be visible at the call site instead of defaulting quietly
+/// inside a struct literal. [`compute_mi`] is the safe default and picks the circular shift.
+///
+/// # Errors
+/// Propagates every validation error [`compute_mi`] can return.
+pub fn compute_mi_with_surrogate(
+    emitter: &[f64],
+    receiver: &[f64],
+    params: &MiParams,
+    surrogate: SurrogateKind,
+) -> Result<MiEstimate, InfoTheoryError> {
     if emitter.len() != receiver.len() {
         return Err(InfoTheoryError::LengthMismatch {
             len_a: emitter.len(),
@@ -748,7 +817,25 @@ pub fn compute_mi(
     let k_min = decorrelation_lag(emitter, n / 2).clamp(1, (n / 4).max(1));
     let k_max = n.saturating_sub(k_min);
 
-    let shifted_emitter = if k_max > k_min {
+    // bd-r4ja: an explicitly requested permutation null re-pairs the series instead of shifting
+    // it. This is the caller asserting the samples are i.i.d.; it is NOT the silent short-series
+    // fallback that was removed, which is why it is unconditional here and reported on the
+    // estimate as `surrogate_kind`.
+    if surrogate == SurrogateKind::PairingPermutation {
+        let mut permuted = emitter.to_vec();
+        for _ in 0..r_runs {
+            for i in (1..n).rev() {
+                let j = rng.random_range(0..=i);
+                permuted.swap(i, j);
+            }
+            let (_, surr_corr) = calc_mi_mm(&permuted, receiver, b);
+            let surr_corr = surr_corr.max(0.0);
+            surrogates.push(surr_corr);
+            if surr_corr >= corrected {
+                ge_count += 1;
+            }
+        }
+    } else if k_max > k_min {
         let mut shifted = vec![0.0f64; n];
         for _ in 0..r_runs {
             let shift = rng.random_range(k_min..=k_max);
@@ -764,7 +851,6 @@ pub fn compute_mi(
                 ge_count += 1;
             }
         }
-        shifted
     } else {
         // bd-r4ja: refuse rather than substitute an i.i.d. shuffle. The two nulls are not
         // interchangeable. A circular shift preserves each series' autocorrelation and destroys
@@ -779,8 +865,7 @@ pub fn compute_mi(
             samples: n,
             need: MIN_CIRCULAR_SURROGATE_SAMPLES,
         });
-    };
-    let _ = shifted_emitter;
+    }
 
     let p_value = (1.0 + ge_count as f64) / (r_runs as f64 + 1.0);
 
@@ -835,7 +920,8 @@ pub fn compute_mi(
         bins: b,
         estimator: ESTIMATOR_IDENTITY,
         correction: CORRECTION_IDENTITY,
-        surrogate_kind: SURROGATE_IDENTITY,
+        // bd-r4ja: reports the null that actually ran, not a constant.
+        surrogate_kind: surrogate.identity(),
         surrogate_seed: params.seed,
         bin_edges: uniform_bin_edges(b),
         surrogate: surrogate_stats,
@@ -897,10 +983,40 @@ pub fn compute_te(
     receiver: &[f64],
     params: &MiParams,
 ) -> Result<TeEstimate, InfoTheoryError> {
+    compute_te_with_surrogate(emitter, receiver, params, SurrogateKind::CircularShift)
+}
+
+/// Transfer entropy tested against an explicitly chosen null (bd-r4ja).
+///
+/// Exists for symmetry with [`compute_mi_with_surrogate`] and so the refusal below is reachable
+/// and testable rather than a comment nobody can exercise.
+///
+/// # Errors
+/// Returns [`InfoTheoryError::SurrogateUnsupported`] for
+/// [`SurrogateKind::PairingPermutation`], plus every validation error [`compute_te`] can return.
+pub fn compute_te_with_surrogate(
+    emitter: &[f64],
+    receiver: &[f64],
+    params: &MiParams,
+    surrogate: SurrogateKind,
+) -> Result<TeEstimate, InfoTheoryError> {
     if emitter.len() != receiver.len() {
         return Err(InfoTheoryError::LengthMismatch {
             len_a: emitter.len(),
             len_b: receiver.len(),
+        });
+    }
+
+    // bd-r4ja: transfer entropy refuses the permutation null rather than silently running a
+    // circular shift instead. TE is a statement about temporal structure, and a pairing
+    // permutation destroys exactly that structure -- the resulting "null" would not be a null for
+    // the quantity being measured. Ignoring the caller's choice and reporting a p-value against a
+    // different null than the one requested is the precise defect this bead exists to remove.
+    if surrogate == SurrogateKind::PairingPermutation {
+        return Err(InfoTheoryError::SurrogateUnsupported {
+            estimator: "transfer entropy",
+            requested: PAIRING_PERMUTATION_IDENTITY,
+            why: "a pairing permutation destroys the temporal structure transfer entropy measures",
         });
     }
 
@@ -1422,6 +1538,74 @@ mod tests {
     #[test]
     fn bd_r4ja_decorrelation_lag_handles_a_constant_series() {
         assert_eq!(decorrelation_lag(&[0.5; 64], 32), 1);
+    }
+
+    /// The chosen null must be honoured and reported, not defaulted (bd-r4ja).
+    #[test]
+    fn bd_r4ja_pairing_permutation_is_selectable_and_recorded() {
+        let (e, r) = independent_ar1_pair(600, 2468);
+        let params = MiParams {
+            bins: 8,
+            surrogate_runs: 40,
+            bootstrap_runs: 16,
+            seed: 24680,
+        };
+
+        let circular = compute_mi(&e, &r, &params).expect("circular");
+        let permuted =
+            compute_mi_with_surrogate(&e, &r, &params, SurrogateKind::PairingPermutation)
+                .expect("permutation");
+
+        assert_eq!(circular.surrogate_kind, SURROGATE_IDENTITY);
+        assert_eq!(permuted.surrogate_kind, PAIRING_PERMUTATION_IDENTITY);
+
+        // The point estimate is a property of the data, so the null cannot move it.
+        assert_eq!(
+            circular.bits_corrected.to_bits(),
+            permuted.bits_corrected.to_bits(),
+            "choosing a different null must not change the estimate itself"
+        );
+
+        // On autocorrelated data the permutation null is anti-conservative, which is exactly why
+        // it is opt-in. This asserts the two nulls genuinely differ rather than aliasing.
+        assert!(
+            permuted.p_value < circular.p_value,
+            "permutation p={} should fall below circular p={} on AR(1) data; if they match, the \
+             requested null is being ignored",
+            permuted.p_value,
+            circular.p_value
+        );
+    }
+
+    /// Transfer entropy refuses a null that would destroy what it measures (bd-r4ja).
+    #[test]
+    fn bd_r4ja_transfer_entropy_refuses_the_pairing_permutation_null() {
+        let (e, r) = independent_ar1_pair(400, 1357);
+        let params = MiParams {
+            bins: 4,
+            surrogate_runs: 8,
+            bootstrap_runs: 8,
+            seed: 13570,
+        };
+
+        let error = compute_te_with_surrogate(&e, &r, &params, SurrogateKind::PairingPermutation)
+            .expect_err("TE must refuse a null that destroys temporal structure");
+
+        assert!(
+            matches!(
+                error,
+                InfoTheoryError::SurrogateUnsupported {
+                    requested: PAIRING_PERMUTATION_IDENTITY,
+                    ..
+                }
+            ),
+            "expected SurrogateUnsupported, got {error:?}"
+        );
+        // Silently running a circular shift instead would be the defect this bead removed.
+        assert!(
+            compute_te_with_surrogate(&e, &r, &params, SurrogateKind::CircularShift).is_ok(),
+            "the supported null must still work"
+        );
     }
 
     /// Both estimators must report enough provenance to reproduce and compare their own output:
