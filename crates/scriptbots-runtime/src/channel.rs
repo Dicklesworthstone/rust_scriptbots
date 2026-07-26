@@ -546,6 +546,43 @@ impl ChannelHostDriver {
         Ok(())
     }
 
+    fn wait_for_timed_ingress(
+        &mut self,
+        interest: HostDriveInterest,
+        now: &mut impl FnMut() -> ManualInstant,
+    ) -> Result<(), HostAccessError> {
+        let wait = match interest {
+            HostDriveInterest::Draining => self.maintenance_period,
+            HostDriveInterest::ReadyNow | HostDriveInterest::Deadline => self
+                .host
+                .next_deadline()
+                .map_or(self.maintenance_period, |deadline| {
+                    let current = now();
+                    if deadline > current {
+                        Duration::from_nanos(deadline.as_nanos() - current.as_nanos())
+                    } else {
+                        Duration::ZERO
+                    }
+                })
+                .min(self.maintenance_period.max(Duration::from_millis(1))),
+            HostDriveInterest::WakeOnly
+            | HostDriveInterest::Terminated
+            | HostDriveInterest::Faulted => {
+                return Err(ChannelHostPort::protocol_violation(format!(
+                    "driver requested a timed wait for non-timed interest {interest:?}"
+                )));
+            }
+        };
+        match self.receiver.recv_timeout(wait) {
+            Ok(message) => self.retain_waited_ingress(message)?,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                self.controller_disconnected = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Process at most the configured ingress budget, drive the host when due,
     /// and mirror all boards once.
     ///
@@ -641,36 +678,10 @@ impl ChannelHostDriver {
                         Err(_) => self.controller_disconnected = true,
                     }
                 }
-                HostDriveInterest::Draining => {
-                    match self.receiver.recv_timeout(self.maintenance_period) {
-                        Ok(message) => self.retain_waited_ingress(message)?,
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => {
-                            self.controller_disconnected = true;
-                        }
-                    }
-                }
-                HostDriveInterest::ReadyNow | HostDriveInterest::Deadline => {
-                    let wait = self
-                        .host
-                        .next_deadline()
-                        .map(|deadline| {
-                            let current = now();
-                            if deadline > current {
-                                Duration::from_nanos(deadline.as_nanos() - current.as_nanos())
-                            } else {
-                                Duration::ZERO
-                            }
-                        })
-                        .unwrap_or(self.maintenance_period)
-                        .min(self.maintenance_period.max(Duration::from_millis(1)));
-                    match self.receiver.recv_timeout(wait) {
-                        Ok(message) => self.retain_waited_ingress(message)?,
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => {
-                            self.controller_disconnected = true;
-                        }
-                    }
+                HostDriveInterest::Draining
+                | HostDriveInterest::ReadyNow
+                | HostDriveInterest::Deadline => {
+                    self.wait_for_timed_ingress(report.interest, &mut now)?;
                 }
             }
         }
@@ -825,6 +836,193 @@ mod tests {
         let receipt = shutdown_and_join(worker, &mut port);
         assert_eq!(receipt.outcome, ChannelRunOutcome::Stopped);
         assert!(receipt.commands_admitted >= 2);
+    }
+
+    type AdmissionReceipt = Receiver<Result<CommandStatus, HostAccessError>>;
+
+    fn timed_wait_driver(draining: bool) -> (ChannelHostDriver, ChannelHostPort) {
+        ChannelHostDriver::new(
+            test_host(draining),
+            ChannelHostOptions {
+                ingress_capacity: 1,
+                ingress_drain_budget: 1,
+                ..fast_options()
+            },
+        )
+        .expect("driver")
+    }
+
+    fn queue_timed_wait_setup(
+        port: &ChannelHostPort,
+        draining: bool,
+        setup_id: CommandId,
+    ) -> Option<AdmissionReceipt> {
+        if draining {
+            let (reply, receipt) = std::sync::mpsc::channel();
+            assert!(
+                port.sender
+                    .try_send(IngressMessage::Command {
+                        envelope: CommandEnvelope::new(setup_id, HostCommand::Step),
+                        reply,
+                    })
+                    .is_ok()
+            );
+            Some(receipt)
+        } else {
+            assert!(port.sender.try_send(IngressMessage::Wake).is_ok());
+            None
+        }
+    }
+
+    fn hold_final_mirror_until_waking_queued(
+        port: &ChannelHostPort,
+    ) -> (std::thread::JoinHandle<()>, Sender<()>) {
+        // Hold the final mirror write while the first step drains the setup
+        // message. This opens exactly one queue slot after the drain budget is
+        // spent, so the waking command can be queued but cannot be consumed
+        // until run() executes the interest-specific recv_timeout branch.
+        let protocol_events = Arc::clone(&port.protocol_events);
+        let (mirror_locked_tx, mirror_locked_rx) = std::sync::mpsc::channel();
+        let (waking_queued_tx, waking_queued_rx) = std::sync::mpsc::channel();
+        let mirror_lock = std::thread::spawn(move || {
+            let guard = protocol_events.read().expect("protocol-event board lock");
+            mirror_locked_tx
+                .send(())
+                .expect("mirror-lock acquisition signal");
+            waking_queued_rx
+                .recv()
+                .expect("waking-command queue signal");
+            drop(guard);
+        });
+        mirror_locked_rx
+            .recv()
+            .expect("protocol-event board lock acquired");
+        (mirror_lock, waking_queued_tx)
+    }
+
+    fn spawn_timed_wait_client(
+        port: &ChannelHostPort,
+        waking_queued_tx: Sender<()>,
+        waking_id: CommandId,
+        shutdown_id: CommandId,
+    ) -> std::thread::JoinHandle<(CommandStatus, CommandStatus)> {
+        let sender = port.sender.clone();
+        std::thread::spawn(move || {
+            let (waking_reply, waking_receipt) = std::sync::mpsc::channel();
+            assert!(
+                sender
+                    .send(IngressMessage::Command {
+                        envelope: CommandEnvelope::new(waking_id, HostCommand::SetSpeed(2.0),),
+                        reply: waking_reply,
+                    })
+                    .is_ok()
+            );
+            waking_queued_tx
+                .send(())
+                .expect("waking-command queue signal");
+
+            let (shutdown_reply, shutdown_receipt) = std::sync::mpsc::channel();
+            assert!(
+                sender
+                    .send(IngressMessage::Command {
+                        envelope: CommandEnvelope::new(shutdown_id, HostCommand::Shutdown),
+                        reply: shutdown_reply,
+                    })
+                    .is_ok()
+            );
+
+            let waking = waking_receipt
+                .recv_timeout(Duration::from_secs(2))
+                .expect("waking command reply")
+                .expect("waking command admission");
+            let shutdown = shutdown_receipt
+                .recv_timeout(Duration::from_secs(2))
+                .expect("shutdown command reply")
+                .expect("shutdown command admission");
+            (waking, shutdown)
+        })
+    }
+
+    fn assert_admission(status: &CommandStatus, command_id: CommandId, sequence: u64) {
+        assert_eq!(status.command_id(), command_id);
+        assert_eq!(
+            status.admission_sequence(),
+            Some(crate::AdmissionSequence::new(sequence))
+        );
+    }
+
+    fn assert_final_applied_status(
+        port: &mut ChannelHostPort,
+        command_id: CommandId,
+        sequence: u64,
+    ) {
+        let status = port
+            .command_status(command_id)
+            .expect("final status lookup")
+            .expect("final status retained");
+        assert_admission(&status, command_id, sequence);
+        assert!(matches!(status.application(), ApplicationState::Applied(_)));
+    }
+
+    fn assert_run_timed_wait_preserves_waking_command(interest: HostDriveInterest) {
+        assert!(matches!(
+            interest,
+            HostDriveInterest::Draining | HostDriveInterest::Deadline
+        ));
+        let draining = interest == HostDriveInterest::Draining;
+        let (mut driver, mut port) = timed_wait_driver(draining);
+        let setup_id = CommandId::new(if draining { 14 } else { 16 });
+        let waking_id = CommandId::new(if draining { 15 } else { 17 });
+        let shutdown_id = CommandId::new(if draining { 18 } else { 19 });
+        let setup_receipt = queue_timed_wait_setup(&port, draining, setup_id);
+        let (mirror_lock, waking_queued_tx) = hold_final_mirror_until_waking_queued(&port);
+        let client = spawn_timed_wait_client(&port, waking_queued_tx, waking_id, shutdown_id);
+
+        let start = std::time::Instant::now();
+        let receipt = driver
+            .run(move || {
+                let elapsed_nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                ManualInstant::from_nanos(1_000_000_u64.saturating_add(elapsed_nanos))
+            })
+            .expect("driver reaches ordered shutdown");
+        mirror_lock.join().expect("mirror-lock holder");
+        let (waking, shutdown) = client.join().expect("timed-wait client");
+
+        let first_waking_sequence = if draining { 2 } else { 1 };
+        assert_admission(&waking, waking_id, first_waking_sequence);
+        assert_admission(&shutdown, shutdown_id, first_waking_sequence + 1);
+        assert_eq!(receipt.outcome, ChannelRunOutcome::Stopped);
+        assert_eq!(
+            receipt.commands_admitted,
+            if draining { 3 } else { 2 },
+            "the retained waking command must be counted exactly once"
+        );
+
+        let mut expected = vec![
+            (waking_id, first_waking_sequence),
+            (shutdown_id, first_waking_sequence + 1),
+        ];
+        if let Some(setup_receipt) = setup_receipt {
+            let setup = setup_receipt
+                .recv_timeout(Duration::from_secs(2))
+                .expect("setup command reply")
+                .expect("setup command admission");
+            assert_admission(&setup, setup_id, 1);
+            expected.insert(0, (setup_id, 1));
+        }
+        for (command_id, sequence) in expected {
+            assert_final_applied_status(&mut port, command_id, sequence);
+        }
+    }
+
+    #[test]
+    fn draining_timed_wait_preserves_the_command_that_wakes_it() {
+        assert_run_timed_wait_preserves_waking_command(HostDriveInterest::Draining);
+    }
+
+    #[test]
+    fn deadline_timed_wait_preserves_the_command_that_wakes_it() {
+        assert_run_timed_wait_preserves_waking_command(HostDriveInterest::Deadline);
     }
 
     #[test]
