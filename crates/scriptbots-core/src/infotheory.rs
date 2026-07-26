@@ -738,6 +738,85 @@ mod tests {
         );
     }
 
+    /// Midpoint of bin `k` under [`discretize`], so a fixture lands in the bin it intends.
+    fn bin_center(k: usize, bins: usize) -> f64 {
+        (k as f64 + 0.5) / bins as f64
+    }
+
+    /// A noiseless 8-symbol channel carries exactly `log2(8) = 3` bits (bd-r4ja).
+    ///
+    /// The existing copy-channel fixture uses 2 symbols, which cannot distinguish a correct
+    /// estimator from one that saturates at 1 bit or that mishandles more than two occupied bins.
+    #[test]
+    fn bd_r4ja_analytic_eight_symbol_channel_carries_three_bits() {
+        let bins = 8;
+        let n = 1000;
+        let e: Vec<f64> = (0..n).map(|i| bin_center(i % bins, bins)).collect();
+        let r = e.clone();
+        let params = MiParams {
+            bins,
+            surrogate_runs: 20,
+            bootstrap_runs: 20,
+            seed: 4242,
+        };
+
+        let est = compute_mi(&e, &r, &params).expect("eight-symbol channel");
+
+        let expected = (bins as f64).log2();
+        assert!(
+            (est.bits_corrected - expected).abs() < 0.05,
+            "a noiseless {bins}-symbol channel carries {expected} bits, got {}",
+            est.bits_corrected
+        );
+        assert!(
+            est.sufficient,
+            "n={n} is far above the {}-sample floor for {bins} bins",
+            bins * bins * 2
+        );
+    }
+
+    /// A binary symmetric channel with crossover `p` carries exactly `1 - H(p)` bits (bd-r4ja).
+    ///
+    /// Unlike the noiseless fixtures this has a non-trivial closed form, so it catches an
+    /// estimator that is right only at the extremes of zero and full information.
+    #[test]
+    fn bd_r4ja_analytic_binary_symmetric_channel_matches_one_minus_entropy() {
+        let n = 1000;
+        // Alternating input; flip 1 in 10 of each symbol, so the crossover is symmetric at 0.2.
+        // Flipping only on `i % 10 == 0` would hit even indices exclusively and make the channel
+        // asymmetric, which is a different (and analytically messier) object.
+        let e: Vec<f64> = (0..n).map(|i| f64::from(u8::from(i % 2 == 1))).collect();
+        let r: Vec<f64> = (0..n)
+            .map(|i| {
+                let bit = i % 2 == 1;
+                let flipped = i % 10 == 0 || i % 10 == 5;
+                f64::from(u8::from(bit != flipped))
+            })
+            .collect();
+        let params = MiParams {
+            bins: 2,
+            surrogate_runs: 20,
+            bootstrap_runs: 20,
+            seed: 2424,
+        };
+
+        let est = compute_mi(&e, &r, &params).expect("binary symmetric channel");
+
+        let p = 0.2_f64;
+        let entropy = -p * p.log2() - (1.0 - p) * (1.0 - p).log2();
+        let expected = 1.0 - entropy;
+        assert!(
+            (est.bits_corrected - expected).abs() < 0.02,
+            "a BSC with crossover {p} carries 1 - H(p) = {expected} bits, got {}",
+            est.bits_corrected
+        );
+        // Guards the fixture itself: if the construction stopped being symmetric this would drift.
+        assert!(
+            expected > 0.2 && expected < 0.35,
+            "fixture sanity: 1 - H(0.2) should be about 0.278, computed {expected}"
+        );
+    }
+
     /// The circular offset must be measured from the data, not assumed (bd-r4ja).
     ///
     /// Pins the property that actually matters: a slowly varying signal must demand a longer
