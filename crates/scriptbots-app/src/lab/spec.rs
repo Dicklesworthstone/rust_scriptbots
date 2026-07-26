@@ -31,10 +31,11 @@
 //! product surface, rendered as one actionable line each and fed verbatim back to
 //! the model as a repair prompt.
 
-use scriptbots_core::knob_range;
+use scriptbots_core::{KNOB_RANGES, knob_range};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use utoipa::{PartialSchema, ToSchema};
 
 /// Most factors one spec may vary.
 pub const MAX_FACTORS: usize = 4;
@@ -49,6 +50,9 @@ pub const MAX_TICKS_PER_RUN: u64 = 1_000_000;
 /// Longest free-text field.
 pub const MAX_STRING_LEN: usize = 4_096;
 
+/// Metrics emitted by the matched-seed runner and therefore valid for analysis.
+pub const KNOWN_METRICS: &[&str] = &["alive_agents"];
+
 /// The knob that may NEVER be a factor.
 ///
 /// `rng_seed` is the MATCHED-SEED AXIS. A spec that sweeps it as a factor is
@@ -58,6 +62,7 @@ pub const SEED_KNOB: &str = "rng_seed";
 
 /// One knob, varied over several values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Factor {
     /// Dotted config path, as `list_knobs` reports it.
     pub knob_path: String,
@@ -71,6 +76,7 @@ pub struct Factor {
 /// The SAME cohort runs under every arm. That is what makes the comparison
 /// paired: the arms differ in the treatment and in nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SeedPlan {
     /// First seed.
     pub base: u64,
@@ -80,6 +86,7 @@ pub struct SeedPlan {
 
 /// The ceiling the run must fit inside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SpecBudget {
     /// Total runs allowed.
     pub runs: u32,
@@ -89,6 +96,7 @@ pub struct SpecBudget {
 
 /// What the model proposes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentSpec {
     /// What it thinks is true.
     pub hypothesis: String,
@@ -166,6 +174,12 @@ pub struct RunCost {
 /// answer, in a single line, "what exactly do I change to make this valid?".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SpecError {
+    /// No scientific claim was supplied.
+    EmptyHypothesis,
+    /// No treatment axis was supplied.
+    EmptyFactors,
+    /// No output was selected for comparison.
+    EmptyMetrics,
     /// No such knob.
     UnknownKnob {
         /// The path the model asked for.
@@ -228,6 +242,16 @@ pub enum SpecError {
         /// The duplicate.
         second: usize,
     },
+    /// Two factor declarations target the same knob, which would overwrite an
+    /// earlier treatment during arm expansion.
+    DuplicateFactor {
+        /// Repeated knob path.
+        path: String,
+        /// First factor index.
+        first: usize,
+        /// Repeated factor index.
+        second: usize,
+    },
     /// The experiment does not fit the budget.
     CostExceedsBudget {
         /// Runs required.
@@ -248,6 +272,15 @@ pub enum SpecError {
     },
     /// A cohort of nobody.
     ZeroSeeds,
+    /// The ascending matched-seed cohort would wrap around `u64::MAX`.
+    SeedOverflow {
+        /// First seed.
+        base: u64,
+        /// Requested cohort size.
+        count: u16,
+    },
+    /// A run that never advances cannot test a dynamic hypothesis.
+    ZeroTicks,
     /// A structural limit was exceeded.
     Bounds {
         /// Which field.
@@ -262,6 +295,18 @@ pub enum SpecError {
 impl fmt::Display for SpecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyHypothesis => write!(
+                f,
+                "`hypothesis` is required and must be non-empty: state the claim this experiment tests."
+            ),
+            Self::EmptyFactors => write!(
+                f,
+                "`factors` must contain at least one treatment axis: an empty arm cannot compare a treatment."
+            ),
+            Self::EmptyMetrics => write!(
+                f,
+                "`metrics` must name at least one reported metric to compare."
+            ),
             Self::UnknownKnob { path } => write!(
                 f,
                 "`{path}` is not a knob. Call list_knobs and use a path exactly as it appears there."
@@ -311,6 +356,15 @@ impl fmt::Display for SpecError {
                 "arms {first} and {second} are identical, so one of them is a run spent learning \
                  nothing. Remove the duplicate value."
             ),
+            Self::DuplicateFactor {
+                path,
+                first,
+                second,
+            } => write!(
+                f,
+                "factors {first} and {second} both target `{path}`. Combine their values into one \
+                 factor so no treatment is silently overwritten."
+            ),
             Self::CostExceedsBudget {
                 runs,
                 ticks,
@@ -335,9 +389,47 @@ impl fmt::Display for SpecError {
                 f,
                 "`seeds.count` must be at least 1: an experiment needs a cohort to run."
             ),
+            Self::SeedOverflow { base, count } => write!(
+                f,
+                "`seeds` beginning at {base} with count {count} would wrap past u64::MAX. \
+                 Choose a smaller base or cohort."
+            ),
+            Self::ZeroTicks => write!(
+                f,
+                "`ticks_per_run` must be at least 1: a zero-tick world cannot test a dynamic hypothesis."
+            ),
             Self::Bounds { field, got, max } => {
                 write!(f, "`{field}` has {got} entries, over the limit of {max}.")
             }
+        }
+    }
+}
+
+impl SpecError {
+    /// Stable machine-readable code used in redacted lab audit events.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::EmptyHypothesis => "empty_hypothesis",
+            Self::EmptyFactors => "empty_factors",
+            Self::EmptyMetrics => "empty_metrics",
+            Self::UnknownKnob { .. } => "unknown_knob",
+            Self::NotSweepable { .. } => "not_sweepable",
+            Self::SeedAsFactor => "seed_as_factor",
+            Self::OutOfRange { .. } => "out_of_range",
+            Self::NonFinite { .. } => "non_finite",
+            Self::NotRepresentableAsF32 { .. } => "not_representable_as_f32",
+            Self::TypeMismatch { .. } => "type_mismatch",
+            Self::TooManyArms { .. } => "too_many_arms",
+            Self::DuplicateArm { .. } => "duplicate_arm",
+            Self::DuplicateFactor { .. } => "duplicate_factor",
+            Self::CostExceedsBudget { .. } => "cost_exceeds_budget",
+            Self::EmptyFalsifier => "empty_falsifier",
+            Self::UnknownMetric { .. } => "unknown_metric",
+            Self::ZeroSeeds => "zero_seeds",
+            Self::SeedOverflow { .. } => "seed_overflow",
+            Self::ZeroTicks => "zero_ticks",
+            Self::Bounds { .. } => "bounds",
         }
     }
 }
@@ -352,6 +444,95 @@ pub fn render_errors(errors: &[SpecError]) -> String {
         .join("\n")
 }
 
+/// Build the standalone tool-input schema from the canonical Rust type.
+///
+/// `utoipa` emits OpenAPI component references for nested structs. Keeping the
+/// collected components beside the root makes those JSON pointers resolvable
+/// when the schema is sent outside an OpenAPI document. The range and metric
+/// registries are attached as deterministic vendor extensions; the validator
+/// below remains authoritative for their dynamic constraints.
+///
+/// # Errors
+///
+/// Returns a serialization error if `utoipa` ever emits a schema value that
+/// `serde_json` cannot encode.
+pub fn tool_input_schema() -> Result<serde_json::Value, serde_json::Error> {
+    let mut root = serde_json::to_value(<ExperimentSpec as PartialSchema>::schema())?;
+    let mut referenced = Vec::new();
+    <ExperimentSpec as ToSchema>::schemas(&mut referenced);
+    let schemas = referenced
+        .into_iter()
+        .map(|(name, schema)| {
+            let mut schema = serde_json::to_value(schema)?;
+            if matches!(name.as_str(), "Factor" | "SeedPlan" | "SpecBudget")
+                && let Some(object) = schema.as_object_mut()
+            {
+                object.insert(
+                    "additionalProperties".to_owned(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+            Ok::<_, serde_json::Error>((name, schema))
+        })
+        .collect::<Result<serde_json::Map<String, serde_json::Value>, _>>()?;
+    let ranges = KNOB_RANGES
+        .iter()
+        .map(|range| {
+            serde_json::json!({
+                "path": range.path,
+                "min": range.min,
+                "max": range.max,
+                "fresh_world_only": range.fresh_world_only,
+                "lab_sweepable": not_sweepable_reason(range.path).is_none(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(object) = root.as_object_mut() {
+        object.insert(
+            "$schema".to_owned(),
+            serde_json::Value::String("https://json-schema.org/draft/2020-12/schema".to_owned()),
+        );
+        object.insert(
+            "additionalProperties".to_owned(),
+            serde_json::Value::Bool(false),
+        );
+        object.insert(
+            "components".to_owned(),
+            serde_json::json!({"schemas": schemas}),
+        );
+        object.insert(
+            "x-scriptbots-knob-ranges".to_owned(),
+            serde_json::Value::Array(ranges),
+        );
+        object.insert(
+            "x-scriptbots-known-metrics".to_owned(),
+            serde_json::json!(KNOWN_METRICS),
+        );
+        object.insert(
+            "x-scriptbots-validation-limits".to_owned(),
+            serde_json::json!({
+                "max_factors": MAX_FACTORS,
+                "max_values_per_factor": MAX_VALUES_PER_FACTOR,
+                "max_arms": MAX_ARMS,
+                "max_seeds": MAX_SEEDS,
+                "max_ticks_per_run": MAX_TICKS_PER_RUN,
+                "max_string_length": MAX_STRING_LEN,
+            }),
+        );
+        object.insert(
+            "x-scriptbots-seed-policy".to_owned(),
+            serde_json::json!({
+                "factor_path": SEED_KNOB,
+                "factor_sweepable": false,
+                "allocation": "ascending_checked_range",
+                "matching": "every arm receives the identical cohort",
+            }),
+        );
+    }
+    Ok(root)
+}
+
 /// Check and expand a proposal.
 ///
 /// Returns ALL errors, not the first. The whole list goes back to the model as
@@ -361,14 +542,23 @@ pub fn render_errors(errors: &[SpecError]) -> String {
 /// # Errors
 ///
 /// Every way the spec can be wrong, as a list.
-pub fn validate(
+pub fn validate_spec(
     spec: &ExperimentSpec,
-    known_metrics: &[&str],
+    operator_budget: SpecBudget,
 ) -> Result<ValidatedSpec, Vec<SpecError>> {
     let mut errors = Vec::new();
 
+    if spec.hypothesis.trim().is_empty() {
+        errors.push(SpecError::EmptyHypothesis);
+    }
     if spec.falsifier.trim().is_empty() {
         errors.push(SpecError::EmptyFalsifier);
+    }
+    if spec.factors.is_empty() {
+        errors.push(SpecError::EmptyFactors);
+    }
+    if spec.metrics.is_empty() {
+        errors.push(SpecError::EmptyMetrics);
     }
     check_len(
         "hypothesis",
@@ -388,6 +578,9 @@ pub fn validate(
     if spec.seeds.count == 0 {
         errors.push(SpecError::ZeroSeeds);
     }
+    if spec.ticks_per_run == 0 {
+        errors.push(SpecError::ZeroTicks);
+    }
     check_len(
         "seeds.count",
         spec.seeds.count as usize,
@@ -402,7 +595,7 @@ pub fn validate(
     );
 
     for metric in &spec.metrics {
-        if !known_metrics.contains(&metric.as_str()) {
+        if !KNOWN_METRICS.contains(&metric.as_str()) {
             errors.push(SpecError::UnknownMetric {
                 name: metric.clone(),
             });
@@ -410,7 +603,17 @@ pub fn validate(
     }
 
     let mut fresh_world_only = false;
-    for factor in &spec.factors {
+    let mut factor_positions = BTreeMap::new();
+    for (factor_index, factor) in spec.factors.iter().enumerate() {
+        if let Some(first) = factor_positions.get(&factor.knob_path).copied() {
+            errors.push(SpecError::DuplicateFactor {
+                path: factor.knob_path.clone(),
+                first,
+                second: factor_index,
+            });
+        } else {
+            factor_positions.insert(factor.knob_path.clone(), factor_index);
+        }
         check_len(
             &format!("factors[{}].values", factor.knob_path),
             factor.values.len(),
@@ -434,6 +637,13 @@ pub fn validate(
             });
             continue;
         };
+        if let Some(reason) = not_sweepable_reason(&factor.knob_path) {
+            errors.push(SpecError::NotSweepable {
+                path: factor.knob_path.clone(),
+                reason: reason.to_owned(),
+            });
+            continue;
+        }
         if range.fresh_world_only {
             fresh_world_only = true;
         }
@@ -442,15 +652,31 @@ pub fn validate(
         }
     }
 
-    // Expand only if the factors themselves are sound; expanding a spec with an
-    // unknown knob would produce arms nobody could apply.
-    let arms = expand(&spec.factors);
-    if arms.len() > MAX_ARMS {
+    let arm_count = spec
+        .factors
+        .iter()
+        .try_fold(1_usize, |count, factor| {
+            count.checked_mul(factor.values.len())
+        })
+        .unwrap_or(usize::MAX);
+    if arm_count > MAX_ARMS {
         errors.push(SpecError::TooManyArms {
-            arms: arms.len(),
+            arms: arm_count,
             max: MAX_ARMS,
         });
     }
+    let can_expand = !spec.factors.is_empty()
+        && spec.factors.len() <= MAX_FACTORS
+        && factor_positions.len() == spec.factors.len()
+        && spec.factors.iter().all(|factor| {
+            !factor.values.is_empty() && factor.values.len() <= MAX_VALUES_PER_FACTOR
+        })
+        && arm_count <= MAX_ARMS;
+    let arms = if can_expand {
+        expand(&spec.factors)
+    } else {
+        Vec::new()
+    };
     for (i, arm) in arms.iter().enumerate() {
         if let Some(j) = arms[..i].iter().position(|other| other == arm) {
             errors.push(SpecError::DuplicateArm {
@@ -460,18 +686,39 @@ pub fn validate(
         }
     }
 
-    let seeds: Vec<u64> = (0..spec.seeds.count)
-        .map(|offset| spec.seeds.base.wrapping_add(u64::from(offset)))
-        .collect();
+    let seeds = if spec.seeds.count == 0 {
+        Vec::new()
+    } else if spec
+        .seeds
+        .base
+        .checked_add(u64::from(spec.seeds.count - 1))
+        .is_none()
+    {
+        errors.push(SpecError::SeedOverflow {
+            base: spec.seeds.base,
+            count: spec.seeds.count,
+        });
+        Vec::new()
+    } else {
+        (0..spec.seeds.count)
+            .map(|offset| spec.seeds.base + u64::from(offset))
+            .collect()
+    };
 
-    let runs = (arms.len() as u64).saturating_mul(seeds.len() as u64);
+    let runs = u64::try_from(arm_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(spec.seeds.count));
     let ticks = runs.saturating_mul(spec.ticks_per_run);
-    if runs > u64::from(spec.budget.runs) || ticks > spec.budget.ticks {
+    let effective_budget = SpecBudget {
+        runs: spec.budget.runs.min(operator_budget.runs),
+        ticks: spec.budget.ticks.min(operator_budget.ticks),
+    };
+    if runs > u64::from(effective_budget.runs) || ticks > effective_budget.ticks {
         errors.push(SpecError::CostExceedsBudget {
             runs,
             ticks,
-            max_runs: spec.budget.runs,
-            max_ticks: spec.budget.ticks,
+            max_runs: effective_budget.runs,
+            max_ticks: effective_budget.ticks,
         });
     }
 
@@ -499,6 +746,30 @@ fn check_len(field: &str, got: usize, max: usize, errors: &mut Vec<SpecError>) {
     }
 }
 
+fn not_sweepable_reason(path: &str) -> Option<&'static str> {
+    match path {
+        "mutation.primary" | "mutation.secondary" => Some(
+            "mutation rates are per-agent runtime state, not a fresh-world ScriptBotsConfig field",
+        ),
+        path if path.starts_with("render.") => {
+            Some("render settings are presentation-only and cannot change a scientific run metric")
+        }
+        _ => None,
+    }
+}
+
+fn integer_knob(path: &str) -> bool {
+    matches!(
+        path,
+        "world_width"
+            | "world_height"
+            | "food_cell_size"
+            | "population_minimum"
+            | "population_spawn_interval"
+            | "render.day_night.cycle_ticks"
+    )
+}
+
 fn check_value(
     path: &str,
     value: &serde_json::Value,
@@ -511,7 +782,17 @@ fn check_value(
     // mutation rate that slipped through would poison the world and the notebook
     // would then report statistics over garbage.
     let number = match value {
-        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::Number(number) => {
+            if integer_knob(path) && number.as_u64().is_none() {
+                errors.push(SpecError::TypeMismatch {
+                    path: path.to_owned(),
+                    expected: "a non-negative integer".to_owned(),
+                    got: "a fractional number".to_owned(),
+                });
+                return;
+            }
+            number.as_f64()
+        }
         serde_json::Value::String(raw) => {
             errors.push(SpecError::NonFinite {
                 path: path.to_owned(),
@@ -640,7 +921,10 @@ fn content_hash(spec: &ExperimentSpec, arms: &[Arm], seeds: &[u64]) -> String {
 mod tests {
     use super::*;
 
-    const METRICS: &[&str] = &["population_mean", "energy_mean"];
+    const OPERATOR_BUDGET: SpecBudget = SpecBudget {
+        runs: u32::MAX,
+        ticks: u64::MAX,
+    };
 
     fn spec() -> ExperimentSpec {
         ExperimentSpec {
@@ -656,7 +940,7 @@ mod tests {
             }],
             seeds: SeedPlan { base: 1, count: 4 },
             ticks_per_run: 2_000,
-            metrics: vec!["population_mean".to_owned()],
+            metrics: vec!["alive_agents".to_owned()],
             budget: SpecBudget {
                 runs: 64,
                 ticks: 10_000_000,
@@ -666,7 +950,7 @@ mod tests {
 
     #[test]
     fn the_canonical_proposal_is_accepted_and_expands_deterministically() {
-        let validated = validate(&spec(), METRICS).expect("canonical spec is valid");
+        let validated = validate_spec(&spec(), OPERATOR_BUDGET).expect("canonical spec is valid");
         assert_eq!(validated.arms.len(), 3);
         assert_eq!(validated.seeds, vec![1, 2, 3, 4]);
         assert_eq!(
@@ -677,7 +961,7 @@ mod tests {
             }
         );
         // Same spec, same identity — this id is what dedupes experiments.
-        let again = validate(&spec(), METRICS).expect("valid");
+        let again = validate_spec(&spec(), OPERATOR_BUDGET).expect("valid");
         assert_eq!(validated.spec_id, again.spec_id);
         assert_eq!(validated.arms, again.arms);
     }
@@ -692,7 +976,7 @@ mod tests {
         // between the lab and that outcome.
         let mut spec = spec();
         spec.factors[0].values = vec![serde_json::json!(1e9)];
-        let errors = validate(&spec, METRICS).expect_err("1e9 must be refused");
+        let errors = validate_spec(&spec, OPERATOR_BUDGET).expect_err("1e9 must be refused");
         assert!(
             errors
                 .iter()
@@ -712,7 +996,8 @@ mod tests {
     fn sweeping_the_seed_is_refused_with_an_explanation_that_teaches() {
         let mut spec = spec();
         spec.factors[0].knob_path = SEED_KNOB.to_owned();
-        let errors = validate(&spec, METRICS).expect_err("seed-as-factor must be refused");
+        let errors =
+            validate_spec(&spec, OPERATOR_BUDGET).expect_err("seed-as-factor must be refused");
         assert!(errors.contains(&SpecError::SeedAsFactor));
         // A model that made this mistake will make it again unless the error
         // explains the design, so the message is part of the contract.
@@ -799,7 +1084,7 @@ mod tests {
         for (name, mutate) in cases {
             let mut spec = spec();
             mutate(&mut spec);
-            let outcome = validate(&spec, METRICS);
+            let outcome = validate_spec(&spec, OPERATOR_BUDGET);
             assert!(
                 outcome.is_err(),
                 "`{name}` must be a typed error, but it validated"
@@ -817,7 +1102,7 @@ mod tests {
         spec.metrics = vec!["vibes".to_owned()];
         spec.factors[0].knob_path = "nope".to_owned();
 
-        let errors = validate(&spec, METRICS).expect_err("four things are wrong");
+        let errors = validate_spec(&spec, OPERATOR_BUDGET).expect_err("four things are wrong");
         assert!(
             errors.len() >= 4,
             "the model must see all four problems in one turn, saw {}: {errors:?}",
@@ -844,7 +1129,8 @@ mod tests {
             runs: 1_000,
             ticks: 1_000_000_000,
         };
-        let validated = validate(&spec, METRICS).expect("two factors, two values each");
+        let validated =
+            validate_spec(&spec, OPERATOR_BUDGET).expect("two factors, two values each");
         assert_eq!(validated.arms.len(), 4);
         // Declaration order, every time.
         assert_eq!(
@@ -873,7 +1159,7 @@ mod tests {
             })
             .collect();
         // 3^4 = 81 > MAX_ARMS.
-        let errors = validate(&too_big, METRICS).expect_err("81 arms is over the cap");
+        let errors = validate_spec(&too_big, OPERATOR_BUDGET).expect_err("81 arms is over the cap");
         assert!(
             errors
                 .iter()
@@ -892,11 +1178,179 @@ mod tests {
             knob_path: "world_width".to_owned(),
             values: vec![serde_json::json!(200), serde_json::json!(400)],
         };
-        let validated = validate(&spec, METRICS).expect("fresh-world sweeps are legal in the lab");
+        let validated =
+            validate_spec(&spec, OPERATOR_BUDGET).expect("fresh-world sweeps are legal in the lab");
         assert!(
             validated.fresh_world_only,
             "a dimension sweep must be flagged: applying it to a live world is refused by \
              apply_config_update, and an unflagged spec would be discovered one failed run at a time"
+        );
+    }
+
+    #[test]
+    fn structural_unknowns_seed_overflow_and_operator_budget_fail_closed() {
+        let mut encoded = serde_json::to_value(spec()).expect("encode canonical spec");
+        encoded
+            .as_object_mut()
+            .expect("spec is an object")
+            .insert("target_knobs".to_owned(), serde_json::json!({}));
+        let decode_error = serde_json::from_value::<ExperimentSpec>(encoded)
+            .expect_err("unknown fields must not be ignored");
+        assert!(decode_error.to_string().contains("target_knobs"));
+
+        let mut overflowing = spec();
+        overflowing.seeds = SeedPlan {
+            base: u64::MAX,
+            count: 2,
+        };
+        let errors = validate_spec(&overflowing, OPERATOR_BUDGET)
+            .expect_err("an ascending cohort may not wrap");
+        assert_eq!(
+            errors.iter().map(SpecError::code).collect::<Vec<_>>(),
+            ["seed_overflow"]
+        );
+
+        let errors = validate_spec(
+            &spec(),
+            SpecBudget {
+                runs: 4,
+                ticks: u64::MAX,
+            },
+        )
+        .expect_err("the operator ceiling is independent of the model's budget");
+        assert!(matches!(
+            errors.as_slice(),
+            [SpecError::CostExceedsBudget { max_runs: 4, .. }]
+        ));
+    }
+
+    #[test]
+    fn repeated_factor_paths_are_rejected_before_arm_expansion() {
+        let mut repeated = spec();
+        repeated.factors.push(Factor {
+            knob_path: repeated.factors[0].knob_path.clone(),
+            values: vec![serde_json::json!(0.5)],
+        });
+        let errors = validate_spec(&repeated, OPERATOR_BUDGET)
+            .expect_err("a repeated path would silently overwrite an earlier treatment");
+        assert!(matches!(
+            errors.as_slice(),
+            [SpecError::DuplicateFactor {
+                path,
+                first: 0,
+                second: 1,
+            }] if path == "food_growth_rate"
+        ));
+    }
+
+    #[test]
+    fn empty_and_maximal_arm_boundaries_have_stable_error_codes() {
+        let mut empty = spec();
+        empty.hypothesis = String::new();
+        empty.falsifier = String::new();
+        empty.factors.clear();
+        empty.metrics.clear();
+        empty.seeds.count = 0;
+        empty.ticks_per_run = 0;
+        let errors =
+            validate_spec(&empty, OPERATOR_BUDGET).expect_err("empty experiment is invalid");
+        assert_eq!(
+            errors.iter().map(SpecError::code).collect::<Vec<_>>(),
+            [
+                "empty_hypothesis",
+                "empty_falsifier",
+                "empty_factors",
+                "empty_metrics",
+                "zero_seeds",
+                "zero_ticks",
+            ]
+        );
+
+        let paths = [
+            "food_growth_rate",
+            "food_max",
+            "food_decay_rate",
+            "food_diffusion_rate",
+        ];
+        let mut maximal = spec();
+        maximal.factors = paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| Factor {
+                knob_path: path.to_owned(),
+                values: if index == 0 {
+                    vec![
+                        serde_json::json!(0.01),
+                        serde_json::json!(0.02),
+                        serde_json::json!(0.03),
+                        serde_json::json!(0.04),
+                    ]
+                } else {
+                    vec![serde_json::json!(0.01), serde_json::json!(0.02)]
+                },
+            })
+            .collect();
+        maximal.seeds.count = 1;
+        maximal.ticks_per_run = 1;
+        maximal.budget = SpecBudget {
+            runs: u32::try_from(MAX_ARMS).expect("arm cap fits u32"),
+            ticks: u64::try_from(MAX_ARMS).expect("arm cap fits u64"),
+        };
+        let validated =
+            validate_spec(&maximal, OPERATOR_BUDGET).expect("the exact arm cap is admissible");
+        assert_eq!(validated.arms.len(), MAX_ARMS);
+    }
+
+    #[test]
+    fn tool_schema_is_canonical_and_carries_dynamic_registries() {
+        let schema = tool_input_schema().expect("canonical schema serializes");
+        assert_eq!(
+            schema.pointer("/additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        let required = schema
+            .pointer("/required")
+            .and_then(serde_json::Value::as_array)
+            .expect("root required fields");
+        for field in [
+            "hypothesis",
+            "falsifier",
+            "factors",
+            "seeds",
+            "ticks_per_run",
+            "metrics",
+            "budget",
+        ] {
+            assert!(
+                required.iter().any(|entry| entry.as_str() == Some(field)),
+                "schema drifted away from canonical field `{field}`: {schema}"
+            );
+        }
+        assert!(
+            schema.pointer("/components/schemas/Factor").is_some(),
+            "nested canonical schemas must accompany their references: {schema}"
+        );
+        assert_eq!(
+            schema.pointer("/x-scriptbots-known-metrics/0"),
+            Some(&serde_json::json!("alive_agents"))
+        );
+        assert!(
+            schema
+                .pointer("/x-scriptbots-knob-ranges")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ranges| ranges.len() == KNOB_RANGES.len())
+        );
+        assert_eq!(
+            schema.pointer("/x-scriptbots-validation-limits/max_arms"),
+            Some(&serde_json::json!(MAX_ARMS))
+        );
+        assert_eq!(
+            schema.pointer("/x-scriptbots-seed-policy/factor_path"),
+            Some(&serde_json::json!(SEED_KNOB))
+        );
+        assert_eq!(
+            schema.pointer("/x-scriptbots-seed-policy/factor_sweepable"),
+            Some(&serde_json::Value::Bool(false))
         );
     }
 }

@@ -1,9 +1,10 @@
 //! The autonomous lab: the model proposes experiments, the simulation runs them.
 //!
-//! This module owns the provider boundary and nothing else yet. The loop, the
-//! experiment schema, the statistics, and the notebook each land in their own
-//! bead — but they can all be written and tested against [`llm::ScriptedClient`]
-//! with no API key and no network, which is the entire reason this seam exists.
+//! [`spec::ExperimentSpec`] is the single proposal contract. Its derived tool
+//! schema is offered through [`llm`], then the state machine deserializes and
+//! validates that same type before the executor boundary can be crossed.
+//! [`llm::ScriptedClient`] exercises the identical provider parser without an
+//! API key or network.
 //!
 //! The lab's action space is deliberately narrow: it may READ knobs and config,
 //! and its only write is to PROPOSE an experiment. It never gets `apply_patch`.

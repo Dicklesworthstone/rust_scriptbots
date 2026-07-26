@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 /// A pathological — or hostile — response that streamed until the process OOMed
 /// would take the user's simulation down with it.
 pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
+/// The only model tool allowed to propose work to the autonomous lab.
+pub const PROPOSE_EXPERIMENT_TOOL_NAME: &str = "propose_experiment";
 
 /// One message in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +137,27 @@ pub enum LlmError {
     /// The model declined the request.
     #[error("model refused the request")]
     Refused,
+}
+
+/// Build the proposal tool from the single canonical experiment contract.
+///
+/// # Errors
+///
+/// [`LlmError::InvalidResponse`] if the generated schema cannot be represented
+/// as JSON. This is a local contract failure, surfaced before any provider call.
+pub fn propose_experiment_tool() -> Result<LlmToolSpec, LlmError> {
+    let input_schema = crate::lab::spec::tool_input_schema().map_err(|error| {
+        LlmError::InvalidResponse(format!(
+            "canonical experiment tool schema is not encodable: {error}"
+        ))
+    })?;
+    Ok(LlmToolSpec {
+        name: PROPOSE_EXPERIMENT_TOOL_NAME.to_owned(),
+        description: "Propose one bounded, falsifiable matched-seed experiment. Every factor, \
+                      seed, metric, arm, and budget is validated before a run can start."
+            .to_owned(),
+        input_schema,
+    })
 }
 
 /// What the model said.
@@ -663,11 +686,7 @@ mod tests {
                 role: "user".to_owned(),
                 content: "propose an experiment".to_owned(),
             }],
-            tools: vec![LlmToolSpec {
-                name: "propose_experiment".to_owned(),
-                description: "propose one experiment".to_owned(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }],
+            tools: vec![propose_experiment_tool().expect("canonical proposal tool")],
             max_tokens: 1024,
         }
     }
@@ -699,6 +718,22 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "propose_experiment");
         assert_eq!(parsed.text.as_deref(), Some("Here is my proposal."));
+    }
+
+    #[test]
+    fn proposal_tool_schema_is_exactly_the_canonical_schema() {
+        let tool = propose_experiment_tool().expect("canonical proposal tool");
+        assert_eq!(tool.name, PROPOSE_EXPERIMENT_TOOL_NAME);
+        assert_eq!(
+            tool.input_schema,
+            crate::lab::spec::tool_input_schema().expect("canonical schema")
+        );
+        assert!(tool.input_schema.pointer("/properties/factors").is_some());
+        assert!(
+            tool.input_schema
+                .pointer("/x-scriptbots-knob-ranges")
+                .is_some()
+        );
     }
 
     #[test]

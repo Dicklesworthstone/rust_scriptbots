@@ -1,10 +1,10 @@
 //! Deterministic matched-seed experiment runner and batch execution engine (bd-2z0.5.5).
 
-use scriptbots_core::{ScriptBotsConfig, WorldState};
+use scriptbots_core::{ScriptBotsConfig, WorldState, knob_range};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{RunManifestRecord, create_run_bundle_from_artifacts, verify_run_bundle};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,9 @@ pub struct MatchedSeedCohort {
 pub struct ScenarioVariant {
     pub variant_id: String,
     pub brain_family: String,
-    pub config_overrides: HashMap<String, f32>,
+    /// Canonical validated arm. JSON values preserve integer-vs-float types
+    /// until strict `ScriptBotsConfig` deserialization.
+    pub config_overrides: BTreeMap<String, serde_json::Value>,
 }
 
 /// Execution status of an individual experiment run.
@@ -173,35 +175,7 @@ impl MatchedSeedExperimentRunner {
         seed: u64,
     ) -> Result<RunRecord, String> {
         let run_id = format!("{}-{}-seed{}", self.experiment_id, variant.variant_id, seed);
-        let mut config = ScriptBotsConfig::default();
-        config.rng_seed = Some(seed);
-
-        for (k, &v) in &variant.config_overrides {
-            match k.as_str() {
-                "food_max" => config.food_max = v,
-                "food_growth_rate" => config.food_growth_rate = v,
-                "food_decay_rate" => config.food_decay_rate = v,
-                "food_respawn_amount" => config.food_respawn_amount = v,
-                "initial_food" => config.initial_food = v,
-                "food_diffusion_rate" => config.food_diffusion_rate = v,
-                "food_intake_rate" => config.food_intake_rate = v,
-                "food_waste_rate" => config.food_waste_rate = v,
-                "agent_max_speed" | "bot_speed" => config.bot_speed = v,
-                "bot_radius" => config.bot_radius = v,
-                "sense_radius" => config.sense_radius = v,
-                "spike_damage" => config.spike_damage = v,
-                "spike_radius" => config.spike_radius = v,
-                "spike_energy_cost" => config.spike_energy_cost = v,
-                "metabolism_drain" => config.metabolism_drain = v,
-                "movement_drain" => config.movement_drain = v,
-                "temperature_discomfort_rate" => config.temperature_discomfort_rate = v,
-                "reproduction_energy_threshold" => config.reproduction_energy_threshold = v,
-                "reproduction_energy_cost" => config.reproduction_energy_cost = v,
-                "population_minimum" => config.population_minimum = v as usize,
-                "population_spawn_interval" => config.population_spawn_interval = v as u32,
-                _ => {}
-            }
-        }
+        let config = config_for_run(&variant.config_overrides, seed)?;
 
         let mut world = WorldState::new(config).map_err(|e| e.to_string())?;
 
@@ -302,9 +276,118 @@ impl MatchedSeedExperimentRunner {
     }
 }
 
+/// Prove that one canonical arm becomes a valid fresh-world configuration
+/// without creating a world or writing an artifact.
+///
+/// # Errors
+///
+/// Returns the exact unknown-path, type, decode, or config-invariant failure.
+pub fn validate_scenario_arm(
+    overrides: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    config_for_run(overrides, 0).map(|_| ())
+}
+
+fn config_for_run(
+    overrides: &BTreeMap<String, serde_json::Value>,
+    seed: u64,
+) -> Result<ScriptBotsConfig, String> {
+    let mut encoded = serde_json::to_value(ScriptBotsConfig::default())
+        .map_err(|error| format!("default config serialization failed: {error}"))?;
+    let root = encoded
+        .as_object_mut()
+        .ok_or_else(|| "default config did not serialize as an object".to_owned())?;
+
+    for (path, value) in overrides {
+        if knob_range(path).is_none() {
+            return Err(format!(
+                "validated arm contains unknown or unsupported knob `{path}`"
+            ));
+        }
+        insert_dotted_value(root, path, value.clone())?;
+    }
+
+    let mut config: ScriptBotsConfig = serde_json::from_value(encoded)
+        .map_err(|error| format!("validated arm does not decode as ScriptBotsConfig: {error}"))?;
+    // The matched-seed axis is owned by the cohort and can never be displaced by
+    // a treatment arm.
+    config.rng_seed = Some(seed);
+    config
+        .validate()
+        .map_err(|error| format!("validated arm produces an invalid config: {error}"))?;
+    Ok(config)
+}
+
+fn insert_dotted_value(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let segments = path.split('.').collect::<Vec<_>>();
+    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(format!("invalid dotted knob path `{path}`"));
+    }
+
+    let mut object = root;
+    for segment in &segments[..segments.len() - 1] {
+        let entry = object
+            .get_mut(*segment)
+            .ok_or_else(|| format!("knob path `{path}` has unknown segment `{segment}`"))?;
+        if entry.is_null() {
+            *entry = serde_json::Value::Object(serde_json::Map::new());
+        }
+        object = entry
+            .as_object_mut()
+            .ok_or_else(|| format!("knob path `{path}` crosses non-object segment `{segment}`"))?;
+    }
+    let leaf = segments[segments.len() - 1];
+    if !object.contains_key(leaf) {
+        return Err(format!("knob path `{path}` has unknown leaf `{leaf}`"));
+    }
+    object.insert(leaf.to_owned(), value);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_arm_application_is_strict_and_type_preserving() {
+        let overrides = BTreeMap::from([
+            ("world_width".to_owned(), serde_json::json!(5_000)),
+            ("food_growth_rate".to_owned(), serde_json::json!(0.2)),
+            ("food_transfer_rate".to_owned(), serde_json::json!(0.25)),
+            ("population_minimum".to_owned(), serde_json::json!(2)),
+        ]);
+        let config = config_for_run(&overrides, 99).expect("canonical arm applies");
+        assert_eq!(config.world_width, 5_000);
+        assert!((config.food_growth_rate - 0.2).abs() < f32::EPSILON);
+        assert!((config.food_transfer_rate - 0.25).abs() < f32::EPSILON);
+        assert_eq!(config.population_minimum, 2);
+        assert_eq!(config.rng_seed, Some(99));
+
+        let unknown = BTreeMap::from([("food.regrowth".to_owned(), serde_json::json!(0.1))]);
+        assert!(
+            config_for_run(&unknown, 1)
+                .expect_err("unknown overrides must never disappear")
+                .contains("unknown or unsupported knob")
+        );
+
+        let default_json =
+            serde_json::to_value(ScriptBotsConfig::default()).expect("default config schema");
+        for range in scriptbots_core::KNOB_RANGES {
+            if range.path.starts_with("mutation.") || range.path.starts_with("render.") {
+                continue;
+            }
+            let pointer = format!("/{}", range.path.replace('.', "/"));
+            assert!(
+                default_json.pointer(&pointer).is_some(),
+                "canonical validator accepts `{}`, but the strict runner config has no such field",
+                range.path
+            );
+        }
+    }
 
     #[test]
     fn test_experiment_runner_planning() {
@@ -316,12 +399,12 @@ mod tests {
             ScenarioVariant {
                 variant_id: "mlp_base".into(),
                 brain_family: "mlp".into(),
-                config_overrides: HashMap::new(),
+                config_overrides: BTreeMap::new(),
             },
             ScenarioVariant {
                 variant_id: "dwraon_base".into(),
                 brain_family: "dwraon".into(),
-                config_overrides: HashMap::new(),
+                config_overrides: BTreeMap::new(),
             },
         ];
 
@@ -348,12 +431,12 @@ mod tests {
             ScenarioVariant {
                 variant_id: "variant_a".into(),
                 brain_family: "mlp".into(),
-                config_overrides: HashMap::new(),
+                config_overrides: BTreeMap::new(),
             },
             ScenarioVariant {
                 variant_id: "variant_b".into(),
                 brain_family: "dwraon".into(),
-                config_overrides: HashMap::new(),
+                config_overrides: BTreeMap::new(),
             },
         ];
 
