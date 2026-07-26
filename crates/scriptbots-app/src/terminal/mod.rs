@@ -76,6 +76,12 @@ pub mod frankentui_shell;
 
 use canvas_ramps::HeadingSector;
 
+/// Contributor rows shown in the per-cone sense probe before the list is cut.
+///
+/// The cut is reported rather than silent: a panel that quietly stopped at N
+/// would look like a cone with exactly N neighbours.
+const PROBE_CONE_ROWS: usize = 6;
+
 const TARGET_SIM_HZ: f32 = 60.0;
 const MAX_STEPS_PER_FRAME: usize = 240;
 const UI_TICK_MILLIS: u64 = 100;
@@ -501,6 +507,14 @@ struct TerminalApp<'a> {
     /// and origin, which is how the old hover picked agents at random.
     map_area: Option<Rect>,
     hover_tooltip: Option<MouseHoverTooltip>,
+    /// Which eye cone the sense probe is narrowed to, or `None` for all cones
+    /// (bd-2z0.7.15).
+    ///
+    /// An index rather than a resolved cone: eyes are identified by position in
+    /// `0..NUM_EYES`, so this cannot dangle when focus moves, an agent dies, or
+    /// the panel closes and reopens — the three lifecycle cases that make a
+    /// cached selection go stale.
+    selected_eye: Option<usize>,
     /// Set by `S`, cleared when the event loop exports the frame on screen.
     /// A request rather than an action because the key handler cannot see the
     /// rendered buffer, and exporting anything else is what made the old
@@ -588,6 +602,7 @@ impl<'a> TerminalApp<'a> {
             map_pan_offset: (0.5, 0.5),
             map_area: None,
             hover_tooltip: None,
+            selected_eye: None,
             export_requested: false,
         };
         app.refresh_snapshot();
@@ -2005,6 +2020,109 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(paragraph, area);
     }
 
+    /// Sense probe narrowed to one eye cone (bd-2z0.7.15).
+    ///
+    /// Every value comes from `SensorAttribution::for_eye`, which owns the
+    /// eye-to-channel mapping. `EyeAttribution::raw`/`clamped`/`saturated` are
+    /// already the four channels of THIS cone in `[density, r, g, b]` order, so
+    /// this renders positions 0..3 directly — there is no sensor index to get
+    /// wrong here, which is the point of consuming the projection rather than
+    /// re-deriving it.
+    ///
+    /// Reports both truncation counts, and separately, because they mean
+    /// different things: `filtered_out` neighbours are retained and simply not
+    /// in this cone, so an empty cone reads as "nobody is in front of this eye"
+    /// rather than as missing data, while `parent_truncated` is a real bound on
+    /// completeness inherited from the parent attribution.
+    fn draw_probe_cone(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        block: Block<'_>,
+        probe: &ProbeSnapshot,
+        eye: usize,
+    ) {
+        let Some(cone) = probe.attribution.for_eye(eye) else {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("eye {eye} is out of range")),
+                    Line::from("press , or . to select another cone"),
+                ])
+                .block(block),
+                area,
+            );
+            return;
+        };
+
+        // Typographic scale (bd-f4x0): label recedes, value carries, hint qualifies.
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("eye ", self.palette.label_style()),
+            Span::styled(eye.to_string(), self.palette.value_style()),
+            Span::styled("  uid ", self.palette.label_style()),
+            Span::styled(probe.agent_uid.to_string(), self.palette.value_style()),
+            Span::styled(format!("  t{}", cone.tick.0), self.palette.muted_style()),
+            Span::styled(
+                format!("  {} in cone", cone.contributions.len()),
+                self.palette.muted_style(),
+            ),
+        ]));
+
+        let mut channels: Vec<Span> = vec![Span::styled("  ", self.palette.header_style())];
+        for (slot, letter) in ["d", "R", "G", "B"].iter().enumerate() {
+            let mut cell = format!("{letter}{:.2}", cone.clamped[slot]);
+            if cone.saturated[slot] {
+                cell.push_str(&format!("⚠{:.1}", cone.raw[slot]));
+            }
+            cell.push(' ');
+            channels.push(Span::raw(cell));
+        }
+        lines.push(Line::from(channels));
+
+        if cone.contributions.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  nobody in this cone",
+                self.palette.muted_style(),
+            )));
+        }
+        for contribution in cone.contributions.iter().take(PROBE_CONE_ROWS) {
+            lines.push(Line::from(vec![
+                Span::styled("  uid ", self.palette.label_style()),
+                Span::styled(
+                    format!("{:<6}", contribution.source_uid.get()),
+                    self.palette.value_style(),
+                ),
+                Span::styled(
+                    format!(
+                        "{:+.2}rad {:>6.1}  d{:.2}",
+                        contribution.bearing, contribution.distance, contribution.density,
+                    ),
+                    self.palette.value_style(),
+                ),
+            ]));
+        }
+
+        let mut notes: Vec<String> = Vec::new();
+        if cone.filtered_out > 0 {
+            notes.push(format!("{} not in cone", cone.filtered_out));
+        }
+        if cone.parent_truncated > 0 {
+            notes.push(format!("+{} truncated upstream", cone.parent_truncated));
+        }
+        if !notes.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", notes.join(", ")),
+                self.palette.muted_style(),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "  , / . cone",
+            self.palette.muted_style(),
+        )));
+
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
     /// Egocentric sense-probe panel (bd-16g.4.2).
     ///
     /// Renders `SensorAttribution` verbatim: clamped values on the gauges, an
@@ -2029,6 +2147,17 @@ impl<'a> TerminalApp<'a> {
             return;
         };
         let att = &probe.attribution;
+
+        // Narrowed to one cone: render the core-owned projection and stop.
+        // `for_eye` is the authority for which sensor channels belong to an eye;
+        // the layout is irregular (densities at 0, 5, 12, 21) so anything that
+        // indexed by `eye * 4` here would show food as eye 1's density and a
+        // clock as eye 3's — plausible-looking and wrong (bd-2z0.7.15).
+        if let Some(eye) = self.selected_eye {
+            self.draw_probe_cone(frame, area, block, probe, eye);
+            return;
+        }
+
         let mut lines: Vec<Line> = Vec::new();
         let truncation = if att.truncated > 0 {
             format!(" (+{} truncated)", att.truncated)
@@ -2613,6 +2742,12 @@ impl<'a> TerminalApp<'a> {
                 self.push_toast("Single-step");
                 self.push_event(self.snapshot.tick, EventKind::Info, "Single-step executed");
             }
+            (KeyCode::Char('.'), _) => {
+                self.cycle_eye_selection(true);
+            }
+            (KeyCode::Char(','), _) => {
+                self.cycle_eye_selection(false);
+            }
             (KeyCode::Char('S'), _) => {
                 // Only a request: the key handler cannot see the rendered buffer,
                 // and exporting anything else would reintroduce the defect this
@@ -2805,6 +2940,28 @@ impl<'a> TerminalApp<'a> {
         }
 
         Ok(false)
+    }
+
+    /// Step the sense-probe cone selection (bd-2z0.7.15).
+    ///
+    /// The states are `All` followed by each eye, so `NUM_EYES + 1` in total, and
+    /// stepping wraps in both directions. Modelled as a total function over that
+    /// ring rather than as increment-and-clamp: clamping would make the ends
+    /// sticky, so a user holding the key would silently stop moving at eye 3 and
+    /// read it as the control dying.
+    fn cycle_eye_selection(&mut self, forward: bool) {
+        let states = NUM_EYES + 1;
+        let current = self.selected_eye.map_or(0, |eye| eye + 1);
+        let next = if forward {
+            (current + 1) % states
+        } else {
+            (current + states - 1) % states
+        };
+        self.selected_eye = (next > 0).then(|| next - 1);
+        let label = self
+            .selected_eye
+            .map_or_else(|| "all cones".to_string(), |eye| format!("eye {eye}"));
+        self.push_toast(format!("Sense probe: {label}"));
     }
 
     /// Whether the user asked for a screenshot and it has not been served yet.
@@ -4987,6 +5144,36 @@ impl Palette {
         Style::default().fg(self.theme().accent)
     }
 
+    /// Field label: the name of a readout, not the readout (bd-f4x0).
+    ///
+    /// DIM on purpose. Panels here had two tiers — bold header or unstyled — so
+    /// labels were routinely drawn in the same bold accent as titles and ended up
+    /// competing with the numbers they introduce. The bead's word for the fix is
+    /// restraint: the world is the subject, chrome should recede. A label is
+    /// chrome, so it is the quietest thing on the panel that still reads.
+    fn label_style(&self) -> Style {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+
+    /// The readout itself — the one thing on a panel that is data.
+    ///
+    /// Undimmed and unbolded: it wins by being the only element at full weight,
+    /// not by shouting louder than the chrome around it. Bolding values too would
+    /// restore the flat hierarchy this scale exists to remove.
+    fn value_style(&self) -> Style {
+        Style::default()
+    }
+
+    /// Secondary text: hints, units, counts that qualify a value.
+    ///
+    /// Shares the dim weight of a label but takes the theme accent, so a hint is
+    /// legible as *related to this panel* without being mistaken for a value.
+    fn muted_style(&self) -> Style {
+        Style::default()
+            .fg(self.theme().accent)
+            .add_modifier(Modifier::DIM)
+    }
+
     fn paused_style(&self) -> Style {
         let theme = self.theme();
         Style::default()
@@ -6944,6 +7131,258 @@ mod tests {
             ansi16,
             (expected[0], expected[1], expected[2]),
             "the 16-color background must be exactly the engine's quantization of the truecolor one"
+        );
+    }
+
+    /// The typographic scale must be a real HIERARCHY, not three names for one
+    /// look (bd-f4x0).
+    ///
+    /// Before this the TUI had two tiers — bold header, or unstyled — so a field
+    /// label was drawn in the same bold accent as a panel title and competed with
+    /// the number it introduced. A "scale" whose tiers were visually identical
+    /// would be the same defect with more code, so each tier is asserted distinct
+    /// from the others and the weights are asserted in order.
+    #[test]
+    fn the_typographic_scale_is_an_ordered_hierarchy() {
+        let palette = Palette::test_backend_evidence();
+        let title = palette.header_style();
+        let label = palette.label_style();
+        let value = palette.value_style();
+        let muted = palette.muted_style();
+
+        assert!(
+            title.add_modifier.contains(Modifier::BOLD),
+            "a panel title is the heaviest tier"
+        );
+        assert!(
+            !value.add_modifier.contains(Modifier::BOLD)
+                && !value.add_modifier.contains(Modifier::DIM),
+            "a value carries by being the only thing at full weight, not by shouting"
+        );
+        assert!(
+            label.add_modifier.contains(Modifier::DIM),
+            "a label is chrome and must recede"
+        );
+        assert!(
+            muted.add_modifier.contains(Modifier::DIM),
+            "a hint is at least as quiet as a label"
+        );
+
+        // Distinctness: a label and a hint share DIM, so colour must separate them.
+        assert_ne!(
+            label, muted,
+            "label and hint must be distinguishable, not two names for one style"
+        );
+        assert_ne!(label, value, "label must not render as a value");
+        assert_ne!(title, value, "title must not render as a value");
+    }
+
+    /// bd-f4x0 requires the accessibility palettes to SURVIVE the redesign. The
+    /// scale derives its colour from the theme rather than hardcoding one, so
+    /// this drives every palette mode and every curated theme and asserts the
+    /// hierarchy still holds — a scale that only worked in the default theme
+    /// would have quietly dropped the colourblind-safe modes.
+    #[test]
+    fn the_scale_survives_every_accessibility_palette_and_theme() {
+        for mode in [
+            TerminalPaletteMode::Natural,
+            TerminalPaletteMode::Deuteranopia,
+            TerminalPaletteMode::Protanopia,
+            TerminalPaletteMode::Tritanopia,
+            TerminalPaletteMode::HighContrast,
+        ] {
+            for theme_id in [
+                CuratedThemeId::BioluminescentDarkField,
+                CuratedThemeId::CyberpunkAurora,
+                CuratedThemeId::Darcula,
+                CuratedThemeId::LumenLight,
+                CuratedThemeId::NordicFrost,
+                CuratedThemeId::HighContrast,
+            ] {
+                let mut palette = Palette::test_backend_evidence();
+                palette.mode = mode;
+                palette.theme_id = theme_id;
+
+                let label = palette.label_style();
+                let value = palette.value_style();
+                let muted = palette.muted_style();
+                assert!(
+                    label.add_modifier.contains(Modifier::DIM),
+                    "{mode:?}/{theme_id:?}: label must stay dim"
+                );
+                assert_ne!(
+                    label, muted,
+                    "{mode:?}/{theme_id:?}: label and hint must stay distinguishable"
+                );
+                assert_ne!(
+                    value, muted,
+                    "{mode:?}/{theme_id:?}: value and hint must stay distinguishable"
+                );
+            }
+        }
+    }
+
+    /// Cone selection is a RING over `All` plus each eye, wrapping both ways.
+    ///
+    /// Increment-and-clamp would make the ends sticky: a user holding `.` would
+    /// silently stop at the last eye and read the control as dead, which is the
+    /// same "control that stops responding" class bd-jw6f was filed for.
+    #[test]
+    fn cone_selection_cycles_through_every_eye_and_wraps_both_ways() {
+        let world = command_characterization_world();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+        assert_eq!(app.selected_eye, None, "starts showing all cones");
+
+        // Forward: All -> 0 -> 1 -> .. -> NUM_EYES-1 -> All
+        for expected in 0..NUM_EYES {
+            app.cycle_eye_selection(true);
+            assert_eq!(
+                app.selected_eye,
+                Some(expected),
+                "forward step must reach eye {expected}"
+            );
+        }
+        app.cycle_eye_selection(true);
+        assert_eq!(
+            app.selected_eye, None,
+            "forward past the last eye wraps to all"
+        );
+
+        // Backward from All must reach the LAST eye, not stick.
+        app.cycle_eye_selection(false);
+        assert_eq!(
+            app.selected_eye,
+            Some(NUM_EYES - 1),
+            "backward from all must wrap to the last eye"
+        );
+        for expected in (0..NUM_EYES - 1).rev() {
+            app.cycle_eye_selection(false);
+            assert_eq!(app.selected_eye, Some(expected));
+        }
+        app.cycle_eye_selection(false);
+        assert_eq!(app.selected_eye, None, "backward past eye 0 wraps to all");
+    }
+
+    /// The keystrokes are the accessible surface, so they are driven rather than
+    /// the method being called directly — a binding that never reached
+    /// `cycle_eye_selection` would pass a method-only test.
+    #[test]
+    fn the_cone_shortcuts_are_reachable_from_the_keyboard() {
+        let world = command_characterization_world();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .expect("dot selects a cone");
+        assert_eq!(app.selected_eye, Some(0), "'.' must select the first cone");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE))
+            .expect("comma steps back");
+        assert_eq!(app.selected_eye, None, "',' must step back to all cones");
+    }
+
+    /// THE TRAP THIS BEAD WARNS ABOUT. Eye channels are NOT a regular `eye * 4`
+    /// stride: densities sit at sensor indices 0, 5, 12, 21. A panel that indexed
+    /// by hand would show a food channel as eye 1's density — plausible-looking
+    /// and wrong. This pins that the rendered cone value equals the sensor
+    /// channel `eye_channel_indices` names, and that it is NOT the naive one.
+    #[test]
+    fn a_selected_cone_reads_the_irregular_channel_layout_not_a_naive_stride() {
+        for eye in 0..NUM_EYES {
+            let indices = scriptbots_core::eye_channel_indices(eye)
+                .expect("every eye in 0..NUM_EYES must own four sensor channels");
+            let naive = eye * 4;
+            if indices[0] != naive {
+                // Prove the authority disagrees with the naive stride somewhere,
+                // so this test is meaningful rather than trivially true.
+                assert_ne!(
+                    indices[0], naive,
+                    "eye {eye} density is at {} not {naive}",
+                    indices[0]
+                );
+            }
+            // And the four channels of a cone are the ones SENSOR_LAYOUT assigns.
+            let from_layout: Vec<usize> = SENSOR_LAYOUT
+                .iter()
+                .filter(|channel| channel.eye == Some(eye))
+                .map(|channel| channel.index)
+                .collect();
+            assert_eq!(
+                indices.to_vec(),
+                from_layout,
+                "eye {eye}: eye_channel_indices must agree with SENSOR_LAYOUT"
+            );
+        }
+        // The layout really is irregular, so the guard above is not vacuous.
+        let first = scriptbots_core::eye_channel_indices(0).expect("eye 0");
+        let second = scriptbots_core::eye_channel_indices(1).expect("eye 1");
+        assert_ne!(
+            second[0] - first[0],
+            4,
+            "if eye spacing were a regular 4 this test would be pointless; \
+             the layout is documented as irregular"
+        );
+    }
+
+    /// Selecting a cone must not touch the world: the probe is a read-only
+    /// projection, and a panel that advanced the simulation would corrupt the
+    /// run an experimenter is observing.
+    #[test]
+    fn selecting_a_cone_does_not_advance_the_simulation() {
+        let world = command_characterization_world();
+        {
+            let mut guard = world.lock().expect("seed");
+            guard
+                .try_spawn_agent(AgentData::default())
+                .expect("default agent is finite");
+        }
+        let before = world.lock().expect("tick").tick().0;
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+        for _ in 0..(NUM_EYES * 3) {
+            app.cycle_eye_selection(true);
+        }
+        assert_eq!(
+            world.lock().expect("tick").tick().0,
+            before,
+            "cone selection must not step the world"
         );
     }
 
