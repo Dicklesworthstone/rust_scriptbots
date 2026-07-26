@@ -22128,6 +22128,31 @@ impl WorldState {
                 runtime.herbivore_tendency,
             );
 
+            // bd-fba5: the visitation order below mirrors C++ `Agent::reproduce` exactly --
+            // herbivore (Agent.cpp:111), clocks (112-115), the five sensory modifiers (122-126),
+            // per-eye FOV and direction interleaved (130-137), then temperature (139). Every draw
+            // advances the shared offspring mutation substream, so the order is part of the genome
+            // contract rather than a stylistic choice: visiting the same genes in a different
+            // sequence yields different offspring from the same seed.
+            for i in 0..runtime.clocks.len() {
+                let before = runtime.clocks[i];
+                let after = Self::mutate_value_with_probability(
+                    mutation_rng,
+                    runtime.clocks[i],
+                    primary_rate,
+                    mutation_scale,
+                    2.0,
+                    200.0,
+                );
+                runtime.clocks[i] = after;
+                runtime.log_change(
+                    gene_log_capacity,
+                    if i == 0 { "clock1" } else { "clock2" },
+                    before,
+                    after,
+                );
+            }
+
             let (before_smell, after_smell) = {
                 let before = runtime.trait_modifiers.smell;
                 let after = Self::mutate_modifier_with_probability(
@@ -22208,42 +22233,10 @@ impl WorldState {
             };
             runtime.log_change(gene_log_capacity, "mut_blood", before_blood, after_blood);
 
-            for i in 0..runtime.clocks.len() {
-                let before = runtime.clocks[i];
-                let after = Self::mutate_value_with_probability(
-                    mutation_rng,
-                    runtime.clocks[i],
-                    primary_rate,
-                    mutation_scale,
-                    2.0,
-                    200.0,
-                );
-                runtime.clocks[i] = after;
-                runtime.log_change(
-                    gene_log_capacity,
-                    if i == 0 { "clock1" } else { "clock2" },
-                    before,
-                    after,
-                );
-            }
-
-            let before_temp = runtime.temperature_preference;
-            runtime.temperature_preference = Self::mutate_value_with_probability(
-                mutation_rng,
-                runtime.temperature_preference,
-                primary_rate,
-                mutation_scale,
-                0.0,
-                1.0,
-            );
-            runtime.log_change(
-                gene_log_capacity,
-                "mut_temp_pref",
-                before_temp,
-                runtime.temperature_preference,
-            );
-
-            for i in 0..runtime.eye_fov.len() {
+            // bd-fba5: one loop per eye, FOV then direction, matching the single C++ loop at
+            // Agent.cpp:130-137. Running every FOV and then every direction visits the same genes
+            // but consumes the substream in a different sequence.
+            for i in 0..NUM_EYES {
                 let before = runtime.eye_fov[i];
                 let after =
                     if Self::mutation_event_accepted(mutation_rng, primary_rate, mutation_scale) {
@@ -22259,8 +22252,7 @@ impl WorldState {
                     };
                 runtime.eye_fov[i] = after;
                 runtime.log_change(gene_log_capacity, &format!("eye_fov{i}"), before, after);
-            }
-            for i in 0..runtime.eye_direction.len() {
+
                 let before = runtime.eye_direction[i];
                 // bd-d5w4: only a perturbed angle is renormalized. C++ treats eye direction as a
                 // closed interval and clamps out-of-range values outside the gate, so an exact
@@ -22282,6 +22274,23 @@ impl WorldState {
                     );
                 }
             }
+
+            // bd-fba5: temperature is drawn LAST, after the eyes, matching C++ Agent.cpp:139.
+            let before_temp = runtime.temperature_preference;
+            runtime.temperature_preference = Self::mutate_value_with_probability(
+                mutation_rng,
+                runtime.temperature_preference,
+                primary_rate,
+                mutation_scale,
+                0.0,
+                1.0,
+            );
+            runtime.log_change(
+                gene_log_capacity,
+                "mut_temp_pref",
+                before_temp,
+                runtime.temperature_preference,
+            );
         }
 
         runtime
@@ -31134,6 +31143,14 @@ mod tests {
         let mut expected_rng = SmallRngStream::seed_from_u64(0x5EED_0004);
         let expected_modifiers = {
             let _herbivore_delta: f32 = expected_rng.random_range(-1.0_f32..1.0_f32);
+            // bd-fba5: both clocks are drawn between herbivore and the modifiers, mirroring
+            // C++ Agent.cpp:112-115. This fixture pins the modifiers' gate-then-delta pairing,
+            // not their absolute position, so it consumes the intervening clock draws rather
+            // than asserting on them -- bd_fba5_draw_order_matches_the_cpp_reference owns order.
+            for _ in 0..2 {
+                let _clock_gate: f32 = expected_rng.random_range(0.0_f32..1.0_f32);
+                let _clock_delta: f32 = expected_rng.random_range(-1.0_f32..1.0_f32);
+            }
             let mut accepted = |before: f32, min: f32, max: f32| {
                 let gate: f32 = expected_rng.random_range(0.0_f32..1.0_f32);
                 assert!(gate < 5.0, "fixture requires an accepted event");
@@ -31194,9 +31211,15 @@ mod tests {
             "a rejected event must inherit the exact parent payload, not a re-clamped copy"
         );
 
-        // Pins the order every gated gene draws in: herbivore delta, the five sensory gates, both
-        // clocks, temperature, then FOV and direction per eye. A reordering is a digest change and
+        // Pins the order every gated gene draws in, which since bd-fba5 mirrors C++
+        // `Agent::reproduce`: herbivore delta, both clock gates, the five sensory gates, then FOV
+        // and direction interleaved per eye, then temperature. A reordering is a digest change and
         // must be argued for explicitly rather than land as a silent edit.
+        //
+        // Note this arm cannot by itself distinguish one order from another: every gate rejects,
+        // so all 16 draws are the same kind and only their COUNT is pinned here. The order proper
+        // is enforced by `bd_fba5_draw_order_matches_the_cpp_reference` below, which accepts every
+        // gate and therefore sees a distinct delta per gene.
         let mut expected = SmallRngStream::seed_from_u64(0x5EED_0006);
         let _herbivore_delta: f32 = expected.random_range(-1.0_f32..1.0_f32);
         for gene in 0..(5 + 2 + 1 + 2 * NUM_EYES) {
@@ -31210,6 +31233,112 @@ mod tests {
             mutation_rng.checkpoint(),
             expected.checkpoint(),
             "a rejected event must consume its gate draw and no delta draw"
+        );
+    }
+
+    /// The per-gene draw order reproduces C++ `Agent::reproduce` exactly (bd-fba5).
+    ///
+    /// Every gate accepts here, so each gene consumes a gate draw and then its own delta. That
+    /// makes position observable: a gene visited at a different point in the sequence receives a
+    /// different delta, so this fails if any gene moves. The reference is Agent.cpp -- herbivore
+    /// 111, clocks 112/114, modifiers 122-126, per-eye FOV 131 and direction 134 inside one loop,
+    /// temperature 139.
+    #[test]
+    fn bd_fba5_draw_order_matches_the_cpp_reference() {
+        let world = v69t_world();
+        // rate*5 == 5.0 exceeds every draw from `random_range(0.0..1.0)`, so no gate rejects.
+        let mut parent = v69t_parent(1.0);
+        parent.clocks = [40.0, 60.0];
+        parent.temperature_preference = 0.5;
+        parent.eye_fov = [0.2, 0.4, 0.6, 0.8];
+        parent.eye_direction = [0.1, 0.2, 0.3, 0.4];
+        let mut crossover_rng = SmallRngStream::seed_from_u64(0xFBA5_0001);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0xFBA5_0002);
+
+        let scale = 1.0_f32;
+        let mut expected = SmallRngStream::seed_from_u64(0xFBA5_0002);
+        // Agent.cpp:111 -- herbivore, unconditional.
+        let _herbivore: f32 = expected.random_range(-scale..scale);
+        // Agent.cpp:112,114 -- both clocks, immediately after herbivore.
+        let mut gated = |before: f32, min: f32, max: f32| -> f32 {
+            let gate: f32 = expected.random_range(0.0_f32..1.0_f32);
+            assert!(gate < 5.0, "fixture requires every gate to accept");
+            let delta: f32 = expected.random_range(-scale..scale);
+            (before + delta).clamp(min, max)
+        };
+        let expected_clocks = [gated(40.0, 2.0, 200.0), gated(60.0, 2.0, 200.0)];
+        // Agent.cpp:122-126 -- the five sensory modifiers.
+        let expected_modifiers = [
+            gated(parent.trait_modifiers.smell, 0.05, 3.0),
+            gated(parent.trait_modifiers.sound, 0.05, 3.0),
+            gated(parent.trait_modifiers.hearing, 0.1, 4.0),
+            gated(parent.trait_modifiers.eye, 0.5, 4.0),
+            gated(parent.trait_modifiers.blood, 0.5, 4.0),
+        ];
+        drop(gated);
+        // Agent.cpp:130-137 -- one loop per eye: FOV then direction.
+        let mut expected_fov = [0.0_f32; NUM_EYES];
+        let mut expected_dir = [0.0_f32; NUM_EYES];
+        for i in 0..NUM_EYES {
+            let _fov_gate: f32 = expected.random_range(0.0_f32..1.0_f32);
+            let fov_delta: f32 = expected.random_range(-scale..scale);
+            expected_fov[i] = (parent.eye_fov[i] + fov_delta).clamp(0.0, f32::MAX);
+            let _dir_gate: f32 = expected.random_range(0.0_f32..1.0_f32);
+            let dir_delta: f32 = expected.random_range(-scale..scale);
+            expected_dir[i] = wrap_unsigned_angle(parent.eye_direction[i] + dir_delta);
+        }
+        // Agent.cpp:139 -- temperature, last.
+        let temp_gate: f32 = expected.random_range(0.0_f32..1.0_f32);
+        assert!(temp_gate < 5.0);
+        let temp_delta: f32 = expected.random_range(-scale..scale);
+        let expected_temp = (parent.temperature_preference + temp_delta).clamp(0.0, 1.0);
+
+        let child = world.build_child_runtime(
+            &parent,
+            None,
+            8,
+            OffspringRngIdentityV1::new(AgentUid(1), None, 0),
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+
+        assert_eq!(
+            child.clocks.map(f32::to_bits),
+            expected_clocks.map(f32::to_bits),
+            "clocks must be drawn immediately after herbivore (Agent.cpp:112,114), before the \
+             sensory modifiers"
+        );
+        assert_eq!(
+            [
+                child.trait_modifiers.smell,
+                child.trait_modifiers.sound,
+                child.trait_modifiers.hearing,
+                child.trait_modifiers.eye,
+                child.trait_modifiers.blood,
+            ]
+            .map(f32::to_bits),
+            expected_modifiers.map(f32::to_bits),
+            "the five modifiers must follow the clocks (Agent.cpp:122-126)"
+        );
+        assert_eq!(
+            child.eye_fov.map(f32::to_bits),
+            expected_fov.map(f32::to_bits),
+            "FOV and direction must interleave per eye (Agent.cpp:130-137), not run as two passes"
+        );
+        assert_eq!(
+            child.eye_direction.map(f32::to_bits),
+            expected_dir.map(f32::to_bits),
+            "direction must be drawn immediately after its own eye's FOV"
+        );
+        assert_eq!(
+            child.temperature_preference.to_bits(),
+            expected_temp.to_bits(),
+            "temperature must be drawn last, after the eyes (Agent.cpp:139)"
+        );
+        assert_eq!(
+            mutation_rng.checkpoint(),
+            expected.checkpoint(),
+            "the pass must consume exactly the reference draw sequence, no more and no less"
         );
     }
 
