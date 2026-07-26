@@ -442,19 +442,15 @@ fn main() -> Result<()> {
             // Semantic projection only: this CPU rasterizer does NOT exercise the
             // GPU pipeline (bd-2z0.14.3.4 renamed it to make the dishonesty
             // impossible to miss); --dump-scene-png owns real GPU captures.
-            match scriptbots_bevy::probe_gpu_capability() {
-                Some(gpu) => info!(
-                    adapter = %gpu.name,
-                    backend = %gpu.backend,
-                    class = ?gpu.class,
-                    max_texture_2d = ?gpu.max_texture_2d,
-                    timestamp_queries = gpu.timestamp_queries,
-                    "GPU capability report for the Bevy snapshot"
-                ),
-                None => warn!(
-                    "no GPU adapter detected; the Bevy snapshot uses the software visual path"
-                ),
-            }
+            //
+            // Deliberately NO probe_gpu_capability() call here. It used to log a
+            // capability report, which meant a command documented as CPU-only
+            // built a wgpu instance and requested an adapter — real GPU work,
+            // and a report describing hardware this path never uses. That made
+            // the semantic reference lane unable to prove it is GPU-free, and
+            // on a headless host it charged adapter enumeration for a raster
+            // that cannot use one (bd-2z0.14.3.4 round-1 audit). The
+            // no_gpu_touch alarm below pins this.
             let (w, h) = cli
                 .png_size
                 .as_deref()
@@ -4321,6 +4317,51 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    /// bd-2z0.14.3.4: the semantic projection path must not touch the GPU.
+    ///
+    /// `--dump-semantic-png` is the CPU reference raster. It used to call
+    /// `probe_gpu_capability()` to log a capability report, so a command
+    /// documented as CPU-only built a wgpu instance and enumerated adapters —
+    /// describing hardware it never uses, and charging that cost on headless
+    /// hosts for a raster that cannot use one.
+    ///
+    /// This inspects the source because the alternative is asserting on a real
+    /// adapter enumeration, which is exactly the side effect under test. The
+    /// scan is scoped to the `dump_semantic_png` block so an unrelated probe
+    /// elsewhere in `main.rs` — `--dump-scene-png` legitimately needs one —
+    /// cannot trip or mask it.
+    #[test]
+    fn semantic_projection_path_never_probes_the_gpu() {
+        let source = include_str!("main.rs");
+        let after = source
+            .split_once("if let Some(path) = cli.dump_semantic_png.as_ref() {")
+            .expect("semantic png branch")
+            .1;
+        // Stop at the next top-level CLI branch so only this arm is inspected.
+        let block = after
+            .split_once("\n        #[cfg(feature")
+            .map_or(after, |(before, _)| before);
+        // Comments are stripped before scanning. The block deliberately explains
+        // in prose why it does NOT probe, and naming the function there must not
+        // read as calling it — a guard that cannot tell a call from a comment
+        // about a call fails on the very code it is meant to bless.
+        let code: String = block
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("probe_gpu_capability"),
+            "the CPU-only semantic projection path must not probe the GPU; \
+             --dump-scene-png owns real GPU captures"
+        );
+        assert!(
+            code.contains("render_bevy_png"),
+            "scan anchored to the wrong block: the semantic arm must still \
+             render through the CPU rasterizer"
+        );
+    }
 
     /// Exercise the shipped startup function, not a protocol-only fixture.
     #[test]
