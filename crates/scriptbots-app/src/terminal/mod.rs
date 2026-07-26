@@ -7531,10 +7531,10 @@ mod tests {
     /// object in the upstream repository at all and survived exactly that way —
     /// no amount of compiling could have caught it.
     ///
-    /// This cannot check that the SHA exists upstream (that needs the network and
-    /// a fetched git db), so it checks the next best invariant: the manifest and
-    /// the document that justifies it cannot disagree. A future edit to either
-    /// one alone fails here.
+    /// This one checks only that the manifest and the document that justifies it
+    /// cannot disagree — a future edit to either alone fails here. It would still
+    /// pass if both were edited in lockstep to a fabricated SHA, which is why
+    /// `the_frankentui_pin_names_a_real_upstream_object` checks existence too.
     #[test]
     fn frankentui_pin_matches_the_documented_revision() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7584,6 +7584,129 @@ mod tests {
             manifest_rev.chars().all(|c| c.is_ascii_hexdigit()),
             "ftui rev {manifest_rev} is not hexadecimal"
         );
+    }
+
+    /// The pinned rev must name an object that actually exists upstream.
+    ///
+    /// The two sibling guards compare Cargo.toml against the document, so they
+    /// both pass if someone edits the pin and the doc together to a SHA that was
+    /// never a commit — which is precisely the shape of the original defect: a
+    /// real short SHA (`15cc6543`) carrying a fabricated 32-character tail.
+    ///
+    /// Cargo itself will never catch this while the pin is unconsumed. Measured,
+    /// not assumed (bd-phj8): in a scratch workspace holding the bad rev in an
+    /// unconsumed `[workspace.dependencies]` entry, `cargo metadata`, `cargo
+    /// fetch`, `cargo update` and `cargo generate-lockfile` all exited 0 and
+    /// `Cargo.lock` never mentioned ftui. Adding one consumer flipped the same
+    /// bad rev to exit 101 while the corrected rev stayed at 0. So forcing
+    /// resolution requires adoption, and adoption is an admission decision under
+    /// docs/franken_integration.md rather than a side effect of fixing a pin.
+    ///
+    /// The existence check does not need the network: Cargo's own fetched git db
+    /// under `$CARGO_HOME/git/db/frankentui-*` answers it. When that db is absent
+    /// (fresh CI, a worker that never fetched frankentui) there is nothing to
+    /// check against, so this skips rather than failing — a guard that goes red
+    /// on machines with a cold cache would just be disabled by the next person.
+    #[test]
+    fn the_frankentui_pin_names_a_real_upstream_object() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root is two levels above this crate");
+
+        let manifest =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("read workspace Cargo.toml");
+        let pin_line = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with("ftui = "))
+            .expect("the workspace must declare an ftui pin");
+        let rev = extract_rev(pin_line).expect("the ftui pin must carry a rev");
+
+        let Some(db) = frankentui_git_db() else {
+            eprintln!("skipping: frankentui has never been fetched into the cargo git db");
+            return;
+        };
+
+        assert_eq!(
+            frankentui_object_kind(&db, &rev).as_deref(),
+            Some("commit"),
+            "ftui is pinned at {rev}, but that is not a commit in the fetched \
+             frankentui git db at {}. An unconsumed pin is never resolved by \
+             Cargo, so a fabricated SHA cannot fail any build — this guard is the \
+             only thing standing between the manifest and a rev that does not \
+             exist (bd-phj8).",
+            db.display()
+        );
+    }
+
+    /// The probe above is only worth having if it actually rejects a bad SHA, so
+    /// this pins that down against the two historically meaningful values rather
+    /// than leaving it to be re-verified by hand.
+    ///
+    /// This exists because the FIRST version of the sibling
+    /// `frankentui_pin_matches_the_documented_revision` guard was vacuous: it
+    /// asserted `doc.contains(manifest_rev)`, and the document quotes the old bad
+    /// SHA in its history note, so it went green on the exact value it existed to
+    /// reject. A guard nobody has watched fail is not yet a guard.
+    #[test]
+    fn the_frankentui_object_probe_rejects_the_original_bad_sha() {
+        /// The real upstream commit, from bd-2z0.6.3.1.
+        const GOOD: &str = "15cc6543f76b814394c590f9e7719dedd6684e4c";
+        /// What the manifest carried before bd-phj8: the same `15cc6543` short
+        /// prefix with a fabricated 32-character tail.
+        const BAD: &str = "15cc65438a2095fbe8dd0dfce9adcfc7edab7612";
+
+        let Some(db) = frankentui_git_db() else {
+            eprintln!("skipping: frankentui has never been fetched into the cargo git db");
+            return;
+        };
+
+        assert_eq!(
+            frankentui_object_kind(&db, GOOD).as_deref(),
+            Some("commit"),
+            "the known-good rev must resolve, otherwise this probe proves nothing"
+        );
+        assert_ne!(
+            frankentui_object_kind(&db, BAD).as_deref(),
+            Some("commit"),
+            "the known-bad rev {BAD} resolved to a commit — the probe cannot tell \
+             a real object from a fabricated one and the guard above is vacuous"
+        );
+    }
+
+    /// Locate Cargo's fetched frankentui git db, or `None` when nothing has ever
+    /// fetched it (fresh CI, a remote build worker) and there is nothing to check
+    /// against. Note this means the existence guards are inert on such machines —
+    /// they have teeth on developer hosts with a warm cargo cache.
+    fn frankentui_git_db() -> Option<std::path::PathBuf> {
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo"))
+            })?;
+        std::fs::read_dir(cargo_home.join("git/db"))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("frankentui-"))
+            })
+    }
+
+    /// Ask the fetched git db what kind of object `rev` is. `None` when git
+    /// cannot answer at all; `Some("commit")` only for a real commit.
+    fn frankentui_object_kind(db: &std::path::Path, rev: &str) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", db.display()))
+            .args(["cat-file", "-t", rev])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
     /// Pull `rev = "..."` out of a Cargo dependency line.
