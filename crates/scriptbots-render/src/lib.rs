@@ -18250,6 +18250,70 @@ mod command_characterization_tests {
         );
     }
 
+    /// bd-jw6f tier 1, the group the map called costliest to get wrong: "if these
+    /// are inert the app feels broken on first contact".
+    ///
+    /// Speed already had a state proof — the GuiSimulationDriver ratio test —
+    /// but that drives the DRIVER directly and never presses a key, so the
+    /// binding half was still unproven. This closes it from the other end:
+    /// keystroke in, canonical intent out.
+    ///
+    /// Asserting the EXACT submitted value rather than "a command was submitted"
+    /// is the point. Speed is computed as `clamp(current + delta, 0.25, 4.0)`
+    /// rounded to 2dp, so a wrong delta, a wrong sign, or a rounding slip would
+    /// all still submit *something* and pass a weaker assertion.
+    #[test]
+    fn speed_shortcuts_submit_the_exact_canonical_speed_intent() {
+        let mut fixture = ShortcutFixture::install();
+        let base = fixture.read(|view| view.simulation_drive_snapshot().speed_multiplier);
+
+        fixture.press("shift-=");
+        let after_increase = fixture.submitted();
+        let expected_up = ((base + 0.25).clamp(0.25, 4.0) * 100.0).round() / 100.0;
+        assert!(
+            after_increase.iter().any(|command| matches!(
+                command,
+                ControlCommand::UpdateSimulation(update)
+                    if update.speed_multiplier == Some(expected_up)
+            )),
+            "IncreaseSimulationSpeed: 'shift-=' must submit speed {expected_up} from {base}, \
+             got {after_increase:?}"
+        );
+
+        fixture.press("-");
+        let after_decrease = fixture.submitted();
+        assert!(
+            after_decrease.len() > after_increase.len(),
+            "DecreaseSimulationSpeed: '-' must submit an intent of its own"
+        );
+        // The view recomputes from the DRIVER's speed, which the fixture never
+        // advances, so the decrease is one step below the same base.
+        let expected_down = ((base - 0.25).clamp(0.25, 4.0) * 100.0).round() / 100.0;
+        assert!(
+            after_decrease
+                .iter()
+                .skip(after_increase.len())
+                .any(|command| matches!(
+                    command,
+                    ControlCommand::UpdateSimulation(update)
+                        if update.speed_multiplier == Some(expected_down)
+                )),
+            "DecreaseSimulationSpeed: '-' must submit speed {expected_down}, got {after_decrease:?}"
+        );
+
+        // Every speed intent must carry the CURRENT pause state rather than
+        // silently resuming a paused world — changing speed is not a play command.
+        let paused_now = fixture.read(|view| view.simulation_drive_snapshot().paused);
+        assert!(
+            after_decrease.iter().all(|command| matches!(
+                command,
+                ControlCommand::UpdateSimulation(update)
+                    if update.paused == Some(paused_now) && !update.step_once
+            )),
+            "a speed change must preserve pause state and never request a step"
+        );
+    }
+
     /// CyclePalette was "driven but not state-proven". The accessibility palette
     /// is a five-way cycle, so proving it means more than "it changed": pressing
     /// it five times must return to where it started, which a control that
