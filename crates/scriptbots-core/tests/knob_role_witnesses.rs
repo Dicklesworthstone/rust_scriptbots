@@ -286,6 +286,38 @@ static WITNESSES: &[Witness] = &[
     // defaults to 0.5) and simply has not been re-verified since. Every entry in this table has
     // been OBSERVED to move material state on a real run; nothing is here on the strength of an
     // argument that it ought to.
+    // Second batch (bd-dorx). Food-lane and terrain-coupled knobs, chosen because the first batch
+    // showed the food/terrain lanes move readily, so a ghost here is informative rather than noise.
+    Witness {
+        path: "food_diffusion_rate",
+        value: || Value::from(0.22),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_waste_rate",
+        value: || Value::from(0.2),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_respawn_amount",
+        value: || Value::from(0.3),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_respawn_interval",
+        value: || Value::from(2),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_fertility_base",
+        value: || Value::from(0.8),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_capacity_base",
+        value: || Value::from(0.4),
+        ticks: 8,
+    },
     Witness {
         path: "aging_tick_interval",
         value: || Value::from(1),
@@ -369,10 +401,10 @@ fn bd_dorx_every_witness_targets_a_scientific_knob() {
 /// lie of exactly the kind bd-dorx exists to stop. A floor makes the debt visible in the test
 /// output every run while making it impossible to quietly delete a witness.
 ///
-/// 15 is the OBSERVED count -- every one of these was seen to move material state on a real run.
+/// 21 is the OBSERVED count -- every one of these was seen to move material state on a real run.
 /// It is not an aspiration. An earlier value of 17 was aspirational and left this gate red,
 /// which is the failure it exists to prevent, so the number now tracks evidence only.
-const WITNESS_COVERAGE_FLOOR: usize = 15;
+const WITNESS_COVERAGE_FLOOR: usize = 21;
 
 /// Report scientific coverage, and hold the line against it regressing.
 ///
@@ -427,7 +459,11 @@ fn bd_dorx_scientific_witness_coverage_does_not_regress() {
 ///   flattener stops at any non-object node, so each is one leaf on a default world and expands
 ///   only once populated. The deeper paths are real and reachable — just not discoverable from a
 ///   default config. That is the discovery/mutation asymmetry recorded on bd-dorx.
-/// * `mutation.primary` and `mutation.secondary` are STALE, and are a live defect. No
+/// The stale pair that motivated this gate -- `mutation.primary` and `mutation.secondary` -- has
+/// now been REMOVED from `KNOB_RANGES`, so only the legitimate entries remain below. Kept in the
+/// docs because the reasoning is what stops them being reintroduced:
+///
+/// * `mutation.primary` and `mutation.secondary` WERE stale. No
 ///   `ScriptBotsConfig` field produces either path: the config carries
 ///   `reproduction_mutation_scale`, `reproduction_meta_mutation_chance` and
 ///   `reproduction_meta_mutation_scale`. The `mutation_primary` / `mutation_secondary` identifiers
@@ -440,8 +476,6 @@ fn bd_dorx_scientific_witness_coverage_does_not_regress() {
 /// them needs an edit to `crates/scriptbots-core/src/lib.rs` (~4749), which was leased by another
 /// agent when this gate was written.
 const KNOB_RANGES_NOT_PUBLISHED_BY_DEFAULT: &[&str] = &[
-    "mutation.primary",
-    "mutation.secondary",
     "render.auto_exposure.speed_brighten",
     "render.auto_exposure.speed_darken",
     "render.day_night.cycle_ticks",
