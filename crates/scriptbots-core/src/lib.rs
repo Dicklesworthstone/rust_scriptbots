@@ -1027,22 +1027,21 @@ fn wrap_signed_angle(mut angle: f32) -> f32 {
 ///    matching makes those two produce the same bytes. What IS achievable, and what this restores,
 ///    is DISTRIBUTIONAL parity: same family, same sigma, same tails.
 ///
-/// STREAM CONSUMPTION CHANGES. A uniform draw consumed exactly one value; this consumes two per
-/// rejection-loop attempt, and the loop retries when the sampled point falls outside the unit
-/// circle (probability `1 - pi/4`, about 21% per attempt). Consumption is therefore both larger
-/// and variable, which shifts every downstream draw in the offspring substream and moves
-/// `WorldDigestV1`.
+/// STREAM CONSUMPTION CHANGES. A uniform draw consumed exactly one value; this consumes exactly
+/// two, so every downstream draw in the offspring substream shifts and `WorldDigestV1` moves.
+///
+/// ALGORITHM CHOICE: Box-Muller, deliberately matching `scriptbots-brain`'s existing sampler
+/// (`MlpBrain::gaussian`, `DwraonBrain::gaussian`) rather than C++'s Marsaglia polar. That crate
+/// reached the no-global-cache conclusion first and paired it with a second property this one
+/// needs too: Box-Muller consumes a FIXED two draws, where polar consumes two per attempt with a
+/// roughly 21% retry, making consumption variable. A fixed cost keeps stream continuations
+/// freezable in tests and keeps one sampler convention across the workspace. Both are exact
+/// standard-normal samplers, so the distribution is unaffected by the choice.
 fn normal_deviate(rng: &mut dyn RandomStream, sigma: f32) -> f32 {
-    loop {
-        let var1 = 2.0_f64 * f64::from(rng.random_range(0.0_f32..1.0_f32)) - 1.0;
-        let var2 = 2.0_f64 * f64::from(rng.random_range(0.0_f32..1.0_f32)) - 1.0;
-        let rsquared = var1.mul_add(var1, var2 * var2);
-        if rsquared >= 1.0 || rsquared == 0.0 {
-            continue;
-        }
-        let polar = (-2.0 * rsquared.ln() / rsquared).sqrt();
-        return (var2 * polar * f64::from(sigma)) as f32;
-    }
+    let u1 = rng.random::<f32>().clamp(f32::MIN_POSITIVE, 1.0);
+    let u2 = rng.random::<f32>();
+    let magnitude = (-2.0 * u1.ln()).sqrt();
+    magnitude * (std::f32::consts::TAU * u2).cos() * sigma
 }
 
 /// Mutation spread for `herbivore_tendency`, from C++ `Agent.cpp:111` (bd-hgxt).
@@ -4258,24 +4257,52 @@ pub struct SensorAttribution {
     pub truncated: usize,
 }
 
-/// Sensor-vector indices for one eye: `[density, red, green, blue]`.
+/// Derive `[density, red, green, blue]` indices for every eye from the canonical
+/// [`SENSOR_LAYOUT`].
 ///
-/// The layout is IRREGULAR and that is deliberate legacy parity, not an
-/// oversight: eye blocks start at 0, 5, 12 and 21, interleaved with food,
-/// sound, smell, health, clock, hearing, blood and temperature channels. The
-/// strides are 5, 7 and 9.
-///
-/// This table exists so no frontend re-derives it. A renderer that assumed a
-/// regular `eye * 4` stride would read food as eye 1's density and clocks as
-/// eye 3's, and the resulting panel would look plausible while being wrong —
-/// which is precisely the failure `bd-hzi1` forbids by saying sensor math must
-/// not be duplicated in a frontend.
-const EYE_CHANNEL_INDICES: [[usize; 4]; NUM_EYES] = [
-    [0, 1, 2, 3],
-    [5, 6, 7, 8],
-    [12, 13, 14, 15],
-    [21, 22, 23, 24],
-];
+/// Keeping this computation `const` makes the public lookup O(1) while ensuring
+/// the cache cannot drift from the wire layout. A missing component, duplicate
+/// component, out-of-range eye owner, or non-eye channel carrying an eye owner
+/// fails the build instead of producing a plausible but wrong inspector panel.
+const fn derive_eye_channel_indices() -> [[usize; 4]; NUM_EYES] {
+    let mut indices = [[usize::MAX; 4]; NUM_EYES];
+    let mut sensor = 0;
+    while sensor < INPUT_SIZE {
+        let channel = SENSOR_LAYOUT[sensor];
+        if let Some(eye) = channel.eye {
+            assert!(eye < NUM_EYES, "sensor channel owns an out-of-range eye");
+            let component = match channel.kind {
+                SensorKind::EyeDensity => 0,
+                SensorKind::EyeRed => 1,
+                SensorKind::EyeGreen => 2,
+                SensorKind::EyeBlue => 3,
+                _ => panic!("non-eye sensor channel carries an eye owner"),
+            };
+            assert!(
+                indices[eye][component] == usize::MAX,
+                "eye sensor component is duplicated"
+            );
+            indices[eye][component] = channel.index;
+        }
+        sensor += 1;
+    }
+
+    let mut eye = 0;
+    while eye < NUM_EYES {
+        let mut component = 0;
+        while component < 4 {
+            assert!(
+                indices[eye][component] != usize::MAX,
+                "eye sensor component is missing"
+            );
+            component += 1;
+        }
+        eye += 1;
+    }
+    indices
+}
+
+const EYE_CHANNEL_INDICES: [[usize; 4]; NUM_EYES] = derive_eye_channel_indices();
 
 /// Sensor-vector indices for `eye`, or `None` when the index is out of range.
 #[must_use]
@@ -30691,6 +30718,28 @@ mod tests {
         assert_eq!(eye_channel_indices(3), Some([21, 22, 23, 24]));
         assert_eq!(eye_channel_indices(NUM_EYES), None);
         assert_eq!(eye_channel_indices(usize::MAX), None);
+
+        let component_kinds = [
+            SensorKind::EyeDensity,
+            SensorKind::EyeRed,
+            SensorKind::EyeGreen,
+            SensorKind::EyeBlue,
+        ];
+        for eye in 0..NUM_EYES {
+            let indices = eye_channel_indices(eye).expect("eye in range");
+            for (component, expected_kind) in component_kinds.iter().copied().enumerate() {
+                let channel = SENSOR_LAYOUT[indices[component]];
+                assert_eq!(
+                    channel.eye,
+                    Some(eye),
+                    "eye {eye} component {component} must come from its canonical owner"
+                );
+                assert_eq!(
+                    channel.kind, expected_kind,
+                    "eye {eye} component {component} must follow density, red, green, blue order"
+                );
+            }
+        }
 
         // A regular stride would be wrong for every eye past the first.
         for eye in 1..NUM_EYES {
