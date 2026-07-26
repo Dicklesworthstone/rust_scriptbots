@@ -2789,6 +2789,24 @@ pub enum StorageError {
     },
     #[error("FrankenSQLite error: {0}")]
     Database(#[from] FrankenError),
+    /// A caller requested a hard wall-clock bound that the pinned read facade cannot supply.
+    ///
+    /// The refusal occurs before opening or inspecting the database path. It is safer than
+    /// returning from a caller-side timeout while the worker query continues consuming
+    /// resources in the background.
+    #[error(
+        "hard execution bound {requested:?} is unavailable for {operation}: pinned FrankenSQLite {engine_version} (rev {engine_revision}) cannot guarantee a wall-clock stop through AsyncConnection while its !Send + !Sync connection remains on the owner worker; use AnalyticsSnapshotProvider::snapshot() for lock-free, non-SQL frontend latest-state access, or StorageReader::open() for explicitly unbounded, create-free read-only offline/reporting SQL"
+    )]
+    ReadExecutionBoundUnavailable {
+        /// Operation refused before it could touch storage.
+        operation: &'static str,
+        /// Requested maximum wall-clock duration.
+        requested: Duration,
+        /// Exact pinned package version against which the refusal was established.
+        engine_version: &'static str,
+        /// Exact immutable source revision against which the refusal was established.
+        engine_revision: &'static str,
+    },
     #[error(
         "FrankenSQLite transaction failed after {attempts} attempt(s) (transient={transient}, commit_state={commit_state:?}): {source}"
     )]
@@ -5590,6 +5608,11 @@ struct FinishedRunReaderLease {
 }
 
 /// Read-only view over an existing ScriptBots database.
+///
+/// "Bounded" reader methods bound result cardinality and allocation only; they do not
+/// impose a hard wall-clock bound on FrankenSQLite execution. This synchronous reader is
+/// for offline/reporting work where waiting is acceptable. Frontend latest-value paths use
+/// [`AnalyticsSnapshotProvider::snapshot`] instead of issuing SQL.
 pub struct StorageReader {
     conn: Option<Connection>,
     run_id: RunId,
@@ -5597,11 +5620,12 @@ pub struct StorageReader {
 }
 
 impl StorageReader {
-    /// Read one bounded page of validated run identities, newest launch first.
+    /// Read one result-bounded page of validated run identities, newest launch first.
     ///
     /// This catalog is the discovery path for multi-run frontends. Callers then bind every
     /// scientific query through [`Self::open_for_run`]. Page sizes share the storage-wide 4096-row
     /// ceiling, so browsing cannot materialize an arbitrarily large experiment database.
+    /// That ceiling does not bound database execution time.
     pub fn catalog_page(
         path: &str,
         offset: usize,
@@ -7431,9 +7455,9 @@ impl StorageReader {
     ///
     /// Mirrors [`Self::recent_metrics`] exactly — bounded limit, newest-window select,
     /// ascending return — so a caller moving between the two surfaces does not have to
-    /// remember which way each one runs. That symmetry is deliberate: `AsyncReadLane` and
-    /// `StorageReader` silently disagreed on metric order until `bd-vd3t`, and a second
-    /// reader with its own convention would invite the same defect.
+    /// remember which way each one runs. That symmetry is deliberate: the retired async
+    /// reader and `StorageReader` silently disagreed on metric order until `bd-vd3t`, and a
+    /// second reader with its own convention would invite the same defect.
     pub fn recent_run_events(&self, limit: usize) -> Result<Vec<PersistedRunEvent>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());

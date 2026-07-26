@@ -5,10 +5,8 @@ edition = "2024"
 
 [dependencies]
 arc-swap = { workspace = true }
-asupersync = { workspace = true }
 blake3 = { workspace = true }
-fsqlite = { workspace = true, features = ["async-api"] }
-fsqlite-types = { workspace = true }
+fsqlite = { workspace = true }
 libc = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
@@ -22,4 +20,3 @@ crossbeam-channel = "0.5"
 [dev-dependencies]
 tempfile = "3.8"
 tracing-subscriber = { workspace = true }
-

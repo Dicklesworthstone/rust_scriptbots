@@ -1,6 +1,6 @@
 # Franken Ecosystem Integration — Program Guide (bd-2js6)
 
-Last reconciled: **2026-07-17** (update this line whenever a program bead
+Last reconciled: **2026-07-26** (update this line whenever a program bead
 closes — that is part of each bead's close checklist by convention). This
 document is what a new contributor reads INSTEAD of re-running the six-repo
 survey that produced the program. Style: terse, factual. Authority order when
@@ -34,8 +34,9 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
   bd-2z0.6.2/bd-2z0.8.8.
 - **fsqlite depth** — FTS5+BM25 narrative search (bd-16g.2.6/.7 — the
   capability is ALREADY compiled into our binary; `fsqlite-ext-fts5` is in the
-  lock today), `async-api` (`AsyncConnection` + `Cx`) for control-plane reads
-  (bd-2z0.8.9.12), BEGIN CONCURRENT decision for archipelago persistence
+  lock today), completed `async-api` evaluation (bd-2z0.8.9.12; the production
+  read lane is disabled by bd-91lr because the pin cannot guarantee a running
+  statement deadline), BEGIN CONCURRENT decision for archipelago persistence
   (bd-2z0.8.9.13, default = per-island DBs unless evidence says otherwise).
 - **Analytics quartet** — new native-only `scriptbots-analytics` crate +
   `sb-analyze` CLI (bd-2z0.11.5): fsci-stats statistical rigor validating the
@@ -99,16 +100,23 @@ release-packaging obligation: bd-2z0.13.6).
    never a dependency of the app binaries; enforced by
    `ci/check_wasm_graph.sh` guard B).
 4. **UI paint paths never issue SQL** — they read `Arc<AnalyticsSnapshot>`.
-5. **One asupersync universe** — a single 0.3.x in the lock, shared by
+5. **SQL result bounds are not execution bounds.** The pinned fsqlite async
+   facade cannot guarantee a hard wall-clock stop after dispatch to the
+   connection-owner worker. `AsyncReadLane::open` therefore always rejects the
+   requested deadline before touching storage; no async SQL lane is exposed.
+   Frontends use `AnalyticsSnapshotProvider::snapshot()`. Offline/reporting
+   callers that can wait use the create-free, read-only `StorageReader`, whose
+   execution is explicitly unbounded (bd-91lr).
+6. **One asupersync universe** — a single 0.3.x in the lock, shared by
    fsqlite/fastmcp/first-party (`ci/check_asupersync_universe.sh`).
-6. **wasm graph is denylisted + snapshotted** (`ci/check_wasm_graph.sh`):
+7. **wasm graph is denylisted + snapshotted** (`ci/check_wasm_graph.sh`):
    no rayon/wide/tokio/rusqlite/franken numeric crates in `scriptbots-web`.
-7. **Single Cargo.lock mutation lane** (bd-2z0.8): franken admissions are
+8. **Single Cargo.lock mutation lane** (bd-2z0.8): franken admissions are
    serialized, one at a time, each with a `docs/licenses.md` row (enforced by
    `ci/check_franken_licenses.sh`).
-8. **Determinism first**: the world tick stays synchronous; brains and buses
+9. **Determinism first**: the world tick stays synchronous; brains and buses
    must prove same-seed bit-identity across thread counts before shipping.
-9. **The V6 base is run-bound and fail-closed**: canonical nonzero 128-bit `RunId`
+10. **The V6 base is run-bound and fail-closed**: canonical nonzero 128-bit `RunId`
    scopes every scientific and operational row. Writers own one run; append is
    atomic and allowed only after prior runs are fully durable. Multi-run reads
    select a run explicitly, catalog discovery is bounded and structurally
@@ -119,7 +127,7 @@ release-packaging obligation: bd-2z0.13.6).
    start `counters` digest bound by `world_counters_digest_v1` to the tick-zero
    allocation cursors, protocol, and counter rows. V3-V5 files are refused
    without rewrite (`bd-2z0.5.1`; `bd-1kxd`).
-10. **V8/V9 make runtime evidence explicit rather than inferential**: every
+11. **V8/V9 make runtime evidence explicit rather than inferential**: every
     scientific sequence, including an honest zero-event boundary, has one V8
     domain projection. V9 records runtime application transitions separately
     from storage commitment transitions while retaining the exact command
@@ -130,7 +138,7 @@ release-packaging obligation: bd-2z0.13.6).
     code-first under `bd-2z0.5.2` and does not become accepted until its
     centralized DSR union is green; pairwise attacker/victim edges remain
     `bd-2z0.5.9`.
-11. **Every supported scientific write uses one outbox protocol**: both
+12. **Every supported scientific write uses one outbox protocol**: both
     `StoragePipeline` and same-thread `Storage::persist` assign a stable BLAKE3
     batch identity before applying rows, advance explicit admitted/applied/durable
     watermarks, reuse exact retries, and reject changed payloads. Raw agent insert
@@ -158,7 +166,10 @@ and review log). Status at last reconcile:
   workspace-verified at `60e06b3`), bd-2z0.8.9.11 (fsqlite advanced to
   `e536d7f8ca102b3eb5236bef48514582379f9346` with the coupled single
   asupersync `=0.3.9` universe at `2807abe`; claim-site correction
-  `ece6ebf`).
+  `ece6ebf`), bd-2z0.8.9.12 (fsqlite async-facade evaluation),
+  bd-2z0.5.9 (sampled pairwise interaction-edge persistence), bd-91lr
+  (async SQL lane disabled; hard bounds refused before path access, with
+  snapshots and the synchronous read-only reader documented as alternatives).
 - **OPEN, currently in progress**: bd-2z0.5.2 **[Currently In Progress]**
   (schema-v1 runtime lifecycle evidence at `211bfa2`; V8 domain and V9 command
   projections at `ae8cea3`; centralized DSR union still pending), and
@@ -166,12 +177,12 @@ and review log). Status at last reconcile:
   (real code-first FtBrain source exists; pinned DSR compile, determinism, and
   benchmark proof plus the F32 `vector_to_parameters` disposition remain
   pending).
-- **OPEN, ready**: bd-2z0.8.9.12 (fsqlite async-api), bd-2z0.4.14
-  (`Cx::scoped_cpu` spike), and bd-2z0.12.4 (BrowserRuntime evaluation).
+- **OPEN, ready**: bd-2z0.4.14 (`Cx::scoped_cpu` spike) and bd-2z0.12.4
+  (BrowserRuntime evaluation).
 - **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.13
   (MVCC decision), bd-2z0.4.13 + bd-2z0.8.9.15 (structured-shutdown chain),
-  bd-2z0.11.6/.7/.8/.9 (analytics implementations), bd-2z0.3.12.4–.6
-  (FtBrain chain), bd-2z0.5.9 (interaction persistence, rides bd-2z0.5.2).
+  bd-2z0.11.6/.7/.8/.9 (analytics implementations), and
+  bd-2z0.3.12.4–.6 (FtBrain chain).
 
 The pinned local DSR verification profile is the only acceptance lane. GitHub
 Actions and direct Cargo invocations are not accepted as verification. DSR runs
