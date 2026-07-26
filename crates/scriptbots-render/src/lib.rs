@@ -9,9 +9,9 @@ mod vfx;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
-    AlignItems, App, Background, Bounds, Context, Corners, Div, FocusHandle, KeyDownEvent,
+    App, Background, Bounds, Context, Corners, Div, FocusHandle, InteractiveElement, KeyDownEvent,
     Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, QuitMode, RenderImage, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
+    Point, QuitMode, RenderImage, Rgba, Role, ScrollDelta, ScrollWheelEvent, SharedString,
     StyleRefinement, Window, WindowBounds, WindowOptions, canvas, div, fill, linear_color_stop,
     linear_gradient, point, prelude::*, px, rgb, size,
 };
@@ -2370,13 +2370,72 @@ enum GuiViewRole {
     WorldCanvas,
 }
 
+const GUI_WINDOW_MARGIN: f32 = 12.0;
+const GUI_WINDOW_GAP: f32 = 12.0;
+const GUI_LAB_MIN_WIDTH: f32 = 380.0;
+const GUI_LAB_MAX_WIDTH: f32 = 480.0;
+const GUI_WORLD_MIN_TILED_WIDTH: f32 = 720.0;
+
+fn gui_window_bounds(role: GuiViewRole, display_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    let display_width = f32::from(display_bounds.size.width);
+    let display_height = f32::from(display_bounds.size.height);
+    let margin_x = GUI_WINDOW_MARGIN.min(display_width * 0.1);
+    let margin_y = GUI_WINDOW_MARGIN.min(display_height * 0.1);
+    let available_width = (display_width - margin_x * 2.0).max(1.0);
+    let available_height = (display_height - margin_y * 2.0).max(1.0);
+    let horizontal_gap = GUI_WINDOW_GAP.min(available_width * 0.1);
+    let lab_width = (available_width * 0.24).clamp(
+        GUI_LAB_MIN_WIDTH.min(available_width),
+        GUI_LAB_MAX_WIDTH.min(available_width),
+    );
+    let world_width = available_width - lab_width - horizontal_gap;
+    let can_tile_horizontally = world_width >= GUI_WORLD_MIN_TILED_WIDTH;
+    let origin_x = f32::from(display_bounds.origin.x) + margin_x;
+    let origin_y = f32::from(display_bounds.origin.y) + margin_y;
+
+    if can_tile_horizontally {
+        match role {
+            GuiViewRole::WorldCanvas => Bounds::new(
+                point(px(origin_x), px(origin_y)),
+                size(px(world_width), px(available_height)),
+            ),
+            GuiViewRole::Hud => Bounds::new(
+                point(px(origin_x + world_width + horizontal_gap), px(origin_y)),
+                size(px(lab_width), px(available_height)),
+            ),
+        }
+    } else {
+        // A narrow display cannot support the preferred horizontal split. Stack the
+        // pair inside the visible frame instead of centering both windows on top of
+        // one another.
+        let vertical_gap = GUI_WINDOW_GAP.min(available_height * 0.1);
+        let distributable_height = (available_height - vertical_gap).max(1.0);
+        let world_height = distributable_height * 0.62;
+        let lab_height = distributable_height - world_height;
+        match role {
+            GuiViewRole::WorldCanvas => Bounds::new(
+                point(px(origin_x), px(origin_y)),
+                size(px(available_width), px(world_height)),
+            ),
+            GuiViewRole::Hud => Bounds::new(
+                point(px(origin_x), px(origin_y + world_height + vertical_gap)),
+                size(px(available_width), px(lab_height)),
+            ),
+        }
+    }
+}
+
 impl GuiViewRole {
     fn window_options(self, app: &App) -> WindowOptions {
-        let (title, width, height) = match self {
-            Self::Hud => ("ScriptBots HUD", 1280.0, 720.0),
-            Self::WorldCanvas => ("ScriptBots World", 1600.0, 900.0),
+        let display_bounds = app
+            .primary_display()
+            .map(|display| display.visible_bounds())
+            .unwrap_or_else(|| Bounds::centered(None, size(px(1600.0), px(900.0)), app));
+        let title = match self {
+            Self::Hud => "ScriptBots Lab",
+            Self::WorldCanvas => "ScriptBots World",
         };
-        let bounds = Bounds::centered(None, size(px(width), px(height)), app);
+        let bounds = gui_window_bounds(self, display_bounds);
         let mut options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..Default::default()
@@ -2389,16 +2448,67 @@ impl GuiViewRole {
 
     fn view_title(self) -> SharedString {
         match self {
-            Self::Hud => "ScriptBots HUD".into(),
+            Self::Hud => "ScriptBots Lab".into(),
             Self::WorldCanvas => "World".into(),
         }
     }
 
     fn launch_label(self) -> &'static str {
         match self {
-            Self::Hud => "HUD",
+            Self::Hud => "Lab",
             Self::WorldCanvas => "simulation",
         }
+    }
+}
+
+#[cfg(test)]
+mod gui_window_layout_tests {
+    use super::*;
+
+    fn edges(bounds: Bounds<Pixels>) -> (f32, f32, f32, f32) {
+        let left = f32::from(bounds.origin.x);
+        let top = f32::from(bounds.origin.y);
+        (
+            left,
+            top,
+            left + f32::from(bounds.size.width),
+            top + f32::from(bounds.size.height),
+        )
+    }
+
+    #[test]
+    fn wide_display_tiles_world_and_lab_without_overlap() {
+        let display = Bounds::new(point(px(0.0), px(78.0)), size(px(1920.0), px(792.0)));
+        let world = gui_window_bounds(GuiViewRole::WorldCanvas, display);
+        let lab = gui_window_bounds(GuiViewRole::Hud, display);
+        let (display_left, display_top, display_right, display_bottom) = edges(display);
+        let (world_left, world_top, world_right, world_bottom) = edges(world);
+        let (lab_left, lab_top, lab_right, lab_bottom) = edges(lab);
+
+        assert!(world_left >= display_left && lab_right <= display_right);
+        assert!(world_top >= display_top && world_bottom <= display_bottom);
+        assert!(lab_top >= display_top && lab_bottom <= display_bottom);
+        assert!(world_right + GUI_WINDOW_GAP <= lab_left + f32::EPSILON);
+        assert!((world_top - lab_top).abs() <= f32::EPSILON);
+        assert!((world_bottom - lab_bottom).abs() <= f32::EPSILON);
+        assert!((GUI_LAB_MIN_WIDTH..=GUI_LAB_MAX_WIDTH).contains(&f32::from(lab.size.width)));
+    }
+
+    #[test]
+    fn narrow_display_stacks_pair_without_overlap() {
+        let display = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+        let world = gui_window_bounds(GuiViewRole::WorldCanvas, display);
+        let lab = gui_window_bounds(GuiViewRole::Hud, display);
+        let (display_left, display_top, display_right, display_bottom) = edges(display);
+        let (world_left, world_top, world_right, world_bottom) = edges(world);
+        let (lab_left, lab_top, lab_right, lab_bottom) = edges(lab);
+
+        assert!(world_left >= display_left && world_right <= display_right);
+        assert!(lab_left >= display_left && lab_right <= display_right);
+        assert!(world_top >= display_top && lab_bottom <= display_bottom);
+        assert!(world_bottom + GUI_WINDOW_GAP <= lab_top + f32::EPSILON);
+        assert!((world_left - lab_left).abs() <= f32::EPSILON);
+        assert!((world_right - lab_right).abs() <= f32::EPSILON);
     }
 }
 
@@ -2406,6 +2516,13 @@ struct GuiSession {
     simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
     analytics: AnalyticsSnapshotProvider,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+    /// Focus and hover describe one experiment, not one window. Sharing the
+    /// inspector state keeps Lab selection, World highlighting, and camera
+    /// follow on the same agent while each window retains its own presentation.
+    inspector: Arc<Mutex<InspectorState>>,
+    /// Palette and narration are application accessibility settings. Both
+    /// windows must render the same state even though World owns their toolbar.
+    accessibility: Arc<Mutex<AccessibilitySettings>>,
     selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
     selection_submission: Arc<Mutex<()>>,
 }
@@ -2418,6 +2535,14 @@ impl GuiSession {
         command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
         command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     ) -> Self {
+        let mut inspector_state = InspectorState::default();
+        if let Ok(world_guard) = world.lock() {
+            let interval = world_guard.config().persistence_interval;
+            if interval > 0 {
+                inspector_state.persistence_last_enabled = interval;
+            }
+        }
+
         Self {
             simulation_driver: Arc::new(Mutex::new(GuiSimulationDriver::new(
                 world,
@@ -2426,6 +2551,8 @@ impl GuiSession {
             ))),
             analytics,
             command_submit,
+            inspector: Arc::new(Mutex::new(inspector_state)),
+            accessibility: Arc::new(Mutex::new(AccessibilitySettings::default())),
             selection_projection: Arc::new(Mutex::new(None)),
             selection_submission: Arc::new(Mutex::new(())),
         }
@@ -2440,6 +2567,8 @@ impl GuiSession {
             Arc::clone(&self.selection_projection),
             Arc::clone(&self.selection_submission),
         );
+        view.inspector = Arc::clone(&self.inspector);
+        view.accessibility = Arc::clone(&self.accessibility);
         view.focus_handle = Some(focus_handle);
         if role == GuiViewRole::WorldCanvas {
             view.set_minimal_canvas_mode();
@@ -2582,7 +2711,17 @@ pub fn run_demo(
 const MAX_SELECTION_EVENTS: usize = 64;
 const SIM_TICK_INTERVAL: f32 = 1.0 / 60.0;
 const MAX_SIM_STEPS_PER_FRAME: usize = 240;
+const WORLD_PRESENTATION_SETTINGS_ESTIMATED_HEIGHT: f32 = 440.0;
 static NEXT_BRAIN_INSPECTION_CLIENT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DashboardTab {
+    #[default]
+    Overview,
+    Inspect,
+    Analytics,
+    Timeline,
+}
 
 struct SimulationView {
     world: Arc<Mutex<WorldState>>,
@@ -2613,7 +2752,7 @@ struct SimulationView {
     /// frames then disagreed on sample_count and the ms values, which rendered as ~14k
     /// pixels of changed glyph text and was misread as harness nondeterminism.
     forced_perf: Option<PerfSnapshot>,
-    accessibility: AccessibilitySettings,
+    accessibility: Arc<Mutex<AccessibilitySettings>>,
     debug: DebugOverlayState,
     selection_events: VecDeque<SelectionEvent>,
     controls: SimulationControls,
@@ -2622,12 +2761,8 @@ struct SimulationView {
     focus_handle: Option<FocusHandle>,
     key_capture: Option<CommandAction>,
     settings_panel: SettingsPanelState,
-    /// User intent for HUD chrome (bd-v9cz). Never written by the resize rule.
+    /// User intent for the Lab's optional diagnostic disclosures.
     hud: HudLayout,
-    /// Transient hysteresis latch: true once the window crossed below
-    /// [`HUD_RAIL_COLLAPSE_WIDTH`], cleared only above [`HUD_RAIL_RESTORE_WIDTH`].
-    /// Deliberately not part of [`HudLayout`] — it is window geometry, not intent.
-    hud_rail_forced_closed: bool,
     analytics_cache: Option<HudAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: StorageUiStatus,
@@ -2635,6 +2770,10 @@ struct SimulationView {
     audio: Option<AudioState>,
     // When true, render a minimal canvas-focused layout (used in the dedicated world window).
     minimal_canvas_mode: bool,
+    /// Active section in the companion Lab window. Keeping one section visible at a
+    /// time prevents telemetry, controls, history, and inspection from competing with
+    /// each other in a narrow utility window.
+    dashboard_tab: DashboardTab,
     // Per-agent short history of brain outputs for inspector sparklines
     brain_history: std::collections::HashMap<AgentId, OutputHistory>,
     brain_client_id: BrainInspectionClientId,
@@ -2700,7 +2839,7 @@ impl SimulationView {
             perf: PerfStats::new(240),
             last_perf: PerfSnapshot::default(),
             forced_perf: None,
-            accessibility: AccessibilitySettings::default(),
+            accessibility: Arc::new(Mutex::new(AccessibilitySettings::default())),
             debug: DebugOverlayState::default(),
             selection_events: VecDeque::with_capacity(MAX_SELECTION_EVENTS),
             controls: SimulationControls::default(),
@@ -2708,8 +2847,10 @@ impl SimulationView {
             bindings: InputBindings::default(),
             focus_handle: None,
             settings_panel: SettingsPanelState::default(),
-            hud: HudLayout::default(),
-            hud_rail_forced_closed: false,
+            // bd-lelp: restore the user's disclosure choices. Falls back to the
+            // default silently on any failure, so a bad preference file cannot
+            // stop the app from starting.
+            hud: hud_layout_store::load(),
             key_capture: None,
             analytics_cache: None,
             analytics_revision: None,
@@ -2722,6 +2863,7 @@ impl SimulationView {
                 })
                 .ok(),
             minimal_canvas_mode: false,
+            dashboard_tab: DashboardTab::default(),
             brain_history: std::collections::HashMap::new(),
             brain_client_id: BrainInspectionClientId::new(
                 NEXT_BRAIN_INSPECTION_CLIENT.fetch_add(1, AtomicOrdering::Relaxed),
@@ -2769,6 +2911,13 @@ impl SimulationView {
         self.camera
             .lock()
             .map(|camera| camera.snapshot())
+            .unwrap_or_default()
+    }
+
+    fn accessibility_snapshot(&self) -> AccessibilitySettings {
+        self.accessibility
+            .lock()
+            .map(|settings| settings.clone())
             .unwrap_or_default()
     }
 
@@ -3196,6 +3345,7 @@ impl SimulationView {
         let cached_brain_inspection = self.brain_inspection_cache.clone();
         let mut next_brain_inspection_cache = cached_brain_inspection.clone();
         let mut brain_request_issued = false;
+        let accessibility = self.accessibility_snapshot();
 
         let analytics_trigger = {
             let mut trigger: Option<(u64, usize)> = None;
@@ -3211,7 +3361,7 @@ impl SimulationView {
                 snapshot.narrative = world.narrative_events().iter().cloned().collect();
                 snapshot.narrative_dropped = world.narrative_dropped_events();
                 snapshot.narrative_capacity = config.narrative_capacity;
-                snapshot.render_frame = RenderFrame::from_world(&world, self.accessibility.palette);
+                snapshot.render_frame = RenderFrame::from_world(&world, accessibility.palette);
                 if let Some(frame) = snapshot.render_frame.as_mut() {
                     for agent in &mut frame.agents {
                         agent.selection = if selection_projection
@@ -3317,31 +3467,240 @@ impl SimulationView {
         }
     }
 
+    fn render_dashboard_tabs(&self, cx: &mut Context<Self>) -> Div {
+        let tabs = [
+            (DashboardTab::Overview, "Overview"),
+            (DashboardTab::Inspect, "Inspect"),
+            (DashboardTab::Analytics, "Analytics"),
+            (DashboardTab::Timeline, "Timeline"),
+        ];
+        div()
+            .flex()
+            .gap_1()
+            .p_1()
+            .rounded_lg()
+            .bg(chrome::surface())
+            .border_1()
+            .border_color(chrome::border())
+            .children(tabs.into_iter().map(|(tab, label)| {
+                let active = self.dashboard_tab == tab;
+                let element_id = match tab {
+                    DashboardTab::Overview => "dashboard-tab-overview",
+                    DashboardTab::Inspect => "dashboard-tab-inspect",
+                    DashboardTab::Analytics => "dashboard-tab-analytics",
+                    DashboardTab::Timeline => "dashboard-tab-timeline",
+                };
+                let listener = cx.listener(move |this, _event, _, cx| {
+                    if this.dashboard_tab != tab {
+                        this.dashboard_tab = tab;
+                        cx.notify();
+                    }
+                });
+                let keyboard_listener = cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    let key = event.keystroke.key.as_str();
+                    if key.eq_ignore_ascii_case("enter")
+                        || key.eq_ignore_ascii_case("space")
+                        || key.trim().is_empty()
+                    {
+                        if this.dashboard_tab != tab {
+                            this.dashboard_tab = tab;
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }
+                });
+                let button = div()
+                    .id(element_id)
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Tab)
+                    .aria_label(format!("{label} tab"))
+                    .aria_selected(active)
+                    .flex_1()
+                    .cursor_pointer()
+                    .rounded_md()
+                    .px_2()
+                    .py_2()
+                    .text_xs()
+                    .text_center()
+                    .child(label)
+                    .on_click(listener)
+                    .on_key_down(keyboard_listener);
+                if active {
+                    button
+                        .bg(chrome::surface_raised())
+                        .border_1()
+                        .border_color(chrome::accent())
+                        .text_color(chrome::text_primary())
+                } else {
+                    button
+                        .border_1()
+                        .border_color(chrome::surface())
+                        .text_color(chrome::text_secondary())
+                        .hover(|style| style.bg(chrome::surface_raised()))
+                }
+            }))
+    }
+
+    fn render_dashboard_status(&self, snapshot: &HudSnapshot) -> Div {
+        let committed = snapshot
+            .storage
+            .committed_tick
+            .map_or_else(|| "pending".to_owned(), |tick| format!("t{tick}"));
+        let storage = if let Some(error) = &snapshot.storage.last_error {
+            format!("Storage error · {error}")
+        } else if snapshot.storage.stopped {
+            "Storage stopped".to_owned()
+        } else {
+            format!("Storage active · committed {committed}")
+        };
+        let perf = if snapshot.perf.sample_count == 0 {
+            "Frame timing warming up".to_owned()
+        } else {
+            format!(
+                "{:.1} fps · {:.2} ms frame",
+                snapshot.perf.fps, snapshot.perf.latest_ms
+            )
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(chrome::border())
+            .bg(chrome::surface())
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_secondary())
+                    .child(storage),
+            )
+            .child(div().text_xs().text_color(chrome::text_muted()).child(perf))
+            .children(snapshot.simulation_fault.as_ref().map(|error| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xfca5a5))
+                    .child(format!("Simulation paused · {error}"))
+            }))
+    }
+
+    fn render_dashboard_body(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
+        let body = match self.dashboard_tab {
+            DashboardTab::Overview => {
+                let mut overview = div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(self.render_summary(snapshot))
+                    .child(self.render_dashboard_status(snapshot));
+                let disclosures = HudDisclosures {
+                    any_open: self.hud.stats_open || self.hud.history_open || self.hud.perf_open,
+                    stats_open: self.hud.stats_open,
+                    history_open: self.hud.history_open,
+                    perf_open: self.hud.perf_open,
+                };
+                if let Some(panel_stack) = self.render_diagnostic_disclosures(snapshot, disclosures)
+                {
+                    overview = overview.child(panel_stack);
+                }
+                overview
+                    .child(self.render_simulation_controls(snapshot, cx))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_muted())
+                            .child("Telemetry panels: 1 stats · 2 history · 3 performance"),
+                    )
+            }
+            DashboardTab::Inspect => self.render_inspector(snapshot, cx),
+            DashboardTab::Analytics => div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(self.render_analytics_panel(snapshot))
+                .child(self.render_history(snapshot))
+                .child(self.render_footer(snapshot)),
+            DashboardTab::Timeline => {
+                if self.rail_visible {
+                    self.render_narrative_rail(snapshot, cx)
+                } else {
+                    let show = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+                        this.rail_visible = true;
+                        cx.notify();
+                    });
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(chrome::border())
+                        .bg(chrome::surface())
+                        .p_4()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(chrome::text_secondary())
+                                .child("Timeline is hidden"),
+                        )
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(chrome::accent())
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .child("Show timeline")
+                                .on_mouse_down(MouseButton::Left, show),
+                        )
+                }
+            }
+        };
+
+        div().flex_1().overflow_hidden().child(
+            div()
+                .id("scriptbots-dashboard-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .scrollbar_width(px(8.0))
+                .pr_1()
+                .child(body),
+        )
+    }
+
     fn render_header(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
-        let theme = hud_theme(self.accessibility.palette);
+        let accessibility = self.accessibility_snapshot();
+        let theme = hud_theme(accessibility.palette);
         let controls = snapshot.controls;
         let subline = format!(
-            "Tick #{}, epoch {}, {} active agents",
+            "Tick {} · epoch {} · {} agents",
             snapshot.tick, snapshot.epoch, snapshot.agent_count
         );
 
         let badge_canvas = {
             let state = HeaderBadgeState {
                 phase: snapshot.tick as f32 * 0.02,
-                palette: self.accessibility.palette,
+                palette: accessibility.palette,
             };
             canvas(
                 move |_, _, _| state,
                 move |bounds, state, window, _| paint_header_badge(bounds, state, window),
             )
-            .w(px(56.0))
-            .h(px(56.0))
+            .w(px(40.0))
+            .h(px(40.0))
             .flex_none()
         };
 
-        let mut chips_row = div().flex().gap_2().items_center();
+        let mut chips_row = div().flex().flex_wrap().gap_2().items_center();
         let run_label = if controls.paused { "Paused" } else { "Running" };
-        let run_icon = if controls.paused { "⏸" } else { "▶" };
+        let run_icon = if controls.paused { "Ⅱ" } else { "●" };
         let run_bg = if controls.paused {
             theme.chip_paused
         } else {
@@ -3351,7 +3710,7 @@ impl SimulationView {
 
         let mut env_chip = self.header_chip(
             theme,
-            if snapshot.is_closed { "🔒" } else { "🌐" },
+            if snapshot.is_closed { "◆" } else { "◇" },
             if snapshot.is_closed { "Closed" } else { "Open" },
             if snapshot.is_closed {
                 theme.chip_closed
@@ -3372,54 +3731,17 @@ impl SimulationView {
 
         if !controls.paused {
             let speed = if (controls.speed_multiplier - 1.0).abs() < f32::EPSILON {
-                "Speed ×1".to_string()
+                "1× speed".to_string()
             } else {
-                format!("Speed ×{}", self.format_float(controls.speed_multiplier, 2))
+                format!("{}× speed", self.format_float(controls.speed_multiplier, 2))
             };
-            chips_row = chips_row.child(self.header_chip(theme, "⚡", speed, theme.chip_follow));
-        }
-
-        if !matches!(controls.follow_mode, FollowMode::Off) {
-            chips_row = chips_row.child(self.header_chip(
-                theme,
-                "🎯",
-                controls.follow_mode.label(),
-                theme.chip_follow,
-            ));
-        }
-
-        let fit_world_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.fit_world_view(cx);
-        });
-        let fit_world_chip = self
-            .header_chip(theme, "🧭", "Fit World", theme.chip_open)
-            .cursor_pointer()
-            .hover(|s| s.opacity(0.92))
-            .on_mouse_down(MouseButton::Left, fit_world_listener);
-        chips_row = chips_row.child(fit_world_chip);
-
-        if let Some(bounds) = self.selection_bounds(&snapshot.inspector) {
-            let min = (bounds.0.x, bounds.0.y);
-            let max = (bounds.1.x, bounds.1.y);
-            let fit_sel_listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
-                this.fit_selection_view(
-                    (Position::new(min.0, min.1), Position::new(max.0, max.1)),
-                    cx,
-                );
-            });
-            let fit_sel_chip = self
-                .header_chip(theme, "🔎", "Fit Selection", theme.chip_follow)
-                .cursor_pointer()
-                .hover(|s| s.opacity(0.92))
-                .on_mouse_down(MouseButton::Left, fit_sel_listener);
-            chips_row = chips_row.child(fit_sel_chip);
+            chips_row = chips_row.child(self.header_chip(theme, "×", speed, theme.chip_follow));
         }
 
         div()
             .flex()
-            .justify_between()
-            .items_center()
-            .gap_4()
+            .flex_col()
+            .gap_3()
             .child(
                 div()
                     .flex()
@@ -3430,10 +3752,9 @@ impl SimulationView {
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
                             .child(
                                 div()
-                                    .text_3xl()
+                                    .text_xl()
                                     .text_color(rgb(theme.text_primary))
                                     .child(self.title.clone()),
                             )
@@ -3445,33 +3766,24 @@ impl SimulationView {
                             ),
                     ),
             )
+            .child(chips_row)
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap_2()
-                    .child(chips_row)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(theme.text_subtle))
-                            .child(format!(
-                                "World {}×{} · History cap {}",
-                                snapshot.world_size.0,
-                                snapshot.world_size.1,
-                                snapshot.history_capacity
-                            )),
-                    ),
+                    .text_xs()
+                    .text_color(chrome::text_muted())
+                    .child(format!(
+                        "World {}×{} · display controls stay with the World window",
+                        snapshot.world_size.0, snapshot.world_size.1
+                    )),
             )
     }
     fn render_summary(&self, snapshot: &HudSnapshot) -> Div {
-        let theme = hud_theme(self.accessibility.palette);
+        let theme = hud_theme(self.accessibility_snapshot().palette);
         let mut cards: Vec<Div> = Vec::new();
 
         if let Some(metrics) = snapshot.summary.as_ref() {
             let growth = metrics.net_growth();
-            let growth_accent = if growth >= 0 { 0x22c55e } else { 0xef4444 };
+            let metric_accent = 0x38bdf8;
             let growth_label = if growth >= 0 {
                 format!("Net +{}", growth)
             } else {
@@ -3496,7 +3808,7 @@ impl SimulationView {
                 &theme,
                 "Agents",
                 metrics.agent_count.to_string(),
-                0x22c55e,
+                metric_accent,
                 Some(format!("{} active", snapshot.agent_count)),
                 agents_series.clone(),
             ));
@@ -3504,7 +3816,7 @@ impl SimulationView {
                 &theme,
                 "Births / Deaths",
                 format!("{} / {}", metrics.births, metrics.deaths),
-                growth_accent,
+                metric_accent,
                 Some(growth_label),
                 growth_series.clone(),
             ));
@@ -3512,7 +3824,7 @@ impl SimulationView {
                 &theme,
                 "Avg Energy",
                 self.format_float(metrics.average_energy, 2),
-                0xf59e0b,
+                metric_accent,
                 Some(format!(
                     "Total {}",
                     self.format_float(metrics.total_energy, 1)
@@ -3523,7 +3835,7 @@ impl SimulationView {
                 &theme,
                 "Avg Health",
                 self.format_float(metrics.average_health, 2),
-                0x8b5cf6,
+                metric_accent,
                 None,
                 health_series,
             ));
@@ -3537,7 +3849,7 @@ impl SimulationView {
                     .border_1()
                     .border_color(rgb(theme.card_border))
                     .bg(rgb(theme.card_bg))
-                    .p_5()
+                    .p_3()
                     .child(
                         div()
                             .text_lg()
@@ -3553,71 +3865,10 @@ impl SimulationView {
             );
         }
 
-        let perf = snapshot.perf;
-        let frame_value = if perf.sample_count == 0 {
-            "—".to_string()
-        } else {
-            format!("{} ms", self.format_float(perf.latest_ms, 2))
-        };
-        let frame_detail = if perf.sample_count == 0 {
-            "Collecting samples…".to_string()
-        } else {
-            format!(
-                "avg {} · min {} · max {}",
-                self.format_float(perf.average_ms, 2),
-                self.format_float(perf.min_ms, 2),
-                self.format_float(perf.max_ms, 2)
-            )
-        };
-        cards.push(self.metric_card(
-            &theme,
-            "Frame Time",
-            frame_value,
-            0x14b8a6,
-            Some(frame_detail),
-            None,
-        ));
-
-        let fps_value = if perf.sample_count == 0 {
-            "—".to_string()
-        } else {
-            self.format_float(perf.fps, 1)
-        };
-        let fps_detail = if perf.sample_count == 0 {
-            "Awaiting samples".to_string()
-        } else {
-            format!("Samples {}", perf.sample_count)
-        };
-        cards.push(self.metric_card(&theme, "FPS", fps_value, 0xf97316, Some(fps_detail), None));
-
-        let controls = snapshot.controls;
-        let speed_value = if controls.paused {
-            "Paused".to_string()
-        } else {
-            format!("{}×", self.format_float(controls.speed_multiplier, 2))
-        };
-        let bool_label = |value: bool| if value { "On" } else { "Off" };
-        let speed_detail = format!(
-            "Agents {} · Food {} · Outline {} · {}",
-            bool_label(controls.draw_agents),
-            bool_label(controls.draw_food),
-            bool_label(controls.agent_outline),
-            controls.follow_mode.label()
-        );
-        cards.push(self.metric_card(
-            &theme,
-            "Sim Controls",
-            speed_value,
-            0x60a5fa,
-            Some(speed_detail),
-            None,
-        ));
-
-        // Use a conservative 3-column grid to avoid clipping on smaller window sizes; rows wrap gracefully.
-        div().grid().grid_cols(3).gap_4().children(cards)
+        div().grid().grid_cols(2).gap_2().children(cards)
     }
     fn render_analytics_panel(&self, snapshot: &HudSnapshot) -> Div {
-        let theme = hud_theme(self.accessibility.palette);
+        let theme = hud_theme(self.accessibility_snapshot().palette);
         let committed = snapshot
             .storage
             .committed_tick
@@ -3708,7 +3959,7 @@ impl SimulationView {
             ),
         ];
 
-        let trophic_row = div().grid().grid_cols(3).gap_4().children(trophic_cards);
+        let trophic_row = div().grid().grid_cols(1).gap_2().children(trophic_cards);
 
         let meta_bar = div()
             .flex()
@@ -3923,8 +4174,7 @@ impl SimulationView {
                 )
         };
 
-        // Reduce to 2 columns to prevent overlap on narrow screens; content flows to multiple rows.
-        let insights_row = div().grid().grid_cols(2).gap_4().children(vec![
+        let insights_row = div().grid().grid_cols(1).gap_2().children(vec![
             resource_panel,
             mutation_panel,
             behavior_panel,
@@ -3939,11 +4189,11 @@ impl SimulationView {
                 .flex()
                 .text_xs()
                 .text_color(rgb(theme.text_subtle))
-                .gap_4()
-                .child(div().w(px(140.0)).child("BRAIN"))
-                .child(div().w(px(80.0)).child("COUNT"))
-                .child(div().w(px(80.0)).child("SHARE"))
-                .child(div().w(px(100.0)).child("AVG ENERGY")),
+                .gap_2()
+                .child(div().flex_1().child("BRAIN"))
+                .child(div().w(px(48.0)).child("COUNT"))
+                .child(div().w(px(48.0)).child("SHARE"))
+                .child(div().w(px(72.0)).child("ENERGY")),
         );
 
         if analytics.brain_shares.is_empty() {
@@ -3959,14 +4209,14 @@ impl SimulationView {
                 brain_rows.push(
                     div()
                         .flex()
-                        .gap_4()
+                        .gap_2()
                         .items_center()
                         .text_xs()
                         .text_color(rgb(theme.text_primary))
-                        .child(div().w(px(140.0)).child(entry.label.clone()))
-                        .child(div().w(px(80.0)).child(entry.count.to_string()))
-                        .child(div().w(px(80.0)).child(format!("{share:.1}%")))
-                        .child(div().w(px(100.0)).child(format!("{:.3}", entry.avg_energy))),
+                        .child(div().flex_1().child(entry.label.clone()))
+                        .child(div().w(px(48.0)).child(entry.count.to_string()))
+                        .child(div().w(px(48.0)).child(format!("{share:.1}%")))
+                        .child(div().w(px(72.0)).child(format!("{:.3}", entry.avg_energy))),
                 );
             }
         }
@@ -3991,7 +4241,7 @@ impl SimulationView {
         div()
             .flex()
             .flex_col()
-            .gap_4()
+            .gap_3()
             .children(simulation_bar)
             .child(storage_bar)
             .child(meta_bar)
@@ -4000,7 +4250,7 @@ impl SimulationView {
             .child(brain_panel)
     }
     fn render_history(&self, snapshot: &HudSnapshot) -> Div {
-        let theme = hud_theme(self.accessibility.palette);
+        let theme = hud_theme(self.accessibility_snapshot().palette);
         let header = div()
             .flex()
             .justify_between()
@@ -4116,15 +4366,14 @@ impl SimulationView {
         div()
             .flex()
             .flex_col()
-            .w(px(280.0))
+            .w_full()
             .flex_none()
             .bg(rgb(theme.card_bg))
             .border_1()
             .border_color(rgb(theme.card_border))
             .rounded_xl()
-            .shadow_lg()
-            .p_4()
-            .gap_3()
+            .p_3()
+            .gap_2()
             .child(header)
             .children(rows)
     }
@@ -4232,14 +4481,14 @@ impl SimulationView {
             .gap_1()
             .p_2()
             .rounded_md()
-            .bg(rgb(0x111c33))
+            .bg(chrome::surface())
             .border_1()
-            .border_color(rgb(0x24334f));
+            .border_color(chrome::border());
 
         let mut header_row = div().flex().justify_between().items_center().child(
             div()
                 .text_xs()
-                .text_color(rgb(0x94a3b8))
+                .text_color(chrome::text_secondary())
                 .child("Timeline — run history (select-only; rewind needs replay bd-2z0.5.3)"),
         );
         let toggle_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
@@ -4249,7 +4498,7 @@ impl SimulationView {
         header_row = header_row.child(
             div()
                 .text_xs()
-                .text_color(rgb(0x60a5fa))
+                .text_color(chrome::accent())
                 .cursor_pointer()
                 .child("hide")
                 .on_mouse_down(MouseButton::Left, toggle_listener),
@@ -4257,7 +4506,7 @@ impl SimulationView {
         rail = rail.child(header_row);
 
         if events.is_empty() {
-            return rail.child(div().text_xs().text_color(rgb(0x64748b)).child(
+            return rail.child(div().text_xs().text_color(chrome::text_muted()).child(
                 "no narrative events yet — the run's story will appear here as it happens",
             ));
         }
@@ -4275,7 +4524,7 @@ impl SimulationView {
             glyph_row = glyph_row.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(chrome::text_muted())
                     .child(format!("+{}…", snapshot.narrative_dropped)),
             );
         }
@@ -4295,7 +4544,7 @@ impl SimulationView {
             if selected {
                 glyph = glyph
                     .rounded_sm()
-                    .bg(rgb(0x24334f))
+                    .bg(chrome::surface_raised())
                     .border_1()
                     .border_color(rgb(color));
             }
@@ -4318,13 +4567,18 @@ impl SimulationView {
         } else {
             String::new()
         };
-        rail = rail.child(div().text_xs().text_color(rgb(0xe2e8f0)).child(format!(
-            "tick {} | {} | severity {:.2} — {}{aged_out}{truncated}",
-            selected_event.tick.0,
-            selected_event.kind.as_str(),
-            selected_event.severity,
-            selected_event.human_text
-        )));
+        rail = rail.child(
+            div()
+                .text_xs()
+                .text_color(chrome::text_secondary())
+                .child(format!(
+                    "tick {} | {} | severity {:.2} — {}{aged_out}{truncated}",
+                    selected_event.tick.0,
+                    selected_event.kind.as_str(),
+                    selected_event.severity,
+                    selected_event.human_text
+                )),
+        );
         rail
     }
 
@@ -4392,7 +4646,11 @@ impl SimulationView {
     /// The rail's first-show logging contract (bd-16g.2.4): one line from which a
     /// reader can tell whether they are looking at a complete history or a tail.
     fn maybe_log_rail_first_show(&mut self, snapshot: &HudSnapshot) {
-        if !self.rail_visible || self.rail_logged_first_show || snapshot.narrative.is_empty() {
+        if self.dashboard_tab != DashboardTab::Timeline
+            || !self.rail_visible
+            || self.rail_logged_first_show
+            || snapshot.narrative.is_empty()
+        {
             return;
         }
         self.rail_logged_first_show = true;
@@ -4407,14 +4665,154 @@ impl SimulationView {
         );
     }
 
-    fn render_canvas(
-        &self,
-        snapshot: &HudSnapshot,
-        resolved: ResolvedHudLayout,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// Compact presentation controls for the window that actually owns the canvas.
+    /// These deliberately stay out of the companion Lab: each GPUI view owns its
+    /// presentation camera and draw flags, so putting the buttons beside the pixels
+    /// they affect keeps the interaction honest.
+    fn render_world_toolbar(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
+        let controls = snapshot.controls;
+        let accessibility = self.accessibility_snapshot();
+        let toggle_agents = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            this.set_draw_agents(!controls.draw_agents, cx);
+        });
+        let toggle_food = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            this.set_draw_food(!controls.draw_food, cx);
+        });
+        let toggle_outline = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            this.set_agent_outline(!controls.agent_outline, cx);
+        });
+        let toggle_follow = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.toggle_follow_selected(cx);
+        });
+        let fit_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.fit_world_view(cx);
+        });
+        let toggle_debug = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_debug_enabled(!this.debug.enabled, cx);
+        });
+        let cycle_palette = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.cycle_palette(cx);
+        });
+        let toggle_narration = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.toggle_narration(cx);
+        });
+        let open_settings = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.toggle_settings(cx);
+        });
+        let selection_bounds = self.selection_bounds(&snapshot.inspector);
+        let fit_selection = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            if let Some(bounds) = selection_bounds {
+                this.fit_selection_view(bounds, cx);
+            }
+        });
+
+        let base_button = |label: SharedString| {
+            div()
+                .cursor_pointer()
+                .rounded_md()
+                .border_1()
+                .border_color(chrome::border())
+                .bg(chrome::surface_raised())
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(chrome::text_secondary())
+                .child(label)
+        };
+        let style_toggle = |button: Div, active: bool| {
+            if active {
+                button
+                    .border_color(chrome::accent())
+                    .text_color(chrome::text_primary())
+            } else {
+                button.hover(|style| style.border_color(chrome::text_muted()))
+            }
+        };
+
+        let agents = style_toggle(
+            base_button("Agents".into()).on_mouse_down(MouseButton::Left, toggle_agents),
+            controls.draw_agents,
+        );
+        let food = style_toggle(
+            base_button("Food".into()).on_mouse_down(MouseButton::Left, toggle_food),
+            controls.draw_food,
+        );
+        let outline = style_toggle(
+            base_button("Outline".into()).on_mouse_down(MouseButton::Left, toggle_outline),
+            controls.agent_outline,
+        );
+        let follow = style_toggle(
+            base_button("Follow".into()).on_mouse_down(MouseButton::Left, toggle_follow),
+            matches!(controls.follow_mode, FollowMode::Selected),
+        );
+        let fit = base_button("Fit".into()).on_mouse_down(MouseButton::Left, fit_world);
+        let debug = style_toggle(
+            base_button("Debug".into()).on_mouse_down(MouseButton::Left, toggle_debug),
+            self.debug.enabled,
+        );
+        let narration = style_toggle(
+            base_button("Narration".into()).on_mouse_down(MouseButton::Left, toggle_narration),
+            accessibility.narration_enabled,
+        );
+        let palette = base_button(format!("Palette: {}", accessibility.palette.label()).into())
+            .on_mouse_down(MouseButton::Left, cycle_palette);
+        let settings =
+            base_button("Settings".into()).on_mouse_down(MouseButton::Left, open_settings);
+        let fit_selected = selection_bounds.map(|_| {
+            base_button("Fit selected".into()).on_mouse_down(MouseButton::Left, fit_selection)
+        });
+
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(chrome::border())
+            .bg(chrome::surface())
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(chrome::text_primary())
+                            .child(format!("Tick {}", snapshot.tick)),
+                    )
+                    .child(
+                        div()
+                            .text_color(chrome::text_muted())
+                            .child(format!("{} agents", snapshot.agent_count)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .children(vec![
+                        agents, food, outline, follow, fit, debug, narration, palette, settings,
+                    ])
+                    .children(fit_selected),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_muted())
+                    .child("scroll zoom · middle-drag pan · 0 fit · , settings"),
+            )
+    }
+
+    fn render_canvas(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
         if let Some(frame) = snapshot.render_frame.clone() {
-            self.render_canvas_world(snapshot, frame, resolved, cx)
+            self.render_canvas_world(snapshot, frame, cx)
         } else {
             self.render_canvas_placeholder(snapshot)
         }
@@ -4423,7 +4821,6 @@ impl SimulationView {
         &self,
         snapshot: &HudSnapshot,
         frame: RenderFrame,
-        _resolved: ResolvedHudLayout,
         cx: &mut Context<Self>,
     ) -> Div {
         let follow_target = self.compute_follow_target(&frame, &snapshot.inspector);
@@ -4457,7 +4854,6 @@ impl SimulationView {
             .relative()
             .flex_1()
             .h_full()
-            .min_h(px(400.0))
             .flex_grow(1.0)
             .on_mouse_down(
                 MouseButton::Left,
@@ -4550,31 +4946,23 @@ impl SimulationView {
             }))
             .child(canvas_element);
 
-        // bd-v9cz layout policy. The world pane and the rail are FLEX SIBLINGS, not a
-        // stack: previously `render_overlay` and `render_history_chart` were absolutely
-        // positioned children of this same element, so they punched opaque rectangles
-        // through the world and — because the mouse handlers live on the parent — a
-        // click on a stats panel also selected whatever agent sat underneath it.
-        // Docking makes overlap structurally impossible rather than a rule to remember.
+        // The dedicated World window owns this entire flexible region. Diagnostic
+        // panels live in the separate Lab window, so overlap with the canvas is
+        // structurally impossible.
         let world_row = div()
             .flex()
             .flex_row()
             .flex_1()
             .h_full()
-            .min_h(px(400.0))
             .gap_3()
             .child(canvas_stack);
 
-        // The rail is no longer nested here — it is a sibling of this canvas in the
-        // HUD row (see render()). Nesting it made the rail invisible to any path that
-        // did not go through render_canvas, and fed the resize rule a width this
-        // container never had.
         let canvas_stack = world_row;
 
         let camera_snapshot = self.camera_snapshot();
         let footer = div()
             .text_xs()
-            .text_color(rgb(0x475569))
+            .text_color(chrome::text_muted())
             .flex()
             .justify_between()
             .child(format!(
@@ -4590,13 +4978,12 @@ impl SimulationView {
             .flex()
             .flex_col()
             .flex_1()
-            .rounded_xl()
+            .rounded_lg()
             .border_1()
-            .border_color(rgb(0x0ea5e9))
-            .bg(rgb(0x0b1120))
-            .shadow_lg()
-            .p_4()
-            .gap_3()
+            .border_color(chrome::border())
+            .bg(chrome::surface())
+            .p_2()
+            .gap_2()
             .child(canvas_stack)
             .child(footer)
     }
@@ -4626,29 +5013,6 @@ impl SimulationView {
     fn focus_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         if let Ok(mut inspector) = self.inspector.lock() {
             inspector.focused_agent = Some(agent_id);
-        }
-        cx.notify();
-    }
-
-    fn set_brush_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if let Ok(mut inspector) = self.inspector.lock() {
-            inspector.brush_enabled = enabled;
-        }
-        cx.notify();
-    }
-
-    fn adjust_brush_radius(&mut self, delta: f32, cx: &mut Context<Self>) {
-        if let Ok(mut inspector) = self.inspector.lock() {
-            let mut radius = inspector.brush_radius + delta;
-            radius = radius.clamp(8.0, 256.0);
-            inspector.brush_radius = radius;
-        }
-        cx.notify();
-    }
-
-    fn set_probe_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if let Ok(mut inspector) = self.inspector.lock() {
-            inspector.probe_enabled = enabled;
         }
         cx.notify();
     }
@@ -4898,6 +5262,7 @@ impl SimulationView {
         // Only allow ToggleSettings (comma) to close the panel
         if self.settings_panel.open {
             if let Some(action) = self.bindings.action_for(&event.keystroke)
+                && self.action_is_available_in_this_window(action)
                 && matches!(action, CommandAction::ToggleSettings)
             {
                 self.invoke_action(action, cx);
@@ -4906,8 +5271,41 @@ impl SimulationView {
             return;
         }
 
-        if let Some(action) = self.bindings.action_for(&event.keystroke) {
+        if let Some(action) = self.bindings.action_for(&event.keystroke)
+            && self.action_is_available_in_this_window(action)
+        {
             self.invoke_action(action, cx);
+        }
+    }
+
+    fn action_is_available_in_this_window(&self, action: CommandAction) -> bool {
+        match action {
+            CommandAction::ToggleNarration
+            | CommandAction::CyclePalette
+            | CommandAction::ToggleAgentDraw
+            | CommandAction::ToggleFoodOverlay
+            | CommandAction::ToggleAgentOutline
+            | CommandAction::FollowSelected
+            | CommandAction::FollowOldest
+            | CommandAction::ToggleDebugOverlay
+            | CommandAction::FitWorld
+            | CommandAction::ToggleSettings => self.minimal_canvas_mode,
+            CommandAction::TogglePlayback
+            | CommandAction::GoLive
+            | CommandAction::ToggleStatsPanel
+            | CommandAction::ToggleHistoryPanel
+            | CommandAction::TogglePerfPanel => !self.minimal_canvas_mode,
+            CommandAction::ToggleSimulationPause
+            | CommandAction::StepSimulation
+            | CommandAction::IncreaseSimulationSpeed
+            | CommandAction::DecreaseSimulationSpeed
+            | CommandAction::AddCrossoverAgents
+            | CommandAction::SpawnCarnivore
+            | CommandAction::SpawnHerbivore
+            | CommandAction::ToggleClosedEnvironment
+            | CommandAction::ClearSelection
+            | CommandAction::SelectAll
+            | CommandAction::FocusFirstSelected => true,
         }
     }
 
@@ -4915,7 +5313,6 @@ impl SimulationView {
         match action {
             CommandAction::TogglePlayback => self.playback_toggle(cx),
             CommandAction::GoLive => self.playback_go_live(cx),
-            CommandAction::ToggleBrush => self.toggle_brush_state(cx),
             CommandAction::ToggleNarration => self.toggle_narration(cx),
             CommandAction::CyclePalette => self.cycle_palette(cx),
             CommandAction::ToggleSimulationPause => {
@@ -4954,16 +5351,22 @@ impl SimulationView {
             CommandAction::ToggleSettings => self.toggle_settings(cx),
             // bd-v9cz: panels are dismissible. These write user INTENT; the resize
             // rule never does, so a narrow window cannot silently undo this choice.
+            // bd-lelp: these three are the only writers of durable HUD intent,
+            // so persisting here — rather than on the resize rule or on any
+            // frame path — is what keeps window geometry out of the saved file.
             CommandAction::ToggleStatsPanel => {
                 self.hud.stats_open = !self.hud.stats_open;
+                hud_layout_store::save(&self.hud);
                 cx.notify();
             }
             CommandAction::ToggleHistoryPanel => {
                 self.hud.history_open = !self.hud.history_open;
+                hud_layout_store::save(&self.hud);
                 cx.notify();
             }
             CommandAction::TogglePerfPanel => {
                 self.hud.perf_open = !self.hud.perf_open;
+                hud_layout_store::save(&self.hud);
                 cx.notify();
             }
         }
@@ -4978,7 +5381,12 @@ impl SimulationView {
             let total_categories = ConfigCategory::all().len();
             self.settings_panel.content_height = self
                 .settings_panel
-                .estimate_content_height(total_categories);
+                .estimate_content_height(total_categories)
+                + if self.minimal_canvas_mode {
+                    WORLD_PRESENTATION_SETTINGS_ESTIMATED_HEIGHT
+                } else {
+                    0.0
+                };
             // Note: viewport_height uses conservative default (400px) from state
             // This ensures content is never blocked, at cost of allowing blank space on large windows
         }
@@ -5542,7 +5950,12 @@ impl SimulationView {
         let total_categories = ConfigCategory::all().len();
         self.settings_panel.content_height = self
             .settings_panel
-            .estimate_content_height(total_categories);
+            .estimate_content_height(total_categories)
+            + if self.minimal_canvas_mode {
+                WORLD_PRESENTATION_SETTINGS_ESTIMATED_HEIGHT
+            } else {
+                0.0
+            };
         // Clamp scroll with updated content height (viewport_height from state)
         self.settings_panel.clamp_scroll();
 
@@ -5552,21 +5965,16 @@ impl SimulationView {
         }
         cx.notify();
     }
-    fn toggle_brush_state(&mut self, cx: &mut Context<Self>) {
-        if let Ok(mut inspector) = self.inspector.lock() {
-            let new_state = !inspector.brush_enabled;
-            inspector.brush_enabled = new_state;
-        }
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
-        }
-        cx.notify();
-    }
-
     fn toggle_narration(&mut self, cx: &mut Context<Self>) {
-        self.accessibility.narration_enabled = !self.accessibility.narration_enabled;
-        if self.accessibility.narration_enabled {
+        let enabled = {
+            let mut accessibility = match self.accessibility.lock() {
+                Ok(accessibility) => accessibility,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            accessibility.narration_enabled = !accessibility.narration_enabled;
+            accessibility.narration_enabled
+        };
+        if enabled {
             info!("Narration enabled");
         } else {
             info!("Narration disabled");
@@ -5747,8 +6155,13 @@ impl SimulationView {
     }
 
     fn cycle_palette(&mut self, cx: &mut Context<Self>) {
-        let next = self.accessibility.palette.next();
-        self.accessibility.palette = next;
+        {
+            let mut accessibility = match self.accessibility.lock() {
+                Ok(accessibility) => accessibility,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            accessibility.palette = accessibility.palette.next();
+        }
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
             audio.play(&audio.toggle_sound);
@@ -5757,8 +6170,16 @@ impl SimulationView {
     }
 
     fn set_palette(&mut self, palette: ColorPaletteMode, cx: &mut Context<Self>) {
-        if self.accessibility.palette != palette {
-            self.accessibility.palette = palette;
+        let changed = {
+            let mut accessibility = match self.accessibility.lock() {
+                Ok(accessibility) => accessibility,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let changed = accessibility.palette != palette;
+            accessibility.palette = palette;
+            changed
+        };
+        if changed {
             cx.notify();
         }
     }
@@ -5875,7 +6296,7 @@ impl SimulationView {
                 .py_2()
                 .text_xs()
                 .text_color(rgb(0x475569))
-                .child("Hover an agent to preview")
+                .child("Hover or select an agent in World to preview")
         };
 
         let mut list_children: Vec<Div> = inspector
@@ -5901,8 +6322,6 @@ impl SimulationView {
 
         let selection_list = div().flex().flex_col().gap_2().children(list_children);
 
-        let brush_tools = self.render_inspector_brush_tools(inspector, cx);
-        let debug_tools = self.render_debug_controls(cx);
         let persistence_controls = self.render_persistence_controls(inspector, cx);
         let playback_controls = self.render_inspector_playback_controls(cx);
 
@@ -5927,14 +6346,13 @@ impl SimulationView {
             .flex()
             .flex_col()
             .gap_3()
-            .w(px(320.0))
+            .w_full()
             .flex_none()
-            .bg(rgb(0x0b1223))
+            .bg(chrome::surface())
             .border_1()
-            .border_color(rgb(0x1d4ed8))
+            .border_color(chrome::border())
             .rounded_xl()
-            .shadow_lg()
-            .p_4()
+            .p_3()
             .child(header)
             .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
                         "Focused: {}",
@@ -5951,13 +6369,8 @@ impl SimulationView {
                     .child(format!("Selected agents: {}", inspector.selected.len())),
             )
             .child(self.render_selection_controls(inspector, cx))
-            .child(self.render_selection_log())
-            .child(self.render_simulation_controls(snapshot, cx))
             .child(selection_list)
-            .child(brush_tools)
-            .child(debug_tools)
             .child(persistence_controls)
-            .child(self.render_accessibility_panel(cx))
             .child(playback_controls)
             .child(detail)
     }
@@ -6026,193 +6439,6 @@ impl SimulationView {
             })
     }
 
-    fn render_inspector_brush_tools(
-        &self,
-        inspector: &InspectorSnapshot,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let brush_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_brush_enabled(true, cx);
-        });
-        let brush_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_brush_enabled(false, cx);
-        });
-        let radius_inc = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.adjust_brush_radius(8.0, cx);
-        });
-        let radius_dec = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.adjust_brush_radius(-8.0, cx);
-        });
-        let probe_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_probe_enabled(true, cx);
-        });
-        let probe_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_probe_enabled(false, cx);
-        });
-
-        let brush_on_button = {
-            let base = div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("On")
-                .on_mouse_down(MouseButton::Left, brush_on);
-            if inspector.brush_enabled {
-                base.border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
-                    .text_color(rgb(0xe0f2fe))
-            } else {
-                base.border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
-            }
-        };
-
-        let brush_off_button = {
-            let base = div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Off")
-                .on_mouse_down(MouseButton::Left, brush_off);
-            if !inspector.brush_enabled {
-                base.border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
-                    .text_color(rgb(0xe0f2fe))
-            } else {
-                base.border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
-            }
-        };
-
-        let brush_minus_button = div()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x111b2b))
-            .px_2()
-            .py_1()
-            .text_xs()
-            .text_color(rgb(0xcbd5f5))
-            .child("-")
-            .on_mouse_down(MouseButton::Left, radius_dec);
-
-        let brush_plus_button = div()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x111b2b))
-            .px_2()
-            .py_1()
-            .text_xs()
-            .text_color(rgb(0xcbd5f5))
-            .child("+")
-            .on_mouse_down(MouseButton::Left, radius_inc);
-
-        let probe_on_button = {
-            let base = div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("On")
-                .on_mouse_down(MouseButton::Left, probe_on);
-            if inspector.probe_enabled {
-                base.border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
-                    .text_color(rgb(0xe0f2fe))
-            } else {
-                base.border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
-            }
-        };
-
-        let probe_off_button = {
-            let base = div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Off")
-                .on_mouse_down(MouseButton::Left, probe_off);
-            if !inspector.probe_enabled {
-                base.border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
-                    .text_color(rgb(0xe0f2fe))
-            } else {
-                base.border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
-            }
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
-            .px_3()
-            .py_2()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x94a3b8))
-                    .child("Brush Tools"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .children(vec![brush_on_button, brush_off_button]),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xcbd5f5))
-                            .child(format!("Radius {:.0}", inspector.brush_radius)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .children(vec![brush_minus_button, brush_plus_button]),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x94a3b8))
-                            .child("Debug probe"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .children(vec![probe_on_button, probe_off_button]),
-                    ),
-            )
-    }
     fn render_persistence_controls(
         &self,
         inspector: &InspectorSnapshot,
@@ -6711,35 +6937,8 @@ impl SimulationView {
         let faster_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.adjust_simulation_speed(0.25, cx);
         });
-        let agents_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_draw_agents(true, cx);
-        });
-        let agents_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_draw_agents(false, cx);
-        });
-        let food_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_draw_food(true, cx);
-        });
-        let food_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_draw_food(false, cx);
-        });
-        let outline_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_agent_outline(true, cx);
-        });
-        let outline_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_agent_outline(false, cx);
-        });
-        let follow_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.controls.follow_mode = FollowMode::Off;
-            this.fit_world_view(cx);
-        });
-        let follow_selected = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.controls.follow_mode = FollowMode::Selected;
-            cx.notify();
-        });
-        let follow_oldest = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.controls.follow_mode = FollowMode::Oldest;
-            cx.notify();
+        let step_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.step_simulation_once(cx);
         });
         let spawn_crossover = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.spawn_crossover_agent(cx);
@@ -6763,301 +6962,56 @@ impl SimulationView {
             cx.notify();
         });
 
+        let base_button = |label: SharedString| {
+            div()
+                .cursor_pointer()
+                .rounded_md()
+                .border_1()
+                .border_color(chrome::border())
+                .bg(chrome::surface_raised())
+                .text_color(chrome::text_secondary())
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(label)
+        };
         let style_toggle = |button: Div, active: bool| {
             if active {
                 button
-                    .border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a5f))
-                    .text_color(rgb(0xe0f2fe))
+                    .border_color(chrome::accent())
+                    .text_color(chrome::text_primary())
             } else {
-                button
-                    .border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
+                button.hover(|style| style.border_color(chrome::text_muted()))
             }
         };
 
-        let pause_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::ToggleSimulationPause)
-            .cloned()
-            .unwrap_or_default();
-        let slower_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::DecreaseSimulationSpeed)
-            .cloned()
-            .unwrap_or_default();
-        let faster_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::IncreaseSimulationSpeed)
-            .cloned()
-            .unwrap_or_default();
-        let draw_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::ToggleAgentDraw)
-            .cloned()
-            .unwrap_or_default();
-        let food_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::ToggleFoodOverlay)
-            .cloned()
-            .unwrap_or_default();
-        let outline_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::ToggleAgentOutline)
-            .cloned()
-            .unwrap_or_default();
-        let crossover_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::AddCrossoverAgents)
-            .cloned()
-            .unwrap_or_default();
-        let carnivore_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::SpawnCarnivore)
-            .cloned()
-            .unwrap_or_default();
-        let herbivore_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::SpawnHerbivore)
-            .cloned()
-            .unwrap_or_default();
-        let closed_binding = self
-            .bindings
-            .map
-            .get(&CommandAction::ToggleClosedEnvironment)
-            .cloned()
-            .unwrap_or_default();
-
         let run_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Run")
-                .on_mouse_down(MouseButton::Left, run_listener),
+            base_button("Run".into()).on_mouse_down(MouseButton::Left, run_listener),
             !controls.paused,
         );
         let pause_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(format!("Pause ({})", format_keystroke(&pause_binding)))
-                .on_mouse_down(MouseButton::Left, pause_listener),
+            base_button("Pause".into()).on_mouse_down(MouseButton::Left, pause_listener),
             controls.paused,
         );
+        let step_button =
+            base_button("Step".into()).on_mouse_down(MouseButton::Left, step_listener);
+        let slower_button =
+            base_button("−".into()).on_mouse_down(MouseButton::Left, slower_listener);
+        let faster_button =
+            base_button("+".into()).on_mouse_down(MouseButton::Left, faster_listener);
 
-        let slower_button = div()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x111b2b))
-            .text_color(rgb(0xcbd5f5))
-            .px_2()
-            .py_1()
-            .text_xs()
-            .child(format!("– ({})", format_keystroke(&slower_binding)))
-            .on_mouse_down(MouseButton::Left, slower_listener);
-        let faster_button = div()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x111b2b))
-            .text_color(rgb(0xcbd5f5))
-            .px_2()
-            .py_1()
-            .text_xs()
-            .child(format!("+ ({})", format_keystroke(&faster_binding)))
-            .on_mouse_down(MouseButton::Left, faster_listener);
-
-        let agents_on_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Agents ON")
-                .on_mouse_down(MouseButton::Left, agents_on),
-            controls.draw_agents,
-        );
-        let agents_off_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(format!("Agents OFF ({})", format_keystroke(&draw_binding)))
-                .on_mouse_down(MouseButton::Left, agents_off),
-            !controls.draw_agents,
-        );
-
-        let food_on_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Food ON")
-                .on_mouse_down(MouseButton::Left, food_on),
-            controls.draw_food,
-        );
-        let food_off_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(format!("Food OFF ({})", format_keystroke(&food_binding)))
-                .on_mouse_down(MouseButton::Left, food_off),
-            !controls.draw_food,
-        );
-
-        let outline_on_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Outline ON")
-                .on_mouse_down(MouseButton::Left, outline_on),
-            controls.agent_outline,
-        );
-        let outline_off_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(format!(
-                    "Outline OFF ({})",
-                    format_keystroke(&outline_binding)
-                ))
-                .on_mouse_down(MouseButton::Left, outline_off),
-            !controls.agent_outline,
-        );
-
-        let follow_off_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Follow OFF")
-                .on_mouse_down(MouseButton::Left, follow_off),
-            matches!(controls.follow_mode, FollowMode::Off),
-        );
-        let follow_selected_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Follow selected")
-                .on_mouse_down(MouseButton::Left, follow_selected),
-            matches!(controls.follow_mode, FollowMode::Selected),
-        );
-        let follow_oldest_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Follow oldest")
-                .on_mouse_down(MouseButton::Left, follow_oldest),
-            matches!(controls.follow_mode, FollowMode::Oldest),
-        );
-
-        let spawn_row = div().flex().gap_2().children(vec![
-            div()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(0x1e293b))
-                .bg(rgb(0x111b2b))
-                .text_color(rgb(0xcbd5f5))
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(format!(
-                    "Crossover ({})",
-                    format_keystroke(&crossover_binding)
-                ))
-                .on_mouse_down(MouseButton::Left, spawn_crossover),
-            div()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(0x1e293b))
-                .bg(rgb(0x111b2b))
-                .text_color(rgb(0xcbd5f5))
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(format!(
-                    "Carnivore ({})",
-                    format_keystroke(&carnivore_binding)
-                ))
-                .on_mouse_down(MouseButton::Left, spawn_carnivore),
-            div()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(0x1e293b))
-                .bg(rgb(0x111b2b))
-                .text_color(rgb(0xcbd5f5))
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(format!(
-                    "Herbivore ({})",
-                    format_keystroke(&herbivore_binding)
-                ))
-                .on_mouse_down(MouseButton::Left, spawn_herbivore),
+        let spawn_row = div().flex().flex_wrap().gap_2().children(vec![
+            base_button("Crossover".into()).on_mouse_down(MouseButton::Left, spawn_crossover),
+            base_button("Carnivore".into()).on_mouse_down(MouseButton::Left, spawn_carnivore),
+            base_button("Herbivore".into()).on_mouse_down(MouseButton::Left, spawn_herbivore),
         ]);
 
         let closed_off_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(format!(
-                    "Closed OFF ({})",
-                    format_keystroke(&closed_binding)
-                ))
-                .on_mouse_down(MouseButton::Left, open_world),
+            base_button("Open".into()).on_mouse_down(MouseButton::Left, open_world),
             !snapshot.is_closed,
         );
         let closed_on_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Closed ON")
-                .on_mouse_down(MouseButton::Left, close_world),
+            base_button("Closed".into()).on_mouse_down(MouseButton::Left, close_world),
             snapshot.is_closed,
         );
 
@@ -7065,87 +7019,67 @@ impl SimulationView {
             .flex()
             .flex_col()
             .gap_2()
-            .rounded_md()
+            .rounded_lg()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(chrome::border())
+            .bg(chrome::surface())
             .px_3()
-            .py_2()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x94a3b8))
-                    .child("Simulation controls"),
-            )
+            .py_3()
             .child(
                 div()
                     .flex()
-                    .gap_2()
-                    .children(vec![run_button, pause_button]),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
                     .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(chrome::text_primary())
+                            .child("Run controls"),
+                    )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0xcbd5f5))
-                            .child(format!("Speed {:.2}×", controls.speed_multiplier)),
-                    )
+                            .text_color(chrome::text_muted())
+                            .child(format!("{:.2}×", controls.speed_multiplier)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(vec![run_button, pause_button, step_button])
                     .child(slower_button)
                     .child(faster_button),
             )
             .child(
                 div()
-                    .flex()
-                    .gap_2()
-                    .children(vec![agents_on_button, agents_off_button]),
+                    .text_xs()
+                    .text_color(chrome::text_muted())
+                    .child("Add agents"),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .children(vec![food_on_button, food_off_button]),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .children(vec![outline_on_button, outline_off_button]),
-            )
-            .child(div().flex().gap_2().children(vec![
-                follow_off_button,
-                follow_selected_button,
-                follow_oldest_button,
-            ]))
             .child(spawn_row)
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .children(vec![closed_off_button, closed_on_button]),
             )
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Presets"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_muted())
+                    .child("Presets"),
+            )
             .child({
                 let apply = |label: &'static str, preset: PresetKind| {
                     let listener = cx.listener(move |this, _e: &MouseDownEvent, _, cx| {
                         this.apply_preset(preset, cx);
                     });
-                    div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(0x1e293b))
-                        .bg(rgb(0x111b2b))
-                        .text_color(rgb(0xcbd5f5))
-                        .px_2()
-                        .py_1()
-                        .text_xs()
-                        .child(label)
-                        .on_mouse_down(MouseButton::Left, listener)
+                    base_button(label.into()).on_mouse_down(MouseButton::Left, listener)
                 };
-                div().flex().gap_2().children(vec![
+                div().flex().flex_wrap().gap_2().children(vec![
                     apply("Arctic", PresetKind::Arctic),
                     apply("Boom–Bust", PresetKind::BoomBust),
                     apply("Closed World", PresetKind::ClosedWorld),
@@ -7291,11 +7225,12 @@ impl SimulationView {
             )
     }
     fn render_accessibility_panel(&self, cx: &mut Context<Self>) -> Div {
+        let accessibility = self.accessibility_snapshot();
         let palette_buttons: Vec<Div> = ColorPaletteMode::ALL
             .iter()
             .map(|mode| {
                 let mode = *mode;
-                let active = self.accessibility.palette == mode;
+                let active = accessibility.palette == mode;
                 let listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
                     this.set_palette(mode, cx);
                 });
@@ -7341,13 +7276,13 @@ impl SimulationView {
                 .px_2()
                 .py_1()
                 .text_xs()
-                .child(if self.accessibility.narration_enabled {
+                .child(if accessibility.narration_enabled {
                     "Narration: On"
                 } else {
                     "Narration: Off"
                 })
                 .on_mouse_down(MouseButton::Left, listener);
-            if self.accessibility.narration_enabled {
+            if accessibility.narration_enabled {
                 base.border_color(rgb(0x38bdf8))
                     .bg(rgb(0x1e3a8a))
                     .text_color(rgb(0xe0f2fe))
@@ -7357,56 +7292,6 @@ impl SimulationView {
                     .text_color(rgb(0xcbd5f5))
             }
         };
-
-        let mut bindings_rows: Vec<Div> = Vec::new();
-        for (action, stroke) in self.bindings.iter() {
-            let capturing = self.key_capture == Some(action);
-            let label = action.label();
-            let binding_text = if capturing {
-                "Press new key...".to_string()
-            } else {
-                format_keystroke(&stroke)
-            };
-            let listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
-                if this.key_capture == Some(action) {
-                    this.key_capture = None;
-                } else {
-                    this.key_capture = Some(action);
-                }
-                cx.notify();
-            });
-            let button = div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(if capturing { "Cancel" } else { "Rebind" })
-                .on_mouse_down(MouseButton::Left, listener);
-            bindings_rows.push(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(label))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x94a3b8))
-                            .child(binding_text),
-                    )
-                    .child(button),
-            );
-        }
-
-        if self.key_capture.is_some() {
-            bindings_rows.push(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0xf97316))
-                    .child("Press a key to assign, or Esc to cancel."),
-            );
-        }
 
         div()
             .flex()
@@ -7433,13 +7318,6 @@ impl SimulationView {
             .child(div().flex().gap_2().children(palette_buttons))
             .child(div().text_xs().text_color(rgb(0xcbd5f5)).child("Narration"))
             .child(narration_button)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0xcbd5f5))
-                    .child("Key bindings"),
-            )
-            .children(bindings_rows)
     }
     fn render_inspector_detail(
         &self,
@@ -7763,67 +7641,57 @@ impl SimulationView {
             .flex()
             .flex_col()
             .flex_1()
-            .rounded_xl()
+            .rounded_lg()
             .border_1()
-            .border_color(rgb(0x0ea5e9))
-            .bg(rgb(0x0b1120))
-            .shadow_lg()
-            .p_4()
+            .border_color(chrome::border())
+            .bg(chrome::surface())
+            .p_3()
             .justify_center()
             .items_center()
             .gap_2()
             .child(
                 div()
                     .text_lg()
-                    .text_color(rgb(0x38bdf8))
+                    .text_color(chrome::accent())
                     .child("Canvas viewport"),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x64748b))
+                    .text_color(chrome::text_secondary())
                     .child("Rendering pipeline will paint agents and terrain here."),
             )
-            .child(div().text_xs().text_color(rgb(0x38bdf8)).child(format!(
+            .child(div().text_xs().text_color(chrome::accent()).child(format!(
                 "Latest tick #{}, {} agents",
                 snapshot.tick, snapshot.agent_count
             )))
     }
-    /// The docked HUD rail (bd-v9cz). Returns `None` when nothing is open or the
-    /// window is too narrow, in which case the world gets the full width.
+    /// Optional overview disclosures. Returns `None` when all three diagnostic
+    /// panels are closed.
     ///
-    /// Panels are children of this rail, so they occupy reserved space and cannot
-    /// overlap the world. Colours are left exactly as they were: bd-f4x0 owns
-    /// typography and palette, and bd-9pqz defines the ramp once for everyone.
-    fn render_hud_rail(&self, snapshot: &HudSnapshot, resolved: ResolvedHudLayout) -> Option<Div> {
-        if !resolved.show_rail {
+    /// Panels are ordinary children of the Lab's vertical scroll region. They consume
+    /// document space rather than overlaying either window.
+    fn render_diagnostic_disclosures(
+        &self,
+        snapshot: &HudSnapshot,
+        disclosures: HudDisclosures,
+    ) -> Option<Div> {
+        if !disclosures.any_open {
             return None;
         }
 
-        let mut rail = div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(px(HUD_RAIL_WIDTH))
-            .h_full()
-            .gap_3()
-            .overflow_hidden();
+        let mut stack = div().flex().flex_col().flex_none().w_full().gap_2();
 
-        // Each panel may SHRINK so they share the rail's height. Without this the first
-        // panel takes everything it wants and `overflow_hidden` silently swallows the
-        // rest: the bd-abu3 capture proved the history chart was being clipped out of
-        // existence while the policy reported it open. A panel the layout says is
-        // visible must be visible, or the toggle state is a lie.
-        if resolved.stats_open {
-            rail = rail.child(self.render_overlay(snapshot).flex_shrink(1.0));
+        if disclosures.stats_open {
+            stack = stack.child(self.render_overlay(snapshot));
         }
-        if resolved.history_open {
-            rail = rail.child(self.render_history_chart(snapshot).flex_shrink(1.0));
+        if disclosures.history_open {
+            stack = stack.child(self.render_history_chart(snapshot));
         }
-        if resolved.perf_open {
-            rail = rail.child(self.render_perf_overlay(self.last_perf).flex_shrink(1.0));
+        if disclosures.perf_open {
+            stack = stack.child(self.render_perf_overlay(self.last_perf));
         }
-        Some(rail)
+        Some(stack)
     }
 
     fn render_overlay(&self, snapshot: &HudSnapshot) -> Div {
@@ -7908,16 +7776,11 @@ impl SimulationView {
                 ));
             }
         }
-        lines.push(format!(
-            "Brush {} · radius {:.0} · Probe {}",
-            if inspector.brush_enabled { "ON" } else { "OFF" },
-            inspector.brush_radius,
-            if inspector.probe_enabled { "ON" } else { "OFF" }
-        ));
+        let accessibility = self.accessibility_snapshot();
         lines.push(format!(
             "Palette {} · Narration {}",
-            self.accessibility.palette.label(),
-            if self.accessibility.narration_enabled {
+            accessibility.palette.label(),
+            if accessibility.narration_enabled {
                 "ON"
             } else {
                 "OFF"
@@ -8038,39 +7901,45 @@ impl SimulationView {
                 .gap_2()
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(0x1e293b))
-                .bg(rgb(0x07111f))
+                .border_color(chrome::border())
+                .bg(chrome::surface_raised())
                 .px_3()
                 .py_3()
                 .child(vector_canvas)
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x64748b))
+                        .text_color(chrome::text_muted())
                         .child("Vector HUD gauges"),
                 )
-                .child(div().text_xs().text_color(rgb(0xa5b4fc)).child(format!(
-                    "Avg speed {:.2} · heading {:+.0}° · cohesion {:>3.0}%",
-                    vector_state.mean_speed, heading_deg, cohesion
-                )));
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Avg speed {:.2} · heading {:+.0}° · cohesion {:>3.0}%",
+                            vector_state.mean_speed, heading_deg, cohesion
+                        )),
+                );
 
             container = container.child(vector_card);
         }
 
-        let text_column = div().flex().flex_col().gap_1().children(
-            lines
-                .into_iter()
-                .map(|line| div().text_sm().text_color(rgb(0xe2e8f0)).child(line)),
-        );
+        let text_column = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(lines.into_iter().map(|line| {
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_secondary())
+                    .child(line)
+            }));
 
         container = container.child(text_column);
 
-        // Docked into the HUD rail (bd-v9cz): no .absolute(), no top/left. It is a
-        // flex sibling of the world, so it occupies reserved space instead of
-        // covering the simulation. Colours unchanged — bd-f4x0/bd-9pqz own those.
-        // bd-f4x0: one shared chrome surface, hairline border, no drop shadow. The
-        // shadow implied the panel floated ABOVE the world, which is exactly the
-        // reading bd-v9cz removed structurally.
+        // One shared chrome surface, hairline border, and no drop shadow. This is a
+        // disclosure in the Lab's document flow, not a floating overlay.
         div()
             .flex_none()
             .bg(chrome::surface())
@@ -8099,18 +7968,17 @@ impl SimulationView {
             lines.push(format!("Samples {}", stats.sample_count));
         }
 
-        // Docked into the HUD rail (bd-v9cz) — see render_overlay.
+        // Mounted in the Lab's diagnostic disclosure stack.
         div()
             .flex_none()
             .bg(chrome::surface())
             .border_1()
-            .border_color(rgb(0x1e293b))
+            .border_color(chrome::border())
             .rounded_md()
-            .shadow_md()
             .px_3()
             .py_2()
             .text_xs()
-            .text_color(rgb(0xcbd5f5))
+            .text_color(chrome::text_secondary())
             .flex()
             .flex_col()
             .gap_1()
@@ -8140,7 +8008,7 @@ impl SimulationView {
                     .child(legend_item(chrome::series_births().into(), "Births"))
                     .child(legend_item(chrome::series_deaths().into(), "Deaths"));
 
-                // Docked into the HUD rail (bd-v9cz) — see render_overlay.
+                // Mounted in the Lab's diagnostic disclosure stack.
                 div()
                     .flex_none()
                     .w(px(WIDTH))
@@ -8148,7 +8016,6 @@ impl SimulationView {
                     .border_1()
                     .border_color(chrome::border())
                     .rounded_md()
-                    .shadow_md()
                     .px_3()
                     .py_2()
                     .flex()
@@ -8178,7 +8045,7 @@ impl SimulationView {
             .justify_between()
             .items_center()
             .text_xs()
-            .text_color(rgb(0x475569))
+            .text_color(chrome::text_muted())
             .child(format!(
                 "World {}×{} · History capacity {}",
                 snapshot.world_size.0, snapshot.world_size.1, snapshot.history_capacity
@@ -8200,15 +8067,17 @@ impl SimulationView {
         div()
             .flex()
             .items_center()
-            .gap_2()
-            .px_3()
+            .gap_1()
+            .px_2()
             .py_1()
             .rounded_full()
-            .bg(rgb(bg_hex))
-            .text_sm()
-            .text_color(rgb(theme.chip_text))
-            .child(div().text_sm().child(SharedString::from(icon.to_string())))
-            .child(div().text_sm().child(label))
+            .bg(chrome::surface_raised())
+            .border_1()
+            .border_color(rgb(bg_hex))
+            .text_xs()
+            .text_color(rgb(theme.text_primary))
+            .child(div().text_xs().child(SharedString::from(icon.to_string())))
+            .child(div().text_xs().child(label))
     }
 
     fn metric_card(
@@ -8231,19 +8100,18 @@ impl SimulationView {
                 paint_metric_badge(bounds, state, window);
             },
         )
-        .w(px(28.0))
-        .h(px(28.0));
+        .w(px(20.0))
+        .h(px(20.0));
 
         let mut card = div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .rounded_lg()
             .border_1()
-            .border_color(accent)
-            .bg(rgb(theme.card_bg))
-            .shadow_md()
-            .p_4()
+            .border_color(rgb(theme.card_border))
+            .bg(chrome::surface())
+            .p_3()
             .child(
                 div().flex().justify_between().items_center().child(
                     div().flex().items_center().gap_2().child(badge).child(
@@ -8256,7 +8124,7 @@ impl SimulationView {
             )
             .child(
                 div()
-                    .text_3xl()
+                    .text_xl()
                     .text_color(rgb(theme.text_primary))
                     .child(value),
             );
@@ -8264,7 +8132,7 @@ impl SimulationView {
         if let Some(detail_text) = detail {
             card = card.child(
                 div()
-                    .text_sm()
+                    .text_xs()
                     .text_color(rgb(theme.text_subtle))
                     .child(detail_text),
             );
@@ -8282,17 +8150,17 @@ impl SimulationView {
                     paint_sparkline(bounds, state, window);
                 },
             )
-            .h(px(28.0))
+            .h(px(20.0))
             .w_full();
 
             card = card.child(
                 div()
-                    .mt(px(6.0))
+                    .mt(px(4.0))
                     .rounded_md()
                     .bg(rgb(theme.spark_bg))
                     .border_1()
                     .border_color(rgb(theme.spark_border))
-                    .px_3()
+                    .px_2()
                     .py_2()
                     .child(spark_canvas),
             );
@@ -8568,6 +8436,13 @@ impl SimulationView {
     fn render_all_config_categories(&self, cx: &mut Context<Self>) -> Div {
         let mut container = div().flex().flex_col().gap_4();
         let mut rendered_count = 0;
+
+        if self.minimal_canvas_mode {
+            container = container
+                .child(self.render_debug_controls(cx))
+                .child(self.render_accessibility_panel(cx))
+                .child(self.render_selection_log());
+        }
 
         // Only render categories that have matching parameters during search
         for category in ConfigCategory::all() {
@@ -10396,72 +10271,36 @@ impl Render for SimulationView {
         self.validate_rail_selection(&snapshot);
         self.maybe_log_rail_first_show(&snapshot);
 
-        // bd-v9cz resize rule. The latch is transient window geometry; `self.hud` holds
-        // user intent and is deliberately NOT written here, so a window dragged briefly
-        // narrow does not destroy the layout the user chose. Separate collapse and
-        // restore thresholds give hysteresis, so dragging an edge cannot strobe the rail.
-        let viewport_width = f32::from(window.bounds().size.width);
-        if self.hud_rail_forced_closed {
-            if viewport_width >= HUD_RAIL_RESTORE_WIDTH {
-                self.hud_rail_forced_closed = false;
-            }
-        } else if viewport_width < HUD_RAIL_COLLAPSE_WIDTH {
-            self.hud_rail_forced_closed = true;
-        }
-        let resolved = self
-            .hud
-            .resolve(viewport_width, self.hud_rail_forced_closed);
-
         let mut content = if self.minimal_canvas_mode {
-            // Dedicated window: render only canvas + overlay and skip heavy HUD sections
+            // The World window is the visual subject: no duplicate dashboard chrome.
             div()
                 .size_full()
                 .relative()
                 .flex()
                 .flex_col()
-                .bg(rgb(0x0f172a))
-                .text_color(rgb(0xf8fafc))
+                .bg(chrome::backdrop())
+                .text_color(chrome::text_primary())
                 .p_2()
-                .child(self.render_canvas(&snapshot, resolved, cx))
+                .gap_2()
+                .child(self.render_world_toolbar(&snapshot, cx))
+                .child(self.render_canvas(&snapshot, cx))
         } else {
+            // The companion Lab window is a narrow, sectioned utility surface. The
+            // previous layout duplicated the world and mounted history, inspector,
+            // telemetry panels, eight KPI cards, and analytics at once. It needed more
+            // horizontal space than the window owned and had no vertical scroll.
             div()
                 .size_full()
                 .relative()
                 .flex()
                 .flex_col()
-                .bg(rgb(0x0f172a))
-                .text_color(rgb(0xf8fafc))
-                .p_6()
-                .gap_4()
+                .bg(chrome::backdrop())
+                .text_color(chrome::text_primary())
+                .p_3()
+                .gap_3()
                 .child(self.render_header(&snapshot, cx))
-                .child(self.render_summary(&snapshot))
-                .child(self.render_analytics_panel(&snapshot))
-                .child({
-                    let mut canvas_row = div()
-                        .flex()
-                        .gap_4()
-                        .flex_1()
-                        .h_full()
-                        .flex_grow(1.0)
-                        .child(self.render_history(&snapshot))
-                        .child(self.render_canvas(&snapshot, resolved, cx))
-                        .child(self.render_inspector(&snapshot, cx));
-                    // bd-v9cz: the HUD rail is a FIRST-CLASS SIBLING here, not a child of
-                    // render_canvas. Nesting it inside the canvas meant the capture
-                    // harness and the real window could disagree about whether chrome
-                    // exists, and it fed the resize rule the wrong width — the rule read
-                    // the 1280px window while the rail actually lived in the ~592px
-                    // canvas container, so it never collapsed when it should have.
-                    if let Some(rail) = self.render_hud_rail(&snapshot, resolved) {
-                        canvas_row = canvas_row.child(rail);
-                    }
-                    canvas_row.style().align_items = Some(AlignItems::Stretch);
-                    canvas_row
-                })
-                .when(self.rail_visible, |content| {
-                    content.child(self.render_narrative_rail(&snapshot, cx))
-                })
-                .child(self.render_footer(&snapshot))
+                .child(self.render_dashboard_tabs(cx))
+                .child(self.render_dashboard_body(&snapshot, cx))
         };
         if let Some(focus_handle) = &self.focus_handle {
             content = content.track_focus(focus_handle);
@@ -10480,11 +10319,10 @@ impl Render for SimulationView {
         #[cfg(feature = "audio")]
         self.update_audio(&snapshot);
 
-        // The perf readout is docked in the HUD rail (bd-v9cz), so it is no longer
-        // appended here as a floating overlay. It previously rendered only on frames
-        // where sample_count % 4 == 0; because GPUI rebuilds the element tree every
-        // frame that throttled the panel's EXISTENCE rather than its data, strobing it
-        // at a quarter of frame rate (bd-rzy3). The rail reads self.last_perf, which is
+        // The perf readout is an Overview disclosure rather than a floating overlay.
+        // It previously rendered only on frames where sample_count % 4 == 0; because
+        // GPUI rebuilds the element tree every frame that throttled the panel's
+        // EXISTENCE rather than its data. The disclosure reads self.last_perf, which is
         // assigned every frame just above, so the panel is stable and the value fresh.
 
         if self.settings_panel.open {
@@ -11245,9 +11083,6 @@ impl From<TickSummary> for HudHistoryEntry {
 struct InspectorState {
     focused_agent: Option<AgentId>,
     hovered_agent: Option<AgentId>,
-    brush_enabled: bool,
-    brush_radius: f32,
-    probe_enabled: bool,
     persistence_last_enabled: u32,
 }
 
@@ -11256,9 +11091,6 @@ impl Default for InspectorState {
         Self {
             focused_agent: None,
             hovered_agent: None,
-            brush_enabled: false,
-            brush_radius: 48.0,
-            probe_enabled: false,
             persistence_last_enabled: 60,
         }
     }
@@ -11271,9 +11103,6 @@ struct InspectorSnapshot {
     hovered: Option<AgentListEntry>,
     focus_id: Option<AgentId>,
     total_agents: usize,
-    brush_enabled: bool,
-    brush_radius: f32,
-    probe_enabled: bool,
     persistence_enabled: bool,
     persistence_interval: u32,
     persistence_cached_interval: u32,
@@ -11307,6 +11136,12 @@ mod chrome {
             (base[2] + lift).clamp(0.0, 1.0),
         ])
         .into()
+    }
+
+    /// Application backdrop. This is the unlifted world substrate, so the utility
+    /// window reads as part of the simulation instead of a separate navy dashboard.
+    pub fn backdrop() -> Hsla {
+        rgb_from_triplet(STYLE.substrate.base_srgb).into()
     }
 
     /// Panel fill. One surface for every docked panel — the old code had three.
@@ -11355,25 +11190,7 @@ mod chrome {
     }
 }
 
-/// Minimum world viewport, in logical pixels. The world has absolute layout
-/// priority: chrome collapses to make room, never the other way round.
-const WORLD_MIN_WIDTH: f32 = 640.0;
-
-/// Docked rail width.
-const HUD_RAIL_WIDTH: f32 = 320.0;
-
-/// Below this the rail is force-collapsed; above [`HUD_RAIL_RESTORE_WIDTH`] it comes
-/// back. The gap between them is hysteresis — with a single threshold, dragging a
-/// window edge across it makes the whole rail strobe.
-const HUD_RAIL_COLLAPSE_WIDTH: f32 = WORLD_MIN_WIDTH + HUD_RAIL_WIDTH;
-const HUD_RAIL_RESTORE_WIDTH: f32 = HUD_RAIL_COLLAPSE_WIDTH + 80.0;
-
-/// Where HUD chrome is permitted to exist (bd-v9cz layout policy).
-///
-/// These fields are USER INTENT. They are read to decide what to draw, but the
-/// resize rule must never write to them: a window briefly dragged narrow would
-/// otherwise silently destroy the layout the user chose. Forced collapse is
-/// derived per-frame in [`HudLayout::resolve`] and thrown away.
+/// User-controlled diagnostic disclosures in the scrollable Lab Overview.
 #[derive(Clone, Copy)]
 struct HudLayout {
     stats_open: bool,
@@ -11383,43 +11200,292 @@ struct HudLayout {
 
 impl Default for HudLayout {
     fn default() -> Self {
-        // First run, no saved config: stats and history docked and visible, perf
-        // collapsed because it is a diagnostic rather than a first-run readout.
+        // The companion Lab window already exposes the primary metrics and controls.
+        // Dense diagnostic panels start closed and remain one-keystroke disclosures;
+        // opening everything by default was the original wall-of-telemetry failure.
         Self {
-            stats_open: true,
-            history_open: true,
+            stats_open: false,
+            history_open: false,
             perf_open: false,
         }
     }
 }
 
-/// What the current window size actually permits, given the user's intent.
+/// Durable HUD disclosure state (bd-lelp).
+///
+/// Answers bd-v9cz question 3, "what does a panel remember across restarts".
+/// Before this, [`HudLayout`] was constructed exactly once from
+/// [`HudLayout::default`], so toggling a panel worked within a session and every
+/// launch was a first launch.
+///
+/// THREE THINGS THIS DELIBERATELY IS NOT:
+///
+/// 1. It is not part of `ScriptBotsConfig` and never touches it. UI preference
+///    reaching simulation config would perturb science and determinism, so this
+///    is a separate file with a separate schema that the simulation never reads.
+/// 2. It does not persist `hud_rail_forced_closed`. That flag is the resize
+///    rule's transient auto-collapse — window geometry, not intent — and writing
+///    it would let one narrow resize permanently destroy a saved layout.
+/// 3. It cannot stop the app from starting. Every failure path — missing file,
+///    unreadable directory, corrupt JSON, a version this build does not know —
+///    resolves to [`HudLayout::default`] silently. A HUD preference file is
+///    never worth refusing to launch over.
+mod hud_layout_store {
+    use super::HudLayout;
+    use std::path::PathBuf;
+
+    /// Schema version. Bump when the meaning of a field changes; an unrecognised
+    /// version is treated exactly like a corrupt file — defaults, no migration,
+    /// no guessing at what an unknown writer meant.
+    const SCHEMA_VERSION: u32 = 1;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct PersistedHudLayout {
+        version: u32,
+        stats_open: bool,
+        history_open: bool,
+        perf_open: bool,
+    }
+
+    /// Platform config directory, resolved with `std` alone.
+    ///
+    /// Deliberately not a `dirs`/`directories` dependency: neither is a
+    /// workspace dependency today (`dirs` appears in `Cargo.lock` only
+    /// transitively), so taking one would be a new direct third-party
+    /// dependency decision for a three-boolean preference file. If a second
+    /// crate ever needs the same path, promote this helper then.
+    fn config_dir() -> Option<PathBuf> {
+        #[cfg(windows)]
+        {
+            std::env::var_os("APPDATA").map(PathBuf::from)
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+        }
+    }
+
+    /// Full path to the preference file, or `None` when no config dir exists.
+    fn layout_path() -> Option<PathBuf> {
+        Some(config_dir()?.join("scriptbots").join("hud_layout.json"))
+    }
+
+    /// Load the saved layout, or the default when anything at all is wrong.
+    pub(super) fn load() -> HudLayout {
+        let Some(path) = layout_path() else {
+            return HudLayout::default();
+        };
+        load_from(&path)
+    }
+
+    /// Path-explicit half of [`load`], so tests can exercise the REAL decode and
+    /// fallback logic against a real file rather than a copy of it living in the
+    /// test module. A duplicated decoder would let this function rot while its
+    /// tests kept passing.
+    fn load_from(path: &std::path::Path) -> HudLayout {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            // Overwhelmingly the first-launch case, so this is not a warning.
+            return HudLayout::default();
+        };
+        match serde_json::from_str::<PersistedHudLayout>(&text) {
+            Ok(saved) if saved.version == SCHEMA_VERSION => HudLayout {
+                stats_open: saved.stats_open,
+                history_open: saved.history_open,
+                perf_open: saved.perf_open,
+            },
+            Ok(saved) => {
+                tracing::debug!(
+                    found = saved.version,
+                    expected = SCHEMA_VERSION,
+                    "ignoring HUD layout written by a different schema version"
+                );
+                HudLayout::default()
+            }
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "ignoring unreadable HUD layout");
+                HudLayout::default()
+            }
+        }
+    }
+
+    /// Persist the layout. Best-effort by contract: a preference that cannot be
+    /// written must not interrupt the session that produced it.
+    pub(super) fn save(layout: &HudLayout) {
+        let Some(path) = layout_path() else {
+            return;
+        };
+        if let Err(error) = save_to(&path, layout) {
+            tracing::debug!(%error, path = %path.display(), "could not save HUD layout");
+        }
+    }
+
+    /// Path-explicit half of [`save`], returning the error so tests can assert
+    /// the write actually succeeded instead of trusting a swallowed failure.
+    fn save_to(path: &std::path::Path, layout: &HudLayout) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let persisted = PersistedHudLayout {
+            version: SCHEMA_VERSION,
+            stats_open: layout.stats_open,
+            history_open: layout.history_open,
+            perf_open: layout.perf_open,
+        };
+        let text = serde_json::to_string_pretty(&persisted)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        std::fs::write(path, text)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A unique scratch path per test. No `tempfile` dependency is added for
+        /// a three-boolean preference file; the pid plus a per-test label keeps
+        /// concurrent test threads off each other's files.
+        fn scratch(label: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "scriptbots-hud-layout-test-{}-{label}",
+                std::process::id()
+            ))
+        }
+
+        fn cleanup(dir: &std::path::Path) {
+            let _ = std::fs::remove_file(dir.join("hud_layout.json"));
+            let _ = std::fs::remove_dir(dir);
+        }
+
+        /// Round-trip through the REAL save and load, not a copy of their logic.
+        #[test]
+        fn a_saved_layout_round_trips_through_the_real_store() {
+            let dir = scratch("roundtrip");
+            cleanup(&dir);
+            let path = dir.join("hud_layout.json");
+
+            let layout = HudLayout {
+                stats_open: true,
+                history_open: false,
+                perf_open: true,
+            };
+            save_to(&path, &layout).expect("save must succeed to a temp dir");
+            let restored = load_from(&path);
+            assert!(restored.stats_open, "stats_open must survive a restart");
+            assert!(!restored.history_open);
+            assert!(restored.perf_open);
+            cleanup(&dir);
+        }
+
+        /// `save_to` must create its parent directory. On a first launch the
+        /// config directory does not exist yet, and a preference that only saves
+        /// once someone else has made the folder never saves at all.
+        #[test]
+        fn saving_creates_the_config_directory_on_first_launch() {
+            let dir = scratch("firstlaunch");
+            cleanup(&dir);
+            assert!(!dir.exists(), "precondition: the directory must be absent");
+
+            let path = dir.join("hud_layout.json");
+            save_to(&path, &HudLayout::default()).expect("save must create its parent");
+            assert!(path.exists(), "the preference file must exist after saving");
+            cleanup(&dir);
+        }
+
+        /// A missing file is the first-launch path and must be silent.
+        #[test]
+        fn an_absent_file_loads_the_default() {
+            let path = scratch("absent").join("hud_layout.json");
+            let _ = std::fs::remove_file(&path);
+            let restored = load_from(&path);
+            assert!(!restored.stats_open && !restored.history_open && !restored.perf_open);
+        }
+
+        /// Every unusable file resolves to the default rather than propagating,
+        /// exercised through the real loader. A HUD preference file must never be
+        /// able to stop the app from starting.
+        #[test]
+        fn unusable_files_fall_back_to_the_default_layout() {
+            let dir = scratch("hostile");
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let path = dir.join("hud_layout.json");
+
+            for hostile in [
+                "",
+                "{",
+                "null",
+                "[]",
+                "{\"version\":1}",
+                "{\"stats_open\":true}",
+                "{\"version\":1,\"stats_open\":\"yes\",\"history_open\":true,\"perf_open\":true}",
+                "\u{0}\u{1}not json at all",
+            ] {
+                std::fs::write(&path, hostile).expect("write hostile fixture");
+                let restored = load_from(&path);
+                assert!(
+                    !restored.stats_open && !restored.history_open && !restored.perf_open,
+                    "hostile file {hostile:?} must load as the closed default"
+                );
+            }
+            cleanup(&dir);
+        }
+
+        /// A file from another schema version is ignored, not migrated and not
+        /// partially trusted — the fields could mean something else entirely.
+        #[test]
+        fn a_foreign_schema_version_is_ignored_even_when_the_fields_parse() {
+            let dir = scratch("version");
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let path = dir.join("hud_layout.json");
+
+            for version in [SCHEMA_VERSION + 1, 0] {
+                let fixture = format!(
+                    "{{\"version\":{version},\"stats_open\":true,\"history_open\":true,\
+                     \"perf_open\":true}}"
+                );
+                std::fs::write(&path, fixture).expect("write versioned fixture");
+                let restored = load_from(&path);
+                assert!(
+                    !restored.stats_open && !restored.history_open && !restored.perf_open,
+                    "schema version {version} must fall back rather than trust fields \
+                     it cannot vouch for"
+                );
+            }
+            cleanup(&dir);
+        }
+
+        /// The path must be a preference file, distinct from anything the
+        /// simulation reads. UI state reaching ScriptBotsConfig would perturb
+        /// science and determinism.
+        #[test]
+        fn the_layout_path_is_a_ui_preference_file() {
+            let Some(path) = layout_path() else {
+                return; // no HOME/APPDATA in this environment; nothing to assert
+            };
+            let text = path.to_string_lossy();
+            assert!(
+                text.ends_with("scriptbots/hud_layout.json")
+                    || text.ends_with("scriptbots\\hud_layout.json"),
+                "unexpected HUD layout path: {text}"
+            );
+        }
+    }
+}
+
+/// The subset of diagnostic cards mounted in the current Lab frame.
 #[derive(Clone, Copy)]
-struct ResolvedHudLayout {
-    show_rail: bool,
+struct HudDisclosures {
+    any_open: bool,
     stats_open: bool,
     history_open: bool,
     perf_open: bool,
 }
 
-impl HudLayout {
-    /// Fold intent together with the available width. Panels drop in a fixed
-    /// order — perf, then history, then the whole rail — so a given window size
-    /// always yields the same layout.
-    fn resolve(self, available_width: f32, rail_forced_closed: bool) -> ResolvedHudLayout {
-        let room_for_rail = !rail_forced_closed && available_width >= HUD_RAIL_COLLAPSE_WIDTH;
-        let any_panel_open = self.stats_open || self.history_open || self.perf_open;
-        ResolvedHudLayout {
-            show_rail: room_for_rail && any_panel_open,
-            stats_open: self.stats_open,
-            history_open: self.history_open,
-            perf_open: self.perf_open,
-        }
-    }
-}
-
 #[cfg(test)]
-mod hud_rail_layout_tests {
+mod hud_disclosure_layout_tests {
     use super::*;
 
     /// bd-rzy3: the perf readout must be MOUNTED on every frame it is open.
@@ -11429,120 +11495,89 @@ mod hud_rail_layout_tests {
     /// The panel used to be appended only when `sample_count % 4 == 0`, i.e. it
     /// was absent three frames in four and strobed at a quarter of frame rate.
     /// Update cadence belongs to the VALUE — `self.last_perf` — never to the
-    /// mount. This inspects the `render_hud_rail` body because the assembled
+    /// mount. This inspects the disclosure renderer because the assembled
     /// `Div` exposes no child list to assert against.
     #[test]
     fn perf_panel_mount_is_not_gated_on_a_frame_counter() {
-        let rail = render_hud_rail_body();
+        let disclosures = render_diagnostic_disclosures_body();
         assert!(
-            rail.contains("self.render_perf_overlay(self.last_perf)"),
-            "the rail must render the retained perf sample, so the panel is stable \
+            disclosures.contains("self.render_perf_overlay(self.last_perf)"),
+            "the disclosure must render the retained perf sample, so the panel is stable \
              frame to frame while its value refreshes independently"
         );
         for forbidden in ["sample_count", "is_multiple_of", "% 4", "frame_index"] {
             assert!(
-                !rail.contains(forbidden),
-                "render_hud_rail must not gate panel mounting on a frame counter \
+                !disclosures.contains(forbidden),
+                "render_diagnostic_disclosures must not gate panel mounting on a frame counter \
                  ({forbidden}); GPUI rebuilds the tree every frame, so that hides \
                  the panel instead of throttling its data"
             );
         }
     }
 
-    /// Every rail panel mounts purely from resolved layout state. If a panel's
+    /// Every diagnostic panel mounts purely from disclosure state. If a panel's
     /// `.child()` call ever grows a second condition, the mount can once again
     /// depend on something other than what the user asked for.
     #[test]
-    fn rail_panels_mount_only_on_resolved_layout_state() {
-        let rail = render_hud_rail_body();
+    fn diagnostic_panels_mount_only_on_disclosure_state() {
+        let disclosures = render_diagnostic_disclosures_body();
         for (panel, gate) in [
-            ("render_overlay", "if resolved.stats_open {"),
-            ("render_history_chart", "if resolved.history_open {"),
-            ("render_perf_overlay", "if resolved.perf_open {"),
+            ("render_overlay", "if disclosures.stats_open {"),
+            ("render_history_chart", "if disclosures.history_open {"),
+            ("render_perf_overlay", "if disclosures.perf_open {"),
         ] {
             assert!(
-                rail.contains(gate),
+                disclosures.contains(gate),
                 "{panel} must mount under exactly `{gate}` so visibility follows \
-                 resolved layout state alone"
+                 disclosure state alone"
             );
         }
     }
 
-    /// The resolved layout is a pure fold of intent and width, so an open panel
-    /// stays open across successive frames when neither input changes. The bead
-    /// symptom was a panel blinking while the user changed nothing.
+    /// The compact Lab starts with every dense diagnostic disclosure closed. This is
+    /// the guard against recreating the original wall of telemetry by default.
     #[test]
-    fn resolved_panel_visibility_is_stable_across_frames() {
+    fn diagnostic_disclosures_start_closed() {
+        let layout = HudLayout::default();
+        assert!(!layout.stats_open);
+        assert!(!layout.history_open);
+        assert!(!layout.perf_open);
+    }
+
+    /// Once a disclosure is requested, its mounted state is a stable direct projection
+    /// of user intent; viewport width no longer mutates or hides that intent.
+    #[test]
+    fn requested_disclosures_mount_stably() {
         let layout = HudLayout {
             stats_open: true,
             history_open: true,
             perf_open: true,
         };
         for frame in 0..8 {
-            let resolved = layout.resolve(HUD_RAIL_COLLAPSE_WIDTH, false);
-            assert!(
-                resolved.show_rail,
-                "rail must resolve visible on every frame; frame {frame} disagreed"
-            );
-            assert!(
-                resolved.perf_open,
-                "perf panel must resolve visible on every frame; frame {frame} disagreed"
-            );
+            let disclosures = HudDisclosures {
+                any_open: layout.stats_open || layout.history_open || layout.perf_open,
+                stats_open: layout.stats_open,
+                history_open: layout.history_open,
+                perf_open: layout.perf_open,
+            };
+            assert!(disclosures.any_open, "frame {frame}");
+            assert!(disclosures.stats_open, "frame {frame}");
+            assert!(disclosures.history_open, "frame {frame}");
+            assert!(disclosures.perf_open, "frame {frame}");
         }
     }
 
-    /// Closed intent stays closed, and a rail with nothing open does not reserve
-    /// width. Guards the other direction of the same fold.
-    #[test]
-    fn resolve_honours_closed_intent_and_narrow_windows() {
-        let perf_closed = HudLayout {
-            stats_open: true,
-            history_open: false,
-            perf_open: false,
-        };
-        let resolved = perf_closed.resolve(HUD_RAIL_COLLAPSE_WIDTH, false);
-        assert!(
-            resolved.show_rail,
-            "an open stats panel still needs the rail"
-        );
-        assert!(!resolved.perf_open, "closed perf intent must stay closed");
-
-        let all_closed = HudLayout {
-            stats_open: false,
-            history_open: false,
-            perf_open: false,
-        };
-        assert!(
-            !all_closed.resolve(HUD_RAIL_COLLAPSE_WIDTH, false).show_rail,
-            "a rail with no open panel must not reserve width"
-        );
-
-        let open = HudLayout {
-            stats_open: true,
-            history_open: true,
-            perf_open: true,
-        };
-        assert!(
-            !open.resolve(HUD_RAIL_COLLAPSE_WIDTH - 1.0, false).show_rail,
-            "below the collapse width the rail yields the space to the world"
-        );
-        assert!(
-            !open.resolve(HUD_RAIL_COLLAPSE_WIDTH, true).show_rail,
-            "a forced-closed rail stays closed regardless of available width"
-        );
-    }
-
-    /// Source of `render_hud_rail`, from its signature to the next method in the
+    /// Source of `render_diagnostic_disclosures`, from its signature to the next method in the
     /// impl block. Scoped to the body so unrelated code — including this module —
     /// can never satisfy or trip the guards above.
-    fn render_hud_rail_body() -> &'static str {
+    fn render_diagnostic_disclosures_body() -> &'static str {
         let after_signature = include_str!("lib.rs")
-            .split_once("fn render_hud_rail(")
-            .expect("render_hud_rail definition")
+            .split_once("fn render_diagnostic_disclosures(")
+            .expect("render_diagnostic_disclosures definition")
             .1;
         after_signature
             .split_once("\n    fn ")
-            .expect("method following render_hud_rail")
+            .expect("method following render_diagnostic_disclosures")
             .0
     }
 }
@@ -11769,9 +11804,6 @@ impl InspectorSnapshot {
     ) -> (Self, Option<BrainInspectorCapture>, bool) {
         let mut snapshot = InspectorSnapshot {
             total_agents: world.agent_count(),
-            brush_enabled: inspector.brush_enabled,
-            brush_radius: inspector.brush_radius,
-            probe_enabled: inspector.probe_enabled,
             persistence_cached_interval: inspector.persistence_last_enabled,
             ..InspectorSnapshot::default()
         };
@@ -11941,7 +11973,6 @@ struct HudTheme {
     spark_border: u32,
     text_primary: u32,
     text_subtle: u32,
-    chip_text: u32,
     chip_running: u32,
     chip_paused: u32,
     chip_open: u32,
@@ -11958,7 +11989,6 @@ fn hud_theme(mode: ColorPaletteMode) -> HudTheme {
             spark_border: 0xf8fafc,
             text_primary: 0xf8fafc,
             text_subtle: 0xcbd5f5,
-            chip_text: 0x020617,
             chip_running: 0xf97316,
             chip_paused: 0xfacc15,
             chip_open: 0x38bdf8,
@@ -11974,7 +12004,6 @@ fn hud_theme(mode: ColorPaletteMode) -> HudTheme {
             spark_border: 0x27364c,
             text_primary: 0xf8fafc,
             text_subtle: 0x9aa7c0,
-            chip_text: 0x0f172a,
             chip_running: 0x2dd4bf,
             chip_paused: 0xfacc15,
             chip_open: 0x60a5fa,
@@ -11988,7 +12017,6 @@ fn hud_theme(mode: ColorPaletteMode) -> HudTheme {
             spark_border: 0x1f2a3d,
             text_primary: 0xf8fafc,
             text_subtle: 0x94a3b8,
-            chip_text: 0x0f172a,
             chip_running: 0x22c55e,
             chip_paused: 0xf59e0b,
             chip_open: 0x38bdf8,
@@ -12002,7 +12030,6 @@ fn hud_theme(mode: ColorPaletteMode) -> HudTheme {
 enum CommandAction {
     TogglePlayback,
     GoLive,
-    ToggleBrush,
     ToggleNarration,
     CyclePalette,
     ToggleSimulationPause,
@@ -12034,7 +12061,6 @@ impl CommandAction {
         match self {
             CommandAction::TogglePlayback => "Toggle playback",
             CommandAction::GoLive => "Jump to live",
-            CommandAction::ToggleBrush => "Toggle brush",
             CommandAction::ToggleNarration => "Toggle narration",
             CommandAction::CyclePalette => "Cycle palette",
             CommandAction::ToggleSimulationPause => "Toggle simulation pause",
@@ -12078,10 +12104,6 @@ impl Default for InputBindings {
         map.insert(
             CommandAction::GoLive,
             Keystroke::parse("g").unwrap_or_default(),
-        );
-        map.insert(
-            CommandAction::ToggleBrush,
-            Keystroke::parse("b").unwrap_or_default(),
         );
         map.insert(
             CommandAction::ToggleNarration,
@@ -12186,6 +12208,7 @@ impl Default for InputBindings {
 }
 
 impl InputBindings {
+    #[cfg(test)]
     fn iter(&self) -> Vec<(CommandAction, Keystroke)> {
         self.map
             .iter()
@@ -18013,6 +18036,7 @@ mod command_characterization_tests {
     struct ShortcutFixture {
         app: gpui::TestApp,
         hud: gpui::WindowHandle<SimulationView>,
+        canvas: gpui::WindowHandle<SimulationView>,
         world: Arc<Mutex<WorldState>>,
         submitted: Arc<Mutex<Vec<ControlCommand>>>,
     }
@@ -18073,9 +18097,11 @@ mod command_characterization_tests {
             // One production repaint, so the view is in the state a user would
             // actually be typing at rather than a freshly constructed one.
             force_production_repaint(&mut app, windows.hud);
+            force_production_repaint(&mut app, windows.canvas);
             Self {
                 app,
                 hud: windows.hud,
+                canvas: windows.canvas,
                 world,
                 submitted,
             }
@@ -18135,21 +18161,41 @@ mod command_characterization_tests {
         /// message, so a parse failure is self-identifying without formatting the
         /// input into a panic here.
         fn press(&mut self, keystroke: &str) {
+            self.press_window(self.hud, keystroke);
+        }
+
+        fn press_world(&mut self, keystroke: &str) {
+            self.press_window(self.canvas, keystroke);
+        }
+
+        fn press_window(&mut self, handle: gpui::WindowHandle<SimulationView>, keystroke: &str) {
             let parsed = Keystroke::parse(keystroke).expect("test shortcut literal must parse");
             self.app.update(|app| {
-                app.update_window(self.hud.into(), |_, window, app| {
+                app.update_window(handle.into(), |_, window, app| {
                     window.dispatch_keystroke(parsed, app);
                 })
-                .expect("dispatch production HUD shortcut");
+                .expect("dispatch production GUI shortcut");
             });
         }
 
         /// Read a field off the production view.
         fn read<T>(&mut self, probe: impl Fn(&SimulationView) -> T) -> T {
+            self.read_window(self.hud, probe)
+        }
+
+        fn read_world<T>(&mut self, probe: impl Fn(&SimulationView) -> T) -> T {
+            self.read_window(self.canvas, probe)
+        }
+
+        fn read_window<T>(
+            &mut self,
+            handle: gpui::WindowHandle<SimulationView>,
+            probe: impl Fn(&SimulationView) -> T,
+        ) -> T {
             let hud = self
                 .app
-                .update(|app| self.hud.root(app))
-                .expect("production HUD root");
+                .update(|app| handle.root(app))
+                .expect("production GUI root");
             self.app.read_entity(&hud, |view, _| probe(view))
         }
     }
@@ -18167,8 +18213,9 @@ mod command_characterization_tests {
         });
     }
 
-    /// bd-jw6f, tier 3 and the panel/accessibility group: every view-local HUD
-    /// toggle must change the state it names, and must toggle BACK.
+    /// bd-jw6f, tier 3 and the panel/accessibility group: every view-local
+    /// toggle must change the state it names in the window that owns it, and
+    /// must toggle BACK.
     ///
     /// Both halves matter. Asserting only that the first press flips something
     /// would pass for a control that latches on and can never be undone — from
@@ -18179,42 +18226,169 @@ mod command_characterization_tests {
     /// controls share one defect class, so they should share one proof and a
     /// newly added toggle should be one line to cover.
     #[test]
-    fn every_view_local_hud_toggle_changes_the_state_it_names_and_toggles_back() {
-        let cases: [(&str, &str, fn(&SimulationView) -> bool); 9] = [
-            ("d", "ToggleAgentDraw", |view| view.controls.draw_agents),
-            ("f", "ToggleFoodOverlay", |view| view.controls.draw_food),
-            ("ctrl-shift-o", "ToggleAgentOutline", |view| {
+    fn every_window_local_toggle_changes_the_state_it_names_and_toggles_back() {
+        let cases: [(&str, &str, bool, fn(&SimulationView) -> bool); 9] = [
+            ("d", "ToggleAgentDraw", true, |view| {
+                view.controls.draw_agents
+            }),
+            ("f", "ToggleFoodOverlay", true, |view| {
+                view.controls.draw_food
+            }),
+            ("ctrl-shift-o", "ToggleAgentOutline", true, |view| {
                 view.controls.agent_outline
             }),
-            ("shift-f", "ToggleDebugOverlay", |view| view.debug.enabled),
-            ("1", "ToggleStatsPanel", |view| view.hud.stats_open),
-            ("2", "ToggleHistoryPanel", |view| view.hud.history_open),
-            ("3", "TogglePerfPanel", |view| view.hud.perf_open),
-            (",", "ToggleSettings", |view| view.settings_panel.open),
-            ("n", "ToggleNarration", |view| {
-                view.accessibility.narration_enabled
+            ("shift-f", "ToggleDebugOverlay", true, |view| {
+                view.debug.enabled
+            }),
+            ("1", "ToggleStatsPanel", false, |view| view.hud.stats_open),
+            ("2", "ToggleHistoryPanel", false, |view| {
+                view.hud.history_open
+            }),
+            ("3", "TogglePerfPanel", false, |view| view.hud.perf_open),
+            (",", "ToggleSettings", true, |view| view.settings_panel.open),
+            ("n", "ToggleNarration", true, |view| {
+                view.accessibility_snapshot().narration_enabled
             }),
         ];
 
-        for (keystroke, action, probe) in cases {
+        for (keystroke, action, in_world, probe) in cases {
             let mut fixture = ShortcutFixture::install();
-            let before = fixture.read(probe);
+            let before = if in_world {
+                fixture.read_world(probe)
+            } else {
+                fixture.read(probe)
+            };
 
-            fixture.press(keystroke);
-            let after = fixture.read(probe);
+            if in_world {
+                fixture.press_world(keystroke);
+            } else {
+                fixture.press(keystroke);
+            }
+            let after = if in_world {
+                fixture.read_world(probe)
+            } else {
+                fixture.read(probe)
+            };
             assert_ne!(
                 before, after,
                 "{action}: pressing '{keystroke}' must change the state it names \
                  (was {before}, still {after})"
             );
 
-            fixture.press(keystroke);
+            if in_world {
+                fixture.press_world(keystroke);
+            } else {
+                fixture.press(keystroke);
+            }
+            let restored = if in_world {
+                fixture.read_world(probe)
+            } else {
+                fixture.read(probe)
+            };
             assert_eq!(
-                fixture.read(probe),
-                before,
+                restored, before,
                 "{action}: '{keystroke}' must toggle, not latch"
             );
         }
+    }
+
+    #[test]
+    fn representative_window_scoped_shortcuts_are_inert_in_the_other_window() {
+        let mut fixture = ShortcutFixture::install();
+
+        let lab_draw_agents = fixture.read(|view| view.controls.draw_agents);
+        let world_draw_agents = fixture.read_world(|view| view.controls.draw_agents);
+        let submitted_before = fixture.submitted().len();
+        fixture.press("d");
+        assert_eq!(
+            fixture.read(|view| view.controls.draw_agents),
+            lab_draw_agents,
+            "the World-only 'd' shortcut must not mutate invisible Lab presentation state"
+        );
+        assert_eq!(
+            fixture.read_world(|view| view.controls.draw_agents),
+            world_draw_agents,
+            "dispatching World-only 'd' in Lab must not mutate its owning World peer"
+        );
+        assert_eq!(
+            fixture.submitted().len(),
+            submitted_before,
+            "a rejected window-local shortcut must not leak onto the command bus"
+        );
+
+        let lab_stats_open = fixture.read(|view| view.hud.stats_open);
+        let world_stats_open = fixture.read_world(|view| view.hud.stats_open);
+        fixture.press_world("1");
+        assert_eq!(
+            fixture.read(|view| view.hud.stats_open),
+            lab_stats_open,
+            "dispatching Lab-only '1' in World must not mutate its owning Lab peer"
+        );
+        assert_eq!(
+            fixture.read_world(|view| view.hud.stats_open),
+            world_stats_open,
+            "the Lab-only '1' shortcut must not mutate invisible World disclosure state"
+        );
+        assert_eq!(
+            fixture.submitted().len(),
+            submitted_before,
+            "a rejected disclosure shortcut must not leak onto the command bus"
+        );
+    }
+
+    #[test]
+    fn world_and_lab_share_one_inspector_focus() {
+        let mut fixture = ShortcutFixture::install_with_agents(3);
+
+        fixture.press("ctrl-a");
+        let lab_focus = fixture.read(|view| {
+            view.inspector
+                .lock()
+                .expect("Lab inspector lock")
+                .focused_agent
+        });
+        let world_focus = fixture.read_world(|view| {
+            view.inspector
+                .lock()
+                .expect("World inspector lock")
+                .focused_agent
+        });
+
+        assert!(
+            lab_focus.is_some(),
+            "select-all must focus a live agent for inspection"
+        );
+        assert_eq!(
+            world_focus, lab_focus,
+            "World and Lab must read the same session-wide focused-agent state"
+        );
+    }
+
+    #[test]
+    fn world_accessibility_changes_are_visible_in_lab() {
+        let mut fixture = ShortcutFixture::install();
+
+        let initial_palette = fixture.read(|view| view.accessibility_snapshot().palette);
+        fixture.press_world("ctrl-p");
+        let world_palette = fixture.read_world(|view| view.accessibility_snapshot().palette);
+        let lab_palette = fixture.read(|view| view.accessibility_snapshot().palette);
+        assert_ne!(
+            world_palette, initial_palette,
+            "the World palette shortcut must change the session palette"
+        );
+        assert_eq!(
+            lab_palette, world_palette,
+            "Lab chrome and World rendering must use one shared accessibility palette"
+        );
+
+        fixture.press_world("n");
+        let world_narration =
+            fixture.read_world(|view| view.accessibility_snapshot().narration_enabled);
+        let lab_narration = fixture.read(|view| view.accessibility_snapshot().narration_enabled);
+        assert_eq!(
+            lab_narration, world_narration,
+            "World and Lab must report one shared narration state"
+        );
     }
 
     /// Selection is SCIENTIFIC state, so both shortcuts are proven against the
@@ -18519,22 +18693,22 @@ mod command_characterization_tests {
     #[test]
     fn cycling_the_palette_advances_and_returns_to_where_it_started() {
         let mut fixture = ShortcutFixture::install();
-        let palette = |view: &SimulationView| view.accessibility.palette;
+        let palette = |view: &SimulationView| view.accessibility_snapshot().palette;
 
-        let start = fixture.read(palette);
-        fixture.press("ctrl-p");
+        let start = fixture.read_world(palette);
+        fixture.press_world("ctrl-p");
         assert_ne!(
             start,
-            fixture.read(palette),
+            fixture.read_world(palette),
             "CyclePalette: 'ctrl-p' must advance the accessibility palette"
         );
 
         // Four more presses complete the five-entry cycle.
         for _ in 0..4 {
-            fixture.press("ctrl-p");
+            fixture.press_world("ctrl-p");
         }
         assert_eq!(
-            fixture.read(palette),
+            fixture.read_world(palette),
             start,
             "CyclePalette must cycle through all five palettes and wrap, not saturate"
         );
@@ -18550,25 +18724,25 @@ mod command_characterization_tests {
 
         // fit_world is a no-op until a render has recorded a base scale, so an
         // unrecorded camera would make this test assert against the guard.
-        let fitted = fixture.read(|view| {
+        let fitted = fixture.read_world(|view| {
             let camera = view.camera.lock().expect("camera lock");
             (camera.zoom(), camera.offset())
         });
 
-        fixture.read(|view| {
+        fixture.read_world(|view| {
             let mut camera = view.camera.lock().expect("camera lock");
             camera.start_pan(gpui::point(gpui::px(0.0), gpui::px(0.0)));
             camera.update_pan(gpui::point(gpui::px(64.0), gpui::px(48.0)));
             camera.end_pan();
         });
-        let panned = fixture.read(|view| view.camera.lock().expect("camera lock").offset());
+        let panned = fixture.read_world(|view| view.camera.lock().expect("camera lock").offset());
         assert_ne!(
             panned, fitted.1,
             "fixture precondition: the camera must actually be off-centre before '0'"
         );
 
-        fixture.press("0");
-        let after = fixture.read(|view| {
+        fixture.press_world("0");
+        let after = fixture.read_world(|view| {
             let camera = view.camera.lock().expect("camera lock");
             (camera.zoom(), camera.offset())
         });
@@ -18580,25 +18754,16 @@ mod command_characterization_tests {
         );
     }
 
-    /// The brush lives behind a mutex on the shared inspector rather than on the
-    /// view, so it gets its own probe — but the same two-way proof.
+    /// The old brush shortcut advertised state that no selection or paint path
+    /// consumed. Keep it unbound until a real brush interaction exists.
     #[test]
-    fn the_brush_shortcut_toggles_the_shared_inspector_state() {
-        let mut fixture = ShortcutFixture::install();
-        let brush =
-            |view: &SimulationView| view.inspector.lock().expect("inspector lock").brush_enabled;
-        let before = fixture.read(brush);
-        fixture.press("b");
-        assert_ne!(
-            before,
-            fixture.read(brush),
-            "ToggleBrush: 'b' must change inspector.brush_enabled"
-        );
-        fixture.press("b");
+    fn inert_brush_shortcut_is_not_registered() {
+        let bindings = InputBindings::default();
+        let brush = Keystroke::parse("b").expect("test shortcut literal must parse");
         assert_eq!(
-            fixture.read(brush),
-            before,
-            "ToggleBrush: 'b' must toggle, not latch"
+            bindings.action_for(&brush),
+            None,
+            "B must not advertise an inert brush interaction"
         );
     }
 
@@ -18610,17 +18775,17 @@ mod command_characterization_tests {
         let follow = |view: &SimulationView| view.controls.follow_mode;
 
         let mut oldest = ShortcutFixture::install();
-        let initial = oldest.read(follow);
-        oldest.press("o");
-        let after_oldest = oldest.read(follow);
+        let initial = oldest.read_world(follow);
+        oldest.press_world("o");
+        let after_oldest = oldest.read_world(follow);
         assert_ne!(
             initial, after_oldest,
             "FollowOldest: 'o' must change controls.follow_mode"
         );
 
         let mut selected = ShortcutFixture::install();
-        selected.press("shift-s");
-        let after_selected = selected.read(follow);
+        selected.press_world("shift-s");
+        let after_selected = selected.read_world(follow);
         assert_ne!(
             initial, after_selected,
             "FollowSelected: 'shift-s' must change controls.follow_mode"

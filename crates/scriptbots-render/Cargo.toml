@@ -11,6 +11,11 @@ scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-storage = { path = "../scriptbots-storage" }
 kira = { workspace = true, optional = true }
 rand = { workspace = true }
+# bd-lelp: HUD layout persistence only. Both are already workspace dependencies
+# and already in Cargo.lock, so this is a crate-level opt-in that adds no new
+# third-party code and no new lock entries.
+serde = { workspace = true }
+serde_json = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 scriptbots-world-gfx = { path = "../scriptbots-world-gfx", optional = true }
 pollster = { version = "0.4", optional = true }
