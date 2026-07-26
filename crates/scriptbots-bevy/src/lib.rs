@@ -1227,6 +1227,7 @@ struct HudElements {
     palette: Entity,
     events: Entity,
     inspector: Entity,
+    history: Entity,
 }
 
 #[derive(Component)]
@@ -1521,6 +1522,9 @@ pub(crate) struct WorldSnapshot {
     terrain_color: TerrainColorMap,
     terrain_height: TerrainHeightSnapshot,
     agents: Vec<AgentVisual>,
+    /// Decimated population/birth/death series for the HUD sparklines
+    /// (bd-2z0.14.1.16). Bounded by [`HUD_SPARKLINE_SAMPLES`] at construction.
+    history: HudHistory,
     /// Newest-first recent world events for the HUD feed (bd-2z0.14.1.13).
     ///
     /// Bounded by [`HUD_EVENT_FEED_CAPACITY`] at construction, so a long run
@@ -1533,6 +1537,96 @@ pub(crate) struct WorldSnapshot {
 /// The bound is applied while deriving from world history, not after, so the
 /// vector is never transiently large.
 const HUD_EVENT_FEED_CAPACITY: usize = 6;
+
+/// Sample budget for each HUD sparkline (bd-2z0.14.1.16).
+///
+/// GPUI's `HistoryChartData::from_entries` uses the same stride-decimation
+/// policy with a budget of 120, sized for a 220px polyline. A text sparkline
+/// is one glyph per sample, so the budget differs while the policy does not.
+const HUD_SPARKLINE_SAMPLES: usize = 32;
+
+/// Ramp used to draw a text sparkline, lowest to highest.
+const SPARK_GLYPHS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/// Decimated population/birth/death series behind the HUD sparklines.
+///
+/// Mirrors GPUI's chart rather than deriving a second history projection:
+/// same three series, same `< 2` guard, same stride decimation, and the same
+/// per-series scaling by that series' own maximum (bd-2z0.14.1.16).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HudHistory {
+    agents: Vec<u32>,
+    births: Vec<u32>,
+    deaths: Vec<u32>,
+}
+
+impl HudHistory {
+    /// Decimate retained tick summaries down to the sparkline budget.
+    ///
+    /// Fewer than two samples yields an empty history, matching GPUI's
+    /// `from_entries` returning `None`: a single point is not a trend and
+    /// drawing it would imply one.
+    fn from_history<'a>(history: impl DoubleEndedIterator<Item = &'a TickSummary>) -> Self {
+        let entries: Vec<&TickSummary> = history.collect();
+        if entries.len() < 2 {
+            return Self::default();
+        }
+        let stride = entries.len().div_ceil(HUD_SPARKLINE_SAMPLES).max(1);
+        let mut out = Self::default();
+        for summary in entries.iter().step_by(stride) {
+            out.agents
+                .push(u32::try_from(summary.agent_count).unwrap_or(u32::MAX));
+            out.births
+                .push(u32::try_from(summary.births).unwrap_or(u32::MAX));
+            out.deaths
+                .push(u32::try_from(summary.deaths).unwrap_or(u32::MAX));
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.agents.is_empty()
+    }
+}
+
+/// Draw one series as a text sparkline, scaled by its own maximum.
+///
+/// Per-series scaling matches GPUI: births and deaths are small numbers beside
+/// a population in the hundreds, so a shared scale would flatten them into a
+/// dead line and hide exactly the events worth seeing.
+fn format_sparkline(series: &[u32]) -> String {
+    let Some(&max) = series.iter().max() else {
+        return String::new();
+    };
+    if max == 0 {
+        return SPARK_GLYPHS[0].repeat(series.len());
+    }
+    series
+        .iter()
+        .map(|&v| {
+            let level = (u64::from(v) * 7 / u64::from(max)) as usize;
+            SPARK_GLYPHS[level.min(SPARK_GLYPHS.len() - 1)]
+        })
+        .collect()
+}
+
+/// Render the three history sparklines as a multi-line HUD block.
+fn format_history_panel(history: &HudHistory) -> String {
+    if history.is_empty() {
+        return "History: collecting…".to_string();
+    }
+    let peak = |s: &[u32]| s.iter().max().copied().unwrap_or(0);
+    format!(
+        "History ({} samples)\n  Agents {} peak {}\n  Births {} peak {}\n  Deaths {} peak {}",
+        history.agents.len(),
+        format_sparkline(&history.agents),
+        peak(&history.agents),
+        format_sparkline(&history.births),
+        peak(&history.births),
+        format_sparkline(&history.deaths),
+        peak(&history.deaths),
+    )
+}
 
 /// One entry in the HUD event feed.
 ///
@@ -1654,6 +1748,7 @@ impl WorldSnapshot {
             && self.terrain_height == other.terrain_height
             && self.agents == other.agents
             && self.events == other.events
+            && self.history == other.history
     }
 
     fn from_world(world: &WorldState) -> Option<Self> {
@@ -1813,6 +1908,7 @@ impl WorldSnapshot {
             terrain_height,
             agents,
             events: HudEvent::recent_from_history(world.history()),
+            history: HudHistory::from_history(world.history()),
         })
     }
 }
@@ -1955,6 +2051,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mut palette = Entity::PLACEHOLDER;
     let mut events = Entity::PLACEHOLDER;
     let mut inspector = Entity::PLACEHOLDER;
+    let mut history = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
         tick = parent
@@ -2037,6 +2134,13 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         inspector = parent
             .spawn((
                 Text::new("Inspector: no selection"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        history = parent
+            .spawn((
+                Text::new("History: collecting…"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -2210,6 +2314,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         palette,
         events,
         inspector,
+        history,
     });
 }
 
@@ -2328,6 +2433,7 @@ fn update_hud(
         primary_selection,
         event_feed,
         inspector_text,
+        history_panel,
     ) = {
         let snapshot = state.latest.as_ref().expect("snapshot available");
         let tick = snapshot.tick;
@@ -2349,6 +2455,7 @@ fn update_hud(
         // Formatted here so the snapshot borrow ends with the rest of the
         // extraction rather than being held across the text writes below.
         let event_feed = format_event_feed(&snapshot.events);
+        let history_panel = format_history_panel(&snapshot.history);
         let inspector_text = format_inspector(
             primary_agent
                 .map(|agent| InspectorDetail::from_agent(agent, selected_count.saturating_sub(1))),
@@ -2362,6 +2469,7 @@ fn update_hud(
             primary,
             event_feed,
             inspector_text,
+            history_panel,
         )
     };
 
@@ -2478,6 +2586,9 @@ fn update_hud(
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.inspector) {
             **text = inspector_text;
+        }
+        if let Ok(mut text) = texts.get_mut(hud_elements.history) {
+            **text = history_panel;
         }
     }
 }
@@ -2616,6 +2727,101 @@ mod hud_inspector_tests {
         for expected in ["smell", "sound", "hearing", "eye", "blood"] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hud_history_sparkline_tests {
+    use super::*;
+
+    fn summary(tick: u64, agents: usize, births: usize, deaths: usize) -> TickSummary {
+        TickSummary {
+            tick: scriptbots_core::Tick(tick),
+            agent_count: agents,
+            births,
+            deaths,
+            total_energy: 0.0,
+            average_energy: 0.0,
+            average_health: 0.0,
+            max_age: 0,
+            spike_hits: 0,
+        }
+    }
+
+    /// Mirrors GPUI's `from_entries` returning `None` below two entries: one
+    /// point is not a trend, and drawing it would imply one.
+    #[test]
+    fn fewer_than_two_samples_yields_no_history() {
+        assert!(HudHistory::from_history([].iter()).is_empty());
+        let one = vec![summary(1, 10, 0, 0)];
+        assert!(HudHistory::from_history(one.iter()).is_empty());
+        let two = vec![summary(1, 10, 0, 0), summary(2, 11, 1, 0)];
+        assert!(!HudHistory::from_history(two.iter()).is_empty());
+    }
+
+    /// Stride decimation caps every series at the sample budget regardless of
+    /// how long the run has been going.
+    #[test]
+    fn long_history_is_decimated_to_the_budget() {
+        let long: Vec<TickSummary> = (0..5000).map(|t| summary(t, 100, 1, 1)).collect();
+        let h = HudHistory::from_history(long.iter());
+        assert!(
+            h.agents.len() <= HUD_SPARKLINE_SAMPLES,
+            "agents series was {}",
+            h.agents.len()
+        );
+        assert_eq!(h.agents.len(), h.births.len());
+        assert_eq!(h.agents.len(), h.deaths.len());
+    }
+
+    /// Each series scales by its OWN maximum. Births in single digits beside a
+    /// population in the hundreds must still show shape, not a flat line.
+    #[test]
+    fn series_scale_independently() {
+        let entries: Vec<TickSummary> = vec![
+            summary(1, 500, 0, 0),
+            summary(2, 500, 4, 0),
+            summary(3, 500, 8, 0),
+        ];
+        let h = HudHistory::from_history(entries.iter());
+        let births = format_sparkline(&h.births);
+        assert_eq!(births.chars().count(), 3);
+        assert!(
+            births.contains('█'),
+            "peak births must reach full height, got {births}"
+        );
+        assert!(
+            births.starts_with('▁'),
+            "zero births must sit at the floor, got {births}"
+        );
+    }
+
+    /// A flat series renders at the floor rather than dividing by zero.
+    #[test]
+    fn all_zero_series_renders_at_the_floor() {
+        assert_eq!(format_sparkline(&[0, 0, 0]), "▁▁▁");
+        assert_eq!(format_sparkline(&[]), "");
+    }
+
+    /// The panel names each series and reports its peak, so a reader can tell
+    /// what the glyph heights are relative to.
+    #[test]
+    fn panel_labels_series_and_peaks() {
+        let entries: Vec<TickSummary> = vec![summary(1, 10, 1, 2), summary(2, 20, 3, 4)];
+        let panel = format_history_panel(&HudHistory::from_history(entries.iter()));
+        for expected in ["Agents", "Births", "Deaths", "peak 20", "peak 3", "peak 4"] {
+            assert!(panel.contains(expected), "missing {expected} in: {panel}");
+        }
+    }
+
+    /// With nothing to draw the panel keeps a stable placeholder rather than
+    /// unmounting — same lesson as bd-rzy3.
+    #[test]
+    fn empty_history_renders_a_stable_placeholder() {
+        assert_eq!(
+            format_history_panel(&HudHistory::default()),
+            "History: collecting…"
+        );
     }
 }
 
@@ -4106,6 +4312,7 @@ mod terrain_tests {
             terrain_height: height,
             agents: Vec::new(),
             events: Vec::new(),
+            history: HudHistory::default(),
         }
     }
 
@@ -4150,6 +4357,7 @@ mod terrain_tests {
             terrain_height: height,
             agents: Vec::new(),
             events: Vec::new(),
+            history: HudHistory::default(),
         }
     }
 
@@ -6178,6 +6386,7 @@ mod tests {
             palette: spawn_label(&mut app),
             events: spawn_label(&mut app),
             inspector: spawn_label(&mut app),
+            history: spawn_label(&mut app),
         };
         app.insert_resource(hud);
 
