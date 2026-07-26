@@ -738,6 +738,98 @@ mod tests {
         );
     }
 
+    /// A seeded estimate must be reproducible bit-for-bit, and a different seed must actually
+    /// move the seeded quantities (bd-r4ja).
+    ///
+    /// Reproducibility is the premise of every other assertion in this module: a fixture that
+    /// silently varies run to run turns a bound into a flakiness allowance. The second half
+    /// matters just as much -- if the seed were ignored, the first half would pass trivially.
+    #[test]
+    fn bd_r4ja_estimates_are_reproducible_under_a_fixed_seed_and_move_with_it() {
+        let (e, r) = independent_ar1_pair(600, 31337);
+        let params = MiParams {
+            bins: 8,
+            surrogate_runs: 32,
+            bootstrap_runs: 32,
+            seed: 5150,
+        };
+
+        let first = compute_mi(&e, &r, &params).expect("first");
+        let second = compute_mi(&e, &r, &params).expect("second");
+
+        assert_eq!(
+            first.bits_corrected.to_bits(),
+            second.bits_corrected.to_bits(),
+            "the point estimate is a pure function of the data and must be bit-identical"
+        );
+        assert_eq!(
+            first.p_value.to_bits(),
+            second.p_value.to_bits(),
+            "the surrogate p-value must be bit-identical under a fixed seed"
+        );
+        assert_eq!(
+            (first.ci_lo.to_bits(), first.ci_hi.to_bits()),
+            (second.ci_lo.to_bits(), second.ci_hi.to_bits()),
+            "the bootstrap interval must be bit-identical under a fixed seed"
+        );
+
+        let moved = compute_mi(
+            &e,
+            &r,
+            &MiParams {
+                seed: 5151,
+                ..params
+            },
+        )
+        .expect("different seed");
+        assert_eq!(
+            moved.bits_corrected.to_bits(),
+            first.bits_corrected.to_bits(),
+            "the point estimate does not depend on the seed at all"
+        );
+        assert_ne!(
+            (moved.p_value, moved.ci_lo, moved.ci_hi),
+            (first.p_value, first.ci_lo, first.ci_hi),
+            "changing the seed must move the seeded quantities; if it does not, the seed is \
+             being ignored and the reproducibility assertion above is vacuous"
+        );
+    }
+
+    /// Saturation must be reported honestly, because it is the signal that a bin range is wrong
+    /// for the data (bd-r4ja).
+    #[test]
+    fn bd_r4ja_saturated_fraction_reflects_how_much_data_sits_in_the_extreme_bins() {
+        let n = 400;
+        let bins = 8;
+        let params = MiParams {
+            bins,
+            surrogate_runs: 8,
+            bootstrap_runs: 8,
+            seed: 99,
+        };
+
+        // Everything crammed into the first and last bins: fully saturated.
+        let extreme: Vec<f64> = (0..n).map(|i| f64::from(u8::from(i % 2 == 1))).collect();
+        let saturated = compute_mi(&extreme, &extreme, &params).expect("extreme");
+        assert!(
+            (saturated.saturated_fraction - 1.0).abs() < f64::EPSILON,
+            "every sample sits in bin 0 or bin {}, so saturation is total, got {}",
+            bins - 1,
+            saturated.saturated_fraction
+        );
+
+        // Spread across the interior bins: nothing in the extremes.
+        let interior: Vec<f64> = (0..n)
+            .map(|i| bin_center(1 + (i % (bins - 2)), bins))
+            .collect();
+        let clean = compute_mi(&interior, &interior, &params).expect("interior");
+        assert!(
+            clean.saturated_fraction.abs() < f64::EPSILON,
+            "no sample occupies an extreme bin, so saturation is zero, got {}",
+            clean.saturated_fraction
+        );
+    }
+
     /// Two independent AR(1) processes, normalized to `[0, 1]`.
     ///
     /// Strong autocorrelation (rho = 0.95) makes both series smooth, which inflates the plug-in
