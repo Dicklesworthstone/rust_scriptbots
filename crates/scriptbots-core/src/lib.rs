@@ -6033,9 +6033,9 @@ pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
 pub const WORLD_STEP_OUTCOME_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v3";
 
 /// Schema identifier for opt-in per-stage scientific-state digests.
-pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.7";
+pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.8";
 /// Wire revision for the adapter-attested canonical-UID six-point trace payload.
-pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 7;
+pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 8;
 /// Schema identifier for a non-boundary world digest captured during one transition.
 pub const WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA: &str =
     "scriptbots.world-step-stage-world-digest.v7";
@@ -7930,6 +7930,17 @@ pub enum ReplayEventKind {
         kind: ReplayInteractionKind,
         /// Damage dealt or energy transferred.
         magnitude: f32,
+    },
+    /// Complete input consumed by the production narrative detector for one tick.
+    ///
+    /// This is a mandatory persistence record rather than an optional replay sample:
+    /// it is emitted even when action replay is disabled or saturated. Keeping it in
+    /// the existing replay envelope lets admission retries, the durable outbox, and
+    /// crash recovery preserve one exact ordered stream without reconstructing facts
+    /// from sparse narrative outputs.
+    NarrativeInputV1 {
+        /// Versioned input, configuration revision, and fixed-width detector policy.
+        record: narrative::NarrativeInputRecordV1,
     },
 }
 
@@ -12456,9 +12467,13 @@ pub struct ScriptBotsConfig {
     pub economy_debug_per_tick: bool,
     /// Interval (ticks) between persistence flushes. 0 disables persistence.
     pub persistence_interval: u32,
-    /// Maximum replay events recorded per tick; `0` disables production replay emission.
-    /// Runs opting into replay verification should set this at or above their peak agent
-    /// count so every live agent is recorded every tick.
+    /// Maximum optional action replay events recorded per tick; `0` disables action and
+    /// digest-anchor emission. Runs opting into action replay verification should set this at
+    /// or above their peak agent count so every live agent is recorded every tick.
+    ///
+    /// The mandatory [`ReplayEventKind::NarrativeInputV1`] record is outside this budget. It
+    /// remains exactly one per persisted simulation tick because it is scientific detector
+    /// input, not an optional replay sample.
     ///
     /// DEFAULTS TO [`DEFAULT_REPLAY_EVENT_TICK_CAP`], NOT ZERO (bd-lhml lesson). The former
     /// zero default was justified as keeping production runs "byte-identical to their
@@ -13942,6 +13957,8 @@ pub mod narrative {
 
     /// Current schema version for the feeder-neutral narrative input contract.
     pub const NARRATIVE_INPUT_V1_SCHEMA_VERSION: u32 = 1;
+    /// Current schema version for a persisted narrative input plus its detector policy.
+    pub const NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION: u32 = 1;
 
     /// Exact per-tick input consumed by the production narrative detector.
     ///
@@ -13988,7 +14005,12 @@ pub mod narrative {
             Ok(input)
         }
 
-        fn validate(self) -> Result<(), NarrativeInputError> {
+        /// Validate this input against the current feeder contract.
+        ///
+        /// # Errors
+        ///
+        /// Returns a typed schema or finite-value refusal naming this input's tick.
+        pub fn validate(self) -> Result<(), NarrativeInputError> {
             if self.schema_version != NARRATIVE_INPUT_V1_SCHEMA_VERSION {
                 return Err(NarrativeInputError::UnsupportedSchema {
                     tick: self.tick.0,
@@ -14003,6 +14025,110 @@ pub mod narrative {
                 });
             }
             Ok(())
+        }
+    }
+
+    /// Persisted production context for one exact narrative detector input.
+    ///
+    /// Capacities are fixed-width here even though the in-process replay policy uses
+    /// `usize`. A stored run must not change meaning with the reader's pointer width.
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NarrativeInputRecordV1 {
+        /// Version of this enclosing persistence contract.
+        pub record_schema_version: u32,
+        /// Exact per-tick detector input.
+        pub input: NarrativeInputV1,
+        /// World configuration revision in force at this completed boundary.
+        pub config_revision: u64,
+        /// Completed ticks between production detector passes.
+        pub narrative_interval: u32,
+        /// Maximum detector inputs retained by production.
+        pub history_capacity: u64,
+        /// Maximum narrative events retained by production.
+        pub event_capacity: u64,
+    }
+
+    impl NarrativeInputRecordV1 {
+        /// Capture one record from the exact production summary and configuration.
+        ///
+        /// # Errors
+        ///
+        /// Returns the first input, capacity, or policy-contract refusal.
+        pub fn from_summary(
+            summary: &TickSummary,
+            config_revision: u64,
+            config: &super::ScriptBotsConfig,
+        ) -> Result<Self, NarrativeInputError> {
+            let input = NarrativeInputV1::try_from(summary)?;
+            let history_capacity = u64::try_from(config.history_capacity).map_err(|_| {
+                NarrativeInputError::PlatformCapacityOutOfRange {
+                    tick: summary.tick.0,
+                    field: "history_capacity",
+                    value: config.history_capacity,
+                }
+            })?;
+            let event_capacity = u64::try_from(config.narrative_capacity).map_err(|_| {
+                NarrativeInputError::PlatformCapacityOutOfRange {
+                    tick: summary.tick.0,
+                    field: "event_capacity",
+                    value: config.narrative_capacity,
+                }
+            })?;
+            let record = Self {
+                record_schema_version: NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                input,
+                config_revision,
+                narrative_interval: config.narrative_interval,
+                history_capacity,
+                event_capacity,
+            };
+            record.validate()?;
+            Ok(record)
+        }
+
+        /// Validate both versioned layers and the persisted detector bounds.
+        ///
+        /// # Errors
+        ///
+        /// Returns the first schema, finite-value, or zero-history refusal.
+        pub fn validate(self) -> Result<(), NarrativeInputError> {
+            if self.record_schema_version != NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION {
+                return Err(NarrativeInputError::UnsupportedRecordSchema {
+                    tick: self.input.tick.0,
+                    expected: NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                    actual: self.record_schema_version,
+                });
+            }
+            self.input.validate()?;
+            if self.history_capacity == 0 {
+                return Err(NarrativeInputError::ZeroHistoryCapacity);
+            }
+            Ok(())
+        }
+
+        /// Convert the fixed-width stored bounds to the in-process replay policy.
+        ///
+        /// # Errors
+        ///
+        /// Returns a typed refusal when the reader platform cannot represent a stored
+        /// capacity.
+        pub fn replay_policy(self) -> Result<NarrativeReplayPolicyV1, NarrativeInputError> {
+            let history_capacity = usize::try_from(self.history_capacity).map_err(|_| {
+                NarrativeInputError::PersistedCapacityOutOfRange {
+                    tick: self.input.tick.0,
+                    field: "history_capacity",
+                    value: self.history_capacity,
+                }
+            })?;
+            let event_capacity = usize::try_from(self.event_capacity).map_err(|_| {
+                NarrativeInputError::PersistedCapacityOutOfRange {
+                    tick: self.input.tick.0,
+                    field: "event_capacity",
+                    value: self.event_capacity,
+                }
+            })?;
+            NarrativeReplayPolicyV1::new(self.narrative_interval, history_capacity, event_capacity)
         }
     }
 
@@ -14028,6 +14154,18 @@ pub mod narrative {
     /// Typed refusal from the narrative input or replay boundary.
     #[derive(Debug, Clone, PartialEq, Eq, Error)]
     pub enum NarrativeInputError {
+        /// A persisted input envelope used a contract version this build cannot interpret.
+        #[error(
+            "narrative input record at tick {tick} uses schema {actual}, expected schema {expected}"
+        )]
+        UnsupportedRecordSchema {
+            /// Tick carried by the rejected input.
+            tick: u64,
+            /// Version supported by this build.
+            expected: u32,
+            /// Version presented by the feeder.
+            actual: u32,
+        },
         /// A persisted feeder used a contract version this build cannot interpret.
         #[error("narrative input at tick {tick} uses schema {actual}, expected schema {expected}")]
         UnsupportedSchema {
@@ -14053,6 +14191,30 @@ pub mod narrative {
             tick: u64,
             /// Rejected platform-sized value.
             value: usize,
+        },
+        /// A production platform capacity could not enter the fixed-width persistence contract.
+        #[error(
+            "narrative {field} capacity {value} at tick {tick} does not fit in the persisted u64 contract"
+        )]
+        PlatformCapacityOutOfRange {
+            /// Tick whose policy was rejected.
+            tick: u64,
+            /// Capacity field.
+            field: &'static str,
+            /// Rejected platform-sized capacity.
+            value: usize,
+        },
+        /// A persisted fixed-width capacity cannot be represented by this reader.
+        #[error(
+            "persisted narrative {field} capacity {value} at tick {tick} does not fit on this platform"
+        )]
+        PersistedCapacityOutOfRange {
+            /// Tick whose policy was rejected.
+            tick: u64,
+            /// Capacity field.
+            field: &'static str,
+            /// Rejected fixed-width capacity.
+            value: u64,
         },
         /// A feeder repeated a tick.
         #[error("narrative input repeats tick {tick}")]
@@ -14471,6 +14633,7 @@ pub mod narrative {
             encoder: &mut super::CharacterizationEncoderV0,
         ) -> Result<(), super::CharacterizationError> {
             encoder.postcard("narrative events", &self.events)?;
+            encoder.postcard("pending narrative events", &self.pending_persistence)?;
             encoder.postcard("narrative emission watermarks", &self.last_emitted)?;
             encoder.f64(self.policy.min_population_fraction);
             encoder.f64(self.policy.min_population_absolute);
@@ -20458,6 +20621,7 @@ impl WorldState {
             max_age,
             spike_hits: self.combat_spike_hits,
         };
+        self.record_narrative_input(&summary);
         if self.history.len() >= self.config.history_capacity {
             self.history.pop_front();
         }
@@ -23780,6 +23944,7 @@ impl WorldState {
             self.pending_lifecycle_birth_metrics.clear();
             self.pending_lifecycle_death_metrics.clear();
             self.replay_events.clear();
+            self.narrative.drain_pending_persistence();
             self.pending_birth_events = 0;
             self.pending_death_events = 0;
             self.pending_spike_attempt_events = 0;
@@ -24537,7 +24702,10 @@ impl WorldState {
                 Some(CompletedStepFault::BrainSpawn(brain))
             }
             Ok(()) => match population_result {
-                Ok(()) => None,
+                Ok(()) => self
+                    .scientific_fault
+                    .clone()
+                    .map(CompletedStepFault::ScientificState),
                 Err(PopulationSpawnError::BrainSpawn(brain)) => {
                     self.brain_fault = Some(brain.clone());
                     Some(CompletedStepFault::BrainSpawn(brain))
@@ -25446,6 +25614,7 @@ impl WorldState {
             || !self.pending_lifecycle_birth_metrics.is_empty()
             || !self.pending_lifecycle_death_metrics.is_empty()
             || !self.replay_events.is_empty()
+            || !self.narrative.pending_persistence().is_empty()
             || !self.pending_persistence_runtime_tail.is_empty()
             || self.pending_birth_events != 0
             || self.pending_death_events != 0
@@ -38825,7 +38994,22 @@ mod tests {
         assert_eq!(batch.agents.len(), 1);
         assert_eq!(batch.births.len(), 1);
         assert_eq!(batch.deaths.len(), 1);
-        assert_eq!(batch.replay_events.len(), 1);
+        assert_eq!(batch.replay_events.len(), 2);
+        assert!(
+            batch
+                .replay_events
+                .iter()
+                .any(|event| event == &replay_marker(0.25))
+        );
+        assert!(batch.replay_events.iter().any(|event| {
+            matches!(
+                event.kind,
+                ReplayEventKind::NarrativeInputV1 { record }
+                    if record.input.tick == Tick(1)
+                        && record.input.spike_hits == 1
+                        && record.config_revision == world.config_revision()
+            )
+        }));
         assert!(
             batch
                 .metrics
@@ -40047,7 +40231,10 @@ mod tests {
         session.step(&mut world).expect("empty non-cadence tick");
         assert_eq!(world.tick(), Tick(1));
         assert!(logs.lock().unwrap().is_empty());
-        assert!(!world.has_pending_persistence_material());
+        assert!(
+            world.has_pending_persistence_material(),
+            "the mandatory tick-one narrative input is an undelivered scientific record"
+        );
         assert!(!session.has_pending_batch());
         assert_eq!(
             world.persistence_boundary,
@@ -40076,7 +40263,15 @@ mod tests {
             .apply_config_update(disabled)
             .expect("disable after empty tick admission");
         assert_eq!(world.config().persistence_interval, 0);
-        assert_eq!(logs.lock().unwrap().len(), 1);
+        let logs = logs.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(matches!(
+            logs[0].replay_events.as_slice(),
+            [ReplayEvent {
+                kind: ReplayEventKind::NarrativeInputV1 { record },
+                ..
+            }] if record.input.tick == Tick(1)
+        ));
     }
 
     #[test]
@@ -40675,6 +40870,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn narrative_record_construction_fault_is_returned_on_the_completed_tick_and_latched() {
+        let (mut world, mut session) =
+            world_with_session(quiet_trace_config(0x4E41_5252, 1), NullPersistence);
+        world.config.history_capacity = 0;
+
+        let completion = session
+            .step_outcome(&mut world)
+            .expect("the transition reaches a completed, typed-fault boundary");
+        let expected = ScientificStateError::DimensionOverflow {
+            path: "narrative_input.persistence_record".to_owned(),
+        };
+        assert!(matches!(
+            completion.fault.as_ref(),
+            Some(CompletedStepFault::ScientificState(actual)) if actual == &expected
+        ));
+        assert_eq!(world.scientific_fault(), Some(&expected));
+        assert_eq!(world.tick(), Tick(1));
+
+        let projected = ready_batch_arc(&completion.outcome.persistence);
+        assert_same_staged_batch(&session, &projected);
+        assert!(
+            !projected
+                .replay_events
+                .iter()
+                .any(|event| matches!(event.kind, ReplayEventKind::NarrativeInputV1 { .. })),
+            "a failed mandatory-record construction must not fabricate evidence"
+        );
+
+        let digest_after_fault = world
+            .characterization_digest_v0()
+            .expect("completed-fault digest");
+        let blocked = session
+            .step_outcome(&mut world)
+            .expect_err("the latched boundary must refuse a second science tick");
+        assert!(matches!(
+            blocked,
+            WorldStepError::ScientificState(
+                ScientificStateError::PersistenceBoundaryUnresolved { ref path, tick: 1 }
+            ) if path == "world.step"
+        ));
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("blocked-step digest"),
+            digest_after_fault
+        );
+        assert!(matches!(
+            world.latched_step_error(),
+            Some(WorldStepError::ScientificState(actual)) if actual == expected
+        ));
+    }
+
     fn lifecycle_birth(tick: u64) -> BirthRecord {
         BirthRecord {
             tick: Tick(tick),
@@ -41115,9 +41364,37 @@ mod tests {
                 PersistenceEventKind::Custom(name) if name == "spike_hits"
             ) && event.count == 3
         }));
+        let replay_markers = batch
+            .replay_events
+            .iter()
+            .filter_map(|event| match event.kind {
+                ReplayEventKind::RngSample { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replay_markers, vec![0.1, 0.2]);
+        let narrative_inputs = batch
+            .replay_events
+            .iter()
+            .filter_map(|event| match event.kind {
+                ReplayEventKind::NarrativeInputV1 { record } => Some(record.input),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            batch.replay_events,
-            vec![replay_marker(0.1), replay_marker(0.2)]
+            narrative_inputs
+                .iter()
+                .map(|input| input.tick)
+                .collect::<Vec<_>>(),
+            vec![Tick(1), Tick(2), Tick(3)]
+        );
+        assert_eq!(
+            narrative_inputs
+                .iter()
+                .map(|input| input.spike_hits)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0],
+            "narrative records retain per-tick spike hits rather than cadence aggregates"
         );
     }
 
@@ -44632,11 +44909,24 @@ mod tests {
             metabolism_drain: 0.002,
             movement_drain: 0.001,
             temperature_discomfort_rate: 0.003,
+            // bd-pdx5: these five were a compounding population runaway. With interval 1,
+            // cooldown 1 and chance 1.0, every agent attempted reproduction on essentially every
+            // tick, and the population grew ~12%/tick MONOTONICALLY -- measured at 14 -> 136 in 17
+            // ticks with no combat at all (878f057ee). Over the 64 ticks `run_gate` actually uses,
+            // times 17 faults, that is what made the economy mutation suite unrunnable.
+            //
+            // The fix has to slow reproduction WITHOUT switching it off: `KIND_TO_FAULTS` maps
+            // ReproductionAllocation -> DropReproductionPosting and PopulationInjection ->
+            // DropPopulationPosting, so both events must still occur or those two faults become
+            // unexercisable -- the same nominal-coverage trap Combat fell into. Attempting every
+            // 16th tick at 1-in-4 still yields a healthy number of births across 64 ticks while
+            // making the population bounded, and deaths can still pull it under
+            // `population_minimum` so injection fires too.
             reproduction_energy_threshold: 0.8,
             reproduction_energy_cost: 0.8,
-            reproduction_cooldown: 1,
-            reproduction_attempt_interval: 1,
-            reproduction_attempt_chance: 1.0,
+            reproduction_cooldown: 8,
+            reproduction_attempt_interval: 16,
+            reproduction_attempt_chance: 0.25,
             reproduction_child_energy: 0.4,
             closed: false,
             population_minimum: 8,
@@ -44979,12 +45269,63 @@ mod tests {
                         }
                     }
                 }
-                // bd-16g.11.2 / bd-e6ff: a DropCombatPosting setup arm belongs here and is
-                // deliberately absent. Making Combat reachable HANGS this test -- see the revert
-                // rationale in dfaca98aa448 and the bead. Do not re-add one without first
-                // resolving that hang; the diagnosis (spike_lengths > 0.5 floor, and the fact that
-                // the commanded spike must come from a bound brain because stage_brains overwrites
-                // runtime.outputs before stage_combat reads them) is recorded on bd-16g.11.2.
+                if matches!(fault, LedgerFault::DropCombatPosting) {
+                    // bd-16g.11.2 / bd-pdx5. This arm was landed (dfaca98aa448), reverted
+                    // (a299e3c71a8e) because the suite stopped terminating, and is now restored:
+                    // the non-termination was the fixture's POPULATION RUNAWAY, not combat. With
+                    // reproduction bounded above, this whole suite runs in under a second, so the
+                    // reason for the revert no longer exists. Combat merely made the runaway
+                    // expensive, by switching on distribute_carcass_rewards -- an O(dead x agents)
+                    // scan gated on `spiked` -- over a compounding population.
+                    //
+                    // Combat is otherwise UNREACHABLE by construction here. stage_combat gates on
+                    // spike_lengths[idx] > 0.5, default spike length is 0, and actuation only walks
+                    // it toward the commanded target at spike_growth_rate (0.005/tick), so 64 ticks
+                    // tops out near 0.32. Seeding 5.0 clears the floor and holds; the same walk
+                    // needs ~900 ticks to decay back.
+                    //
+                    // The commanded spike must come from a BRAIN, not a write to `outputs`.
+                    // stage_brains runs before stage_combat and overwrites runtime.outputs
+                    // unconditionally for every agent, bound or not (an unbound one receives
+                    // default_outputs(sensors)), so a value staged between ticks is gone before
+                    // combat reads it. LedgerAggressorBrain commands SpikeTarget = 1.0 every tick,
+                    // which is how resource_ledger_attributes_ecology_combat_and_interventions
+                    // earns its asserted non-zero Combat attribution.
+                    let handles: Vec<AgentId> = world.agents().iter_handles().collect();
+                    if handles.len() >= 2 {
+                        let attacker = handles[0];
+                        let victim = handles[1];
+                        world.config.spike_min_length = 0.0;
+                        world.config.spike_alignment_cosine = 0.0;
+                        let aggressor = world
+                            .brain_registry_mut()
+                            .expect("combat fault registry mutation")
+                            .register("test.economy-fault-aggressor", |_rng| {
+                                Ok(Box::new(LedgerAggressorBrain))
+                            });
+                        assert!(
+                            world
+                                .bind_agent_brain(attacker, aggressor)
+                                .expect("combat fault aggressor brain"),
+                            "attacker must accept the aggressor brain"
+                        );
+                        let attacker_idx = world.agents.index_of(attacker).expect("attacker index");
+                        let victim_idx = world.agents.index_of(victim).expect("victim index");
+                        let columns = world.agents.columns_mut();
+                        columns.positions_mut()[attacker_idx] = Position::new(40.0, 60.0);
+                        columns.positions_mut()[victim_idx] = Position::new(45.0, 60.0);
+                        columns.headings_mut()[attacker_idx] = 0.0;
+                        columns.spike_lengths_mut()[attacker_idx] = 5.0;
+                        columns.health_mut()[victim_idx] = 2.0;
+                        if let Some(runtime) = world.runtime.get_mut(attacker) {
+                            runtime.herbivore_tendency = 0.0;
+                            runtime.energy = 1.5;
+                        }
+                        if let Some(runtime) = world.runtime.get_mut(victim) {
+                            runtime.herbivore_tendency = 1.0;
+                        }
+                    }
+                }
                 if matches!(fault, LedgerFault::SkipDeathResidue) {
                     let agent = world.agents().iter_handles().next();
                     if let Some(agent) = agent {

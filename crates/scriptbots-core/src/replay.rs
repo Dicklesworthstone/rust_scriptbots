@@ -7,10 +7,12 @@
 //! actuation stage already computed: it never mutates science state, so identical
 //! configurations produce identical streams and the world digest is unaffected.
 //!
-//! Emission is bounded by `ScriptBotsConfig::replay_event_tick_cap`, which defaults to
-//! `DEFAULT_REPLAY_EVENT_TICK_CAP` (512). THE STREAM IS ON BY DEFAULT. Runs with larger
-//! populations should raise the cap to at or above their peak agent count so every live
-//! agent is recorded every tick; the reported drop count is how they learn they need to.
+//! Optional action emission is bounded by `ScriptBotsConfig::replay_event_tick_cap`, which
+//! defaults to `DEFAULT_REPLAY_EVENT_TICK_CAP` (512). THE ACTION STREAM IS ON BY DEFAULT.
+//! Runs with larger populations should raise the cap to at or above their peak agent count so
+//! every live agent is recorded every tick; the reported drop count is how they learn they need
+//! to. The mandatory narrative input record is independent of this optional budget and remains
+//! exactly one per persisted tick even when the cap is zero.
 //! Setting the cap to zero is an explicit opt-OUT, not the resting state.
 //!
 //! WHAT "BYTE-IDENTICAL" MEANS NOW, because this sentence used to promise something else.
@@ -35,11 +37,47 @@
 //! persistence_interval` events are retained between drains.
 
 use crate::{
-    PendingReplayInteraction, ReplayEvent, ReplayEventKind, Tick, WorldState,
+    PendingReplayInteraction, ReplayEvent, ReplayEventKind, ScientificStateError, Tick,
+    TickSummary, WorldState,
     channels::{OutputChannel, OutputsExt},
+    narrative::{NarrativeInputError, NarrativeInputRecordV1},
 };
 
 impl WorldState {
+    /// Append the exact production narrative input outside optional replay sampling budgets.
+    pub(crate) fn record_narrative_input(&mut self, summary: &TickSummary) {
+        if self.config.persistence_interval == 0 {
+            return;
+        }
+        match NarrativeInputRecordV1::from_summary(summary, self.config_revision, &self.config) {
+            Ok(record) => self.replay_events.push(ReplayEvent {
+                agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                kind: ReplayEventKind::NarrativeInputV1 { record },
+            }),
+            Err(error) => {
+                let fault = match &error {
+                    NarrativeInputError::NonFinite { field, .. } => {
+                        ScientificStateError::NonFinite {
+                            path: format!("narrative_input.{field}"),
+                        }
+                    }
+                    _ => ScientificStateError::DimensionOverflow {
+                        path: "narrative_input.persistence_record".to_owned(),
+                    },
+                };
+                diag_error!(
+                    tick = summary.tick.0,
+                    %error,
+                    "complete narrative input could not enter persistence"
+                );
+                self.latch_scientific_fault(fault);
+            }
+        }
+    }
+
     fn replay_interaction_tick_selected(&self, tick: Tick) -> bool {
         let stride = self.config.interaction_event_tick_stride;
         self.config.interaction_event_tick_cap > 0
@@ -388,12 +426,10 @@ mod tests {
         );
     }
 
-    /// An explicit zero cap -- the opt-OUT, no longer the default -- must leave the stream
-    /// completely empty. This still matters after the default moved to 512: a run that
-    /// deliberately disables emission must actually get silence, or "opt out" would be as
-    /// hollow as the inert default it replaced.
+    /// An explicit zero action cap must suppress optional action and digest records without
+    /// suppressing the mandatory narrative input needed for scientific replay.
     #[test]
-    fn a_zero_cap_records_nothing() {
+    fn a_zero_action_cap_still_records_complete_narrative_inputs() {
         const INTERVAL: u32 = 2;
 
         let (mut world, mut session, batches) =
@@ -409,9 +445,26 @@ mod tests {
         let batch = batches
             .last()
             .expect("the window boundary projected a batch");
+        assert!(action_events(batch).is_empty());
         assert!(
-            batch.replay_events.is_empty(),
-            "disabled emission must not record actions or a digest anchor"
+            !batch
+                .replay_events
+                .iter()
+                .any(|event| matches!(event.kind, ReplayEventKind::WorldDigest { .. })),
+            "the optional digest anchor follows the action replay opt-out"
+        );
+        let narrative_inputs = batch
+            .replay_events
+            .iter()
+            .filter_map(|event| match event.kind {
+                ReplayEventKind::NarrativeInputV1 { record } => Some(record.input.tick),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            narrative_inputs,
+            vec![Tick(1), Tick(2)],
+            "mandatory detector inputs must cover every completed tick"
         );
     }
 

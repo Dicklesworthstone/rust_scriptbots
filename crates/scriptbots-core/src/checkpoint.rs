@@ -49,8 +49,8 @@ pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.3";
 /// requires a codec bump. A change to future-state coverage or field meaning requires a new
 /// checkpoint schema. Never rebless the representative V1 wire golden without reviewing both
 /// version identities.
-pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 6;
-const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v6";
+pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 7;
+const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v7";
 
 /// Maximum complete checkpoint wire accepted by the decoder.
 ///
@@ -2895,10 +2895,10 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_546,
-                "946e46ce043e58ef24722a4c3c5e78d02eeaea963421d884f1d4ac9daaba3daa",
+                8_549,
+                "3318ac675fa65c5ac33f18128f86c7342974ba1e9fc127066eef7991fbfc609f",
             ),
-            "the reviewed V1.3/codec-6 wire must remain byte-identical: re-pinned in \
+            "the reviewed V1.3/codec-7 wire must remain byte-identical: re-pinned in \
              bd-2i1 after the locomotion model was bound, then re-pinned in \
              bd-2z0.14.3.1 after RenderSettings v2 added presentation-only fields \
              (quality tier, post stack, day/night, theme, palette) to the serialized \
@@ -2907,7 +2907,9 @@ mod tests {
              default 0) joined the serialized config tree (+1 byte of usize varint). \
              Re-pinned in bd-yw1j from the reviewed four-thread arm64 macOS DSR lane \
              after ActiveEffect gained its kind discriminant, Region gained Rect, and \
-             the orphaned positional sense_max_neighbors field was retired"
+             the orphaned positional sense_max_neighbors field was retired. Re-pinned \
+             in bd-16g.2.9.2.1 after interaction-event retention controls joined the \
+             config tree and mandatory narrative inputs advanced the checkpoint codec"
         );
     }
 
@@ -3214,9 +3216,12 @@ mod tests {
 
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode private wire fixture");
-        assert_eq!(wire.codec_version, 6, "bd-yw1j checkpoint codec bump");
         assert_eq!(
-            wire.codec, "postcard+blake3-v6",
+            wire.codec_version, 7,
+            "bd-16g.2.9.2.1 checkpoint codec bump"
+        );
+        assert_eq!(
+            wire.codec, "postcard+blake3-v7",
             "bd-yw1j checkpoint codec identity bump"
         );
 

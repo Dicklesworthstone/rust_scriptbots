@@ -72,6 +72,7 @@ run_exact_test \
   --test storage_journal
 
 crash_window_tests=(
+  tests::durable_preclaim_commit_survives_lost_reply_and_applies_once_after_restart
   tests::host_journal_receive_and_admission_transaction_fault_matrix_rolls_back_exactly
   tests::host_journal_scientific_table_transaction_fault_matrix_recovers_exactly_once
   tests::host_journal_lost_rollback_ack_is_indeterminate_but_reopen_safe

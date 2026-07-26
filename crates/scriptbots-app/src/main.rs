@@ -33,8 +33,8 @@ use scriptbots_core::{
 use scriptbots_render::{render_png_offscreen, run_demo};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    INTERACTION_REPLAY_SEQ_BASE, PersistedReplayEvent, PersistenceGuarantee, ShutdownReceipt,
-    StoragePipeline, StorageReader,
+    INTERACTION_REPLAY_SEQ_BASE, NARRATIVE_INPUT_REPLAY_SEQ, PersistedReplayEvent,
+    PersistenceGuarantee, ShutdownReceipt, StoragePipeline, StorageReader,
 };
 use serde_json::{self, Value as JsonValue};
 use std::process::{Command, Stdio};
@@ -3392,6 +3392,12 @@ struct ReplayRun {
     final_digest: WorldDigestV1,
 }
 
+fn canonicalize_replay_event_order(events: &mut [PersistedReplayEvent]) {
+    // `sort_by_key` is stable, so an invalid duplicate identity still retains its
+    // deterministic emission order for the later divergence report.
+    events.sort_by_key(|entry| (entry.tick, entry.seq));
+}
+
 fn run_headless_simulation(
     config: &ScriptBotsConfig,
     tick_limit: u64,
@@ -3444,11 +3450,15 @@ fn run_headless_simulation(
                         .checked_add(*ordinal)
                         .ok_or_else(|| anyhow::anyhow!("interaction replay ordinal overflow"))?,
                 ),
+                ReplayEventKind::NarrativeInputV1 { record } => {
+                    (record.input.tick.0, NARRATIVE_INPUT_REPLAY_SEQ)
+                }
                 _ => (record.tick, fallback_seq as u64),
             };
             events.push(PersistedReplayEvent { tick, seq, event });
         }
     }
+    canonicalize_replay_event_order(&mut events);
 
     Ok(ReplayRun {
         events,
@@ -3940,6 +3950,7 @@ fn count_event_kinds(events: &[PersistedReplayEvent]) -> HashMap<&'static str, u
                 kind: ReplayInteractionKind::FoodShare,
                 ..
             } => "food_share",
+            ReplayEventKind::NarrativeInputV1 { .. } => "narrative_input_v1",
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -4043,6 +4054,17 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
             "Interaction(tick={}, ordinal={ordinal}, kind={kind:?}, actor={:?}, target={:?}, magnitude={magnitude:.6})",
             tick.0, event.agent_uid, event.counterpart
         ),
+        ReplayEventKind::NarrativeInputV1 { record } => format!(
+            "NarrativeInputV1(tick={}, agents={}, average_energy_bits={:08x}, spike_hits={}, config_revision={}, interval={}, history_capacity={}, event_capacity={})",
+            record.input.tick.0,
+            record.input.agent_count,
+            record.input.average_energy.to_bits(),
+            record.input.spike_hits,
+            record.config_revision,
+            record.narrative_interval,
+            record.history_capacity,
+            record.event_capacity
+        ),
     }
 }
 
@@ -4058,6 +4080,7 @@ fn print_event_counts(
         "world_digest",
         "combat",
         "food_share",
+        "narrative_input_v1",
     ];
     println!("  {}", label.cyan().bold());
     for key in keys {
@@ -5506,6 +5529,98 @@ activation = "Sigmoid"
     }
 
     #[test]
+    fn canonical_replay_order_places_narrative_before_interactions_and_preserves_ties() {
+        let tick = scriptbots_core::Tick(7);
+        let ordinary = |overall| PersistedReplayEvent {
+            tick: tick.0,
+            seq: 0,
+            event: scriptbots_core::ReplayEvent {
+                agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                kind: ReplayEventKind::WorldDigest {
+                    overall: overall.to_owned(),
+                },
+            },
+        };
+        let narrative_record = scriptbots_core::narrative::NarrativeInputRecordV1::from_summary(
+            &TickSummary {
+                tick,
+                agent_count: 2,
+                births: 0,
+                deaths: 0,
+                total_energy: 2.0,
+                average_energy: 1.0,
+                average_health: 1.0,
+                max_age: 0,
+                spike_hits: 1,
+            },
+            3,
+            &ScriptBotsConfig::default(),
+        )
+        .expect("canonical narrative record");
+        let narrative = PersistedReplayEvent {
+            tick: tick.0,
+            seq: NARRATIVE_INPUT_REPLAY_SEQ,
+            event: scriptbots_core::ReplayEvent {
+                agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                kind: ReplayEventKind::NarrativeInputV1 {
+                    record: narrative_record,
+                },
+            },
+        };
+        let interaction = PersistedReplayEvent {
+            tick: tick.0,
+            seq: INTERACTION_REPLAY_SEQ_BASE,
+            event: scriptbots_core::ReplayEvent {
+                agent_uid: Some(scriptbots_core::AgentUid(1)),
+                position: None,
+                counterpart: Some(scriptbots_core::AgentUid(2)),
+                counterpart_position: None,
+                kind: ReplayEventKind::Interaction {
+                    tick,
+                    ordinal: 0,
+                    kind: ReplayInteractionKind::Combat,
+                    magnitude: 0.5,
+                },
+            },
+        };
+        let mut events = vec![
+            interaction,
+            ordinary("1111111111111111"),
+            narrative,
+            ordinary("2222222222222222"),
+        ];
+
+        canonicalize_replay_event_order(&mut events);
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|entry| (entry.tick, entry.seq))
+                .collect::<Vec<_>>(),
+            [
+                (tick.0, 0),
+                (tick.0, 0),
+                (tick.0, NARRATIVE_INPUT_REPLAY_SEQ),
+                (tick.0, INTERACTION_REPLAY_SEQ_BASE),
+            ]
+        );
+        let ReplayEventKind::WorldDigest { overall: first } = &events[0].event.kind else {
+            panic!("first tied event changed kind");
+        };
+        let ReplayEventKind::WorldDigest { overall: second } = &events[1].event.kind else {
+            panic!("second tied event changed kind");
+        };
+        assert_eq!(first, "1111111111111111");
+        assert_eq!(second, "2222222222222222");
+    }
+
+    #[test]
     #[serial]
     fn headless_replay_finalizes_non_aligned_persistence_tail() {
         let dir = tempdir().expect("tempdir");
@@ -5559,14 +5674,29 @@ activation = "Sigmoid"
                 .collect::<Vec<_>>(),
             [5, 10, 15, 16]
         );
+        let narrative_ticks = |events: &[PersistedReplayEvent]| {
+            events
+                .iter()
+                .filter_map(|entry| match &entry.event.kind {
+                    ReplayEventKind::NarrativeInputV1 { record } => Some(record.input.tick.0),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_ticks = (1..=16).collect::<Vec<_>>();
+        assert_eq!(narrative_ticks(&recorded_events), expected_ticks);
+        assert_eq!(narrative_ticks(&replay.events), expected_ticks);
         assert!(
-            recorded_events.is_empty() && replay.events.is_empty(),
-            "this cadence test must not masquerade as meaningful replay instrumentation"
+            replay
+                .events
+                .windows(2)
+                .all(|pair| (pair[0].tick, pair[0].seq) <= (pair[1].tick, pair[1].seq)),
+            "simulated events must use the same canonical order as durable replay rows"
         );
         let diff = diff_event_stream(&recorded_events, &replay.events);
         assert!(
             diff.is_none(),
-            "empty event-stream plumbing should remain stable"
+            "non-aligned finalization must preserve the complete replay stream"
         );
     }
 

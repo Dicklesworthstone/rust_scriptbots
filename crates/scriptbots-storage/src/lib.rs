@@ -46,7 +46,11 @@ use scriptbots_core::{
     PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase, ReplayEvent,
     ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
-    narrative::{EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord, SubjectRef},
+    narrative::{
+        EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord,
+        NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION, NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+        NarrativeInputRecordV1, NarrativeInputV1, SubjectRef,
+    },
     rng_domains::{AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain},
     world_counters_digest_v1,
 };
@@ -99,6 +103,14 @@ const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
 /// events retain a per-source-tick ordinal instead, so placing them in this disjoint namespace
 /// prevents a collision while preserving a stable identity across persistence windows.
 pub const INTERACTION_REPLAY_SEQ_BASE: u64 = 1 << 62;
+/// Sequence reserved for the one mandatory narrative input at each source tick.
+///
+/// Optional replay events occupy the low enumeration namespace and pairwise interactions begin
+/// at [`INTERACTION_REPLAY_SEQ_BASE`]. A constant is sufficient because `tick` is also part of
+/// the replay-events primary key.
+pub const NARRATIVE_INPUT_REPLAY_SEQ: u64 = 1 << 61;
+const NARRATIVE_INPUT_EVENT_TYPE: &str = "narrative_input_v1";
+const NARRATIVE_INPUT_SCOPE: &str = "world:narrative";
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -200,9 +212,10 @@ const SCRIPTBOTS_SCHEMA_V9_VERSION: i64 = 9;
 const SCRIPTBOTS_SCHEMA_V10_VERSION: i64 = 10;
 const SCRIPTBOTS_SCHEMA_V11_VERSION: i64 = 11;
 const SCRIPTBOTS_SCHEMA_V12_VERSION: i64 = 12;
+const SCRIPTBOTS_SCHEMA_V13_VERSION: i64 = 13;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 13;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 14;
 
 /// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
@@ -1127,7 +1140,17 @@ const SCRIPTBOTS_SCHEMA_V13: &str = r#"
     PRAGMA user_version = 13;
 "#;
 
-const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 8] = [
+/// V14 contract migration: add the mandatory `narrative_input_v1` replay vocabulary.
+///
+/// The physical V6 replay table already carries a typed scope, event type, and payload. The
+/// migration is intentionally metadata-only: advancing the schema gate prevents a V13 reader,
+/// which does not understand this mandatory event, from opening a database and presenting a
+/// partial replay as complete.
+const SCRIPTBOTS_SCHEMA_V14: &str = r#"
+    PRAGMA user_version = 14;
+"#;
+
+const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 9] = [
     (
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         "create_multi_run_schema",
@@ -1164,9 +1187,14 @@ const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 8] = [
         SCRIPTBOTS_SCHEMA_V12,
     ),
     (
-        SCRIPTBOTS_SCHEMA_VERSION,
+        SCRIPTBOTS_SCHEMA_V13_VERSION,
         "add_durable_command_claims",
         SCRIPTBOTS_SCHEMA_V13,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_VERSION,
+        "add_narrative_input_replay_contract",
+        SCRIPTBOTS_SCHEMA_V14,
     ),
 ];
 
@@ -1236,7 +1264,7 @@ fn refuse_lossy_command_lifecycle_migration(connection: &Connection) -> Result<(
 
 fn refuse_ambiguous_command_claim_migration(connection: &Connection) -> Result<(), StorageError> {
     let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
-    if !(SCRIPTBOTS_SCHEMA_V9_VERSION..SCRIPTBOTS_SCHEMA_VERSION).contains(&user_version) {
+    if !(SCRIPTBOTS_SCHEMA_V9_VERSION..SCRIPTBOTS_SCHEMA_V13_VERSION).contains(&user_version) {
         return Ok(());
     }
     let rows = connection.query(
@@ -1263,7 +1291,7 @@ fn refuse_ambiguous_command_claim_migration(connection: &Connection) -> Result<(
 
 fn refuse_lossy_command_claim_migration(connection: &Connection) -> Result<(), StorageError> {
     let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
-    if !(SCRIPTBOTS_SCHEMA_V9_VERSION..SCRIPTBOTS_SCHEMA_VERSION).contains(&user_version) {
+    if !(SCRIPTBOTS_SCHEMA_V9_VERSION..SCRIPTBOTS_SCHEMA_V13_VERSION).contains(&user_version) {
         return Ok(());
     }
 
@@ -1306,7 +1334,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
     // Every suffix of the chain is a legal lineage: a database joins at whatever version it
     // was left at and runs forward from there. Enumerated rather than computed so that adding
     // a migration without extending this list fails loudly instead of accepting a gap.
-    const LINEAGE: [i64; 8] = [
+    const LINEAGE: [i64; 9] = [
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         SCRIPTBOTS_SCHEMA_V7_VERSION,
         SCRIPTBOTS_SCHEMA_V8_VERSION,
@@ -1314,6 +1342,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
         SCRIPTBOTS_SCHEMA_V10_VERSION,
         SCRIPTBOTS_SCHEMA_V11_VERSION,
         SCRIPTBOTS_SCHEMA_V12_VERSION,
+        SCRIPTBOTS_SCHEMA_V13_VERSION,
         SCRIPTBOTS_SCHEMA_VERSION,
     ];
     let applied_is_valid = result.applied.is_empty()
@@ -2944,6 +2973,143 @@ pub enum NarrativeQueryError {
     AroundWindowTooDense { max: usize },
 }
 
+/// Stable refusals from the complete persisted narrative-input stream.
+///
+/// These failures name the first tick at which evidence stops being usable. Callers therefore
+/// never need to parse SQLite prose to distinguish an incomplete run from a bad page token or
+/// a contract drift.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum NarrativeInputStreamError {
+    #[error("narrative input page size {limit} is outside 1..={max}")]
+    InvalidPageSize { limit: usize, max: usize },
+    #[error("complete narrative input paging requires a finished-run reader")]
+    FinishedReaderRequired,
+    #[error("run has no narrative input evidence at tick {first_offending_tick}")]
+    MissingEvidence { first_offending_tick: u64 },
+    #[error(
+        "narrative input stream is truncated at tick {first_offending_tick}: terminal tick {terminal_tick}, rows={rows}, min={minimum_tick:?}, max={maximum_tick:?}"
+    )]
+    Truncated {
+        first_offending_tick: u64,
+        terminal_tick: u64,
+        rows: u64,
+        minimum_tick: Option<u64>,
+        maximum_tick: Option<u64>,
+    },
+    #[error("narrative input repeats tick {tick}")]
+    DuplicateTick { tick: u64 },
+    #[error("narrative input tick {current} follows newer tick {previous}")]
+    OutOfOrder { previous: u64, current: u64 },
+    #[error(
+        "narrative input stream has a gap after tick {previous}: expected {expected}, found {actual}"
+    )]
+    TickGap {
+        previous: u64,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "narrative input contract changed at tick {tick}: expected record/input schemas {expected_record}/{expected_input}, found {actual_record}/{actual_input}"
+    )]
+    MixedVersion {
+        tick: u64,
+        expected_record: u32,
+        actual_record: u32,
+        expected_input: u32,
+        actual_input: u32,
+    },
+    #[error(
+        "narrative configuration revision changed at tick {tick}: expected {expected}, found {actual}"
+    )]
+    MixedConfiguration {
+        tick: u64,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("narrative detector policy changed at tick {tick}")]
+    MixedPolicy { tick: u64 },
+    #[error(
+        "narrative detector history is insufficient at tick {first_offending_tick}: available {available}, required {required}"
+    )]
+    InsufficientHistory {
+        first_offending_tick: u64,
+        available: u64,
+        required: u64,
+    },
+    #[error("narrative cursor belongs to run {actual}, expected {expected}")]
+    CursorRunMismatch { expected: RunId, actual: RunId },
+    #[error("narrative cursor config digest does not match the selected run at tick {tick}")]
+    CursorConfigDigestMismatch { tick: u64 },
+    #[error(
+        "narrative cursor build/manifest digest does not match the selected run at tick {tick}"
+    )]
+    CursorBuildDigestMismatch { tick: u64 },
+    #[error("narrative cursor contract does not match the selected run at tick {tick}")]
+    CursorContractMismatch { tick: u64 },
+    #[error("narrative cursor does not name one exact persisted input at tick {tick}")]
+    CursorNotFound { tick: u64 },
+    #[error("invalid narrative input record at tick {tick}: {reason}")]
+    InvalidRecord { tick: u64, reason: String },
+}
+
+/// Fixed-width narrative detector policy bound to a persisted stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NarrativeInputPolicyV1 {
+    pub narrative_interval: u32,
+    pub history_capacity: u64,
+    pub event_capacity: u64,
+}
+
+impl From<NarrativeInputRecordV1> for NarrativeInputPolicyV1 {
+    fn from(record: NarrativeInputRecordV1) -> Self {
+        Self {
+            narrative_interval: record.narrative_interval,
+            history_capacity: record.history_capacity,
+            event_capacity: record.event_capacity,
+        }
+    }
+}
+
+/// Run, contract, configuration, build, and continuity evidence shared by every page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NarrativeInputBindingV1 {
+    pub run_id: RunId,
+    pub record_schema_version: u32,
+    pub input_schema_version: u32,
+    pub config_revision: u64,
+    pub config_digest: String,
+    pub manifest_digest: String,
+    pub policy: NarrativeInputPolicyV1,
+    pub first_tick: u64,
+    pub terminal_tick: u64,
+    pub input_count: u64,
+}
+
+/// Exact forward-page token. Every provenance field is revalidated before use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NarrativeInputCursorV1 {
+    pub run_id: RunId,
+    pub tick: u64,
+    pub record_schema_version: u32,
+    pub input_schema_version: u32,
+    pub config_revision: u64,
+    pub config_digest: String,
+    pub manifest_digest: String,
+    pub policy: NarrativeInputPolicyV1,
+}
+
+/// One bounded, canonically ordered page of complete detector inputs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NarrativeInputPageV1 {
+    pub binding: NarrativeInputBindingV1,
+    pub inputs: Vec<NarrativeInputRecordV1>,
+    pub next_after: Option<NarrativeInputCursorV1>,
+}
+
 /// Storage error wrapper.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -3016,6 +3182,9 @@ pub enum StorageError {
     /// A narrative search caller supplied invalid or too-dense bounded input.
     #[error(transparent)]
     NarrativeQuery(#[from] NarrativeQueryError),
+    /// A complete persisted narrative-input contract was refused.
+    #[error(transparent)]
+    NarrativeInputStream(#[from] NarrativeInputStreamError),
     /// A narrative event failed its versioned typed persistence contract.
     #[error(transparent)]
     RunEvent(#[from] RunEventDecodeError),
@@ -5584,6 +5753,10 @@ impl StorageBuffer {
             }
         }
         let mut replay_keys = BTreeSet::new();
+        let mut previous_narrative_tick: Option<u64> = None;
+        let mut narrative_contract: Option<(u32, u32, u64, NarrativeInputPolicyV1)> = None;
+        let mut narrative_rows = 0_u64;
+        let mut minimum_narrative_tick = None;
         for row in &self.replay_events {
             let row_tick = checked_u64("replay_events.tick", row.tick)?;
             if row_tick > enclosing_tick {
@@ -5596,6 +5769,12 @@ impl StorageBuffer {
             }
             checked_u64("replay_events.seq", row.seq)?;
             if !replay_keys.insert((row.tick, row.seq)) {
+                if row.event_type == NARRATIVE_INPUT_EVENT_TYPE {
+                    return Err(NarrativeInputStreamError::DuplicateTick {
+                        tick: checked_u64("replay_events.narrative_input.tick", row.tick)?,
+                    }
+                    .into());
+                }
                 return Err(StorageError::InvalidData {
                     context: "replay_events.seq",
                     reason: format!(
@@ -5603,6 +5782,105 @@ impl StorageBuffer {
                         row.tick, row.seq
                     ),
                 });
+            }
+            if row.seq
+                == encode_u64(
+                    "replay_events.narrative_input.seq",
+                    NARRATIVE_INPUT_REPLAY_SEQ,
+                )?
+                && row.event_type != NARRATIVE_INPUT_EVENT_TYPE
+            {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.seq",
+                    reason: format!(
+                        "event type {:?} occupies the narrative sequence at tick {}",
+                        row.event_type, row.tick
+                    ),
+                });
+            }
+            if row.event_type == NARRATIVE_INPUT_EVENT_TYPE {
+                let record = narrative_input_record_from_row(row, false)?;
+                narrative_rows = narrative_rows.saturating_add(1);
+                minimum_narrative_tick.get_or_insert(record.input.tick.0);
+                if let Some(previous) = previous_narrative_tick {
+                    let expected =
+                        previous
+                            .checked_add(1)
+                            .ok_or(NarrativeInputStreamError::OutOfOrder {
+                                previous,
+                                current: record.input.tick.0,
+                            })?;
+                    if record.input.tick.0 == previous {
+                        return Err(
+                            NarrativeInputStreamError::DuplicateTick { tick: previous }.into()
+                        );
+                    }
+                    if record.input.tick.0 < previous {
+                        return Err(NarrativeInputStreamError::OutOfOrder {
+                            previous,
+                            current: record.input.tick.0,
+                        }
+                        .into());
+                    }
+                    if record.input.tick.0 != expected {
+                        return Err(NarrativeInputStreamError::TickGap {
+                            previous,
+                            expected,
+                            actual: record.input.tick.0,
+                        }
+                        .into());
+                    }
+                }
+                let contract = (
+                    record.record_schema_version,
+                    record.input.schema_version,
+                    record.config_revision,
+                    NarrativeInputPolicyV1::from(record),
+                );
+                if let Some(expected) = narrative_contract {
+                    if (contract.0, contract.1) != (expected.0, expected.1) {
+                        return Err(NarrativeInputStreamError::MixedVersion {
+                            tick: record.input.tick.0,
+                            expected_record: expected.0,
+                            actual_record: contract.0,
+                            expected_input: expected.1,
+                            actual_input: contract.1,
+                        }
+                        .into());
+                    }
+                    if contract.2 != expected.2 {
+                        return Err(NarrativeInputStreamError::MixedConfiguration {
+                            tick: record.input.tick.0,
+                            expected: expected.2,
+                            actual: contract.2,
+                        }
+                        .into());
+                    }
+                    if contract.3 != expected.3 {
+                        return Err(NarrativeInputStreamError::MixedPolicy {
+                            tick: record.input.tick.0,
+                        }
+                        .into());
+                    }
+                } else {
+                    if (contract.0, contract.1)
+                        != (
+                            NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                            NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                        )
+                    {
+                        return Err(NarrativeInputStreamError::MixedVersion {
+                            tick: record.input.tick.0,
+                            expected_record: NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                            actual_record: contract.0,
+                            expected_input: NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                            actual_input: contract.1,
+                        }
+                        .into());
+                    }
+                    narrative_contract = Some(contract);
+                }
+                previous_narrative_tick = Some(record.input.tick.0);
             }
             if let Some(value) = row.interaction_value
                 && (!value.is_finite() || value <= 0.0)
@@ -5626,6 +5904,18 @@ impl StorageBuffer {
                     ),
                 });
             }
+        }
+        if let Some(last_tick) = previous_narrative_tick
+            && last_tick != enclosing_tick
+        {
+            return Err(NarrativeInputStreamError::Truncated {
+                first_offending_tick: last_tick.saturating_add(1),
+                terminal_tick: enclosing_tick,
+                rows: narrative_rows,
+                minimum_tick: minimum_narrative_tick,
+                maximum_tick: Some(last_tick),
+            }
+            .into());
         }
         for event in validated_run_event_map(&self.run_events)?.into_values() {
             if event.tick.0 > enclosing_tick {
@@ -5759,6 +6049,23 @@ fn decode_hex_u64(context: &'static str, encoded: &str) -> Result<u64, StorageEr
         });
     }
     u64::from_str_radix(encoded, 16).map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })
+}
+
+fn decode_hex_u32(context: &'static str, encoded: &str) -> Result<u32, StorageError> {
+    if encoded.len() != 8
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: format!("expected exactly 8 lowercase hexadecimal characters, got {encoded:?}"),
+        });
+    }
+    u32::from_str_radix(encoded, 16).map_err(|error| StorageError::InvalidData {
         context,
         reason: error.to_string(),
     })
@@ -6291,6 +6598,7 @@ struct FinishedRunReaderLease {
 pub struct StorageReader {
     conn: Option<Connection>,
     run_id: RunId,
+    narrative_input_binding_v1: OnceLock<NarrativeInputBindingV1>,
     _finished_run_lease: Option<FinishedRunReaderLease>,
 }
 
@@ -6386,6 +6694,7 @@ impl StorageReader {
         Ok(Self {
             conn: Some(conn),
             run_id,
+            narrative_input_binding_v1: OnceLock::new(),
             _finished_run_lease: None,
         })
     }
@@ -6441,6 +6750,7 @@ impl StorageReader {
         Ok(Self {
             conn: Some(conn),
             run_id,
+            narrative_input_binding_v1: OnceLock::new(),
             _finished_run_lease: Some(FinishedRunReaderLease {
                 _path: path_lease,
                 _writer: writer_lease,
@@ -7824,6 +8134,349 @@ impl StorageReader {
         }
         events.reverse();
         Ok(events)
+    }
+
+    fn narrative_input_binding_v1(
+        &self,
+        required_complete_history: u64,
+    ) -> Result<NarrativeInputBindingV1, StorageError> {
+        if self._finished_run_lease.is_none() {
+            return Err(NarrativeInputStreamError::FinishedReaderRequired.into());
+        }
+        if let Some(binding) = self.narrative_input_binding_v1.get() {
+            Self::require_narrative_history(binding, required_complete_history)?;
+            return Ok(binding.clone());
+        }
+        let connection = self.finished_connection()?;
+        Storage::validate_narrative_input_reserved_identities(connection, self.run_id)?;
+        let terminal_row = connection.query_row_with_params(
+            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let terminal_tick =
+            decode::<Option<i64>>(&terminal_row, 0, "narrative_input.tick_summaries.max_tick")?
+                .map(|tick| checked_u64("narrative_input.tick_summaries.max_tick", tick))
+                .transpose()?
+                .ok_or(NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: 1,
+                })?;
+        if terminal_tick == 0 {
+            return Err(NarrativeInputStreamError::MissingEvidence {
+                first_offending_tick: 1,
+            }
+            .into());
+        }
+
+        let page_limit = checked_query_limit(
+            "narrative_input.coverage_page_limit",
+            MAX_STORAGE_QUERY_PAGE,
+        )?;
+        let mut after_tick = 0_u64;
+        let mut count = 0_u64;
+        let mut expected_contract: Option<(u32, u32, u64, NarrativeInputPolicyV1)> = None;
+        loop {
+            let rows = connection.query_with_params(
+                NARRATIVE_INPUT_SELECT_AFTER,
+                &[
+                    sqlite_run_id(self.run_id),
+                    NARRATIVE_INPUT_EVENT_TYPE.into(),
+                    encode_u64("narrative_input.coverage.after_tick", after_tick)?.into(),
+                    page_limit.into(),
+                ],
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let replay_row = replay_event_row_from_query_row(row)?;
+                let row_tick = checked_u64("narrative_input.tick", replay_row.tick)?;
+                let expected_tick =
+                    after_tick
+                        .checked_add(1)
+                        .ok_or(NarrativeInputStreamError::OutOfOrder {
+                            previous: after_tick,
+                            current: row_tick,
+                        })?;
+                if row_tick == after_tick {
+                    return Err(NarrativeInputStreamError::DuplicateTick { tick: row_tick }.into());
+                }
+                if row_tick < after_tick {
+                    return Err(NarrativeInputStreamError::OutOfOrder {
+                        previous: after_tick,
+                        current: row_tick,
+                    }
+                    .into());
+                }
+                if row_tick != expected_tick {
+                    return Err(NarrativeInputStreamError::TickGap {
+                        previous: after_tick,
+                        expected: expected_tick,
+                        actual: row_tick,
+                    }
+                    .into());
+                }
+                let record = narrative_input_record_from_row(&replay_row, false)?;
+                let contract = (
+                    record.record_schema_version,
+                    record.input.schema_version,
+                    record.config_revision,
+                    NarrativeInputPolicyV1::from(record),
+                );
+                if let Some(expected) = expected_contract {
+                    if (contract.0, contract.1) != (expected.0, expected.1) {
+                        return Err(NarrativeInputStreamError::MixedVersion {
+                            tick: row_tick,
+                            expected_record: expected.0,
+                            actual_record: contract.0,
+                            expected_input: expected.1,
+                            actual_input: contract.1,
+                        }
+                        .into());
+                    }
+                    if contract.2 != expected.2 {
+                        return Err(NarrativeInputStreamError::MixedConfiguration {
+                            tick: row_tick,
+                            expected: expected.2,
+                            actual: contract.2,
+                        }
+                        .into());
+                    }
+                    if contract.3 != expected.3 {
+                        return Err(
+                            NarrativeInputStreamError::MixedPolicy { tick: row_tick }.into()
+                        );
+                    }
+                } else {
+                    if (contract.0, contract.1)
+                        != (
+                            NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                            NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                        )
+                    {
+                        return Err(NarrativeInputStreamError::MixedVersion {
+                            tick: row_tick,
+                            expected_record: NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                            actual_record: contract.0,
+                            expected_input: NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                            actual_input: contract.1,
+                        }
+                        .into());
+                    }
+                    expected_contract = Some(contract);
+                }
+                after_tick = row_tick;
+                count = count.saturating_add(1);
+            }
+            if rows.len() < MAX_STORAGE_QUERY_PAGE {
+                break;
+            }
+        }
+
+        if count == 0 {
+            return Err(NarrativeInputStreamError::MissingEvidence {
+                first_offending_tick: 1,
+            }
+            .into());
+        }
+        if after_tick != terminal_tick || count != terminal_tick {
+            return Err(NarrativeInputStreamError::Truncated {
+                first_offending_tick: after_tick.min(terminal_tick).saturating_add(1),
+                terminal_tick,
+                rows: count,
+                minimum_tick: Some(1),
+                maximum_tick: Some(after_tick),
+            }
+            .into());
+        }
+        let (record_schema_version, input_schema_version, config_revision, policy) =
+            expected_contract.ok_or(NarrativeInputStreamError::MissingEvidence {
+                first_offending_tick: 1,
+            })?;
+        let manifest = self.run_manifest()?;
+        let manifest_digest = manifest.manifest_digest()?;
+        let binding = NarrativeInputBindingV1 {
+            run_id: self.run_id,
+            record_schema_version,
+            input_schema_version,
+            config_revision,
+            config_digest: manifest.config_digest,
+            manifest_digest,
+            policy,
+            first_tick: 1,
+            terminal_tick,
+            input_count: count,
+        };
+        let _ = self.narrative_input_binding_v1.set(binding.clone());
+        Self::require_narrative_history(&binding, required_complete_history)?;
+        Ok(binding)
+    }
+
+    fn require_narrative_history(
+        binding: &NarrativeInputBindingV1,
+        required_complete_history: u64,
+    ) -> Result<(), StorageError> {
+        let available = binding.input_count.min(binding.policy.history_capacity);
+        if available < required_complete_history {
+            return Err(NarrativeInputStreamError::InsufficientHistory {
+                first_offending_tick: available.saturating_add(1),
+                available,
+                required: required_complete_history,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Read one bounded forward page of complete production narrative inputs.
+    ///
+    /// The immutable finished-reader lease prevents the stream from changing between pages.
+    /// The first page scans the reserved identities in bounded chunks, proving prefix/suffix
+    /// coverage, adjacency, one stable contract/configuration/policy, and the caller-declared
+    /// history requirement. That binding is cached for the immutable reader lease, so later pages
+    /// perform only their bounded row query. A cursor must name an exact retained row and repeat
+    /// the selected run's configuration and build/manifest bindings.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the public scientific page boundary validates global continuity, provenance-bound cursor identity, and every returned typed record"
+    )]
+    pub fn narrative_input_page_v1(
+        &self,
+        after: Option<&NarrativeInputCursorV1>,
+        record_limit: usize,
+        required_complete_history: u64,
+    ) -> Result<NarrativeInputPageV1, StorageError> {
+        if record_limit == 0 || record_limit > MAX_STORAGE_QUERY_PAGE {
+            return Err(NarrativeInputStreamError::InvalidPageSize {
+                limit: record_limit,
+                max: MAX_STORAGE_QUERY_PAGE,
+            }
+            .into());
+        }
+        let query_limit = checked_query_limit("narrative_input.record_limit", record_limit)?;
+        let binding = self.narrative_input_binding_v1(required_complete_history)?;
+        let after_tick = match after {
+            None => 0,
+            Some(cursor) => {
+                if cursor.run_id != self.run_id {
+                    return Err(NarrativeInputStreamError::CursorRunMismatch {
+                        expected: self.run_id,
+                        actual: cursor.run_id,
+                    }
+                    .into());
+                }
+                if cursor.config_digest != binding.config_digest {
+                    return Err(NarrativeInputStreamError::CursorConfigDigestMismatch {
+                        tick: cursor.tick,
+                    }
+                    .into());
+                }
+                if cursor.manifest_digest != binding.manifest_digest {
+                    return Err(NarrativeInputStreamError::CursorBuildDigestMismatch {
+                        tick: cursor.tick,
+                    }
+                    .into());
+                }
+                if cursor.record_schema_version != binding.record_schema_version
+                    || cursor.input_schema_version != binding.input_schema_version
+                    || cursor.config_revision != binding.config_revision
+                    || cursor.policy != binding.policy
+                    || cursor.tick == 0
+                    || cursor.tick > binding.terminal_tick
+                {
+                    return Err(NarrativeInputStreamError::CursorContractMismatch {
+                        tick: cursor.tick,
+                    }
+                    .into());
+                }
+                let rows = self.finished_connection()?.query_with_params(
+                    NARRATIVE_INPUT_SELECT_EXACT,
+                    &[
+                        sqlite_run_id(self.run_id),
+                        NARRATIVE_INPUT_EVENT_TYPE.into(),
+                        encode_u64("narrative_input.cursor.tick", cursor.tick)?.into(),
+                        encode_u64("narrative_input.cursor.seq", NARRATIVE_INPUT_REPLAY_SEQ)?
+                            .into(),
+                    ],
+                )?;
+                let [row] = rows.as_slice() else {
+                    return Err(
+                        NarrativeInputStreamError::CursorNotFound { tick: cursor.tick }.into(),
+                    );
+                };
+                let replay_row = replay_event_row_from_query_row(row)?;
+                let event = replay_event_from_row(&replay_row)?;
+                let ReplayEventKind::NarrativeInputV1 { record } = event.kind else {
+                    return Err(
+                        NarrativeInputStreamError::CursorNotFound { tick: cursor.tick }.into(),
+                    );
+                };
+                if record.input.tick.0 != cursor.tick
+                    || record.record_schema_version != cursor.record_schema_version
+                    || record.input.schema_version != cursor.input_schema_version
+                    || record.config_revision != cursor.config_revision
+                    || NarrativeInputPolicyV1::from(record) != cursor.policy
+                {
+                    return Err(NarrativeInputStreamError::CursorContractMismatch {
+                        tick: cursor.tick,
+                    }
+                    .into());
+                }
+                cursor.tick
+            }
+        };
+
+        let rows = self.finished_connection()?.query_with_params(
+            NARRATIVE_INPUT_SELECT_AFTER,
+            &[
+                sqlite_run_id(self.run_id),
+                NARRATIVE_INPUT_EVENT_TYPE.into(),
+                encode_u64("narrative_input.after_tick", after_tick)?.into(),
+                query_limit.into(),
+            ],
+        )?;
+        let mut inputs = Vec::with_capacity(rows.len());
+        let mut previous = after_tick;
+        for row in &rows {
+            let replay_row = replay_event_row_from_query_row(row)?;
+            let event = replay_event_from_row(&replay_row)?;
+            let ReplayEventKind::NarrativeInputV1 { record } = event.kind else {
+                unreachable!("narrative query decoded to another replay variant");
+            };
+            let expected =
+                previous
+                    .checked_add(1)
+                    .ok_or(NarrativeInputStreamError::OutOfOrder {
+                        previous,
+                        current: record.input.tick.0,
+                    })?;
+            if record.input.tick.0 != expected {
+                return Err(NarrativeInputStreamError::TickGap {
+                    previous,
+                    expected,
+                    actual: record.input.tick.0,
+                }
+                .into());
+            }
+            previous = record.input.tick.0;
+            inputs.push(record);
+        }
+        let next_after = inputs.last().and_then(|record| {
+            (record.input.tick.0 < binding.terminal_tick).then(|| NarrativeInputCursorV1 {
+                run_id: binding.run_id,
+                tick: record.input.tick.0,
+                record_schema_version: binding.record_schema_version,
+                input_schema_version: binding.input_schema_version,
+                config_revision: binding.config_revision,
+                config_digest: binding.config_digest.clone(),
+                manifest_digest: binding.manifest_digest.clone(),
+                policy: binding.policy,
+            })
+        });
+        Ok(NarrativeInputPageV1 {
+            binding,
+            inputs,
+            next_after,
+        })
     }
 
     /// Load canonical per-agent observations from a complete half-open tick window.
@@ -9947,6 +10600,13 @@ impl Storage {
             return Err(error);
         }
         if recover_existing
+            && let Err(error) =
+                Self::validate_all_persisted_narrative_input_prefixes(storage.connection()?)
+        {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
+        if recover_existing
             && let Err(error) = Self::validate_all_host_journal_invariants(
                 storage.connection()?,
                 storage.file_backed(),
@@ -9994,6 +10654,13 @@ impl Storage {
             return Err(error);
         }
         if let Err(error) = storage.recover_outbox() {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
+        let run_id = storage.run_id;
+        if let Err(error) =
+            Self::validate_persisted_narrative_input_prefix(storage.connection()?, run_id)
+        {
             storage.terminally_failed = true;
             return Err(error);
         }
@@ -11333,6 +12000,227 @@ impl Storage {
         Ok(())
     }
 
+    fn validate_all_persisted_narrative_input_prefixes(
+        connection: &Connection,
+    ) -> Result<(), StorageError> {
+        let rows = connection.query("SELECT run_id FROM runs ORDER BY run_id ASC")?;
+        for row in rows {
+            Self::validate_persisted_narrative_input_prefix(
+                connection,
+                decode_run_id(&row, 0, "runs.run_id")?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_persisted_narrative_input_prefix(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<(), StorageError> {
+        Self::validate_narrative_input_reserved_identities(connection, run_id)?;
+        let terminal_row = connection.query_row_with_params(
+            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        let terminal_tick =
+            decode::<Option<i64>>(&terminal_row, 0, "narrative_input.tick_summaries.max_tick")?
+                .map(|tick| checked_u64("narrative_input.tick_summaries.max_tick", tick))
+                .transpose()?;
+        let manifest_row = connection.query_row_with_params(
+            "SELECT manifest_schema_version FROM runs WHERE run_id = ?1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        let manifest_schema_version: i64 =
+            decode(&manifest_row, 0, "runs.manifest_schema_version")?;
+        let page_limit = checked_query_limit(
+            "narrative_input.coverage_page_limit",
+            MAX_STORAGE_QUERY_PAGE,
+        )?;
+        let mut after_tick = 0_u64;
+        let mut count = 0_u64;
+        let mut expected_contract: Option<(u32, u32, u64, NarrativeInputPolicyV1)> = None;
+        loop {
+            let rows = connection.query_with_params(
+                NARRATIVE_INPUT_SELECT_AFTER,
+                &[
+                    sqlite_run_id(run_id),
+                    NARRATIVE_INPUT_EVENT_TYPE.into(),
+                    encode_u64("narrative_input.coverage.after_tick", after_tick)?.into(),
+                    page_limit.into(),
+                ],
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let replay_row = replay_event_row_from_query_row(row)?;
+                let row_tick = checked_u64("narrative_input.tick", replay_row.tick)?;
+                let expected_tick =
+                    after_tick
+                        .checked_add(1)
+                        .ok_or(NarrativeInputStreamError::OutOfOrder {
+                            previous: after_tick,
+                            current: row_tick,
+                        })?;
+                if row_tick == after_tick {
+                    return Err(NarrativeInputStreamError::DuplicateTick { tick: row_tick }.into());
+                }
+                if row_tick < after_tick {
+                    return Err(NarrativeInputStreamError::OutOfOrder {
+                        previous: after_tick,
+                        current: row_tick,
+                    }
+                    .into());
+                }
+                if row_tick != expected_tick {
+                    return Err(NarrativeInputStreamError::TickGap {
+                        previous: after_tick,
+                        expected: expected_tick,
+                        actual: row_tick,
+                    }
+                    .into());
+                }
+                let record = narrative_input_record_from_row(&replay_row, false)?;
+                let contract = (
+                    record.record_schema_version,
+                    record.input.schema_version,
+                    record.config_revision,
+                    NarrativeInputPolicyV1::from(record),
+                );
+                if let Some(expected) = expected_contract {
+                    if (contract.0, contract.1) != (expected.0, expected.1) {
+                        return Err(NarrativeInputStreamError::MixedVersion {
+                            tick: row_tick,
+                            expected_record: expected.0,
+                            actual_record: contract.0,
+                            expected_input: expected.1,
+                            actual_input: contract.1,
+                        }
+                        .into());
+                    }
+                    if contract.2 != expected.2 {
+                        return Err(NarrativeInputStreamError::MixedConfiguration {
+                            tick: row_tick,
+                            expected: expected.2,
+                            actual: contract.2,
+                        }
+                        .into());
+                    }
+                    if contract.3 != expected.3 {
+                        return Err(
+                            NarrativeInputStreamError::MixedPolicy { tick: row_tick }.into()
+                        );
+                    }
+                } else {
+                    if (contract.0, contract.1)
+                        != (
+                            NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                            NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                        )
+                    {
+                        return Err(NarrativeInputStreamError::MixedVersion {
+                            tick: row_tick,
+                            expected_record: NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                            actual_record: contract.0,
+                            expected_input: NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                            actual_input: contract.1,
+                        }
+                        .into());
+                    }
+                    expected_contract = Some(contract);
+                }
+                after_tick = row_tick;
+                count = count.saturating_add(1);
+            }
+            if rows.len() < MAX_STORAGE_QUERY_PAGE {
+                break;
+            }
+        }
+
+        let Some(terminal_tick) = terminal_tick else {
+            return if count == 0 {
+                Ok(())
+            } else {
+                Err(NarrativeInputStreamError::Truncated {
+                    first_offending_tick: 1,
+                    terminal_tick: 0,
+                    rows: count,
+                    minimum_tick: Some(1),
+                    maximum_tick: Some(after_tick),
+                }
+                .into())
+            };
+        };
+        if terminal_tick == 0 && count == 0 {
+            return Ok(());
+        }
+        if count == 0 {
+            return if manifest_schema_version == 0 {
+                Ok(())
+            } else {
+                Err(NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: 1,
+                }
+                .into())
+            };
+        }
+        if after_tick != terminal_tick || count != terminal_tick {
+            return Err(NarrativeInputStreamError::Truncated {
+                first_offending_tick: after_tick.min(terminal_tick).saturating_add(1),
+                terminal_tick,
+                rows: count,
+                minimum_tick: Some(1),
+                maximum_tick: Some(after_tick),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn validate_narrative_input_reserved_identities(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<(), StorageError> {
+        let reserved_sequence = encode_u64(
+            "narrative_input.reserved_sequence",
+            NARRATIVE_INPUT_REPLAY_SEQ,
+        )?;
+        let invalid_identity = connection.query_with_params(
+            "SELECT tick, seq, event_type
+             FROM replay_events
+             WHERE run_id = ?1
+               AND (
+                   (event_type = ?2 AND (tick < 1 OR seq != ?3))
+                   OR (seq = ?3 AND event_type != ?2)
+               )
+             ORDER BY tick ASC, seq ASC
+             LIMIT 1",
+            &[
+                sqlite_run_id(run_id),
+                NARRATIVE_INPUT_EVENT_TYPE.into(),
+                reserved_sequence.into(),
+            ],
+        )?;
+        if let Some(row) = invalid_identity.first() {
+            let tick = checked_u64(
+                "replay_events.narrative_input.tick",
+                decode(row, 0, "replay_events.narrative_input.tick")?,
+            )?;
+            let seq: i64 = decode(row, 1, "replay_events.narrative_input.seq")?;
+            let event_type: String = decode(row, 2, "replay_events.narrative_input.event_type")?;
+            return Err(NarrativeInputStreamError::InvalidRecord {
+                tick,
+                reason: format!(
+                    "reserved narrative identity requires event type {NARRATIVE_INPUT_EVENT_TYPE:?}, \
+                     tick >= 1, and sequence {reserved_sequence}; found type {event_type:?}, \
+                     tick {tick}, sequence {seq}"
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     fn validate_run_event_search_index(
         connection: &Connection,
         run_id: RunId,
@@ -11793,6 +12681,228 @@ impl Storage {
                     &candidate,
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn previous_storage_batch_tick(
+        &self,
+        batch_id: PersistenceBatchId,
+    ) -> Result<u64, StorageError> {
+        let Some(previous_batch_id) = batch_id.get().checked_sub(1) else {
+            unreachable!("persistence batch ids are nonzero");
+        };
+        if previous_batch_id == 0 {
+            return Ok(0);
+        }
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick
+             FROM storage_batch_ledger
+             WHERE run_id = ?1 AND batch_id = ?2
+             LIMIT 2",
+            &[
+                sqlite_run_id(self.run_id),
+                encode_u64("storage_batch_ledger.batch_id", previous_batch_id)?.into(),
+            ],
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "storage_batch_ledger.batch_id",
+                reason: format!(
+                    "batch {} requires exactly one preceding batch {}, found {}",
+                    batch_id.get(),
+                    previous_batch_id,
+                    rows.len()
+                ),
+            });
+        };
+        checked_u64(
+            "storage_batch_ledger.tick",
+            decode(row, 0, "storage_batch_ledger.tick")?,
+        )
+    }
+
+    fn validate_new_narrative_input_identities(
+        &self,
+        prepared: &StorageBuffer,
+        batch_id: PersistenceBatchId,
+        enclosing_tick: u64,
+    ) -> Result<(), StorageError> {
+        let previous_batch_tick = self.previous_storage_batch_tick(batch_id)?;
+        let first_candidate = prepared
+            .replay_events
+            .iter()
+            .find(|row| row.event_type == NARRATIVE_INPUT_EVENT_TYPE)
+            .map(|row| narrative_input_record_from_row(row, false))
+            .transpose()?;
+
+        let buffered_tail = self
+            .buffer
+            .replay_events
+            .iter()
+            .filter(|row| row.event_type == NARRATIVE_INPUT_EVENT_TYPE)
+            .max_by_key(|row| row.tick)
+            .map(|row| narrative_input_record_from_row(row, false))
+            .transpose()?;
+        let persisted_rows = self.connection()?.query_with_params(
+            NARRATIVE_INPUT_SELECT_LAST,
+            &[
+                sqlite_run_id(self.run_id),
+                NARRATIVE_INPUT_EVENT_TYPE.into(),
+            ],
+        )?;
+        let persisted_tail = match persisted_rows.as_slice() {
+            [] => None,
+            [row] => Some(narrative_input_record_from_row(
+                &replay_event_row_from_query_row(row)?,
+                false,
+            )?),
+            _ => unreachable!("the bounded last-narrative query returns at most one row"),
+        };
+        let previous = match (buffered_tail, persisted_tail) {
+            (Some(buffered), Some(persisted)) => {
+                if buffered.input.tick.0 <= persisted.input.tick.0 {
+                    return Err(NarrativeInputStreamError::DuplicateTick {
+                        tick: buffered.input.tick.0,
+                    }
+                    .into());
+                }
+                Some(buffered)
+            }
+            (Some(buffered), None) => Some(buffered),
+            (None, Some(persisted)) => Some(persisted),
+            (None, None) => None,
+        };
+
+        if previous.is_none() && first_candidate.is_none() {
+            let row = self.connection()?.query_row_with_params(
+                "SELECT manifest_schema_version FROM runs WHERE run_id = ?1",
+                &[sqlite_run_id(self.run_id)],
+            )?;
+            let manifest_schema_version: i64 = decode(&row, 0, "runs.manifest_schema_version")?;
+            if manifest_schema_version == 0 {
+                return Ok(());
+            }
+        }
+
+        match previous {
+            Some(previous) if previous.input.tick.0 < previous_batch_tick => {
+                return Err(NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: previous.input.tick.0.saturating_add(1),
+                }
+                .into());
+            }
+            Some(previous) if previous.input.tick.0 > previous_batch_tick => {
+                return Err(NarrativeInputStreamError::OutOfOrder {
+                    previous: previous_batch_tick,
+                    current: previous.input.tick.0,
+                }
+                .into());
+            }
+            None if previous_batch_tick > 0 => {
+                return Err(NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: 1,
+                }
+                .into());
+            }
+            Some(_) | None => {}
+        }
+
+        let expected_tick =
+            previous_batch_tick
+                .checked_add(1)
+                .ok_or(NarrativeInputStreamError::OutOfOrder {
+                    previous: previous_batch_tick,
+                    current: enclosing_tick,
+                })?;
+        let Some(candidate) = first_candidate else {
+            return Err(NarrativeInputStreamError::MissingEvidence {
+                first_offending_tick: expected_tick,
+            }
+            .into());
+        };
+
+        if candidate.input.tick.0 == previous_batch_tick {
+            return Err(NarrativeInputStreamError::DuplicateTick {
+                tick: candidate.input.tick.0,
+            }
+            .into());
+        }
+        if candidate.input.tick.0 < expected_tick {
+            return Err(NarrativeInputStreamError::OutOfOrder {
+                previous: previous_batch_tick,
+                current: candidate.input.tick.0,
+            }
+            .into());
+        }
+        if candidate.input.tick.0 != expected_tick {
+            return Err(NarrativeInputStreamError::TickGap {
+                previous: expected_tick.saturating_sub(1),
+                expected: expected_tick,
+                actual: candidate.input.tick.0,
+            }
+            .into());
+        }
+        if candidate.input.tick.0 > enclosing_tick {
+            return Err(NarrativeInputStreamError::OutOfOrder {
+                previous: enclosing_tick,
+                current: candidate.input.tick.0,
+            }
+            .into());
+        }
+        if let Some(previous) = previous {
+            let expected = previous.input.tick.0.checked_add(1).ok_or(
+                NarrativeInputStreamError::OutOfOrder {
+                    previous: previous.input.tick.0,
+                    current: candidate.input.tick.0,
+                },
+            )?;
+            debug_assert_eq!(expected, expected_tick);
+            if (
+                previous.record_schema_version,
+                previous.input.schema_version,
+            ) != (
+                candidate.record_schema_version,
+                candidate.input.schema_version,
+            ) {
+                return Err(NarrativeInputStreamError::MixedVersion {
+                    tick: candidate.input.tick.0,
+                    expected_record: previous.record_schema_version,
+                    actual_record: candidate.record_schema_version,
+                    expected_input: previous.input.schema_version,
+                    actual_input: candidate.input.schema_version,
+                }
+                .into());
+            }
+            if candidate.config_revision != previous.config_revision {
+                return Err(NarrativeInputStreamError::MixedConfiguration {
+                    tick: candidate.input.tick.0,
+                    expected: previous.config_revision,
+                    actual: candidate.config_revision,
+                }
+                .into());
+            }
+            if NarrativeInputPolicyV1::from(candidate) != NarrativeInputPolicyV1::from(previous) {
+                return Err(NarrativeInputStreamError::MixedPolicy {
+                    tick: candidate.input.tick.0,
+                }
+                .into());
+            }
+        } else if (
+            candidate.record_schema_version,
+            candidate.input.schema_version,
+        ) != (
+            NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+            NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+        ) {
+            return Err(NarrativeInputStreamError::MixedVersion {
+                tick: candidate.input.tick.0,
+                expected_record: NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+                actual_record: candidate.record_schema_version,
+                expected_input: NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                actual_input: candidate.input.schema_version,
+            }
+            .into());
         }
         Ok(())
     }
@@ -13779,9 +14889,10 @@ impl Storage {
             ));
         }
 
+        let batch_id = PersistenceBatchId::new(self.next_batch_id)?;
         self.validate_new_lifecycle_identities(prepared)?;
         self.validate_new_run_event_identities(prepared)?;
-        let batch_id = PersistenceBatchId::new(self.next_batch_id)?;
+        self.validate_new_narrative_input_identities(prepared, batch_id, tick)?;
         let expected_previous = batch_id.as_i64() - 1;
         if before.admitted_raw() != expected_previous {
             return Err(StorageError::InvalidData {
@@ -13961,6 +15072,11 @@ impl Storage {
             );
             self.validate_new_lifecycle_identities(&batch.storage)?;
             self.validate_new_run_event_identities(&batch.storage)?;
+            self.validate_new_narrative_input_identities(
+                &batch.storage,
+                batch.batch_id,
+                batch.tick,
+            )?;
             self.buffer.append(batch.storage);
             self.buffered_outbox_ids.push(batch.batch_id);
             next_unapplied += 1;
@@ -14378,12 +15494,22 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        let sql = "insert or replace into replay_events (
+        let replace_sql = "insert or replace into replay_events (
+                run_id, tick, seq, agent_uid, scope, event_type, payload,
+                position_x, position_y,
+                counterpart_uid, counterpart_position_x, counterpart_position_y
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+        let insert_sql = "insert into replay_events (
                 run_id, tick, seq, agent_uid, scope, event_type, payload,
                 position_x, position_y,
                 counterpart_uid, counterpart_position_x, counterpart_position_y
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
         for row in rows {
+            let sql = if row.event_type == NARRATIVE_INPUT_EVENT_TYPE {
+                insert_sql
+            } else {
+                replace_sql
+            };
             let (position_x, position_y) = split_optional_position(row.position);
             let (counterpart_x, counterpart_y) = split_optional_position(row.counterpart_position);
             tx.execute_with_params(
@@ -17730,6 +18856,14 @@ fn replay_row_from_event(
         reason: format!("non-finite replay value at tick {tick}, seq {seq}"),
     };
     let fallback_seq = checked_i64("replay_events.seq", seq)?;
+    if u64::try_from(seq).map_or(true, |sequence| sequence >= NARRATIVE_INPUT_REPLAY_SEQ) {
+        return Err(StorageError::InvalidData {
+            context: "replay_events.seq",
+            reason: format!(
+                "ordinary replay enumeration {seq} enters the reserved narrative namespace"
+            ),
+        });
+    }
     let (scope, event_type, payload_value, row_tick, row_seq, interaction_value): (
         String,
         String,
@@ -17846,6 +18980,52 @@ fn replay_row_from_event(
                 json!({ "overall": overall }),
                 tick,
                 fallback_seq,
+                None,
+            )
+        }
+        ReplayEventKind::NarrativeInputV1 { record } => {
+            record
+                .validate()
+                .map_err(|error| NarrativeInputStreamError::InvalidRecord {
+                    tick: record.input.tick.0,
+                    reason: error.to_string(),
+                })?;
+            if event.agent_uid.is_some()
+                || event.position.is_some()
+                || event.counterpart.is_some()
+                || event.counterpart_position.is_some()
+            {
+                return Err(NarrativeInputStreamError::InvalidRecord {
+                    tick: record.input.tick.0,
+                    reason: "narrative input must be a participant-free world record".to_owned(),
+                }
+                .into());
+            }
+            let source_tick =
+                encode_u64("replay_events.narrative_input.tick", record.input.tick.0)?;
+            if source_tick > tick {
+                return Err(NarrativeInputStreamError::InvalidRecord {
+                    tick: record.input.tick.0,
+                    reason: format!(
+                        "source tick {source_tick} exceeds enclosing batch tick {tick}"
+                    ),
+                }
+                .into());
+            }
+            (
+                NARRATIVE_INPUT_SCOPE.to_owned(),
+                NARRATIVE_INPUT_EVENT_TYPE.to_owned(),
+                serde_json::to_value(NarrativeInputPayloadV1::from_record(*record)).map_err(
+                    |error| NarrativeInputStreamError::InvalidRecord {
+                        tick: record.input.tick.0,
+                        reason: error.to_string(),
+                    },
+                )?,
+                source_tick,
+                encode_u64(
+                    "replay_events.narrative_input.seq",
+                    NARRATIVE_INPUT_REPLAY_SEQ,
+                )?,
                 None,
             )
         }
@@ -18058,6 +19238,141 @@ struct InteractionPayload {
     magnitude: f32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NarrativeInputPayloadV1 {
+    record_schema_version: u32,
+    input_schema_version: u32,
+    tick_hex: String,
+    agent_count_hex: String,
+    average_energy_bits_hex: String,
+    spike_hits: u32,
+    config_revision_hex: String,
+    narrative_interval: u32,
+    history_capacity_hex: String,
+    event_capacity_hex: String,
+}
+
+impl NarrativeInputPayloadV1 {
+    fn from_record(record: NarrativeInputRecordV1) -> Self {
+        Self {
+            record_schema_version: record.record_schema_version,
+            input_schema_version: record.input.schema_version,
+            tick_hex: format!("{:016x}", record.input.tick.0),
+            agent_count_hex: format!("{:016x}", record.input.agent_count),
+            average_energy_bits_hex: format!("{:08x}", record.input.average_energy.to_bits()),
+            spike_hits: record.input.spike_hits,
+            config_revision_hex: format!("{:016x}", record.config_revision),
+            narrative_interval: record.narrative_interval,
+            history_capacity_hex: format!("{:016x}", record.history_capacity),
+            event_capacity_hex: format!("{:016x}", record.event_capacity),
+        }
+    }
+
+    fn into_record_unvalidated(
+        self,
+        row_tick: i64,
+    ) -> Result<NarrativeInputRecordV1, StorageError> {
+        let tick = decode_hex_u64("replay_events.narrative_input.tick", &self.tick_hex)?;
+        let row_tick = checked_u64("replay_events.narrative_input.row_tick", row_tick)?;
+        if tick != row_tick {
+            return Err(NarrativeInputStreamError::InvalidRecord {
+                tick,
+                reason: format!("payload tick {tick} differs from row tick {row_tick}"),
+            }
+            .into());
+        }
+        let energy_bits = decode_hex_u32(
+            "replay_events.narrative_input.average_energy_bits",
+            &self.average_energy_bits_hex,
+        )?;
+        let average_energy = f32::from_bits(energy_bits);
+        if !average_energy.is_finite() {
+            return Err(NarrativeInputStreamError::InvalidRecord {
+                tick,
+                reason: "average_energy is not finite".to_owned(),
+            }
+            .into());
+        }
+        let record = NarrativeInputRecordV1 {
+            record_schema_version: self.record_schema_version,
+            input: NarrativeInputV1 {
+                schema_version: self.input_schema_version,
+                tick: Tick(tick),
+                agent_count: decode_hex_u64(
+                    "replay_events.narrative_input.agent_count",
+                    &self.agent_count_hex,
+                )?,
+                average_energy,
+                spike_hits: self.spike_hits,
+            },
+            config_revision: decode_hex_u64(
+                "replay_events.narrative_input.config_revision",
+                &self.config_revision_hex,
+            )?,
+            narrative_interval: self.narrative_interval,
+            history_capacity: decode_hex_u64(
+                "replay_events.narrative_input.history_capacity",
+                &self.history_capacity_hex,
+            )?,
+            event_capacity: decode_hex_u64(
+                "replay_events.narrative_input.event_capacity",
+                &self.event_capacity_hex,
+            )?,
+        };
+        if record.history_capacity == 0 {
+            return Err(NarrativeInputStreamError::InvalidRecord {
+                tick,
+                reason: "narrative replay requires a non-zero history capacity".to_owned(),
+            }
+            .into());
+        }
+        Ok(record)
+    }
+
+    fn into_record(self, row_tick: i64) -> Result<NarrativeInputRecordV1, StorageError> {
+        let record = self.into_record_unvalidated(row_tick)?;
+        let tick = record.input.tick.0;
+        record
+            .validate()
+            .map_err(|error| NarrativeInputStreamError::InvalidRecord {
+                tick,
+                reason: error.to_string(),
+            })?;
+        Ok(record)
+    }
+}
+
+fn narrative_input_record_from_row(
+    row: &ReplayEventRow,
+    validate_schema: bool,
+) -> Result<NarrativeInputRecordV1, StorageError> {
+    let tick = checked_u64("replay_events.narrative_input.tick", row.tick)?;
+    if row.scope != NARRATIVE_INPUT_SCOPE
+        || row.seq
+            != encode_u64(
+                "replay_events.narrative_input.seq",
+                NARRATIVE_INPUT_REPLAY_SEQ,
+            )?
+        || row.agent_uid.is_some()
+        || row.counterpart.is_some()
+        || row.position.is_some()
+        || row.counterpart_position.is_some()
+    {
+        return Err(NarrativeInputStreamError::InvalidRecord {
+            tick,
+            reason: "narrative input has a noncanonical scope, sequence, or participant".to_owned(),
+        }
+        .into());
+    }
+    let payload: NarrativeInputPayloadV1 = parse_payload(row)?;
+    if validate_schema {
+        payload.into_record(row.tick)
+    } else {
+        payload.into_record_unvalidated(row.tick)
+    }
+}
+
 /// Column list shared by every `replay_events` reader.
 ///
 /// Written once because the columns and the positional [`decode`] indices in
@@ -18087,6 +19402,32 @@ const REPLAY_EVENT_SELECT_DESCENDING_BOUNDED: &str = concat!(
      WHERE run_id = ?1
      ORDER BY tick DESC, seq DESC
      LIMIT ?2"
+);
+
+const NARRATIVE_INPUT_SELECT_AFTER: &str = concat!(
+    "SELECT ",
+    replay_event_columns!(),
+    " FROM replay_events
+     WHERE run_id = ?1 AND event_type = ?2 AND tick > ?3
+     ORDER BY tick ASC, seq ASC
+     LIMIT ?4"
+);
+
+const NARRATIVE_INPUT_SELECT_EXACT: &str = concat!(
+    "SELECT ",
+    replay_event_columns!(),
+    " FROM replay_events
+     WHERE run_id = ?1 AND event_type = ?2 AND tick = ?3 AND seq = ?4
+     LIMIT 2"
+);
+
+const NARRATIVE_INPUT_SELECT_LAST: &str = concat!(
+    "SELECT ",
+    replay_event_columns!(),
+    " FROM replay_events
+     WHERE run_id = ?1 AND event_type = ?2
+     ORDER BY tick DESC, seq DESC
+     LIMIT 1"
 );
 
 /// Rebuild a [`ReplayEventRow`] from a query row selected with `replay_event_columns!()`.
@@ -18261,6 +19602,9 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
                 overall: payload.overall,
             }
         }
+        NARRATIVE_INPUT_EVENT_TYPE => ReplayEventKind::NarrativeInputV1 {
+            record: narrative_input_record_from_row(row, true)?,
+        },
         "combat" | "food_share" => {
             let (Some(actor), Some(target)) = (agent_uid, counterpart) else {
                 return Err(StorageError::ReplayParse {
@@ -18426,7 +19770,7 @@ mod tests {
     use std::{
         fs,
         io::{Read, Write},
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{Child, Command, ExitStatus, Stdio},
         sync::TryLockError,
         time::{Instant, SystemTime, UNIX_EPOCH},
@@ -18567,6 +19911,23 @@ mod tests {
     ) -> CommandStatus {
         let initial = frontend.submit(command, None);
         resolve_authority_submission(frontend, core, initial, next_nanos)
+    }
+
+    fn submit_fault_envelope(
+        frontend: &mut NullFrontend<LocalHostPort>,
+        core: &mut HostCore,
+        envelope: &CommandEnvelope,
+        next_nanos: &mut u64,
+    ) -> CommandStatus {
+        let initial = frontend.submit_envelope(envelope.clone());
+        resolve_authority_submission(frontend, core, initial, next_nanos)
+    }
+
+    fn fault_step_envelope(session_id: HostSessionId) -> CommandEnvelope {
+        CommandEnvelope::new(
+            CommandId::from_client_sequence(session_id.get() ^ 0xfeed, 1),
+            HostCommand::Step,
+        )
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -18758,6 +20119,30 @@ mod tests {
         assert_eq!(snapshot.ledger_state, None);
     }
 
+    fn assert_claim_only_journal_snapshot(snapshot: &JournalDatabaseSnapshot) {
+        assert_eq!(snapshot.archive_count, 0);
+        assert_eq!(snapshot.ledger_count, 0);
+        assert_eq!(snapshot.scientific_event_count, 0);
+        assert_eq!(snapshot.tick_count, 0);
+        assert_eq!(snapshot.metric_count, 0);
+        assert_eq!(snapshot.event_count, 0);
+        assert_eq!(snapshot.agent_count, 0);
+        assert_eq!(snapshot.birth_count, 0);
+        assert_eq!(snapshot.death_count, 0);
+        assert_eq!(snapshot.replay_event_count, 0);
+        assert_eq!(snapshot.command_claim_count, 1);
+        assert_eq!(snapshot.admitted_journal, 0);
+        assert_eq!(snapshot.applied_journal, 0);
+        assert_eq!(snapshot.committed_volatile_journal, 0);
+        assert_eq!(snapshot.durable_journal, 0);
+        assert_eq!(snapshot.admitted_event, 0);
+        assert_eq!(snapshot.applied_event, 0);
+        assert_eq!(snapshot.committed_volatile_event, 0);
+        assert_eq!(snapshot.durable_event, 0);
+        assert_eq!(snapshot.shutdown_sequence, None);
+        assert_eq!(snapshot.ledger_state, None);
+    }
+
     fn assert_complete_journal_prefix(
         snapshot: &JournalDatabaseSnapshot,
         expected_batches: u64,
@@ -18901,6 +20286,94 @@ mod tests {
         (pipeline, core, frontend)
     }
 
+    fn recover_and_assert_exact_command_authority(
+        path: &str,
+        session_id: HostSessionId,
+        envelope: &CommandEnvelope,
+        interrupted_status: &CommandStatus,
+    ) -> JournalDatabaseSnapshot {
+        let storage = recover_file_storage(path).expect("recover fault-test storage directly");
+        let recovered_database = journal_database_snapshot(path);
+        let encoded = encode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            envelope,
+        )
+        .expect("encode the canonical recovery envelope");
+        let exact_submit = CommandAuthorityRequest::Submit {
+            envelope_postcard_hex: encoded,
+            policy: CommandClaimPolicy::ReserveIfAbsent,
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        let CommandAuthorityLookup::Found(replay) = storage
+            .resolve_command_authority(session_id, envelope.command_id, &exact_submit)
+            .expect("resolve exact recovered command authority")
+        else {
+            panic!("exact recovered command did not resolve to terminal authority");
+        };
+        let replay = replay.status();
+        assert_eq!(replay.command_id(), envelope.command_id);
+        assert_eq!(
+            replay.admission_sequence(),
+            interrupted_status.admission_sequence(),
+            "recovered authority changed the command's total admission identity"
+        );
+        assert_eq!(
+            replay.application(),
+            interrupted_status.application(),
+            "recovered authority changed the command's application result"
+        );
+        assert_eq!(
+            replay.journal(),
+            &JournalState::Durable,
+            "recovery must finish the authoritative journal status"
+        );
+
+        let changed = CommandEnvelope::new(envelope.command_id, HostCommand::Pause);
+        let changed = CommandAuthorityRequest::Submit {
+            envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &changed,
+            )
+            .expect("encode changed recovery envelope"),
+            policy: CommandClaimPolicy::ReserveIfAbsent,
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        assert_eq!(
+            storage
+                .resolve_command_authority(session_id, envelope.command_id, &changed)
+                .expect("resolve changed recovered command authority"),
+            CommandAuthorityLookup::Collision,
+            "recovered authority must reject a changed payload for the original command id"
+        );
+        let status = storage
+            .resolve_command_authority(
+                session_id,
+                envelope.command_id,
+                &CommandAuthorityRequest::Status {
+                    max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+                },
+            )
+            .expect("resolve recovered command status");
+        let CommandAuthorityLookup::Found(status) = status else {
+            panic!("status lookup did not preserve recovered terminal authority");
+        };
+        assert_eq!(
+            status.status(),
+            replay,
+            "the collision must not replace recovered authoritative status"
+        );
+
+        storage
+            .close()
+            .expect("close direct recovered authority reader");
+        let replayed_database = journal_database_snapshot(path);
+        assert_eq!(
+            replayed_database, recovered_database,
+            "authority replay and collision must not duplicate persisted rows or advance watermarks"
+        );
+        replayed_database
+    }
+
     fn drop_fault_host(
         mut pipeline: StoragePipeline,
         core: HostCore,
@@ -19032,8 +20505,9 @@ mod tests {
             let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
             arm_host_journal_fault(&path, point);
             let mut next_nanos = 0;
+            let envelope = fault_step_envelope(session_id);
             let command =
-                submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
+                submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
             let status = drive_journal_command_to_terminal(
                 &mut frontend,
                 &mut core,
@@ -19059,8 +20533,8 @@ mod tests {
             assert_eq!(rolled_back.durable_journal, 0);
             assert_eq!(rolled_back.ledger_state.as_deref(), Some("admitted"));
 
-            recover_fault_database(&path);
-            let recovered = journal_database_snapshot(&path);
+            let recovered =
+                recover_and_assert_exact_command_authority(&path, session_id, &envelope, &status);
             assert_complete_journal_prefix(&recovered, 1, 1);
             assert_eq!(recovered, baseline, "recovery after {point:?}");
         }
@@ -19070,15 +20544,16 @@ mod tests {
     fn host_journal_lost_rollback_ack_is_indeterminate_but_reopen_safe() {
         let path = temp_db_path("host-journal-lost-rollback-ack");
         let path = path.to_string_lossy().into_owned();
-        let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x20a));
+        let session_id = HostSessionId::new(0x20a);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
         arm_host_journal_fault(&path, HostJournalFaultPoint::PersistenceAfterTicks);
         arm_host_journal_fault(
             &path,
             HostJournalFaultPoint::PersistenceRollbackAcknowledgementLost,
         );
         let mut next_nanos = 0;
-        let command =
-            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
+        let envelope = fault_step_envelope(session_id);
+        let command = submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19108,8 +20583,8 @@ mod tests {
         assert_eq!(closed.durable_journal, 0);
         assert_eq!(closed.ledger_state.as_deref(), Some("admitted"));
 
-        recover_fault_database(&path);
-        let recovered = journal_database_snapshot(&path);
+        let recovered =
+            recover_and_assert_exact_command_authority(&path, session_id, &envelope, &status);
         assert_complete_journal_prefix(&recovered, 1, 1);
         assert_eq!(recovered.tick_count, 1);
     }
@@ -19118,11 +20593,12 @@ mod tests {
     fn host_journal_post_archive_fault_recovers_and_applies_exactly_once() {
         let path = temp_db_path("host-journal-post-archive");
         let path = path.to_string_lossy().into_owned();
-        let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x201));
+        let session_id = HostSessionId::new(0x201);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
         arm_host_journal_fault(&path, HostJournalFaultPoint::AfterArchiveBeforeApplication);
         let mut next_nanos = 0;
-        let command =
-            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
+        let envelope = fault_step_envelope(session_id);
+        let command = submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19142,8 +20618,8 @@ mod tests {
         assert_eq!(before.tick_count, 0);
         assert_eq!(before.ledger_state.as_deref(), Some("admitted"));
 
-        recover_fault_database(&path);
-        let after = journal_database_snapshot(&path);
+        let after =
+            recover_and_assert_exact_command_authority(&path, session_id, &envelope, &status);
         assert_eq!(after.archive_count, 1);
         assert_eq!(after.ledger_count, 1);
         assert_eq!(after.tick_count, 1);
@@ -19151,7 +20627,7 @@ mod tests {
         let reader = StorageReader::open_finished(&path)
             .expect("open recovered command projection under immutable lease");
         let evidence = reader
-            .command_journal_evidence(HostSessionId::new(0x201))
+            .command_journal_evidence(session_id)
             .expect("recovery regenerated non-vacuous command evidence");
         assert_eq!(evidence.command_count, 1);
         assert_eq!(evidence.application_transition_count, 2);
@@ -19167,7 +20643,7 @@ mod tests {
             .expect("reopen command projection after idempotent recovery");
         assert_eq!(
             reader
-                .command_journal_evidence(HostSessionId::new(0x201))
+                .command_journal_evidence(session_id)
                 .expect("idempotent recovery retained exact command evidence"),
             evidence
         );
@@ -19180,11 +20656,12 @@ mod tests {
     fn host_journal_post_commit_pre_receipt_fault_reopens_without_duplicate_effects() {
         let path = temp_db_path("host-journal-post-commit-pre-receipt");
         let path = path.to_string_lossy().into_owned();
-        let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x202));
+        let session_id = HostSessionId::new(0x202);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
         arm_host_journal_fault(&path, HostJournalFaultPoint::AfterPublicationBeforeReceipt);
         let mut next_nanos = 0;
-        let command =
-            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
+        let envelope = fault_step_envelope(session_id);
+        let command = submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19197,8 +20674,8 @@ mod tests {
         assert_eq!(committed.tick_count, 1);
         assert_complete_journal_prefix(&committed, 1, 1);
 
-        recover_fault_database(&path);
-        let reopened = journal_database_snapshot(&path);
+        let reopened =
+            recover_and_assert_exact_command_authority(&path, session_id, &envelope, &status);
         assert_complete_journal_prefix(&reopened, 1, 1);
         assert_eq!(reopened.tick_count, 1);
         assert_eq!(reopened, committed);
@@ -19222,12 +20699,13 @@ mod tests {
         ] {
             let path = temp_db_path(&format!("host-journal-{suffix}"));
             let path = path.to_string_lossy().into_owned();
-            let (pipeline, mut core, mut frontend) =
-                fault_test_host(&path, HostSessionId::new(0x203));
+            let session_id = HostSessionId::new(0x203);
+            let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
             arm_host_journal_fault(&path, point);
             let mut next_nanos = 0;
+            let envelope = fault_step_envelope(session_id);
             let command =
-                submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
+                submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
             let status = drive_journal_command_to_terminal(
                 &mut frontend,
                 &mut core,
@@ -19256,8 +20734,8 @@ mod tests {
             assert_eq!(failed.ledger_state.as_deref(), Some(expected_state));
             assert_eq!(failed.durable_journal, expected_durable);
 
-            recover_fault_database(&path);
-            let recovered = journal_database_snapshot(&path);
+            let recovered =
+                recover_and_assert_exact_command_authority(&path, session_id, &envelope, &status);
             assert_eq!(recovered.tick_count, 1);
             assert_complete_journal_prefix(&recovered, 1, 1);
         }
@@ -19319,11 +20797,12 @@ mod tests {
     fn host_journal_analytics_publication_fault_keeps_the_durable_event_exactly_once() {
         let path = temp_db_path("host-journal-analytics-publication");
         let path = path.to_string_lossy().into_owned();
-        let (pipeline, mut core, mut frontend) = fault_test_host(&path, HostSessionId::new(0x206));
+        let session_id = HostSessionId::new(0x206);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
         arm_host_journal_fault(&path, HostJournalFaultPoint::BeforeAnalyticsPublication);
         let mut next_nanos = 0;
-        let command =
-            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
+        let envelope = fault_step_envelope(session_id);
+        let command = submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
         let status = drive_journal_command_to_terminal(
             &mut frontend,
             &mut core,
@@ -19343,8 +20822,8 @@ mod tests {
         let committed = journal_database_snapshot(&path);
         assert_complete_journal_prefix(&committed, 1, 1);
         assert_eq!(committed.tick_count, 1);
-        recover_fault_database(&path);
-        let reopened = journal_database_snapshot(&path);
+        let reopened =
+            recover_and_assert_exact_command_authority(&path, session_id, &envelope, &status);
         assert_eq!(reopened, committed);
     }
 
@@ -19886,6 +21365,86 @@ mod tests {
             replay_events: Vec::new(),
             narrative_events: Vec::new(),
         }
+    }
+
+    fn sample_narrative_record(
+        tick: u64,
+        energy: f32,
+        spike_hits: u32,
+        config_revision: u64,
+        history_capacity: u64,
+    ) -> NarrativeInputRecordV1 {
+        NarrativeInputRecordV1 {
+            record_schema_version: NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION,
+            input: NarrativeInputV1 {
+                schema_version: NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                tick: Tick(tick),
+                agent_count: 1,
+                average_energy: energy,
+                spike_hits,
+            },
+            config_revision,
+            narrative_interval: 3,
+            history_capacity,
+            event_capacity: 32,
+        }
+    }
+
+    fn sample_narrative_event(record: NarrativeInputRecordV1) -> ReplayEvent {
+        ReplayEvent {
+            agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::NarrativeInputV1 { record },
+        }
+    }
+
+    fn sample_narrative_batch(
+        tick: u64,
+        energy: f32,
+        config_revision: u64,
+        history_capacity: u64,
+    ) -> PersistenceBatch {
+        let mut batch = sample_batch(tick, energy);
+        let spike_hits = u32::try_from(tick % 7).expect("bounded spike count");
+        batch.summary.spike_hits = spike_hits;
+        batch
+            .replay_events
+            .push(sample_narrative_event(sample_narrative_record(
+                tick,
+                energy,
+                spike_hits,
+                config_revision,
+                history_capacity,
+            )));
+        batch
+    }
+
+    fn sample_narrative_span_batch(
+        first_tick: u64,
+        terminal_tick: u64,
+        config_revision: u64,
+        history_capacity: u64,
+    ) -> PersistenceBatch {
+        assert!(
+            first_tick > 0 && first_tick <= terminal_tick,
+            "narrative fixture span must be nonempty and begin after tick zero"
+        );
+        let mut batch = sample_batch(terminal_tick, 1.0);
+        batch.summary.spike_hits = u32::try_from(terminal_tick % 7).expect("bounded spike count");
+        batch
+            .replay_events
+            .extend((first_tick..=terminal_tick).map(|tick| {
+                sample_narrative_event(sample_narrative_record(
+                    tick,
+                    1.0,
+                    u32::try_from(tick % 7).expect("bounded spike count"),
+                    config_revision,
+                    history_capacity,
+                ))
+            }));
+        batch
     }
 
     #[test]
@@ -20740,7 +22299,11 @@ mod tests {
                 SCRIPTBOTS_SCHEMA_V12_VERSION,
                 "create_plain_content_narrative_search",
             ),
-            (SCRIPTBOTS_SCHEMA_VERSION, "add_durable_command_claims"),
+            (SCRIPTBOTS_SCHEMA_V13_VERSION, "add_durable_command_claims"),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_narrative_input_replay_contract",
+            ),
         ];
         assert_eq!(migrations.len(), expected.len());
         for (row, (expected_version, expected_name)) in migrations.iter().zip(expected) {
@@ -20803,7 +22366,7 @@ mod tests {
             decode(&record, 3, "host_command_records.envelope_postcard_hex")?;
         connection.execute_batch(
             "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version = 13;
+             DELETE FROM _schema_migrations WHERE version >= 13;
              PRAGMA user_version = 12;",
         )?;
         assert_eq!(
@@ -20889,7 +22452,7 @@ mod tests {
         let connection = Connection::open(&path_string)?;
         connection.execute_batch(
             "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version = 13;
+             DELETE FROM _schema_migrations WHERE version >= 13;
              PRAGMA user_version = 12;",
         )?;
         assert_eq!(
@@ -20941,7 +22504,7 @@ mod tests {
         let connection = Connection::open(&path_string)?;
         connection.execute_batch(
             "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version = 13;
+             DELETE FROM _schema_migrations WHERE version >= 13;
              PRAGMA user_version = 12;",
         )?;
         assert_eq!(
@@ -20979,7 +22542,7 @@ mod tests {
         let connection = Connection::open(&path_string)?;
         connection.execute_batch(
             "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version = 13;
+             DELETE FROM _schema_migrations WHERE version >= 13;
              PRAGMA user_version = 12;
              UPDATE host_command_records SET envelope_postcard_hex = '00';",
         )?;
@@ -21018,7 +22581,7 @@ mod tests {
         let connection = Connection::open(&path_string)?;
         connection.execute_batch(
             "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version = 13;
+             DELETE FROM _schema_migrations WHERE version >= 13;
              PRAGMA user_version = 12;
              PRAGMA foreign_keys = OFF;
              INSERT INTO host_command_records
@@ -21310,6 +22873,172 @@ mod tests {
             }
         ));
         storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one crash-boundary proof follows a worker-committed preclaim across a disconnected reply, owner resumption, exact application, replay, collision, and cold lookup"
+    )]
+    fn durable_preclaim_commit_survives_lost_reply_and_applies_once_after_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-command-preclaim-lost-reply");
+        let path_string = path.to_string_lossy().into_owned();
+        let owner_session = HostSessionId::new(0x51a7);
+        let observer_session = HostSessionId::new(0x51a8);
+        let mut pipeline = StoragePipeline::create_unattributed_file(&path_string)?;
+        let run_id = pipeline.run_id();
+        let journal = pipeline.journal_port(owner_session, StorageJournalOptions::default())?;
+        drop(journal);
+        let envelope = fault_step_envelope(owner_session);
+        let command_id = envelope.command_id;
+        let exact_submit = CommandAuthorityRequest::Submit {
+            envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &envelope,
+            )?,
+            policy: CommandClaimPolicy::ReserveIfAbsent,
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        let changed_envelope = CommandEnvelope::new(command_id, HostCommand::Pause);
+        let changed_submit = CommandAuthorityRequest::Submit {
+            envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &changed_envelope,
+            )?,
+            policy: CommandClaimPolicy::ReserveIfAbsent,
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+
+        let (lost_reply_tx, lost_reply_rx) = xchan::bounded(1);
+        drop(lost_reply_rx);
+        pipeline
+            .sink
+            .tx
+            .send(StorageCommand::ResolveCommandAuthority {
+                session_id: owner_session,
+                command_id,
+                request: CommandAuthorityRequest::Submit {
+                    envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                        "host_command_claims.envelope_postcard_hex",
+                        &envelope,
+                    )?,
+                    policy: CommandClaimPolicy::ReserveIfAbsent,
+                    max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+                },
+                reply: lost_reply_tx,
+                permit: None,
+            })?;
+        pipeline.flush_and_wait()?;
+        pipeline.shutdown()?;
+
+        let claim_only = journal_database_snapshot(&path_string);
+        assert_claim_only_journal_snapshot(&claim_only);
+
+        let storage = Storage::recover_existing_run(&path_string, run_id)?;
+        assert_eq!(
+            storage.resolve_command_authority(
+                observer_session,
+                command_id,
+                &CommandAuthorityRequest::Status {
+                    max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+                },
+            )?,
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending)
+        );
+        assert_eq!(
+            storage.resolve_command_authority(observer_session, command_id, &exact_submit)?,
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending)
+        );
+        assert_eq!(
+            storage.resolve_command_authority(observer_session, command_id, &changed_submit)?,
+            CommandAuthorityLookup::Collision
+        );
+        assert_eq!(
+            storage.resolve_command_authority(owner_session, command_id, &exact_submit)?,
+            CommandAuthorityLookup::Claimed,
+            "only the original session may resume its committed pre-admission claim"
+        );
+        storage.close()?;
+        assert_eq!(journal_database_snapshot(&path_string), claim_only);
+
+        let (pipeline, mut core, mut frontend) =
+            recovered_fault_test_host(&path_string, owner_session);
+        assert_eq!(core.world_tick(), Tick::zero());
+        let mut next_nanos = 0;
+        let submitted = submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
+        let terminal = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command_id,
+            &mut next_nanos,
+        );
+        assert_eq!(terminal.command_id(), submitted.command_id());
+        assert_eq!(
+            terminal.admission_sequence(),
+            submitted.admission_sequence()
+        );
+        assert!(matches!(
+            terminal.application(),
+            ApplicationState::Applied(_)
+        ));
+        assert_eq!(terminal.journal(), &JournalState::Durable);
+        assert_eq!(core.world_tick(), Tick(1));
+
+        let terminal_tick = core.world_tick();
+        let terminal_snapshot = core.latest_snapshot();
+        let terminal_revisions = terminal_snapshot.revisions;
+        let terminal_lifecycle = terminal_snapshot.lifecycle;
+        let terminal_digest = core.world().world_digest_v1()?;
+        let replay = submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
+        assert_eq!(replay, terminal);
+        assert_eq!(core.world_tick(), terminal_tick);
+        assert_eq!(core.latest_snapshot().revisions, terminal_revisions);
+        assert_eq!(core.latest_snapshot().lifecycle, terminal_lifecycle);
+        assert_eq!(core.world().world_digest_v1()?, terminal_digest);
+
+        let collision = frontend.submit_envelope(changed_envelope);
+        assert!(
+            matches!(
+                collision,
+                Err(NullFrontendSubmissionError::HostAccess {
+                    source: HostAccessError::CommandIdCollision { command_id: actual },
+                    ..
+                }) if actual == command_id
+            ),
+            "changed payload must collide with the applied command identity"
+        );
+        assert_eq!(frontend.command_status(command_id)?, Some(terminal.clone()));
+        assert_eq!(core.world_tick(), terminal_tick);
+        assert_eq!(core.latest_snapshot().revisions, terminal_revisions);
+        assert_eq!(core.latest_snapshot().lifecycle, terminal_lifecycle);
+        assert_eq!(core.world().world_digest_v1()?, terminal_digest);
+        drop_fault_host(pipeline, core, frontend);
+
+        let applied_once = journal_database_snapshot(&path_string);
+        assert_complete_journal_prefix(&applied_once, 1, 1);
+        assert_eq!(applied_once.tick_count, 1);
+        assert_eq!(applied_once.command_claim_count, 1);
+
+        let storage = Storage::recover_existing_run(&path_string, run_id)?;
+        let status_request = CommandAuthorityRequest::Status {
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        for request in [&exact_submit, &status_request] {
+            let CommandAuthorityLookup::Found(authority) =
+                storage.resolve_command_authority(observer_session, command_id, request)?
+            else {
+                return Err("cold lookup did not find terminal command authority".into());
+            };
+            assert_eq!(authority.status(), &terminal);
+        }
+        assert_eq!(
+            storage.resolve_command_authority(observer_session, command_id, &changed_submit)?,
+            CommandAuthorityLookup::Collision
+        );
+        storage.close()?;
+        assert_eq!(journal_database_snapshot(&path_string), applied_once);
         Ok(())
     }
 
@@ -21622,7 +23351,7 @@ mod tests {
 
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 8);
+        assert_eq!(migrations.len(), 9);
         for (index, (expected_version, expected_name)) in [
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
@@ -21645,7 +23374,11 @@ mod tests {
                 SCRIPTBOTS_SCHEMA_V12_VERSION,
                 "create_plain_content_narrative_search",
             ),
-            (SCRIPTBOTS_SCHEMA_VERSION, "add_durable_command_claims"),
+            (SCRIPTBOTS_SCHEMA_V13_VERSION, "add_durable_command_claims"),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_narrative_input_replay_contract",
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -22264,7 +23997,8 @@ mod tests {
                 (10, 'add_replay_event_interaction_edges', 'forged'),
                 (11, 'drop_external_content_narrative_search', 'forged'),
                 (12, 'create_plain_content_narrative_search', 'forged'),
-                (13, 'add_durable_command_claims', 'forged');
+                (13, 'add_durable_command_claims', 'forged'),
+                (14, 'add_narrative_input_replay_contract', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -22274,7 +24008,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 13;",
+             PRAGMA user_version = 14;",
         )?;
         connection.close()?;
 
@@ -23913,6 +25647,680 @@ mod tests {
         assert_eq!(replay[0].event, batch.replay_events[0]);
         storage.close()?;
         let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn narrative_input_payload_roundtrip_preserves_fixed_width_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (tick, energy, spike_hits, config_revision, history_capacity) in [
+            (1, -0.0_f32, 0, 0, 1),
+            (u32::MAX as u64, f32::MIN_POSITIVE, u32::MAX, 9, 64),
+            (i64::MAX as u64, f32::MAX, 17, u64::MAX, u32::MAX as u64),
+        ] {
+            let record = sample_narrative_record(
+                tick,
+                energy,
+                spike_hits,
+                config_revision,
+                history_capacity,
+            );
+            let event = sample_narrative_event(record);
+            let row = replay_row_from_event(&event, i64::MAX, 0)?;
+            assert_eq!(checked_u64("test.narrative.tick", row.tick)?, tick);
+            assert_eq!(
+                checked_u64("test.narrative.seq", row.seq)?,
+                NARRATIVE_INPUT_REPLAY_SEQ
+            );
+            let decoded = replay_event_from_row(&row)?;
+            let ReplayEventKind::NarrativeInputV1 { record: actual } = decoded.kind else {
+                return Err("narrative row decoded to a different replay variant".into());
+            };
+            assert_eq!(actual, record);
+            assert_eq!(
+                actual.input.average_energy.to_bits(),
+                energy.to_bits(),
+                "fixed-width payload changed the exact floating-point representation"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn narrative_input_admission_refuses_duplicate_disorder_and_gap_at_first_tick() {
+        let record = |tick| sample_narrative_event(sample_narrative_record(tick, 1.0, 0, 7, 8));
+
+        let mut duplicate = sample_batch(2, 1.0);
+        duplicate.replay_events = vec![record(2), record(2)];
+        assert!(matches!(
+            PreparedPersistenceBatch::from_batch(&duplicate),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::DuplicateTick { tick: 2 }
+            ))
+        ));
+
+        let mut disordered = sample_batch(3, 1.0);
+        disordered.replay_events = vec![record(2), record(1), record(3)];
+        assert!(matches!(
+            PreparedPersistenceBatch::from_batch(&disordered),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::OutOfOrder {
+                    previous: 2,
+                    current: 1
+                }
+            ))
+        ));
+
+        let mut gap = sample_batch(3, 1.0);
+        gap.replay_events = vec![record(1), record(3)];
+        assert!(matches!(
+            PreparedPersistenceBatch::from_batch(&gap),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::TickGap {
+                    previous: 1,
+                    expected: 2,
+                    actual: 3
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one atomic-admission matrix proves every cross-batch missing, overlap, gap, valid continuation, and late-backfill disposition without mutating the frontier"
+    )]
+    fn attributed_admission_requires_first_and_cross_batch_narrative_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut attributed = Storage::unattributed_memory_with_thresholds(64, 4096, 1024, 1024)?;
+        assert_eq!(
+            attributed.connection()?.execute_with_params(
+                "UPDATE runs SET manifest_schema_version = 3 WHERE run_id = ?1",
+                &[sqlite_run_id(attributed.run_id)],
+            )?,
+            1
+        );
+        let before = attributed.persistence_watermarks()?;
+        assert!(matches!(
+            attributed.persist(&sample_batch(1, 1.0)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: 1
+                }
+            ))
+        ));
+        assert_eq!(attributed.persistence_watermarks()?, before);
+        assert_eq!(
+            attributed.connection()?.execute_with_params(
+                "UPDATE runs SET manifest_schema_version = 0 WHERE run_id = ?1",
+                &[sqlite_run_id(attributed.run_id)],
+            )?,
+            1
+        );
+        attributed.close()?;
+
+        let mut storage = Storage::unattributed_memory_with_thresholds(64, 4096, 1024, 1024)?;
+        storage.persist(&sample_narrative_span_batch(1, 2, 7, 8))?;
+        let after_first = storage.persistence_watermarks()?;
+
+        assert!(matches!(
+            storage.persist(&sample_batch(3, 1.0)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: 3
+                }
+            ))
+        ));
+        assert_eq!(storage.persistence_watermarks()?, after_first);
+
+        assert!(matches!(
+            storage.persist(&sample_narrative_span_batch(2, 3, 7, 8)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::DuplicateTick { tick: 2 }
+            ))
+        ));
+        assert_eq!(storage.persistence_watermarks()?, after_first);
+
+        assert!(matches!(
+            storage.persist(&sample_narrative_span_batch(1, 3, 7, 8)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::OutOfOrder {
+                    previous: 2,
+                    current: 1
+                }
+            ))
+        ));
+        assert_eq!(storage.persistence_watermarks()?, after_first);
+
+        assert!(matches!(
+            storage.persist(&sample_narrative_batch(4, 1.0, 7, 8)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::TickGap {
+                    previous: 2,
+                    expected: 3,
+                    actual: 4
+                }
+            ))
+        ));
+        assert_eq!(storage.persistence_watermarks()?, after_first);
+
+        storage.persist(&sample_narrative_batch(3, 1.0, 7, 8))?;
+        storage.close()?;
+
+        let mut missing_tail = Storage::unattributed_memory_with_thresholds(64, 4096, 1024, 1024)?;
+        missing_tail.persist(&sample_narrative_span_batch(1, 2, 7, 8))?;
+        missing_tail.flush()?;
+        assert_eq!(
+            missing_tail.connection()?.execute_with_params(
+                "DELETE FROM replay_events
+                 WHERE run_id = ?1 AND tick = ?2 AND seq = ?3",
+                &[
+                    sqlite_run_id(missing_tail.run_id),
+                    encode_u64("test.narrative.tick", 2)?.into(),
+                    encode_u64("test.narrative.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+                ],
+            )?,
+            1
+        );
+        assert!(matches!(
+            missing_tail.persist(&sample_narrative_batch(3, 1.0, 7, 8)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: 2
+                }
+            ))
+        ));
+        missing_tail.abandon_after_error();
+        Ok(())
+    }
+
+    #[test]
+    fn finished_reader_pages_empty_single_boundary_and_long_narrative_streams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty_path = temp_db_path("storage-narrative-input-empty");
+        let empty_path_string = empty_path.to_string_lossy().into_owned();
+        Storage::create_unattributed_file_with_thresholds(
+            &empty_path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )?
+        .close()?;
+        let empty = StorageReader::open_finished(&empty_path_string)?;
+        assert!(matches!(
+            empty.narrative_input_page_v1(None, 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: 1
+                }
+            ))
+        ));
+        empty.close()?;
+
+        let single_path = temp_db_path("storage-narrative-input-single");
+        let single_path_string = single_path.to_string_lossy().into_owned();
+        let mut single = Storage::create_unattributed_file_with_thresholds(
+            &single_path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )?;
+        single.persist(&sample_narrative_batch(1, -0.0, 11, 1))?;
+        single.close()?;
+        let single = StorageReader::open_finished(&single_path_string)?;
+        let single_page = single.narrative_input_page_v1(None, 1, 1)?;
+        assert_eq!(single_page.binding.first_tick, 1);
+        assert_eq!(single_page.binding.terminal_tick, 1);
+        assert_eq!(single_page.binding.input_count, 1);
+        assert_eq!(single_page.inputs.len(), 1);
+        assert_eq!(
+            single_page.inputs[0].input.average_energy.to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        assert!(single_page.next_after.is_none());
+        single.close()?;
+
+        const TERMINAL_TICK: u64 = 257;
+        const PAGE_SIZE: usize = 64;
+        let long_path = temp_db_path("storage-narrative-input-long");
+        let long_path_string = long_path.to_string_lossy().into_owned();
+        let mut storage = Storage::create_unattributed_file_with_thresholds(
+            &long_path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )?;
+        for tick in 1..=TERMINAL_TICK {
+            storage.persist(&sample_narrative_batch(tick, tick as f32 / 8.0, 19, 32))?;
+        }
+        storage.close()?;
+
+        let reader = StorageReader::open_finished(&long_path_string)?;
+        let live_reader = StorageReader::open(&long_path_string)?;
+        assert!(matches!(
+            live_reader.narrative_input_page_v1(None, 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::FinishedReaderRequired
+            ))
+        ));
+        live_reader.close()?;
+
+        let mut cursor = None;
+        let mut observed = Vec::new();
+        let mut first_cursor = None;
+        loop {
+            let page = reader.narrative_input_page_v1(cursor.as_ref(), PAGE_SIZE, 32)?;
+            assert_eq!(page.binding.first_tick, 1);
+            assert_eq!(page.binding.terminal_tick, TERMINAL_TICK);
+            assert_eq!(page.binding.input_count, TERMINAL_TICK);
+            observed.extend(page.inputs.iter().map(|record| record.input.tick.0));
+            if first_cursor.is_none() {
+                first_cursor = page.next_after.clone();
+            }
+            cursor = page.next_after;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(observed, (1..=TERMINAL_TICK).collect::<Vec<_>>());
+        assert!(
+            reader.narrative_input_binding_v1.get().is_some(),
+            "the first complete scan must cache its immutable whole-run binding"
+        );
+
+        let cursor = first_cursor.expect("first full page has a forward cursor");
+        let mut wrong_config = cursor.clone();
+        wrong_config.config_digest.push('0');
+        assert!(matches!(
+            reader.narrative_input_page_v1(Some(&wrong_config), PAGE_SIZE, 32),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::CursorConfigDigestMismatch { tick: 64 }
+            ))
+        ));
+        let mut wrong_build = cursor;
+        wrong_build.manifest_digest.push('0');
+        assert!(matches!(
+            reader.narrative_input_page_v1(Some(&wrong_build), PAGE_SIZE, 32),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::CursorBuildDigestMismatch { tick: 64 }
+            ))
+        ));
+        assert!(matches!(
+            reader.narrative_input_page_v1(None, 1, 33),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::InsufficientHistory {
+                    first_offending_tick: 33,
+                    available: 32,
+                    required: 33
+                }
+            ))
+        ));
+        assert!(matches!(
+            reader.narrative_input_page_v1(None, 0, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::InvalidPageSize { limit: 0, .. }
+            ))
+        ));
+        reader.close()?;
+        Ok(())
+    }
+
+    fn create_complete_narrative_database(
+        prefix: &str,
+        terminal_tick: u64,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let path = temp_db_path(prefix);
+        let path_string = path.to_string_lossy().into_owned();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        for tick in 1..=terminal_tick {
+            storage.persist(&sample_narrative_batch(tick, tick as f32, 23, 16))?;
+        }
+        storage.close()?;
+        Ok(path_string)
+    }
+
+    #[test]
+    fn finished_reader_reports_gap_truncation_version_and_config_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let gap_path = create_complete_narrative_database("storage-narrative-gap", 4)?;
+        let gap = Connection::open(&gap_path)?;
+        gap.execute_with_params(
+            "DELETE FROM replay_events
+             WHERE run_id = ?1 AND tick = ?2 AND seq = ?3",
+            &[
+                sqlite_run_id(RunId::new(1)),
+                encode_u64("test.narrative.tick", 2)?.into(),
+                encode_u64("test.narrative.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+            ],
+        )?;
+        gap.close()?;
+        assert_recovery_refused_without_database_mutation(
+            Path::new(&gap_path),
+            "expected 2, found 3",
+        )?;
+        let gap_reader = StorageReader::open_finished(&gap_path)?;
+        assert!(matches!(
+            gap_reader.narrative_input_page_v1(None, 4, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::TickGap {
+                    previous: 1,
+                    expected: 2,
+                    actual: 3
+                }
+            ))
+        ));
+        gap_reader.close()?;
+
+        let truncated_path = create_complete_narrative_database("storage-narrative-truncated", 4)?;
+        let truncated = Connection::open(&truncated_path)?;
+        truncated.execute_with_params(
+            "DELETE FROM replay_events
+             WHERE run_id = ?1 AND tick = ?2 AND seq = ?3",
+            &[
+                sqlite_run_id(RunId::new(1)),
+                encode_u64("test.narrative.tick", 4)?.into(),
+                encode_u64("test.narrative.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+            ],
+        )?;
+        truncated.close()?;
+        let truncated_reader = StorageReader::open_finished(&truncated_path)?;
+        assert!(matches!(
+            truncated_reader.narrative_input_page_v1(None, 4, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::Truncated {
+                    first_offending_tick: 4,
+                    terminal_tick: 4,
+                    ..
+                }
+            ))
+        ));
+        truncated_reader.close()?;
+
+        let drift_path = create_complete_narrative_database("storage-narrative-contract-drift", 4)?;
+        let drift = Connection::open(&drift_path)?;
+        let row = drift.query_row_with_params(
+            "SELECT payload FROM replay_events
+             WHERE run_id = ?1 AND tick = ?2 AND seq = ?3",
+            &[
+                sqlite_run_id(RunId::new(1)),
+                encode_u64("test.narrative.tick", 3)?.into(),
+                encode_u64("test.narrative.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+            ],
+        )?;
+        let original_payload: String = row.get_typed(0)?;
+        let mut config_payload: Value = serde_json::from_str(&original_payload)?;
+        config_payload["config_revision_hex"] = json!("0000000000000018");
+        drift.execute_with_params(
+            "UPDATE replay_events SET payload = ?1
+             WHERE run_id = ?2 AND tick = ?3 AND seq = ?4",
+            &[
+                serde_json::to_string(&config_payload)?.into(),
+                sqlite_run_id(RunId::new(1)),
+                encode_u64("test.narrative.tick", 3)?.into(),
+                encode_u64("test.narrative.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+            ],
+        )?;
+        drift.close()?;
+        let config_reader = StorageReader::open_finished(&drift_path)?;
+        assert!(matches!(
+            config_reader.narrative_input_page_v1(None, 4, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MixedConfiguration {
+                    tick: 3,
+                    expected: 23,
+                    actual: 24
+                }
+            ))
+        ));
+        config_reader.close()?;
+
+        let drift = Connection::open(&drift_path)?;
+        let mut version_payload: Value = serde_json::from_str(&original_payload)?;
+        version_payload["record_schema_version"] = json!(2);
+        drift.execute_with_params(
+            "UPDATE replay_events SET payload = ?1
+             WHERE run_id = ?2 AND tick = ?3 AND seq = ?4",
+            &[
+                serde_json::to_string(&version_payload)?.into(),
+                sqlite_run_id(RunId::new(1)),
+                encode_u64("test.narrative.tick", 3)?.into(),
+                encode_u64("test.narrative.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+            ],
+        )?;
+        drift.close()?;
+        let version_reader = StorageReader::open_finished(&drift_path)?;
+        assert!(matches!(
+            version_reader.narrative_input_page_v1(None, 4, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MixedVersion {
+                    tick: 3,
+                    expected_record: 1,
+                    actual_record: 2,
+                    expected_input: 1,
+                    actual_input: 1
+                }
+            ))
+        ));
+        version_reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn writable_recovery_refuses_noncanonical_narrative_identities_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let zero_path = create_complete_narrative_database("storage-narrative-tick-zero", 3)?;
+        let zero = Connection::open(&zero_path)?;
+        assert_eq!(
+            zero.execute_with_params(
+                "UPDATE replay_events
+                 SET tick = 0
+                 WHERE run_id = ?1 AND tick = ?2 AND seq = ?3",
+                &[
+                    sqlite_run_id(RunId::new(1)),
+                    encode_u64("test.narrative.tick", 1)?.into(),
+                    encode_u64("test.narrative.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+                ],
+            )?,
+            1
+        );
+        zero.close()?;
+        assert_recovery_refused_without_database_mutation(
+            Path::new(&zero_path),
+            "reserved narrative identity requires",
+        )?;
+        assert_finished_reader_refused_without_database_mutation(
+            Path::new(&zero_path),
+            "reserved narrative identity requires",
+        )?;
+
+        let sequence_path =
+            create_complete_narrative_database("storage-narrative-wrong-sequence", 3)?;
+        let sequence = Connection::open(&sequence_path)?;
+        assert_eq!(
+            sequence.execute_with_params(
+                "UPDATE replay_events
+                 SET seq = ?1
+                 WHERE run_id = ?2 AND tick = ?3 AND seq = ?4",
+                &[
+                    encode_u64("test.narrative.wrong_seq", NARRATIVE_INPUT_REPLAY_SEQ + 1,)?.into(),
+                    sqlite_run_id(RunId::new(1)),
+                    encode_u64("test.narrative.tick", 2)?.into(),
+                    encode_u64("test.narrative.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+                ],
+            )?,
+            1
+        );
+        sequence.close()?;
+        assert_recovery_refused_without_database_mutation(
+            Path::new(&sequence_path),
+            "reserved narrative identity requires",
+        )?;
+        assert_finished_reader_refused_without_database_mutation(
+            Path::new(&sequence_path),
+            "reserved narrative identity requires",
+        )
+    }
+
+    #[test]
+    fn narrative_input_outbox_recovery_preserves_exact_identity_and_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-narrative-input-recovery");
+        let path_string = path.to_string_lossy().into_owned();
+        let mut storage = create_file_storage(&path_string)?;
+        for tick in 1..=3 {
+            storage.persist(&sample_narrative_batch(tick, tick as f32, 29, 8))?;
+        }
+        arm_host_journal_fault(
+            &path_string,
+            HostJournalFaultPoint::PersistenceAfterReplayEvents,
+        );
+        assert!(matches!(
+            storage.flush(),
+            Err(StorageError::Transaction {
+                commit_state: FailureCommitState::RolledBack,
+                ..
+            })
+        ));
+        storage.abandon_after_error();
+
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        recovered.shutdown()?;
+        let reader = StorageReader::open_finished(&path_string)?;
+        let page = reader.narrative_input_page_v1(None, 8, 3)?;
+        assert_eq!(
+            page.inputs
+                .iter()
+                .map(|record| record.input.tick.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            reader
+                .replay_event_counts()?
+                .into_iter()
+                .find(|entry| entry.event_type == NARRATIVE_INPUT_EVENT_TYPE)
+                .map(|entry| entry.count),
+            Some(3)
+        );
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the recovery negative constructs two exact outbox identities, rehashes only the second payload, and proves typed refusal before any partial replay"
+    )]
+    fn narrative_outbox_recovery_refuses_rehashed_discontinuity_before_partial_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-narrative-outbox-discontinuity");
+        let path_string = path.to_string_lossy().into_owned();
+        let mut interrupted = create_file_storage(&path_string)?;
+
+        let first =
+            PreparedPersistenceBatch::from_batch(&sample_narrative_span_batch(1, 3, 29, 8))?;
+        let (first_admission, first_is_new) =
+            interrupted.stage_outbox(first.tick, &first.storage)?;
+        assert!(first_is_new);
+        assert!(!interrupted.enqueue_staged(first_admission.batch_id, first.storage)?);
+
+        let second =
+            PreparedPersistenceBatch::from_batch(&sample_narrative_span_batch(4, 6, 29, 8))?;
+        let (second_admission, second_is_new) =
+            interrupted.stage_outbox(second.tick, &second.storage)?;
+        assert!(second_is_new);
+        assert!(!interrupted.enqueue_staged(second_admission.batch_id, second.storage)?);
+        interrupted.abandon_after_error();
+
+        let corruptor = Connection::open(&path_string)?;
+        let original_payload: String = corruptor
+            .query_row_with_params(
+                "SELECT payload FROM storage_outbox WHERE run_id = ?1 AND batch_id = ?2",
+                &[
+                    sqlite_run_id(RunId::new(1)),
+                    second_admission.batch_id.as_i64().into(),
+                ],
+            )?
+            .get_typed(0)?;
+        let mut corrupted: Value = serde_json::from_str(&original_payload)?;
+        let replay_events = corrupted["storage"]["replay_events"]
+            .as_array_mut()
+            .ok_or("outbox fixture has no replay event array")?;
+        assert_eq!(
+            replay_events.remove(0)["tick"],
+            json!(encode_u64("test.narrative.tick", 4)?)
+        );
+        let corrupted_payload = serde_json::to_string(&corrupted)?;
+        let corrupted_digest = format!(
+            "blake3:{}",
+            blake3::hash(corrupted_payload.as_bytes()).to_hex()
+        );
+        assert_eq!(
+            corruptor.execute_with_params(
+                "UPDATE storage_outbox
+                 SET payload = ?1
+                 WHERE run_id = ?2 AND batch_id = ?3",
+                &[
+                    corrupted_payload.as_str().into(),
+                    sqlite_run_id(RunId::new(1)),
+                    second_admission.batch_id.as_i64().into(),
+                ],
+            )?,
+            1
+        );
+        assert_eq!(
+            corruptor.execute_with_params(
+                "UPDATE storage_batch_ledger
+                 SET payload_digest = ?1
+                 WHERE run_id = ?2 AND batch_id = ?3",
+                &[
+                    corrupted_digest.as_str().into(),
+                    sqlite_run_id(RunId::new(1)),
+                    second_admission.batch_id.as_i64().into(),
+                ],
+            )?,
+            1
+        );
+        corruptor.close()?;
+
+        let error = recover_file_storage(&path_string)
+            .err()
+            .expect("recovery accepted a discontinuous narrative outbox");
+        assert!(matches!(
+            error,
+            StorageError::NarrativeInputStream(NarrativeInputStreamError::TickGap {
+                previous: 3,
+                expected: 4,
+                actual: 5
+            })
+        ));
+        let inspector = Connection::open(&path_string)?;
+        let tick_count: i64 = inspector
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(RunId::new(1))],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            tick_count, 0,
+            "failed recovery partially replayed batch one"
+        );
+        let progress = inspector.query_row_with_params(
+            "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+             FROM storage_progress WHERE run_id = ?1 AND singleton = 1",
+            &[sqlite_run_id(RunId::new(1))],
+        )?;
+        assert_eq!(
+            progress.get_typed::<i64>(0)?,
+            second_admission.batch_id.as_i64()
+        );
+        assert_eq!(progress.get_typed::<i64>(1)?, 0);
+        assert_eq!(progress.get_typed::<i64>(2)?, 0);
+        inspector.close()?;
         Ok(())
     }
 
