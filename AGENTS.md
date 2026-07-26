@@ -681,7 +681,25 @@ rch status                    # Overview of current state
 rch queue                     # See active/waiting builds
 ```
 
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
+**RCH FAILS OPEN TO A LOCAL BUILD — TREAT EVERY `rch exec` AS CAPABLE OF BECOMING ONE (`bd-e6ff`).**
+When the remote leg fails, rch logs `Remote execution failed: ... running locally` and runs the
+build on this host. That is benign on a healthy machine and dangerous on this one: with
+`CARGO_TARGET_DIR` on the exFAT volume and `UVFSService` wedged, a local `rustc` blocks in
+uninterruptible (`U`) state, where `SIGKILL` does not apply — `timeout` and `pkill` are both no-ops
+and every attempt leaks a permanent process. Agents have leaked wedged `rustc` while deliberately
+running no local cargo, because rch ran it for them.
+
+`force_remote = true` does NOT prevent this; the sync-failure path does not consult it. There is no
+config-level guard. Mitigations that actually work:
+
+- Read the `Executing command remotely: ... on <worker>` line and the sync result before believing
+  any outcome. A permission/rsync failure is an infrastructure result, not a test result.
+- `rch workers drain <id> --yes` any worker that returns `mkdir: Permission denied` or rsync code 23
+  (reverse with `rch workers enable <id>`). Fewer bad dispatches means fewer silent local fallbacks.
+- `rch workers probe --all` proves SSH reachability only. It does not write to the project tree,
+  so a worker that fails every job in 1.6s still probes green — "6/6 healthy" is not evidence.
+- Never pipe `rch exec` into `tail`/`head`: you get the pipe's exit code, not the build's. Redirect
+  to a file, then check `$?`.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
