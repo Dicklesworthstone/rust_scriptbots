@@ -29,6 +29,7 @@ use scriptbots_core::{
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
+    fmt,
     mem::size_of,
     rc::Rc,
     sync::Arc,
@@ -451,6 +452,129 @@ fn command_envelope_digest(
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
+struct CommandEnvelopeDigest([u8; blake3::OUT_LEN]);
+
+impl fmt::Display for CommandEnvelopeDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", blake3::Hash::from_bytes(self.0).to_hex())
+    }
+}
+
+const fn lifecycle_status(lifecycle: HostLifecycle) -> &'static str {
+    match lifecycle {
+        HostLifecycle::Running => "running",
+        HostLifecycle::Stopping => "stopping",
+        HostLifecycle::Stopped => "stopped",
+    }
+}
+
+const fn application_status(application: Option<&ApplicationState>) -> &'static str {
+    match application {
+        Some(ApplicationState::Admitted) => "admitted",
+        Some(ApplicationState::Applied(_)) => "applied",
+        Some(ApplicationState::Rejected(_)) => "rejected",
+        Some(ApplicationState::Failed(_)) => "failed",
+        None => "not_available",
+    }
+}
+
+const fn durable_lookup_failure(failure: &crate::CommandAuthorityLookupFailure) -> &'static str {
+    match failure {
+        crate::CommandAuthorityLookupFailure::Pending => "pending",
+        crate::CommandAuthorityLookupFailure::Capacity { .. } => "capacity",
+        crate::CommandAuthorityLookupFailure::Oversized { .. } => "oversized",
+        crate::CommandAuthorityLookupFailure::Busy => "busy",
+        crate::CommandAuthorityLookupFailure::Cancelled => "cancelled",
+        crate::CommandAuthorityLookupFailure::Unavailable { .. } => "unavailable",
+        crate::CommandAuthorityLookupFailure::Timeout { .. } => "timeout",
+        crate::CommandAuthorityLookupFailure::Ambiguous { .. } => "ambiguous",
+        crate::CommandAuthorityLookupFailure::Corrupt { .. } => "corrupt",
+    }
+}
+
+const fn authority_error_disposition(error: &HostAccessError) -> &'static str {
+    match error {
+        HostAccessError::CommandIdCollision { .. } => "collision",
+        HostAccessError::CommandAuthorityLookup {
+            failure:
+                crate::CommandAuthorityLookupFailure::Pending
+                | crate::CommandAuthorityLookupFailure::Capacity { .. }
+                | crate::CommandAuthorityLookupFailure::Busy,
+            ..
+        } => "retry_pending",
+        _ => "fail_closed",
+    }
+}
+
+const fn authority_error_lookup(error: &HostAccessError) -> &'static str {
+    match error {
+        HostAccessError::CommandIdCollision { .. } => "collision",
+        HostAccessError::CommandAuthorityLookup { failure, .. } => durable_lookup_failure(failure),
+        HostAccessError::CommandEvidenceClosed { .. } => "evidence_closed",
+        _ => "protocol_error",
+    }
+}
+
+fn trace_command_authority_decision(
+    command_id: CommandId,
+    envelope_digest: [u8; blake3::OUT_LEN],
+    cache_result: &'static str,
+    durable_lookup: &'static str,
+    lifecycle: HostLifecycle,
+    application: Option<&ApplicationState>,
+    disposition: &'static str,
+) {
+    tracing::debug!(
+        target: "scriptbots_runtime::command_authority",
+        %command_id,
+        envelope_digest = %CommandEnvelopeDigest(envelope_digest),
+        cache_result,
+        durable_lookup,
+        lifecycle = lifecycle_status(lifecycle),
+        application_status = application_status(application),
+        disposition,
+        "durable CommandId authority decision"
+    );
+}
+
+fn trace_fresh_authority_result(
+    command_id: CommandId,
+    envelope_digest: [u8; blake3::OUT_LEN],
+    durable_lookup: &'static str,
+    lifecycle: HostLifecycle,
+    result: &Result<CommandStatus, HostAccessError>,
+) {
+    match result {
+        Ok(status) => trace_command_authority_decision(
+            command_id,
+            envelope_digest,
+            "miss",
+            durable_lookup,
+            lifecycle,
+            Some(status.application()),
+            if matches!(status.application(), ApplicationState::Rejected(_)) {
+                "fresh_rejection"
+            } else {
+                "fresh"
+            },
+        ),
+        Err(_) => trace_command_authority_decision(
+            command_id,
+            envelope_digest,
+            "miss",
+            durable_lookup,
+            lifecycle,
+            None,
+            "fail_closed",
+        ),
+    }
+}
+
+enum DurableSubmissionResolution {
+    Fresh { durable_lookup: &'static str },
+    Replay(CommandStatus),
+}
+
 struct SharedHostState {
     session_id: HostSessionId,
     command_capacity: usize,
@@ -630,7 +754,7 @@ impl SharedHostState {
         envelope: &CommandEnvelope,
         envelope_digest: [u8; blake3::OUT_LEN],
         reserve_lifecycle_slot: bool,
-    ) -> Result<Option<CommandStatus>, HostAccessError> {
+    ) -> Result<DurableSubmissionResolution, HostAccessError> {
         let command_id = envelope.command_id;
         let Some(reader) = self.command_authority_reader.as_ref().map(Arc::clone) else {
             if self.command_authority_required {
@@ -641,7 +765,9 @@ impl SharedHostState {
                     },
                 });
             }
-            return Ok(None);
+            return Ok(DurableSubmissionResolution::Fresh {
+                durable_lookup: "not_configured",
+            });
         };
         let policy =
             if !self.audit_gate_closed && self.admission_lifecycle == HostLifecycle::Running {
@@ -656,13 +782,19 @@ impl SharedHostState {
                 let prior_digest = authority.envelope_digest();
                 self.retain_archived_authority(command_id, prior_digest, status.clone());
                 if prior_digest == envelope_digest {
-                    Ok(Some(status))
+                    Ok(DurableSubmissionResolution::Replay(status))
                 } else {
                     Err(HostAccessError::CommandIdCollision { command_id })
                 }
             }
-            CommandAuthorityLookup::Claimed => Ok(None),
-            CommandAuthorityLookup::Absent if policy == CommandClaimPolicy::CompareOnly => Ok(None),
+            CommandAuthorityLookup::Claimed => Ok(DurableSubmissionResolution::Fresh {
+                durable_lookup: "claimed",
+            }),
+            CommandAuthorityLookup::Absent if policy == CommandClaimPolicy::CompareOnly => {
+                Ok(DurableSubmissionResolution::Fresh {
+                    durable_lookup: "absent_compare_only",
+                })
+            }
             CommandAuthorityLookup::Absent => Err(protocol_violation(format!(
                 "durable command authority proved {command_id} absent without reserving it"
             ))),
@@ -735,6 +867,7 @@ impl SharedHostState {
                     pending.envelope.clone(),
                     pending.envelope_digest,
                     pending.reserve_lifecycle_slot,
+                    "claimed",
                 );
                 if let Err(error) = result {
                     self.retain_authority_failure(&pending, error);
@@ -1053,37 +1186,77 @@ impl SharedHostState {
         reserve_lifecycle_slot: bool,
     ) -> Result<CommandStatus, HostAccessError> {
         let envelope_digest = command_envelope_digest(&envelope)?;
+        macro_rules! trace_decision {
+            ($cache:literal, $lookup:expr, $application:expr, $disposition:expr) => {
+                trace_command_authority_decision(
+                    envelope.command_id,
+                    envelope_digest,
+                    $cache,
+                    $lookup,
+                    self.admission_lifecycle,
+                    $application,
+                    $disposition,
+                )
+            };
+        }
         if let Some(error) = self.take_authority_failure(envelope.command_id, envelope_digest) {
+            trace_decision!(
+                "miss",
+                authority_error_lookup(&error),
+                None,
+                authority_error_disposition(&error)
+            );
             return Err(error);
         }
         if let Some(pending) = &self.pending_command_authority {
             if pending.envelope.command_id == envelope.command_id
                 && pending.envelope_digest != envelope_digest
             {
+                trace_decision!("miss", "pending", None, "collision");
                 return Err(HostAccessError::CommandIdCollision {
                     command_id: envelope.command_id,
                 });
             }
             if pending.envelope.command_id != envelope.command_id {
+                trace_decision!("miss", "busy", None, "retry_pending");
                 return Err(HostAccessError::CommandAuthorityLookup {
                     command_id: envelope.command_id,
                     failure: crate::CommandAuthorityLookupFailure::Busy,
                 });
             }
             if self.poll_pending_command_authority()? {
+                trace_decision!("miss", "pending", None, "retry_pending");
                 return Err(HostAccessError::CommandAuthorityLookup {
                     command_id: envelope.command_id,
                     failure: crate::CommandAuthorityLookupFailure::Pending,
                 });
             }
             if let Some(error) = self.take_authority_failure(envelope.command_id, envelope_digest) {
+                trace_decision!(
+                    "miss",
+                    authority_error_lookup(&error),
+                    None,
+                    authority_error_disposition(&error)
+                );
                 return Err(error);
             }
         }
         if let Some(authority) = self.commands.get(&envelope.command_id) {
             if authority.envelope_digest == envelope_digest {
+                trace_decision!(
+                    "live",
+                    "not_consulted",
+                    Some(authority.status.application()),
+                    "exact_replay"
+                );
                 return Ok(authority.status.clone());
             }
+            trace_decision!(
+                "live",
+                "not_consulted",
+                Some(authority.status.application()),
+                "collision"
+            );
             return Err(HostAccessError::CommandIdCollision {
                 command_id: envelope.command_id,
             });
@@ -1092,21 +1265,74 @@ impl SharedHostState {
             // The command is durably archived: an exact retry replays the archived
             // terminal status, a changed payload collides (bd-2z0.5.2.1).
             if archived.envelope_digest == envelope_digest {
+                trace_decision!(
+                    "archive",
+                    "not_consulted",
+                    Some(archived.status.application()),
+                    "exact_replay"
+                );
                 return Ok(archived.status.clone());
             }
+            trace_decision!(
+                "archive",
+                "not_consulted",
+                Some(archived.status.application()),
+                "collision"
+            );
             return Err(HostAccessError::CommandIdCollision {
                 command_id: envelope.command_id,
             });
         }
-        if let Some(status) =
-            self.resolve_durable_submission(&envelope, envelope_digest, reserve_lifecycle_slot)?
-        {
-            return Ok(status);
+        let resolution = match self.resolve_durable_submission(
+            &envelope,
+            envelope_digest,
+            reserve_lifecycle_slot,
+        ) {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                trace_decision!(
+                    "miss",
+                    authority_error_lookup(&error),
+                    None,
+                    authority_error_disposition(&error)
+                );
+                return Err(error);
+            }
+        };
+        match resolution {
+            DurableSubmissionResolution::Replay(status) => {
+                trace_decision!("miss", "found", Some(status.application()), "exact_replay");
+                Ok(status)
+            }
+            DurableSubmissionResolution::Fresh { durable_lookup } => self.submit_fresh(
+                envelope,
+                envelope_digest,
+                reserve_lifecycle_slot,
+                durable_lookup,
+            ),
         }
-        self.submit_fresh(envelope, envelope_digest, reserve_lifecycle_slot)
     }
 
     fn submit_fresh(
+        &mut self,
+        envelope: CommandEnvelope,
+        envelope_digest: [u8; blake3::OUT_LEN],
+        reserve_lifecycle_slot: bool,
+        durable_lookup: &'static str,
+    ) -> Result<CommandStatus, HostAccessError> {
+        let command_id = envelope.command_id;
+        let result = self.submit_fresh_untraced(envelope, envelope_digest, reserve_lifecycle_slot);
+        trace_fresh_authority_result(
+            command_id,
+            envelope_digest,
+            durable_lookup,
+            self.admission_lifecycle,
+            &result,
+        );
+        result
+    }
+
+    fn submit_fresh_untraced(
         &mut self,
         envelope: CommandEnvelope,
         envelope_digest: [u8; blake3::OUT_LEN],
