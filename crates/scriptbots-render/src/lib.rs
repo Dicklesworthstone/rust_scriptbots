@@ -18275,6 +18275,65 @@ mod command_characterization_tests {
         );
     }
 
+    /// SpawnCarnivore and SpawnHerbivore, the last two population controls that
+    /// could be proven without pinning a shape that is being replaced.
+    ///
+    /// THE DEFERRAL ON THESE IS NOW OBSOLETE, which is why they are proven here.
+    /// This bead deferred all three population controls in July because spawn was
+    /// a DIRECT render-layer world mutation — it locked the world, mutated it, and
+    /// sampled RNG render-side — so any assertion written then would have pinned
+    /// exactly the shape bd-37m exists to remove. `spawn_agent_with_tendency` now
+    /// submits `ControlCommand::SpawnAgent`, so the observable state is the
+    /// canonical intent, which IS the post-migration contract rather than a
+    /// snapshot of the old one.
+    ///
+    /// The tendency value is asserted exactly, and the two shortcuts are asserted
+    /// to carry DIFFERENT tendencies. "A spawn intent was submitted" would pass if
+    /// both keys spawned the same diet, which is precisely the bug an experimenter
+    /// could not see: a carnivore key that quietly seeds herbivores looks like a
+    /// population that simply refuses to turn predatory.
+    #[test]
+    fn the_spawn_shortcuts_submit_distinct_canonical_spawn_intents() {
+        let tendency_of = |commands: &[ControlCommand]| -> Vec<f32> {
+            commands
+                .iter()
+                .filter_map(|command| match command {
+                    ControlCommand::SpawnAgent { herbivore_tendency } => Some(*herbivore_tendency),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut carnivore = ShortcutFixture::install();
+        carnivore.press("q");
+        let carnivore_intents = tendency_of(&carnivore.submitted());
+        assert_eq!(
+            carnivore_intents.len(),
+            1,
+            "SpawnCarnivore: 'q' must submit exactly one spawn intent, got {carnivore_intents:?}"
+        );
+
+        let mut herbivore = ShortcutFixture::install();
+        herbivore.press("h");
+        let herbivore_intents = tendency_of(&herbivore.submitted());
+        assert_eq!(
+            herbivore_intents.len(),
+            1,
+            "SpawnHerbivore: 'h' must submit exactly one spawn intent, got {herbivore_intents:?}"
+        );
+
+        assert_ne!(
+            carnivore_intents[0], herbivore_intents[0],
+            "'q' and 'h' must seed different diets, not the same one twice"
+        );
+        assert!(
+            herbivore_intents[0] > carnivore_intents[0],
+            "herbivore_tendency must be HIGHER for the herbivore key: 'h' gave {}, 'q' gave {}",
+            herbivore_intents[0],
+            carnivore_intents[0]
+        );
+    }
+
     /// ToggleSimulationPause was the last of the six "driven but not
     /// state-proven". Like the speed controls it routes through the command bus,
     /// so the observable state is the exact canonical intent.
