@@ -18088,6 +18088,31 @@ mod command_characterization_tests {
             }
         }
 
+        /// Step the world and repaint until the playback timeline holds
+        /// `frames` distinct snapshots.
+        ///
+        /// The stepping is essential, not incidental: `PlaybackTimeline::record`
+        /// drops a snapshot whose tick matches the newest one it already holds,
+        /// so repainting a frozen world records exactly one frame no matter how
+        /// many times it is called.
+        fn record_frames(&mut self, frames: usize) {
+            for _ in 0..(frames * 4) {
+                if self.read(|view| view.playback.timeline.len()) >= frames {
+                    return;
+                }
+                {
+                    let mut world = self.world.lock().expect("shortcut world lock");
+                    let _ = world.step();
+                }
+                force_production_repaint(&mut self.app, self.hud);
+            }
+            let recorded = self.read(|view| view.playback.timeline.len());
+            assert!(
+                recorded >= frames,
+                "the production renderer must record {frames} playback frames, got {recorded}"
+            );
+        }
+
         /// Every control intent the view has submitted so far.
         fn submitted(&self) -> Vec<ControlCommand> {
             self.submitted
@@ -18247,6 +18272,127 @@ mod command_characterization_tests {
             fixture.selected_agents(),
             0,
             "the GPUI handler must not mutate world selection before the intent is drained"
+        );
+    }
+
+    /// ToggleSimulationPause was the last of the six "driven but not
+    /// state-proven". Like the speed controls it routes through the command bus,
+    /// so the observable state is the exact canonical intent.
+    ///
+    /// The speed field matters as much as the pause field: `set_simulation_paused`
+    /// carries the CURRENT speed through, so a pause that silently reset speed to
+    /// a default would be a real regression and is pinned here.
+    #[test]
+    fn the_pause_shortcut_submits_the_inverted_pause_intent() {
+        let mut fixture = ShortcutFixture::install();
+        let drive = fixture.read(|view| view.simulation_drive_snapshot());
+
+        fixture.press("p");
+        let submitted = fixture.submitted();
+        assert!(
+            submitted.iter().any(|command| matches!(
+                command,
+                ControlCommand::UpdateSimulation(update)
+                    if update.paused == Some(!drive.paused)
+                        && update.speed_multiplier == Some(drive.speed_multiplier)
+                        && !update.step_once
+            )),
+            "ToggleSimulationPause: 'p' must submit paused={} carrying speed {}, got {submitted:?}",
+            !drive.paused,
+            drive.speed_multiplier
+        );
+    }
+
+    /// TogglePlayback and GoLive, the last two of the six "driven but not
+    /// state-proven".
+    ///
+    /// THE TIMELINE DEPTH IS LOAD-BEARING, and getting it wrong is what made
+    /// this look broken (bd-zlmc). With a single recorded frame, `toggle_play`
+    /// does set `Playing` — but the very next render calls `snapshot_for_render`,
+    /// which finds `pointer + 1 == timeline.len()`, concludes playback has run
+    /// off the end, and returns the mode to `Live`. That is correct behaviour:
+    /// a one-frame timeline finishes the instant it starts. A test recording one
+    /// frame therefore observes `Live` after pressing space and reads it as a
+    /// dead control. Recording several frames gives playback somewhere to go.
+    #[test]
+    fn playback_shortcuts_move_the_playback_mode() {
+        let mode = |view: &SimulationView| view.playback.mode();
+        let mut fixture = ShortcutFixture::install();
+        fixture.record_frames(4);
+        assert_eq!(
+            fixture.read(mode),
+            PlaybackMode::Live,
+            "a recording session must still be following live"
+        );
+
+        fixture.press("space");
+        assert_eq!(
+            fixture.read(mode),
+            PlaybackMode::Playing,
+            "TogglePlayback: 'space' must leave live and start playing the timeline"
+        );
+
+        fixture.press("space");
+        assert_eq!(
+            fixture.read(mode),
+            PlaybackMode::Paused,
+            "TogglePlayback: a second 'space' must pause, not latch on Playing"
+        );
+
+        fixture.press("g");
+        assert_eq!(
+            fixture.read(mode),
+            PlaybackMode::Live,
+            "GoLive: 'g' must return playback to live from a paused scrub"
+        );
+    }
+
+    /// FocusFirstSelected, driven through the realistic flow: select, then focus.
+    ///
+    /// It resolves its target through `effective_selected_agents`, which prefers
+    /// the pre-drain selection PROJECTION over the world's canonical selection —
+    /// so this also proves the projection bd-37m's intent routing publishes is
+    /// actually consumable by a downstream control, not just recorded.
+    #[test]
+    fn focus_first_selected_focuses_an_agent_from_the_selection() {
+        let mut fixture = ShortcutFixture::install_with_agents(3);
+        let focused =
+            |view: &SimulationView| view.inspector.lock().expect("inspector lock").focused_agent;
+        assert_eq!(
+            fixture.read(focused),
+            None,
+            "the fixture must start with nothing focused"
+        );
+
+        // Pressing ctrl-f with no selection must do nothing rather than focus an
+        // arbitrary agent — a focus that invents a target is worse than none.
+        fixture.press("ctrl-f");
+        assert_eq!(
+            fixture.read(focused),
+            None,
+            "FocusFirstSelected must not invent a target when nothing is selected"
+        );
+
+        fixture.press("ctrl-a");
+        fixture.press("ctrl-f");
+        let after = fixture.read(focused);
+        assert!(
+            after.is_some(),
+            "FocusFirstSelected: 'ctrl-f' must focus an agent once a selection exists"
+        );
+
+        // And it must be an agent that actually exists in the world, not a stale
+        // or fabricated handle.
+        let live: Vec<AgentId> = fixture
+            .world
+            .lock()
+            .expect("shortcut world lock")
+            .agents()
+            .iter_handles()
+            .collect();
+        assert!(
+            after.is_some_and(|id| live.contains(&id)),
+            "the focused handle must name a live agent, got {after:?}"
         );
     }
 
