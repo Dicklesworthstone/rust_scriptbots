@@ -112,10 +112,10 @@ release-packaging obligation: bd-2z0.13.6).
    scopes every scientific and operational row. Writers own one run; append is
    atomic and allowed only after prior runs are fully durable. Multi-run reads
    select a run explicitly, catalog discovery is bounded and structurally
-   validated, and recovery revalidates canonical V3.3/V3.5 manifest projections
+   validated, and recovery revalidates canonical V3.3/V3.6 manifest projections
    and digests under the writer lease. That contract includes the exact
    `AgentSubstreamProtocolV1` envelope, strictly ascending
-   `AgentRngCounterStateV1` rows for every launch UID, and a V3.5 bootstrap
+   `AgentRngCounterStateV1` rows for every launch UID, and a V3.6 bootstrap
    start `counters` digest bound by `world_counters_digest_v1` to the tick-zero
    allocation cursors, protocol, and counter rows. V3-V5 files are refused
    without rewrite (`bd-2z0.5.1`; `bd-1kxd`).
