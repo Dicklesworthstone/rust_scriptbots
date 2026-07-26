@@ -21761,7 +21761,14 @@ impl WorldState {
 
             let (before_smell, after_smell) = {
                 let before = runtime.trait_modifiers.smell;
-                let after = Self::mutate_value(mutation_rng, before, mutation_scale, 0.05, 3.0);
+                let after = Self::mutate_modifier_with_probability(
+                    mutation_rng,
+                    before,
+                    primary_rate,
+                    mutation_scale,
+                    0.05,
+                    3.0,
+                );
                 runtime.trait_modifiers.smell = after;
                 (before, after)
             };
@@ -21769,7 +21776,14 @@ impl WorldState {
 
             let (before_sound, after_sound) = {
                 let before = runtime.trait_modifiers.sound;
-                let after = Self::mutate_value(mutation_rng, before, mutation_scale, 0.05, 3.0);
+                let after = Self::mutate_modifier_with_probability(
+                    mutation_rng,
+                    before,
+                    primary_rate,
+                    mutation_scale,
+                    0.05,
+                    3.0,
+                );
                 runtime.trait_modifiers.sound = after;
                 (before, after)
             };
@@ -21777,7 +21791,14 @@ impl WorldState {
 
             let (before_hearing, after_hearing) = {
                 let before = runtime.trait_modifiers.hearing;
-                let after = Self::mutate_value(mutation_rng, before, mutation_scale, 0.1, 4.0);
+                let after = Self::mutate_modifier_with_probability(
+                    mutation_rng,
+                    before,
+                    primary_rate,
+                    mutation_scale,
+                    0.1,
+                    4.0,
+                );
                 runtime.trait_modifiers.hearing = after;
                 (before, after)
             };
@@ -21790,7 +21811,14 @@ impl WorldState {
 
             let (before_eye, after_eye) = {
                 let before = runtime.trait_modifiers.eye;
-                let after = Self::mutate_value(mutation_rng, before, mutation_scale, 0.5, 4.0);
+                let after = Self::mutate_modifier_with_probability(
+                    mutation_rng,
+                    before,
+                    primary_rate,
+                    mutation_scale,
+                    0.5,
+                    4.0,
+                );
                 runtime.trait_modifiers.eye = after;
                 (before, after)
             };
@@ -21798,7 +21826,14 @@ impl WorldState {
 
             let (before_blood, after_blood) = {
                 let before = runtime.trait_modifiers.blood;
-                let after = Self::mutate_value(mutation_rng, before, mutation_scale, 0.5, 4.0);
+                let after = Self::mutate_modifier_with_probability(
+                    mutation_rng,
+                    before,
+                    primary_rate,
+                    mutation_scale,
+                    0.5,
+                    4.0,
+                );
                 runtime.trait_modifiers.blood = after;
                 (before, after)
             };
@@ -21841,32 +21876,30 @@ impl WorldState {
 
             for i in 0..runtime.eye_fov.len() {
                 let before = runtime.eye_fov[i];
-                let after = if primary_rate > 0.0
-                    && mutation_rng.random_range(0.0..1.0) < primary_rate * 5.0
-                {
-                    Self::mutate_value(
-                        mutation_rng,
-                        runtime.eye_fov[i],
-                        mutation_scale,
-                        0.0,
-                        f32::MAX,
-                    )
-                } else {
-                    runtime.eye_fov[i]
-                };
+                let after =
+                    if Self::mutation_event_accepted(mutation_rng, primary_rate, mutation_scale) {
+                        Self::mutate_value(
+                            mutation_rng,
+                            runtime.eye_fov[i],
+                            mutation_scale,
+                            0.0,
+                            f32::MAX,
+                        )
+                    } else {
+                        runtime.eye_fov[i]
+                    };
                 runtime.eye_fov[i] = after;
                 runtime.log_change(gene_log_capacity, &format!("eye_fov{i}"), before, after);
             }
             for i in 0..runtime.eye_direction.len() {
                 let before = runtime.eye_direction[i];
-                let after = if primary_rate > 0.0
-                    && mutation_rng.random_range(0.0..1.0) < primary_rate * 5.0
-                {
-                    let delta = mutation_rng.random_range(-mutation_scale..mutation_scale);
-                    wrap_unsigned_angle(runtime.eye_direction[i] + delta)
-                } else {
-                    wrap_unsigned_angle(runtime.eye_direction[i])
-                };
+                let after =
+                    if Self::mutation_event_accepted(mutation_rng, primary_rate, mutation_scale) {
+                        let delta = mutation_rng.random_range(-mutation_scale..mutation_scale);
+                        wrap_unsigned_angle(runtime.eye_direction[i] + delta)
+                    } else {
+                        wrap_unsigned_angle(runtime.eye_direction[i])
+                    };
                 runtime.eye_direction[i] = after;
                 if (after - before).abs() > 1e-4 {
                     runtime.push_gene_log(
@@ -21888,6 +21921,24 @@ impl WorldState {
         (value + delta).clamp(min, max)
     }
 
+    /// The legacy `randf(0,1) < MR*5` per-gene reproduction gate (bd-v69t).
+    ///
+    /// `MutationRates::primary` is a probability, not a switch: C++ `Agent::reproduce` decides
+    /// each heritable attribute with its own draw against `MR*5`. A zero (or negative) rate or
+    /// scale is a disabled pass rather than a certain-rejection pass, so it draws nothing and the
+    /// offspring mutation stream stays bit-identical to a run in which the gene does not exist.
+    fn mutation_event_accepted(rng: &mut dyn RandomStream, rate: f32, scale: f32) -> bool {
+        if scale <= 0.0 || rate <= 0.0 {
+            return false;
+        }
+        rng.random_range(0.0..1.0) < rate * 5.0
+    }
+
+    /// Gated mutation for genes the legacy code clamps *outside* the gate.
+    ///
+    /// C++ follows the clock draws with an unconditional `if(a2.clockf1<2) a2.clockf1= 2;`, so a
+    /// rejected event still normalizes the inherited value. Genes without such a post-clamp must
+    /// use [`Self::mutate_modifier_with_probability`] instead.
     fn mutate_value_with_probability(
         rng: &mut dyn RandomStream,
         value: f32,
@@ -21896,13 +21947,31 @@ impl WorldState {
         min: f32,
         max: f32,
     ) -> f32 {
-        if scale <= 0.0 || rate <= 0.0 {
-            return value.clamp(min, max);
-        }
-        if rng.random_range(0.0..1.0) < rate * 5.0 {
+        if Self::mutation_event_accepted(rng, rate, scale) {
             Self::mutate_value(rng, value, scale, min, max)
         } else {
             value.clamp(min, max)
+        }
+    }
+
+    /// Gated mutation for genes the legacy code never clamps (bd-v69t).
+    ///
+    /// The five sensory modifiers are plain `randn` targets in C++ with no surrounding bound, so a
+    /// rejected event is exact inheritance. Returning `value.clamp(..)` here would let a no-op
+    /// mutation rewrite the genome payload; the domain bound is applied only to a value this pass
+    /// actually perturbed.
+    fn mutate_modifier_with_probability(
+        rng: &mut dyn RandomStream,
+        value: f32,
+        rate: f32,
+        scale: f32,
+        min: f32,
+        max: f32,
+    ) -> f32 {
+        if Self::mutation_event_accepted(rng, rate, scale) {
+            Self::mutate_value(rng, value, scale, min, max)
+        } else {
+            value
         }
     }
     /// Project live agents into the batch's agent rows, ordered by stable `AgentUid` (bd-mv2j).
@@ -30412,6 +30481,165 @@ mod tests {
                 "a rejected mutation event must preserve the exact heritable FOV payload"
             );
         }
+    }
+
+    /// Parent used by the bd-v69t fixtures: five distinct in-range sensory modifiers so a lost
+    /// bit is attributable to a specific gene rather than to a shared default.
+    fn v69t_parent(primary_rate: f32) -> AgentRuntime {
+        let mut parent = AgentRuntime::default();
+        parent.trait_modifiers = TraitModifiers {
+            smell: 0.3,
+            sound: 0.4,
+            hearing: 1.0,
+            eye: 1.5,
+            blood: 1.25,
+        };
+        parent.mutation_rates.primary = primary_rate;
+        parent.mutation_rates.secondary = 1.0;
+        parent
+    }
+
+    fn v69t_world() -> WorldState {
+        WorldState::new(ScriptBotsConfig {
+            reproduction_mutation_scale: 1.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world")
+    }
+
+    fn v69t_modifier_bits(runtime: &AgentRuntime) -> [u32; 5] {
+        [
+            runtime.trait_modifiers.smell.to_bits(),
+            runtime.trait_modifiers.sound.to_bits(),
+            runtime.trait_modifiers.hearing.to_bits(),
+            runtime.trait_modifiers.eye.to_bits(),
+            runtime.trait_modifiers.blood.to_bits(),
+        ]
+    }
+
+    #[test]
+    fn bd_v69t_zero_primary_rate_preserves_sensory_modifiers_and_draws_nothing_for_them() {
+        let world = v69t_world();
+        let parent = v69t_parent(0.0);
+        let mut crossover_rng = SmallRngStream::seed_from_u64(0x5EED_0001);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0x5EED_0002);
+
+        let child = world.build_child_runtime(
+            &parent,
+            None,
+            8,
+            OffspringRngIdentityV1::new(AgentUid(1), None, 0),
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+
+        assert_eq!(
+            v69t_modifier_bits(&child),
+            v69t_modifier_bits(&parent),
+            "a zero per-gene probability must inherit every sensory modifier bit-exactly"
+        );
+
+        // The herbivore draw is the only unconditional trait mutation in the pass, so a disabled
+        // probability must leave the mutation stream exactly one draw past its seed.
+        let mut expected = SmallRngStream::seed_from_u64(0x5EED_0002);
+        let _herbivore_delta: f32 = expected.random_range(-1.0_f32..1.0_f32);
+        assert_eq!(
+            mutation_rng.checkpoint(),
+            expected.checkpoint(),
+            "a disabled probability must consume no gate or delta draw for any gated gene"
+        );
+    }
+
+    #[test]
+    fn bd_v69t_accepted_sensory_events_consume_a_gate_then_a_delta_in_declaration_order() {
+        let world = v69t_world();
+        // rate*5 == 5.0 exceeds every draw from `random_range(0.0..1.0)`, so every gate accepts.
+        let parent = v69t_parent(1.0);
+        let mut crossover_rng = SmallRngStream::seed_from_u64(0x5EED_0003);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0x5EED_0004);
+
+        let mut expected_rng = SmallRngStream::seed_from_u64(0x5EED_0004);
+        let expected_modifiers = {
+            let _herbivore_delta: f32 = expected_rng.random_range(-1.0_f32..1.0_f32);
+            let mut accepted = |before: f32, min: f32, max: f32| {
+                let gate: f32 = expected_rng.random_range(0.0_f32..1.0_f32);
+                assert!(gate < 5.0, "fixture requires an accepted event");
+                let delta: f32 = expected_rng.random_range(-1.0_f32..1.0_f32);
+                (before + delta).clamp(min, max)
+            };
+            [
+                accepted(parent.trait_modifiers.smell, 0.05, 3.0),
+                accepted(parent.trait_modifiers.sound, 0.05, 3.0),
+                accepted(parent.trait_modifiers.hearing, 0.1, 4.0),
+                accepted(parent.trait_modifiers.eye, 0.5, 4.0),
+                accepted(parent.trait_modifiers.blood, 0.5, 4.0),
+            ]
+        };
+
+        let child = world.build_child_runtime(
+            &parent,
+            None,
+            8,
+            OffspringRngIdentityV1::new(AgentUid(1), None, 0),
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+
+        assert_eq!(
+            v69t_modifier_bits(&child),
+            expected_modifiers.map(f32::to_bits),
+            "an accepted event must draw its gate first and then its delta, gene by gene"
+        );
+        assert_ne!(
+            v69t_modifier_bits(&child),
+            v69t_modifier_bits(&parent),
+            "the fixture must actually perturb the modifiers it claims to accept"
+        );
+    }
+
+    #[test]
+    fn bd_v69t_rejected_sensory_event_consumes_only_its_gate_draw() {
+        let world = v69t_world();
+        // rate*5 == 5e-9 is below every draw the fixture asserts, so every gate rejects.
+        let rate = 1e-9_f32;
+        let parent = v69t_parent(rate);
+        let mut crossover_rng = SmallRngStream::seed_from_u64(0x5EED_0005);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0x5EED_0006);
+
+        let child = world.build_child_runtime(
+            &parent,
+            None,
+            8,
+            OffspringRngIdentityV1::new(AgentUid(1), None, 0),
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+
+        assert_eq!(
+            v69t_modifier_bits(&child),
+            v69t_modifier_bits(&parent),
+            "a rejected event must inherit the exact parent payload, not a re-clamped copy"
+        );
+
+        // Pins the order every gated gene draws in: herbivore delta, the five sensory gates, both
+        // clocks, temperature, then FOV and direction per eye. A reordering is a digest change and
+        // must be argued for explicitly rather than land as a silent edit.
+        let mut expected = SmallRngStream::seed_from_u64(0x5EED_0006);
+        let _herbivore_delta: f32 = expected.random_range(-1.0_f32..1.0_f32);
+        for gene in 0..(5 + 2 + 1 + 2 * NUM_EYES) {
+            let gate: f32 = expected.random_range(0.0_f32..1.0_f32);
+            assert!(
+                gate >= rate * 5.0,
+                "fixture requires every gate to reject; gene {gene} drew {gate}"
+            );
+        }
+        assert_eq!(
+            mutation_rng.checkpoint(),
+            expected.checkpoint(),
+            "a rejected event must consume its gate draw and no delta draw"
+        );
     }
 
     #[test]
