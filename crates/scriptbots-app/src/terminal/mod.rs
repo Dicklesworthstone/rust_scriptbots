@@ -61,7 +61,17 @@ pub mod canvas_inspector;
 pub mod canvas_ramps;
 pub mod command_palette;
 pub mod frankentui_shell;
-pub mod paint;
+
+// `paint.rs` is deliberately NOT declared (bd-c1z8). It is a second, complete
+// sub-cell painter engine, shipped by the same task that produced `subcell`, and
+// `subcell` is the one wired into the live canvas and covered by tests. Dropping
+// the declaration is what actually converges the crate on ONE painter: the file
+// stays on disk, losing nothing and fully reversible, but the duplicate engine is
+// no longer part of the build. The file itself is retained pending the explicit
+// written deletion permission AGENTS.md Rule 1 requires.
+//
+// `the_exempt_duplicate_painter_stays_out_of_the_build` fails if this declaration
+// comes back, so the second engine cannot silently rejoin the crate.
 
 use canvas_ramps::HeadingSector;
 
@@ -7050,12 +7060,33 @@ mod tests {
         );
     }
 
-    /// `paint.rs` is exempt only because it is DEAD. If anything ever imports it,
-    /// the exemption is wrong and this fails — an allowlist that silently starts
-    /// covering live code is worse than no allowlist.
+    /// `paint.rs` is exempt from the duplicate guard only because it is OUT OF THE
+    /// BUILD and unreferenced. Both halves are checked here, because an allowlist
+    /// that silently starts covering live code is worse than no allowlist.
+    ///
+    /// The module-declaration half is the load-bearing one: re-adding
+    /// `pub mod paint;` would put a second painter engine back into the crate,
+    /// which is precisely the state bd-c1z8 exists to prevent, and the name-based
+    /// guard alone would not catch it because `paint.rs` is on its exempt list.
     #[test]
-    fn the_exempt_duplicate_painter_is_still_entirely_unreferenced() {
+    fn the_exempt_duplicate_painter_stays_out_of_the_build() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal");
+
+        let module_root =
+            std::fs::read_to_string(dir.join("mod.rs")).expect("read terminal mod.rs");
+        let declarations = module_root
+            .split_once(TERMINAL_DUPLICATE_GUARD_MARKER)
+            .map_or(module_root.as_str(), |(before, _)| before);
+        assert!(
+            !declarations
+                .lines()
+                .any(|line| line.trim_start().starts_with("pub mod paint")
+                    || line.trim_start().starts_with("mod paint")),
+            "paint.rs has been declared as a module again, putting a SECOND sub-cell \
+             painter engine back into the crate. subcell.rs is the canonical one \
+             (bd-c1z8); converge on it rather than compiling both."
+        );
+
         let exports = [
             "PixelBuffer",
             "CellGlyph",
@@ -8967,25 +8998,67 @@ mod tests {
 
     #[test]
     fn test_curated_theme_id_cycling() {
-        let t1 = CuratedThemeId::CyberpunkAurora;
-        let t2 = t1.next();
-        let t3 = t2.next();
-        let t4 = t3.next();
-        let t5 = t4.next();
-        let t6 = t5.next();
+        // Walk the cycle instead of counting steps by hand. The hand-counted
+        // version stepped five times and asserted the wrap, which was correct for
+        // five themes and silently wrong the moment bd-f4x0 added a sixth
+        // (BioluminescentDarkField) — the assertion encoded the COUNT rather than
+        // the property, so growing the enum broke a test that had nothing to say
+        // about the new theme.
+        let start = CuratedThemeId::CyberpunkAurora;
+        let mut cycle = vec![start];
+        let mut current = start.next();
+        while current != start {
+            assert!(
+                !cycle.contains(&current),
+                "next() re-enters {current:?} without returning to {start:?}, so the \
+                 themes form a lasso rather than a cycle and some are unreachable"
+            );
+            cycle.push(current);
+            assert!(
+                cycle.len() <= 64,
+                "next() never returned to {start:?}; the theme cycle is not closed"
+            );
+            current = current.next();
+        }
 
-        assert_eq!(t2, CuratedThemeId::Darcula);
-        assert_eq!(t3, CuratedThemeId::LumenLight);
-        assert_eq!(t4, CuratedThemeId::NordicFrost);
-        assert_eq!(t5, CuratedThemeId::HighContrast);
-        assert_eq!(
-            t6,
+        // The one place that needs updating when a theme is added, and it fails
+        // with a message that says so rather than an opaque count mismatch.
+        for theme in [
+            CuratedThemeId::BioluminescentDarkField,
             CuratedThemeId::CyberpunkAurora,
-            "theme cycle must wrap back to start"
+            CuratedThemeId::Darcula,
+            CuratedThemeId::LumenLight,
+            CuratedThemeId::NordicFrost,
+            CuratedThemeId::HighContrast,
+        ] {
+            assert!(
+                cycle.contains(&theme),
+                "{theme:?} exists but Ctrl-T never reaches it — add it to \
+                 CuratedThemeId::next() so the cycle covers every theme"
+            );
+        }
+        assert_eq!(
+            cycle.len(),
+            6,
+            "cycle visited {:?}; if a theme was added, extend the list above too",
+            cycle
         );
 
-        assert_eq!(t1.label(), "Cyberpunk Aurora");
-        assert_ne!(t1.header_color(), t2.header_color());
+        // Documented order, kept so a silent reordering is still caught.
+        assert_eq!(
+            cycle,
+            vec![
+                CuratedThemeId::CyberpunkAurora,
+                CuratedThemeId::Darcula,
+                CuratedThemeId::LumenLight,
+                CuratedThemeId::NordicFrost,
+                CuratedThemeId::HighContrast,
+                CuratedThemeId::BioluminescentDarkField,
+            ]
+        );
+
+        assert_eq!(start.label(), "Cyberpunk Aurora");
+        assert_ne!(start.header_color(), start.next().header_color());
     }
 
     #[test]
