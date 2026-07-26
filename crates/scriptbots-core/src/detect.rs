@@ -1984,4 +1984,254 @@ mod tests {
             "a non-finite configured bound must be reported, not hidden"
         );
     }
+
+    // ---- bd-16g.2.11 item 3: oracles, property series, and chunk boundaries ----
+
+    /// Deterministic LCG. A seeded generator, not a random one: property tests that
+    /// cannot be replayed exactly are not evidence, they are anecdotes.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_f64(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+    }
+
+    /// Bimodality must agree with the sorting oracle across generated series, not
+    /// only on hand-picked fixtures.
+    ///
+    /// Hand-written fixtures test the cases the author already thought of. The point
+    /// of generating is to reach the ones they did not -- overlapping clusters,
+    /// lopsided splits, heavy duplication, and near-degenerate spreads all appear
+    /// here without anyone choosing them.
+    #[test]
+    fn bd_16g_2_11_bimodality_matches_oracle_on_property_generated_series() {
+        let params = BimodalityParams::default();
+        let mut rng = Lcg(0x5EED_1234_ABCD_0001);
+        for case in 0..200 {
+            let n = 8 + (case % 91);
+            let gap = (case % 7) as f64;
+            let spread = 0.25 + (case % 4) as f64 * 0.5;
+            let values: Vec<f64> = (0..n)
+                .map(|i| {
+                    let noise = (rng.next_f64() - 0.5) * spread;
+                    if i % 2 == 0 { noise } else { gap + noise }
+                })
+                .collect();
+
+            let fast = bimodality(&values, params).expect("finite");
+            let oracle = bimodality_sorting_oracle(&values, params);
+
+            assert_eq!(
+                fast.lower_count + fast.upper_count,
+                values.len(),
+                "case {case}: classes must partition the sample"
+            );
+            // Score is a variance ratio in [0,1]; the histogram searches a coarser
+            // candidate set, so it can only ever find a split at least as good as
+            // nothing and at most as good as the exhaustive optimum.
+            assert!(
+                fast.score <= oracle.score + 1e-9,
+                "case {case}: histogram cannot beat the exhaustive optimum \
+                 (fast {} vs oracle {})",
+                fast.score,
+                oracle.score
+            );
+            assert!(
+                fast.score.is_finite() && (0.0..=1.0).contains(&fast.score),
+                "case {case}: score {} left [0,1]",
+                fast.score
+            );
+            if oracle.is_bimodal && fast.is_bimodal {
+                assert!(
+                    (fast.split - oracle.split).abs()
+                        <= (values.iter().copied().fold(f64::MIN, f64::max)
+                            - values.iter().copied().fold(f64::MAX, f64::min))
+                            / BIMODALITY_BINS as f64
+                            + 1e-9,
+                    "case {case}: split must sit within one bin width of the optimum"
+                );
+            }
+        }
+    }
+
+    /// CUSUM and threshold crossings must be prefix-determined at EVERY boundary.
+    ///
+    /// This is the property that lets the live HUD and post-hoc analysis agree. If it
+    /// held only at some boundaries, an online consumer would report detections that
+    /// the offline rerun does not, and the disagreement would look like a data bug
+    /// rather than a detector contract violation.
+    #[test]
+    fn bd_16g_2_11_detections_are_prefix_determined_at_every_boundary() {
+        let series: Vec<Sample> = (0..400)
+            .map(|i| {
+                let v = match i {
+                    0..=149 => 0.0,
+                    150..=299 => 12.0,
+                    _ => -6.0,
+                };
+                Sample::new(i as u64, v)
+            })
+            .collect();
+        let cusum = CusumParams::default();
+        let thresholds = [Threshold {
+            name: "zero",
+            level: 1.0,
+            direction: CrossDirection::Either,
+        }];
+
+        let full_changes = change_points_cusum(&series, cusum).expect("valid");
+        let full_crossings = threshold_crossings(&series, &thresholds).expect("valid");
+
+        for boundary in 0..=series.len() {
+            let prefix = &series[..boundary];
+
+            let got = change_points_cusum(prefix, cusum).expect("valid");
+            let expected: Vec<ChangePoint> = full_changes
+                .iter()
+                .copied()
+                .filter(|cp| cp.index < boundary)
+                .collect();
+            assert_eq!(
+                got, expected,
+                "cusum at boundary {boundary}: a detection must depend only on series[..=i]"
+            );
+
+            let got_cross = threshold_crossings(prefix, &thresholds).expect("valid");
+            let expected_cross: Vec<Crossing> = full_crossings
+                .iter()
+                .copied()
+                .filter(|c| c.index < boundary)
+                .collect();
+            assert_eq!(
+                got_cross, expected_cross,
+                "crossings at boundary {boundary}: pointwise detectors must be prefix-determined"
+            );
+        }
+    }
+
+    /// Regime windows are prefix-determined at MULTIPLES OF THE WINDOW, and only there.
+    ///
+    /// `regimes` consumes `chunks_exact(window)`, so a trailing partial window is not
+    /// classified until it is complete. That is the primitive's supported boundary set,
+    /// and stating it precisely is the point: claiming "prefix-determined at every
+    /// boundary" would be false, and claiming nothing would leave a consumer guessing
+    /// whether a missing final window is a bug.
+    #[test]
+    fn bd_16g_2_11_regime_windows_are_prefix_determined_at_window_multiples() {
+        let params = RegimeParams::default();
+        let series: Vec<Sample> = (0..(params.window * 6))
+            .map(|i| Sample::new(i as u64, (i as f64) * 0.5))
+            .collect();
+        let full = regimes(&series, params).expect("valid");
+
+        for windows in 0..=6 {
+            let boundary = windows * params.window;
+            let got = regimes(&series[..boundary], params).expect("valid");
+            assert_eq!(
+                got,
+                full[..windows.min(full.len())].to_vec(),
+                "regimes at {windows} complete windows must match the full run's prefix"
+            );
+        }
+
+        // And the documented exclusion: a partial trailing window yields nothing extra.
+        let partial =
+            regimes(&series[..params.window * 2 + params.window / 2], params).expect("valid");
+        assert_eq!(
+            partial.len(),
+            2,
+            "a partial trailing window must not be classified early"
+        );
+    }
+
+    /// Evidence must be byte-identical however the series was fed.
+    ///
+    /// Detections agreeing while their evidence differs would be worse than either
+    /// failing outright: consumers key explanations off the evidence, so a silent
+    /// divergence there is a divergence in what users are told happened.
+    #[test]
+    fn bd_16g_2_11_evidence_is_byte_identical_across_chunk_boundaries() {
+        let series: Vec<Sample> = (0..300)
+            .map(|i| Sample::new(i as u64, if i < 150 { 0.0 } else { 9.0 }))
+            .collect();
+        let cusum = CusumParams::default();
+        let full = change_points_cusum(&series, cusum).expect("valid");
+        assert!(
+            !full.is_empty(),
+            "the fixture must actually detect something"
+        );
+
+        // Evidence is compared at a FIXED sample count so the property under test is
+        // "the detection carries the same explanation", not "the prefix was shorter".
+        let samples = series.len();
+        for boundary in 0..=series.len() {
+            let prefix_detections = change_points_cusum(&series[..boundary], cusum).expect("valid");
+            for (from_prefix, from_full) in prefix_detections.iter().zip(full.iter()) {
+                assert_eq!(
+                    from_prefix.evidence("agents.energy", samples, cusum),
+                    from_full.evidence("agents.energy", samples, cusum),
+                    "evidence diverged at boundary {boundary}"
+                );
+            }
+        }
+    }
+
+    /// Calibration behaviour must survive the item-1 rewrite.
+    ///
+    /// The bead asks for existing calibration to be preserved, so this pins the
+    /// documented thresholds directly rather than trusting that untouched tests cover
+    /// them: a bimodal fixture must clear every configured bound, and a unimodal one
+    /// must fail on the bound that is supposed to reject it.
+    #[test]
+    fn bd_16g_2_11_calibration_thresholds_still_govern_the_verdict() {
+        let params = BimodalityParams::default();
+
+        let split = two_clusters(60, 60, 6.0);
+        let bimodal = bimodality(&split, params).expect("finite");
+        assert!(bimodal.is_bimodal);
+        assert!(bimodal.score >= params.min_score, "score bound must be met");
+        assert!(
+            bimodal.separation >= params.min_separation,
+            "separation bound must be met"
+        );
+
+        // A single spread-out cluster: fails on separation, which is the bound that
+        // is supposed to reject it.
+        //
+        // NOTE, because the obvious fixture here is wrong: a tiny ABSOLUTE gap does
+        // NOT make a sample unimodal. `separation` is normalised by the sample's own
+        // sigma, so two zero-spread clusters 1e-6 apart score separation ~2.0 and are
+        // correctly reported bimodal. That is deliberate scale invariance -- the same
+        // property `bd_16g_2_11_bimodality_is_invariant_under_positive_affine_rescaling`
+        // pins -- and it means the only absolute floor in the whole primitive is
+        // `min_sigma`. A unimodal fixture therefore has to be genuinely unimodal in
+        // SHAPE, not merely small in scale.
+        let mut rng = Lcg(0x1111_2222_3333_4444);
+        let unimodal_values: Vec<f64> = (0..200).map(|_| rng.next_f64()).collect();
+        let unimodal = bimodality(&unimodal_values, params).expect("finite");
+        assert!(
+            !unimodal.is_bimodal,
+            "one broad cluster is not two clades: {unimodal:?}"
+        );
+        assert!(
+            unimodal.separation < params.min_separation,
+            "separation is the bound that must reject a single cluster"
+        );
+
+        // Lopsided: fails on cluster fraction even with a clean gap.
+        let mut lopsided = vec![0.0; 200];
+        lopsided.extend_from_slice(&[20.0; 5]);
+        let outliers = bimodality(&lopsided, params).expect("finite");
+        assert!(!outliers.is_bimodal, "five outliers are not a clade");
+        let smaller = outliers.lower_count.min(outliers.upper_count) as f64 / 205.0;
+        assert!(
+            smaller < params.min_cluster_fraction,
+            "cluster fraction is the bound that must reject it"
+        );
+    }
 }
