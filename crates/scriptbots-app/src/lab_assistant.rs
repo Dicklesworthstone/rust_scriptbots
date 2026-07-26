@@ -8,12 +8,24 @@ use crate::lab::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, PROPOSE_EXPERIMENT_TOOL_NAME, StopReason,
     propose_experiment_tool,
 };
+use crate::lab::notebook::{NotebookRenderError, NotebookRenderer, claims_from_analysis, run_refs};
 use crate::lab::spec::{
     ExperimentSpec, SpecBudget, SpecError, ValidatedSpec, render_errors, validate_spec,
 };
+use crate::lab::stats::{
+    AnalysisParams, MatchedSeedAnalysis, RunSummary, StatsError, analyze_matched_seed_runs,
+};
+use scriptbots_storage::{
+    RunBundleV1, bundle::RunBundleVerificationLimits, bundle::verify_run_bundle_bounded,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::PathBuf;
+
+const MAX_ANALYSIS_SUMMARY_BYTES: usize = 4_096;
+const MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES: usize = 512 * 1_024;
 
 /// State machine phases for autonomous lab execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,12 +59,14 @@ impl Default for LabBudget {
 }
 
 /// Successful execution accounting returned by an experiment executor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionReceipt {
     /// Runs allocated by the executor.
     pub runs: usize,
     /// Ticks allocated across those runs.
     pub ticks: u64,
+    /// Verified per-run scientific summaries in canonical variant/seed order.
+    pub summaries: Vec<RunSummary>,
 }
 
 /// Side-effect boundary invoked only after canonical validation succeeds.
@@ -107,13 +121,15 @@ impl ExperimentExecutor for MatchedSeedExecutor {
         let status = runner
             .execute_batch(&output_dir.join("status.json"))
             .map_err(|error| error.to_string())?;
-        execution_receipt(spec, &status)
+        let summaries = completed_run_summaries(spec, &status)?;
+        execution_receipt(spec, &status, summaries)
     }
 }
 
 fn execution_receipt(
     spec: &ValidatedSpec,
     status: &ExperimentBatchStatus,
+    summaries: Vec<RunSummary>,
 ) -> Result<ExecutionReceipt, String> {
     let cost = spec.cost();
     let expected_runs = usize::try_from(cost.runs)
@@ -131,7 +147,202 @@ fn execution_receipt(
     Ok(ExecutionReceipt {
         runs: expected_runs,
         ticks: cost.ticks,
+        summaries,
     })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExperimentSummaryRow {
+    tick: u64,
+    alive_agents: usize,
+    seed: u64,
+    brain_family: String,
+    final_digest: String,
+}
+
+fn read_bounded_analysis_file(path: &std::path::Path, limit: usize) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "{} must be a regular file no larger than {limit} bytes",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(limit).min(limit));
+    file.take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "{} exceeded the {limit}-byte analysis bound while reading",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn completed_run_summaries(
+    spec: &ValidatedSpec,
+    status: &ExperimentBatchStatus,
+) -> Result<Vec<RunSummary>, String> {
+    let mut summaries = Vec::with_capacity(status.runs.len());
+    for record in &status.runs {
+        let arm_id = record
+            .variant_id
+            .strip_prefix("arm-")
+            .ok_or_else(|| {
+                format!(
+                    "run {} has non-canonical variant_id {}",
+                    record.run_id, record.variant_id
+                )
+            })?
+            .parse::<u16>()
+            .map_err(|error| {
+                format!(
+                    "run {} has invalid variant_id {}: {error}",
+                    record.run_id, record.variant_id
+                )
+            })?;
+        if spec.arms.get(usize::from(arm_id)).is_none() {
+            return Err(format!(
+                "run {} references arm {} outside validated arm count {}",
+                record.run_id,
+                arm_id,
+                spec.arms.len()
+            ));
+        }
+        let bundle_path = record.bundle_path.as_ref().ok_or_else(|| {
+            format!(
+                "completed experiment run {} has no verified bundle path",
+                record.run_id
+            )
+        })?;
+        let bundle_dir = PathBuf::from(bundle_path);
+        let bundle_manifest_path = bundle_dir.join("bundle_manifest.json");
+        let bundle_bytes =
+            read_bounded_analysis_file(&bundle_manifest_path, MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)?;
+        let bundle: RunBundleV1 = serde_json::from_slice(&bundle_bytes)
+            .map_err(|error| format!("parse {}: {error}", bundle_manifest_path.display()))?;
+        let summary_entries = bundle
+            .artifacts
+            .iter()
+            .filter(|entry| {
+                entry.relative_path == "exports/summary.csv"
+                    && entry.artifact_type == "experiment-summary"
+            })
+            .collect::<Vec<_>>();
+        let [summary_entry] = summary_entries.as_slice() else {
+            return Err(format!(
+                "bundle {} must index exports/summary.csv exactly once as experiment-summary",
+                bundle_dir.display()
+            ));
+        };
+        for (matches, field) in [
+            (
+                bundle.manifest.variant_id.as_deref() == Some(record.variant_id.as_str()),
+                "variant_id",
+            ),
+            (bundle.manifest.root_seed == record.seed, "root_seed"),
+            (
+                bundle.manifest.requested_tick_budget == Some(record.total_ticks),
+                "requested_tick_budget",
+            ),
+            (bundle.digests.max_tick == record.total_ticks, "max_tick"),
+        ] {
+            if !matches {
+                return Err(format!(
+                    "bundle {} disagrees with completed run {} on {field}",
+                    bundle_dir.display(),
+                    record.run_id
+                ));
+            }
+        }
+
+        let summary_path = bundle_dir.join("exports/summary.csv");
+        let bytes = read_bounded_analysis_file(&summary_path, MAX_ANALYSIS_SUMMARY_BYTES)?;
+        if summary_entry.bytes_len != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+            || summary_entry.blake3_hex != blake3::hash(&bytes).to_hex().as_str()
+        {
+            return Err(format!(
+                "summary {} no longer matches its verified bundle artifact entry",
+                summary_path.display()
+            ));
+        }
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(bytes.as_slice());
+        let mut rows = reader.deserialize::<ExperimentSummaryRow>();
+        let row = rows
+            .next()
+            .ok_or_else(|| format!("summary {} has no data row", summary_path.display()))?
+            .map_err(|error| format!("parse {}: {error}", summary_path.display()))?;
+        if rows.next().is_some() {
+            return Err(format!(
+                "summary {} must contain exactly one data row",
+                summary_path.display()
+            ));
+        }
+        let final_digest = record.final_digest.as_ref().ok_or_else(|| {
+            format!(
+                "completed experiment run {} has no final digest",
+                record.run_id
+            )
+        })?;
+        for (matches, field) in [
+            (row.tick == record.total_ticks, "tick"),
+            (row.seed == record.seed, "seed"),
+            (row.brain_family == record.brain_family, "brain_family"),
+            (row.final_digest == *final_digest, "final_digest"),
+        ] {
+            if !matches {
+                return Err(format!(
+                    "summary {} disagrees with verified run {} on {field}",
+                    summary_path.display(),
+                    record.run_id
+                ));
+            }
+        }
+        let alive_agents = u32::try_from(row.alive_agents).map_err(|_| {
+            format!(
+                "summary {} alive_agents {} exceeds the bounded reporting representation",
+                summary_path.display(),
+                row.alive_agents
+            )
+        })?;
+        verify_run_bundle_bounded(
+            &bundle_dir,
+            RunBundleVerificationLimits {
+                max_manifest_bytes: u64::try_from(MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)
+                    .unwrap_or(u64::MAX),
+                max_artifacts: 32,
+                max_artifact_bytes: u64::try_from(MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)
+                    .unwrap_or(u64::MAX),
+                max_total_artifact_bytes: 1_024 * 1_024,
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "bundle {} changed before analysis: {error}",
+                bundle_dir.display()
+            )
+        })?;
+        summaries.push(RunSummary::from_verified_parts(
+            record.run_id.clone(),
+            arm_id,
+            row.seed,
+            bundle.manifest.config_digest.clone(),
+            row.final_digest,
+            row.tick,
+            BTreeMap::from([("alive_agents".to_owned(), f64::from(alive_agents))]),
+            summary_entry.blake3_hex.clone(),
+            Some(summary_path.to_string_lossy().into_owned()),
+        ));
+    }
+    Ok(summaries)
 }
 
 /// Typed state-machine failure. Validation failures retain the complete ordered
@@ -198,6 +409,12 @@ pub enum LabError {
         /// Executor-reported tick count.
         actual_ticks: u64,
     },
+    /// The canonical statistics authority rejected completed run evidence.
+    #[error("lab analysis failed: {0}")]
+    Analysis(#[source] StatsError),
+    /// The notebook rejected statistical or run provenance.
+    #[error("lab notebook failed: {0}")]
+    Notebook(#[source] NotebookRenderError),
 }
 
 /// Autonomous lab assistant state machine runner (bd-16g.1.3).
@@ -213,8 +430,19 @@ pub struct LabStateMachine {
     pub tokens_spent: usize,
     pub iterations: usize,
     pub executed_spec_hashes: BTreeSet<String>,
+    /// Verified completed summaries retained for the Analyze phase.
+    pub run_summaries: Vec<RunSummary>,
+    /// Canonical structured report produced by the Analyze phase.
+    pub analysis: Option<MatchedSeedAnalysis>,
+    /// Provenance-checked Markdown produced by the Report phase.
+    pub rendered_notebook: Option<String>,
+    /// Materialized notebook path for production runs.
+    pub notebook_path: Option<PathBuf>,
+    /// Exact terminal failure retained when a phase refuses to continue.
+    pub failure_reason: Option<String>,
     client: Box<dyn LlmClient>,
     executor: Box<dyn ExperimentExecutor>,
+    notebook_root: Option<PathBuf>,
 }
 
 impl LabStateMachine {
@@ -226,10 +454,12 @@ impl LabStateMachine {
         budget: LabBudget,
         output_root: impl Into<PathBuf>,
     ) -> Self {
-        Self::with_executor(
+        let output_root = output_root.into();
+        Self::with_executor_and_notebook_root(
             client,
             budget,
-            Box::new(MatchedSeedExecutor::new(output_root)),
+            Box::new(MatchedSeedExecutor::new(output_root.clone())),
+            Some(output_root),
         )
     }
 
@@ -239,6 +469,15 @@ impl LabStateMachine {
         client: Box<dyn LlmClient>,
         budget: LabBudget,
         executor: Box<dyn ExperimentExecutor>,
+    ) -> Self {
+        Self::with_executor_and_notebook_root(client, budget, executor, None)
+    }
+
+    fn with_executor_and_notebook_root(
+        client: Box<dyn LlmClient>,
+        budget: LabBudget,
+        executor: Box<dyn ExperimentExecutor>,
+        notebook_root: Option<PathBuf>,
     ) -> Self {
         Self {
             phase: LabPhase::Propose,
@@ -252,8 +491,14 @@ impl LabStateMachine {
             tokens_spent: 0,
             iterations: 0,
             executed_spec_hashes: BTreeSet::new(),
+            run_summaries: Vec::new(),
+            analysis: None,
+            rendered_notebook: None,
+            notebook_path: None,
+            failure_reason: None,
             client,
             executor,
+            notebook_root,
         }
     }
 
@@ -268,22 +513,26 @@ impl LabStateMachine {
         if self.iterations > self.budget.max_iterations
             && !matches!(self.phase, LabPhase::Report | LabPhase::Finished)
         {
+            self.failure_reason = Some(format!(
+                "iteration budget exhausted after {} transitions (limit {})",
+                self.iterations, self.budget.max_iterations
+            ));
             self.phase = LabPhase::Report;
             return Ok(self.phase);
         }
 
-        match self.phase {
-            LabPhase::Propose => self.propose()?,
-            LabPhase::Validate => self.validate()?,
-            LabPhase::Execute => self.execute()?,
-            LabPhase::Analyze => {
-                self.phase = LabPhase::Report;
-            }
-            LabPhase::Report => {
-                self.phase = LabPhase::Finished;
-            }
-            LabPhase::Finished => {}
+        let transition = match self.phase {
+            LabPhase::Propose => self.propose(),
+            LabPhase::Validate => self.validate(),
+            LabPhase::Execute => self.execute(),
+            LabPhase::Analyze => self.analyze(),
+            LabPhase::Report => self.report(),
+            LabPhase::Finished => Ok(()),
+        };
+        if let Err(error) = &transition {
+            self.failure_reason = Some(error.to_string());
         }
+        transition?;
         Ok(self.phase)
     }
 
@@ -453,14 +702,143 @@ impl LabStateMachine {
                 actual_ticks: receipt.ticks,
             });
         }
+        if receipt.summaries.len() != expected_runs {
+            self.phase = LabPhase::Report;
+            return Err(LabError::Execution(format!(
+                "experiment {} returned {} summaries for {expected_runs} completed runs",
+                validated.spec_id,
+                receipt.summaries.len()
+            )));
+        }
+        self.run_summaries = receipt.summaries;
         self.executed_spec_hashes.insert(validated.spec_id.clone());
         self.phase = LabPhase::Analyze;
         Ok(())
     }
 
-    /// Render a human-readable, reproducible notebook summary.
+    fn analyze(&mut self) -> Result<(), LabError> {
+        let validated = self
+            .validated_spec
+            .as_ref()
+            .ok_or_else(|| LabError::State("Analyze phase has no validated spec".to_owned()))?;
+        let started = std::time::Instant::now();
+        let analysis = match analyze_matched_seed_runs(
+            &self.run_summaries,
+            &validated.spec.metrics,
+            AnalysisParams::default(),
+        ) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                self.phase = LabPhase::Report;
+                return Err(LabError::Analysis(error));
+            }
+        };
+        tracing::info!(
+            spec_id = %validated.spec_id,
+            stage = "analyze",
+            inputs = self.run_summaries.len(),
+            effects = analysis.effects.len(),
+            correction = analysis.params.correction.as_str(),
+            alternative = analysis.params.alternative.as_str(),
+            bootstrap_iterations = analysis.params.bootstrap_iterations,
+            permutation_iterations = analysis.params.permutation_iterations,
+            resampling_seed = analysis.params.resampling_seed,
+            elapsed_micros = started.elapsed().as_micros(),
+            "matched-seed summaries analyzed by the canonical statistics authority"
+        );
+        self.analysis = Some(analysis);
+        self.phase = LabPhase::Report;
+        Ok(())
+    }
+
+    fn report(&mut self) -> Result<(), LabError> {
+        let (Some(validated), Some(analysis)) =
+            (self.validated_spec.as_ref(), self.analysis.as_ref())
+        else {
+            let reason = self
+                .failure_reason
+                .as_deref()
+                .unwrap_or("no validated statistical analysis was produced");
+            let rendered = format!(
+                "# ScriptBots Autonomous Science Lab Notebook\n\n\
+                 ## Outcome\n\
+                 No scientific result is available.\n\n\
+                 ## Typed Refusal\n\
+                 {reason}\n"
+            );
+            if let Some(root) = &self.notebook_root {
+                let report_id = self
+                    .proposal_id
+                    .as_deref()
+                    .unwrap_or("unvalidated-proposal");
+                let directory = root.join(report_id).join("notebook");
+                fs::create_dir_all(&directory).map_err(|error| {
+                    LabError::Notebook(NotebookRenderError::Io(error.to_string()))
+                })?;
+                let path = directory.join("notebook.md");
+                fs::write(&path, &rendered).map_err(|error| {
+                    LabError::Notebook(NotebookRenderError::Io(error.to_string()))
+                })?;
+                self.notebook_path = Some(path);
+            }
+            self.rendered_notebook = Some(rendered);
+            self.phase = LabPhase::Finished;
+            return Ok(());
+        };
+        let known_runs = run_refs(&self.run_summaries);
+        let claims = match claims_from_analysis(
+            analysis,
+            &self.run_summaries,
+            &validated.spec.hypothesis,
+            &validated.spec.falsifier,
+        ) {
+            Ok(claims) => claims,
+            Err(error) => {
+                self.phase = LabPhase::Finished;
+                return Err(LabError::Notebook(error));
+            }
+        };
+        let goal = format!(
+            "{}\n\n- Validated Spec ID: {}",
+            validated.spec.hypothesis, validated.spec_id
+        );
+        let rendered = match NotebookRenderer::render_markdown(&goal, &claims, &known_runs) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                self.phase = LabPhase::Finished;
+                return Err(LabError::Notebook(error));
+            }
+        };
+        if let Some(root) = &self.notebook_root {
+            let directory = root.join(&validated.spec_id).join("notebook");
+            let path = NotebookRenderer::render_notebook(
+                &validated.spec_id,
+                &goal,
+                &claims,
+                &known_runs,
+                &directory,
+            )
+            .map_err(LabError::Notebook)?;
+            self.notebook_path = Some(path);
+        }
+        tracing::info!(
+            spec_id = %validated.spec_id,
+            stage = "report",
+            effects = analysis.effects.len(),
+            notebook_bytes = rendered.len(),
+            "provenance-checked lab notebook rendered"
+        );
+        self.rendered_notebook = Some(rendered);
+        self.phase = LabPhase::Finished;
+        Ok(())
+    }
+
+    /// Return the completed report, or an explicitly provisional state summary.
     #[must_use]
     pub fn generate_notebook(&self) -> String {
+        if let Some(rendered) = &self.rendered_notebook {
+            return rendered.clone();
+        }
         let hypothesis = self
             .spec
             .as_ref()
@@ -482,23 +860,22 @@ impl LabStateMachine {
             "# ScriptBots Autonomous Science Lab Notebook\n\n\
              ## Hypothesis\n\
              {hypothesis}\n\n\
-             ## Provenance & Reproducibility\n\
+             ## Provisional State\n\
+             No completed statistical report has been rendered yet.\n\n\
              - Spec ID: {spec_id}\n\
              - Matched Seeds: {seeds}\n\
              - Ordered Arms: {arms}\n\
              - Runs Spent: {} / {}\n\
              - Ticks Spent: {} / {}\n\
-             - Iterations: {} / {}\n\n\
-             ```bash\n\
-             # reproduce.sh\n\
-             scriptbots-control experiment run --spec-id {spec_id}\n\
-             ```\n",
+             - Iterations: {} / {}\n\
+             - Failure: {}\n",
             self.runs_spent,
             self.budget.max_runs,
             self.ticks_spent,
             self.budget.max_ticks,
             self.iterations,
-            self.budget.max_iterations
+            self.budget.max_iterations,
+            self.failure_reason.as_deref().unwrap_or("none recorded")
         )
     }
 }
@@ -533,10 +910,42 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .push(spec.clone());
             let cost = spec.cost();
+            let mut summaries = Vec::new();
+            for (arm_index, arm) in spec.arms.iter().enumerate() {
+                let arm_id = u16::try_from(arm_index)
+                    .map_err(|_| "arm index does not fit u16".to_owned())?;
+                let config_digest =
+                    blake3::hash(&serde_json::to_vec(arm).map_err(|error| error.to_string())?)
+                        .to_hex()
+                        .to_string();
+                for &seed in &spec.seeds {
+                    let seed_component = u32::try_from(seed % 17)
+                        .map_err(|_| "bounded seed component does not fit u32".to_owned())?;
+                    let arm_component = u32::from(arm_id)
+                        .checked_mul(seed_component + 1)
+                        .ok_or_else(|| "synthetic test outcome overflowed u32".to_owned())?;
+                    let run_id = format!("{}-arm-{arm_id:03}-seed{seed}", spec.spec_id);
+                    summaries.push(RunSummary::from_verified_parts(
+                        run_id.clone(),
+                        arm_id,
+                        seed,
+                        config_digest.clone(),
+                        format!("digest-{arm_id}-{seed}"),
+                        spec.spec.ticks_per_run,
+                        BTreeMap::from([(
+                            "alive_agents".to_owned(),
+                            f64::from(100 + seed_component + arm_component),
+                        )]),
+                        format!("summary-{run_id}"),
+                        None,
+                    ));
+                }
+            }
             Ok(ExecutionReceipt {
                 runs: usize::try_from(cost.runs)
                     .map_err(|_| "run count does not fit usize".to_owned())?,
                 ticks: cost.ticks,
+                summaries,
             })
         }
     }
@@ -553,6 +962,21 @@ mod tests {
             "ticks_per_run": 2,
             "metrics": ["alive_agents"],
             "budget": {"runs": 4, "ticks": 8}
+        })
+    }
+
+    fn three_arm_input() -> serde_json::Value {
+        serde_json::json!({
+            "hypothesis": "faster food growth changes the final population",
+            "falsifier": "matched-seed final populations are unchanged",
+            "factors": [{
+                "knob_path": "food_growth_rate",
+                "values": [0.01, 0.02, 0.03]
+            }],
+            "seeds": {"base": 101, "count": 3},
+            "ticks_per_run": 2,
+            "metrics": ["alive_agents"],
+            "budget": {"runs": 9, "ticks": 18}
         })
     }
 
@@ -618,12 +1042,206 @@ mod tests {
         drop(recorded);
 
         assert_eq!(runner.step().expect("analysis"), LabPhase::Report);
+        let analysis = runner.analysis.as_ref().expect("analysis retained");
+        assert_eq!(analysis.effects.len(), 1);
+        assert_eq!(analysis.effects[0].metric, "alive_agents");
+        assert_eq!(runner.run_summaries.len(), 4);
         assert_eq!(runner.step().expect("report"), LabPhase::Finished);
         let notebook = runner.generate_notebook();
         assert!(notebook.contains("faster food growth"));
         assert!(notebook.contains(&validated.spec_id));
-        assert!(notebook.contains("Matched Seeds: [41, 42]"));
+        assert!(notebook.contains("Estimator**: paired_difference"));
+        assert!(notebook.contains("Correction**: benjamini_hochberg"));
+        assert!(notebook.contains("Matched Pairs**: 2"));
         assert!(notebook.contains("reproduce.sh"));
+        assert_eq!(runner.rendered_notebook.as_deref(), Some(notebook.as_str()));
+    }
+
+    #[test]
+    fn real_matched_seed_pipeline_is_byte_stable_and_data_responsive() {
+        let temp = tempfile::tempdir().expect("temporary experiment root");
+        let run_lab = |output_root: PathBuf| {
+            // The provider response is an offline canonical tool fixture; validation, world
+            // execution, bundle verification, statistics, and notebook materialization are real.
+            let client =
+                ScriptedClient::new("offline-scripted", vec![tool_turn(three_arm_input())]);
+            let mut lab = LabStateMachine::new(
+                Box::new(client),
+                LabBudget {
+                    max_runs: 9,
+                    max_ticks: 18,
+                    max_tokens: 1_000,
+                    max_iterations: 10,
+                },
+                output_root,
+            );
+            for expected in [
+                LabPhase::Validate,
+                LabPhase::Execute,
+                LabPhase::Analyze,
+                LabPhase::Report,
+                LabPhase::Finished,
+            ] {
+                assert_eq!(lab.step().expect("real lab transition"), expected);
+            }
+            lab
+        };
+        let first_lab = run_lab(temp.path().join("first"));
+        assert_eq!(first_lab.runs_spent, 9);
+        assert_eq!(first_lab.ticks_spent, 18);
+        assert_eq!(first_lab.run_summaries.len(), 9);
+        assert_eq!(
+            first_lab
+                .run_summaries
+                .iter()
+                .map(|summary| summary.config_digest.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            9,
+            "the authoritative executed-config digest must include each matched seed"
+        );
+        assert_eq!(
+            first_lab
+                .analysis
+                .as_ref()
+                .expect("analysis retained")
+                .effects
+                .len(),
+            2
+        );
+        let first = first_lab
+            .rendered_notebook
+            .as_ref()
+            .expect("notebook retained");
+        let notebook_path = first_lab
+            .notebook_path
+            .as_ref()
+            .expect("production report materialized");
+        assert_eq!(
+            fs::read_to_string(notebook_path).expect("materialized notebook readable"),
+            first.as_str()
+        );
+        let verifier = fs::read_to_string(
+            notebook_path
+                .parent()
+                .expect("notebook parent")
+                .join("reproduce.sh"),
+        )
+        .expect("retained evidence verifier");
+        assert!(verifier.contains("b3sum"));
+        assert!(verifier.contains("This does not re-run the simulation"));
+
+        let repeated_lab = run_lab(temp.path().join("repeated"));
+        assert_eq!(
+            repeated_lab.rendered_notebook.as_ref(),
+            Some(first),
+            "independent executions of the same seeds must produce a byte-stable report"
+        );
+
+        let validated = first_lab
+            .validated_spec
+            .as_ref()
+            .expect("validated spec retained");
+        let render = |summaries: &[RunSummary]| {
+            let analysis = analyze_matched_seed_runs(
+                summaries,
+                &validated.spec.metrics,
+                AnalysisParams::default(),
+            )
+            .expect("verified summaries analyze");
+            assert_eq!(analysis.effects.len(), 2);
+            let claims = claims_from_analysis(
+                &analysis,
+                summaries,
+                &validated.spec.hypothesis,
+                &validated.spec.falsifier,
+            )
+            .expect("analysis retains exact run provenance");
+            NotebookRenderer::render_markdown(
+                &validated.spec.hypothesis,
+                &claims,
+                &run_refs(summaries),
+            )
+            .expect("verified analysis renders")
+        };
+        let mut reordered = first_lab.run_summaries.clone();
+        reordered.reverse();
+        assert_eq!(
+            render(&reordered),
+            first.as_str(),
+            "input order must not change the scientific report"
+        );
+
+        let mut changed = first_lab.run_summaries.clone();
+        let treatment_index = changed
+            .iter()
+            .position(|summary| summary.arm_id == 1)
+            .expect("treatment run");
+        let treatment = &changed[treatment_index];
+        let mut changed_metrics = treatment.metrics.clone();
+        *changed_metrics
+            .get_mut("alive_agents")
+            .expect("reported metric") += 1.0;
+        changed[treatment_index] = RunSummary::from_verified_parts(
+            treatment.run_id.clone(),
+            treatment.arm_id,
+            treatment.seed,
+            treatment.config_digest.clone(),
+            blake3::hash(b"independently changed world fixture")
+                .to_hex()
+                .to_string(),
+            treatment.ticks,
+            changed_metrics,
+            blake3::hash(b"independently changed verified summary fixture")
+                .to_hex()
+                .to_string(),
+            None,
+        );
+        assert_ne!(
+            render(&changed),
+            first.as_str(),
+            "a changed observed outcome must change the report"
+        );
+    }
+
+    #[test]
+    fn analysis_ingestion_rejects_a_summary_changed_after_bundle_verification() {
+        let proposed: ExperimentSpec =
+            serde_json::from_value(valid_input()).expect("canonical proposal");
+        let validated = validate_spec(&proposed, SpecBudget { runs: 4, ticks: 8 })
+            .expect("bounded proposal validates");
+        let temp = tempfile::tempdir().expect("temporary experiment root");
+        MatchedSeedExecutor::new(temp.path())
+            .execute(&validated)
+            .expect("real bundle cohort");
+        let status_path = temp.path().join(&validated.spec_id).join("status.json");
+        let status: ExperimentBatchStatus = serde_json::from_slice(
+            &fs::read(&status_path).expect("completed status remains readable"),
+        )
+        .expect("completed status schema");
+        let summary_path = PathBuf::from(
+            status.runs[0]
+                .bundle_path
+                .as_ref()
+                .expect("completed run bundle"),
+        )
+        .join("exports/summary.csv");
+        let summary = fs::read_to_string(&summary_path).expect("summary fixture");
+        let mut lines = summary.lines();
+        let header = lines.next().expect("summary header");
+        let row = lines.next().expect("summary row");
+        let mut cells = row.split(',').map(str::to_owned).collect::<Vec<_>>();
+        let alive = cells[1].parse::<u32>().expect("alive count");
+        cells[1] = alive.saturating_add(1).to_string();
+        fs::write(&summary_path, format!("{header}\n{}\n", cells.join(",")))
+            .expect("deliberate post-verification mutation");
+
+        let error = completed_run_summaries(&validated, &status)
+            .expect_err("artifact mutation must fail closed");
+        assert!(
+            error.contains("no longer matches its verified bundle artifact entry"),
+            "unexpected refusal: {error}"
+        );
     }
 
     #[test]
@@ -673,6 +1291,12 @@ mod tests {
             runner.step().expect("report terminates"),
             LabPhase::Finished
         );
+        let report = runner
+            .rendered_notebook
+            .as_deref()
+            .expect("typed refusal report retained");
+        assert!(report.contains("No scientific result is available"));
+        assert!(report.contains("experiment proposal failed validation"));
     }
 
     #[test]
