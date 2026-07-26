@@ -23,7 +23,12 @@ pub enum InfoTheoryError {
     #[error(
         "circular-shift surrogate needs at least {need} samples to form a non-degenerate shift, have {samples}"
     )]
-    SurrogateInfeasible { samples: usize, need: usize },
+    SurrogateInfeasible {
+        /// Series length that was offered.
+        samples: usize,
+        /// Shortest length admitting a non-degenerate circular shift.
+        need: usize,
+    },
     #[error("non-finite value encountered in input series")]
     NonFiniteInput,
 }
@@ -252,6 +257,9 @@ pub const SURROGATE_IDENTITY: &str = "circular-shift";
 ///
 /// Mirrors [`discretize`], which clamps to that closed interval and splits it evenly. Reported on
 /// every estimate so a stored record stays interpretable if the binning strategy ever changes.
+// Bin counts are capped at MAX_ESTIMATOR_BINS and series lengths are far below 2^52, so every
+// cast here is exact.
+#[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn uniform_bin_edges(bins: usize) -> Vec<f64> {
     (0..=bins).map(|i| i as f64 / bins as f64).collect()
@@ -268,6 +276,8 @@ pub fn uniform_bin_edges(bins: usize) -> Vec<f64> {
 ///
 /// A constant series has no autocorrelation structure to respect -- every shift is equivalent --
 /// so it reports lag 1 rather than dividing by a zero variance.
+// Series lengths are far below 2^52, so the length casts below are exact.
+#[allow(clippy::cast_precision_loss)]
 fn decorrelation_lag(series: &[f64], max_lag: usize) -> usize {
     let n = series.len();
     if n < 3 || max_lag == 0 {
@@ -735,7 +745,7 @@ mod tests {
     /// the surrogate still carrying the dependence the null is supposed to remove.
     #[test]
     fn bd_r4ja_decorrelation_lag_is_longer_for_a_correlated_series_than_for_noise() {
-        let mut rng = SmallRngStream::seed_from_u64(0x0FF1_CE);
+        let mut rng = SmallRngStream::seed_from_u64(0x000F_F1CE);
         let noise: Vec<f64> = (0..400).map(|_| rng.random_range(0.0..1.0)).collect();
 
         // A slow triangular sweep: adjacent samples are nearly identical, so the autocorrelation
