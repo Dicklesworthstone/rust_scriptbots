@@ -2977,7 +2977,14 @@ mod tests {
         );
     }
 
-    // --- bd-grbc provisional surface ---------------------------------------------------
+    // --- bd-grbc settled surface -------------------------------------------------------
+    //
+    // These cover the orientation contract and the world-space terrain sampler. Both were
+    // offered as proposals and have since been adopted by real consumers, so the surface is
+    // settled, not provisional: scriptbots-world-gfx::AgentInstance takes `heading` straight
+    // from `facing`, and scriptbots-render calls `splat_weights` / `TerrainFieldView` /
+    // `sample_corners` on its live paths. The tests below are therefore a contract, not a
+    // sketch — changing what they assert changes what those consumers already rely on.
 
     /// Orientation must be ONE stated convention, not something each renderer re-derives.
     #[test]
