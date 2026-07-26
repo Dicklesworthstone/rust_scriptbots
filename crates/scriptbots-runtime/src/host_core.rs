@@ -5413,6 +5413,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn archived_idempotency_bound_is_invariant_under_long_unique_control_churn() {
+        for retention in [1_usize, 2, 7, 32] {
+            let mut host_options = options(true);
+            host_options.archived_command_capacity = retention;
+            let mut core = HostCore::new(
+                HostSessionId::new(
+                    0x9a00 + u64::try_from(retention).expect("retention fits the session id"),
+                ),
+                world(0),
+                host_options,
+            )
+            .expect("long-churn bounded-idempotency host");
+            let mut port = core.local_port();
+            let unique_commands = retention
+                .checked_mul(128)
+                .and_then(|count| count.checked_add(257))
+                .expect("bounded test command count");
+
+            for ordinal in 1..=unique_commands {
+                let command_id =
+                    u128::try_from(ordinal).expect("bounded command ordinal fits u128");
+                submit(&mut port, command_id, HostCommand::Pause);
+                let boundary = u64::try_from(ordinal)
+                    .expect("bounded command ordinal fits the manual clock")
+                    .checked_mul(2)
+                    .expect("manual clock boundary does not overflow");
+                core.drive(ManualInstant::from_nanos(boundary))
+                    .expect("control command application boundary");
+                core.drive(ManualInstant::from_nanos(boundary + 1))
+                    .expect("control command archival boundary");
+
+                let shared = core.shared.borrow();
+                let expected_retained = ordinal.min(retention);
+                assert!(
+                    shared.commands.is_empty(),
+                    "terminal command {ordinal} escaped archival at retention {retention}"
+                );
+                assert_eq!(
+                    shared.archived_idempotency.len(),
+                    expected_retained,
+                    "archived authority exceeded retention {retention} after {ordinal} unique ids"
+                );
+                assert_eq!(shared.archived_order.len(), expected_retained);
+            }
+
+            let shared = core.shared.borrow();
+            assert!(
+                !shared.archived_idempotency.contains_key(&CommandId::new(1)),
+                "oldest id survived churn far beyond retention {retention}"
+            );
+            assert!(
+                shared.archived_idempotency.contains_key(&CommandId::new(
+                    u128::try_from(unique_commands).expect("bounded command count fits u128")
+                )),
+                "newest id was not retained at retention {retention}"
+            );
+        }
+    }
+
     struct ScriptedCommandAuthority {
         outcomes: Mutex<HashMap<CommandId, VecDeque<CommandAuthorityLookup>>>,
     }
