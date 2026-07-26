@@ -37,4 +37,9 @@ winit = { version = "0.30.12", default-features = false, features = ["rwh_06", "
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+# bd-2z0.7.11: parse+validate the WGSL sources in tests. Dev-only — the shaders
+# ship as source and are compiled by wgpu at pipeline creation, so this buys a
+# compile-time gate without adding anything to the shipped binary. Same version
+# as scriptbots-render already uses, so no new lock entry.
+naga = { version = "27" }
 wgpu = { version = "27", default-features = false, features = ["noop"] }

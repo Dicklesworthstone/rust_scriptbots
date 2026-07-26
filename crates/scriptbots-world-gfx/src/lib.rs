@@ -1105,6 +1105,65 @@ mod tests {
         visual::{self, SplatInput, TerrainSurfaceInput},
     };
 
+    /// Every shipped WGSL source must parse and pass naga semantic validation.
+    ///
+    /// These four shaders are compiled by wgpu at PIPELINE CREATION, on a real
+    /// adapter — so until now a syntax or type error in any of them could only
+    /// be discovered by running the GPU product on a machine with a working
+    /// backend. That is the most expensive possible place to find it, and it is
+    /// unreachable from CI, from the software lane, and from every agent
+    /// working without a GPU.
+    ///
+    /// `scriptbots-bevy` already gates its particle shader this way
+    /// (`wgsl_source_compiles_and_validates_with_naga`); world-gfx, which owns
+    /// the actual world render path, had no equivalent.
+    ///
+    /// This matters directly for the remaining bd-2z0.7.11 work: the agent
+    /// ornament colours still authored inside `AGENTS_WGSL` have to be rerouted
+    /// through the core `AgentVisualParams` authority, and editing a shader that
+    /// nothing can validate is how that lands broken.
+    #[test]
+    fn every_world_gfx_wgsl_source_parses_and_validates() {
+        for (name, source) in [
+            ("TERRAIN_WGSL", super::TERRAIN_WGSL),
+            ("AGENTS_WGSL", super::AGENTS_WGSL),
+            ("POST_WGSL", super::POST_WGSL),
+            ("BLOOM_WGSL", super::BLOOM_WGSL),
+        ] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|error| panic!("{name} must parse as valid WGSL: {error}"));
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            );
+            validator
+                .validate(&module)
+                .unwrap_or_else(|error| panic!("{name} must pass naga validation: {error}"));
+        }
+    }
+
+    /// The shaders must not be empty or accidentally truncated.
+    ///
+    /// A raw string that lost its body still parses as a valid empty module and
+    /// would sail through validation above, so the parse gate alone cannot tell
+    /// "compiles" from "compiles because there is nothing left".
+    #[test]
+    fn every_world_gfx_wgsl_source_declares_entry_points() {
+        for (name, source) in [
+            ("TERRAIN_WGSL", super::TERRAIN_WGSL),
+            ("AGENTS_WGSL", super::AGENTS_WGSL),
+            ("POST_WGSL", super::POST_WGSL),
+            ("BLOOM_WGSL", super::BLOOM_WGSL),
+        ] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|error| panic!("{name} must parse: {error}"));
+            assert!(
+                !module.entry_points.is_empty(),
+                "{name} declares no entry point, so nothing it contains can ever run"
+            );
+        }
+    }
+
     #[test]
     fn stride_alignment_is_multiple_of_256() {
         let widths = [1u32, 2, 63, 64, 65, 257, 1023, 1920, 2560, 3840];
