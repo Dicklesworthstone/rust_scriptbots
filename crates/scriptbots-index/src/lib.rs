@@ -155,13 +155,14 @@ impl UniformGridIndex {
         }
     }
 
-    #[cfg(test)]
     #[inline]
-    const fn wrap(value: i32, max: i32) -> i32 {
+    #[allow(clippy::cast_possible_truncation)]
+    fn wrap(value: i64, max: i32) -> i32 {
         if max <= 0 {
             return 0;
         }
-        ((value % max) + max) % max
+        // A positive i32 modulus bounds the remainder to 0..=i32::MAX - 1.
+        value.rem_euclid(i64::from(max)) as i32
     }
 
     /// Minimum-image delta between two coordinates on a toroidal axis of the given extent.
@@ -224,11 +225,7 @@ impl UniformGridIndex {
 
     #[inline]
     fn advance_cell(start: i32, offset: i32, cells: i32) -> i32 {
-        if cells <= 0 {
-            return 0;
-        }
-        let cell = (i64::from(start) + i64::from(offset)).rem_euclid(i64::from(cells));
-        i32::try_from(cell).unwrap_or(0)
+        Self::wrap(i64::from(start) + i64::from(offset), cells)
     }
 
     #[inline]
@@ -949,5 +946,39 @@ mod tests {
     fn wrap_zero_max_does_not_panic() {
         assert_eq!(UniformGridIndex::wrap(5, 0), 0);
         assert_eq!(UniformGridIndex::wrap(5, -10), 0);
+    }
+
+    #[test]
+    fn wrap_is_in_bounds_for_extreme_values_and_moduli() {
+        for max in [1, 2, 3, 17, i32::MAX] {
+            for value in [
+                i64::MIN,
+                i64::from(i32::MIN),
+                -17,
+                -1,
+                0,
+                1,
+                17,
+                i64::from(i32::MAX),
+                i64::MAX,
+            ] {
+                let wrapped = UniformGridIndex::wrap(value, max);
+                assert!(
+                    (0..max).contains(&wrapped),
+                    "wrap({value}, {max}) returned out-of-range value {wrapped}"
+                );
+                assert_eq!(i64::from(wrapped), value.rem_euclid(i64::from(max)));
+            }
+        }
+    }
+
+    #[test]
+    fn rebuild_and_query_support_i32_max_cell_modulus() {
+        let positions = [(2_147_483_392.0, 0.5)];
+        let index = build_index(1.0, 2_147_483_648.0, 1.0, &positions);
+
+        assert_eq!(index.cells_x, i32::MAX);
+        assert_eq!(index.agent_cells, vec![(2_147_483_392, 0)]);
+        assert_eq!(bucket_candidates(&index, 0, 512.0), HashSet::from([0]));
     }
 }
