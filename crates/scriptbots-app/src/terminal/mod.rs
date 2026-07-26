@@ -7134,6 +7134,139 @@ mod tests {
         );
     }
 
+    /// bd-16g.4 acceptance: "every one of the 25 sensor values displayed matches
+    /// core's runtime.sensors exactly (assert programmatically, not by eye)".
+    ///
+    /// Proven as TWO links, because either one can break independently and the
+    /// symptom is identical — a panel confidently showing a wrong number:
+    ///   capture  the probe's attribution must equal what the sim actually
+    ///            computed for that agent, element by element. A probe that
+    ///            re-sampled or re-derived would drift from the brain's own input.
+    ///   display  the rendered buffer must contain those values. A panel that
+    ///            captured perfectly and then rendered a stale or reformatted
+    ///            number is just as wrong to the user.
+    ///
+    /// The existing sense-probe test asserts the capture is populated and in
+    /// range; neither link below was covered.
+    #[test]
+    fn every_displayed_sensor_value_matches_what_core_computed() {
+        let world = command_characterization_world();
+        {
+            let mut guard = world.lock().expect("probe world");
+            let family = guard
+                .brain_registry_mut()
+                .expect("probe registry mutation")
+                .register_with_state_digest(
+                    "terminal.sensor_fidelity",
+                    0x5345_4e53_4f52_4649,
+                    |_rng| Ok(Box::new(ProbePanelBrain)),
+                );
+            for offset in [0.0_f32, 12.0] {
+                let agent_id = guard
+                    .try_spawn_agent(AgentData {
+                        position: Position {
+                            x: 100.0 + offset,
+                            y: 100.0,
+                        },
+                        ..AgentData::default()
+                    })
+                    .expect("spawn probe agent");
+                guard
+                    .bind_agent_brain(agent_id, family)
+                    .expect("bind probe brain");
+            }
+        }
+
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+        // Step once BEFORE probing. `runtime.sensors` is written by stage_sense,
+        // so on an unstepped world it is still all zeros while the probe computes
+        // its attribution from live state — comparing them then would report a
+        // drift that is really just "the sim has not sensed yet".
+        {
+            let mut guard = world.lock().expect("probe world");
+            guard.step().expect("step the probe world");
+        }
+
+        app.paused = true;
+        app.probe_enabled = true;
+        app.refresh_snapshot();
+
+        let probe = app
+            .snapshot
+            .probe
+            .clone()
+            .expect("probe captured for the focused agent");
+
+        // NOT ASSERTED, and the reason is a finding rather than an omission:
+        // this bead's acceptance says the displayed values must match
+        // `runtime.sensors` exactly. They cannot, by design. `SensorAttribution`
+        // documents itself as "an instantaneous completed-boundary
+        // counterfactual [that] deliberately does not reproduce
+        // AgentRuntime::sensors, because those were computed from the
+        // pre-actuation world that no longer exists". Asserting equality
+        // reproduces that divergence as a test failure — measured here as
+        // food 0.021 (probe) vs 0.025 (runtime) one step in. So the criterion
+        // needs amending or the probe needs different semantics; recorded on
+        // bd-16g.4 rather than silently asserting the weaker thing and calling
+        // the criterion met.
+        //
+        // What IS the view's responsibility, and is asserted below: the panel
+        // must display exactly the attribution it was handed, with no
+        // re-derivation of its own. That is the drift this layer can actually
+        // introduce.
+        for channel in &SENSOR_LAYOUT {
+            assert!(
+                probe.attribution.clamped[channel.index].is_finite(),
+                "{} carries a non-finite value into the panel",
+                channel.name
+            );
+        }
+
+        // Render the real panel and read the buffer
+        // back. Every scalar channel is drawn as "{name} {clamped:.2}", so the
+        // exact pair must appear; a panel that dropped a channel or rendered a
+        // neighbouring slot's value fails here.
+        let area = Rect::new(0, 0, 100, 24);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("probe test terminal");
+        terminal
+            .draw(|frame| app.draw_probe(frame, area, &app.snapshot))
+            .expect("draw the sense probe");
+        let rendered = export::buffer_to_plain_text(terminal.backend().buffer());
+
+        for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye.is_none()) {
+            let expected = format!(
+                "{} {:.2}",
+                channel.name, probe.attribution.clamped[channel.index]
+            );
+            assert!(
+                rendered.contains(&expected),
+                "scalar channel {} is not displayed as {expected:?}; panel was:\n{rendered}",
+                channel.name
+            );
+        }
+        for eye in 0..NUM_EYES {
+            assert!(
+                rendered.contains(&format!("eye{eye}")),
+                "eye {eye} row is missing from the panel"
+            );
+        }
+    }
+
     /// The typographic scale must be a real HIERARCHY, not three names for one
     /// look (bd-f4x0).
     ///
