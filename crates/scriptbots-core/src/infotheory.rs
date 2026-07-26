@@ -52,8 +52,31 @@ pub struct MiEstimate {
     pub n: usize,
     /// Number of uniform discretization bins.
     pub bins: usize,
-    /// Identifier of the estimator used ("miller-madow").
+    /// Base estimator identity, before any bias correction ("plug-in").
     pub estimator: &'static str,
+    /// Bias correction applied on top of the base estimator ("miller-madow").
+    ///
+    /// Reported separately from [`Self::estimator`] because they are independent choices: a
+    /// consumer comparing two estimates has to know both, and "miller-madow" in a single field
+    /// cannot say whether the plug-in value was corrected or merely labelled (bd-r4ja).
+    pub correction: &'static str,
+    /// Which null the p-value was tested against ("circular-shift").
+    ///
+    /// This module previously substituted an i.i.d. shuffle for short series without telling the
+    /// caller, which silently changed what the p-value meant. Recording the null makes that
+    /// guarantee auditable from the record instead of from the source (bd-r4ja).
+    pub surrogate_kind: &'static str,
+    /// Seed that generated the surrogate and bootstrap draws.
+    ///
+    /// Without it the p-value and confidence interval are not reproducible from the report, and
+    /// two estimates that differ only by seed are indistinguishable (bd-r4ja).
+    pub surrogate_seed: u64,
+    /// The `bins + 1` uniform bin boundaries the discretization used.
+    ///
+    /// Derivable from `bins` today, and reported anyway: `bins` alone cannot distinguish this
+    /// binning from a future non-uniform or data-driven one, and a comparison across that change
+    /// would be silently wrong (bd-r4ja).
+    pub bin_edges: Vec<f64>,
     /// Surrogate null distribution statistics.
     pub surrogate: SurrogateStats,
     /// p-value against the circular time-shift surrogate null.
@@ -77,6 +100,19 @@ pub struct TeEstimate {
     pub n: usize,
     /// Number of discretization bins.
     pub bins: usize,
+    /// Base estimator identity, before any bias correction ("plug-in").
+    ///
+    /// Transfer entropy reported no estimator identity at all, while mutual information reported
+    /// one -- an asymmetry with no justification, since both go through Miller-Madow (bd-r4ja).
+    pub estimator: &'static str,
+    /// Bias correction applied on top of the base estimator ("miller-madow").
+    pub correction: &'static str,
+    /// Which null the p-value was tested against ("circular-shift").
+    pub surrogate_kind: &'static str,
+    /// Seed that generated the surrogate and bootstrap draws.
+    pub surrogate_seed: u64,
+    /// The `bins + 1` uniform bin boundaries the discretization used.
+    pub bin_edges: Vec<f64>,
     /// Surrogate null distribution statistics.
     pub surrogate: SurrogateStats,
     /// p-value against the surrogate null.
@@ -193,6 +229,28 @@ pub const MIN_CIRCULAR_SURROGATE_SAMPLES: usize = 3;
 /// ceiling matches [`compute_mi`]'s existing `2..=32` contract, keeping the worst case at
 /// `32^3 = 32768` cells, and it must be enforced BEFORE the allocation, not after.
 pub const MAX_ESTIMATOR_BINS: usize = 32;
+
+/// Base estimator identity reported by both [`compute_mi`] and [`compute_te`] (bd-r4ja).
+pub const ESTIMATOR_IDENTITY: &str = "plug-in";
+
+/// Bias correction identity reported by both [`compute_mi`] and [`compute_te`] (bd-r4ja).
+pub const CORRECTION_IDENTITY: &str = "miller-madow";
+
+/// Null-distribution identity reported by both estimators (bd-r4ja).
+///
+/// There is exactly one null now. The i.i.d.-shuffle branch that used to replace it for short
+/// series was removed in favour of an explicit refusal, so this constant is a guarantee rather
+/// than a label on a branch.
+pub const SURROGATE_IDENTITY: &str = "circular-shift";
+
+/// The `bins + 1` boundaries of the uniform discretization over `[0.0, 1.0]` (bd-r4ja).
+///
+/// Mirrors [`discretize`], which clamps to that closed interval and splits it evenly. Reported on
+/// every estimate so a stored record stays interpretable if the binning strategy ever changes.
+#[must_use]
+pub fn uniform_bin_edges(bins: usize) -> Vec<f64> {
+    (0..=bins).map(|i| i as f64 / bins as f64).collect()
+}
 
 /// Computes discretized bin index for `v` in `[0.0, 1.0]` over `bins`.
 #[must_use]
@@ -339,7 +397,11 @@ pub fn compute_mi(
         bits_corrected: corrected,
         n,
         bins: b,
-        estimator: "miller-madow",
+        estimator: ESTIMATOR_IDENTITY,
+        correction: CORRECTION_IDENTITY,
+        surrogate_kind: SURROGATE_IDENTITY,
+        surrogate_seed: params.seed,
+        bin_edges: uniform_bin_edges(b),
         surrogate: surrogate_stats,
         p_value,
         ci_lo,
@@ -525,6 +587,11 @@ pub fn compute_te(
         te_bits,
         n,
         bins: b,
+        estimator: ESTIMATOR_IDENTITY,
+        correction: CORRECTION_IDENTITY,
+        surrogate_kind: SURROGATE_IDENTITY,
+        surrogate_seed: params.seed,
+        bin_edges: uniform_bin_edges(b),
         surrogate: surrogate_stats,
         p_value,
         ci_lo,
@@ -608,6 +675,61 @@ mod tests {
             "Copy channel 2 symbols should be ~1 bit, got {}",
             est.bits_corrected
         );
+    }
+
+    /// Both estimators must report enough provenance to reproduce and compare their own output:
+    /// which estimator, which correction, which null, which seed, and which bin edges (bd-r4ja).
+    #[test]
+    fn bd_r4ja_both_estimators_report_their_full_identity() {
+        let series: Vec<f64> = (0..96).map(|i| f64::from(i % 11) / 11.0).collect();
+        let other: Vec<f64> = (0..96).map(|i| f64::from((i * 3) % 7) / 7.0).collect();
+        let params = MiParams {
+            bins: 4,
+            surrogate_runs: 4,
+            bootstrap_runs: 4,
+            seed: 0xABCD_1234,
+        };
+
+        let mi = compute_mi(&series, &other, &params).expect("mi");
+        let te = compute_te(&series, &other, &params).expect("te");
+
+        for (label, estimator, correction, surrogate_kind, seed, edges) in [
+            (
+                "mi",
+                mi.estimator,
+                mi.correction,
+                mi.surrogate_kind,
+                mi.surrogate_seed,
+                &mi.bin_edges,
+            ),
+            (
+                "te",
+                te.estimator,
+                te.correction,
+                te.surrogate_kind,
+                te.surrogate_seed,
+                &te.bin_edges,
+            ),
+        ] {
+            assert_eq!(estimator, ESTIMATOR_IDENTITY, "{label} estimator identity");
+            assert_eq!(
+                correction, CORRECTION_IDENTITY,
+                "{label} correction identity"
+            );
+            assert_eq!(
+                surrogate_kind, SURROGATE_IDENTITY,
+                "{label} must name the null its p-value was tested against"
+            );
+            assert_eq!(
+                seed, 0xABCD_1234,
+                "{label} must report the seed that produced its surrogate and bootstrap draws"
+            );
+            assert_eq!(
+                edges,
+                &vec![0.0, 0.25, 0.5, 0.75, 1.0],
+                "{label} must report the actual bin boundaries, not just the bin count"
+            );
+        }
     }
 
     /// Transfer entropy cubes the bin count into a dense histogram, so the count must be
