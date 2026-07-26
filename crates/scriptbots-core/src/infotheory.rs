@@ -738,6 +738,95 @@ mod tests {
         );
     }
 
+    /// Two independent AR(1) processes, normalized to `[0, 1]`.
+    ///
+    /// Strong autocorrelation (rho = 0.95) makes both series smooth, which inflates the plug-in
+    /// mutual information between them even though they share no information at all. That gap
+    /// between "looks related" and "is related" is the whole point of the trap.
+    fn independent_ar1_pair(n: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+        let mut rng = SmallRngStream::seed_from_u64(seed);
+        let mut e = vec![0.0f64; n];
+        let mut r = vec![0.0f64; n];
+        for t in 1..n {
+            e[t] = 0.95f64.mul_add(e[t - 1], 0.05 * rng.random_range(-1.0..1.0));
+            r[t] = 0.95f64.mul_add(r[t - 1], 0.05 * rng.random_range(-1.0..1.0));
+        }
+        let normalize = |series: &mut Vec<f64>| {
+            let lo = series.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = series.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            for v in series.iter_mut() {
+                *v = (*v - lo) / (hi - lo);
+            }
+        };
+        normalize(&mut e);
+        normalize(&mut r);
+        (e, r)
+    }
+
+    /// The i.i.d.-shuffle null calls independent AR(1) series significant; the circular-shift null
+    /// does not. This is why the shuffle fallback was removed (bd-r4ja).
+    ///
+    /// `test_autocorrelation_trap_circular_vs_iid` asserts only that the circular null behaves.
+    /// It never demonstrates the failure it is named for, so nothing in the suite showed what the
+    /// removed fallback actually did wrong. This reconstructs that null in test code -- the only
+    /// place it should ever exist again -- and measures the anti-conservatism directly.
+    #[test]
+    fn bd_r4ja_iid_shuffle_null_manufactures_significance_the_circular_null_avoids() {
+        let n = 2000;
+        let bins = 8;
+        let (e, r) = independent_ar1_pair(n, 888);
+        let params = MiParams {
+            bins,
+            surrogate_runs: 100,
+            bootstrap_runs: 20,
+            seed: 777,
+        };
+
+        let est = compute_mi(&e, &r, &params).expect("independent AR(1) pair");
+
+        // The trap's premise: the point estimate is visibly positive despite true independence.
+        assert!(
+            est.bits_corrected > 0.0,
+            "smooth series should show spurious plug-in dependence, got {}",
+            est.bits_corrected
+        );
+
+        // The forbidden null, rebuilt here solely to show why it is forbidden.
+        let (_, observed) = calc_mi_mm(&e, &r, bins);
+        let mut shuffle_rng = SmallRngStream::seed_from_u64(params.seed);
+        let mut shuffled = e.clone();
+        let runs = 100usize;
+        let mut ge = 0usize;
+        for _ in 0..runs {
+            for i in (1..n).rev() {
+                let j = shuffle_rng.random_range(0..=i);
+                shuffled.swap(i, j);
+            }
+            let (_, surrogate) = calc_mi_mm(&shuffled, &r, bins);
+            if surrogate >= observed {
+                ge += 1;
+            }
+        }
+        let shuffle_p = (1.0 + ge as f64) / (runs as f64 + 1.0);
+
+        assert!(
+            shuffle_p < 0.05,
+            "the i.i.d. shuffle null must (wrongly) call these independent series significant; \
+             if it does not, this fixture no longer demonstrates the trap. got {shuffle_p}"
+        );
+        assert!(
+            est.p_value >= 0.05,
+            "the circular-shift null must not call independent AR(1) series significant, got {}",
+            est.p_value
+        );
+        assert!(
+            est.p_value > shuffle_p,
+            "circular p={} must exceed shuffle p={shuffle_p}: destroying autocorrelation narrows \
+             the null and inflates significance",
+            est.p_value
+        );
+    }
+
     /// Midpoint of bin `k` under [`discretize`], so a fixture lands in the bin it intends.
     fn bin_center(k: usize, bins: usize) -> f64 {
         (k as f64 + 0.5) / bins as f64
