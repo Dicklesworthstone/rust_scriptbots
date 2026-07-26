@@ -170,7 +170,14 @@ cargo test --workspace
 cargo test --workspace -- --nocapture
 
 # Run tests for a specific crate
-cargo test -p scriptbots-core
+#
+# scriptbots-core: use --features economy-faults (bd-dz37). The economy fault-injection
+# machinery is gated on that feature alone. It used to be reachable via
+# cfg(any(test, feature = "economy-faults")), which gave every test build a `fault` field on
+# ResourceLedgerState that production does not have — the tested binary was structurally not
+# the shipped one. Without the feature, the bd-16g.11.2 mutation suite does not compile in and
+# therefore does not run.
+cargo test -p scriptbots-core --features economy-faults
 cargo test -p scriptbots-brain
 cargo test -p scriptbots-brain-ml
 cargo test -p scriptbots-brain-neuro

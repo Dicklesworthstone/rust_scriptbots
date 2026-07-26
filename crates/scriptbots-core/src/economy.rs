@@ -33,7 +33,7 @@
 )]
 #![allow(clippy::float_cmp, clippy::while_float)]
 
-#[cfg(any(test, feature = "economy-faults"))]
+#[cfg(feature = "economy-faults")]
 use crate::LedgerFault;
 use crate::{RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick, Tick};
 use serde::{Deserialize, Serialize};
@@ -1329,6 +1329,7 @@ mod tests {
     /// by at least one injectable fault. Add a category without adding a fault
     /// and the length check below fails the build; remove a fault's coverage
     /// and the per-category check fails the test.
+    #[cfg(feature = "economy-faults")]
     const KIND_TO_FAULTS: [&[LedgerFault]; CATEGORY_COUNT] = [
         &[LedgerFault::DropInterventionPosting], // ScenarioIntervention
         &[LedgerFault::MislabelSunlightAsTransfer], // FoodDynamics
@@ -1359,6 +1360,9 @@ mod tests {
         ], // CapacityRejection
     ];
 
+    // bd-dz37: the fault machinery is feature-gated, so the tests that drive it are too. Run with
+    // --features economy-faults; a bare `cargo test` no longer compiles LedgerFault at all.
+    #[cfg(feature = "economy-faults")]
     #[test]
     fn every_flow_category_is_exercised_by_at_least_one_fault() {
         assert_eq!(KIND_TO_FAULTS.len(), CATEGORY_COUNT, "compile-time length");

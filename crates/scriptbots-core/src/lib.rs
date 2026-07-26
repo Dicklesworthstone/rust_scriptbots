@@ -5403,10 +5403,14 @@ struct WorkingResourceLedger {
 
 /// Injectable economy faults for the conservation gate's mutation suite
 /// (bd-16g.11.2). Each variant reproduces one historical shape of economy bug;
-/// every one MUST turn the gate red. Available only in tests or with the
-/// `economy-faults` feature — production code paths keep one shape and consult
-/// a cheap `Option`.
-#[cfg(any(test, feature = "economy-faults"))]
+/// every one MUST turn the gate red.
+///
+/// Gated on the `economy-faults` feature ALONE (bd-dz37). It previously also admitted `test`, via
+/// `cfg(any(test, feature = "economy-faults"))`, which put the `fault` field on
+/// `ResourceLedgerState` and its branches into method bodies for every test build — so the binary
+/// the tests exercised was structurally not the binary that ships. One axis, not two: enable the
+/// feature to get the machinery, in tests and in production alike.
+#[cfg(feature = "economy-faults")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerFault {
     /// The agent is credited twice for one intake.
@@ -5450,7 +5454,7 @@ pub enum LedgerFault {
     CorruptGiveTransfer,
 }
 
-#[cfg(any(test, feature = "economy-faults"))]
+#[cfg(feature = "economy-faults")]
 impl LedgerFault {
     /// Every injectable fault, for the mutation suite's table drive.
     pub const ALL: [Self; 17] = [
@@ -5479,7 +5483,7 @@ struct ResourceLedgerState {
     enabled: bool,
     working: Option<WorkingResourceLedger>,
     report: ResourceLedgerReport,
-    #[cfg(any(test, feature = "economy-faults"))]
+    #[cfg(feature = "economy-faults")]
     fault: Option<LedgerFault>,
 }
 
@@ -5510,7 +5514,7 @@ impl ResourceLedgerState {
         #[allow(unused_mut)] mut delta: ResourceAmounts,
         activity: ResourceAmounts,
     ) {
-        #[cfg(any(test, feature = "economy-faults"))]
+        #[cfg(feature = "economy-faults")]
         if let Some(fault) = self.fault {
             use ResourceFlowKind as K;
             match fault {
@@ -5668,9 +5672,9 @@ impl ResourceLedgerState {
         // inspectable in the report.
         #[cfg(debug_assertions)]
         {
-            #[cfg(any(test, feature = "economy-faults"))]
+            #[cfg(feature = "economy-faults")]
             let fault_installed = self.fault.is_some();
-            #[cfg(not(any(test, feature = "economy-faults")))]
+            #[cfg(not(feature = "economy-faults"))]
             let fault_installed = false;
             let unexplained = reconciliation.unexplained_delta;
             let tick = working.tick;
@@ -18470,7 +18474,7 @@ impl WorldState {
         let spike_growth = self.config.spike_growth_rate.max(0.0);
         let movement_drain = self.config.movement_drain;
         let metabolism_drain = self.config.metabolism_drain;
-        #[cfg(any(test, feature = "economy-faults"))]
+        #[cfg(feature = "economy-faults")]
         let ledger_fault = self.current_ledger_fault();
         let ramp_floor = self.config.metabolism_ramp_floor;
         let ramp_rate = self.config.metabolism_ramp_rate;
@@ -18555,7 +18559,7 @@ impl WorldState {
 
                     let movement_penalty = movement_drain * locomotion.wheel_effort;
                     let mut drain = metabolism_drain + movement_penalty;
-                    #[cfg(any(test, feature = "economy-faults"))]
+                    #[cfg(feature = "economy-faults")]
                     if ledger_fault == Some(LedgerFault::ScaleMetabolismDrainBy10) {
                         // THE FAULT (bd-16g.11.2): basal metabolism ten times the
                         // configured drain — the hidden death timer.
@@ -18774,7 +18778,7 @@ impl WorldState {
             let mut deltas = [ResourceAmounts::default(); 5];
             let mut capacity_rejection = ResourceAmounts::default();
             let healths = self.agents.columns().health();
-            #[cfg(any(test, feature = "economy-faults"))]
+            #[cfg(feature = "economy-faults")]
             let ledger_fault = self.current_ledger_fault();
             for (idx, agent_id) in handles.iter().enumerate() {
                 let Some(runtime) = self.runtime.get(*agent_id) else {
@@ -18808,7 +18812,7 @@ impl WorldState {
                     flow.health -= f64::from(health_loss) * share;
                 }
             }
-            #[cfg(any(test, feature = "economy-faults"))]
+            #[cfg(feature = "economy-faults")]
             if ledger_fault == Some(LedgerFault::ScaleMetabolismDrainBy10) {
                 // THE BLIND SPOT (bd-16g.11.2): science drains ten times the
                 // configured rate; the books post one tenth of the real loss.
@@ -19610,7 +19614,7 @@ impl WorldState {
         let mut interaction_events = Vec::with_capacity(interaction_slots.min(64));
         let mut interaction_events_dropped = 0usize;
         let cell_size = validated_world_unit_f32(self.config.food_cell_size);
-        #[cfg(any(test, feature = "economy-faults"))]
+        #[cfg(feature = "economy-faults")]
         let ledger_fault = self.current_ledger_fault();
         // Reuse buffers: positions, handles, sharers
         self.work_positions.clear();
@@ -19640,7 +19644,7 @@ impl WorldState {
             let embargo_scale = self.intake_scale_for_position(pos.x, pos.y);
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 // legacy C++ gate: a full agent neither eats nor wastes cell food
-                #[cfg(any(test, feature = "economy-faults"))]
+                #[cfg(feature = "economy-faults")]
                 let health_gate =
                     if ledger_fault == Some(LedgerFault::CreditIntakeWithoutHealthGate) {
                         // THE FAULT (bd-16g.11.2): full agents drain cells forever.
@@ -19648,7 +19652,7 @@ impl WorldState {
                     } else {
                         healths[idx] < 2.0
                     };
-                #[cfg(not(any(test, feature = "economy-faults")))]
+                #[cfg(not(feature = "economy-faults"))]
                 let health_gate = healths[idx] < 2.0;
                 if (intake_rate > 0.0 || waste_rate > 0.0) && health_gate {
                     // bd-9zq2: positions are wrapped into [0, extent) by the toroidal
@@ -23267,13 +23271,13 @@ impl WorldState {
     /// Install an economy fault for the conservation gate's mutation suite
     /// (bd-16g.11.2). Test/feature-gated; never available in a production build
     /// without the `economy-faults` feature.
-    #[cfg(any(test, feature = "economy-faults"))]
+    #[cfg(feature = "economy-faults")]
     pub fn inject_ledger_fault(&mut self, fault: LedgerFault) {
         self.resource_ledger.fault = Some(fault);
     }
 
     /// The currently installed economy fault, when the fault machinery is built in.
-    #[cfg(any(test, feature = "economy-faults"))]
+    #[cfg(feature = "economy-faults")]
     #[must_use]
     pub const fn current_ledger_fault(&self) -> Option<LedgerFault> {
         self.resource_ledger.fault
@@ -42257,6 +42261,9 @@ mod tests {
         );
     }
 
+    // bd-dz37: drives the feature-gated fault machinery, so it is gated to match. Run with
+    // --features economy-faults.
+    #[cfg(feature = "economy-faults")]
     #[test]
     fn every_injectable_fault_turns_the_gate_red() {
         // The centerpiece of bd-16g.11.2: a conservation gate that has never
