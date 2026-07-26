@@ -2974,12 +2974,21 @@ mod visual_authority_consumer_guard {
     ///
     /// An entry here is a TRACKED DECISION, not a silence. Adding one without a
     /// bead id is the thing this guard exists to prevent.
-    const EXEMPT: &[(&str, &str)] = &[
-        ("bake_biome_atlas", "bd-ikts.2"),
-        ("bake_biome_texture", "bd-ikts.2"),
-        ("cell_phase", "bd-ikts.2"),
-        ("terrain_lushness", "bd-ikts.2"),
-    ];
+    ///
+    /// `cell_phase` was on this list and should not have been: it is called by
+    /// `shimmer`, which frontends do consume. The first version of this guard
+    /// could not see that, because it excluded `visual.rs` wholesale and so read
+    /// every internal helper as dead. An audit that cannot tell "dead" from
+    /// "helper of a live function" produces deletion advice for working code,
+    /// which is the failure mode bd-ikts.2 warns about — so the guard now counts
+    /// production call sites inside `visual.rs` as well.
+    /// `terrain_lushness` was also listed here and also should not have been:
+    /// the TUI calls it in production (`app/src/terminal/mod.rs:3535`). My
+    /// manual survey reported it unconsumed; the survey was wrong and this
+    /// guard caught it. That is the argument for having the check at all —
+    /// a hand grep is a snapshot of one person's shell history, and this runs
+    /// on every build.
+    const EXEMPT: &[(&str, &str)] = &[("bake_biome_atlas", "bd-ikts.2")];
 
     fn workspace_root() -> PathBuf {
         // crates/scriptbots-bevy -> crates -> workspace root
@@ -3034,6 +3043,31 @@ mod visual_authority_consumer_guard {
         out
     }
 
+    /// `visual.rs`'s own production half, with definitions and comments removed.
+    ///
+    /// An authority used only by a sibling in `visual.rs` is NOT dead when that
+    /// sibling is itself consumed — `cell_phase` is exactly this, reached
+    /// through `shimmer`. Excluding the file wholesale, as the first version of
+    /// this guard did, reports such helpers as unconsumed and invites deleting
+    /// live code. Test call sites are excluded because a function whose only
+    /// callers are its own tests IS dead in production, which is a real finding
+    /// rather than a consumer.
+    fn visual_internal_production_uses(root: &Path) -> String {
+        let source = std::fs::read_to_string(root.join("crates/scriptbots-core/src/visual.rs"))
+            .expect("visual.rs readable");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source.as_str(), |(before, _)| before);
+        production
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !t.starts_with("//") && !t.starts_with("pub fn ") && !t.starts_with("fn ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn visual_authorities(root: &Path) -> Vec<String> {
         let source = std::fs::read_to_string(root.join("crates/scriptbots-core/src/visual.rs"))
             .expect("visual.rs readable");
@@ -3059,11 +3093,13 @@ mod visual_authority_consumer_guard {
             sources.len()
         );
         let exempt: BTreeMap<&str, &str> = EXEMPT.iter().copied().collect();
+        let internal = visual_internal_production_uses(&root);
 
         let mut unconsumed = Vec::new();
         let mut exempt_but_actually_consumed = Vec::new();
         for name in visual_authorities(&root) {
-            let consumed = sources.iter().any(|text| text.contains(&name));
+            let consumed =
+                sources.iter().any(|text| text.contains(&name)) || internal.contains(&name);
             match (consumed, exempt.get(name.as_str())) {
                 (false, None) => unconsumed.push(name),
                 (true, Some(bead)) => exempt_but_actually_consumed.push(format!("{name} ({bead})")),
@@ -3081,6 +3117,50 @@ mod visual_authority_consumer_guard {
             exempt_but_actually_consumed.is_empty(),
             "these are exempt but now have real consumers, so the exemption is stale \
              and should be removed along with its bead: {exempt_but_actually_consumed:?}"
+        );
+    }
+
+    /// A helper reached only from a sibling in `visual.rs` is alive when that
+    /// sibling is consumed, and must NOT be reported as dead.
+    ///
+    /// `cell_phase` is the concrete case: nothing outside `visual.rs` calls it,
+    /// but `shimmer` does, and frontends call `shimmer`. The first version of
+    /// this guard exempted it as unconsumed, which was wrong and would have led
+    /// someone to delete a live function.
+    #[test]
+    fn internal_helpers_of_consumed_functions_are_not_dead() {
+        let root = workspace_root();
+        let internal = visual_internal_production_uses(&root);
+        assert!(
+            internal.contains("cell_phase"),
+            "cell_phase is called by shimmer in visual.rs production code; if this \
+             fails the internal sweep is not seeing intra-file call sites"
+        );
+        let sources = consumer_sources(&root);
+        assert!(
+            sources.iter().any(|t| t.contains("shimmer")),
+            "shimmer must have an external consumer for this case to hold"
+        );
+        // Definitions and comments must not count as uses, or everything looks alive.
+        assert!(
+            !internal.contains("pub fn cell_phase"),
+            "definition lines must be stripped from the internal sweep"
+        );
+    }
+
+    /// Test-only call sites are not consumers. A function whose only callers are
+    /// its own tests is dead in production, and saying so is the point.
+    ///
+    /// If this ever stopped holding, the guard would go permanently blind to
+    /// the exact class it exists to catch: every dead function has tests, so
+    /// counting test callers would mark all of them alive.
+    #[test]
+    fn test_only_call_sites_do_not_count_as_consumers() {
+        let internal = visual_internal_production_uses(&workspace_root());
+        assert!(
+            !internal.contains("bake_biome_atlas"),
+            "bake_biome_atlas is called only from tests, so it must not appear in \
+             the production-only sweep; if it does, the #[cfg(test)] split is wrong"
         );
     }
 
