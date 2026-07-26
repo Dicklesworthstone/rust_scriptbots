@@ -222,19 +222,34 @@ pub fn compare_frames(
             candidate.len()
         ));
     }
+    // Count PIXELS, not channels. The previous form counted differing channels
+    // and divided by four, which is only equivalent when every differing pixel
+    // differs in all four channels. A single-channel regression — a red shift,
+    // a dead blue term, an alpha-only change — was therefore reported at a
+    // QUARTER of its true extent, making it four times less likely to breach
+    // max_differing_ratio. A golden comparison that under-reports difference is
+    // an evidence check weaker than it claims to be (bd-2z0.14.3.4 round-1
+    // audit).
     let mut differing_pixels = 0_u64;
     let mut max_channel_diff = 0_u8;
     let mut abs_sum = 0_u64;
-    for (g, c) in golden.iter().zip(candidate.iter()) {
-        let diff = g.abs_diff(*c);
-        max_channel_diff = max_channel_diff.max(diff);
-        abs_sum += u64::from(diff);
-        if diff > thresholds.differing_channel {
+    for (g_px, c_px) in golden
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(candidate.as_chunks::<4>().0.iter())
+    {
+        let mut pixel_differs = false;
+        for channel in 0..4 {
+            let diff = g_px[channel].abs_diff(c_px[channel]);
+            max_channel_diff = max_channel_diff.max(diff);
+            abs_sum += u64::from(diff);
+            pixel_differs |= diff > thresholds.differing_channel;
+        }
+        if pixel_differs {
             differing_pixels += 1;
         }
     }
-    // Channel diffs over-count pixels by 4x; divide back out.
-    let differing_pixels = differing_pixels / 4;
     let total_pixels = u64::from(width) * u64::from(height);
     let differing_ratio = differing_pixels as f64 / total_pixels as f64;
     let mean_abs_diff = abs_sum as f64 / (total_pixels * 4) as f64;
@@ -1689,6 +1704,56 @@ mod tests {
         // Already-tight width (64*4 = 256) passes through unchanged.
         let aligned = frame(64, 4, 7);
         assert_eq!(unpad_readback(&aligned, 64, 4), aligned);
+    }
+
+    /// A single-channel regression must be counted at full extent.
+    ///
+    /// The previous implementation counted differing CHANNELS and divided by
+    /// four, so a change confined to one channel — a red shift, a dead blue
+    /// term — reported at a quarter of its true size and was four times less
+    /// likely to breach the ratio threshold. Under the old arithmetic the four
+    /// differing pixels below would have been reported as one.
+    #[test]
+    fn compare_counts_pixels_not_channels_for_single_channel_drift() {
+        let thresholds = CompareThresholds {
+            differing_channel: 0,
+            max_differing_ratio: 0.0,
+            max_mean_abs_diff: 255.0,
+        };
+        // 4 pixels, each differing in RED only.
+        let golden = [10u8, 20, 30, 255].repeat(4);
+        let mut candidate = golden.clone();
+        for pixel in 0..4 {
+            candidate[pixel * 4] = 40;
+        }
+        let stats = compare_frames(&golden, &candidate, 4, 1, &thresholds).expect("shape matches");
+        assert_eq!(
+            stats.differing_pixels, 4,
+            "every pixel differs in red, so all four must be counted"
+        );
+        assert_eq!(stats.total_pixels, 4);
+        assert!((stats.differing_ratio - 1.0).abs() < f64::EPSILON);
+        assert!(!stats.pass, "a full-frame red shift must not pass");
+    }
+
+    /// A pixel differing in all four channels is still ONE pixel.
+    #[test]
+    fn compare_does_not_multiply_a_fully_differing_pixel() {
+        let thresholds = CompareThresholds {
+            differing_channel: 0,
+            max_differing_ratio: 1.0,
+            max_mean_abs_diff: 255.0,
+        };
+        let golden = [10u8, 20, 30, 40].repeat(2);
+        let mut candidate = golden.clone();
+        for channel in 0..4 {
+            candidate[channel] = 200;
+        }
+        let stats = compare_frames(&golden, &candidate, 2, 1, &thresholds).expect("shape matches");
+        assert_eq!(
+            stats.differing_pixels, 1,
+            "one pixel differing in four channels is one differing pixel"
+        );
     }
 
     /// Alpha must never count as content, and neither must trivial variation.
