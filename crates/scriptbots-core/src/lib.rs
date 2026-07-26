@@ -1003,6 +1003,48 @@ fn wrap_signed_angle(mut angle: f32) -> f32 {
     angle
 }
 
+/// Gaussian deviate with standard deviation `sigma`, matching C++ `randn` (bd-uz8k).
+///
+/// The reference (`original_scriptbots_code_for_reference/helpers.h`) uses the Marsaglia polar
+/// method, and every per-gene mutation in `Agent::reproduce` is a `randn` call. The port drew
+/// uniformly from `-scale..scale` instead, which is a different distribution: a Gaussian has
+/// unbounded tails, so rare large jumps -- the mutations that let a population escape a local
+/// optimum -- are possible in the reference and were impossible here. This is the same algorithm,
+/// including the rejection loop, so the shape and the tail behaviour match.
+///
+/// TWO DELIBERATE DEPARTURES FROM THE REFERENCE, both recorded on bd-uz8k:
+///
+/// 1. NO CACHED DEVIATE. C++ `randn` keeps `storedDeviate`/`deviateAvailable` in function-local
+///    statics, so consecutive calls alternate between consuming a rejection loop's worth of draws
+///    and consuming none. That cache is process-global and shared across every caller, including
+///    brain mutation, so it leaks between whichever agents happen to reproduce consecutively. This
+///    port deliberately isolates each birth in its own `offspring_substream`, and reintroducing a
+///    global cache would undo that. Each call here therefore runs its own loop and discards the
+///    second deviate.
+///
+/// 2. BIT-EXACT PARITY IS UNREACHABLE REGARDLESS, so it is not the goal. The reference draws from
+///    C `rand()`; this port draws from a project-owned Xoshiro256++. No amount of algorithm
+///    matching makes those two produce the same bytes. What IS achievable, and what this restores,
+///    is DISTRIBUTIONAL parity: same family, same sigma, same tails.
+///
+/// STREAM CONSUMPTION CHANGES. A uniform draw consumed exactly one value; this consumes two per
+/// rejection-loop attempt, and the loop retries when the sampled point falls outside the unit
+/// circle (probability `1 - pi/4`, about 21% per attempt). Consumption is therefore both larger
+/// and variable, which shifts every downstream draw in the offspring substream and moves
+/// `WorldDigestV1`.
+fn normal_deviate(rng: &mut dyn RandomStream, sigma: f32) -> f32 {
+    loop {
+        let var1 = 2.0_f64 * f64::from(rng.random_range(0.0_f32..1.0_f32)) - 1.0;
+        let var2 = 2.0_f64 * f64::from(rng.random_range(0.0_f32..1.0_f32)) - 1.0;
+        let rsquared = var1.mul_add(var1, var2 * var2);
+        if rsquared >= 1.0 || rsquared == 0.0 {
+            continue;
+        }
+        let polar = (-2.0 * rsquared.ln() / rsquared).sqrt();
+        return (var2 * polar * f64::from(sigma)) as f32;
+    }
+}
+
 /// Mutation spread for `herbivore_tendency`, from C++ `Agent.cpp:111` (bd-hgxt).
 ///
 /// C++ gives this gene its own fixed spread rather than the shared `MR2` mutation scale, so an
@@ -22104,7 +22146,8 @@ impl WorldState {
             && meta_scale > 0.0
             && mutation_rng.random_range(0.0..1.0) < meta_chance
         {
-            let delta_primary = mutation_rng.random_range(-meta_scale..meta_scale);
+            // bd-uz8k: C++ Agent.cpp:107-108 mutate the mutation rates with randn too.
+            let delta_primary = normal_deviate(mutation_rng, meta_scale);
             let before = runtime.mutation_rates.primary;
             runtime.mutation_rates.primary =
                 (runtime.mutation_rates.primary + delta_primary).max(0.0001);
@@ -22115,7 +22158,7 @@ impl WorldState {
                 runtime.mutation_rates.primary,
             );
 
-            let delta_secondary = mutation_rng.random_range(-meta_scale..meta_scale);
+            let delta_secondary = normal_deviate(mutation_rng, meta_scale);
             let before = runtime.mutation_rates.secondary;
             runtime.mutation_rates.secondary =
                 (runtime.mutation_rates.secondary + delta_secondary).max(0.001);
@@ -22279,7 +22322,8 @@ impl WorldState {
                 // heredity attribution are not, so a no-op mutation must be exact inheritance.
                 let after =
                     if Self::mutation_event_accepted(mutation_rng, primary_rate, mutation_scale) {
-                        let delta = mutation_rng.random_range(-mutation_scale..mutation_scale);
+                        // bd-uz8k: C++ Agent.cpp:134 is randn like every other gene.
+                        let delta = normal_deviate(mutation_rng, mutation_scale);
                         wrap_unsigned_angle(runtime.eye_direction[i] + delta)
                     } else {
                         runtime.eye_direction[i]
@@ -22316,11 +22360,17 @@ impl WorldState {
         runtime
     }
 
+    /// Perturb `value` by a Gaussian deviate of standard deviation `scale`, then clamp.
+    ///
+    /// bd-uz8k: `scale` is a SIGMA, not a half-width. Every C++ mutation is
+    /// `randn(value, sigma)`; this port previously drew uniformly from `-scale..scale`, which
+    /// bounded the mutation hard and removed the tails entirely. See [`normal_deviate`] for the
+    /// algorithm and for what parity this does and does not buy.
     fn mutate_value(rng: &mut dyn RandomStream, value: f32, scale: f32, min: f32, max: f32) -> f32 {
         if scale <= 0.0 {
             return value.clamp(min, max);
         }
-        let delta = rng.random_range(-scale..scale);
+        let delta = normal_deviate(rng, scale);
         (value + delta).clamp(min, max)
     }
 
@@ -31144,11 +31194,11 @@ mod tests {
         // bd-hgxt: herbivore and temperature are the two UNCONDITIONAL trait mutations, so a
         // disabled probability leaves the stream exactly two draws past its seed -- one each,
         // at their own fixed C++ spreads rather than the shared mutation scale.
+        // bd-uz8k: the mirror calls normal_deviate rather than open-coding a draw, because a
+        // Gaussian consumes a variable number of uniforms through its rejection loop.
         let mut expected = SmallRngStream::seed_from_u64(0x5EED_0002);
-        let _herbivore_delta: f32 =
-            expected.random_range(-HERBIVORE_MUTATION_SPREAD..HERBIVORE_MUTATION_SPREAD);
-        let _temperature_delta: f32 =
-            expected.random_range(-TEMPERATURE_MUTATION_SPREAD..TEMPERATURE_MUTATION_SPREAD);
+        let _herbivore_delta = normal_deviate(&mut expected, HERBIVORE_MUTATION_SPREAD);
+        let _temperature_delta = normal_deviate(&mut expected, TEMPERATURE_MUTATION_SPREAD);
         assert_eq!(
             mutation_rng.checkpoint(),
             expected.checkpoint(),
@@ -31166,20 +31216,20 @@ mod tests {
 
         let mut expected_rng = SmallRngStream::seed_from_u64(0x5EED_0004);
         let expected_modifiers = {
-            let _herbivore_delta: f32 =
-                expected_rng.random_range(-HERBIVORE_MUTATION_SPREAD..HERBIVORE_MUTATION_SPREAD);
+            let _herbivore_delta = normal_deviate(&mut expected_rng, HERBIVORE_MUTATION_SPREAD);
             // bd-fba5: both clocks are drawn between herbivore and the modifiers, mirroring
             // C++ Agent.cpp:112-115. This fixture pins the modifiers' gate-then-delta pairing,
             // not their absolute position, so it consumes the intervening clock draws rather
             // than asserting on them -- bd_fba5_draw_order_matches_the_cpp_reference owns order.
             for _ in 0..2 {
                 let _clock_gate: f32 = expected_rng.random_range(0.0_f32..1.0_f32);
-                let _clock_delta: f32 = expected_rng.random_range(-1.0_f32..1.0_f32);
+                let _clock_delta = normal_deviate(&mut expected_rng, 1.0);
             }
             let mut accepted = |before: f32, min: f32, max: f32| {
                 let gate: f32 = expected_rng.random_range(0.0_f32..1.0_f32);
                 assert!(gate < 5.0, "fixture requires an accepted event");
-                let delta: f32 = expected_rng.random_range(-1.0_f32..1.0_f32);
+                // bd-uz8k: the gate stays uniform (C++ randf); only the delta is Gaussian.
+                let delta = normal_deviate(&mut expected_rng, 1.0);
                 (before + delta).clamp(min, max)
             };
             [
@@ -31246,8 +31296,7 @@ mod tests {
         // is enforced by `bd_fba5_draw_order_matches_the_cpp_reference` below, which accepts every
         // gate and therefore sees a distinct delta per gene.
         let mut expected = SmallRngStream::seed_from_u64(0x5EED_0006);
-        let _herbivore_delta: f32 =
-            expected.random_range(-HERBIVORE_MUTATION_SPREAD..HERBIVORE_MUTATION_SPREAD);
+        let _herbivore_delta = normal_deviate(&mut expected, HERBIVORE_MUTATION_SPREAD);
         // bd-hgxt: temperature is no longer gated, so the gated set is the five modifiers, both
         // clocks, and two per eye -- temperature's unconditional draw comes after them.
         for gene in 0..(5 + 2 + 2 * NUM_EYES) {
@@ -31257,8 +31306,7 @@ mod tests {
                 "fixture requires every gate to reject; gene {gene} drew {gate}"
             );
         }
-        let _temperature_delta: f32 =
-            expected.random_range(-TEMPERATURE_MUTATION_SPREAD..TEMPERATURE_MUTATION_SPREAD);
+        let _temperature_delta = normal_deviate(&mut expected, TEMPERATURE_MUTATION_SPREAD);
         assert_eq!(
             mutation_rng.checkpoint(),
             expected.checkpoint(),
@@ -31288,13 +31336,14 @@ mod tests {
         let scale = 1.0_f32;
         let mut expected = SmallRngStream::seed_from_u64(0xFBA5_0002);
         // Agent.cpp:111 -- herbivore, unconditional, at its own fixed spread (bd-hgxt).
-        let _herbivore: f32 =
-            expected.random_range(-HERBIVORE_MUTATION_SPREAD..HERBIVORE_MUTATION_SPREAD);
+        let _herbivore = normal_deviate(&mut expected, HERBIVORE_MUTATION_SPREAD);
         // Agent.cpp:112,114 -- both clocks, immediately after herbivore.
+        // bd-uz8k: the gate is uniform (C++ randf) but the delta is Gaussian (C++ randn), and the
+        // Gaussian consumes a variable number of draws, so the mirror calls the same sampler.
         let mut gated = |before: f32, min: f32, max: f32| -> f32 {
             let gate: f32 = expected.random_range(0.0_f32..1.0_f32);
             assert!(gate < 5.0, "fixture requires every gate to accept");
-            let delta: f32 = expected.random_range(-scale..scale);
+            let delta = normal_deviate(&mut expected, scale);
             (before + delta).clamp(min, max)
         };
         let expected_clocks = [gated(40.0, 2.0, 200.0), gated(60.0, 2.0, 200.0)];
@@ -31312,16 +31361,15 @@ mod tests {
         let mut expected_dir = [0.0_f32; NUM_EYES];
         for i in 0..NUM_EYES {
             let _fov_gate: f32 = expected.random_range(0.0_f32..1.0_f32);
-            let fov_delta: f32 = expected.random_range(-scale..scale);
+            let fov_delta = normal_deviate(&mut expected, scale);
             expected_fov[i] = (parent.eye_fov[i] + fov_delta).clamp(0.0, f32::MAX);
             let _dir_gate: f32 = expected.random_range(0.0_f32..1.0_f32);
-            let dir_delta: f32 = expected.random_range(-scale..scale);
+            let dir_delta = normal_deviate(&mut expected, scale);
             expected_dir[i] = wrap_unsigned_angle(parent.eye_direction[i] + dir_delta);
         }
         // Agent.cpp:139 -- temperature, last, UNCONDITIONAL and at its own fixed spread (bd-hgxt):
         // no gate draw, one delta.
-        let temp_delta: f32 =
-            expected.random_range(-TEMPERATURE_MUTATION_SPREAD..TEMPERATURE_MUTATION_SPREAD);
+        let temp_delta = normal_deviate(&mut expected, TEMPERATURE_MUTATION_SPREAD);
         let expected_temp = (parent.temperature_preference + temp_delta).clamp(0.0, 1.0);
 
         let child = world.build_child_runtime(
