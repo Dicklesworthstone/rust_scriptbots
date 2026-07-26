@@ -28,7 +28,10 @@ use fsqlite::{
     Connection, FrankenError, SqliteValue,
     compat::{OpenFlags, RowExt, open_with_flags},
 };
-use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
+use scriptbots_core::{
+    MetricSample, PersistenceBatch, Tick, TickSummary,
+    narrative::{EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord},
+};
 use scriptbots_storage::{
     FailureCommitState, PersistenceBatchId, PersistenceWatermarks, Storage, StorageError,
     StoragePipeline, StorageReader,
@@ -560,8 +563,39 @@ fn storage_flush_under_real_contention_is_bounded_logged_and_recovers_exactly_on
     let mut storage =
         Storage::create_unattributed_file_with_thresholds(&path_string, 1_000, 1_000, 1_000, 1_000)
             .expect("file-backed storage opens");
+    let mut contended_batch = sample_batch(1, 41.5);
+    contended_batch.narrative_events = vec![
+        EventRecord {
+            schema_version: EVENT_RECORD_SCHEMA_VERSION,
+            tick: Tick(1),
+            kind: EventKind::PopulationCrash,
+            severity: 0.75,
+            magnitude: 9.0,
+            window: (0, 1),
+            metric: "population".to_owned(),
+            before: 20.0,
+            after: 11.0,
+            score: 4.0,
+            subject: None,
+            human_text: "contention fixture: population crashed".to_owned(),
+        },
+        EventRecord {
+            schema_version: EVENT_RECORD_SCHEMA_VERSION,
+            tick: Tick(1),
+            kind: EventKind::EnergyRecovery,
+            severity: 0.5,
+            magnitude: 2.0,
+            window: (0, 1),
+            metric: "energy.mean".to_owned(),
+            before: 1.0,
+            after: 3.0,
+            score: 2.5,
+            subject: None,
+            human_text: "contention fixture: energy recovered".to_owned(),
+        },
+    ];
     storage
-        .persist(&sample_batch(1, 41.5))
+        .persist(&contended_batch)
         .expect("batch admission stages the outbox payload");
 
     // Discover the run id the unattributed storage created so the contender can stage a
@@ -638,6 +672,12 @@ fn storage_flush_under_real_contention_is_bounded_logged_and_recovers_exactly_on
             "retry warning must identify the attempt: {record}"
         );
     }
+    assert!(
+        retry_records
+            .iter()
+            .all(|line| !line.contains("narrative event persisted")),
+        "rolled-back attempts must not emit narrative commit records: {retry_records:?}"
+    );
     // The typed terminal result identifies the transaction, the attempt count, and the cause.
     let terminal_text = terminal.to_string();
     assert!(
@@ -699,6 +739,14 @@ fn storage_flush_under_real_contention_is_bounded_logged_and_recovers_exactly_on
             && watermarks.applied == watermarks.durable,
         "recovery must converge admitted/applied/durable watermarks, got {watermarks:?}"
     );
+    let narrative_events = reader
+        .recent_run_events(8)
+        .expect("recovered narrative events decode");
+    assert_eq!(
+        narrative_events.len(),
+        contended_batch.narrative_events.len(),
+        "recovery must apply every admitted narrative event exactly once"
+    );
     reader.close().expect("reader closes");
 
     // The contender's probe row was rolled back: it must not exist.
@@ -720,6 +768,39 @@ fn storage_flush_under_real_contention_is_bounded_logged_and_recovers_exactly_on
             .any(|line| line.contains("transaction committed")),
         "a committed-transaction record naming the database path must exist: {commit_records:?}"
     );
+    let narrative_records = commit_records
+        .iter()
+        .filter(|line| line.contains("narrative event persisted"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        narrative_records.len(),
+        contended_batch.narrative_events.len(),
+        "recovery must emit exactly one structured record per committed narrative event: \
+         {narrative_records:?}"
+    );
+    for record in narrative_records {
+        for field in [
+            "event_identity=",
+            "event_tick=",
+            "event_kind=",
+            "event_metric=",
+            "schema_version=",
+            "severity=",
+            "magnitude=",
+            "window_start=",
+            "window_end=",
+            "before=",
+            "after=",
+            "score=",
+            "subject_ref=",
+            "human_text=",
+        ] {
+            assert!(
+                record.contains(field),
+                "recovered narrative record omitted {field}: {record}"
+            );
+        }
+    }
 
     assert_integrity_ok(&path_string);
     cleanup(&path);

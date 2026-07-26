@@ -46,6 +46,7 @@ use scriptbots_core::{
     PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase, ReplayEvent,
     ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
+    narrative::{EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord, SubjectRef},
     rng_domains::{AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain},
     world_counters_digest_v1,
 };
@@ -2821,6 +2822,9 @@ pub enum StorageError {
     Closed,
     #[error("storage transaction is terminally failed; buffered rows will not be replayed")]
     TerminallyFailed,
+    /// A narrative event failed its versioned typed persistence contract.
+    #[error(transparent)]
+    RunEvent(#[from] RunEventDecodeError),
     #[error("invalid storage data in {context}: {reason}")]
     InvalidData {
         context: &'static str,
@@ -2847,6 +2851,47 @@ pub enum StorageError {
     Worker(#[from] StorageWorkerError),
     #[error("invalid replay event at tick {tick}, seq {seq}: {reason}")]
     ReplayParse { tick: i64, seq: i64, reason: String },
+}
+
+/// Version-1 narrative-event fields named by strict decoder errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEventField {
+    SchemaVersion,
+    Tick,
+    Kind,
+    Severity,
+    Magnitude,
+    WindowStart,
+    WindowEnd,
+    Metric,
+    Before,
+    After,
+    Score,
+    Subject,
+    HumanText,
+    IdentityOrder,
+}
+
+/// Version-aware refusal from the typed narrative-event boundary.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum RunEventDecodeError {
+    /// The row belongs to a future schema whose semantics this binary does not know.
+    #[error(
+        "unsupported narrative event schema version {found}; this binary supports version {supported}"
+    )]
+    UnsupportedSchemaVersion { found: u32, supported: u32 },
+    /// One version-1 field cannot be interpreted without inventing data.
+    #[error("invalid narrative event field {field:?}: {reason}")]
+    InvalidField {
+        field: RunEventField,
+        reason: String,
+    },
+    /// The same canonical identity appeared more than once with identical evidence.
+    #[error("duplicate narrative event identity {identity}")]
+    DuplicateIdentity { identity: RunEventIdentity },
+    /// The same canonical identity appeared with different evidence.
+    #[error("conflicting narrative event identity {identity}")]
+    ConflictingIdentity { identity: RunEventIdentity },
 }
 
 #[derive(Debug)]
@@ -3371,25 +3416,94 @@ pub struct PersistedMetric {
     pub value: f64,
 }
 
-/// Narrative event row read back from a run database (`bd-erff`).
+/// Canonical version-1 identity of one narrative event within a run.
 ///
-/// The readable projection of `run_events`: enough to render a run timeline without
-/// exposing the detector internals (`magnitude`, `window`, `before`/`after`, `score`) that
-/// only a re-derivation would need. Those stay in the table for offline analysis.
-#[derive(Debug, Clone, PartialEq)]
+/// The enclosing [`StorageReader`] supplies the run identity. These three fields are the
+/// existing `run_events` primary-key suffix, so identity assignment is independent of query
+/// order and survives durable-outbox recovery without a migration or an inferred row number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunEventIdentity {
+    tick: Tick,
+    kind: EventKind,
+    metric: String,
+}
+
+impl RunEventIdentity {
+    #[must_use]
+    pub fn from_record(record: &EventRecord) -> Self {
+        Self {
+            tick: record.tick,
+            kind: record.kind,
+            metric: record.metric.clone(),
+        }
+    }
+
+    #[must_use]
+    pub const fn tick(&self) -> Tick {
+        self.tick
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> EventKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn metric(&self) -> &str {
+        &self.metric
+    }
+}
+
+impl Ord for RunEventIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.tick
+            .cmp(&other.tick)
+            .then_with(|| self.kind.as_str().cmp(other.kind.as_str()))
+            .then_with(|| self.metric.as_str().cmp(other.metric.as_str()))
+    }
+}
+
+impl PartialOrd for RunEventIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for RunEventIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "v1/{}/{}/{}:{}",
+            self.tick,
+            self.kind.as_str(),
+            self.metric.len(),
+            self.metric
+        )
+    }
+}
+
+/// Complete typed narrative event read back from a run database.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedRunEvent {
-    /// Tick the detector fired at.
-    pub tick: u64,
-    /// Which detector fired, as its stable string form.
-    pub kind: String,
-    /// Rough importance in `[0, 1]`.
-    pub severity: f64,
-    /// Series the change was detected on.
-    pub metric: String,
-    /// Human-readable description of what happened.
-    pub human_text: String,
-    /// Encoded subject (`agent:`/`species:`/`island:`), when the event names one.
-    pub subject_ref: Option<String>,
+    identity: RunEventIdentity,
+    record: EventRecord,
+}
+
+impl PersistedRunEvent {
+    #[must_use]
+    pub const fn identity(&self) -> &RunEventIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn record(&self) -> &EventRecord {
+        &self.record
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (RunEventIdentity, EventRecord) {
+        (self.identity, self.record)
+    }
 }
 
 /// Tick ledger row exposed to storage consumers without leaking SQL details.
@@ -3995,6 +4109,51 @@ pub struct PersistedInteraction {
     pub target_position: Option<Position>,
     /// The event's own payload, verbatim.
     pub payload: String,
+}
+
+/// One immutable per-agent observation from the canonical `agents` table.
+///
+/// The reader that returns this row is bound to exactly one [`RunId`]. Keeping
+/// the run identifier on the reader avoids duplicating it on every row while
+/// still making cross-run joins an explicit adapter responsibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedAgentObservation {
+    /// Simulation boundary where the snapshot was recorded.
+    pub tick: u64,
+    /// Stable logical identity within the reader's run.
+    pub agent_uid: AgentUid,
+    /// World-space velocity components.
+    pub velocity_x: f64,
+    pub velocity_y: f64,
+    /// Persisted diet genotype/trait proxy. This is not a realized diet measure.
+    pub herbivore_tendency: f64,
+    /// Persisted sensing trait modifiers. These are not realized sensor readings.
+    pub trait_smell: f64,
+    pub trait_sound: f64,
+    pub trait_hearing: f64,
+    pub trait_eye: f64,
+    pub trait_blood: f64,
+}
+
+/// Auditable accounting for pairwise interaction capture in a tick window.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedInteractionCapture {
+    /// Pairwise events completed by the simulation.
+    pub observed: u64,
+    /// Pairwise events retained in the durable interaction projection.
+    pub persisted: u64,
+    /// Events omitted because their tick was outside the configured stride.
+    pub sampled_out: u64,
+    /// Events omitted because a selected tick exceeded its hard cap.
+    pub truncated: u64,
+}
+
+impl PersistedInteractionCapture {
+    /// True only when absence from the durable edge table can be interpreted as zero.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.sampled_out == 0 && self.truncated == 0 && self.observed == self.persisted
+    }
 }
 
 /// Checkpoint record reconstructed from persisted storage.
@@ -5223,6 +5382,17 @@ impl StorageBuffer {
                 });
             }
         }
+        for event in validated_run_event_map(&self.run_events)?.into_values() {
+            if event.tick.0 > enclosing_tick {
+                return Err(invalid_run_event(
+                    RunEventField::Tick,
+                    format!(
+                        "event tick {} exceeds enclosing batch tick {enclosing_tick}",
+                        event.tick
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -5474,6 +5644,25 @@ fn checked_query_limit(context: &'static str, limit: usize) -> Result<i64, Stora
     checked_i64(context, limit)
 }
 
+fn checked_tick_window(
+    context: &'static str,
+    start_tick: u64,
+    end_tick: u64,
+) -> Result<(i64, i64), StorageError> {
+    if start_tick >= end_tick {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: format!(
+                "expected a non-empty half-open tick window, found [{start_tick}, {end_tick})"
+            ),
+        });
+    }
+    Ok((
+        encode_u64(context, start_tick)?,
+        encode_u64(context, end_tick)?,
+    ))
+}
+
 /// Checked `u64` -> `i64` conversion for values headed into SQLite INTEGER
 /// columns. Values above `i64::MAX` would otherwise wrap negative on write
 /// while the read side rejects negatives, so out-of-range input must fail
@@ -5495,6 +5684,172 @@ fn decode<T: FromSqliteValue>(
             context,
             reason: error.to_string(),
         })
+}
+
+fn invalid_run_event(field: RunEventField, reason: impl Into<String>) -> StorageError {
+    RunEventDecodeError::InvalidField {
+        field,
+        reason: reason.into(),
+    }
+    .into()
+}
+
+fn decode_run_event_value<T: FromSqliteValue>(
+    row: &Row,
+    index: usize,
+    field: RunEventField,
+) -> Result<T, StorageError> {
+    row.get_typed(index)
+        .map_err(|error| invalid_run_event(field, error.to_string()))
+}
+
+fn supported_run_event_schema(raw: i64) -> Result<u32, StorageError> {
+    let schema_version = u32::try_from(raw).map_err(|error| {
+        invalid_run_event(
+            RunEventField::SchemaVersion,
+            format!("{raw} cannot be represented as u32: {error}"),
+        )
+    })?;
+    if schema_version != EVENT_RECORD_SCHEMA_VERSION {
+        return Err(RunEventDecodeError::UnsupportedSchemaVersion {
+            found: schema_version,
+            supported: EVENT_RECORD_SCHEMA_VERSION,
+        }
+        .into());
+    }
+    Ok(schema_version)
+}
+
+fn run_event_row_from_query_row(row: &Row) -> Result<RunEventRow, StorageError> {
+    // Establish the decoder contract before interpreting any version-specific field.
+    let schema_version = decode_run_event_value(row, 12, RunEventField::SchemaVersion)?;
+    supported_run_event_schema(schema_version)?;
+    Ok(RunEventRow {
+        tick: decode_run_event_value(row, 0, RunEventField::Tick)?,
+        kind: decode_run_event_value(row, 1, RunEventField::Kind)?,
+        severity: decode_run_event_value(row, 2, RunEventField::Severity)?,
+        magnitude: decode_run_event_value(row, 3, RunEventField::Magnitude)?,
+        window_start: decode_run_event_value(row, 4, RunEventField::WindowStart)?,
+        window_end: decode_run_event_value(row, 5, RunEventField::WindowEnd)?,
+        metric: decode_run_event_value(row, 6, RunEventField::Metric)?,
+        before_value: decode_run_event_value(row, 7, RunEventField::Before)?,
+        after_value: decode_run_event_value(row, 8, RunEventField::After)?,
+        score: decode_run_event_value(row, 9, RunEventField::Score)?,
+        subject_ref: decode_run_event_value(row, 10, RunEventField::Subject)?,
+        human_text: decode_run_event_value(row, 11, RunEventField::HumanText)?,
+        schema_version,
+    })
+}
+
+fn persisted_run_event_from_row(row: &RunEventRow) -> Result<PersistedRunEvent, StorageError> {
+    let schema_version = supported_run_event_schema(row.schema_version)?;
+
+    let tick = u64::try_from(row.tick)
+        .map(Tick)
+        .map_err(|error| invalid_run_event(RunEventField::Tick, error.to_string()))?;
+    let kind = row
+        .kind
+        .parse::<EventKind>()
+        .map_err(|reason| invalid_run_event(RunEventField::Kind, reason))?;
+    if row.metric.is_empty() {
+        return Err(invalid_run_event(RunEventField::Metric, "metric is empty"));
+    }
+    if row.human_text.is_empty() {
+        return Err(invalid_run_event(
+            RunEventField::HumanText,
+            "human_text is empty",
+        ));
+    }
+
+    if !row.severity.is_finite() || !(0.0..=1.0).contains(&row.severity) {
+        return Err(invalid_run_event(
+            RunEventField::Severity,
+            format!("{} is outside the finite range 0.0..=1.0", row.severity),
+        ));
+    }
+    let severity = row.severity as f32;
+    if f64::from(severity).to_bits() != row.severity.to_bits() {
+        return Err(invalid_run_event(
+            RunEventField::Severity,
+            format!("{} is not an exact persisted f32 value", row.severity),
+        ));
+    }
+    for (field, value) in [
+        (RunEventField::Magnitude, row.magnitude),
+        (RunEventField::Before, row.before_value),
+        (RunEventField::After, row.after_value),
+        (RunEventField::Score, row.score),
+    ] {
+        if !value.is_finite() {
+            return Err(invalid_run_event(field, format!("{value} is not finite")));
+        }
+    }
+
+    let window_start = u64::try_from(row.window_start)
+        .map_err(|error| invalid_run_event(RunEventField::WindowStart, error.to_string()))?;
+    let window_end = u64::try_from(row.window_end)
+        .map_err(|error| invalid_run_event(RunEventField::WindowEnd, error.to_string()))?;
+    if window_start > window_end {
+        return Err(invalid_run_event(
+            RunEventField::WindowEnd,
+            format!("window [{window_start}, {window_end}] is reversed"),
+        ));
+    }
+    let subject = row
+        .subject_ref
+        .as_deref()
+        .map(SubjectRef::from_db_string)
+        .transpose()
+        .map_err(|reason| invalid_run_event(RunEventField::Subject, reason))?;
+
+    let record = EventRecord {
+        schema_version,
+        tick,
+        kind,
+        severity,
+        magnitude: row.magnitude,
+        window: (window_start, window_end),
+        metric: row.metric.clone(),
+        before: row.before_value,
+        after: row.after_value,
+        score: row.score,
+        subject,
+        human_text: row.human_text.clone(),
+    };
+    Ok(PersistedRunEvent {
+        identity: RunEventIdentity::from_record(&record),
+        record,
+    })
+}
+
+fn run_event_identity_collision(
+    identity: RunEventIdentity,
+    existing: &EventRecord,
+    candidate: &EventRecord,
+) -> StorageError {
+    if existing == candidate {
+        RunEventDecodeError::DuplicateIdentity { identity }.into()
+    } else {
+        RunEventDecodeError::ConflictingIdentity { identity }.into()
+    }
+}
+
+fn validated_run_event_map(
+    rows: &[RunEventRow],
+) -> Result<BTreeMap<RunEventIdentity, EventRecord>, StorageError> {
+    let mut events = BTreeMap::new();
+    for row in rows {
+        let persisted = persisted_run_event_from_row(row)?;
+        if let Some(existing) = events.get(&persisted.identity) {
+            return Err(run_event_identity_collision(
+                persisted.identity,
+                existing,
+                &persisted.record,
+            ));
+        }
+        events.insert(persisted.identity, persisted.record);
+    }
+    Ok(events)
 }
 
 fn load_run_manifest(
@@ -7152,6 +7507,139 @@ impl StorageReader {
         Ok(events)
     }
 
+    /// Load canonical per-agent observations from a complete half-open tick window.
+    ///
+    /// Rows are ordered by stable identity and then tick. Unlike the bounded
+    /// dashboard queries, this API is intentionally unbounded and belongs only
+    /// to the finished-run offline reader.
+    pub fn load_agent_observations(
+        &self,
+        start_tick: u64,
+        end_tick: u64,
+    ) -> Result<Vec<PersistedAgentObservation>, StorageError> {
+        let (start, end) = checked_tick_window("agents.analysis_window", start_tick, end_tick)?;
+        let rows = self.finished_connection()?.query_with_params(
+            "SELECT tick, agent_uid, velocity_x, velocity_y, herbivore_tendency,
+                    trait_smell, trait_sound, trait_hearing, trait_eye, trait_blood
+             FROM agents
+             WHERE run_id = ?1 AND tick >= ?2 AND tick < ?3
+             ORDER BY agent_uid ASC, tick ASC",
+            &[sqlite_run_id(self.run_id), start.into(), end.into()],
+        )?;
+        let mut observations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tick: i64 = decode(&row, 0, "agents.tick")?;
+            let agent_uid: i64 = decode(&row, 1, "agents.agent_uid")?;
+            let finite = |index, context| -> Result<f64, StorageError> {
+                let value: f64 = decode(&row, index, context)?;
+                if value.is_finite() {
+                    Ok(value)
+                } else {
+                    Err(StorageError::InvalidData {
+                        context,
+                        reason: format!(
+                            "non-finite observation for agent {agent_uid} at tick {tick}"
+                        ),
+                    })
+                }
+            };
+            observations.push(PersistedAgentObservation {
+                tick: checked_u64("agents.tick", tick)?,
+                agent_uid: AgentUid(checked_u64("agents.agent_uid", agent_uid)?),
+                velocity_x: finite(2, "agents.velocity_x")?,
+                velocity_y: finite(3, "agents.velocity_y")?,
+                herbivore_tendency: finite(4, "agents.herbivore_tendency")?,
+                trait_smell: finite(5, "agents.trait_smell")?,
+                trait_sound: finite(6, "agents.trait_sound")?,
+                trait_hearing: finite(7, "agents.trait_hearing")?,
+                trait_eye: finite(8, "agents.trait_eye")?,
+                trait_blood: finite(9, "agents.trait_blood")?,
+            });
+        }
+        Ok(observations)
+    }
+
+    /// Load every directed interaction edge in a complete half-open tick window.
+    ///
+    /// This differs from [`Self::recent_interactions`]: it does not truncate to
+    /// a dashboard page and therefore can back a scientific extractor.
+    pub fn load_interactions_window(
+        &self,
+        start_tick: u64,
+        end_tick: u64,
+    ) -> Result<Vec<PersistedInteraction>, StorageError> {
+        let (start, end) =
+            checked_tick_window("interactions.analysis_window", start_tick, end_tick)?;
+        let rows = self.finished_connection()?.query_with_params(
+            "SELECT i.tick, i.seq, i.kind, i.actor_agent_uid, i.target_agent_uid,
+                    i.value, i.payload_json,
+                    e.position_x, e.position_y,
+                    e.counterpart_position_x, e.counterpart_position_y
+             FROM interactions i
+             LEFT JOIN replay_events e
+                    ON e.run_id = i.run_id AND e.tick = i.tick AND e.seq = i.seq
+             WHERE i.run_id = ?1 AND i.tick >= ?2 AND i.tick < ?3
+             ORDER BY i.tick ASC, i.seq ASC",
+            &[sqlite_run_id(self.run_id), start.into(), end.into()],
+        )?;
+        rows.iter().map(persisted_interaction_from_row).collect()
+    }
+
+    /// Load run-wide interaction-capture accounting.
+    ///
+    /// These counters are persisted at the enclosing batch boundary, while
+    /// interaction edges retain their source tick. They therefore certify a
+    /// complete run but cannot certify an arbitrary sub-window. Missing
+    /// event-count rows mean zero. The accounting identity is rechecked so a
+    /// corrupt database cannot turn omitted interactions into apparent zero
+    /// behavior.
+    pub fn load_interaction_capture(&self) -> Result<PersistedInteractionCapture, StorageError> {
+        let rows = self.finished_connection()?.query_with_params(
+            "SELECT kind, SUM(count)
+             FROM events
+             WHERE run_id = ?1 AND kind IN (?2, ?3, ?4, ?5)
+             GROUP BY kind
+             ORDER BY kind ASC",
+            &[
+                sqlite_run_id(self.run_id),
+                INTERACTION_EVENTS_OBSERVED_KIND.into(),
+                INTERACTION_EVENTS_PERSISTED_KIND.into(),
+                INTERACTION_EVENTS_SAMPLED_OUT_KIND.into(),
+                INTERACTION_EVENTS_TRUNCATED_KIND.into(),
+            ],
+        )?;
+        let mut capture = PersistedInteractionCapture::default();
+        for row in rows {
+            let kind: String = decode(&row, 0, "events.kind")?;
+            let count = checked_u64("events.count", decode(&row, 1, "events.count")?)?;
+            match kind.as_str() {
+                INTERACTION_EVENTS_OBSERVED_KIND => capture.observed = count,
+                INTERACTION_EVENTS_PERSISTED_KIND => capture.persisted = count,
+                INTERACTION_EVENTS_SAMPLED_OUT_KIND => capture.sampled_out = count,
+                INTERACTION_EVENTS_TRUNCATED_KIND => capture.truncated = count,
+                _ => unreachable!("SQL predicate restricts interaction accounting kinds"),
+            }
+        }
+        let accounted = capture
+            .persisted
+            .checked_add(capture.sampled_out)
+            .and_then(|value| value.checked_add(capture.truncated))
+            .ok_or_else(|| StorageError::InvalidData {
+                context: "events.interaction_capture",
+                reason: "interaction accounting overflowed u64".to_owned(),
+            })?;
+        if capture.observed != accounted {
+            return Err(StorageError::InvalidData {
+                context: "events.interaction_capture",
+                reason: format!(
+                    "observed {} != persisted {} + sampled_out {} + truncated {}",
+                    capture.observed, capture.persisted, capture.sampled_out, capture.truncated
+                ),
+            });
+        }
+        Ok(capture)
+    }
+
     /// Load a bounded page of the newest interaction edges in chronological order.
     ///
     /// Reads the `interactions` table rather than filtering `replay_events` here, so that SQL
@@ -7193,51 +7681,10 @@ impl StorageReader {
              LIMIT ?2",
             &[sqlite_run_id(self.run_id), bound.into()],
         )?;
-        let mut interactions = Vec::with_capacity(rows.len());
-        for row in rows {
-            let tick: i64 = decode(&row, 0, "interactions.tick")?;
-            let seq: i64 = decode(&row, 1, "interactions.seq")?;
-            // Decoded as optional and then required. The column is nullable in the schema, so
-            // an edge missing a participant is representable; reporting which one is missing
-            // beats decoding a NULL into a type error that names neither row nor column.
-            let actor =
-                decode_agent_uid(decode(&row, 3, "interactions.actor_agent_uid")?, tick, seq)?
-                    .ok_or_else(|| StorageError::InvalidData {
-                        context: "interactions.actor_agent_uid",
-                        reason: format!("interaction has no actor at tick {tick}, seq {seq}"),
-                    })?;
-            let target =
-                decode_agent_uid(decode(&row, 4, "interactions.target_agent_uid")?, tick, seq)?
-                    .ok_or_else(|| StorageError::InvalidData {
-                        context: "interactions.target_agent_uid",
-                        reason: format!("interaction has no target at tick {tick}, seq {seq}"),
-                    })?;
-            interactions.push(PersistedInteraction {
-                tick: checked_u64("interactions.tick", tick)?,
-                seq: checked_u64("interactions.seq", seq)?,
-                kind: decode(&row, 2, "interactions.kind")?,
-                actor,
-                target,
-                value: decode(&row, 5, "interactions.value")?,
-                payload: decode(&row, 6, "interactions.payload_json")?,
-                actor_position: paired_position(
-                    decode(&row, 7, "replay_events.position_x")?,
-                    decode(&row, 8, "replay_events.position_y")?,
-                    "interactions.actor_position",
-                    tick,
-                    seq,
-                )?
-                .map(position_from_columns),
-                target_position: paired_position(
-                    decode(&row, 9, "replay_events.counterpart_position_x")?,
-                    decode(&row, 10, "replay_events.counterpart_position_y")?,
-                    "interactions.target_position",
-                    tick,
-                    seq,
-                )?
-                .map(position_from_columns),
-            });
-        }
+        let mut interactions = rows
+            .iter()
+            .map(persisted_interaction_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
         interactions.reverse();
         Ok(interactions)
     }
@@ -7450,21 +7897,21 @@ impl StorageReader {
         Ok(stats)
     }
 
-    /// Load a bounded page of the newest metric rows in chronological order.
-    /// The most recent `limit` narrative events, ordered oldest-first (`bd-erff`).
+    /// The most recent `limit` narrative events in canonical identity order.
     ///
-    /// Mirrors [`Self::recent_metrics`] exactly — bounded limit, newest-window select,
-    /// ascending return — so a caller moving between the two surfaces does not have to
-    /// remember which way each one runs. That symmetry is deliberate: the retired async
-    /// reader and `StorageReader` silently disagreed on metric order until `bd-vd3t`, and a
-    /// second reader with its own convention would invite the same defect.
+    /// The descending inner query selects the newest bounded window; reversing the fully
+    /// decoded result returns the stable primary-key order `(tick, kind, metric)`. All rows
+    /// are validated before any record escapes, including schema, typed kind/subject,
+    /// numeric evidence, and strict identity monotonicity.
     pub fn recent_run_events(&self, limit: usize) -> Result<Vec<PersistedRunEvent>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let bound = checked_query_limit("recent_run_events.limit", limit)?;
         let rows = self.connection()?.query_with_params(
-            "SELECT tick, kind, severity, metric, human_text, subject_ref
+            "SELECT tick, kind, severity, magnitude, window_start, window_end,
+                    metric, before_value, after_value, score, subject_ref, human_text,
+                    schema_version
              FROM run_events
              WHERE run_id = ?1
              ORDER BY tick DESC, kind DESC, metric DESC
@@ -7474,16 +7921,28 @@ impl StorageReader {
 
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            events.push(PersistedRunEvent {
-                tick: checked_u64("run_events.tick", decode(&row, 0, "run_events.tick")?)?,
-                kind: decode(&row, 1, "run_events.kind")?,
-                severity: decode(&row, 2, "run_events.severity")?,
-                metric: decode(&row, 3, "run_events.metric")?,
-                human_text: decode(&row, 4, "run_events.human_text")?,
-                subject_ref: decode(&row, 5, "run_events.subject_ref")?,
-            });
+            events.push(persisted_run_event_from_row(
+                &run_event_row_from_query_row(&row)?,
+            )?);
         }
         events.reverse();
+        for pair in events.windows(2) {
+            match pair[0].identity.cmp(&pair[1].identity) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => {
+                    return Err(RunEventDecodeError::DuplicateIdentity {
+                        identity: pair[0].identity.clone(),
+                    }
+                    .into());
+                }
+                std::cmp::Ordering::Greater => {
+                    return Err(invalid_run_event(
+                        RunEventField::IdentityOrder,
+                        format!("{} appeared before {}", pair[0].identity, pair[1].identity),
+                    ));
+                }
+            }
+        }
         Ok(events)
     }
 
@@ -10552,6 +11011,58 @@ impl Storage {
         self.validate_new_ancestry_relationships(prepared)
     }
 
+    fn validate_new_run_event_identities(
+        &self,
+        prepared: &StorageBuffer,
+    ) -> Result<(), StorageError> {
+        if prepared.run_events.is_empty() {
+            return Ok(());
+        }
+
+        let buffered = validated_run_event_map(&self.buffer.run_events)?;
+        for (identity, candidate) in validated_run_event_map(&prepared.run_events)? {
+            if let Some(existing) = buffered.get(&identity) {
+                return Err(run_event_identity_collision(identity, existing, &candidate));
+            }
+
+            let rows = self.connection()?.query_with_params(
+                "SELECT tick, kind, severity, magnitude, window_start, window_end,
+                        metric, before_value, after_value, score, subject_ref, human_text,
+                        schema_version
+                 FROM run_events
+                 WHERE run_id = ?1 AND tick = ?2 AND kind = ?3 AND metric = ?4
+                 LIMIT 2",
+                &[
+                    sqlite_run_id(self.run_id),
+                    encode_u64("run_events.tick", identity.tick.0)?.into(),
+                    identity.kind.as_str().into(),
+                    identity.metric.as_str().into(),
+                ],
+            )?;
+            if rows.len() > 1 {
+                return Err(RunEventDecodeError::DuplicateIdentity { identity }.into());
+            }
+            if let Some(row) = rows.first() {
+                let persisted = persisted_run_event_from_row(&run_event_row_from_query_row(row)?)?;
+                if persisted.identity != identity {
+                    return Err(invalid_run_event(
+                        RunEventField::IdentityOrder,
+                        format!(
+                            "identity lookup for {identity} returned {}",
+                            persisted.identity
+                        ),
+                    ));
+                }
+                return Err(run_event_identity_collision(
+                    identity,
+                    &persisted.record,
+                    &candidate,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn load_host_journal_progress(
         &self,
         session_id: HostSessionId,
@@ -12126,6 +12637,7 @@ impl Storage {
         }
 
         self.validate_new_lifecycle_identities(prepared)?;
+        self.validate_new_run_event_identities(prepared)?;
         let batch_id = PersistenceBatchId::new(self.next_batch_id)?;
         let expected_previous = batch_id.as_i64() - 1;
         if before.admitted_raw() != expected_previous {
@@ -12305,6 +12817,7 @@ impl Storage {
                 Some(batch.tick)
             );
             self.validate_new_lifecycle_identities(&batch.storage)?;
+            self.validate_new_run_event_identities(&batch.storage)?;
             self.buffer.append(batch.storage);
             self.buffered_outbox_ids.push(batch.batch_id);
             next_unapplied += 1;
@@ -12661,10 +13174,10 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        // `insert or replace` matches the other scientific tables: replaying an admitted
-        // outbox batch after recovery must be idempotent rather than a constraint violation
-        // on the (run_id, tick, kind, metric) primary key.
-        let sql = "insert or replace into run_events (
+        // Application and the applied watermark commit in one transaction. Recovery therefore
+        // inserts only admitted-but-unapplied rows; replacing an existing primary key would hide
+        // a duplicate or conflicting canonical event identity.
+        let sql = "insert into run_events (
                 run_id, tick, kind, severity, magnitude, window_start, window_end,
                 metric, before_value, after_value, score, subject_ref, human_text,
                 schema_version
@@ -12981,6 +13494,34 @@ impl Storage {
                 &self.buffered_outbox_ids,
             ) {
                 Ok(()) => {
+                    for event in &self.buffer.run_events {
+                        let identity = format!(
+                            "v1/{}/{}/{}:{}",
+                            event.tick,
+                            event.kind,
+                            event.metric.len(),
+                            event.metric
+                        );
+                        info!(
+                            path = %self.path,
+                            run_id = %self.run_id,
+                            event_identity = %identity,
+                            event_tick = event.tick,
+                            event_kind = %event.kind,
+                            event_metric = %event.metric,
+                            schema_version = event.schema_version,
+                            severity = event.severity,
+                            magnitude = event.magnitude,
+                            window_start = event.window_start,
+                            window_end = event.window_end,
+                            before = event.before_value,
+                            after = event.after_value,
+                            score = event.score,
+                            subject_ref = ?event.subject_ref,
+                            human_text = %event.human_text,
+                            "narrative event persisted"
+                        );
+                    }
                     info!(
                         path = %self.path,
                         attempt,
@@ -15906,48 +16447,22 @@ fn scope_label(scope: ReplayRngScope) -> String {
 /// The table's CHECK constraints are the contract, so the conversion refuses what the schema
 /// would reject rather than deferring to a constraint violation that would roll back the
 /// whole batch — including the scientific rows sharing the transaction.
-fn run_event_row_from_record(
-    record: &scriptbots_core::narrative::EventRecord,
-) -> Result<RunEventRow, StorageError> {
-    let invalid = |reason: String| StorageError::InvalidData {
-        context: "run_events",
-        reason,
-    };
-    if record.human_text.is_empty() {
-        return Err(invalid("human_text is empty".to_owned()));
-    }
-    if record.metric.is_empty() {
-        return Err(invalid("metric is empty".to_owned()));
-    }
-    if !record.severity.is_finite() || !(0.0..=1.0).contains(&record.severity) {
-        return Err(invalid(format!(
-            "severity {} is outside 0.0..=1.0",
-            record.severity
-        )));
-    }
-    for (label, value) in [
-        ("magnitude", record.magnitude),
-        ("before", record.before),
-        ("after", record.after),
-        ("score", record.score),
-    ] {
-        if !value.is_finite() {
-            return Err(invalid(format!("{label} is not finite: {value}")));
-        }
-    }
-    let as_i64 = |label: &str, value: u64| -> Result<i64, StorageError> {
-        i64::try_from(value).map_err(|_| StorageError::InvalidData {
-            context: "run_events",
-            reason: format!("{label} {value} exceeds i64"),
+fn run_event_row_from_record(record: &EventRecord) -> Result<RunEventRow, StorageError> {
+    let as_i64 = |field: RunEventField, value: u64| -> Result<i64, StorageError> {
+        i64::try_from(value).map_err(|error| {
+            invalid_run_event(
+                field,
+                format!("{value} exceeds the SQLite integer range: {error}"),
+            )
         })
     };
-    Ok(RunEventRow {
-        tick: as_i64("tick", record.tick.0)?,
+    let row = RunEventRow {
+        tick: as_i64(RunEventField::Tick, record.tick.0)?,
         kind: record.kind.as_str().to_owned(),
         severity: f64::from(record.severity),
         magnitude: record.magnitude,
-        window_start: as_i64("window_start", record.window.0)?,
-        window_end: as_i64("window_end", record.window.1)?,
+        window_start: as_i64(RunEventField::WindowStart, record.window.0)?,
+        window_end: as_i64(RunEventField::WindowEnd, record.window.1)?,
         metric: record.metric.clone(),
         before_value: record.before,
         after_value: record.after,
@@ -15957,7 +16472,10 @@ fn run_event_row_from_record(
             .map(scriptbots_core::narrative::SubjectRef::to_db_string),
         human_text: record.human_text.clone(),
         schema_version: i64::from(record.schema_version),
-    })
+    };
+    let decoded = persisted_run_event_from_row(&row)?;
+    debug_assert_eq!(&decoded.record, record);
+    Ok(row)
 }
 
 fn replay_row_from_event(
@@ -16359,6 +16877,50 @@ fn replay_event_row_from_query_row(row: &Row) -> Result<ReplayEventRow, StorageE
     })
 }
 
+/// Decode the shared interaction/replay join used by both bounded UI pages and
+/// complete offline-analysis windows.
+fn persisted_interaction_from_row(row: &Row) -> Result<PersistedInteraction, StorageError> {
+    let tick: i64 = decode(row, 0, "interactions.tick")?;
+    let seq: i64 = decode(row, 1, "interactions.seq")?;
+    // Decode nullable participant columns explicitly so corrupt rows name the
+    // missing identity rather than surfacing an opaque SQL conversion error.
+    let actor = decode_agent_uid(decode(row, 3, "interactions.actor_agent_uid")?, tick, seq)?
+        .ok_or_else(|| StorageError::InvalidData {
+            context: "interactions.actor_agent_uid",
+            reason: format!("interaction has no actor at tick {tick}, seq {seq}"),
+        })?;
+    let target = decode_agent_uid(decode(row, 4, "interactions.target_agent_uid")?, tick, seq)?
+        .ok_or_else(|| StorageError::InvalidData {
+            context: "interactions.target_agent_uid",
+            reason: format!("interaction has no target at tick {tick}, seq {seq}"),
+        })?;
+    Ok(PersistedInteraction {
+        tick: checked_u64("interactions.tick", tick)?,
+        seq: checked_u64("interactions.seq", seq)?,
+        kind: decode(row, 2, "interactions.kind")?,
+        actor,
+        target,
+        value: decode(row, 5, "interactions.value")?,
+        payload: decode(row, 6, "interactions.payload_json")?,
+        actor_position: paired_position(
+            decode(row, 7, "replay_events.position_x")?,
+            decode(row, 8, "replay_events.position_y")?,
+            "interactions.actor_position",
+            tick,
+            seq,
+        )?
+        .map(position_from_columns),
+        target_position: paired_position(
+            decode(row, 9, "replay_events.counterpart_position_x")?,
+            decode(row, 10, "replay_events.counterpart_position_y")?,
+            "interactions.target_position",
+            tick,
+            seq,
+        )?
+        .map(position_from_columns),
+    })
+}
+
 /// Refuse a half-written coordinate pair rather than inventing the missing half.
 ///
 /// A row with an x and no y cannot be interpreted: the alternatives are to guess zero, which
@@ -16611,7 +17173,7 @@ mod tests {
     use super::*;
     use scriptbots_core::{
         AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
-        PersistenceEventKind, Position, ScriptBotsConfig, Tick, TickSummary, WorldState,
+        PersistenceEventKind, Position, ScriptBotsConfig, Tick, TickSummary, Velocity, WorldState,
         rng_domains::AgentRngCountersV1,
     };
     use scriptbots_runtime::{
@@ -21007,6 +21569,97 @@ mod tests {
 
         storage.close()?;
         let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn finished_reader_exposes_complete_canonical_analysis_windows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-phenotype-window");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let mut first = sample_batch(0, 5.0);
+        first.births = vec![
+            sample_birth(0, 1, BirthOrigin::Seeded),
+            sample_birth(0, 2, BirthOrigin::Seeded),
+        ];
+        first.agents[0].data.velocity = Velocity::new(3.0, 4.0);
+        first.agents[0].runtime.herbivore_tendency = 0.25;
+        first.agents[0].runtime.trait_modifiers.smell = 1.0;
+        first.agents[0].runtime.trait_modifiers.sound = 2.0;
+        first.agents[0].runtime.trait_modifiers.hearing = 3.0;
+        first.agents[0].runtime.trait_modifiers.eye = 4.0;
+        first.agents[0].runtime.trait_modifiers.blood = 5.0;
+        storage.persist(&first)?;
+
+        let mut second = sample_batch(2, 4.0);
+        second.agents[0].data.velocity = Velocity::new(0.0, 2.0);
+        second.replay_events.push(ReplayEvent {
+            agent_uid: Some(AgentUid(1)),
+            position: Some(Position::new(1.0, 2.0)),
+            counterpart: Some(AgentUid(2)),
+            counterpart_position: Some(Position::new(3.0, 4.0)),
+            kind: ReplayEventKind::Interaction {
+                tick: Tick(2),
+                ordinal: 0,
+                kind: ReplayInteractionKind::Combat,
+                magnitude: 1.5,
+            },
+        });
+        second.events.extend([
+            PersistenceEvent::new(
+                PersistenceEventKind::Custom(INTERACTION_EVENTS_OBSERVED_KIND.into()),
+                1,
+            ),
+            PersistenceEvent::new(
+                PersistenceEventKind::Custom(INTERACTION_EVENTS_PERSISTED_KIND.into()),
+                1,
+            ),
+        ]);
+        storage.persist(&second)?;
+        storage.flush()?;
+        storage.close()?;
+
+        let reader = StorageReader::open_finished(&path_string)?;
+        let first_window = reader.load_agent_observations(0, 2)?;
+        assert_eq!(first_window.len(), 1);
+        assert_eq!(first_window[0].tick, 0);
+        assert_eq!(first_window[0].agent_uid, AgentUid(1));
+        assert_eq!(first_window[0].velocity_x, 3.0);
+        assert_eq!(first_window[0].velocity_y, 4.0);
+        assert_eq!(first_window[0].herbivore_tendency, 0.25);
+        assert_eq!(first_window[0].trait_blood, 5.0);
+
+        let all_observations = reader.load_agent_observations(0, 3)?;
+        assert_eq!(
+            all_observations
+                .iter()
+                .map(|row| (row.agent_uid, row.tick))
+                .collect::<Vec<_>>(),
+            vec![(AgentUid(1), 0), (AgentUid(1), 2)]
+        );
+        let interactions = reader.load_interactions_window(0, 3)?;
+        assert_eq!(interactions.len(), 1);
+        assert_eq!(interactions[0].actor, AgentUid(1));
+        assert_eq!(interactions[0].target, AgentUid(2));
+        assert_eq!(interactions[0].kind, "combat");
+        assert_eq!(interactions[0].value, Some(1.5));
+        assert_eq!(
+            reader.load_interaction_capture()?,
+            PersistedInteractionCapture {
+                observed: 1,
+                persisted: 1,
+                sampled_out: 0,
+                truncated: 0,
+            }
+        );
+        assert_invalid_data_context(
+            reader.load_agent_observations(2, 2),
+            "agents.analysis_window",
+        );
+        reader.close()?;
         Ok(())
     }
 

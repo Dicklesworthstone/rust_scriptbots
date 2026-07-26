@@ -211,7 +211,7 @@ fn buffered_narrative_events_are_never_dropped_between_batches() {
 
     let actual = stored
         .iter()
-        .map(|event| (event.tick, event.human_text.clone()))
+        .map(|event| (event.record().tick.0, event.record().human_text.clone()))
         .collect::<Vec<_>>();
     assert_eq!(
         actual, expected,

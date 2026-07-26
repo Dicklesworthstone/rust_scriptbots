@@ -1,12 +1,24 @@
-use fsqlite::compat::{OpenFlags, RowExt, open_with_flags};
-use scriptbots_core::{
-    AgentData, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, PersistenceBatch, Position, ReplayEvent,
-    ReplayEventKind, ReplayInteractionKind, ScriptBotsConfig, Tick, TickSummary, WorldState,
-    channels::OutputChannel,
+use fsqlite::{
+    Connection,
+    compat::{OpenFlags, RowExt, open_with_flags},
 };
-use scriptbots_storage::{StorageDeadlines, StoragePipeline, StorageReader};
+use scriptbots_core::{
+    AgentData, AgentUid, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, PersistenceBatch, Position,
+    ReplayEvent, ReplayEventKind, ReplayInteractionKind, ScriptBotsConfig, Tick, TickSummary,
+    WorldState,
+    channels::OutputChannel,
+    narrative::{EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord, SubjectRef},
+};
+use scriptbots_runtime::RunId;
+use scriptbots_storage::{
+    RunEventDecodeError, RunEventField, RunEventIdentity, RunManifestRecord, Storage,
+    StorageDeadlines, StorageError, StoragePipeline, StorageReader,
+};
 use std::{
     fs,
+    io::Write,
+    process::Command,
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -132,112 +144,427 @@ fn storage_persists_metrics_roundtrip() {
     let _ = fs::remove_file(&path);
 }
 
-#[test]
-/// Every narrative event emitted online must be readable back from the run database.
-///
-/// This is a real parity proof again (`bd-erff`). It could not be one for most of its life:
-/// storage charged `PersistenceBatch.narrative_events` against the admission budget and then
-/// discarded it, so there was no offline side to compare against. An earlier session made
-/// the file compile by replacing a call to the nonexistent `StorageReader::search_narrative`
-/// with a `max_tick` probe, which left the parity claim in the name while asserting nothing
-/// about it.
-///
-/// The offline half now exists, and asserting it immediately earned its keep: it caught that
-/// `StorageBuffer::append` silently dropped `run_events`, so rows were built per batch and
-/// then lost when batches merged into the flush buffer. The writer looked correct and
-/// persisted nothing.
-fn narrative_events_persisted_online_are_readable_offline() {
+const NARRATIVE_CHILD_PATH: &str = "SCRIPTBOTS_NARRATIVE_CHILD_PATH";
+const NARRATIVE_CHILD_SEED: &str = "SCRIPTBOTS_NARRATIVE_CHILD_SEED";
+const NARRATIVE_CRASH_EXIT: i32 = 86;
+
+#[derive(Clone)]
+struct NarrativeLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for NarrativeLogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("narrative log buffer poisoned")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn narrative_log_buffer() -> NarrativeLogBuffer {
+    static BUFFER: LazyLock<NarrativeLogBuffer> = LazyLock::new(|| {
+        let buffer = NarrativeLogBuffer(Arc::new(Mutex::new(Vec::new())));
+        let writer = buffer.clone();
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .try_init();
+        buffer
+    });
+    BUFFER.clone()
+}
+
+impl NarrativeLogBuffer {
+    fn records_for(&self, needle: &str) -> Vec<String> {
+        let text = String::from_utf8_lossy(&self.0.lock().expect("narrative log buffer poisoned"))
+            .into_owned();
+        text.lines()
+            .filter(|line| line.contains(needle))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+fn narrative_test_path(label: &str, seed: u64) -> std::path::PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
-        .as_micros();
-    let path = std::env::temp_dir().join(format!(
-        "scriptbots_narrative_parity_{}_{}.sqlite",
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "scriptbots_narrative_{label}_{seed:016x}_{}_{}.sqlite",
         std::process::id(),
         timestamp
-    ));
-    let path_str = path.to_str().expect("utf8 path");
-    let mut pipeline =
-        StoragePipeline::create_unattributed_file_with_thresholds(path_str, 1, 1, 1, 1)
-            .expect("pipeline");
+    ))
+}
 
-    let config = ScriptBotsConfig {
-        world_width: 200,
-        world_height: 200,
-        food_cell_size: 20,
-        rng_seed: Some(0xCA1F),
-        persistence_interval: 1,
-        ..ScriptBotsConfig::default()
-    };
+fn curated_narrative_events(seed: u64) -> Vec<EventRecord> {
+    let base = 20 + seed % 31;
+    vec![
+        EventRecord {
+            schema_version: EVENT_RECORD_SCHEMA_VERSION,
+            tick: Tick(base),
+            kind: EventKind::PopulationBoom,
+            severity: 0.75,
+            magnitude: 8.0 + (seed & 7) as f64,
+            window: (base - 4, base),
+            metric: "population".to_owned(),
+            before: 24.0,
+            after: 48.0,
+            score: 4.5,
+            subject: None,
+            human_text: format!("seed {seed:016x}: population doubled"),
+        },
+        EventRecord {
+            schema_version: EVENT_RECORD_SCHEMA_VERSION,
+            tick: Tick(base + 3),
+            kind: EventKind::DietShift,
+            severity: 0.5,
+            magnitude: 0.25,
+            window: (base, base + 3),
+            metric: "diet.mix".to_owned(),
+            before: 0.25,
+            after: 0.5,
+            score: 3.0,
+            subject: Some(SubjectRef::Species(seed & 0xff)),
+            human_text: format!("seed {seed:016x}: diet shifted"),
+        },
+        EventRecord {
+            schema_version: EVENT_RECORD_SCHEMA_VERSION,
+            tick: Tick(base),
+            kind: EventKind::EnergyRecovery,
+            severity: 0.25,
+            magnitude: 1.5,
+            window: (base - 2, base),
+            metric: "energy.mean".to_owned(),
+            before: 2.0,
+            after: 3.5,
+            score: 2.25,
+            subject: Some(SubjectRef::Agent(AgentUid(seed))),
+            human_text: format!("seed {seed:016x}: energy recovered"),
+        },
+    ]
+}
 
-    let online_events = {
-        let (mut world, mut persistence) =
-            WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
-
-        for seed in 0..24 {
-            world
-                .try_spawn_agent(AgentData {
-                    position: scriptbots_core::Position::new(
-                        (seed * 37 % 190) as f32,
-                        (seed * 53 % 190) as f32,
-                    ),
-                    health: 1.0,
-                    ..AgentData::default()
-                })
-                .expect("valid agent");
-        }
-
-        for _ in 0..500 {
-            persistence.step(&mut world).expect("persistence step");
-        }
-
-        world
-            .narrative_events()
-            .iter()
-            .map(|e| (e.tick.0, e.human_text.clone()))
-            .collect::<Vec<_>>()
-    };
-
-    pipeline.shutdown().expect("clean shutdown");
-
-    let storage = StorageReader::open(path_str).expect("open storage");
-    let max_tick = storage.max_tick().expect("read max tick");
-    assert!(max_tick.is_some());
-    assert!(
-        !online_events.is_empty(),
-        "expected online events generated during run"
-    );
-    storage.close().expect("close storage reader");
-
-    // The offline half, restored (bd-erff). This test was named for online/offline parity
-    // but could not check it: narrative events reached the persistence boundary and were
-    // discarded, because nothing wrote `StorageBuffer.run_events`. With the writer in place
-    // every event the world emitted must now be readable back from the run database.
-    let reader = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .expect("independent read-only reader opens");
-    let rows = reader
-        .query("SELECT tick, human_text FROM run_events ORDER BY tick ASC, human_text ASC")
-        .expect("run_events query runs");
-    let mut offline_events = rows
+fn narrative_batch(events: Vec<EventRecord>) -> PersistenceBatch {
+    let tick = events
         .iter()
-        .map(|row| {
-            let tick: i64 = row.get_typed(0).expect("tick is INTEGER");
-            let text: String = row.get_typed(1).expect("human_text is TEXT");
-            (u64::try_from(tick).expect("tick is non-negative"), text)
-        })
-        .collect::<Vec<_>>();
-    reader.close().expect("read-only reader closes");
+        .map(|event| event.tick.0)
+        .max()
+        .expect("curated run has events");
+    PersistenceBatch {
+        summary: TickSummary {
+            tick: Tick(tick),
+            agent_count: 0,
+            births: 0,
+            deaths: 0,
+            total_energy: 0.0,
+            average_energy: 0.0,
+            average_health: 0.0,
+            max_age: 0,
+            spike_hits: 0,
+        },
+        epoch: 0,
+        closed: false,
+        metrics: Vec::new(),
+        events: Vec::new(),
+        agents: Vec::new(),
+        births: Vec::new(),
+        deaths: Vec::new(),
+        replay_events: Vec::new(),
+        narrative_events: events,
+    }
+}
 
-    let mut expected = online_events.clone();
-    expected.sort();
-    offline_events.sort();
-    assert_eq!(
-        offline_events, expected,
-        "every narrative event the world emitted online must be readable back from the run \
-         database; this is the parity the test is named for"
+fn expected_narrative_pairs(seed: u64) -> Vec<(RunEventIdentity, EventRecord)> {
+    let mut expected = curated_narrative_events(seed)
+        .into_iter()
+        .map(|record| (RunEventIdentity::from_record(&record), record))
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    expected
+}
+
+/// Guarded child role: durably admit the exact narrative payload, then emulate a process crash
+/// before the high-threshold worker can apply it. The parent owns all assertions.
+#[test]
+fn narrative_outbox_crash_child() {
+    let (Ok(path), Ok(seed)) = (
+        std::env::var(NARRATIVE_CHILD_PATH),
+        std::env::var(NARRATIVE_CHILD_SEED),
+    ) else {
+        return;
+    };
+    let seed = seed.parse::<u64>().expect("child seed is u64");
+    let run_id = RunId::new(u128::from(seed));
+    let mut manifest = RunManifestRecord::unattributed(run_id);
+    manifest.root_seed = seed;
+    manifest.variant_id = Some(format!("curated-seed-{seed:016x}"));
+    let pipeline = StoragePipeline::create_new_file_for_run_with_thresholds(
+        &path, manifest, 10_000, 10_000, 10_000, 10_000,
+    )
+    .expect("child pipeline opens");
+    let receipt = pipeline
+        .submit_with_receipt(&narrative_batch(curated_narrative_events(seed)))
+        .expect("child payload reaches the durable outbox");
+    println!(
+        "narrative-child: path={path} seed={seed:016x} batch={} admitted={:?}",
+        receipt.batch_id.get(),
+        receipt.watermarks.admitted
     );
+    std::io::stdout().flush().expect("child stdout flushes");
+    std::process::exit(NARRATIVE_CRASH_EXIT);
+}
+
+/// Three seeded, curated narrative runs survive a real admitted-before-apply process exit.
+#[test]
+fn narrative_events_recover_as_byte_identical_typed_records_with_stable_identities() {
+    let logs = narrative_log_buffer();
+    for seed in [0xCA1F_u64, 0x5EED, 0xD1E7] {
+        let path = narrative_test_path("recovery", seed);
+        let path_str = path.to_str().expect("utf8 path");
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "narrative_outbox_crash_child", "--nocapture"])
+            .env(NARRATIVE_CHILD_PATH, path_str)
+            .env(NARRATIVE_CHILD_SEED, seed.to_string())
+            .output()
+            .expect("narrative child launches");
+        assert_eq!(
+            output.status.code(),
+            Some(NARRATIVE_CRASH_EXIT),
+            "child must exit at the admitted-before-apply crash boundary: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut recovered =
+            StoragePipeline::recover_existing(path_str).expect("outbox recovery opens");
+        let shutdown = recovered.shutdown().expect("recovered run shuts down");
+        assert_eq!(shutdown.watermarks.admitted, shutdown.watermarks.applied);
+        assert_eq!(shutdown.watermarks.applied, shutdown.watermarks.durable);
+
+        let expected = expected_narrative_pairs(seed);
+        let reader = StorageReader::open(path_str).expect("typed reader opens");
+        let first = reader
+            .recent_run_events(64)
+            .expect("complete narrative events decode")
+            .into_iter()
+            .map(|event| event.into_parts())
+            .collect::<Vec<_>>();
+        reader.close().expect("typed reader closes");
+        assert_eq!(
+            serde_json::to_vec(&first).expect("first read serializes"),
+            serde_json::to_vec(&expected).expect("expected events serialize"),
+            "seed {seed:016x} did not reload byte-identical full EventRecord values"
+        );
+
+        let mut recovered_again =
+            StoragePipeline::recover_existing(path_str).expect("fixed-point recovery opens");
+        recovered_again
+            .shutdown()
+            .expect("fixed-point recovery shuts down");
+        let reader = StorageReader::open(path_str).expect("second typed reader opens");
+        let second = reader
+            .recent_run_events(64)
+            .expect("second complete narrative read")
+            .into_iter()
+            .map(|event| event.into_parts())
+            .collect::<Vec<_>>();
+        reader.close().expect("second typed reader closes");
+        assert_eq!(
+            serde_json::to_vec(&second).expect("second read serializes"),
+            serde_json::to_vec(&first).expect("first read reserializes"),
+            "seed {seed:016x} identities or evidence changed across repeated recovery"
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|(identity, _)| identity)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(identity, _)| identity)
+                .collect::<Vec<_>>(),
+            "seed {seed:016x} reader order is not canonical identity order"
+        );
+
+        let event_logs = logs
+            .records_for(path_str)
+            .into_iter()
+            .filter(|line| line.contains("narrative event persisted"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_logs.len(),
+            expected.len(),
+            "one structured info record is required per recovered event: {event_logs:?}"
+        );
+        for (identity, record) in &expected {
+            let matching = event_logs
+                .iter()
+                .filter(|line| line.contains(&format!("event_identity={identity}")))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "identity {identity} must have exactly one structured record: {event_logs:?}"
+            );
+            let line = matching[0];
+            for field in [
+                "event_tick=",
+                "event_kind=",
+                "event_metric=",
+                "schema_version=",
+                "severity=",
+                "magnitude=",
+                "window_start=",
+                "window_end=",
+                "before=",
+                "after=",
+                "score=",
+                "subject_ref=",
+                "human_text=",
+            ] {
+                assert!(
+                    line.contains(field),
+                    "structured record for {identity} omitted {field}: {line}"
+                );
+            }
+            assert!(line.contains(" INFO "), "event record is not INFO: {line}");
+            assert!(line.contains(record.kind.as_str()));
+            assert!(line.contains(&record.metric));
+            assert!(line.contains(&record.human_text));
+            if let Some(subject) = record.subject {
+                assert!(line.contains(&subject.to_db_string()));
+            }
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+}
+
+fn create_narrative_fixture(path: &str, event: EventRecord) {
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(path, 1, 1, 1, 1)
+        .expect("fixture pipeline opens");
+    pipeline
+        .submit(&narrative_batch(vec![event]))
+        .expect("fixture event admits");
+    pipeline.shutdown().expect("fixture pipeline shuts down");
+}
+
+fn mutate_narrative_fixture(path: &str, sql: &str) {
+    let connection = Connection::open(path).expect("fixture writer opens");
+    connection.execute(sql).expect("fixture mutation applies");
+    connection.close().expect("fixture writer closes");
+}
+
+#[test]
+fn narrative_reader_refuses_future_and_malformed_rows_without_partial_defaults() {
+    let seed = 0xA11CE_u64;
+    let path = narrative_test_path("malformed", seed);
+    let path_str = path.to_str().expect("utf8 path");
+    let event = curated_narrative_events(seed)
+        .into_iter()
+        .next()
+        .expect("curated event");
+    create_narrative_fixture(path_str, event);
+
+    mutate_narrative_fixture(path_str, "UPDATE run_events SET schema_version = 2");
+    let reader = StorageReader::open(path_str).expect("reader opens future row");
+    let error = reader
+        .recent_run_events(8)
+        .expect_err("future schema must be refused");
+    assert!(matches!(
+        error,
+        StorageError::RunEvent(RunEventDecodeError::UnsupportedSchemaVersion {
+            found: 2,
+            supported: EVENT_RECORD_SCHEMA_VERSION,
+        })
+    ));
+    reader.close().expect("reader closes");
+    mutate_narrative_fixture(path_str, "UPDATE run_events SET schema_version = 1");
+
+    mutate_narrative_fixture(path_str, "UPDATE run_events SET kind = 'unknown_kind'");
+    let reader = StorageReader::open(path_str).expect("reader opens malformed kind");
+    let error = reader
+        .recent_run_events(8)
+        .expect_err("malformed identity kind must be refused");
+    assert!(matches!(
+        error,
+        StorageError::RunEvent(RunEventDecodeError::InvalidField {
+            field: RunEventField::Kind,
+            ..
+        })
+    ));
+    reader.close().expect("reader closes");
+    mutate_narrative_fixture(
+        path_str,
+        "UPDATE run_events SET kind = 'population_boom', subject_ref = 'agent:not-a-number'",
+    );
+
+    let reader = StorageReader::open(path_str).expect("reader opens malformed subject");
+    let error = reader
+        .recent_run_events(8)
+        .expect_err("malformed typed subject must be refused");
+    assert!(matches!(
+        error,
+        StorageError::RunEvent(RunEventDecodeError::InvalidField {
+            field: RunEventField::Subject,
+            ..
+        })
+    ));
+    reader.close().expect("reader closes");
+    mutate_narrative_fixture(
+        path_str,
+        "UPDATE run_events SET subject_ref = NULL, severity = 0.1",
+    );
+
+    let reader = StorageReader::open(path_str).expect("reader opens malformed numeric");
+    let error = reader
+        .recent_run_events(8)
+        .expect_err("precision-changing severity must be refused");
+    assert!(matches!(
+        error,
+        StorageError::RunEvent(RunEventDecodeError::InvalidField {
+            field: RunEventField::Severity,
+            ..
+        })
+    ));
+    reader.close().expect("reader closes");
 
     let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn narrative_admission_refuses_duplicate_and_conflicting_identities() {
+    let seed = 0xD0B1E_u64;
+    let event = curated_narrative_events(seed)
+        .into_iter()
+        .next()
+        .expect("curated event");
+    let mut storage = Storage::unattributed_memory().expect("memory storage opens");
+    let duplicate = storage
+        .persist(&narrative_batch(vec![event.clone(), event.clone()]))
+        .expect_err("an identical identity cannot be admitted twice");
+    assert!(matches!(
+        duplicate,
+        StorageError::RunEvent(RunEventDecodeError::DuplicateIdentity { .. })
+    ));
+
+    let mut changed = event.clone();
+    changed.after += 1.0;
+    changed.human_text.push_str(" conflicting");
+    let conflict = storage
+        .persist(&narrative_batch(vec![event, changed]))
+        .expect_err("one identity cannot carry unstable evidence");
+    assert!(matches!(
+        conflict,
+        StorageError::RunEvent(RunEventDecodeError::ConflictingIdentity { .. })
+    ));
+    storage.close().expect("memory storage closes");
 }
 
 /// Build a batch carrying exactly the supplied replay events at `tick`.
