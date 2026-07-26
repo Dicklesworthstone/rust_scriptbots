@@ -10,6 +10,7 @@
 use crate::SmallRngStream;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Error variants for infotheory estimations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -51,8 +52,20 @@ pub struct SurrogateStats {
 pub struct MiEstimate {
     /// Uncorrected plug-in mutual information (in bits).
     pub bits_plugin: f64,
-    /// Miller-Madow bias-corrected mutual information (in bits).
+    /// Miller-Madow bias-corrected mutual information (in bits), floored at zero.
+    ///
+    /// This is the reportable point estimate: mutual information cannot be negative, so a
+    /// correction that overshoots is reported as zero.
     pub bits_corrected: f64,
+    /// The same correction WITHOUT the non-negativity floor (bd-r4ja).
+    ///
+    /// Use this, never [`Self::bits_corrected`], to measure residual bias. Averaging the floored
+    /// value estimates `E[max(0, MI_MM)]`, which is strictly greater than `E[MI_MM]` whenever the
+    /// null distribution has negative mass -- so a bias guard built on the floored value reports
+    /// the truncation, not the bias. bd-270k measured 29 of 100 runs on independent noise hitting
+    /// the floor, which is most of the gap between the observed 0.0398 and the ~0.01 the
+    /// Miller-Madow residual predicts at these bin counts.
+    pub bits_corrected_unclamped: f64,
     /// Number of sample pairs evaluated.
     pub n: usize,
     /// Number of uniform discretization bins.
@@ -194,6 +207,363 @@ pub fn evaluate_study_emergence(
         scrambled_arm_p_value: scrambled_mi_p_value,
         behavioral_effect_delta: behavioral_conditioning_delta,
     }
+}
+
+/// Number of predeclared seeds in each communication-study arm.
+pub const COMMUNICATION_STUDY_SEEDS_PER_ARM: usize = 10;
+
+/// Fixed tick budget for every run in the pre-registered communication study.
+pub const COMMUNICATION_STUDY_TICKS_PER_RUN: u64 = 100_000;
+
+/// Total number of runs in the three-arm communication study.
+pub const COMMUNICATION_STUDY_TOTAL_RUNS: usize = 3 * COMMUNICATION_STUDY_SEEDS_PER_ARM;
+
+/// One arm of the pre-registered communication-emergence study.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommunicationStudyArm {
+    /// Existing one-band channel.
+    Legacy,
+    /// Three-band channel whose emitter-to-listener mapping is preserved.
+    Signal,
+    /// Three-band channel with the matched-cost deterministic scramble enabled.
+    ScrambledControl,
+}
+
+impl CommunicationStudyArm {
+    const ALL: [Self; 3] = [Self::Legacy, Self::Signal, Self::ScrambledControl];
+
+    const fn expected_bands(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Signal | Self::ScrambledControl => 3,
+        }
+    }
+}
+
+/// Immutable design registered before any communication-study run begins.
+///
+/// Deserialized plans must call [`Self::validate`] before execution. The fixed
+/// seed count, tick budget, and band counts make post-hoc extension observable
+/// instead of allowing a study to keep running until it finds a preferred
+/// result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunicationStudyPlan {
+    /// Versioned scenario identifier, such as `sentinel-v1`.
+    pub scenario_id: String,
+    /// Canonically sorted root seeds used once in every arm.
+    pub root_seeds: Vec<u64>,
+    /// Completed ticks required from every run.
+    pub ticks_per_run: u64,
+    /// Band count for the legacy arm.
+    pub legacy_bands: u8,
+    /// Band count shared by the signal and scrambled-control arms.
+    pub signal_bands: u8,
+}
+
+impl CommunicationStudyPlan {
+    /// Build the fixed three-arm plan, sorting seed identity into canonical order.
+    pub fn new(
+        scenario_id: impl Into<String>,
+        mut root_seeds: Vec<u64>,
+    ) -> Result<Self, CommunicationStudyMatrixError> {
+        root_seeds.sort_unstable();
+        let plan = Self {
+            scenario_id: scenario_id.into(),
+            root_seeds,
+            ticks_per_run: COMMUNICATION_STUDY_TICKS_PER_RUN,
+            legacy_bands: 1,
+            signal_bands: 3,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Reject a plan that changes the pre-registered sample count, stopping rule,
+    /// or matched-cost arm layout.
+    pub fn validate(&self) -> Result<(), CommunicationStudyMatrixError> {
+        if self.scenario_id.trim().is_empty() {
+            return Err(CommunicationStudyMatrixError::EmptyScenarioId);
+        }
+        if self.root_seeds.len() != COMMUNICATION_STUDY_SEEDS_PER_ARM {
+            return Err(CommunicationStudyMatrixError::SeedCount {
+                expected: COMMUNICATION_STUDY_SEEDS_PER_ARM,
+                actual: self.root_seeds.len(),
+            });
+        }
+        for pair in self.root_seeds.windows(2) {
+            if pair[0] == pair[1] {
+                return Err(CommunicationStudyMatrixError::DuplicateSeed { seed: pair[0] });
+            }
+            if pair[0] > pair[1] {
+                return Err(CommunicationStudyMatrixError::NonCanonicalSeedOrder);
+            }
+        }
+        if self.ticks_per_run != COMMUNICATION_STUDY_TICKS_PER_RUN {
+            return Err(CommunicationStudyMatrixError::PlanTickBudget {
+                expected: COMMUNICATION_STUDY_TICKS_PER_RUN,
+                actual: self.ticks_per_run,
+            });
+        }
+        if self.legacy_bands != 1 || self.signal_bands != 3 {
+            return Err(CommunicationStudyMatrixError::PlanBandLayout {
+                legacy: self.legacy_bands,
+                signal: self.signal_bands,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Provenance and completion identity for one arm/seed execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunicationStudyRunIdentity {
+    /// Study arm executed by this run.
+    pub arm: CommunicationStudyArm,
+    /// Root seed from the pre-registered plan.
+    pub root_seed: u64,
+    /// Number of completed ticks, which must equal the stopping rule exactly.
+    pub completed_ticks: u64,
+    /// Digest of the resolved run configuration.
+    pub config_digest: String,
+    /// Version of the brain/world I/O layout.
+    pub io_layout_version: u16,
+    /// Active signalling-band count.
+    pub bands: u8,
+    /// Exact source/build identity shared by every matched arm.
+    pub build_identity: String,
+}
+
+/// Canonically ordered, complete execution matrix for one pre-registered study.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatedCommunicationStudyMatrix {
+    /// Validated immutable plan.
+    pub plan: CommunicationStudyPlan,
+    /// All 30 runs ordered by arm and then root seed.
+    pub runs: Vec<CommunicationStudyRunIdentity>,
+    /// Exact source/build identity common to every run.
+    pub build_identity: String,
+}
+
+/// Why a communication-study plan or execution matrix is inadmissible.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+pub enum CommunicationStudyMatrixError {
+    /// The versioned scenario identity is absent.
+    #[error("communication study scenario_id must not be empty")]
+    EmptyScenarioId,
+    /// The plan does not contain exactly ten seeds.
+    #[error("communication study requires {expected} seeds per arm, got {actual}")]
+    SeedCount {
+        /// Required seed count.
+        expected: usize,
+        /// Supplied seed count.
+        actual: usize,
+    },
+    /// A seed appears more than once in the pre-registration.
+    #[error("communication study seed {seed} is duplicated")]
+    DuplicateSeed {
+        /// Duplicated seed.
+        seed: u64,
+    },
+    /// A deserialized plan did not preserve canonical ascending seed order.
+    #[error("communication study root_seeds must be strictly increasing")]
+    NonCanonicalSeedOrder,
+    /// The plan changed the fixed no-peeking stopping rule.
+    #[error("communication study requires {expected} ticks per run, got {actual}")]
+    PlanTickBudget {
+        /// Required tick budget.
+        expected: u64,
+        /// Supplied tick budget.
+        actual: u64,
+    },
+    /// The plan changed the matched-cost band layout.
+    #[error(
+        "communication study requires legacy=1 and signal/control=3 bands, got legacy={legacy}, signal={signal}"
+    )]
+    PlanBandLayout {
+        /// Supplied legacy-arm band count.
+        legacy: u8,
+        /// Supplied signal/control band count.
+        signal: u8,
+    },
+    /// The supplied matrix has the wrong number of runs.
+    #[error("communication study requires {expected} total runs, got {actual}")]
+    RunCount {
+        /// Required total run count.
+        expected: usize,
+        /// Supplied total run count.
+        actual: usize,
+    },
+    /// A run references a seed that was not pre-registered.
+    #[error("communication study run uses unregistered seed {seed}")]
+    UnregisteredSeed {
+        /// Unexpected seed.
+        seed: u64,
+    },
+    /// The same arm/seed cell appears twice.
+    #[error("communication study duplicates arm {arm:?} seed {seed}")]
+    DuplicateRun {
+        /// Duplicated arm.
+        arm: CommunicationStudyArm,
+        /// Duplicated seed.
+        seed: u64,
+    },
+    /// One pre-registered arm/seed cell is absent.
+    #[error("communication study is missing arm {arm:?} seed {seed}")]
+    MissingRun {
+        /// Missing arm.
+        arm: CommunicationStudyArm,
+        /// Missing seed.
+        seed: u64,
+    },
+    /// A run stopped early or extended past the pre-registered budget.
+    #[error(
+        "communication study arm {arm:?} seed {seed} completed {actual} ticks, expected {expected}"
+    )]
+    RunTickBudget {
+        /// Affected arm.
+        arm: CommunicationStudyArm,
+        /// Affected seed.
+        seed: u64,
+        /// Required completed tick count.
+        expected: u64,
+        /// Reported completed tick count.
+        actual: u64,
+    },
+    /// A run used the wrong band count for its arm.
+    #[error("communication study arm {arm:?} seed {seed} used {actual} bands, expected {expected}")]
+    RunBandCount {
+        /// Affected arm.
+        arm: CommunicationStudyArm,
+        /// Affected seed.
+        seed: u64,
+        /// Required band count.
+        expected: u8,
+        /// Reported band count.
+        actual: u8,
+    },
+    /// A run omitted its config digest.
+    #[error("communication study arm {arm:?} seed {seed} has an empty config digest")]
+    EmptyConfigDigest {
+        /// Affected arm.
+        arm: CommunicationStudyArm,
+        /// Affected seed.
+        seed: u64,
+    },
+    /// A run omitted its exact build identity.
+    #[error("communication study arm {arm:?} seed {seed} has an empty build identity")]
+    EmptyBuildIdentity {
+        /// Affected arm.
+        arm: CommunicationStudyArm,
+        /// Affected seed.
+        seed: u64,
+    },
+    /// Matched arms were executed from different source/build identities.
+    #[error("communication study build identity mismatch: expected {expected}, got {actual}")]
+    BuildIdentityMismatch {
+        /// Identity established by the first canonical run.
+        expected: String,
+        /// Conflicting identity.
+        actual: String,
+    },
+}
+
+/// Validate that a study executed exactly its pre-registered 3x10 matrix.
+///
+/// The returned order is independent of completion order, making its serialized
+/// bytes deterministic. This validates execution identity only; estimator rows
+/// and the positive/negative scientific verdict remain separate so a complete
+/// negative study is still an admissible artifact.
+pub fn validate_communication_study_matrix(
+    plan: &CommunicationStudyPlan,
+    runs: &[CommunicationStudyRunIdentity],
+) -> Result<ValidatedCommunicationStudyMatrix, CommunicationStudyMatrixError> {
+    plan.validate()?;
+    if runs.len() != COMMUNICATION_STUDY_TOTAL_RUNS {
+        return Err(CommunicationStudyMatrixError::RunCount {
+            expected: COMMUNICATION_STUDY_TOTAL_RUNS,
+            actual: runs.len(),
+        });
+    }
+
+    let registered_seeds: BTreeSet<u64> = plan.root_seeds.iter().copied().collect();
+    let mut by_identity = BTreeMap::new();
+
+    for run in runs {
+        if !registered_seeds.contains(&run.root_seed) {
+            return Err(CommunicationStudyMatrixError::UnregisteredSeed {
+                seed: run.root_seed,
+            });
+        }
+        if run.completed_ticks != plan.ticks_per_run {
+            return Err(CommunicationStudyMatrixError::RunTickBudget {
+                arm: run.arm,
+                seed: run.root_seed,
+                expected: plan.ticks_per_run,
+                actual: run.completed_ticks,
+            });
+        }
+        let expected_bands = run.arm.expected_bands();
+        if run.bands != expected_bands {
+            return Err(CommunicationStudyMatrixError::RunBandCount {
+                arm: run.arm,
+                seed: run.root_seed,
+                expected: expected_bands,
+                actual: run.bands,
+            });
+        }
+        if run.config_digest.trim().is_empty() {
+            return Err(CommunicationStudyMatrixError::EmptyConfigDigest {
+                arm: run.arm,
+                seed: run.root_seed,
+            });
+        }
+        if run.build_identity.trim().is_empty() {
+            return Err(CommunicationStudyMatrixError::EmptyBuildIdentity {
+                arm: run.arm,
+                seed: run.root_seed,
+            });
+        }
+
+        let key = (run.arm, run.root_seed);
+        if by_identity.insert(key, run.clone()).is_some() {
+            return Err(CommunicationStudyMatrixError::DuplicateRun {
+                arm: run.arm,
+                seed: run.root_seed,
+            });
+        }
+    }
+
+    for arm in CommunicationStudyArm::ALL {
+        for &seed in &plan.root_seeds {
+            if !by_identity.contains_key(&(arm, seed)) {
+                return Err(CommunicationStudyMatrixError::MissingRun { arm, seed });
+            }
+        }
+    }
+
+    let build_identity = by_identity
+        .values()
+        .next()
+        .map(|run| run.build_identity.clone())
+        .ok_or(CommunicationStudyMatrixError::RunCount {
+            expected: COMMUNICATION_STUDY_TOTAL_RUNS,
+            actual: 0,
+        })?;
+    for run in by_identity.values() {
+        if run.build_identity != build_identity {
+            return Err(CommunicationStudyMatrixError::BuildIdentityMismatch {
+                expected: build_identity,
+                actual: run.build_identity.clone(),
+            });
+        }
+    }
+
+    Ok(ValidatedCommunicationStudyMatrix {
+        plan: plan.clone(),
+        runs: by_identity.into_values().collect(),
+        build_identity,
+    })
 }
 
 /// Configuration parameters for Mutual Information estimation.
@@ -353,7 +723,10 @@ pub fn compute_mi(
     let saturated_fraction = saturated_count as f64 / n as f64;
 
     let b = params.bins;
-    let (plugin, corrected) = calc_mi_mm(emitter, receiver, b);
+    // bd-r4ja: the reported point estimate keeps the non-negativity floor -- mutual information
+    // cannot be negative -- while the unclamped value is carried alongside it for bias work.
+    let (plugin, corrected_unclamped) = calc_mi_mm(emitter, receiver, b);
+    let corrected = corrected_unclamped.max(0.0);
 
     // Surrogate null: Circular Time-Shift
     let mut rng = SmallRngStream::seed_from_u64(params.seed);
@@ -382,7 +755,10 @@ pub fn compute_mi(
             for i in 0..n {
                 shifted[i] = emitter[(i + shift) % n];
             }
+            // Clamped to keep the p-value comparison exactly as it was: surrogate and observed are
+            // both floored, so this change exposes the raw value without moving any p-value.
             let (_, surr_corr) = calc_mi_mm(&shifted, receiver, b);
+            let surr_corr = surr_corr.max(0.0);
             surrogates.push(surr_corr);
             if surr_corr >= corrected {
                 ge_count += 1;
@@ -443,7 +819,7 @@ pub fn compute_mi(
             boot_r[i] = receiver[idx];
         }
         let (_, b_corr) = calc_mi_mm(&boot_e, &boot_r, b);
-        boot_mis.push(b_corr);
+        boot_mis.push(b_corr.max(0.0));
     }
     boot_mis.sort_by(f64::total_cmp);
     let lo_idx = ((boot_runs as f64) * 0.025).floor() as usize;
@@ -454,6 +830,7 @@ pub fn compute_mi(
     Ok(MiEstimate {
         bits_plugin: plugin,
         bits_corrected: corrected,
+        bits_corrected_unclamped: corrected_unclamped,
         n,
         bins: b,
         estimator: ESTIMATOR_IDENTITY,
@@ -505,9 +882,13 @@ fn calc_mi_mm(emitter: &[f64], receiver: &[f64], b: usize) -> (f64, f64) {
 
     let mm_correction =
         (k_xy as f64 - k_x as f64 - k_y as f64 + 1.0) / (2.0 * n * std::f64::consts::LN_2);
-    let corrected = (plugin - mm_correction).max(0.0);
 
-    (plugin.max(0.0), corrected)
+    // bd-r4ja: returns the correction UNCLAMPED. Callers that report a point estimate apply the
+    // non-negativity floor themselves; callers that measure bias must not, because averaging
+    // `max(0, x)` estimates `E[max(0, X)]`, which is strictly greater than `E[X]` whenever the
+    // distribution has negative mass. bd-270k measured 29 of 100 runs hitting that floor on
+    // independent noise, so the difference is not a rounding detail.
+    (plugin.max(0.0), plugin - mm_correction)
 }
 
 /// Computes Transfer Entropy `TE(E -> R)` given emitter and receiver series.
@@ -1209,6 +1590,8 @@ mod tests {
         // averaging: every run the correction pushes below zero contributes 0 instead of its
         // negative value, so the mean is pulled upward by exactly the mass that was truncated.
         let mut clamped_runs = 0usize;
+        // bd-r4ja: the untruncated sum is what the bias bound is now asserted on.
+        let mut unclamped_sum = 0.0;
 
         for _ in 0..runs {
             let e: Vec<f64> = (0..n).map(|_| rng.random_range(0.0..1.0)).collect();
@@ -1216,6 +1599,7 @@ mod tests {
             let est = compute_mi(&e, &r, &params).unwrap();
             uncorrected_sum += est.bits_plugin;
             corrected_sum += est.bits_corrected;
+            unclamped_sum += est.bits_corrected_unclamped;
             if est.bits_corrected == 0.0 {
                 clamped_runs += 1;
             }
@@ -1223,6 +1607,7 @@ mod tests {
 
         let mean_uncorrected = uncorrected_sum / runs as f64;
         let mean_corrected = corrected_sum / runs as f64;
+        let mean_unclamped = unclamped_sum / runs as f64;
 
         // Self-reporting, visible under `--nocapture` (bd-270k). Both means are facts about a
         // fully seeded fixture, so the only way to observe them used to be tightening a bound
@@ -1231,6 +1616,7 @@ mod tests {
         // when the value moves for a legitimate reason -- such as the scientific RNG becoming
         // project-owned Xoshiro256++ in aaac3fd99, which reseeded every fixture in this module.
         println!("bd-270k mean_uncorrected={mean_uncorrected:.17}");
+        println!("bd-r4ja mean_unclamped={mean_unclamped:.17}");
         println!("bd-270k mean_corrected={mean_corrected:.17}");
         println!("bd-270k clamped_runs={clamped_runs}/{runs}");
 
@@ -1256,6 +1642,24 @@ mod tests {
             mean_corrected < 0.05,
             "Corrected MI on noise should be near zero, got {}",
             mean_corrected
+        );
+
+        // bd-r4ja: the guard that actually measures BIAS asserts on the untruncated statistic.
+        // The bound above is a report on `E[max(0, MI_MM)]`; this one is a report on `E[MI_MM]`,
+        // which is what "the correction does substantive work" means. The two are not the same
+        // number and the floored one can never go negative no matter how badly the estimator
+        // over-corrects, so on its own it could not distinguish a working correction from one
+        // that overshoots every run.
+        assert!(
+            mean_unclamped.abs() < 0.05,
+            "unclamped Miller-Madow mean on independent noise should sit near zero in BOTH \
+             directions, got {mean_unclamped}"
+        );
+        assert!(
+            mean_unclamped < mean_corrected,
+            "with {clamped_runs}/{runs} runs truncated at the floor, the unclamped mean \
+             ({mean_unclamped}) must sit below the floored mean ({mean_corrected}); if it does \
+             not, the floor is no longer the thing separating them"
         );
     }
 
@@ -1373,5 +1777,140 @@ mod tests {
             evaluate_study_emergence(0.005, 0.20, 0.01, "sentinel", "digest_123", 1, 3);
         assert_eq!(report_neg3.verdict, EmergenceVerdict::Negative);
         assert!(!report_neg3.criterion_3_behavioral_conditioning);
+    }
+
+    fn study_plan() -> CommunicationStudyPlan {
+        CommunicationStudyPlan::new("sentinel-v1", (100..110).collect())
+            .expect("canonical pre-registration")
+    }
+
+    fn complete_study_runs(plan: &CommunicationStudyPlan) -> Vec<CommunicationStudyRunIdentity> {
+        let mut runs = Vec::with_capacity(COMMUNICATION_STUDY_TOTAL_RUNS);
+        for arm in CommunicationStudyArm::ALL {
+            for &root_seed in &plan.root_seeds {
+                runs.push(CommunicationStudyRunIdentity {
+                    arm,
+                    root_seed,
+                    completed_ticks: plan.ticks_per_run,
+                    config_digest: format!("{arm:?}-{root_seed}"),
+                    io_layout_version: 2,
+                    bands: arm.expected_bands(),
+                    build_identity: "source-abc123-toolchain-nightly".to_owned(),
+                });
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn communication_study_matrix_is_complete_and_order_independent() {
+        let plan = study_plan();
+        let forward = complete_study_runs(&plan);
+        let mut reverse = forward.clone();
+        reverse.reverse();
+
+        let validated_forward =
+            validate_communication_study_matrix(&plan, &forward).expect("complete matrix");
+        let validated_reverse =
+            validate_communication_study_matrix(&plan, &reverse).expect("same complete matrix");
+
+        assert_eq!(validated_forward, validated_reverse);
+        assert_eq!(
+            serde_json::to_vec(&validated_forward).expect("serialize matrix"),
+            serde_json::to_vec(&validated_reverse).expect("serialize matrix"),
+            "completion order must not change canonical report bytes"
+        );
+        assert_eq!(validated_forward.runs.len(), 30);
+        assert_eq!(
+            validated_forward.runs.first().map(|run| run.arm),
+            Some(CommunicationStudyArm::Legacy)
+        );
+        assert_eq!(
+            validated_forward.runs.last().map(|run| run.arm),
+            Some(CommunicationStudyArm::ScrambledControl)
+        );
+    }
+
+    #[test]
+    fn communication_study_plan_refuses_post_hoc_extension_and_seed_aliases() {
+        let mut extended = study_plan();
+        extended.ticks_per_run += 1;
+        assert_eq!(
+            extended.validate(),
+            Err(CommunicationStudyMatrixError::PlanTickBudget {
+                expected: COMMUNICATION_STUDY_TICKS_PER_RUN,
+                actual: COMMUNICATION_STUDY_TICKS_PER_RUN + 1,
+            })
+        );
+
+        let duplicate =
+            CommunicationStudyPlan::new("sentinel-v1", vec![1, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            duplicate,
+            Err(CommunicationStudyMatrixError::DuplicateSeed { seed: 1 })
+        );
+
+        let mut noncanonical = study_plan();
+        noncanonical.root_seeds.swap(0, 1);
+        assert_eq!(
+            noncanonical.validate(),
+            Err(CommunicationStudyMatrixError::NonCanonicalSeedOrder)
+        );
+    }
+
+    #[test]
+    fn communication_study_matrix_refuses_early_stop_and_wrong_cost() {
+        let plan = study_plan();
+        let mut early = complete_study_runs(&plan);
+        early[0].completed_ticks -= 1;
+        assert_eq!(
+            validate_communication_study_matrix(&plan, &early),
+            Err(CommunicationStudyMatrixError::RunTickBudget {
+                arm: CommunicationStudyArm::Legacy,
+                seed: 100,
+                expected: COMMUNICATION_STUDY_TICKS_PER_RUN,
+                actual: COMMUNICATION_STUDY_TICKS_PER_RUN - 1,
+            })
+        );
+
+        let mut wrong_cost = complete_study_runs(&plan);
+        let signal = wrong_cost
+            .iter_mut()
+            .find(|run| run.arm == CommunicationStudyArm::Signal)
+            .expect("signal arm");
+        signal.bands = 2;
+        assert_eq!(
+            validate_communication_study_matrix(&plan, &wrong_cost),
+            Err(CommunicationStudyMatrixError::RunBandCount {
+                arm: CommunicationStudyArm::Signal,
+                seed: 100,
+                expected: 3,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn communication_study_matrix_refuses_duplicates_and_mixed_builds() {
+        let plan = study_plan();
+        let mut duplicate = complete_study_runs(&plan);
+        duplicate[29] = duplicate[0].clone();
+        assert_eq!(
+            validate_communication_study_matrix(&plan, &duplicate),
+            Err(CommunicationStudyMatrixError::DuplicateRun {
+                arm: CommunicationStudyArm::Legacy,
+                seed: 100,
+            })
+        );
+
+        let mut mixed_build = complete_study_runs(&plan);
+        mixed_build[1].build_identity = "different-source".to_owned();
+        assert_eq!(
+            validate_communication_study_matrix(&plan, &mixed_build),
+            Err(CommunicationStudyMatrixError::BuildIdentityMismatch {
+                expected: "source-abc123-toolchain-nightly".to_owned(),
+                actual: "different-source".to_owned(),
+            })
+        );
     }
 }
