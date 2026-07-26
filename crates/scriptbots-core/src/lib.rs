@@ -42595,8 +42595,10 @@ mod tests {
             runtime.energy = 1.5;
         }
 
+        // 64 ticks, matching `run_gate`'s budget exactly, so a pass here rules out tick count as
+        // the difference between this probe and the run that died.
         let mut population = Vec::new();
-        for tick in 0..16 {
+        for tick in 0..64 {
             world.step().expect("pdx5 step");
             let live = world.agents().len();
             population.push(live);
@@ -42605,6 +42607,112 @@ mod tests {
                 "population ran away under sustained combat at tick {tick}: {population:?}"
             );
         }
+        eprintln!("bd-pdx5 combat-only population trace: {population:?}");
+    }
+
+    #[test]
+    // bd-pdx5 CONTROL. This one is RED: it fails at tick 17 with
+    //   [14, 19, 23, 27, 31, 37, 43, 48, 54, 61, 68, 74, 82, 90, 100, 110, 123, 136]
+    // #[ignore] here is recording a known defect without making the default suite red, exactly as
+    // for the two combat probes -- not hiding it. The trace is in the message, the diagnosis is on
+    // bd-pdx5, and this stops being ignored the moment the fixture stops exploding.
+    //   cargo test -p scriptbots-core --lib -- --ignored the_unmutated_suite_world_population
+    #[ignore = "bd-pdx5: RED — mutation_suite_world's population runs away with no combat at all; unignore when the fixture is bounded"]
+    fn the_unmutated_suite_world_population_stays_bounded() {
+        // bd-pdx5 CONTROL, and the one that decides who is guilty. The two combat probes show a
+        // monotone population climb, but `mutation_suite_world` is configured with
+        // reproduction_attempt_chance 1.0, reproduction_cooldown 1 and
+        // reproduction_attempt_interval 1, with agents seeded at energy 1.5 and
+        // reproduction_counter 10.0. That is a hair trigger, and it would be a serious error to
+        // blame combat for growth the fixture produces on its own.
+        //
+        // So: identical world, identical tick budget, identical ceiling, NO combat staging at
+        // all. If this stays flat, combat is the driver. If it climbs too, the fixture itself is
+        // explosive and every long run over it has been living on borrowed time.
+        let mut world = mutation_suite_world(0x9D_5002);
+        let mut population = Vec::new();
+        for tick in 0..64 {
+            world.step().expect("pdx5 control step");
+            let live = world.agents().len();
+            population.push(live);
+            assert!(
+                live <= PDX5_POPULATION_CEILING,
+                "the fixture explodes WITHOUT combat at tick {tick}: {population:?}"
+            );
+        }
+        eprintln!("bd-pdx5 no-combat control trace: {population:?}");
+    }
+
+    #[test]
+    // bd-pdx5: same #[ignore] rationale as the probe above -- this is the variant that adds the
+    // one remaining difference from the run that hung, so it is the more likely of the two to
+    // not return. Run explicitly:
+    //   cargo test -p scriptbots-core --lib -- --ignored sustained_combat_with_the_ledger_enabled
+    #[ignore = "bd-pdx5: probes a suspected non-termination; must not gate the default test path until it is known to return"]
+    fn sustained_combat_with_the_ledger_enabled_stays_bounded() {
+        // bd-pdx5 BISECTION. `sustained_combat_keeps_the_world_bounded` passes in 0.03s, which
+        // proves sustained real combat is NOT by itself the non-termination. Exactly two things
+        // separated that probe from the 64-tick x 17-fault run that was SIGKILLed at 1800s:
+        // the tick budget, and the resource ledger (`run_gate` calls
+        // `set_resource_ledger_enabled(true)` before stepping). The probe above now runs the same
+        // 64 ticks, so this test isolates the remaining variable: the ledger, with combat
+        // actually moving resources.
+        //
+        // This matters beyond the hang. Combat is unreachable in the fixture, so
+        // `record_resource_change(Combat, before)` has only ever posted a ZERO delta here, and
+        // `distribute_carcass_rewards` early-returns unless the victim was `spiked` -- meaning
+        // the ledger has never once had to account for a real combat or carcass flow in this
+        // world. If it does not cope, that is a live defect in the accounting path, not a test
+        // artifact.
+        let mut world = mutation_suite_world(0x9D_5001);
+        let handles: Vec<AgentId> = world.agents().iter_handles().collect();
+        assert!(handles.len() >= 2, "fixture must seed at least two agents");
+        let attacker = handles[0];
+        let victim = handles[1];
+
+        world.config.spike_min_length = 0.0;
+        world.config.spike_alignment_cosine = 0.0;
+        let aggressor = world
+            .brain_registry_mut()
+            .expect("pdx5 ledger registry mutation")
+            .register("test.pdx5-ledger-aggressor", |_rng| {
+                Ok(Box::new(LedgerAggressorBrain))
+            });
+        assert!(
+            world
+                .bind_agent_brain(attacker, aggressor)
+                .expect("pdx5 ledger aggressor brain"),
+            "attacker must accept the aggressor brain"
+        );
+        let attacker_idx = world.agents.index_of(attacker).expect("attacker index");
+        let victim_idx = world.agents.index_of(victim).expect("victim index");
+        {
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[attacker_idx] = Position::new(40.0, 60.0);
+            columns.positions_mut()[victim_idx] = Position::new(45.0, 60.0);
+            columns.headings_mut()[attacker_idx] = 0.0;
+            columns.spike_lengths_mut()[attacker_idx] = 5.0;
+            columns.health_mut()[victim_idx] = 2.0;
+        }
+        if let Some(runtime) = world.runtime.get_mut(attacker) {
+            runtime.herbivore_tendency = 0.0;
+            runtime.energy = 1.5;
+        }
+
+        // THE ONE VARIABLE UNDER TEST.
+        world.set_resource_ledger_enabled(true);
+
+        let mut population = Vec::new();
+        for tick in 0..64 {
+            world.step().expect("pdx5 ledger step");
+            let live = world.agents().len();
+            population.push(live);
+            assert!(
+                live <= PDX5_POPULATION_CEILING,
+                "population ran away with the ledger enabled at tick {tick}: {population:?}"
+            );
+        }
+        eprintln!("bd-pdx5 ledger-enabled population trace: {population:?}");
     }
 
     // bd-dz37: drives the feature-gated fault machinery, so it is gated to match. Run with
