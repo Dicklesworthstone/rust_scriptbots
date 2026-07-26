@@ -60,6 +60,7 @@ use crate::{
 pub mod canvas_inspector;
 pub mod canvas_ramps;
 pub mod command_palette;
+pub mod export;
 pub mod frankentui_shell;
 
 // `paint.rs` is deliberately NOT declared (bd-c1z8). It is a second, complete
@@ -296,6 +297,38 @@ fn run_event_loop(
                 _ => {}
             }
         }
+
+        // Serve a screenshot request from the frame that is ACTUALLY ON SCREEN.
+        // Drawing here and capturing that same buffer is what makes the exported
+        // file equal to the displayed one by construction, rather than by a
+        // second rasterization that could disagree (bd-2z0.14.2.6).
+        if app.export_requested() {
+            let mut displayed: Option<Buffer> = None;
+            terminal.draw(|frame| {
+                app.draw(frame);
+                displayed = Some(frame.buffer_mut().clone());
+            })?;
+            app.last_draw = Instant::now();
+            if let Some(buffer) = displayed {
+                let tick = app.snapshot.tick;
+                match app.write_frame_export(&buffer) {
+                    Ok((ansi_path, _, hash)) => {
+                        let name = ansi_path
+                            .file_name()
+                            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                        app.push_event(
+                            tick,
+                            EventKind::Info,
+                            format!("Saved frame {name} ({hash})"),
+                        );
+                    }
+                    Err(err) => {
+                        app.export_requested = false;
+                        app.push_event(tick, EventKind::Info, format!("Screenshot failed: {err}"));
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -468,6 +501,11 @@ struct TerminalApp<'a> {
     /// and origin, which is how the old hover picked agents at random.
     map_area: Option<Rect>,
     hover_tooltip: Option<MouseHoverTooltip>,
+    /// Set by `S`, cleared when the event loop exports the frame on screen.
+    /// A request rather than an action because the key handler cannot see the
+    /// rendered buffer, and exporting anything else is what made the old
+    /// screenshot describe a different renderer than the user's (bd-2z0.14.2.6).
+    export_requested: bool,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -550,6 +588,7 @@ impl<'a> TerminalApp<'a> {
             map_pan_offset: (0.5, 0.5),
             map_area: None,
             hover_tooltip: None,
+            export_requested: false,
         };
         app.refresh_snapshot();
         app
@@ -2575,19 +2614,10 @@ impl<'a> TerminalApp<'a> {
                 self.push_event(self.snapshot.tick, EventKind::Info, "Single-step executed");
             }
             (KeyCode::Char('S'), _) => {
-                if let Err(err) = self.save_ascii_snapshot() {
-                    self.push_event(
-                        self.snapshot.tick,
-                        EventKind::Info,
-                        format!("Screenshot failed: {err}"),
-                    );
-                } else {
-                    self.push_event(
-                        self.snapshot.tick,
-                        EventKind::Info,
-                        "Saved ASCII screenshot",
-                    );
-                }
+                // Only a request: the key handler cannot see the rendered buffer,
+                // and exporting anything else would reintroduce the defect this
+                // replaced. The event loop fulfils it from the frame on screen.
+                self.export_requested = true;
             }
             (KeyCode::Char('e') | KeyCode::Char('E'), _) => {
                 self.palette.toggle_emoji();
@@ -2777,41 +2807,50 @@ impl<'a> TerminalApp<'a> {
         Ok(false)
     }
 
-    fn save_ascii_snapshot(&self) -> Result<()> {
-        use std::io::Write;
-        let dir = std::path::Path::new("screenshots");
-        std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("frame_{}.txt", self.snapshot.tick));
-        let mut file = std::fs::File::create(path)?;
+    /// Whether the user asked for a screenshot and it has not been served yet.
+    const fn export_requested(&self) -> bool {
+        self.export_requested
+    }
 
-        let width = 64usize.min(self.snapshot.world_size.0 as usize).max(16);
-        let height = 32usize.min(self.snapshot.world_size.1 as usize).max(8);
-        for y in 0..height {
-            for x in 0..width {
-                let u = (x as f32 + 0.5) / width as f32;
-                let v = (y as f32 + 0.5) / height as f32;
-                let terrain_kind = self.terrain.sample(u, v);
-                let food = self.snapshot.food.sample(u, v);
-                let ch = match terrain_kind {
-                    TerrainKind::DeepWater => '~',
-                    TerrainKind::ShallowWater => '=',
-                    TerrainKind::Sand => '.',
-                    TerrainKind::Grass => ',',
-                    TerrainKind::Bloom => '*',
-                    TerrainKind::Rock => '^',
-                };
-                let glyph = if food > 0.66 {
-                    '#'
-                } else if food > 0.33 {
-                    '+'
-                } else {
-                    ch
-                };
-                write!(file, "{}", glyph)?;
-            }
-            writeln!(file)?;
-        }
-        Ok(())
+    /// Write the EXACT displayed frame as ANSI truecolor plus a plain-text
+    /// fallback, and report both paths and the frame's evidence hash.
+    ///
+    /// Takes the rendered `Buffer` rather than re-deriving anything from world
+    /// state. That is the whole point: the previous exporter re-rasterized
+    /// terrain and food into a 64x32 ASCII grid with no agents and no panels, so
+    /// it could not show what the user was looking at even in principle
+    /// (bd-2z0.14.2.6). The frame identity is the SAME FNV-1a64 the headless
+    /// evidence contract already publishes, so an export and a headless report of
+    /// one frame cannot disagree.
+    fn write_frame_export(&mut self, buffer: &Buffer) -> Result<(PathBuf, PathBuf, String)> {
+        use std::io::Write;
+
+        self.export_requested = false;
+        let dir = std::path::Path::new("screenshots");
+        fs::create_dir_all(dir)?;
+
+        let tick = self.snapshot.tick;
+        let ansi_path = dir.join(format!("frame_{tick}.ans"));
+        let text_path = dir.join(format!("frame_{tick}.txt"));
+
+        let ansi = export::buffer_to_ansi(buffer);
+        let plain = export::buffer_to_plain_text(buffer);
+        File::create(&ansi_path)?.write_all(ansi.as_bytes())?;
+        File::create(&text_path)?.write_all(plain.as_bytes())?;
+
+        let evidence = HeadlessBufferEvidence::inspect(buffer, tick)?;
+        let hash = evidence.full_cell_fnv1a64.clone();
+        info!(
+            ansi = %ansi_path.display(),
+            text = %text_path.display(),
+            ansi_bytes = ansi.len(),
+            text_bytes = plain.len(),
+            width = buffer.area.width,
+            height = buffer.area.height,
+            hash = %hash,
+            "exported the displayed terminal frame"
+        );
+        Ok((ansi_path, text_path, hash))
     }
 
     fn snapshot(&self) -> &Snapshot {
