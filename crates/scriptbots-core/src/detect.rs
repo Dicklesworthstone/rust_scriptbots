@@ -871,6 +871,247 @@ fn bimodality_bin(value: f64, min: f64, span: f64) -> usize {
     index.min(BIMODALITY_BINS - 1)
 }
 
+// ---------------------------------------------------------------------------
+// bd-16g.2.11 acceptance item 2: one self-describing evidence envelope.
+//
+// Four primitives previously returned four unrelated shapes, so every consumer
+// -- narrated timeline, speciation cross-validation, highlight selection,
+// sonification, the lab assistant -- had to re-derive "what was measured, over
+// what window, against what bound, and how sure are we" from detector-specific
+// fields. That is how five consumers end up with five different answers to the
+// same question. The envelope is the shared answer.
+//
+// It is ADDITIVE: every existing type and signature is untouched, and this module
+// still performs NO LOGGING. Evidence is data; a caller decides whether to log it.
+// ---------------------------------------------------------------------------
+
+/// Which primitive produced a piece of evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectionKind {
+    /// A CUSUM level shift.
+    ChangePoint,
+    /// A named threshold crossing.
+    ThresholdCrossing,
+    /// A classified regime window.
+    Regime,
+    /// A bimodality assessment over a value set.
+    Bimodality,
+}
+
+/// The detector's own verdict, kept typed rather than flattened to a string.
+///
+/// Unifying four different notions of "direction" into one enum would lose exactly
+/// the distinction each detector exists to draw, so each variant carries its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceClass {
+    /// A level shift, up or down.
+    Shift(Direction),
+    /// A threshold crossing, up or down.
+    Crossing(Direction),
+    /// A regime classification.
+    Regime(Regime),
+    /// Whether the sample split into two clusters.
+    Bimodal(bool),
+}
+
+/// One side of a before/after or cluster comparison.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvidenceSide {
+    /// How many samples this side summarises.
+    pub samples: usize,
+    /// Mean of this side.
+    pub mean: f64,
+}
+
+/// Self-describing evidence for one detection (bd-16g.2.11).
+///
+/// Carries what a consumer needs to explain a detection without re-reading the
+/// series: what was measured, over which ticks, how many samples, against which
+/// configured bounds, what the detector concluded, and whether the numbers are
+/// trustworthy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetectionEvidence {
+    /// Metric identity, supplied by the caller: this module deliberately does not
+    /// know metric names, and inventing one here would be a lie about provenance.
+    pub metric: &'static str,
+    /// Which primitive produced this.
+    pub kind: DetectionKind,
+    /// First tick of the evidence window.
+    pub start_tick: u64,
+    /// Last tick of the evidence window. Equals `start_tick` for point detections.
+    pub end_tick: u64,
+    /// Samples the detection was drawn from.
+    pub samples: usize,
+    /// The detector's score, in its own units (documented per primitive).
+    pub score: f64,
+    /// The typed verdict.
+    pub class: EvidenceClass,
+    /// Summary of the "before" side, or the lower cluster. `None` when the
+    /// primitive has no such side.
+    pub before: Option<EvidenceSide>,
+    /// Summary of the "after" side, or the upper cluster.
+    pub after: Option<EvidenceSide>,
+    /// The configured bounds that governed this decision, as `(name, value)`.
+    ///
+    /// Named rather than positional so a consumer can report "fired at h=8" without
+    /// knowing which primitive it came from, and so a re-tuned bound is visible in
+    /// the evidence rather than only in a config diff.
+    pub params: Vec<(&'static str, f64)>,
+    /// True when every numeric field above is finite.
+    ///
+    /// Evidence that silently carries `NaN` is worse than no evidence, because it
+    /// looks like it worked -- the same argument this module already makes for
+    /// rejecting non-finite input.
+    pub finite: bool,
+}
+
+impl DetectionEvidence {
+    /// Recompute [`Self::finite`] from the numeric fields actually present.
+    fn sealed(mut self) -> Self {
+        let sides_finite = [self.before, self.after]
+            .iter()
+            .flatten()
+            .all(|side| side.mean.is_finite());
+        self.finite = self.score.is_finite()
+            && sides_finite
+            && self.params.iter().all(|(_, value)| value.is_finite());
+        self
+    }
+}
+
+impl ChangePoint {
+    /// Evidence for this change point. `samples` is the length of the analysed series.
+    #[must_use]
+    pub fn evidence(
+        &self,
+        metric: &'static str,
+        samples: usize,
+        params: CusumParams,
+    ) -> DetectionEvidence {
+        DetectionEvidence {
+            metric,
+            kind: DetectionKind::ChangePoint,
+            start_tick: self.tick,
+            end_tick: self.tick,
+            samples,
+            score: self.score,
+            class: EvidenceClass::Shift(self.direction),
+            before: Some(EvidenceSide {
+                samples: params.warmup,
+                mean: self.baseline_mean,
+            }),
+            after: Some(EvidenceSide {
+                samples: 1,
+                mean: self.baseline_mean + self.magnitude,
+            }),
+            params: vec![
+                ("k", params.k),
+                ("h", params.h),
+                ("warmup", params.warmup as f64),
+            ],
+            finite: true,
+        }
+        .sealed()
+    }
+}
+
+impl Crossing {
+    /// Evidence for this threshold crossing.
+    #[must_use]
+    pub fn evidence(&self, metric: &'static str, samples: usize) -> DetectionEvidence {
+        DetectionEvidence {
+            metric,
+            kind: DetectionKind::ThresholdCrossing,
+            start_tick: self.tick,
+            end_tick: self.tick,
+            samples,
+            // A crossing has no statistic of its own; the distance travelled past
+            // the level is the closest honest analogue, and calling it `score`
+            // without saying so would misrepresent it.
+            score: self.to - self.level,
+            class: EvidenceClass::Crossing(self.direction),
+            before: Some(EvidenceSide {
+                samples: 1,
+                mean: self.from,
+            }),
+            after: Some(EvidenceSide {
+                samples: 1,
+                mean: self.to,
+            }),
+            params: vec![("level", self.level)],
+            finite: true,
+        }
+        .sealed()
+    }
+}
+
+impl RegimeWindow {
+    /// Evidence for this regime window.
+    #[must_use]
+    pub fn evidence(&self, metric: &'static str, samples: usize) -> DetectionEvidence {
+        DetectionEvidence {
+            metric,
+            kind: DetectionKind::Regime,
+            start_tick: self.start_tick,
+            end_tick: self.end_tick,
+            samples,
+            score: self.relative_slope,
+            class: EvidenceClass::Regime(self.regime),
+            before: None,
+            after: None,
+            params: vec![
+                ("relative_spread", self.relative_spread),
+                ("crossing_rate", self.crossing_rate),
+                ("autocorrelation", self.autocorrelation),
+            ],
+            finite: true,
+        }
+        .sealed()
+    }
+}
+
+impl BimodalityScore {
+    /// Evidence for this bimodality assessment.
+    ///
+    /// `start_tick`/`end_tick` are caller-supplied: bimodality reads a value set
+    /// with no ticks of its own, and fabricating a window here would misattribute
+    /// the evidence to a span this primitive never saw.
+    #[must_use]
+    pub fn evidence(
+        &self,
+        metric: &'static str,
+        start_tick: u64,
+        end_tick: u64,
+        params: BimodalityParams,
+    ) -> DetectionEvidence {
+        DetectionEvidence {
+            metric,
+            kind: DetectionKind::Bimodality,
+            start_tick,
+            end_tick,
+            samples: self.lower_count + self.upper_count,
+            score: self.score,
+            class: EvidenceClass::Bimodal(self.is_bimodal),
+            before: Some(EvidenceSide {
+                samples: self.lower_count,
+                mean: self.lower_mean,
+            }),
+            after: Some(EvidenceSide {
+                samples: self.upper_count,
+                mean: self.upper_mean,
+            }),
+            params: vec![
+                ("min_score", params.min_score),
+                ("min_separation", params.min_separation),
+                ("min_cluster_fraction", params.min_cluster_fraction),
+                ("separation", self.separation),
+            ],
+            finite: true,
+        }
+        .sealed()
+    }
+}
+
 fn validate_series(series: &[Sample]) -> Result<(), DetectError> {
     for (index, sample) in series.iter().enumerate() {
         if !sample.value.is_finite() {
@@ -1584,6 +1825,163 @@ mod tests {
         assert_eq!(
             BIMODALITY_BINS, 1024,
             "working memory is O(BIMODALITY_BINS) and must stay independent of n"
+        );
+    }
+
+    // ---- bd-16g.2.11 item 2: the evidence envelope ----
+
+    /// Every primitive must produce evidence, and every required field must be populated.
+    ///
+    /// This is the completeness gate the bead asks for. It is written as an exhaustive
+    /// `match` on [`DetectionKind`] so that ADDING A PRIMITIVE WITHOUT GIVING IT EVIDENCE
+    /// FAILS THE BUILD rather than silently shipping a detector no consumer can explain --
+    /// the same fail-closed shape that caught an unclassified knob in bd-dorx.
+    #[test]
+    fn bd_16g_2_11_every_primitive_emits_complete_evidence() {
+        let series: Vec<Sample> = (0..200)
+            .map(|i| Sample::new(i as u64, if i < 100 { 0.0 } else { 10.0 }))
+            .collect();
+
+        let cusum = CusumParams::default();
+        let change = change_points_cusum(&series, cusum)
+            .expect("valid")
+            .first()
+            .copied()
+            .expect("a 10-sigma step must be detected");
+        let crossing = threshold_crossings(
+            &series,
+            &[Threshold {
+                name: "half",
+                level: 5.0,
+                direction: CrossDirection::Either,
+            }],
+        )
+        .expect("valid")
+        .first()
+        .copied()
+        .expect("the series crosses 5.0");
+        let regime = regimes(&series, RegimeParams::default())
+            .expect("valid")
+            .first()
+            .copied()
+            .expect("a regime window must exist");
+        let bimodal_params = BimodalityParams::default();
+        let values: Vec<f64> = series.iter().map(|s| s.value).collect();
+        let bimodal = bimodality(&values, bimodal_params).expect("valid");
+
+        let all = [
+            change.evidence("agents.energy", series.len(), cusum),
+            crossing.evidence("agents.energy", series.len()),
+            regime.evidence("agents.energy", series.len()),
+            bimodal.evidence("agents.energy", 0, 199, bimodal_params),
+        ];
+
+        let mut seen = Vec::new();
+        for evidence in &all {
+            assert_eq!(
+                evidence.metric, "agents.energy",
+                "metric identity must survive"
+            );
+            assert!(
+                evidence.finite,
+                "{:?} produced non-finite evidence",
+                evidence.kind
+            );
+            assert!(
+                evidence.samples > 0,
+                "{:?} must report a sample count",
+                evidence.kind
+            );
+            assert!(
+                evidence.end_tick >= evidence.start_tick,
+                "{:?} window must not run backwards",
+                evidence.kind
+            );
+            assert!(
+                !evidence.params.is_empty(),
+                "{:?} must name the configured bounds that governed it",
+                evidence.kind
+            );
+
+            // Exhaustive: a new DetectionKind without evidence support stops compiling.
+            let needs_sides = match evidence.kind {
+                DetectionKind::ChangePoint
+                | DetectionKind::ThresholdCrossing
+                | DetectionKind::Bimodality => true,
+                DetectionKind::Regime => false,
+            };
+            if needs_sides {
+                assert!(
+                    evidence.before.is_some() && evidence.after.is_some(),
+                    "{:?} must carry a before/after or cluster summary",
+                    evidence.kind
+                );
+            }
+            seen.push(evidence.kind);
+        }
+
+        for kind in [
+            DetectionKind::ChangePoint,
+            DetectionKind::ThresholdCrossing,
+            DetectionKind::Regime,
+            DetectionKind::Bimodality,
+        ] {
+            assert!(seen.contains(&kind), "{kind:?} emitted no evidence");
+        }
+    }
+
+    /// Evidence must classify with the detector's own vocabulary, not a flattened one.
+    #[test]
+    fn bd_16g_2_11_evidence_classification_is_typed_per_primitive() {
+        let series: Vec<Sample> = (0..200)
+            .map(|i| Sample::new(i as u64, if i < 100 { 0.0 } else { 10.0 }))
+            .collect();
+        let change = change_points_cusum(&series, CusumParams::default())
+            .expect("valid")
+            .first()
+            .copied()
+            .expect("detected");
+        assert!(matches!(
+            change
+                .evidence("m", series.len(), CusumParams::default())
+                .class,
+            EvidenceClass::Shift(Direction::Up)
+        ));
+
+        let values: Vec<f64> = series.iter().map(|s| s.value).collect();
+        let bimodal = bimodality(&values, BimodalityParams::default()).expect("valid");
+        assert!(matches!(
+            bimodal
+                .evidence("m", 0, 199, BimodalityParams::default())
+                .class,
+            EvidenceClass::Bimodal(true)
+        ));
+    }
+
+    /// `finite` must be computed, not asserted.
+    ///
+    /// A field that is always `true` is decoration. Feeding a non-finite bound through
+    /// the params proves the seal actually inspects what it carries.
+    #[test]
+    fn bd_16g_2_11_evidence_finite_flag_reflects_its_contents() {
+        let values = vec![0.0; 50]
+            .into_iter()
+            .chain(vec![9.0; 50])
+            .collect::<Vec<f64>>();
+        let good = bimodality(&values, BimodalityParams::default()).expect("valid");
+        assert!(
+            good.evidence("m", 0, 99, BimodalityParams::default())
+                .finite
+        );
+
+        let poisoned = BimodalityParams {
+            min_score: f64::NAN,
+            ..BimodalityParams::default()
+        };
+        let evidence = good.evidence("m", 0, 99, poisoned);
+        assert!(
+            !evidence.finite,
+            "a non-finite configured bound must be reported, not hidden"
         );
     }
 }
