@@ -2882,6 +2882,9 @@ pub enum CommandAuthorityLookupFailure {
     /// The storage command lane cannot accept the request at this boundary.
     #[error("lookup worker is busy")]
     Busy,
+    /// Host cancellation stopped polling before the command entered runtime admission.
+    #[error("lookup was cancelled before runtime admission")]
+    Cancelled,
     /// The storage worker, lookup lane, or database is unavailable.
     #[error("lookup worker is unavailable: {message}")]
     Unavailable {

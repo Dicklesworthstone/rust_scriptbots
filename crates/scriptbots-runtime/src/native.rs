@@ -803,6 +803,7 @@ mod asupersync_runner {
         panic_message: Option<String>,
         host_admission_failure: Option<HostAccessError>,
         terminal_drain_failure: Option<TerminalDrainFailure>,
+        pending_authority_envelope: Option<CommandEnvelope>,
         unresolved_envelopes: Vec<CommandEnvelope>,
     }
 
@@ -841,6 +842,7 @@ mod asupersync_runner {
                     panic_message: None,
                     host_admission_failure: None,
                     terminal_drain_failure: None,
+                    pending_authority_envelope: None,
                     unresolved_envelopes: Vec::new(),
                 },
                 control,
@@ -1048,6 +1050,7 @@ mod asupersync_runner {
             }
 
             self.drive(now, trigger)?;
+            self.reconcile_pending_command_authority()?;
             let cancellation_after_drive = self.should_cancel(cx);
             self.reconcile_provisional_shutdown();
             self.reconcile_controller_disconnect();
@@ -1071,6 +1074,7 @@ mod asupersync_runner {
                 self.reconcile_provisional_shutdown();
                 self.reconcile_controller_disconnect();
             }
+            self.reconcile_pending_command_authority()?;
             Ok(())
         }
 
@@ -1206,6 +1210,9 @@ mod asupersync_runner {
             limit: usize,
         ) -> Result<(), NativeRunError> {
             for _ in 0..limit {
+                if self.pending_authority_envelope.is_some() {
+                    return Ok(());
+                }
                 match self.receiver.try_recv() {
                     Ok(message) => *trigger = self.process_message(message, *trigger)?,
                     Err(RecvError::Empty) => return Ok(()),
@@ -1241,9 +1248,14 @@ mod asupersync_runner {
                     match self.host.submit(envelope) {
                         Ok(_) => {}
                         Err(HostAccessError::CommandAuthorityLookup {
-                            failure: crate::CommandAuthorityLookupFailure::Pending,
+                            failure:
+                                crate::CommandAuthorityLookupFailure::Pending
+                                | crate::CommandAuthorityLookupFailure::Busy
+                                | crate::CommandAuthorityLookupFailure::Capacity { .. },
                             ..
-                        }) => {}
+                        }) => {
+                            self.pending_authority_envelope = Some(retained);
+                        }
                         Err(error) => {
                             self.unresolved_envelopes.push(retained);
                             self.close_runner_after_failure();
@@ -1267,6 +1279,48 @@ mod asupersync_runner {
                         .retry_retained_journal()
                         .map_err(NativeScheduleError::from)?;
                     Ok(trigger.combine(NativeDriveTrigger::JournalReady))
+                }
+            }
+        }
+
+        fn reconcile_pending_command_authority(&mut self) -> Result<(), NativeRunError> {
+            let Some(envelope) = self.pending_authority_envelope.as_ref() else {
+                return Ok(());
+            };
+            if self.host.core().pending_command_authority_id() == Some(envelope.command_id) {
+                return Ok(());
+            }
+
+            let envelope = self
+                .pending_authority_envelope
+                .take()
+                .expect("pending authority envelope checked above");
+            match self.host.submit(envelope.clone()) {
+                Ok(_) => Ok(()),
+                Err(HostAccessError::CommandAuthorityLookup {
+                    failure:
+                        crate::CommandAuthorityLookupFailure::Pending
+                        | crate::CommandAuthorityLookupFailure::Busy
+                        | crate::CommandAuthorityLookupFailure::Capacity { .. },
+                    ..
+                }) => {
+                    self.pending_authority_envelope = Some(envelope);
+                    Ok(())
+                }
+                Err(error)
+                    if self.cancellation_observed
+                        || self.controller_state != ControllerState::Connected
+                        || self.shutdown_started_at.is_some() =>
+                {
+                    self.unresolved_envelopes.push(envelope);
+                    let _ = self.cache_terminal_drain_failure(error.to_string());
+                    Ok(())
+                }
+                Err(error) => {
+                    self.unresolved_envelopes.push(envelope);
+                    self.close_runner_after_failure();
+                    self.host_admission_failure = Some(error.clone());
+                    Err(NativeScheduleError::from(error).into())
                 }
             }
         }
@@ -1362,6 +1416,13 @@ mod asupersync_runner {
         fn close_runner_cleanly(&mut self) -> Result<(), NativeRunError> {
             self.seal_runner_ingress();
             let mut first_error = None;
+            if let Some(envelope) = self.pending_authority_envelope.take() {
+                self.unresolved_envelopes.push(envelope);
+                first_error = Some(
+                    "native terminal boundary retained an unresolved command-authority envelope"
+                        .to_owned(),
+                );
+            }
             while let Ok(message) = self.receiver.try_recv() {
                 match message {
                     NativeMessage::Command(envelope) => {
@@ -1388,6 +1449,12 @@ mod asupersync_runner {
             if let Some(message) = first_error {
                 return Err(self.cache_terminal_drain_failure(message));
             }
+            if let Some(failure) = &self.terminal_drain_failure {
+                return Err(NativeRunError::TerminalDrainFailed {
+                    unresolved_envelopes: failure.unresolved_envelopes,
+                    message: failure.message.clone(),
+                });
+            }
             Ok(())
         }
 
@@ -1405,6 +1472,9 @@ mod asupersync_runner {
 
         fn close_runner_after_failure(&mut self) {
             self.seal_runner_ingress();
+            if let Some(envelope) = self.pending_authority_envelope.take() {
+                self.unresolved_envelopes.push(envelope);
+            }
             while let Ok(message) = self.receiver.try_recv() {
                 match message {
                     NativeMessage::Command(envelope) => {
@@ -1494,6 +1564,26 @@ mod asupersync_runner {
         }
 
         async fn wait_for_work(&mut self, cx: &Cx) -> DriverWake {
+            if self.pending_authority_envelope.is_some() {
+                let now = manual_now(cx);
+                let maintenance = advance_absolute_deadline(
+                    self.maintenance_deadline,
+                    now,
+                    self.options.maintenance_period_nanos,
+                );
+                self.maintenance_deadline = Some(maintenance);
+                let deadline = self
+                    .shutdown_wait_started_at()
+                    .map_or(maintenance, |started| {
+                        let timeout = ManualInstant::from_nanos(
+                            started
+                                .as_nanos()
+                                .saturating_add(self.options.shutdown_timeout_nanos),
+                        );
+                        maintenance.min(timeout)
+                    });
+                return self.wait_deadline(cx, deadline).await;
+            }
             match self.host.drive_interest() {
                 HostDriveInterest::ReadyNow => DriverWake::Immediate,
                 HostDriveInterest::Deadline => {
@@ -1570,6 +1660,25 @@ mod asupersync_runner {
                     }
                     Poll::Ready(Err(RecvError::Cancelled)) => Poll::Ready(DriverWake::Cancellation),
                     Poll::Ready(Err(RecvError::Empty)) | Poll::Pending => Poll::Pending,
+                }
+            })
+            .await;
+            self.state.clear_runner_waker();
+            wake
+        }
+
+        async fn wait_deadline(&mut self, cx: &Cx, deadline: ManualInstant) -> DriverWake {
+            self.state.begin_owner_wait();
+            let mut sleep = Box::pin(sleep_until(Time::from_nanos(deadline.as_nanos())));
+            let state = Arc::clone(&self.state);
+            let wake = poll_fn(|task_cx| {
+                state.register_runner_waker(task_cx.waker());
+                if !self.cancellation_observed && self.should_cancel(cx) {
+                    return Poll::Ready(DriverWake::Cancellation);
+                }
+                match sleep.as_mut().poll(task_cx) {
+                    Poll::Ready(()) => Poll::Ready(DriverWake::Deadline),
+                    Poll::Pending => Poll::Pending,
                 }
             })
             .await;
@@ -1685,7 +1794,10 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
-    use crate::{HostLifecycle, JournalFailure};
+    use crate::{
+        CommandAuthorityLookup, CommandAuthorityMode, CommandAuthorityReader, CommandClaimPolicy,
+        HostLifecycle, JournalFailure,
+    };
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     use asupersync::runtime::RuntimeBuilder;
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
@@ -1693,7 +1805,12 @@ mod tests {
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     use asupersync::types::Time;
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::collections::HashMap;
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[derive(Debug, Clone, Copy, Default)]
     enum ReceiptMode {
@@ -1783,6 +1900,64 @@ mod tests {
 
         fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
             ShutdownCommitRequirement::CommittedVolatile
+        }
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    struct ScriptedNativeAuthority {
+        outcomes: Mutex<HashMap<CommandId, VecDeque<CommandAuthorityLookup>>>,
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    impl CommandAuthorityReader for ScriptedNativeAuthority {
+        fn resolve_for_submit(
+            &self,
+            envelope: &CommandEnvelope,
+            _envelope_digest: [u8; blake3::OUT_LEN],
+            _policy: CommandClaimPolicy,
+        ) -> CommandAuthorityLookup {
+            self.resolve_status(envelope.command_id)
+        }
+
+        fn resolve_status(&self, command_id: CommandId) -> CommandAuthorityLookup {
+            self.outcomes
+                .lock()
+                .expect("scripted native authority lock")
+                .get_mut(&command_id)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(CommandAuthorityLookup::Absent)
+        }
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    struct NativeAuthorityJournal {
+        inner: CaptureJournal,
+        authority: Arc<dyn CommandAuthorityReader>,
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    impl JournalPort for NativeAuthorityJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            self.inner.try_admit(batch)
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            self.inner.poll_receipts(limit)
+        }
+
+        fn command_authority_reader(
+            &self,
+            _session_id: HostSessionId,
+        ) -> Option<Arc<dyn CommandAuthorityReader>> {
+            Some(Arc::clone(&self.authority))
+        }
+
+        fn command_authority_mode(&self) -> CommandAuthorityMode {
+            CommandAuthorityMode::DurableRequired
+        }
+
+        fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+            self.inner.shutdown_commit_requirement()
         }
     }
 
@@ -2310,6 +2485,161 @@ mod tests {
             runner.run_until_terminal().expect("idempotent join"),
             outcome
         );
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn pending_authority_preserves_native_fifo_until_each_claim_resolves() {
+        let first = envelope(1, HostCommand::Pause);
+        let shutdown = envelope(2, HostCommand::Shutdown);
+        let authority = Arc::new(ScriptedNativeAuthority {
+            outcomes: Mutex::new(HashMap::from([
+                (
+                    first.command_id,
+                    VecDeque::from([
+                        CommandAuthorityLookup::Failed(
+                            crate::CommandAuthorityLookupFailure::Pending,
+                        ),
+                        CommandAuthorityLookup::Claimed,
+                    ]),
+                ),
+                (
+                    shutdown.command_id,
+                    VecDeque::from([
+                        CommandAuthorityLookup::Failed(
+                            crate::CommandAuthorityLookupFailure::Pending,
+                        ),
+                        CommandAuthorityLookup::Claimed,
+                    ]),
+                ),
+            ])),
+        });
+        let journal_state = Rc::new(RefCell::new(CaptureState {
+            mode: ReceiptMode::Immediate,
+            ..CaptureState::default()
+        }));
+        let core = HostCore::with_journal(
+            HostSessionId::new(0x5454),
+            world(),
+            options(true),
+            Box::new(NativeAuthorityJournal {
+                inner: CaptureJournal {
+                    state: Rc::clone(&journal_state),
+                },
+                authority: authority.clone(),
+            }),
+        )
+        .expect("native authority-backed host");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("native authority runner");
+        control
+            .try_submit(first.clone())
+            .expect("first pending command ingress");
+        control
+            .try_submit(shutdown.clone())
+            .expect("later shutdown ingress");
+
+        let outcome = runner
+            .run_until_terminal()
+            .expect("both durable claims resolve in FIFO order");
+        assert!(matches!(
+            outcome,
+            NativeRunOutcome::Stopped {
+                shutdown_command_id,
+            } if shutdown_command_id == shutdown.command_id
+        ));
+        assert!(runner.unresolved_envelopes().is_empty());
+        assert_eq!(runner.metrics().command_wakes, 2);
+        assert_eq!(runner.host().core().world_tick(), Tick(0));
+
+        let remaining = authority
+            .outcomes
+            .lock()
+            .expect("scripted native outcomes lock");
+        assert_eq!(remaining.get(&first.command_id).map_or(0, VecDeque::len), 0);
+        assert_eq!(
+            remaining.get(&shutdown.command_id).map_or(0, VecDeque::len),
+            0
+        );
+        drop(remaining);
+
+        let mut port = runner.host().local_port();
+        for command in [first, shutdown] {
+            let status = port
+                .command_status(command.command_id)
+                .expect("native terminal status query")
+                .expect("native command status");
+            assert!(matches!(
+                status.application(),
+                crate::ApplicationState::Applied(_)
+            ));
+        }
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn cancellation_retains_exact_envelope_while_compare_only_lookup_finishes() {
+        let session_id = HostSessionId::new(0x5555);
+        let shutdown_id = CommandId::from_client_sequence(u64::MAX, session_id.get());
+        let racing = envelope(1, HostCommand::Step);
+        let authority = Arc::new(ScriptedNativeAuthority {
+            outcomes: Mutex::new(HashMap::from([
+                (
+                    racing.command_id,
+                    VecDeque::from([
+                        CommandAuthorityLookup::Failed(
+                            crate::CommandAuthorityLookupFailure::Pending,
+                        ),
+                        CommandAuthorityLookup::Absent,
+                    ]),
+                ),
+                (
+                    shutdown_id,
+                    VecDeque::from([CommandAuthorityLookup::Claimed]),
+                ),
+            ])),
+        });
+        let journal_state = Rc::new(RefCell::new(CaptureState {
+            mode: ReceiptMode::Immediate,
+            ..CaptureState::default()
+        }));
+        let core = HostCore::with_journal(
+            session_id,
+            world(),
+            options(true),
+            Box::new(NativeAuthorityJournal {
+                inner: CaptureJournal {
+                    state: Rc::clone(&journal_state),
+                },
+                authority,
+            }),
+        )
+        .expect("native cancellation authority host");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("native cancellation authority runner");
+        control
+            .try_submit(racing.clone())
+            .expect("racing command ingress");
+        assert!(control.cancel());
+
+        assert!(matches!(
+            runner.run_until_terminal(),
+            Err(NativeRunError::TerminalDrainFailed {
+                unresolved_envelopes: 1,
+                ..
+            })
+        ));
+        assert_eq!(runner.unresolved_envelopes(), std::slice::from_ref(&racing));
+        assert_eq!(runner.host().core().world_tick(), Tick(0));
+        assert!(matches!(
+            runner.run_until_terminal(),
+            Err(NativeRunError::TerminalDrainFailed {
+                unresolved_envelopes: 1,
+                ..
+            })
+        ));
     }
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]

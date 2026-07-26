@@ -473,6 +473,9 @@ struct SharedHostState {
     command_archive_requirement: ShutdownCommitRequirement,
     /// One ordered cache-miss submission awaiting worker-side durable authority.
     pending_command_authority: Option<PendingCommandAuthority>,
+    /// Bounded terminal lookup outcomes awaiting their submitting callers' exact retries.
+    resolved_command_authority_failures: HashMap<CommandId, ResolvedCommandAuthorityFailure>,
+    resolved_command_authority_failure_order: VecDeque<CommandId>,
     next_audit_order: u64,
     pending_audit_count: usize,
     pending_audits: VecDeque<(u64, CommandId)>,
@@ -497,12 +500,89 @@ struct PendingCommandAuthority {
     policy: CommandClaimPolicy,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedCommandAuthorityFailure {
+    command_id: CommandId,
+    envelope_digest: [u8; blake3::OUT_LEN],
+    error: HostAccessError,
+}
+
 /// Maximum archived terminal commands retained for idempotent retry answers. Beyond
 /// this bound the oldest archived records are evicted and the durable journal is the
 /// only authority (bd-2z0.5.2.1).
 const ARCHIVED_IDEMPOTENCY_RETENTION: usize = 4_096;
 
 impl SharedHostState {
+    fn retain_authority_failure(
+        &mut self,
+        pending: &PendingCommandAuthority,
+        error: HostAccessError,
+    ) {
+        let command_id = pending.envelope.command_id;
+        if !self
+            .resolved_command_authority_failures
+            .contains_key(&command_id)
+        {
+            self.resolved_command_authority_failure_order
+                .push_back(command_id);
+        }
+        self.resolved_command_authority_failures.insert(
+            command_id,
+            ResolvedCommandAuthorityFailure {
+                command_id,
+                envelope_digest: pending.envelope_digest,
+                error,
+            },
+        );
+        while self.resolved_command_authority_failure_order.len() > self.command_capacity {
+            if let Some(oldest) = self.resolved_command_authority_failure_order.pop_front() {
+                self.resolved_command_authority_failures.remove(&oldest);
+            }
+        }
+    }
+
+    fn take_authority_failure(
+        &mut self,
+        command_id: CommandId,
+        envelope_digest: [u8; blake3::OUT_LEN],
+    ) -> Option<HostAccessError> {
+        let matches = self
+            .resolved_command_authority_failures
+            .get(&command_id)
+            .is_some_and(|resolved| {
+                resolved.command_id == command_id && resolved.envelope_digest == envelope_digest
+            });
+        if !matches {
+            return None;
+        }
+        self.resolved_command_authority_failure_order
+            .retain(|retained| *retained != command_id);
+        self.resolved_command_authority_failures
+            .remove(&command_id)
+            .map(|resolved| resolved.error)
+    }
+
+    fn cancel_pending_non_shutdown_authority(&mut self) {
+        let should_cancel = self
+            .pending_command_authority
+            .as_ref()
+            .is_some_and(|pending| !matches!(pending.envelope.command, HostCommand::Shutdown));
+        if !should_cancel {
+            return;
+        }
+        let pending = self
+            .pending_command_authority
+            .take()
+            .expect("pending authority checked above");
+        self.retain_authority_failure(
+            &pending,
+            HostAccessError::CommandAuthorityLookup {
+                command_id: pending.envelope.command_id,
+                failure: crate::CommandAuthorityLookupFailure::Cancelled,
+            },
+        );
+    }
+
     fn validate_journaled_authority(
         command_id: CommandId,
         authority: &crate::JournaledCommandAuthority,
@@ -615,54 +695,78 @@ impl SharedHostState {
             return Ok(false);
         };
         let command_id = pending.envelope.command_id;
-        let reader = self
-            .command_authority_reader
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| HostAccessError::CommandAuthorityLookup {
-                command_id,
-                failure: crate::CommandAuthorityLookupFailure::Unavailable {
-                    message: "pending durable lookup lost its authority reader".to_owned(),
+        let Some(reader) = self.command_authority_reader.as_ref().map(Arc::clone) else {
+            self.pending_command_authority = None;
+            self.retain_authority_failure(
+                &pending,
+                HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure: crate::CommandAuthorityLookupFailure::Unavailable {
+                        message: "pending durable lookup lost its authority reader".to_owned(),
+                    },
                 },
-            })?;
+            );
+            return Ok(false);
+        };
         match reader.resolve_for_submit(&pending.envelope, pending.envelope_digest, pending.policy)
         {
             CommandAuthorityLookup::Found(authority) => {
-                Self::validate_journaled_authority(command_id, &authority)?;
+                if let Err(error) = Self::validate_journaled_authority(command_id, &authority) {
+                    self.pending_command_authority = None;
+                    self.retain_authority_failure(&pending, error);
+                    return Ok(false);
+                }
                 let status = authority.status().clone();
                 let prior_digest = authority.envelope_digest();
                 self.pending_command_authority = None;
                 self.retain_archived_authority(command_id, prior_digest, status);
-                if prior_digest == pending.envelope_digest {
-                    Ok(false)
-                } else {
-                    Err(HostAccessError::CommandIdCollision { command_id })
+                if prior_digest != pending.envelope_digest {
+                    self.retain_authority_failure(
+                        &pending,
+                        HostAccessError::CommandIdCollision { command_id },
+                    );
                 }
+                Ok(false)
             }
             CommandAuthorityLookup::Claimed => {
                 self.pending_command_authority = None;
-                self.submit_fresh(
-                    pending.envelope,
+                let result = self.submit_fresh(
+                    pending.envelope.clone(),
                     pending.envelope_digest,
                     pending.reserve_lifecycle_slot,
-                )?;
+                );
+                if let Err(error) = result {
+                    self.retain_authority_failure(&pending, error);
+                }
                 Ok(false)
             }
             CommandAuthorityLookup::Absent if pending.policy == CommandClaimPolicy::CompareOnly => {
                 self.pending_command_authority = None;
-                self.submit_fresh(
-                    pending.envelope,
-                    pending.envelope_digest,
-                    pending.reserve_lifecycle_slot,
-                )?;
+                self.retain_authority_failure(
+                    &pending,
+                    HostAccessError::CommandEvidenceClosed {
+                        lifecycle: self.admission_lifecycle,
+                    },
+                );
                 Ok(false)
             }
-            CommandAuthorityLookup::Absent => Err(protocol_violation(format!(
-                "durable command authority proved {command_id} absent without reserving it"
-            ))),
+            CommandAuthorityLookup::Absent => {
+                self.pending_command_authority = None;
+                self.retain_authority_failure(
+                    &pending,
+                    protocol_violation(format!(
+                        "durable command authority proved {command_id} absent without reserving it"
+                    )),
+                );
+                Ok(false)
+            }
             CommandAuthorityLookup::Collision => {
                 self.pending_command_authority = None;
-                Err(HostAccessError::CommandIdCollision { command_id })
+                self.retain_authority_failure(
+                    &pending,
+                    HostAccessError::CommandIdCollision { command_id },
+                );
+                Ok(false)
             }
             CommandAuthorityLookup::Failed(
                 crate::CommandAuthorityLookupFailure::Pending
@@ -670,10 +774,15 @@ impl SharedHostState {
                 | crate::CommandAuthorityLookupFailure::Capacity { .. },
             ) => Ok(true),
             CommandAuthorityLookup::Failed(failure) => {
-                Err(HostAccessError::CommandAuthorityLookup {
-                    command_id,
-                    failure,
-                })
+                self.pending_command_authority = None;
+                self.retain_authority_failure(
+                    &pending,
+                    HostAccessError::CommandAuthorityLookup {
+                        command_id,
+                        failure,
+                    },
+                );
+                Ok(false)
             }
         }
     }
@@ -943,6 +1052,9 @@ impl SharedHostState {
         reserve_lifecycle_slot: bool,
     ) -> Result<CommandStatus, HostAccessError> {
         let envelope_digest = command_envelope_digest(&envelope)?;
+        if let Some(error) = self.take_authority_failure(envelope.command_id, envelope_digest) {
+            return Err(error);
+        }
         if let Some(pending) = &self.pending_command_authority {
             if pending.envelope.command_id == envelope.command_id
                 && pending.envelope_digest != envelope_digest
@@ -962,6 +1074,9 @@ impl SharedHostState {
                     command_id: envelope.command_id,
                     failure: crate::CommandAuthorityLookupFailure::Pending,
                 });
+            }
+            if let Some(error) = self.take_authority_failure(envelope.command_id, envelope_digest) {
+                return Err(error);
             }
         }
         if let Some(authority) = self.commands.get(&envelope.command_id) {
@@ -1647,6 +1762,8 @@ impl HostCore {
             command_authority_required,
             command_archive_requirement,
             pending_command_authority: None,
+            resolved_command_authority_failures: HashMap::new(),
+            resolved_command_authority_failure_order: VecDeque::new(),
             next_audit_order: 1,
             pending_audit_count: 0,
             pending_audits: VecDeque::with_capacity(options.command_capacity),
@@ -1737,6 +1854,9 @@ impl HostCore {
                 .map(|authority| authority.status.clone())
                 .ok_or_else(|| protocol_violation("shutdown command status is missing"));
         }
+        self.shared
+            .borrow_mut()
+            .cancel_pending_non_shutdown_authority();
 
         loop {
             let sequence = self.next_lifecycle_command_sequence;
@@ -1774,6 +1894,19 @@ impl HostCore {
             .shutdown_command_id
             .and_then(|command_id| shared.commands.get(&command_id))
             .map(|authority| authority.status.clone())
+    }
+
+    /// Command currently waiting for durable cache-miss authority, when any.
+    ///
+    /// Platform owners use this identity only to retain and correlate the exact
+    /// ingress envelope until the worker-side lookup reaches a typed outcome.
+    #[must_use]
+    pub fn pending_command_authority_id(&self) -> Option<CommandId> {
+        self.shared
+            .borrow()
+            .pending_command_authority
+            .as_ref()
+            .map(|pending| pending.envelope.command_id)
     }
 
     /// Latest immutable host publication.
@@ -1857,14 +1990,14 @@ impl HostCore {
     /// Current scheduling interest for a platform-owned driver.
     #[must_use]
     pub fn drive_interest(&self) -> HostDriveInterest {
+        if self.shared.borrow().pending_command_authority.is_some() {
+            return HostDriveInterest::Draining;
+        }
         if self.lifecycle == HostLifecycle::Stopped {
             return HostDriveInterest::Terminated;
         }
         if self.health.fault().is_some() {
             return HostDriveInterest::Faulted;
-        }
-        if self.shared.borrow().pending_command_authority.is_some() {
-            return HostDriveInterest::Draining;
         }
         if self.retained_journal.is_some() {
             return HostDriveInterest::WakeOnly;
@@ -5180,6 +5313,143 @@ mod tests {
             core.world
                 .world_digest_v1()
                 .expect("post-collision deterministic world digest"),
+            before_digest
+        );
+    }
+
+    #[test]
+    fn terminal_authority_failure_is_correlated_without_failing_the_owner_drive() {
+        let command_id = CommandId::from_client_sequence(0x52, 8);
+        let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+        let failure = CommandAuthorityLookupFailure::Corrupt {
+            message: "duplicate terminal command authority".to_owned(),
+        };
+        let scripted = Arc::new(ScriptedCommandAuthority {
+            outcomes: Mutex::new(HashMap::from([(
+                command_id,
+                VecDeque::from([
+                    CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+                    CommandAuthorityLookup::Failed(failure.clone()),
+                    CommandAuthorityLookup::Claimed,
+                ]),
+            )])),
+        });
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(0x5252),
+            world(0),
+            options(true),
+            Box::new(AuthorityBackedVolatileJournal {
+                inner: VolatileJournal::with_capacity(64),
+                authority: scripted.clone(),
+            }),
+        )
+        .expect("authority-backed host");
+        let mut port = core.local_port();
+        let before_digest = core
+            .world
+            .world_digest_v1()
+            .expect("pre-lookup deterministic world digest");
+
+        assert!(matches!(
+            port.submit(envelope.clone()),
+            Err(HostAccessError::CommandAuthorityLookup {
+                command_id: pending_id,
+                failure: CommandAuthorityLookupFailure::Pending,
+            }) if pending_id == command_id
+        ));
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("terminal lookup outcome must not fail the sole owner drive");
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("a resolved failure must not be polled again without caller retry");
+
+        let remaining = scripted
+            .outcomes
+            .lock()
+            .expect("scripted outcomes lock")
+            .get(&command_id)
+            .map_or(0, VecDeque::len);
+        assert_eq!(remaining, 1, "the later claim must remain unconsumed");
+        assert_eq!(port.queue_depth(), 0);
+        assert_eq!(core.pending_command_authority_id(), None);
+        assert_eq!(
+            core.world
+                .world_digest_v1()
+                .expect("post-failure deterministic world digest"),
+            before_digest
+        );
+        assert!(matches!(
+            port.submit(envelope),
+            Err(HostAccessError::CommandAuthorityLookup {
+                command_id: failed_id,
+                failure: CommandAuthorityLookupFailure::Corrupt { message },
+            }) if failed_id == command_id && message == "duplicate terminal command authority"
+        ));
+    }
+
+    #[test]
+    fn shutdown_cancels_pending_non_shutdown_authority_without_applying_it() {
+        let command_id = CommandId::from_client_sequence(0x53, 9);
+        let session_id = HostSessionId::new(0x5353);
+        let shutdown_id =
+            CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, session_id.get());
+        let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+        let scripted = Arc::new(ScriptedCommandAuthority {
+            outcomes: Mutex::new(HashMap::from([
+                (
+                    command_id,
+                    VecDeque::from([CommandAuthorityLookup::Failed(
+                        CommandAuthorityLookupFailure::Pending,
+                    )]),
+                ),
+                (
+                    shutdown_id,
+                    VecDeque::from([CommandAuthorityLookup::Claimed]),
+                ),
+            ])),
+        });
+        let mut core = HostCore::with_journal(
+            session_id,
+            world(0),
+            options(true),
+            Box::new(AuthorityBackedVolatileJournal {
+                inner: VolatileJournal::with_capacity(64),
+                authority: scripted,
+            }),
+        )
+        .expect("authority-backed host");
+        let mut port = core.local_port();
+        let before_digest = core
+            .world
+            .world_digest_v1()
+            .expect("pre-cancellation deterministic world digest");
+
+        assert!(matches!(
+            port.submit(envelope.clone()),
+            Err(HostAccessError::CommandAuthorityLookup {
+                command_id: pending_id,
+                failure: CommandAuthorityLookupFailure::Pending,
+            }) if pending_id == command_id
+        ));
+        let shutdown = core
+            .request_shutdown()
+            .expect("host-owned shutdown must replace the cancelled lookup");
+        assert_eq!(shutdown.command_id(), shutdown_id);
+        assert_eq!(core.pending_command_authority_id(), None);
+        assert!(matches!(
+            port.submit(envelope),
+            Err(HostAccessError::CommandAuthorityLookup {
+                command_id: cancelled_id,
+                failure: CommandAuthorityLookupFailure::Cancelled,
+            }) if cancelled_id == command_id
+        ));
+
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("ordered shutdown boundary");
+        assert_eq!(core.world_tick(), Tick(0));
+        assert_eq!(
+            core.world
+                .world_digest_v1()
+                .expect("post-cancellation deterministic world digest"),
             before_digest
         );
     }
