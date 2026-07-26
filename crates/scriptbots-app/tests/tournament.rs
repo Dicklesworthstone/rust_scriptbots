@@ -5,11 +5,12 @@
 //! qualifier that can never be lost, and the null-tournament bias probe.
 
 use scriptbots_app::tournament::{
-    FamilyOutcome, MatchOutcome, OrderPolicy, TournamentError, TournamentSpec,
-    enforce_no_config_drift, plan, run_match, run_tournament,
+    EloRating, FamilyOutcome, FamilyScore, MatchOutcome, MatchResult, OrderPolicy, TournamentError,
+    TournamentHarness, TournamentSpec, enforce_no_config_drift, plan, run_match, run_tournament,
 };
 use scriptbots_brain::BrainKind;
 use scriptbots_core::ScriptBotsConfig;
+use std::collections::HashMap;
 
 const MLP_A: BrainKind = BrainKind::new("mlp-a");
 const MLP_B: BrainKind = BrainKind::new("mlp-b");
@@ -189,4 +190,60 @@ fn outcomes_record_every_family_with_warnings_channel() {
             .all(|outcome| outcome.survival_share >= 0.0 && outcome.survival_share <= 1.0),
         "survival shares are probabilities"
     );
+}
+
+#[test]
+fn test_tournament_integration_elo_progression() {
+    let mut harness = TournamentHarness::new();
+    harness.register_family("mlp");
+    harness.register_family("dwraon");
+    harness.register_family("assembly");
+
+    let mut scores = HashMap::new();
+    scores.insert(
+        "mlp".to_owned(),
+        FamilyScore {
+            survival_share: 0.8,
+            biomass_share: 0.7,
+            max_generation: 20,
+        },
+    );
+    scores.insert(
+        "dwraon".to_owned(),
+        FamilyScore {
+            survival_share: 0.2,
+            biomass_share: 0.3,
+            max_generation: 10,
+        },
+    );
+
+    harness.record_match(MatchResult {
+        seed: 100,
+        ticks: 1_000,
+        family_scores: scores,
+    });
+
+    let mlp_rating = harness.ratings.get("mlp").expect("mlp rating");
+    let dwraon_rating = harness.ratings.get("dwraon").expect("dwraon rating");
+
+    assert!(mlp_rating.rating > 1_500.0);
+    assert!(dwraon_rating.rating < 1_500.0);
+    assert_eq!(mlp_rating.wins, 1);
+    assert_eq!(dwraon_rating.wins, 0);
+
+    let leaderboard = harness.generate_leaderboard_markdown();
+    assert!(leaderboard.contains("mlp"));
+    assert!(leaderboard.contains("dwraon"));
+    assert!(leaderboard.contains("assembly"));
+}
+
+#[test]
+fn test_elo_update_symmetry() {
+    let mut winner = EloRating::new("winner");
+    let mut loser = EloRating::new("loser");
+
+    EloRating::update_elo(&mut winner, &mut loser, 32.0);
+
+    assert!((winner.rating - 1_516.0).abs() < 1e-4);
+    assert!((loser.rating - 1_484.0).abs() < 1e-4);
 }
