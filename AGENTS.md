@@ -907,9 +907,31 @@ AGENT_NAME=<mail-name> scripts/shared_tree_commit.py review \
   -m "chore(beads): close bd-xxxx" -- .beads/issues.jsonl .beads/last-touched
 AGENT_NAME=<mail-name> scripts/shared_tree_commit.py commit --review <token>
 
-git push origin main
-git push origin main:master
+# AGENT_NAME is required for the PUSH too, not just the commits above (bd-tat5).
+AGENT_NAME=<mail-name> git push origin main
+AGENT_NAME=<mail-name> git push origin main:master
 ```
+
+**`git push` without `AGENT_NAME` fails, and the error does not say so (`bd-tat5`).** The
+`pre-push` hook chain runs `50-agent-mail.py`, which exits 2 with
+`mcp-agent-mail: AGENT_NAME environment variable is required.` Git then reports only:
+
+```
+error: failed to push some refs to 'https://github.com/.../rust_scriptbots.git'
+```
+
+which reads like a non-fast-forward or a network problem. It is neither — nothing in that
+message points at a local hook. If a push fails and `git fetch` shows you are not behind,
+check `echo $AGENT_NAME` before investigating the remote. Claude Code Bash sessions do **not**
+export it by default, so this is the default condition rather than an edge case.
+
+Do **not** route around it with `git push --no-verify`: the same chain carries the file
+reservation guard, so skipping it silently disables the protection that makes a shared working
+tree safe. Prefix the push instead.
+
+The commit path is already safe — `scripts/shared_tree_commit.py` refuses with an explicit
+`REFUSED: AGENT_NAME is required` (exit 64) rather than a misleading one — so the push is the
+only place this still bites.
 
 Never stage into the shared index and never use a raw, bare, or pathspec
 `git commit`. A pathspec protects only the shared index; it still re-reads
