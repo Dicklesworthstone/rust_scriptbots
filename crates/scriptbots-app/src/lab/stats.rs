@@ -38,6 +38,8 @@ pub enum TestName {
 pub enum StatsError {
     #[error("No samples provided")]
     NoSamples,
+    #[error("At least two samples per cohort are required")]
+    InsufficientSamples,
     #[error("Unmatched seeds between cohorts")]
     UnmatchedSeeds,
     #[error("Metric {0} missing from run summary")]
@@ -88,12 +90,19 @@ pub struct Effect {
 /// zero: a permutation test can bound a p-value from above but cannot prove it is zero, and
 /// reporting 0.0 would claim more than the procedure supports.
 fn paired_permutation_p_value(diffs: &[f64], iterations: u32, seed: u64) -> f64 {
-    debug_assert!(!diffs.is_empty(), "caller rejects empty cohorts before this point");
+    debug_assert!(
+        !diffs.is_empty(),
+        "caller rejects empty cohorts before this point"
+    );
     let n = diffs.len() as f64;
     let observed = (diffs.iter().sum::<f64>() / n).abs();
 
     // Never zero: xorshift64 has a fixed point at zero and would emit a constant stream.
-    let mut state = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+    let mut state = if seed == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        seed
+    };
     let mut at_least_as_extreme = 0u32;
     for _ in 0..iterations {
         let mut sum = 0.0;
@@ -193,6 +202,9 @@ pub fn hedges_g(a: &[RunSummary], b: &[RunSummary], metric: &str) -> Result<Effe
     if a.is_empty() || b.is_empty() {
         return Err(StatsError::NoSamples);
     }
+    if a.len() < 2 || b.len() < 2 {
+        return Err(StatsError::InsufficientSamples);
+    }
 
     let vals_a: Vec<f64> = a
         .iter()
@@ -214,6 +226,14 @@ pub fn hedges_g(a: &[RunSummary], b: &[RunSummary], metric: &str) -> Result<Effe
         })
         .collect::<Result<_, _>>()?;
 
+    if vals_a
+        .iter()
+        .chain(vals_b.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(StatsError::NonFiniteValue);
+    }
+
     let na = vals_a.len() as f64;
     let nb = vals_b.len() as f64;
 
@@ -223,19 +243,50 @@ pub fn hedges_g(a: &[RunSummary], b: &[RunSummary], metric: &str) -> Result<Effe
     let var_a = vals_a.iter().map(|x| (x - mean_a).powi(2)).sum::<f64>() / (na - 1.0).max(1.0);
     let var_b = vals_b.iter().map(|x| (x - mean_b).powi(2)).sum::<f64>() / (nb - 1.0).max(1.0);
 
-    let pooled_sd = (((na - 1.0) * var_a + (nb - 1.0) * var_b) / (na + nb - 2.0).max(1.0)).sqrt();
-    let cohens_d = if pooled_sd > 1e-12 {
-        (mean_a - mean_b) / pooled_sd
-    } else {
-        0.0
-    };
+    let df = na + nb - 2.0;
+    let pooled_variance = ((na - 1.0) * var_a + (nb - 1.0) * var_b) / df;
+    if !pooled_variance.is_finite() {
+        return Err(StatsError::NonFiniteValue);
+    }
+    if pooled_variance <= 0.0 {
+        return Err(StatsError::ZeroVariance);
+    }
+    let pooled_sd = pooled_variance.sqrt();
+    let (data_min, data_max) = vals_a
+        .iter()
+        .chain(vals_b.iter())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
+            (min.min(*value), max.max(*value))
+        });
+    let data_range = data_max - data_min;
+    if !data_range.is_finite() {
+        return Err(StatsError::NonFiniteValue);
+    }
+    // Preserve paired_diff's 1e-12 degeneracy boundary without making it depend on
+    // the unit or additive origin: the total observed range scales with the values
+    // but is unchanged by translating every observation.
+    let degenerate_tolerance = 1e-12 * data_range;
+    if pooled_sd <= degenerate_tolerance {
+        return Err(StatsError::ZeroVariance);
+    }
+    let cohens_d = (mean_a - mean_b) / pooled_sd;
 
     // Small-sample correction factor for Hedges' g
-    let df = na + nb - 2.0;
     let correction_factor = 1.0 - (3.0 / (4.0 * df - 1.0).max(1.0));
     let g = cohens_d * correction_factor;
+    if !g.is_finite() {
+        return Err(StatsError::NonFiniteValue);
+    }
 
-    let ci_95 = (g - 1.96 * 0.1, g + 1.96 * 0.1);
+    // Large-sample standard error for Hedges' g. Unlike the previous hardcoded 0.1,
+    // this uncertainty responds to both cohort size and the observed standardized effect:
+    // https://www.itl.nist.gov/div898/software/dataplot/refman1/auxillar/hedges_g.htm
+    let standard_error = ((na + nb) / (na * nb) + g.powi(2) / (2.0 * (na + nb))).sqrt();
+    if !standard_error.is_finite() {
+        return Err(StatsError::NonFiniteValue);
+    }
+    let margin_95 = 1.959_963_984_540_054 * standard_error;
+    let ci_95 = (g - margin_95, g + margin_95);
 
     Ok(Effect {
         metric: metric.to_string(),
@@ -483,8 +534,12 @@ mod tests {
         let control = [run(1, 7, metrics_a), run(2, 8, metrics_c)];
         let treatment = [run(3, 7, metrics_b), run(4, 8, metrics_d)];
 
-        let first = paired_diff(&control, &treatment, "pop").expect("effect").p_value;
-        let second = paired_diff(&control, &treatment, "pop").expect("effect").p_value;
+        let first = paired_diff(&control, &treatment, "pop")
+            .expect("effect")
+            .p_value;
+        let second = paired_diff(&control, &treatment, "pop")
+            .expect("effect")
+            .p_value;
         assert_eq!(first, second, "permutation p-value must be reproducible");
     }
 
@@ -512,33 +567,178 @@ mod tests {
 
     #[test]
     fn test_hedges_g_bias_correction() {
-        let mut m1 = BTreeMap::new();
-        m1.insert("score".to_string(), 10.0);
-        let mut m2 = BTreeMap::new();
-        m2.insert("score".to_string(), 5.0);
-
-        let run_a = RunSummary {
-            run_id: 1,
-            arm_id: 0,
-            seed: 100,
-            config_hash: [0; 32],
-            digest: [0; 32],
-            ticks: 50,
-            metrics: m1,
+        let cohort = |first_run_id: u64, arm_id: u16, values: &[f64]| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let mut metrics = BTreeMap::new();
+                    metrics.insert("score".to_string(), *value);
+                    RunSummary {
+                        run_id: first_run_id + index as u64,
+                        arm_id,
+                        seed: 100 + index as u64,
+                        config_hash: [0; 32],
+                        digest: [0; 32],
+                        ticks: 50,
+                        metrics,
+                    }
+                })
+                .collect::<Vec<_>>()
         };
+        let a = cohort(1, 0, &[-1.0, 0.0, 1.0, 2.0, 3.0]);
+        let b = cohort(6, 1, &[-2.0, -1.0, 0.0, 1.0, 2.0]);
 
-        let run_b = RunSummary {
-            run_id: 2,
-            arm_id: 1,
-            seed: 101,
-            config_hash: [0; 32],
-            digest: [0; 32],
-            ticks: 50,
-            metrics: m2,
+        let effect = hedges_g(&a, &b, "score").unwrap();
+        assert!((effect.statistic - 0.571_250_157_965_900_7).abs() < 1e-12);
+        assert!((effect.ci_95.0 - (-0.693_369_178_253_24)).abs() < 1e-12);
+        assert!((effect.ci_95.1 - 1.835_869_494_185_041_5).abs() < 1e-12);
+        assert_eq!(effect.n, 10);
+        assert!(!effect.underpowered);
+    }
+
+    #[test]
+    fn hedges_g_refuses_degenerate_pooled_spread() {
+        let summary = |run_id: u64, arm_id: u16, value: f64| {
+            let mut metrics = BTreeMap::new();
+            metrics.insert("score".to_string(), value);
+            RunSummary {
+                run_id,
+                arm_id,
+                seed: run_id,
+                config_hash: [0; 32],
+                digest: [0; 32],
+                ticks: 50,
+                metrics,
+            }
         };
+        let control = [summary(1, 0, 10.0), summary(2, 0, 10.0)];
+        let treatment = [summary(3, 1, 20.0), summary(4, 1, 20.0)];
 
-        let effect = hedges_g(&[run_a], &[run_b], "score").unwrap();
-        assert_eq!(effect.n, 2);
-        assert!(effect.underpowered);
+        assert_eq!(
+            hedges_g(&control, &treatment, "score"),
+            Err(StatsError::ZeroVariance),
+            "constant cohorts with different means have an unbounded standardized effect, \
+             not a zero effect"
+        );
+
+        let equal_treatment = [summary(5, 1, 10.0), summary(6, 1, 10.0)];
+        assert_eq!(
+            hedges_g(&control, &equal_treatment, "score"),
+            Err(StatsError::ZeroVariance),
+            "equal constant cohorts still cannot support a standardized effect estimate"
+        );
+
+        assert_eq!(
+            hedges_g(&control[..1], &treatment, "score"),
+            Err(StatsError::InsufficientSamples),
+            "each independent cohort needs at least two observations"
+        );
+
+        let near_constant_control = [summary(7, 0, 0.0), summary(8, 0, 1e-13)];
+        let near_constant_treatment = [summary(9, 1, 1.0), summary(10, 1, 1.0 + 1e-13)];
+        assert_eq!(
+            hedges_g(&near_constant_control, &near_constant_treatment, "score"),
+            Err(StatsError::ZeroVariance),
+            "spread below the scale-relative degeneracy boundary must be refused"
+        );
+
+        let ordinary_control = [summary(11, 0, 0.0), summary(12, 0, 1.0)];
+        let ordinary_treatment = [summary(13, 1, 2.0), summary(14, 1, 3.0)];
+        let ordinary = hedges_g(&ordinary_control, &ordinary_treatment, "score").unwrap();
+
+        let translated_control = [
+            summary(15, 0, 1_000_000_000_000.0),
+            summary(16, 0, 1_000_000_000_001.0),
+        ];
+        let translated_treatment = [
+            summary(17, 1, 1_000_000_000_002.0),
+            summary(18, 1, 1_000_000_000_003.0),
+        ];
+        let translated = hedges_g(&translated_control, &translated_treatment, "score").unwrap();
+        assert_eq!(
+            ordinary.statistic, translated.statistic,
+            "adding a common origin must not change a standardized effect"
+        );
+        assert_eq!(
+            ordinary.ci_95, translated.ci_95,
+            "adding a common origin must not change its interval"
+        );
+
+        let scaled_control = [summary(19, 0, 0.0), summary(20, 0, 1e-13)];
+        let scaled_treatment = [summary(21, 1, 2e-13), summary(22, 1, 3e-13)];
+        let scaled = hedges_g(&scaled_control, &scaled_treatment, "score").unwrap();
+        assert!(
+            (ordinary.statistic - scaled.statistic).abs() < 1e-12,
+            "uniform scaling must not change a standardized effect"
+        );
+        assert!(
+            (ordinary.ci_95.0 - scaled.ci_95.0).abs() < 1e-12
+                && (ordinary.ci_95.1 - scaled.ci_95.1).abs() < 1e-12,
+            "uniform scaling must not change its interval"
+        );
+    }
+
+    #[test]
+    fn hedges_g_ci_width_responds_to_dispersion_and_sample_size() {
+        let cohort = |first_run_id: u64, arm_id: u16, values: &[f64]| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let mut metrics = BTreeMap::new();
+                    metrics.insert("score".to_string(), *value);
+                    RunSummary {
+                        run_id: first_run_id + index as u64,
+                        arm_id,
+                        seed: index as u64,
+                        config_hash: [0; 32],
+                        digest: [0; 32],
+                        ticks: 50,
+                        metrics,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let control_values = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let narrow_values = [10.0, 11.0, 12.0, 13.0, 14.0];
+        let diffuse_control_values = [-18.0, -8.0, 2.0, 12.0, 22.0];
+        let diffuse_values = [-8.0, 2.0, 12.0, 22.0, 32.0];
+
+        let control = cohort(1, 0, &control_values);
+        let narrow = cohort(10, 1, &narrow_values);
+        let diffuse_control = cohort(20, 0, &diffuse_control_values);
+        let diffuse = cohort(30, 1, &diffuse_values);
+        let narrow_effect = hedges_g(&control, &narrow, "score").unwrap();
+        let diffuse_effect = hedges_g(&diffuse_control, &diffuse, "score").unwrap();
+        let narrow_width = narrow_effect.ci_95.1 - narrow_effect.ci_95.0;
+        let diffuse_width = diffuse_effect.ci_95.1 - diffuse_effect.ci_95.0;
+
+        assert!(
+            (narrow_width - 5.587_284_583_568_884).abs() < 1e-12,
+            "tight-cohort CI width drifted: {narrow_width}"
+        );
+        assert!(
+            (diffuse_width - 2.529_238_672_438_281_4).abs() < 1e-12,
+            "diffuse-cohort CI width drifted: {diffuse_width}"
+        );
+        assert!(
+            (narrow_width - diffuse_width).abs() > 0.5,
+            "cohorts with the same means and sample sizes but different dispersion must not \
+             receive a constant-width interval: narrow={narrow_width}, diffuse={diffuse_width}"
+        );
+
+        let repeated_control = control_values.repeat(10);
+        let repeated_narrow = narrow_values.repeat(10);
+        let large_control = cohort(100, 0, &repeated_control);
+        let large_narrow = cohort(200, 1, &repeated_narrow);
+        let large_effect = hedges_g(&large_control, &large_narrow, "score").unwrap();
+        let large_width = large_effect.ci_95.1 - large_effect.ci_95.0;
+
+        assert!(
+            large_width < narrow_width,
+            "more observations of the same cohort pattern must narrow the interval: \
+             small={narrow_width}, large={large_width}"
+        );
     }
 }
