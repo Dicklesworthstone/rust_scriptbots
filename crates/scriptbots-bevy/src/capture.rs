@@ -151,6 +151,33 @@ pub struct CaptureProvenance {
     pub rustc_version: String,
     /// Compile target triple.
     pub target_triple: String,
+    /// Commit the source tree was on when this binary's build script ran,
+    /// suffixed `-dirty` if that tree had uncommitted changes (bd-2z0.14.3.10).
+    ///
+    /// This is what lets a golden mismatch distinguish "the renderer changed"
+    /// from "a different build produced this". World identity alone cannot:
+    /// two trees can depict the same world and render it differently.
+    ///
+    /// Read it as an identifier, not a reproducibility proof. Cargo re-runs the
+    /// build script when `.git/HEAD` moves, not on every source edit, so a
+    /// value without `-dirty` means the tree was clean when the script last
+    /// ran — not that it is clean now. `-dirty` appearing is therefore
+    /// conclusive; its absence is merely the best the build can honestly claim.
+    ///
+    /// `None` when git is unavailable or this is not a repository (release
+    /// tarballs, vendored builds).
+    #[serde(default)]
+    pub source_commit: Option<String>,
+    /// FNV-1a-64 of the workspace `Cargo.lock` at build time (bd-2z0.14.3.10).
+    ///
+    /// Equal digests mean both artifacts linked the same resolved dependency
+    /// graph, which `source_commit` does not establish on its own: the lock can
+    /// move without a commit, and a commit can be rebuilt against a changed
+    /// lock. Non-cryptographic — it answers "same file", not "untampered".
+    ///
+    /// `None` when the lock file could not be read.
+    #[serde(default)]
+    pub lock_digest: Option<String>,
     /// Whether the alarm-test corruption mode was active.
     pub corrupt: bool,
 }
@@ -681,6 +708,8 @@ impl<'a> OffscreenCapture<'a> {
                     },
                 )
                 .to_string(),
+            source_commit: option_env!("SCRIPTBOTS_SOURCE_COMMIT").map(str::to_string),
+            lock_digest: option_env!("SCRIPTBOTS_LOCK_DIGEST").map(str::to_string),
             corrupt: self.corrupt,
         }
     }
@@ -1855,6 +1884,8 @@ mod tests {
             colorspace: "rgba8-srgb".to_string(),
             rustc_version: "rustc test".to_string(),
             target_triple: "aarch64-apple-darwin".to_string(),
+            source_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            lock_digest: Some("0f1e2d3c4b5a6978".to_string()),
             corrupt: false,
         };
         let json = serde_json::to_value(&provenance).expect("serialize");
@@ -1876,6 +1907,10 @@ mod tests {
             // A capture that cannot say which world it depicts records how it
             // was rendered but not what it shows (bd-2z0.14.3.4).
             "world_digest",
+            // ...and one that cannot say which source tree rendered it cannot
+            // separate a renderer change from a different build (bd-2z0.14.3.10).
+            "source_commit",
+            "lock_digest",
         ] {
             assert!(
                 json.get(field).is_some(),
@@ -1884,6 +1919,103 @@ mod tests {
         }
         assert_eq!(json["schema"], PROVENANCE_SCHEMA);
         assert_eq!(json["world_digest"], "blake3:deadbeef");
+    }
+
+    /// Provenance JSON written before build identity existed must still decode.
+    ///
+    /// This is the exact shape of the committed goldens under
+    /// `scriptbots-app/tests/scenes/goldens/`, which are parsed rather than
+    /// byte-compared. If the new fields were required, every one of those
+    /// artifacts would become unreadable and the harness would fail on its own
+    /// history rather than on a visual regression.
+    #[test]
+    fn provenance_v1_json_without_build_identity_still_decodes() {
+        let legacy = r#"{
+            "schema": "scriptbots.capture-provenance.v1",
+            "scene": "empty_world",
+            "seed": 1001,
+            "tick": 0,
+            "frontend": "bevy_offscreen",
+            "adapter_name": "Apple M4",
+            "backend": "Metal",
+            "device_type": "Integrated",
+            "quality_tier": "Medium",
+            "viewport": [1280, 720],
+            "colorspace": "rgba8-srgb",
+            "rustc_version": "",
+            "target_triple": "aarch64-apple-darwin",
+            "corrupt": false
+        }"#;
+        let decoded: CaptureProvenance =
+            serde_json::from_str(legacy).expect("a pre-existing v1 golden must still decode");
+        assert_eq!(decoded.scene, "empty_world");
+        assert!(
+            decoded.source_commit.is_none(),
+            "an artifact from before the field existed must read as unknown, not as a value"
+        );
+        assert!(decoded.lock_digest.is_none());
+        assert!(
+            decoded.world_digest.is_none(),
+            "the same additive rule that let world_digest land must still hold"
+        );
+    }
+
+    /// The build script must actually inject build identity, not merely offer a
+    /// field for it.
+    ///
+    /// `rustc_version` is the cautionary case this guards against: it was read
+    /// via `option_env!("SCRIPTBOTS_RUSTC_VERSION").or(option_env!("CARGO_PKG_RUST_VERSION"))`
+    /// with nothing in the workspace setting either, and because cargo sets
+    /// `CARGO_PKG_RUST_VERSION` to an EMPTY string when `rust-version` is absent,
+    /// the `.or` succeeded with `""` and never reached the `"unknown"` fallback.
+    /// Every committed golden therefore carries `"rustc_version": ""`. A field
+    /// that exists and is always blank looks like provenance and proves nothing.
+    #[test]
+    fn build_script_injects_real_build_identity() {
+        let workspace_lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Cargo.lock")
+            .exists();
+        if !workspace_lock {
+            // Vendored or tarball build: the script correctly injects nothing.
+            return;
+        }
+
+        let lock_digest =
+            option_env!("SCRIPTBOTS_LOCK_DIGEST").expect("build.rs must inject the lock digest");
+        assert_eq!(lock_digest.len(), 16, "FNV-1a-64 renders as 16 hex digits");
+        assert!(
+            lock_digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "lock digest must be hex, got {lock_digest}"
+        );
+
+        let rustc = option_env!("SCRIPTBOTS_RUSTC_VERSION")
+            .expect("build.rs must inject the toolchain identity");
+        assert!(
+            !rustc.trim().is_empty(),
+            "the blank-rustc_version hole must stay closed"
+        );
+
+        let target =
+            option_env!("SCRIPTBOTS_TARGET_TRIPLE").expect("build.rs must inject the true target");
+        assert!(
+            !target.trim().is_empty() && target.contains('-'),
+            "target triple must be cargo's resolved TARGET, got {target}"
+        );
+
+        // Only assert shape when git was available; a repo-less build legitimately
+        // has no commit to report.
+        if let Some(commit) = option_env!("SCRIPTBOTS_SOURCE_COMMIT") {
+            let base = commit.strip_suffix("-dirty").unwrap_or(commit);
+            assert_eq!(
+                base.len(),
+                40,
+                "git object names are 40 hex digits: {commit}"
+            );
+            assert!(
+                base.chars().all(|c| c.is_ascii_hexdigit()),
+                "commit must be hex, got {commit}"
+            );
+        }
     }
 
     /// An absent world digest must serialize as an explicit null, never vanish.
@@ -1909,6 +2041,8 @@ mod tests {
             colorspace: "rgba8-srgb".to_string(),
             rustc_version: "rustc test".to_string(),
             target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            source_commit: None,
+            lock_digest: None,
             corrupt: false,
         };
         let json = serde_json::to_value(&provenance).expect("serialize");
