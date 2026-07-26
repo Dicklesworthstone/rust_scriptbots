@@ -3,16 +3,17 @@
 use fsqlite::Connection;
 use scriptbots_core::{
     AgentData, AgentUid, BrainRunner, ControlCommand, INPUT_SIZE, OUTPUT_SIZE, Position,
-    ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, Tick, WorldDigestV1,
-    WorldState, channels::OutputChannel,
+    ReplayEventKind, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, Tick,
+    WorldDigestV1, WorldState, channels::OutputChannel,
 };
 use scriptbots_runtime::{
     ApplicationState, CommandAuthorityLookupFailure, CommandEnvelope, CommandId, CommandStatus,
     ControlRevision, EventCatchUp, EventCatchUpGuarantee, EventCatchUpState, EventCommitment,
-    EventJournalReader, EventPageSource, EventPoll, EventSequence, HostAccessError, HostBlocker,
-    HostCommand, HostCore, HostCoreOptions, HostLifecycle, HostSessionId, JournalAdmission,
-    JournalBatchId, JournalState, LocalHostPort, ManualInstant, NullFrontend,
-    NullFrontendSubmissionError, PlaybackSnapshot, RejectionReason,
+    EventJournalReader, EventPageSource, EventPoll, EventSequence, FixedDeadlineHost,
+    HostAccessError, HostBlocker, HostCommand, HostCore, HostCoreOptions, HostLifecycle, HostPort,
+    HostSessionId, JournalAdmission, JournalBatchId, JournalState, LocalHostPort, ManualInstant,
+    NullFrontend, NullFrontendSubmissionError, PlaybackSnapshot, RejectionReason,
+    channel::{ChannelHostDriver, ChannelHostOptions, ChannelHostPort, ChannelRunOutcome},
 };
 use scriptbots_storage::{
     CommandJournalCursor, CommandStorageTransitionKind, DomainEventExpectation, DomainEventPayload,
@@ -22,9 +23,9 @@ use scriptbots_storage::{
 };
 use std::{
     fs,
-    sync::Arc,
+    sync::{Arc, Barrier},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const WORKER_RETRY_LIMIT: usize = 2_000;
@@ -172,6 +173,50 @@ fn unique_database_path(label: &str) -> String {
         .to_str()
         .expect("temporary path is valid UTF-8")
         .to_owned()
+}
+
+struct CommandAuthorityEvidence<'a> {
+    envelope: &'a CommandEnvelope,
+    authority_phase: &'static str,
+    cache_result: &'static str,
+    durable_lookup: &'static str,
+    status: Option<&'a CommandStatus>,
+    disposition: &'static str,
+    tick: Tick,
+    world_digest: &'a str,
+    recovery: bool,
+    host_lifecycle: HostLifecycle,
+}
+
+fn emit_command_authority_evidence(evidence: CommandAuthorityEvidence<'_>) {
+    let encoded =
+        postcard::to_allocvec(evidence.envelope).expect("canonical command envelope encoding");
+    let envelope_digest = blake3::hash(&encoded).to_hex().to_string();
+    let admission_sequence = evidence
+        .status
+        .and_then(CommandStatus::admission_sequence)
+        .map(|sequence| sequence.get());
+    let application = evidence.status.map(CommandStatus::application);
+    let journal = evidence.status.map(CommandStatus::journal);
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "scriptbots.command-authority.evidence.v1",
+            "command_id": evidence.envelope.command_id.to_string(),
+            "envelope_digest": envelope_digest,
+            "authority_phase": evidence.authority_phase,
+            "cache_result": evidence.cache_result,
+            "durable_lookup": evidence.durable_lookup,
+            "application_status": application,
+            "journal_status": journal,
+            "admission_sequence": admission_sequence,
+            "host_lifecycle": evidence.host_lifecycle,
+            "disposition": evidence.disposition,
+            "tick": evidence.tick.0,
+            "world_digest": evidence.world_digest,
+            "recovery": evidence.recovery,
+        })
+    );
 }
 
 fn drive_until_journal_state(
@@ -396,6 +441,28 @@ fn submit_command_with_authority_before_owner_drive(
         "durable command authority did not resolve before the owner drive within \
          {WORKER_RETRY_LIMIT} nonblocking polls"
     );
+}
+
+fn wait_channel_command_durable(
+    port: &mut ChannelHostPort,
+    command_id: CommandId,
+) -> CommandStatus {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = port
+            .command_status(command_id)
+            .expect("channel command-status lookup")
+            && !matches!(status.application(), ApplicationState::Admitted)
+            && status.journal() == &JournalState::Durable
+        {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "channel command {command_id:?} did not become durable"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn sorted_agent_identities(core: &HostCore) -> Vec<(AgentUid, u64)> {
@@ -1143,8 +1210,21 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
             .expect("world digest after exact evicted replay"),
         before_evicted_retry_digest
     );
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &first_envelope,
+        authority_phase: "evicted_durable_lookup",
+        cache_result: "miss_evicted",
+        durable_lookup: "resolved_exact",
+        status: Some(&exact_replay),
+        disposition: "authoritative_replay",
+        tick: core.world_tick(),
+        world_digest: &before_evicted_retry_digest.overall,
+        recovery: false,
+        host_lifecycle: core.latest_snapshot().lifecycle,
+    });
 
-    let changed = frontend.submit_envelope(CommandEnvelope::new(first_id, HostCommand::Pause));
+    let changed_envelope = CommandEnvelope::new(first_id, HostCommand::Pause);
+    let changed = frontend.submit_envelope(changed_envelope.clone());
     assert!(
         matches!(
             changed,
@@ -1168,6 +1248,18 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
             .expect("world digest after evicted authority replay and collision"),
         before_evicted_retry_digest
     );
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &changed_envelope,
+        authority_phase: "evicted_cache",
+        cache_result: "hit_collision",
+        durable_lookup: "not_used",
+        status: Some(&first_status),
+        disposition: "command_id_collision",
+        tick: core.world_tick(),
+        world_digest: &before_evicted_retry_digest.overall,
+        recovery: false,
+        host_lifecycle: core.latest_snapshot().lifecycle,
+    });
 
     let shutdown_envelope = CommandEnvelope::new(
         CommandId::from_client_sequence(CLIENT_NAMESPACE, 4),
@@ -1239,6 +1331,18 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
             .expect("fresh world digest after cold recovered status lookup"),
         status_before_digest
     );
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &first_envelope,
+        authority_phase: "recovered_durable_status",
+        cache_result: "miss_cold",
+        durable_lookup: "resolved_status",
+        status: Some(&recovered_status),
+        disposition: "authoritative_status",
+        tick: status_core.world_tick(),
+        world_digest: &status_before_digest.overall,
+        recovery: true,
+        host_lifecycle: status_core.latest_snapshot().lifecycle,
+    });
     drop(status_frontend);
     drop(status_core);
     assert_eq!(
@@ -1301,6 +1405,18 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
             .expect("fresh world digest after cold recovered exact replay"),
         exact_before_digest
     );
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &first_envelope,
+        authority_phase: "recovered_durable_exact",
+        cache_result: "miss_cold",
+        durable_lookup: "resolved_exact",
+        status: Some(&recovered_exact),
+        disposition: "authoritative_replay",
+        tick: exact_core.world_tick(),
+        world_digest: &exact_before_digest.overall,
+        recovery: true,
+        host_lifecycle: exact_core.latest_snapshot().lifecycle,
+    });
     drop(exact_frontend);
     drop(exact_core);
     assert_eq!(
@@ -1333,8 +1449,8 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
         .world_digest_v1()
         .expect("fresh world digest before cold recovered collision");
 
-    let recovered_changed =
-        recovered_frontend.submit_envelope(CommandEnvelope::new(first_id, HostCommand::Pause));
+    let recovered_changed_envelope = CommandEnvelope::new(first_id, HostCommand::Pause);
+    let recovered_changed = recovered_frontend.submit_envelope(recovered_changed_envelope.clone());
     assert!(
         matches!(
             &recovered_changed,
@@ -1370,9 +1486,21 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
             .expect("fresh world digest after recovered replay and collision"),
         recovered_before_digest
     );
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &recovered_changed_envelope,
+        authority_phase: "recovered_durable_collision",
+        cache_result: "miss_cold",
+        durable_lookup: "resolved_collision",
+        status: Some(&first_status),
+        disposition: "command_id_collision",
+        tick: recovered_core.world_tick(),
+        world_digest: &recovered_before_digest.overall,
+        recovery: true,
+        host_lifecycle: recovered_core.latest_snapshot().lifecycle,
+    });
 
     let recovered_exact = recovered_frontend
-        .submit_envelope(first_envelope)
+        .submit_envelope(first_envelope.clone())
         .expect("exact retry uses authority warmed by cold collision resolution");
     assert_eq!(recovered_exact, first_status);
     assert_eq!(recovered_core.world_tick(), recovered_before_tick);
@@ -1383,6 +1511,18 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
             .expect("fresh world digest after recovered collision and exact replay"),
         recovered_before_digest
     );
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &first_envelope,
+        authority_phase: "recovered_cache",
+        cache_result: "hit_exact",
+        durable_lookup: "not_used",
+        status: Some(&recovered_exact),
+        disposition: "authoritative_replay",
+        tick: recovered_core.world_tick(),
+        world_digest: &recovered_before_digest.overall,
+        recovery: true,
+        host_lifecycle: recovered_core.latest_snapshot().lifecycle,
+    });
 
     let before_fresh_revisions = recovered_core.latest_snapshot().revisions;
     let fresh_envelope = CommandEnvelope::new(
@@ -1406,7 +1546,7 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
     );
     assert_eq!(recovered_core.world_tick(), recovered_before_tick);
     let fresh_replay = recovered_frontend
-        .submit_envelope(fresh_envelope)
+        .submit_envelope(fresh_envelope.clone())
         .expect("fresh durable command exact retry");
     assert_eq!(fresh_replay, fresh_status);
     assert_eq!(
@@ -1422,6 +1562,18 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
             .expect("fresh command exact retry digest"),
         fresh_digest
     );
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &fresh_envelope,
+        authority_phase: "recovered_fresh_durable",
+        cache_result: "hit_exact",
+        durable_lookup: "not_used",
+        status: Some(&fresh_status),
+        disposition: "applied_once",
+        tick: recovered_core.world_tick(),
+        world_digest: &fresh_digest.overall,
+        recovery: true,
+        host_lifecycle: recovered_core.latest_snapshot().lifecycle,
+    });
 
     let recovered_shutdown = CommandEnvelope::new(
         CommandId::from_client_sequence(CLIENT_NAMESPACE, 6),
@@ -1440,6 +1592,338 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
             .guarantee,
         PersistenceGuarantee::Durable
     );
+
+    // The uniquely named database is intentionally retained; this test performs no file deletion.
+}
+
+#[test]
+#[allow(
+    clippy::drop_non_drop,
+    clippy::too_many_lines,
+    reason = "one mock-free proof keeps the concurrent clients, sole owner, durable authority, and independent science oracle visible together"
+)]
+fn file_channel_concurrent_exact_duplicate_clients_apply_once_and_persist_authority() {
+    const CLIENT_NAMESPACE: u64 = 0x2a_63_68_61;
+    const SESSION: HostSessionId = HostSessionId::new(0x2a_11);
+    const ORACLE_SESSION: HostSessionId = HostSessionId::new(0x2a_12);
+
+    let path = unique_database_path("channel_concurrent_exact_duplicate");
+    let journal_options = StorageJournalOptions::default();
+    let command_id = CommandId::from_client_sequence(CLIENT_NAMESPACE, 1);
+    let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+
+    let mut oracle = HostCore::new(ORACLE_SESSION, compact_world(), host_options(8))
+        .expect("independent persistence-free science oracle");
+    let mut oracle_frontend = NullFrontend::new(oracle.local_port(), CLIENT_NAMESPACE);
+    let mut oracle_nanos = 0;
+    submit_envelope_with_authority(
+        &mut oracle_frontend,
+        &mut oracle,
+        envelope.clone(),
+        &mut oracle_nanos,
+    );
+    let oracle_status = drive_until_journal_state(
+        &mut oracle_frontend,
+        &mut oracle,
+        command_id,
+        &JournalState::CommittedVolatile,
+        &mut oracle_nanos,
+    );
+    let oracle_digest = oracle
+        .scientific_digest_v1()
+        .expect("independent post-Step science digest");
+    let ApplicationState::Applied(oracle_applied) = oracle_status.application() else {
+        panic!("independent Step oracle did not apply");
+    };
+    assert_eq!(oracle_applied.tick, Tick(1));
+    assert_eq!(oracle_digest.tick, Tick(1));
+
+    let (handoff_tx, handoff_rx) = std::sync::mpsc::sync_channel(1);
+    let owner_path = path.clone();
+    let owner = thread::spawn(move || {
+        let mut world = compact_world();
+        world.request_replay_world_digest();
+        let mut pipeline = StoragePipeline::create_unattributed_file(&owner_path)
+            .expect("new file-backed channel command journal");
+        let run_id = pipeline.run_id();
+        let journal = pipeline
+            .journal_port(SESSION, journal_options)
+            .expect("channel owner journal port");
+        let core = HostCore::with_journal(SESSION, world, host_options(8), Box::new(journal))
+            .expect("file-backed channel owner host");
+        let (mut driver, port) = ChannelHostDriver::new(
+            FixedDeadlineHost::new(core),
+            ChannelHostOptions {
+                ingress_capacity: 8,
+                ingress_drain_budget: 8,
+                status_board_capacity: 8,
+                protocol_event_capacity: 16,
+                submit_deadline: Duration::from_secs(10),
+                maintenance_period: Duration::from_millis(1),
+            },
+        )
+        .expect("bounded channel driver");
+        handoff_tx
+            .send((port, run_id))
+            .expect("hand channel port to concurrent clients");
+        let started = Instant::now();
+        let run = driver
+            .run(move || {
+                ManualInstant::from_nanos(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                )
+            })
+            .expect("channel owner reaches ordered shutdown");
+        let guarantee = pipeline
+            .shutdown()
+            .expect("channel storage pipeline shuts down")
+            .guarantee;
+        (run, guarantee)
+    });
+    let (mut coordinator, run_id) = handoff_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("receive channel client from owner thread");
+
+    let barrier = Arc::new(Barrier::new(3));
+    let spawn_submitter =
+        |mut client: ChannelHostPort, barrier: Arc<Barrier>, envelope: CommandEnvelope| {
+            thread::spawn(move || {
+                barrier.wait();
+                let submitted = client
+                    .submit(envelope.clone())
+                    .expect("concurrent exact envelope reaches command authority");
+                let terminal = wait_channel_command_durable(&mut client, envelope.command_id);
+                (submitted, terminal)
+            })
+        };
+    let left = spawn_submitter(coordinator.clone(), Arc::clone(&barrier), envelope.clone());
+    let right = spawn_submitter(coordinator.clone(), Arc::clone(&barrier), envelope.clone());
+    barrier.wait();
+    let (left_submission, left_terminal) = left.join().expect("left client joins");
+    let (right_submission, right_terminal) = right.join().expect("right client joins");
+
+    assert_eq!(left_submission.command_id(), command_id);
+    assert_eq!(right_submission.command_id(), command_id);
+    assert_eq!(
+        left_submission.admission_sequence(),
+        right_submission.admission_sequence(),
+        "both exact submissions must resolve to one admission identity"
+    );
+    assert_eq!(
+        left_terminal, right_terminal,
+        "both clients must observe one identical authoritative terminal status"
+    );
+    assert_eq!(left_terminal.journal(), &JournalState::Durable);
+    assert_eq!(
+        left_terminal.admission_sequence().map(|value| value.get()),
+        Some(1)
+    );
+    let ApplicationState::Applied(applied) = left_terminal.application() else {
+        panic!("concurrent exact Step did not apply");
+    };
+    let applied = *applied;
+    assert_eq!(applied.tick, Tick(1));
+    assert_eq!(applied, *oracle_applied);
+
+    let before_collision = coordinator
+        .snapshot_after(None)
+        .expect("channel snapshot lookup")
+        .expect("channel owner published a snapshot");
+    assert_eq!(before_collision.last_applied_command, Some(command_id));
+    assert_eq!(
+        before_collision
+            .completed_summary
+            .as_ref()
+            .map(|summary| summary.tick),
+        Some(Tick(1))
+    );
+    assert_eq!(before_collision.revisions, applied.revisions);
+
+    let changed_envelope = CommandEnvelope::new(command_id, HostCommand::Pause);
+    let collision = coordinator
+        .submit(changed_envelope.clone())
+        .expect_err("changed payload under the same id must collide");
+    assert!(
+        matches!(
+            collision,
+            HostAccessError::CommandIdCollision {
+                command_id: collision_id,
+            } if collision_id == command_id
+        ),
+        "changed payload must retain the exact colliding command id"
+    );
+    let after_collision = coordinator
+        .snapshot_after(None)
+        .expect("post-collision channel snapshot lookup")
+        .expect("post-collision snapshot remains available");
+    assert_eq!(
+        after_collision.as_ref(),
+        before_collision.as_ref(),
+        "a collision must not apply or publish a second world boundary"
+    );
+
+    let shutdown_envelope = CommandEnvelope::new(
+        CommandId::from_client_sequence(CLIENT_NAMESPACE, 2),
+        HostCommand::Shutdown,
+    );
+    coordinator
+        .submit(shutdown_envelope)
+        .expect("ordered channel shutdown admission");
+    let (run, guarantee) = owner.join().expect("channel owner thread joins");
+    assert_eq!(run.outcome, ChannelRunOutcome::Stopped);
+    assert_eq!(
+        run.commands_admitted, 2,
+        "only the Step and Shutdown envelopes may be admitted"
+    );
+    assert_eq!(guarantee, PersistenceGuarantee::Durable);
+
+    let reader = StorageReader::open_finished_for_run(&path, run_id)
+        .expect("open immutable concurrent-command run");
+    let evidence = reader
+        .command_journal_evidence(SESSION)
+        .expect("concurrent run has normalized command evidence");
+    assert_eq!(evidence.command_count, 2);
+    assert_eq!(evidence.application_transition_count, 4);
+    assert_eq!(evidence.storage_transition_count, 4);
+
+    let record = reader
+        .command_journal_record(SESSION, command_id)
+        .expect("read exact durable Step authority");
+    assert_eq!(record.batch_id, JournalBatchId::new(SESSION, 1));
+    assert_eq!(record.lifecycle.envelope(), &envelope);
+    assert_eq!(
+        record.lifecycle.admission_sequence(),
+        left_terminal.admission_sequence()
+    );
+    assert_eq!(record.terminal_boundary, applied);
+    assert_eq!(
+        record
+            .lifecycle
+            .terminal()
+            .map(|transition| transition.application()),
+        Some(left_terminal.application())
+    );
+    assert_eq!(
+        record.scientific_event_sequence,
+        Some(EventSequence::new(1))
+    );
+    assert_eq!(record.storage_transitions.len(), 2);
+    assert_eq!(
+        record.storage_transitions[0].kind,
+        CommandStorageTransitionKind::CommittedVolatile
+    );
+    assert_eq!(
+        record.storage_transitions[1].kind,
+        CommandStorageTransitionKind::Durable
+    );
+
+    let page = reader
+        .host_journal_session_conformance_page(
+            SESSION,
+            None,
+            4,
+            journal_options.max_event_page_bytes,
+        )
+        .expect("read complete bounded concurrent-command session");
+    assert_eq!(
+        page.progress.journal,
+        HostJournalPrefixes {
+            admitted: 2,
+            applied: 2,
+            committed_volatile: 2,
+            durable: 2,
+        }
+    );
+    assert_eq!(
+        page.progress.events,
+        HostJournalPrefixes {
+            admitted: 1,
+            applied: 1,
+            committed_volatile: 1,
+            durable: 1,
+        }
+    );
+    assert_eq!(
+        page.progress.shutdown,
+        Some(JournalBatchId::new(SESSION, 2))
+    );
+    assert_eq!(page.records.len(), 2);
+    assert_eq!(page.next_after, None);
+    assert!(
+        page.records
+            .iter()
+            .all(|record| record.state == HostJournalRecordState::Durable)
+    );
+
+    let persisted = reader
+        .load_replay_events()
+        .expect("load durable concurrent-command replay events");
+    let world_digests = persisted
+        .iter()
+        .filter_map(|entry| match &entry.event.kind {
+            ReplayEventKind::WorldDigest { overall } => Some((entry.tick, overall.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(world_digests.len(), 1);
+    let (persisted_tick, persisted_digest) = world_digests[0];
+    assert_eq!(persisted_tick, applied.tick.0);
+    assert_eq!(
+        persisted_digest, oracle_digest.overall,
+        "durable world anchor must match the independent single-Step oracle"
+    );
+
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &envelope,
+        authority_phase: "concurrent_client_left",
+        cache_result: "miss_or_live_exact_race",
+        durable_lookup: "claimed_or_not_consulted_race",
+        status: Some(&left_terminal),
+        disposition: "authoritative_terminal",
+        tick: applied.tick,
+        world_digest: persisted_digest,
+        recovery: false,
+        host_lifecycle: HostLifecycle::Running,
+    });
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &envelope,
+        authority_phase: "concurrent_client_right",
+        cache_result: "miss_or_live_exact_race",
+        durable_lookup: "claimed_or_not_consulted_race",
+        status: Some(&right_terminal),
+        disposition: "authoritative_terminal",
+        tick: applied.tick,
+        world_digest: persisted_digest,
+        recovery: false,
+        host_lifecycle: HostLifecycle::Running,
+    });
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &changed_envelope,
+        authority_phase: "concurrent_cache_collision",
+        cache_result: "hit_collision",
+        durable_lookup: "not_used",
+        status: Some(&left_terminal),
+        disposition: "command_id_collision",
+        tick: applied.tick,
+        world_digest: persisted_digest,
+        recovery: false,
+        host_lifecycle: HostLifecycle::Running,
+    });
+    emit_command_authority_evidence(CommandAuthorityEvidence {
+        envelope: &envelope,
+        authority_phase: "finished_durable_database",
+        cache_result: "not_observed",
+        durable_lookup: "finished_reader_exact",
+        status: Some(&left_terminal),
+        disposition: "single_admission_single_application",
+        tick: applied.tick,
+        world_digest: persisted_digest,
+        recovery: false,
+        host_lifecycle: HostLifecycle::Stopped,
+    });
+    reader
+        .close()
+        .expect("close immutable concurrent-command reader");
 
     // The uniquely named database is intentionally retained; this test performs no file deletion.
 }
