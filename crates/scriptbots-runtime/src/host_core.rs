@@ -5467,6 +5467,24 @@ mod tests {
         }
     }
 
+    struct DurableJournalWithoutAuthority {
+        inner: VolatileJournal,
+    }
+
+    impl JournalPort for DurableJournalWithoutAuthority {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            self.inner.try_admit(batch)
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            self.inner.poll_receipts(limit)
+        }
+
+        fn command_authority_mode(&self) -> CommandAuthorityMode {
+            CommandAuthorityMode::DurableRequired
+        }
+    }
+
     #[test]
     fn durable_cache_miss_never_admits_until_authority_resolves() {
         let command_id = CommandId::from_client_sequence(0x51, 7);
@@ -5557,72 +5575,156 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table proves every terminal durable-authority failure preserves the same complete host boundary"
+    )]
     fn terminal_authority_failure_is_correlated_without_failing_the_owner_drive() {
-        let command_id = CommandId::from_client_sequence(0x52, 8);
-        let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
-        let failure = CommandAuthorityLookupFailure::Corrupt {
-            message: "duplicate terminal command authority".to_owned(),
-        };
-        let scripted = Arc::new(ScriptedCommandAuthority {
-            outcomes: Mutex::new(HashMap::from([(
-                command_id,
-                VecDeque::from([
-                    CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
-                    CommandAuthorityLookup::Failed(failure.clone()),
-                    CommandAuthorityLookup::Claimed,
-                ]),
-            )])),
-        });
+        let failures = [
+            CommandAuthorityLookupFailure::Timeout {
+                waited: std::time::Duration::from_millis(17),
+            },
+            CommandAuthorityLookupFailure::Unavailable {
+                message: "storage command-authority reply lane disconnected".to_owned(),
+            },
+            CommandAuthorityLookupFailure::Ambiguous { matches: 2 },
+            CommandAuthorityLookupFailure::Corrupt {
+                message: "duplicate terminal command authority".to_owned(),
+            },
+        ];
+
+        for (offset, failure) in failures.into_iter().enumerate() {
+            let offset = u64::try_from(offset).expect("authority failure offset fits u64");
+            let command_id = CommandId::from_client_sequence(0x52, 8 + offset);
+            let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+            let scripted = Arc::new(ScriptedCommandAuthority {
+                outcomes: Mutex::new(HashMap::from([(
+                    command_id,
+                    VecDeque::from([
+                        CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+                        CommandAuthorityLookup::Failed(failure.clone()),
+                        CommandAuthorityLookup::Claimed,
+                    ]),
+                )])),
+            });
+            let mut core = HostCore::with_journal(
+                HostSessionId::new(0x5252 + offset),
+                world(0),
+                options(true),
+                Box::new(AuthorityBackedVolatileJournal {
+                    inner: VolatileJournal::with_capacity(64),
+                    authority: scripted.clone(),
+                }),
+            )
+            .expect("authority-backed host");
+            let mut port = core.local_port();
+            let before_admission = core.admission_cursor();
+            let before_tick = core.world_tick();
+            let before_digest = core
+                .world
+                .world_digest_v1()
+                .expect("pre-lookup deterministic world digest");
+            let before_snapshot = core.latest_snapshot();
+            let before_revisions = before_snapshot.revisions;
+            let before_lifecycle = before_snapshot.lifecycle;
+
+            assert!(matches!(
+                port.submit(envelope.clone()),
+                Err(HostAccessError::CommandAuthorityLookup {
+                    command_id: pending_id,
+                    failure: CommandAuthorityLookupFailure::Pending,
+                }) if pending_id == command_id
+            ));
+            core.drive(ManualInstant::from_nanos(0))
+                .expect("terminal lookup outcome must not fail the sole owner drive");
+            core.drive(ManualInstant::from_nanos(0))
+                .expect("a resolved failure must not be polled again without caller retry");
+
+            let remaining = scripted
+                .outcomes
+                .lock()
+                .expect("scripted outcomes lock")
+                .get(&command_id)
+                .map_or(0, VecDeque::len);
+            assert_eq!(remaining, 1, "the later claim must remain unconsumed");
+            assert_eq!(port.queue_depth(), 0);
+            assert_eq!(core.pending_command_authority_id(), None);
+            assert_eq!(core.admission_cursor(), before_admission);
+            assert_eq!(core.world_tick(), before_tick);
+            assert_eq!(core.latest_snapshot().revisions, before_revisions);
+            assert_eq!(core.latest_snapshot().lifecycle, before_lifecycle);
+            assert_eq!(
+                core.world
+                    .world_digest_v1()
+                    .expect("post-failure deterministic world digest"),
+                before_digest
+            );
+            assert_eq!(
+                port.submit(envelope),
+                Err(HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure: failure.clone(),
+                })
+            );
+            assert_eq!(port.queue_depth(), 0);
+            assert_eq!(core.admission_cursor(), before_admission);
+            assert_eq!(core.world_tick(), before_tick);
+            assert_eq!(core.latest_snapshot().revisions, before_revisions);
+            assert_eq!(core.latest_snapshot().lifecycle, before_lifecycle);
+            assert_eq!(
+                core.world
+                    .world_digest_v1()
+                    .expect("exact failure retry leaves deterministic world unchanged"),
+                before_digest
+            );
+        }
+    }
+
+    #[test]
+    fn durable_required_journal_without_authority_reader_fails_closed() {
+        let session_id = HostSessionId::new(0x525f);
+        let command_id = CommandId::from_client_sequence(0x52, 0xff);
         let mut core = HostCore::with_journal(
-            HostSessionId::new(0x5252),
+            session_id,
             world(0),
             options(true),
-            Box::new(AuthorityBackedVolatileJournal {
+            Box::new(DurableJournalWithoutAuthority {
                 inner: VolatileJournal::with_capacity(64),
-                authority: scripted.clone(),
             }),
         )
-        .expect("authority-backed host");
+        .expect("durable-required host without an authority reader");
         let mut port = core.local_port();
+        let before_admission = core.admission_cursor();
+        let before_tick = core.world_tick();
         let before_digest = core
             .world
             .world_digest_v1()
-            .expect("pre-lookup deterministic world digest");
+            .expect("pre-submission deterministic world digest");
+        let before_snapshot = core.latest_snapshot();
+        let before_revisions = before_snapshot.revisions;
+        let before_lifecycle = before_snapshot.lifecycle;
 
-        assert!(matches!(
-            port.submit(envelope.clone()),
+        assert_eq!(
+            port.submit(CommandEnvelope::new(command_id, HostCommand::Step)),
             Err(HostAccessError::CommandAuthorityLookup {
-                command_id: pending_id,
-                failure: CommandAuthorityLookupFailure::Pending,
-            }) if pending_id == command_id
-        ));
-        core.drive(ManualInstant::from_nanos(0))
-            .expect("terminal lookup outcome must not fail the sole owner drive");
-        core.drive(ManualInstant::from_nanos(0))
-            .expect("a resolved failure must not be polled again without caller retry");
-
-        let remaining = scripted
-            .outcomes
-            .lock()
-            .expect("scripted outcomes lock")
-            .get(&command_id)
-            .map_or(0, VecDeque::len);
-        assert_eq!(remaining, 1, "the later claim must remain unconsumed");
+                command_id,
+                failure: CommandAuthorityLookupFailure::Unavailable {
+                    message: "durable journal exposes no command-authority reader".to_owned(),
+                },
+            })
+        );
         assert_eq!(port.queue_depth(), 0);
         assert_eq!(core.pending_command_authority_id(), None);
+        assert_eq!(core.admission_cursor(), before_admission);
+        assert_eq!(core.world_tick(), before_tick);
+        assert_eq!(core.latest_snapshot().revisions, before_revisions);
+        assert_eq!(core.latest_snapshot().lifecycle, before_lifecycle);
         assert_eq!(
             core.world
                 .world_digest_v1()
-                .expect("post-failure deterministic world digest"),
+                .expect("missing authority leaves deterministic world unchanged"),
             before_digest
         );
-        assert!(matches!(
-            port.submit(envelope),
-            Err(HostAccessError::CommandAuthorityLookup {
-                command_id: failed_id,
-                failure: CommandAuthorityLookupFailure::Corrupt { message },
-            }) if failed_id == command_id && message == "duplicate terminal command authority"
-        ));
     }
 
     #[test]
