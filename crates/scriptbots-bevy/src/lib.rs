@@ -3556,6 +3556,151 @@ mod visual_authority_consumer_guard {
 }
 
 #[cfg(test)]
+mod adaptive_governor_tests {
+    use super::*;
+
+    /// A launch that is permitted to adapt, with a known tier, built by hand so
+    /// these tests never depend on the host having a particular GPU.
+    fn auto_launch(tier: RenderQuality) -> EffectiveRenderSettings {
+        EffectiveRenderSettings {
+            tier,
+            features: tier_features(tier),
+            gpu: None,
+            requested: RenderQuality::Auto,
+        }
+    }
+
+    /// The real system, driven by a deterministic clock rather than wall time.
+    fn governed_app(tier: RenderQuality) -> App {
+        let effective = auto_launch(tier);
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(AdaptiveQualityGovernor::for_launch(&effective))
+            .insert_resource(effective)
+            .add_systems(Update, drive_adaptive_quality);
+        app
+    }
+
+    fn run_frames(app: &mut App, frames: usize, frame_time: std::time::Duration) {
+        for _ in 0..frames {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(frame_time);
+            app.update();
+        }
+    }
+
+    fn tier_of(app: &App) -> RenderQuality {
+        app.world().resource::<EffectiveRenderSettings>().tier
+    }
+
+    const WINDOW: usize = 120;
+    const HEALTHY: std::time::Duration = std::time::Duration::from_millis(8);
+
+    /// A single catastrophic frame must not cost the user a quality tier.
+    ///
+    /// Window drags, display reconfiguration, resuming from sleep and debugger
+    /// pauses all produce one enormous delta. If the governor reacted to the
+    /// worst frame it would downgrade the renderer for something that already
+    /// finished, and the user would see quality collapse for no visible reason.
+    ///
+    /// It survives because the decision is a p95 over a 120-sample window, and
+    /// `((120-1)*95 + 50)/100` selects sorted index 113 — a single outlier sits
+    /// at index 119 and cannot reach the statistic. This pins that arithmetic
+    /// against a future change to the window size or the percentile.
+    #[test]
+    fn one_catastrophic_frame_per_window_never_downgrades_quality() {
+        let mut app = governed_app(RenderQuality::High);
+        assert_eq!(tier_of(&app), RenderQuality::High);
+
+        // Three full windows, each carrying one ten-second stall.
+        for _ in 0..3 {
+            run_frames(&mut app, WINDOW - 1, HEALTHY);
+            run_frames(&mut app, 1, std::time::Duration::from_secs(10));
+        }
+
+        assert_eq!(
+            tier_of(&app),
+            RenderQuality::High,
+            "a lone stall per window must be absorbed by the p95, not acted on"
+        );
+    }
+
+    /// The positive control, without which the test above proves nothing: a
+    /// governor that never moves would also pass it.
+    ///
+    /// Sustained overload — every frame over the 16.6ms budget — must step the
+    /// tier down once the required consecutive blowout windows have elapsed.
+    #[test]
+    fn sustained_overload_does_step_the_tier_down() {
+        let mut app = governed_app(RenderQuality::High);
+        let overloaded = std::time::Duration::from_millis(40);
+
+        run_frames(
+            &mut app,
+            WINDOW * (RenderGovernor::BLOWOUT_WINDOWS_REQUIRED as usize + 1),
+            overloaded,
+        );
+
+        assert_ne!(
+            tier_of(&app),
+            RenderQuality::High,
+            "sustained frames at 40ms against a 16.6ms budget must downgrade"
+        );
+    }
+
+    /// An explicitly requested tier is never touched, however bad frames get.
+    #[test]
+    fn an_explicit_tier_is_never_downgraded_by_sustained_overload() {
+        let pinned = EffectiveRenderSettings {
+            tier: RenderQuality::High,
+            features: tier_features(RenderQuality::High),
+            gpu: None,
+            requested: RenderQuality::High,
+        };
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(AdaptiveQualityGovernor::for_launch(&pinned))
+            .insert_resource(pinned)
+            .add_systems(Update, drive_adaptive_quality);
+
+        run_frames(&mut app, WINDOW * 5, std::time::Duration::from_millis(40));
+
+        assert_eq!(
+            tier_of(&app),
+            RenderQuality::High,
+            "explicit quality disables adaptation; the operator's choice stands"
+        );
+    }
+
+    /// The frame time this frontend feeds the governor is ALWAYS finite.
+    ///
+    /// The bead asks for NaN and outlier coverage. Outliers are covered above;
+    /// NaN is covered by being unreachable from here rather than by a test that
+    /// pretends otherwise. `Time::delta_secs` is derived from a `Duration`,
+    /// which cannot represent NaN or a negative span, so `drive_adaptive_quality`
+    /// cannot deliver a non-finite sample no matter how pathological the clock.
+    /// `RenderGovernor::observe` still defends against one for other callers.
+    #[test]
+    fn the_frontend_cannot_deliver_a_non_finite_frame_time() {
+        let mut app = governed_app(RenderQuality::High);
+        for extreme in [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_nanos(1),
+            std::time::Duration::from_secs(86_400),
+        ] {
+            app.world_mut().resource_mut::<Time>().advance_by(extreme);
+            let delta = app.world().resource::<Time>().delta_secs() * 1_000.0;
+            assert!(
+                delta.is_finite() && delta >= 0.0,
+                "a Duration of {extreme:?} produced a non-finite frame time: {delta}"
+            );
+            app.update();
+        }
+    }
+}
+
+#[cfg(test)]
 mod quality_tier_consumer_tests {
     use super::*;
 
