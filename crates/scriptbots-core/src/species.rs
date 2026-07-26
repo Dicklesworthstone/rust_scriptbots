@@ -470,7 +470,40 @@ pub struct PhenotypeClusterComparison {
     /// entries in per-process `RandomState` order, giving the same run different bytes on
     /// every execution and on every platform.
     pub feature_effect_sizes: BTreeMap<String, f32>,
-    pub overall_mahalanobis_distance: f32,
+    /// Multivariate separation of the two cohort means under their pooled covariance.
+    ///
+    /// Typed rather than numeric because `0.0` is not a neutral placeholder for this statistic:
+    /// it is precisely the value meaning "these cohorts occupy the same point in phenotype
+    /// space". A cohort pair too small or too degenerate to support a covariance inverse has no
+    /// distance at all, and must say so instead of reporting perfect coincidence (bd-hawp).
+    pub overall_mahalanobis_distance: MahalanobisDistance,
+}
+
+/// Multivariate cohort separation, or the reason there is none to report (bd-hawp).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum MahalanobisDistance {
+    /// Mahalanobis distance between the cohort means under the pooled covariance.
+    Computed(f32),
+    /// The statistic is not defined for this cohort pair.
+    Unavailable(MahalanobisUnavailable),
+}
+
+/// Why a cohort pair admits no Mahalanobis distance (bd-hawp).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MahalanobisUnavailable {
+    /// One or both cohorts contributed no samples, so neither mean exists.
+    EmptyCohort,
+    /// Pooled covariance cannot reach full rank: its rank is bounded by `n_a + n_b - 2`, so
+    /// fewer degrees of freedom than features leaves the inverse under-determined.
+    InsufficientSamples {
+        /// `n_a + n_b - 2`, the rank ceiling of the pooled covariance.
+        degrees_of_freedom: usize,
+        /// Feature count the covariance would need to span to be invertible.
+        features: usize,
+    },
+    /// The pooled covariance is singular to working precision: some feature is constant across
+    /// both cohorts, or two features are exactly collinear, so no inverse exists.
+    SingularCovariance,
 }
 
 /// Comprehensive phenotype shift and interaction analysis report (bd-2z0.11.2).
@@ -527,8 +560,159 @@ pub fn compare_phenotype_clusters(
         sample_size_a: a.len(),
         sample_size_b: b.len(),
         feature_effect_sizes: effect_sizes,
-        overall_mahalanobis_distance: 0.0,
+        overall_mahalanobis_distance: mahalanobis_between_cohorts(a, b),
     }
+}
+
+/// Number of phenotype features, and therefore the dimension of the pooled covariance.
+const PHENOTYPE_FEATURE_COUNT: usize = 6;
+
+/// Mahalanobis distance between two cohort means under their pooled covariance (bd-hawp).
+///
+/// `sqrt(d' * S^-1 * d)` where `d` is the difference of cohort means and `S` is the unbiased
+/// pooled covariance `((n_a - 1) * S_a + (n_b - 1) * S_b) / (n_a + n_b - 2)`.
+///
+/// The inverse is never formed. `S` is symmetric positive semi-definite by construction, so a
+/// Cholesky factorization `S = L * L'` both solves the quadratic form -- `L y = d` gives
+/// `d' * S^-1 * d = y' * y` -- and detects degeneracy, since a non-positive pivot is exactly the
+/// singular case. That makes "no inverse exists" a decision the arithmetic reaches rather than a
+/// threshold chosen by hand.
+///
+/// Accumulation is in `f64`. The inputs are `f32` and the quadratic form squares them, so a
+/// well-separated pair in `f32` arithmetic can otherwise lose most of its significant digits.
+/// The inner products deliberately use plain multiply-then-add rather than `mul_add`, and
+/// `suboptimal_flops` is allowed below for that reason. A fused multiply-add rounds once instead
+/// of twice, so it yields different bits depending on whether the target has an FMA instruction
+/// or falls back to a software `fma`; this crate ships to `wasm32` as well as native. The extra
+/// accuracy is not worth making a published statistic platform-dependent.
+///
+/// Note the deliberate asymmetry with the per-feature Cohen's d above, which divides by `n`
+/// (population variance). This uses the `n - 1` unbiased convention because the pooled-covariance
+/// definition of Mahalanobis distance is stated that way; the two are not meant to agree.
+// Sample counts convert exactly at these magnitudes, and the reported statistic is narrowed back
+// to the `f32` domain its inputs came from; only the accumulation needs the wider type.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::suboptimal_flops
+)]
+fn mahalanobis_between_cohorts(
+    a: &[AgentPhenotypeVector],
+    b: &[AgentPhenotypeVector],
+) -> MahalanobisDistance {
+    if a.is_empty() || b.is_empty() {
+        return MahalanobisDistance::Unavailable(MahalanobisUnavailable::EmptyCohort);
+    }
+    let degrees_of_freedom = a.len() + b.len() - 2;
+    if degrees_of_freedom < PHENOTYPE_FEATURE_COUNT {
+        return MahalanobisDistance::Unavailable(MahalanobisUnavailable::InsufficientSamples {
+            degrees_of_freedom,
+            features: PHENOTYPE_FEATURE_COUNT,
+        });
+    }
+
+    let mean_a = cohort_mean(a);
+    let mean_b = cohort_mean(b);
+    let mut pooled = [[0.0_f64; PHENOTYPE_FEATURE_COUNT]; PHENOTYPE_FEATURE_COUNT];
+    accumulate_scatter(&mut pooled, a, &mean_a);
+    accumulate_scatter(&mut pooled, b, &mean_b);
+    for row in &mut pooled {
+        for cell in row.iter_mut() {
+            *cell /= degrees_of_freedom as f64;
+        }
+    }
+
+    let Some(lower) = cholesky_lower(&pooled) else {
+        return MahalanobisDistance::Unavailable(MahalanobisUnavailable::SingularCovariance);
+    };
+    let mut delta = [0.0_f64; PHENOTYPE_FEATURE_COUNT];
+    for (index, cell) in delta.iter_mut().enumerate() {
+        *cell = mean_a[index] - mean_b[index];
+    }
+    // Forward substitution: L y = delta. The squared distance is then y' * y.
+    let mut squared = 0.0_f64;
+    let mut solved = [0.0_f64; PHENOTYPE_FEATURE_COUNT];
+    for row in 0..PHENOTYPE_FEATURE_COUNT {
+        let mut acc = delta[row];
+        for column in 0..row {
+            acc -= lower[row][column] * solved[column];
+        }
+        solved[row] = acc / lower[row][row];
+        squared += solved[row] * solved[row];
+    }
+    MahalanobisDistance::Computed(squared.max(0.0).sqrt() as f32)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn cohort_mean(cohort: &[AgentPhenotypeVector]) -> [f64; PHENOTYPE_FEATURE_COUNT] {
+    let mut mean = [0.0_f64; PHENOTYPE_FEATURE_COUNT];
+    for vector in cohort {
+        let features = vector.features();
+        for (slot, feature) in mean.iter_mut().zip(features) {
+            *slot += f64::from(feature);
+        }
+    }
+    for slot in &mut mean {
+        *slot /= cohort.len() as f64;
+    }
+    mean
+}
+
+/// Add one cohort's scatter matrix `sum (x - mean)(x - mean)'` into the running total.
+///
+/// Plain multiply-then-add, not `mul_add`: see [`mahalanobis_between_cohorts`] for why this
+/// routine keeps its arithmetic platform-invariant.
+#[allow(clippy::suboptimal_flops)]
+fn accumulate_scatter(
+    scatter: &mut [[f64; PHENOTYPE_FEATURE_COUNT]; PHENOTYPE_FEATURE_COUNT],
+    cohort: &[AgentPhenotypeVector],
+    mean: &[f64; PHENOTYPE_FEATURE_COUNT],
+) {
+    for vector in cohort {
+        let features = vector.features();
+        let mut centered = [0.0_f64; PHENOTYPE_FEATURE_COUNT];
+        for (slot, (feature, mean_value)) in centered.iter_mut().zip(features.iter().zip(mean)) {
+            *slot = f64::from(*feature) - mean_value;
+        }
+        for row in 0..PHENOTYPE_FEATURE_COUNT {
+            for column in 0..PHENOTYPE_FEATURE_COUNT {
+                scatter[row][column] += centered[row] * centered[column];
+            }
+        }
+    }
+}
+
+/// Cholesky factorization `matrix = L * L'`, or `None` when the matrix is not positive definite.
+///
+/// A non-positive diagonal pivot means the matrix is singular or indefinite to working precision,
+/// which is the honest stopping condition: there is no inverse to take.
+///
+/// Plain multiply-then-add, not `mul_add`: see [`mahalanobis_between_cohorts`] for why this
+/// routine keeps its arithmetic platform-invariant.
+#[allow(clippy::suboptimal_flops)]
+fn cholesky_lower(
+    matrix: &[[f64; PHENOTYPE_FEATURE_COUNT]; PHENOTYPE_FEATURE_COUNT],
+) -> Option<[[f64; PHENOTYPE_FEATURE_COUNT]; PHENOTYPE_FEATURE_COUNT]> {
+    let mut lower = [[0.0_f64; PHENOTYPE_FEATURE_COUNT]; PHENOTYPE_FEATURE_COUNT];
+    for row in 0..PHENOTYPE_FEATURE_COUNT {
+        for column in 0..=row {
+            let mut acc = matrix[row][column];
+            for (left, right) in lower[row].iter().zip(&lower[column]).take(column) {
+                acc -= left * right;
+            }
+            if row == column {
+                // `acc <= 0.0` catches the singular and indefinite pivots; the finiteness test
+                // catches NaN, which compares false against every bound and would slip past.
+                if acc <= 0.0 || !acc.is_finite() {
+                    return None;
+                }
+                lower[row][column] = acc.sqrt();
+            } else {
+                lower[row][column] = acc / lower[column][column];
+            }
+        }
+    }
+    Some(lower)
 }
 
 /// Generates a comprehensive phenotype analysis report over population samples (bd-2z0.11.2).
@@ -749,6 +933,185 @@ mod tests {
         let (table_outlier, _) = segment_species(Tick(10), &outlier_samples, &prev, &params);
         assert_eq!(table_normal.species[0].members, vec![AgentUid(1)]);
         assert_eq!(table_outlier.species[0].members, vec![AgentUid(1)]);
+    }
+
+    fn hawp_vector(uid: u64, features: [f32; PHENOTYPE_FEATURE_COUNT]) -> AgentPhenotypeVector {
+        AgentPhenotypeVector {
+            agent_uid: AgentUid(uid),
+            movement_speed_mean: features[0],
+            diet_herbivore_ratio: features[1],
+            sensing_range_mean: features[2],
+            aggression_index: features[3],
+            giving_altruism_index: features[4],
+            reproduction_rate: features[5],
+        }
+    }
+
+    /// Eight irregular rows: no feature is constant and no pair is collinear, so the pooled
+    /// covariance of two such cohorts reaches full rank and admits a Cholesky factorization.
+    const HAWP_ROWS: [[f32; PHENOTYPE_FEATURE_COUNT]; 8] = [
+        [1.50, 0.90, 0.80, 0.10, 0.50, 0.05],
+        [1.62, 0.71, 0.34, 0.48, 0.13, 0.22],
+        [0.94, 0.35, 0.61, 0.27, 0.88, 0.14],
+        [1.18, 0.58, 0.92, 0.63, 0.31, 0.41],
+        [0.77, 0.83, 0.19, 0.35, 0.66, 0.09],
+        [1.41, 0.22, 0.74, 0.81, 0.45, 0.33],
+        [1.05, 0.67, 0.48, 0.16, 0.72, 0.27],
+        [0.89, 0.44, 0.86, 0.59, 0.24, 0.18],
+    ];
+
+    /// A cohort built from [`HAWP_ROWS`] with every `movement_speed` displaced by `shift`.
+    ///
+    /// A constant displacement moves the mean without touching the covariance, so separation is
+    /// the only thing that varies across the cases below.
+    fn hawp_cohort(uid_base: u64, shift: f32) -> Vec<AgentPhenotypeVector> {
+        HAWP_ROWS
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut features = *row;
+                features[0] += shift;
+                hawp_vector(uid_base + index as u64, features)
+            })
+            .collect()
+    }
+
+    fn hawp_distance(a: &[AgentPhenotypeVector], b: &[AgentPhenotypeVector]) -> f32 {
+        match compare_phenotype_clusters("a", a, "b", b).overall_mahalanobis_distance {
+            MahalanobisDistance::Computed(distance) => distance,
+            MahalanobisDistance::Unavailable(reason) => {
+                panic!("fixture must admit a distance, got {reason:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn bd_hawp_identical_cohorts_have_zero_separation() {
+        let a = hawp_cohort(1, 0.0);
+        let b = hawp_cohort(100, 0.0);
+
+        let distance = hawp_distance(&a, &b);
+
+        assert!(
+            distance < 1e-5,
+            "cohorts drawn from identical phenotypes must not be separated, got {distance}"
+        );
+    }
+
+    #[test]
+    fn bd_hawp_separation_grows_with_the_distance_between_cohort_means() {
+        let base = hawp_cohort(1, 0.0);
+        let mut previous = hawp_distance(&base, &hawp_cohort(100, 0.0));
+
+        // The old hardcoded 0.0 satisfied "identical cohorts are close" by accident; only a
+        // monotone response to real separation distinguishes a computed statistic from a stub.
+        for step in 1..=5 {
+            let shifted = hawp_cohort(100, 0.25 * step as f32);
+            let distance = hawp_distance(&base, &shifted);
+            assert!(
+                distance > previous,
+                "separation must increase with mean displacement: step {step} gave {distance}, \
+                 previous was {previous}"
+            );
+            previous = distance;
+        }
+        assert!(
+            previous > 1.0,
+            "a five-step displacement must be a substantial distance, got {previous}"
+        );
+    }
+
+    #[test]
+    fn bd_hawp_cohorts_too_small_for_a_covariance_inverse_report_why() {
+        let a = vec![hawp_vector(1, HAWP_ROWS[0]), hawp_vector(2, HAWP_ROWS[1])];
+        let b = vec![hawp_vector(3, HAWP_ROWS[2])];
+
+        let comparison = compare_phenotype_clusters("a", &a, "b", &b);
+
+        assert_eq!(
+            comparison.overall_mahalanobis_distance,
+            MahalanobisDistance::Unavailable(MahalanobisUnavailable::InsufficientSamples {
+                degrees_of_freedom: 1,
+                features: PHENOTYPE_FEATURE_COUNT,
+            }),
+            "an under-determined pair must say so rather than report perfect coincidence"
+        );
+    }
+
+    #[test]
+    fn bd_hawp_empty_cohort_reports_why_instead_of_zero() {
+        let a = hawp_cohort(1, 0.0);
+
+        assert_eq!(
+            compare_phenotype_clusters("a", &a, "b", &[]).overall_mahalanobis_distance,
+            MahalanobisDistance::Unavailable(MahalanobisUnavailable::EmptyCohort)
+        );
+        assert_eq!(
+            compare_phenotype_clusters("a", &[], "b", &a).overall_mahalanobis_distance,
+            MahalanobisDistance::Unavailable(MahalanobisUnavailable::EmptyCohort)
+        );
+    }
+
+    #[test]
+    fn bd_hawp_a_constant_feature_makes_the_covariance_singular() {
+        // `reproduction_rate` is identical in every sample of both cohorts, so its variance is
+        // zero, the pooled covariance loses rank, and no inverse exists.
+        let flatten = |uid_base: u64, shift: f32| -> Vec<AgentPhenotypeVector> {
+            hawp_cohort(uid_base, shift)
+                .into_iter()
+                .map(|mut vector| {
+                    vector.reproduction_rate = 0.25;
+                    vector
+                })
+                .collect()
+        };
+
+        let comparison = compare_phenotype_clusters("a", &flatten(1, 0.0), "b", &flatten(100, 0.5));
+
+        assert_eq!(
+            comparison.overall_mahalanobis_distance,
+            MahalanobisDistance::Unavailable(MahalanobisUnavailable::SingularCovariance),
+            "a degenerate covariance must be reported, not silently inverted"
+        );
+    }
+
+    #[test]
+    fn bd_hawp_cohens_d_matches_a_hand_computed_golden() {
+        // movement_speed only: A = {1.0, 3.0}, B = {5.0, 7.0}.
+        //   mean_a = 2.0, mean_b = 6.0
+        //   var_a  = ((1-2)^2 + (3-2)^2) / 2 = 1.0,  var_b = 1.0   (population convention)
+        //   pooled_sd = sqrt((1.0 + 1.0) / 2) = 1.0
+        //   d = (2.0 - 6.0) / 1.0 = -4.0
+        let a = vec![
+            hawp_vector(1, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            hawp_vector(2, [3.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ];
+        let b = vec![
+            hawp_vector(3, [5.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            hawp_vector(4, [7.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ];
+
+        let comparison = compare_phenotype_clusters("a", &a, "b", &b);
+
+        let movement = comparison.feature_effect_sizes["movement_speed"];
+        assert!(
+            (movement - (-4.0)).abs() < 1e-6,
+            "hand-computed Cohen's d for movement_speed is -4.0, got {movement}"
+        );
+        // Every other feature is identical in both cohorts, so its effect size is exactly zero.
+        for name in [
+            "diet_herbivore_ratio",
+            "sensing_range",
+            "aggression_index",
+            "giving_altruism_index",
+            "reproduction_rate",
+        ] {
+            let value = comparison.feature_effect_sizes[name];
+            assert!(
+                value.abs() < 1e-6,
+                "{name} is identical across cohorts and must have zero effect size, got {value}"
+            );
+        }
     }
 
     #[test]
