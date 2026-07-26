@@ -3464,6 +3464,175 @@ mod tests {
     }
 
     #[test]
+    fn command_authority_expired_reply_returns_timeout_and_releases_permit() {
+        let session_id = HostSessionId::new(0x409);
+        let envelope = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+        let envelope_bytes =
+            command_envelope_postcard_size("host_command_claims.envelope_postcard_hex", &envelope)
+                .expect("step envelope size");
+        let charged_bytes = envelope_bytes.checked_mul(2).expect("step hex size");
+        let digest = [1; blake3::OUT_LEN];
+        let timeout = Duration::from_millis(1);
+        let (worker_tx, worker_rx) = xchan::bounded(1);
+        let inflight_bytes = Arc::new(AtomicUsize::new(0));
+        let reader = StorageCommandAuthorityReader::new(
+            session_id,
+            worker_tx,
+            1,
+            timeout,
+            1_024,
+            Arc::clone(&inflight_bytes),
+            charged_bytes,
+        );
+
+        assert_eq!(
+            reader.resolve_for_submit(&envelope, digest, CommandClaimPolicy::ReserveIfAbsent),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending)
+        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), charged_bytes);
+        let (reply, permit) = match worker_rx
+            .try_recv()
+            .expect("authority lookup reaches the storage worker")
+        {
+            StorageCommand::ResolveCommandAuthority {
+                command_id,
+                reply,
+                permit: Some(permit),
+                ..
+            } => {
+                assert_eq!(command_id, envelope.command_id);
+                (reply, permit)
+            }
+            other => panic!("unexpected storage command: {other:?}"),
+        };
+        drop(permit);
+        assert_eq!(
+            inflight_bytes.load(Ordering::SeqCst),
+            0,
+            "the worker-side request lifetime must release its byte permit"
+        );
+
+        std::thread::sleep(timeout.saturating_add(Duration::from_millis(1)));
+        assert_eq!(
+            reader.resolve_for_submit(&envelope, digest, CommandClaimPolicy::ReserveIfAbsent),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Timeout {
+                waited: timeout,
+            })
+        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert!(
+            reader
+                .pending
+                .lock()
+                .expect("authority pending map")
+                .is_empty()
+        );
+        drop(reply);
+    }
+
+    #[test]
+    fn command_authority_disconnected_worker_returns_unavailable_without_permit_leak() {
+        let session_id = HostSessionId::new(0x40a);
+        let envelope = CommandEnvelope::new(CommandId::new(2), HostCommand::Step);
+        let envelope_bytes =
+            command_envelope_postcard_size("host_command_claims.envelope_postcard_hex", &envelope)
+                .expect("step envelope size");
+        let charged_bytes = envelope_bytes.checked_mul(2).expect("step hex size");
+        let (worker_tx, worker_rx) = xchan::bounded(1);
+        drop(worker_rx);
+        let inflight_bytes = Arc::new(AtomicUsize::new(0));
+        let reader = StorageCommandAuthorityReader::new(
+            session_id,
+            worker_tx,
+            1,
+            Duration::from_secs(60),
+            1_024,
+            Arc::clone(&inflight_bytes),
+            charged_bytes,
+        );
+
+        assert_eq!(
+            reader.resolve_for_submit(
+                &envelope,
+                [2; blake3::OUT_LEN],
+                CommandClaimPolicy::ReserveIfAbsent,
+            ),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Unavailable {
+                message: "storage command lane disconnected".to_owned(),
+            })
+        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert!(
+            reader
+                .pending
+                .lock()
+                .expect("authority pending map")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn command_authority_disconnected_reply_returns_unavailable_without_permit_leak() {
+        let session_id = HostSessionId::new(0x40b);
+        let envelope = CommandEnvelope::new(CommandId::new(3), HostCommand::Step);
+        let envelope_bytes =
+            command_envelope_postcard_size("host_command_claims.envelope_postcard_hex", &envelope)
+                .expect("step envelope size");
+        let charged_bytes = envelope_bytes.checked_mul(2).expect("step hex size");
+        let digest = [3; blake3::OUT_LEN];
+        let (worker_tx, worker_rx) = xchan::bounded(1);
+        let inflight_bytes = Arc::new(AtomicUsize::new(0));
+        let reader = StorageCommandAuthorityReader::new(
+            session_id,
+            worker_tx,
+            1,
+            Duration::from_secs(60),
+            1_024,
+            Arc::clone(&inflight_bytes),
+            charged_bytes,
+        );
+
+        assert_eq!(
+            reader.resolve_for_submit(&envelope, digest, CommandClaimPolicy::ReserveIfAbsent),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending)
+        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), charged_bytes);
+        let (reply, permit) = match worker_rx
+            .try_recv()
+            .expect("authority lookup reaches the storage worker")
+        {
+            StorageCommand::ResolveCommandAuthority {
+                command_id,
+                reply,
+                permit: Some(permit),
+                ..
+            } => {
+                assert_eq!(command_id, envelope.command_id);
+                (reply, permit)
+            }
+            other => panic!("unexpected storage command: {other:?}"),
+        };
+        drop(permit);
+        drop(reply);
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            reader.resolve_for_submit(&envelope, digest, CommandClaimPolicy::ReserveIfAbsent),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Unavailable {
+                message: "storage command-authority reply lane disconnected".to_owned(),
+            })
+        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert!(
+            reader
+                .pending
+                .lock()
+                .expect("authority pending map")
+                .is_empty()
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one allocation-boundary test covers frozen encoding, pre-allocation oversize refusal, shared byte-capacity refusal, and permit release"
