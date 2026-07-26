@@ -11425,6 +11425,135 @@ impl HudLayout {
     }
 }
 
+#[cfg(test)]
+mod hud_rail_layout_tests {
+    use super::*;
+
+    /// bd-rzy3: the perf readout must be MOUNTED on every frame it is open.
+    ///
+    /// GPUI rebuilds the element tree on every render, so gating the panel's
+    /// `.child()` call on a frame counter throttles its EXISTENCE, not its data.
+    /// The panel used to be appended only when `sample_count % 4 == 0`, i.e. it
+    /// was absent three frames in four and strobed at a quarter of frame rate.
+    /// Update cadence belongs to the VALUE — `self.last_perf` — never to the
+    /// mount. This inspects the `render_hud_rail` body because the assembled
+    /// `Div` exposes no child list to assert against.
+    #[test]
+    fn perf_panel_mount_is_not_gated_on_a_frame_counter() {
+        let rail = render_hud_rail_body();
+        assert!(
+            rail.contains("self.render_perf_overlay(self.last_perf)"),
+            "the rail must render the retained perf sample, so the panel is stable \
+             frame to frame while its value refreshes independently"
+        );
+        for forbidden in ["sample_count", "is_multiple_of", "% 4", "frame_index"] {
+            assert!(
+                !rail.contains(forbidden),
+                "render_hud_rail must not gate panel mounting on a frame counter \
+                 ({forbidden}); GPUI rebuilds the tree every frame, so that hides \
+                 the panel instead of throttling its data"
+            );
+        }
+    }
+
+    /// Every rail panel mounts purely from resolved layout state. If a panel's
+    /// `.child()` call ever grows a second condition, the mount can once again
+    /// depend on something other than what the user asked for.
+    #[test]
+    fn rail_panels_mount_only_on_resolved_layout_state() {
+        let rail = render_hud_rail_body();
+        for (panel, gate) in [
+            ("render_overlay", "if resolved.stats_open {"),
+            ("render_history_chart", "if resolved.history_open {"),
+            ("render_perf_overlay", "if resolved.perf_open {"),
+        ] {
+            assert!(
+                rail.contains(gate),
+                "{panel} must mount under exactly `{gate}` so visibility follows \
+                 resolved layout state alone"
+            );
+        }
+    }
+
+    /// The resolved layout is a pure fold of intent and width, so an open panel
+    /// stays open across successive frames when neither input changes. The bead
+    /// symptom was a panel blinking while the user changed nothing.
+    #[test]
+    fn resolved_panel_visibility_is_stable_across_frames() {
+        let layout = HudLayout {
+            stats_open: true,
+            history_open: true,
+            perf_open: true,
+        };
+        for frame in 0..8 {
+            let resolved = layout.resolve(HUD_RAIL_COLLAPSE_WIDTH, false);
+            assert!(
+                resolved.show_rail,
+                "rail must resolve visible on every frame; frame {frame} disagreed"
+            );
+            assert!(
+                resolved.perf_open,
+                "perf panel must resolve visible on every frame; frame {frame} disagreed"
+            );
+        }
+    }
+
+    /// Closed intent stays closed, and a rail with nothing open does not reserve
+    /// width. Guards the other direction of the same fold.
+    #[test]
+    fn resolve_honours_closed_intent_and_narrow_windows() {
+        let perf_closed = HudLayout {
+            stats_open: true,
+            history_open: false,
+            perf_open: false,
+        };
+        let resolved = perf_closed.resolve(HUD_RAIL_COLLAPSE_WIDTH, false);
+        assert!(
+            resolved.show_rail,
+            "an open stats panel still needs the rail"
+        );
+        assert!(!resolved.perf_open, "closed perf intent must stay closed");
+
+        let all_closed = HudLayout {
+            stats_open: false,
+            history_open: false,
+            perf_open: false,
+        };
+        assert!(
+            !all_closed.resolve(HUD_RAIL_COLLAPSE_WIDTH, false).show_rail,
+            "a rail with no open panel must not reserve width"
+        );
+
+        let open = HudLayout {
+            stats_open: true,
+            history_open: true,
+            perf_open: true,
+        };
+        assert!(
+            !open.resolve(HUD_RAIL_COLLAPSE_WIDTH - 1.0, false).show_rail,
+            "below the collapse width the rail yields the space to the world"
+        );
+        assert!(
+            !open.resolve(HUD_RAIL_COLLAPSE_WIDTH, true).show_rail,
+            "a forced-closed rail stays closed regardless of available width"
+        );
+    }
+
+    /// Source of `render_hud_rail`, from its signature to the next method in the
+    /// impl block. Scoped to the body so unrelated code — including this module —
+    /// can never satisfy or trip the guards above.
+    fn render_hud_rail_body() -> &'static str {
+        let after_signature = include_str!("lib.rs")
+            .split_once("fn render_hud_rail(")
+            .expect("render_hud_rail definition")
+            .1;
+        after_signature
+            .split_once("\n    fn ")
+            .expect("method following render_hud_rail")
+            .0
+    }
+}
+
 /// Settings panel state for configuration management
 #[derive(Clone)]
 struct SettingsPanelState {
