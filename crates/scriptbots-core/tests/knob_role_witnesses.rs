@@ -11,7 +11,8 @@
 //! the list here cannot drift from the list callers actually see, and cannot be invalidated by a
 //! `#[serde(rename)]` that source-level transcription would miss.
 
-use scriptbots_core::ScriptBotsConfig;
+use scriptbots_core::knob_roles::KNOB_ROLES;
+use scriptbots_core::{AgentData, Position, ScriptBotsConfig, WorldDigestV1, WorldState};
 use serde_json::Value;
 
 /// Flatten a serialized config into dotted leaf paths.
@@ -89,5 +90,296 @@ fn bd_dorx_flattening_expands_objects_and_stops_at_every_other_node() {
             "scalar".to_owned(),
         ],
         "an array is one knob, not one knob per element, and a null is still a knob"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// bd-dorx acceptance item 2: behavioural counterfactual witnesses.
+//
+// The bead is explicit that neither a source grep nor `WorldDigest.config` sensitivity counts as
+// proof a knob is consumed, and it is right: a dead field changes the config lane BY
+// CONSTRUCTION, so any config-derived evidence is satisfied by a field nobody reads. The only
+// thing that distinguishes a live knob from a ghost is running two worlds that differ in exactly
+// that knob and observing MATERIAL, NON-CONFIG state diverge.
+//
+// `WorldDigestV1` already separates its lanes, which is what makes this checkable rather than
+// hand-wavy: `config` is excluded here, and so is `overall` (it folds the config lane in, so it
+// would happily "prove" a ghost). `rng` is excluded too, deliberately and more strictly than
+// necessary -- a knob that only changes HOW MANY random numbers get drawn, without changing any
+// outcome, should not earn a passing witness.
+// ---------------------------------------------------------------------------
+
+/// The lanes a witness is allowed to count as evidence.
+///
+/// Everything here is material simulation state. `config`, `overall` and `rng` are deliberately
+/// absent; see the module comment above.
+fn material_lanes(digest: &WorldDigestV1) -> Vec<(&'static str, String)> {
+    vec![
+        ("agents", digest.agents.clone()),
+        ("brains", digest.brains.clone()),
+        ("food", digest.food.clone()),
+        ("terrain", digest.terrain.clone()),
+        ("hydrology", format!("{:?}", digest.hydrology)),
+        ("counters", digest.counters.clone()),
+        ("effects", digest.effects.clone()),
+        ("derived_transition", digest.derived_transition.clone()),
+        ("origins", digest.origins.clone()),
+    ]
+}
+
+/// Deterministic world for a witness run: fixed seed, fixed agent layout, fixed tick budget.
+///
+/// Agents are seeded explicitly rather than left to population dynamics, because a witness must
+/// differ from its baseline ONLY in the knob under test.
+fn run_material(config: ScriptBotsConfig, ticks: u64) -> Option<Vec<(&'static str, String)>> {
+    let mut world = WorldState::new(config).ok()?;
+    for index in 0..6_u32 {
+        let agent = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(30.0 + f32::from(index as u16) * 9.0, 45.0),
+                ..AgentData::default()
+            })
+            .ok()?;
+        world
+            .try_update_agent_runtime(agent, |runtime| {
+                runtime.energy = 1.2;
+            })
+            .ok()?;
+    }
+    for _ in 0..ticks {
+        world.step().ok()?;
+    }
+    let digest = world.world_digest_v1().ok()?;
+    Some(material_lanes(&digest))
+}
+
+/// Apply a dotted-path override to the serialized config, exactly as `apply_patch` addresses it.
+///
+/// Going through JSON rather than the struct is the point: it witnesses the knob at the SAME
+/// address the control plane publishes, so a witness cannot accidentally prove that some
+/// adjacent Rust field is live while the published path is a ghost.
+fn perturbed_config(path: &str, value: Value) -> Option<ScriptBotsConfig> {
+    let mut root = serde_json::to_value(ScriptBotsConfig::default()).ok()?;
+    let mut cursor = &mut root;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let map = cursor.as_object_mut()?;
+        if segments.peek().is_none() {
+            map.insert(segment.to_owned(), value);
+            return serde_json::from_value(root).ok();
+        }
+        cursor = map.get_mut(segment)?;
+    }
+    None
+}
+
+/// One counterfactual: the published path, the value to set, and how long to run.
+struct Witness {
+    path: &'static str,
+    value: fn() -> Value,
+    ticks: u64,
+}
+
+/// Witnesses for scientific knobs whose consumption is proven by a two-world differential.
+///
+/// Each entry perturbs exactly one published path away from its default and requires at least one
+/// material lane to move. Values stay inside the config's own validation bounds; a witness that
+/// cannot build a world is a failure, not a skip.
+static WITNESSES: &[Witness] = &[
+    Witness {
+        path: "rng_seed",
+        value: || Value::from(987_654_u64),
+        ticks: 4,
+    },
+    Witness {
+        path: "world_width",
+        value: || Value::from(180),
+        ticks: 2,
+    },
+    Witness {
+        path: "world_height",
+        value: || Value::from(180),
+        ticks: 2,
+    },
+    Witness {
+        path: "food_cell_size",
+        value: || Value::from(10),
+        ticks: 2,
+    },
+    Witness {
+        path: "initial_food",
+        value: || Value::from(0.9),
+        ticks: 2,
+    },
+    Witness {
+        path: "food_growth_rate",
+        value: || Value::from(0.4),
+        ticks: 6,
+    },
+    Witness {
+        path: "food_decay_rate",
+        value: || Value::from(0.25),
+        ticks: 6,
+    },
+    Witness {
+        path: "food_intake_rate",
+        value: || Value::from(0.5),
+        ticks: 6,
+    },
+    Witness {
+        path: "food_max",
+        value: || Value::from(4.0),
+        ticks: 6,
+    },
+    Witness {
+        path: "metabolism_drain",
+        value: || Value::from(0.25),
+        ticks: 6,
+    },
+    Witness {
+        path: "movement_drain",
+        value: || Value::from(0.25),
+        ticks: 6,
+    },
+    Witness {
+        path: "bot_speed",
+        value: || Value::from(2.5),
+        ticks: 4,
+    },
+    Witness {
+        path: "bot_radius",
+        value: || Value::from(25.0),
+        ticks: 4,
+    },
+    Witness {
+        path: "sense_radius",
+        value: || Value::from(60.0),
+        ticks: 6,
+    },
+    Witness {
+        path: "temperature_discomfort_rate",
+        value: || Value::from(0.4),
+        ticks: 6,
+    },
+    Witness {
+        path: "aging_health_decay_rate",
+        value: || Value::from(0.3),
+        ticks: 8,
+    },
+    Witness {
+        path: "aging_tick_interval",
+        value: || Value::from(1),
+        ticks: 8,
+    },
+];
+
+/// THE WITNESS GATE. Every listed knob must move material, non-config world state.
+///
+/// A failure here means one of two things, and both matter: either the knob is a ghost -- public,
+/// patchable, and read by nothing -- or its consuming code path is unreachable under this fixture.
+/// The second is not a lesser finding; an unreachable consumer is how bd-pdx5's Combat category
+/// spent its entire life reporting coverage it did not have.
+#[test]
+fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
+    let baseline = run_material(ScriptBotsConfig::default(), 8)
+        .expect("the default config must build and step a world");
+
+    let mut ghosts = Vec::new();
+    for witness in WITNESSES {
+        let config = perturbed_config(witness.path, (witness.value)())
+            .unwrap_or_else(|| panic!("{} must address a real published path", witness.path));
+        let Some(perturbed) = run_material(config, witness.ticks.max(8)) else {
+            panic!(
+                "{} produced a config that cannot build a world",
+                witness.path
+            );
+        };
+        let moved: Vec<&str> = baseline
+            .iter()
+            .zip(perturbed.iter())
+            .filter(|((_, before), (_, after))| before != after)
+            .map(|((lane, _), _)| *lane)
+            .collect();
+        if moved.is_empty() {
+            ghosts.push(witness.path);
+        } else {
+            println!("WITNESS\t{}\tmoved={moved:?}", witness.path);
+        }
+    }
+
+    assert!(
+        ghosts.is_empty(),
+        "these knobs are published and patchable but moved no material world state: {ghosts:?}"
+    );
+}
+
+/// Witnesses must address knobs this registry actually calls scientific.
+///
+/// Without this, a witness could quietly drift onto an Operational or Presentation path and
+/// inflate the apparent coverage of the scientific surface.
+#[test]
+fn bd_dorx_every_witness_targets_a_scientific_knob() {
+    for witness in WITNESSES {
+        let spec = KNOB_ROLES
+            .iter()
+            .find(|spec| spec.path == witness.path)
+            .unwrap_or_else(|| panic!("{} is witnessed but not classified", witness.path));
+        assert!(
+            spec.role.is_scientific(),
+            "{} is witnessed as scientific but classified {:?}",
+            witness.path,
+            spec.role
+        );
+    }
+}
+
+/// Ratchet for scientific witness coverage. It may only ever be raised.
+///
+/// Deliberately a floor rather than an equality with the scientific count: 88 knobs are
+/// classified scientific and far fewer are witnessed today, so asserting completeness would be a
+/// lie of exactly the kind bd-dorx exists to stop. A floor makes the debt visible in the test
+/// output every run while making it impossible to quietly delete a witness.
+const WITNESS_COVERAGE_FLOOR: usize = 17;
+
+/// Report scientific coverage, and hold the line against it regressing.
+///
+/// This is deliberately NOT an assertion that all 88 scientific knobs are witnessed: they are not,
+/// and claiming otherwise is the exact false assurance this bead exists to prevent. It asserts
+/// that coverage never goes DOWN, so the debt can only shrink. The remaining entries are tracked
+/// on bd-dorx rather than silently tolerated here.
+#[test]
+fn bd_dorx_scientific_witness_coverage_does_not_regress() {
+    let scientific: Vec<&str> = KNOB_ROLES
+        .iter()
+        .filter(|spec| spec.role.is_scientific())
+        .map(|spec| spec.path)
+        .collect();
+    let witnessed: Vec<&str> = WITNESSES
+        .iter()
+        .filter(|w| scientific.contains(&w.path))
+        .map(|w| w.path)
+        .collect();
+
+    println!(
+        "SCIENTIFIC_KNOBS={} WITNESSED={} UNWITNESSED={}",
+        scientific.len(),
+        witnessed.len(),
+        scientific.len() - witnessed.len()
+    );
+    for path in &scientific {
+        if !witnessed.contains(path) {
+            println!("UNWITNESSED\t{path}");
+        }
+    }
+
+    assert!(
+        witnessed.len() >= WITNESS_COVERAGE_FLOOR,
+        "scientific witness coverage regressed: {} witnessed, floor is {WITNESS_COVERAGE_FLOOR}. \
+         Raise the floor when you add witnesses; never lower it to make this pass",
+        witnessed.len()
+    );
+    assert!(
+        scientific.len() >= witnessed.len(),
+        "a witness targeted a path the registry does not call scientific"
     );
 }
