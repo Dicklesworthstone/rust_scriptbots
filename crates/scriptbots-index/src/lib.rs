@@ -9,7 +9,7 @@ type BucketVisitor<'a> = dyn FnMut(&[f32], &[f32], &[usize]) + 'a;
 /// Errors emitted by spatial index implementations.
 #[derive(Debug, Error)]
 pub enum IndexError {
-    /// Indicates configuration values that cannot be used (e.g., non-positive cell size).
+    /// Indicates configuration values that cannot be used (e.g., non-finite cell size).
     #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
 }
@@ -261,12 +261,18 @@ impl Default for UniformGridIndex {
 
 impl NeighborhoodIndex for UniformGridIndex {
     fn rebuild(&mut self, positions: &[(f32, f32)]) -> Result<(), IndexError> {
-        if self.cell_size <= 0.0 {
-            return Err(IndexError::InvalidConfig("cell_size must be positive"));
-        }
-        if self.width <= 0.0 || self.height <= 0.0 {
+        if !self.cell_size.is_finite() || self.cell_size <= 0.0 {
             return Err(IndexError::InvalidConfig(
-                "world dimensions must be positive",
+                "cell_size must be finite and positive",
+            ));
+        }
+        if !self.width.is_finite()
+            || self.width <= 0.0
+            || !self.height.is_finite()
+            || self.height <= 0.0
+        {
+            return Err(IndexError::InvalidConfig(
+                "world dimensions must be finite and positive",
             ));
         }
         self.positions.clear();
@@ -980,5 +986,83 @@ mod tests {
         assert_eq!(index.cells_x, i32::MAX);
         assert_eq!(index.agent_cells, vec![(2_147_483_392, 0)]);
         assert_eq!(bucket_candidates(&index, 0, 512.0), HashSet::from([0]));
+    }
+
+    #[test]
+    fn rebuild_rejects_non_finite_grid_configuration() {
+        for (case, cell_size, width, height, expected_message) in [
+            (
+                "nan cell size",
+                f32::NAN,
+                10.0,
+                10.0,
+                "cell_size must be finite and positive",
+            ),
+            (
+                "positive infinite cell size",
+                f32::INFINITY,
+                10.0,
+                10.0,
+                "cell_size must be finite and positive",
+            ),
+            (
+                "negative infinite cell size",
+                f32::NEG_INFINITY,
+                10.0,
+                10.0,
+                "cell_size must be finite and positive",
+            ),
+            (
+                "nan width",
+                1.0,
+                f32::NAN,
+                10.0,
+                "world dimensions must be finite and positive",
+            ),
+            (
+                "positive infinite width",
+                1.0,
+                f32::INFINITY,
+                10.0,
+                "world dimensions must be finite and positive",
+            ),
+            (
+                "negative infinite width",
+                1.0,
+                f32::NEG_INFINITY,
+                10.0,
+                "world dimensions must be finite and positive",
+            ),
+            (
+                "nan height",
+                1.0,
+                10.0,
+                f32::NAN,
+                "world dimensions must be finite and positive",
+            ),
+            (
+                "positive infinite height",
+                1.0,
+                10.0,
+                f32::INFINITY,
+                "world dimensions must be finite and positive",
+            ),
+            (
+                "negative infinite height",
+                1.0,
+                10.0,
+                f32::NEG_INFINITY,
+                "world dimensions must be finite and positive",
+            ),
+        ] {
+            let mut index = UniformGridIndex::new(cell_size, width, height);
+            assert!(
+                matches!(
+                    index.rebuild(&[]),
+                    Err(IndexError::InvalidConfig(message)) if message == expected_message
+                ),
+                "{case}: rebuild must return the expected invalid-configuration error"
+            );
+        }
     }
 }
