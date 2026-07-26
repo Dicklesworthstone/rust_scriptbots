@@ -19,7 +19,9 @@
 //!   never a fabricated status.
 //! - Command statuses and ordered protocol events are mirrored into bounded,
 //!   lock-guarded boards by the owner after every admission and drive
-//!   boundary, so `command_status` and `events_after` never touch the host.
+//!   boundary. A status-board miss makes one bounded owner round-trip so an
+//!   evicted id can still consult durable command authority; event reads stay
+//!   mirror-only.
 //! - Snapshot and scientific-event reads delegate to the thread-safe
 //!   [`SnapshotHub`] and [`EventHub`] handles already published by the host.
 //! - [`ChannelHostDriver`] owns the [`FixedDeadlineHost`] on the owner thread:
@@ -138,6 +140,13 @@ enum IngressMessage {
         /// Single-use reply lane carrying the authoritative admission status.
         reply: Sender<Result<CommandStatus, HostAccessError>>,
     },
+    /// A cache-miss status query that must consult the owner-side durable authority.
+    CommandStatus {
+        /// Stable command identity requested by the client.
+        command_id: CommandId,
+        /// Single-use reply carrying authoritative found/absent/fail-closed knowledge.
+        reply: Sender<Result<Option<CommandStatus>, HostAccessError>>,
+    },
     /// A coalesced non-command observation request.
     Wake,
 }
@@ -218,7 +227,8 @@ impl ProtocolEventBoard {
 /// Successful submission means the owner thread admitted (or truthfully
 /// rejected) the exact envelope through the same ordered path as
 /// [`LocalHostPort`]; it is not merely a channel enqueue. Status, snapshot,
-/// and event reads never block the owner.
+/// and event reads use bounded mirrors, except that a status-board miss makes
+/// one bounded owner round-trip to durable command authority.
 pub struct ChannelHostPort {
     sender: SyncSender<IngressMessage>,
     statuses: Arc<RwLock<StatusBoard>>,
@@ -249,29 +259,19 @@ impl ChannelHostPort {
             message: message.into(),
         }
     }
-}
 
-impl HostPort for ChannelHostPort {
-    fn session_id(&self) -> HostSessionId {
-        self.session_id
-    }
-
-    fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        let message = IngressMessage::Command { envelope, reply };
+    fn enqueue(&self, message: IngressMessage) -> Result<(), HostAccessError> {
         match self.sender.try_send(message) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(message)) => {
-                // `SyncSender::send_timeout` is unstable; park briefly between
-                // retries inside the configured deadline instead of blocking
-                // without bound. The owner drains ingress every boundary, so
-                // a full channel for the whole deadline means it is wedged.
+                // `SyncSender::send_timeout` is unstable; park briefly between retries inside the
+                // configured deadline instead of blocking without bound.
                 const RETRY_PARK: Duration = Duration::from_millis(2);
                 let started = std::time::Instant::now();
                 let mut pending = message;
                 loop {
                     match self.sender.try_send(pending) {
-                        Ok(()) => break,
+                        Ok(()) => return Ok(()),
                         Err(TrySendError::Full(returned)) => {
                             if started.elapsed() >= self.submit_deadline {
                                 return Err(Self::protocol_violation(format!(
@@ -288,28 +288,86 @@ impl HostPort for ChannelHostPort {
                     }
                 }
             }
-            Err(TrySendError::Disconnected(_)) => return Err(HostAccessError::Disconnected),
+            Err(TrySendError::Disconnected(_)) => Err(HostAccessError::Disconnected),
         }
-        reply_rx
-            .recv_timeout(self.submit_deadline)
-            .map_err(|error| match error {
-                RecvTimeoutError::Timeout => Self::protocol_violation(format!(
-                    "channel host admission reply exceeded {:?}",
-                    self.submit_deadline
-                )),
-                RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
-            })?
+    }
+}
+
+impl HostPort for ChannelHostPort {
+    fn session_id(&self) -> HostSessionId {
+        self.session_id
+    }
+
+    fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
+        let started = std::time::Instant::now();
+        loop {
+            let (reply, reply_rx) = std::sync::mpsc::channel();
+            self.enqueue(IngressMessage::Command {
+                envelope: envelope.clone(),
+                reply,
+            })?;
+            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+            let result = reply_rx
+                .recv_timeout(remaining)
+                .map_err(|error| match error {
+                    RecvTimeoutError::Timeout => Self::protocol_violation(format!(
+                        "channel host admission reply exceeded {:?}",
+                        self.submit_deadline
+                    )),
+                    RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
+                })?;
+            match result {
+                Err(HostAccessError::CommandAuthorityLookup {
+                    failure:
+                        crate::CommandAuthorityLookupFailure::Pending
+                        | crate::CommandAuthorityLookupFailure::Busy,
+                    ..
+                }) if started.elapsed() < self.submit_deadline => {
+                    std::thread::park_timeout(Duration::from_millis(2));
+                }
+                result => return result,
+            }
+        }
     }
 
     fn command_status(
         &mut self,
         command_id: CommandId,
     ) -> Result<Option<CommandStatus>, HostAccessError> {
-        let board = self
+        if let Some(status) = self
             .statuses
             .read()
-            .map_err(|_| Self::protocol_violation("channel status board poisoned"))?;
-        Ok(board.get(command_id))
+            .map_err(|_| Self::protocol_violation("channel status board poisoned"))?
+            .get(command_id)
+        {
+            return Ok(Some(status));
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let (reply, reply_rx) = std::sync::mpsc::channel();
+            self.enqueue(IngressMessage::CommandStatus { command_id, reply })?;
+            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+            let result = reply_rx
+                .recv_timeout(remaining)
+                .map_err(|error| match error {
+                    RecvTimeoutError::Timeout => Self::protocol_violation(format!(
+                        "channel host status reply exceeded {:?}",
+                        self.submit_deadline
+                    )),
+                    RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
+                })?;
+            match result {
+                Err(HostAccessError::CommandAuthorityLookup {
+                    failure:
+                        crate::CommandAuthorityLookupFailure::Pending
+                        | crate::CommandAuthorityLookupFailure::Busy,
+                    ..
+                }) if started.elapsed() < self.submit_deadline => {
+                    std::thread::park_timeout(Duration::from_millis(2));
+                }
+                result => return result,
+            }
+        }
     }
 
     fn snapshot_after(
@@ -499,6 +557,7 @@ impl ChannelHostDriver {
         match message {
             IngressMessage::Command { envelope, reply } => {
                 let result = self.host.submit(envelope);
+                let admitted = usize::from(result.is_ok());
                 if let Ok(status) = &result {
                     if let Ok(mut board) = self.statuses.write() {
                         board.insert(status.clone(), self.status_board_capacity);
@@ -507,7 +566,17 @@ impl ChannelHostDriver {
                 // A client that timed out is unreachable; the admission
                 // remains authoritative and mirrored either way.
                 let _ = reply.send(result);
-                1
+                admitted
+            }
+            IngressMessage::CommandStatus { command_id, reply } => {
+                let result = self.port.command_status(command_id);
+                if let Ok(Some(status)) = &result
+                    && let Ok(mut board) = self.statuses.write()
+                {
+                    board.insert(status.clone(), self.status_board_capacity);
+                }
+                let _ = reply.send(result);
+                0
             }
             IngressMessage::Wake => 0,
         }
@@ -617,12 +686,27 @@ impl ChannelHostDriver {
             | HostDriveInterest::Faulted => {}
         }
         if self.controller_disconnected && !self.shutdown_requested {
-            let _ = self.host.request_shutdown()?;
-            self.shutdown_requested = true;
+            match self.host.request_shutdown() {
+                Ok(_) => self.shutdown_requested = true,
+                Err(HostAccessError::CommandAuthorityLookup {
+                    failure:
+                        crate::CommandAuthorityLookupFailure::Pending
+                        | crate::CommandAuthorityLookupFailure::Busy
+                        | crate::CommandAuthorityLookupFailure::Capacity { .. },
+                    ..
+                }) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         self.mirror_retained_statuses();
         self.mirror_protocol_events();
         interest = self.host.drive_interest();
+        if self.controller_disconnected
+            && !self.shutdown_requested
+            && interest == HostDriveInterest::WakeOnly
+        {
+            interest = HostDriveInterest::Draining;
+        }
         Ok(ChannelStepReport {
             admitted,
             drove,
@@ -1180,6 +1264,10 @@ mod tests {
                 let mut state = self.state.borrow_mut();
                 let count = limit.min(state.receipts.len());
                 state.receipts.drain(..count).collect()
+            }
+
+            fn command_authority_mode(&self) -> crate::CommandAuthorityMode {
+                crate::CommandAuthorityMode::ProcessLocal
             }
         }
 

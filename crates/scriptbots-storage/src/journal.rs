@@ -1,9 +1,9 @@
 //! Nonblocking HostCore journal adapter and detached event-reader surface.
 
 use super::{
-    AdmissionState, DEFAULT_COMMAND_CAPACITY, ExistingStorageLease, InFlightPermit,
-    MAX_STORAGE_QUERY_PAGE, MAX_STORAGE_WAIT_TIMEOUT, Storage, StorageBuffer, StorageCommand,
-    StorageError, load_host_journal_index, read_host_journal_events,
+    AdmissionState, CommandAuthorityRequest, DEFAULT_COMMAND_CAPACITY, ExistingStorageLease,
+    InFlightPermit, MAX_STORAGE_QUERY_PAGE, MAX_STORAGE_WAIT_TIMEOUT, Storage, StorageBuffer,
+    StorageCommand, StorageError, load_host_journal_index, read_host_journal_events,
 };
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
@@ -12,17 +12,18 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand,
-    COMMAND_LIFECYCLE_SCHEMA_VERSION, CommandEnvelope, CommandId, CommandLifecycleEvidence,
-    CommandLifecycleTransition, ConfigRevision, ControlRevision, EventCatchUp,
-    EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason, EventCommitment,
-    EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot, EventSequence,
-    EventSequenceRange, HostAccessError, HostCommand, HostRevisions, HostSessionId,
+    COMMAND_LIFECYCLE_SCHEMA_VERSION, CommandAuthorityLookup, CommandAuthorityLookupFailure,
+    CommandAuthorityReader, CommandClaimPolicy, CommandEnvelope, CommandId,
+    CommandLifecycleEvidence, CommandLifecycleTransition, ConfigRevision, ControlRevision,
+    EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason,
+    EventCommitment, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot,
+    EventSequence, EventSequenceRange, HostAccessError, HostCommand, HostRevisions, HostSessionId,
     JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
     JournalReceiptState, JournaledScientificEvent, RejectionReason, RunId, ScientificBoundary,
     ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     io::Write,
     sync::{
         Arc, Mutex, TryLockError,
@@ -2467,10 +2468,182 @@ pub struct StorageJournalPort {
     max_inflight_bytes: usize,
     inflight_bytes: Arc<AtomicUsize>,
     reader: Arc<dyn EventJournalReader>,
+    command_reader: Option<Arc<dyn CommandAuthorityReader>>,
     shutdown_requirement: ShutdownCommitRequirement,
     expected_sequence: u64,
     last_accepted_sequence: u64,
     open: bool,
+}
+
+struct PendingCommandAuthorityLookup {
+    requested_at: Instant,
+    reply: xchan::Receiver<CommandAuthorityLookup>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CommandAuthorityLookupKey {
+    Status(CommandId),
+    Submit {
+        command_id: CommandId,
+        envelope_digest: [u8; blake3::OUT_LEN],
+        policy: CommandClaimPolicy,
+    },
+}
+
+struct StorageCommandAuthorityReader {
+    session_id: HostSessionId,
+    tx: xchan::Sender<StorageCommand>,
+    capacity: usize,
+    timeout: Duration,
+    max_envelope_bytes: usize,
+    pending: Mutex<HashMap<CommandAuthorityLookupKey, PendingCommandAuthorityLookup>>,
+}
+
+impl StorageCommandAuthorityReader {
+    fn new(
+        session_id: HostSessionId,
+        tx: xchan::Sender<StorageCommand>,
+        capacity: usize,
+        timeout: Duration,
+        max_envelope_bytes: usize,
+    ) -> Self {
+        Self {
+            session_id,
+            tx,
+            capacity,
+            timeout,
+            max_envelope_bytes,
+            pending: Mutex::new(HashMap::with_capacity(capacity)),
+        }
+    }
+
+    fn resolve(
+        &self,
+        key: CommandAuthorityLookupKey,
+        command_id: CommandId,
+        request: CommandAuthorityRequest,
+    ) -> CommandAuthorityLookup {
+        let mut pending = match self.pending.try_lock() {
+            Ok(pending) => pending,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Busy);
+            }
+        };
+        if let Some(existing) = pending.get(&key) {
+            match existing.reply.try_recv() {
+                Ok(outcome) => {
+                    pending.remove(&key);
+                    return outcome;
+                }
+                Err(xchan::TryRecvError::Empty)
+                    if existing.requested_at.elapsed() >= self.timeout =>
+                {
+                    pending.remove(&key);
+                    return CommandAuthorityLookup::Failed(
+                        CommandAuthorityLookupFailure::Timeout {
+                            waited: self.timeout,
+                        },
+                    );
+                }
+                Err(xchan::TryRecvError::Empty) => {
+                    return CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending);
+                }
+                Err(xchan::TryRecvError::Disconnected) => {
+                    pending.remove(&key);
+                    return CommandAuthorityLookup::Failed(
+                        CommandAuthorityLookupFailure::Unavailable {
+                            message: "storage command-authority reply lane disconnected".to_owned(),
+                        },
+                    );
+                }
+            }
+        }
+        pending.retain(|_, existing| {
+            matches!(existing.reply.try_recv(), Err(xchan::TryRecvError::Empty))
+                && existing.requested_at.elapsed() < self.timeout
+        });
+        if pending.len() >= self.capacity {
+            return CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Capacity {
+                capacity: self.capacity,
+            });
+        }
+        let (reply_tx, reply_rx) = xchan::bounded(1);
+        let command = StorageCommand::ResolveCommandAuthority {
+            session_id: self.session_id,
+            command_id,
+            request,
+            reply: reply_tx,
+        };
+        match self.tx.try_send(command) {
+            Ok(()) => {
+                pending.insert(
+                    key,
+                    PendingCommandAuthorityLookup {
+                        requested_at: Instant::now(),
+                        reply: reply_rx,
+                    },
+                );
+                CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending)
+            }
+            Err(xchan::TrySendError::Full(_)) => {
+                CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Busy)
+            }
+            Err(xchan::TrySendError::Disconnected(_)) => {
+                CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Unavailable {
+                    message: "storage command lane disconnected".to_owned(),
+                })
+            }
+        }
+    }
+}
+
+impl CommandAuthorityReader for StorageCommandAuthorityReader {
+    fn resolve_for_submit(
+        &self,
+        envelope: &CommandEnvelope,
+        envelope_digest: [u8; blake3::OUT_LEN],
+        policy: CommandClaimPolicy,
+    ) -> CommandAuthorityLookup {
+        let envelope_postcard_hex = match encode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            envelope,
+        ) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Corrupt {
+                    message: error.to_string(),
+                });
+            }
+        };
+        let envelope_bytes = envelope_postcard_hex.len() / 2;
+        if envelope_bytes > self.max_envelope_bytes {
+            return CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Oversized {
+                bytes: envelope_bytes,
+                limit: self.max_envelope_bytes,
+            });
+        }
+        self.resolve(
+            CommandAuthorityLookupKey::Submit {
+                command_id: envelope.command_id,
+                envelope_digest,
+                policy,
+            },
+            envelope.command_id,
+            CommandAuthorityRequest::Submit {
+                envelope_postcard_hex,
+                policy,
+            },
+        )
+    }
+
+    fn resolve_status(&self, command_id: CommandId) -> CommandAuthorityLookup {
+        self.resolve(
+            CommandAuthorityLookupKey::Status(command_id),
+            command_id,
+            CommandAuthorityRequest::Status,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -2505,6 +2678,13 @@ impl StorageJournalPort {
         options: StorageJournalOptions,
         shutdown_requirement: ShutdownCommitRequirement,
     ) -> Self {
+        let command_reader = Some(Arc::new(StorageCommandAuthorityReader::new(
+            publisher.inner.session_id,
+            tx.clone(),
+            options.admission_capacity,
+            options.receipt_timeout,
+            options.max_batch_bytes,
+        )) as Arc<dyn CommandAuthorityReader>);
         Self {
             session_id: publisher.inner.session_id,
             tx,
@@ -2519,6 +2699,7 @@ impl StorageJournalPort {
             max_inflight_bytes: options.max_inflight_bytes,
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
             reader: publisher.reader(),
+            command_reader,
             shutdown_requirement,
             expected_sequence: 1,
             last_accepted_sequence: 0,
@@ -2805,6 +2986,16 @@ impl JournalPort for StorageJournalPort {
 
     fn event_reader(&self, session_id: HostSessionId) -> Option<Arc<dyn EventJournalReader>> {
         (session_id == self.session_id).then(|| Arc::clone(&self.reader))
+    }
+
+    fn command_authority_reader(
+        &self,
+        session_id: HostSessionId,
+    ) -> Option<Arc<dyn CommandAuthorityReader>> {
+        if session_id != self.session_id {
+            return None;
+        }
+        self.command_reader.as_ref().map(Arc::clone)
     }
 
     fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {

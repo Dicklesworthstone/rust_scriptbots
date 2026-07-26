@@ -1238,11 +1238,18 @@ mod asupersync_runner {
                 NativeMessage::Command(envelope) => {
                     self.metrics.command_wakes = self.metrics.command_wakes.saturating_add(1);
                     let retained = envelope.clone();
-                    if let Err(error) = self.host.submit(envelope) {
-                        self.unresolved_envelopes.push(retained);
-                        self.close_runner_after_failure();
-                        self.host_admission_failure = Some(error.clone());
-                        return Err(NativeScheduleError::from(error).into());
+                    match self.host.submit(envelope) {
+                        Ok(_) => {}
+                        Err(HostAccessError::CommandAuthorityLookup {
+                            failure: crate::CommandAuthorityLookupFailure::Pending,
+                            ..
+                        }) => {}
+                        Err(error) => {
+                            self.unresolved_envelopes.push(retained);
+                            self.close_runner_after_failure();
+                            self.host_admission_failure = Some(error.clone());
+                            return Err(NativeScheduleError::from(error).into());
+                        }
                     }
                     Ok(trigger.combine(NativeDriveTrigger::Command))
                 }
@@ -1317,10 +1324,17 @@ mod asupersync_runner {
                 self.cancellation_observed = true;
             }
             if self.shutdown_command_id.is_none() {
-                let status = self
-                    .host
-                    .request_shutdown()
-                    .map_err(NativeScheduleError::from)?;
+                let status = match self.host.request_shutdown() {
+                    Ok(status) => status,
+                    Err(HostAccessError::CommandAuthorityLookup {
+                        failure:
+                            crate::CommandAuthorityLookupFailure::Pending
+                            | crate::CommandAuthorityLookupFailure::Busy
+                            | crate::CommandAuthorityLookupFailure::Capacity { .. },
+                        ..
+                    }) => return Ok(()),
+                    Err(error) => return Err(NativeScheduleError::from(error).into()),
+                };
                 self.shutdown_command_id = Some(status.command_id());
                 self.metrics.shutdown_requests = self.metrics.shutdown_requests.saturating_add(1);
             }

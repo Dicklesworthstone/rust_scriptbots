@@ -2,7 +2,8 @@
 
 use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, BrainProjection,
-    BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId,
+    BrainProjectionRequest, BrainProjectionSource, CommandAuthorityLookup, CommandAuthorityMode,
+    CommandAuthorityReader, CommandClaimPolicy, CommandEnvelope, CommandId,
     CommandLifecycleEvidence, CommandLifecycleTransition, CommandStatus, ConfigRevision,
     ControlRevision, DriveReceipt, EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator,
     EventCatchUpUnavailableReason, EventCommitment, EventHub, EventJournalReader, EventPage,
@@ -464,6 +465,14 @@ struct SharedHostState {
     /// Retention bound for the archived index; a field so tests can shrink it without
     /// touching production defaults.
     archived_retention: usize,
+    /// Optional nonblocking bridge to run-scoped durable command authority.
+    command_authority_reader: Option<Arc<dyn CommandAuthorityReader>>,
+    /// A durable adapter without the reader must fail closed on every cache miss.
+    command_authority_required: bool,
+    /// Commitment required before full command evidence may leave the live authority map.
+    command_archive_requirement: ShutdownCommitRequirement,
+    /// One ordered cache-miss submission awaiting worker-side durable authority.
+    pending_command_authority: Option<PendingCommandAuthority>,
     next_audit_order: u64,
     pending_audit_count: usize,
     pending_audits: VecDeque<(u64, CommandId)>,
@@ -480,12 +489,249 @@ struct ArchivedIdempotency {
     status: CommandStatus,
 }
 
+#[derive(Debug, Clone)]
+struct PendingCommandAuthority {
+    envelope: CommandEnvelope,
+    envelope_digest: [u8; blake3::OUT_LEN],
+    reserve_lifecycle_slot: bool,
+    policy: CommandClaimPolicy,
+}
+
 /// Maximum archived terminal commands retained for idempotent retry answers. Beyond
 /// this bound the oldest archived records are evicted and the durable journal is the
 /// only authority (bd-2z0.5.2.1).
 const ARCHIVED_IDEMPOTENCY_RETENTION: usize = 4_096;
 
 impl SharedHostState {
+    fn validate_journaled_authority(
+        command_id: CommandId,
+        authority: &crate::JournaledCommandAuthority,
+    ) -> Result<(), HostAccessError> {
+        if authority.status().command_id() != command_id {
+            return Err(HostAccessError::CommandAuthorityLookup {
+                command_id,
+                failure: crate::CommandAuthorityLookupFailure::Corrupt {
+                    message: format!(
+                        "authority returned command id {} for requested id {command_id}",
+                        authority.status().command_id()
+                    ),
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn retain_archived_authority(
+        &mut self,
+        command_id: CommandId,
+        envelope_digest: [u8; blake3::OUT_LEN],
+        status: CommandStatus,
+    ) {
+        if !self.archived_idempotency.contains_key(&command_id) {
+            self.archived_order.push_back(command_id);
+        }
+        self.archived_idempotency.insert(
+            command_id,
+            ArchivedIdempotency {
+                envelope_digest,
+                status,
+            },
+        );
+        while self.archived_order.len() > self.archived_retention {
+            if let Some(oldest) = self.archived_order.pop_front() {
+                self.archived_idempotency.remove(&oldest);
+            }
+        }
+    }
+
+    fn resolve_durable_submission(
+        &mut self,
+        envelope: &CommandEnvelope,
+        envelope_digest: [u8; blake3::OUT_LEN],
+        reserve_lifecycle_slot: bool,
+    ) -> Result<Option<CommandStatus>, HostAccessError> {
+        let command_id = envelope.command_id;
+        let Some(reader) = self.command_authority_reader.as_ref().map(Arc::clone) else {
+            if self.command_authority_required {
+                return Err(HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure: crate::CommandAuthorityLookupFailure::Unavailable {
+                        message: "durable journal exposes no command-authority reader".to_owned(),
+                    },
+                });
+            }
+            return Ok(None);
+        };
+        let policy =
+            if !self.audit_gate_closed && self.admission_lifecycle != HostLifecycle::Stopped {
+                CommandClaimPolicy::ReserveIfAbsent
+            } else {
+                CommandClaimPolicy::CompareOnly
+            };
+        match reader.resolve_for_submit(envelope, envelope_digest, policy) {
+            CommandAuthorityLookup::Found(authority) => {
+                Self::validate_journaled_authority(command_id, &authority)?;
+                let status = authority.status().clone();
+                let prior_digest = authority.envelope_digest();
+                self.retain_archived_authority(command_id, prior_digest, status.clone());
+                if prior_digest == envelope_digest {
+                    Ok(Some(status))
+                } else {
+                    Err(HostAccessError::CommandIdCollision { command_id })
+                }
+            }
+            CommandAuthorityLookup::Claimed => Ok(None),
+            CommandAuthorityLookup::Absent if policy == CommandClaimPolicy::CompareOnly => Ok(None),
+            CommandAuthorityLookup::Absent => Err(protocol_violation(format!(
+                "durable command authority proved {command_id} absent without reserving it"
+            ))),
+            CommandAuthorityLookup::Collision => {
+                Err(HostAccessError::CommandIdCollision { command_id })
+            }
+            CommandAuthorityLookup::Failed(crate::CommandAuthorityLookupFailure::Pending) => {
+                self.pending_command_authority
+                    .get_or_insert_with(|| PendingCommandAuthority {
+                        envelope: envelope.clone(),
+                        envelope_digest,
+                        reserve_lifecycle_slot,
+                        policy,
+                    });
+                Err(HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure: crate::CommandAuthorityLookupFailure::Pending,
+                })
+            }
+            CommandAuthorityLookup::Failed(failure) => {
+                Err(HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure,
+                })
+            }
+        }
+    }
+
+    fn poll_pending_command_authority(&mut self) -> Result<bool, HostAccessError> {
+        let Some(pending) = self.pending_command_authority.clone() else {
+            return Ok(false);
+        };
+        let command_id = pending.envelope.command_id;
+        let reader = self
+            .command_authority_reader
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| HostAccessError::CommandAuthorityLookup {
+                command_id,
+                failure: crate::CommandAuthorityLookupFailure::Unavailable {
+                    message: "pending durable lookup lost its authority reader".to_owned(),
+                },
+            })?;
+        match reader.resolve_for_submit(&pending.envelope, pending.envelope_digest, pending.policy)
+        {
+            CommandAuthorityLookup::Found(authority) => {
+                Self::validate_journaled_authority(command_id, &authority)?;
+                let status = authority.status().clone();
+                let prior_digest = authority.envelope_digest();
+                self.pending_command_authority = None;
+                self.retain_archived_authority(command_id, prior_digest, status);
+                if prior_digest == pending.envelope_digest {
+                    Ok(false)
+                } else {
+                    Err(HostAccessError::CommandIdCollision { command_id })
+                }
+            }
+            CommandAuthorityLookup::Claimed => {
+                self.pending_command_authority = None;
+                self.submit_fresh(
+                    pending.envelope,
+                    pending.envelope_digest,
+                    pending.reserve_lifecycle_slot,
+                )?;
+                Ok(false)
+            }
+            CommandAuthorityLookup::Absent if pending.policy == CommandClaimPolicy::CompareOnly => {
+                self.pending_command_authority = None;
+                self.submit_fresh(
+                    pending.envelope,
+                    pending.envelope_digest,
+                    pending.reserve_lifecycle_slot,
+                )?;
+                Ok(false)
+            }
+            CommandAuthorityLookup::Absent => Err(protocol_violation(format!(
+                "durable command authority proved {command_id} absent without reserving it"
+            ))),
+            CommandAuthorityLookup::Collision => {
+                self.pending_command_authority = None;
+                Err(HostAccessError::CommandIdCollision { command_id })
+            }
+            CommandAuthorityLookup::Failed(
+                crate::CommandAuthorityLookupFailure::Pending
+                | crate::CommandAuthorityLookupFailure::Busy
+                | crate::CommandAuthorityLookupFailure::Capacity { .. },
+            ) => Ok(true),
+            CommandAuthorityLookup::Failed(failure) => {
+                Err(HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure,
+                })
+            }
+        }
+    }
+
+    fn command_status(
+        &mut self,
+        command_id: CommandId,
+    ) -> Result<Option<CommandStatus>, HostAccessError> {
+        if let Some(status) = self
+            .commands
+            .get(&command_id)
+            .map(|authority| authority.status.clone())
+            .or_else(|| {
+                self.archived_idempotency
+                    .get(&command_id)
+                    .map(|archived| archived.status.clone())
+            })
+        {
+            return Ok(Some(status));
+        }
+        let Some(reader) = self.command_authority_reader.as_ref().map(Arc::clone) else {
+            if self.command_authority_required {
+                return Err(HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure: crate::CommandAuthorityLookupFailure::Unavailable {
+                        message: "durable journal exposes no command-authority reader".to_owned(),
+                    },
+                });
+            }
+            return Ok(None);
+        };
+        match reader.resolve_status(command_id) {
+            CommandAuthorityLookup::Found(authority) => {
+                Self::validate_journaled_authority(command_id, &authority)?;
+                let status = authority.status().clone();
+                self.retain_archived_authority(
+                    command_id,
+                    authority.envelope_digest(),
+                    status.clone(),
+                );
+                Ok(Some(status))
+            }
+            CommandAuthorityLookup::Absent => Ok(None),
+            CommandAuthorityLookup::Claimed => Err(protocol_violation(format!(
+                "status-only durable lookup claimed command id {command_id}"
+            ))),
+            CommandAuthorityLookup::Collision => Err(protocol_violation(format!(
+                "status-only durable lookup reported a digest collision for {command_id}"
+            ))),
+            CommandAuthorityLookup::Failed(failure) => {
+                Err(HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure,
+                })
+            }
+        }
+    }
+
     fn emit(&mut self, kind: HostEventKind) -> Result<(), HostAccessError> {
         let sequence = self.next_event;
         self.next_event = sequence
@@ -583,18 +829,10 @@ impl SharedHostState {
         {
             return;
         }
-        let archived = ArchivedIdempotency {
-            envelope_digest: authority.envelope_digest,
-            status: authority.status.clone(),
-        };
-        self.archived_idempotency.insert(command_id, archived);
-        self.archived_order.push_back(command_id);
+        let envelope_digest = authority.envelope_digest;
+        let status = authority.status.clone();
         self.commands.remove(&command_id);
-        while self.archived_order.len() > self.archived_retention {
-            if let Some(oldest) = self.archived_order.pop_front() {
-                self.archived_idempotency.remove(&oldest);
-            }
-        }
+        self.retain_archived_authority(command_id, envelope_digest, status);
     }
 
     fn reserve_pre_admission_audit(&mut self) -> Result<u64, HostAccessError> {
@@ -705,6 +943,27 @@ impl SharedHostState {
         reserve_lifecycle_slot: bool,
     ) -> Result<CommandStatus, HostAccessError> {
         let envelope_digest = command_envelope_digest(&envelope)?;
+        if let Some(pending) = &self.pending_command_authority {
+            if pending.envelope.command_id == envelope.command_id
+                && pending.envelope_digest != envelope_digest
+            {
+                return Err(HostAccessError::CommandIdCollision {
+                    command_id: envelope.command_id,
+                });
+            }
+            if pending.envelope.command_id != envelope.command_id {
+                return Err(HostAccessError::CommandAuthorityLookup {
+                    command_id: envelope.command_id,
+                    failure: crate::CommandAuthorityLookupFailure::Busy,
+                });
+            }
+            if self.poll_pending_command_authority()? {
+                return Err(HostAccessError::CommandAuthorityLookup {
+                    command_id: envelope.command_id,
+                    failure: crate::CommandAuthorityLookupFailure::Pending,
+                });
+            }
+        }
         if let Some(authority) = self.commands.get(&envelope.command_id) {
             if authority.envelope_digest == envelope_digest {
                 return Ok(authority.status.clone());
@@ -723,7 +982,20 @@ impl SharedHostState {
                 command_id: envelope.command_id,
             });
         }
+        if let Some(status) =
+            self.resolve_durable_submission(&envelope, envelope_digest, reserve_lifecycle_slot)?
+        {
+            return Ok(status);
+        }
+        self.submit_fresh(envelope, envelope_digest, reserve_lifecycle_slot)
+    }
 
+    fn submit_fresh(
+        &mut self,
+        envelope: CommandEnvelope,
+        envelope_digest: [u8; blake3::OUT_LEN],
+        reserve_lifecycle_slot: bool,
+    ) -> Result<CommandStatus, HostAccessError> {
         if self.audit_gate_closed || self.admission_lifecycle == HostLifecycle::Stopped {
             return Err(HostAccessError::CommandEvidenceClosed {
                 lifecycle: self.admission_lifecycle,
@@ -814,17 +1086,7 @@ impl HostPort for LocalHostPort {
         &mut self,
         command_id: CommandId,
     ) -> Result<Option<CommandStatus>, HostAccessError> {
-        let shared = self.shared.borrow();
-        Ok(shared
-            .commands
-            .get(&command_id)
-            .map(|authority| authority.status.clone())
-            .or_else(|| {
-                shared
-                    .archived_idempotency
-                    .get(&command_id)
-                    .map(|archived| archived.status.clone())
-            }))
+        self.shared.borrow_mut().command_status(command_id)
     }
 
     fn snapshot_after(
@@ -1363,6 +1625,10 @@ impl HostCore {
             world: dynamic_world,
         });
         let snapshots = SnapshotHub::new(initial_snapshot);
+        let command_archive_requirement = journal.shutdown_commit_requirement();
+        let command_authority_reader = journal.command_authority_reader(session_id);
+        let command_authority_required =
+            journal.command_authority_mode() == CommandAuthorityMode::DurableRequired;
         let shared = Rc::new(RefCell::new(SharedHostState {
             session_id,
             command_capacity: options.command_capacity,
@@ -1377,6 +1643,10 @@ impl HostCore {
             archived_idempotency: HashMap::new(),
             archived_order: VecDeque::new(),
             archived_retention: ARCHIVED_IDEMPOTENCY_RETENTION,
+            command_authority_reader,
+            command_authority_required,
+            command_archive_requirement,
+            pending_command_authority: None,
             next_audit_order: 1,
             pending_audit_count: 0,
             pending_audits: VecDeque::with_capacity(options.command_capacity),
@@ -1468,25 +1738,26 @@ impl HostCore {
                 .ok_or_else(|| protocol_violation("shutdown command status is missing"));
         }
 
-        let command_id = loop {
+        loop {
             let sequence = self.next_lifecycle_command_sequence;
             let candidate = CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
-            let occupied = {
-                let shared = self.shared.borrow();
-                shared.commands.contains_key(&candidate)
-                    || shared.archived_idempotency.contains_key(&candidate)
-            };
-            if !occupied {
-                break candidate;
+            let result = self
+                .shared
+                .borrow_mut()
+                .submit(CommandEnvelope::new(candidate, HostCommand::Shutdown), true);
+            match result {
+                Ok(status) if self.shared.borrow().shutdown_command_id == Some(candidate) => {
+                    return Ok(status);
+                }
+                Ok(_) | Err(HostAccessError::CommandIdCollision { .. }) => {
+                    self.next_lifecycle_command_sequence =
+                        sequence.checked_add(1).ok_or_else(|| {
+                            protocol_violation("lifecycle command sequence exhausted")
+                        })?;
+                }
+                Err(error) => return Err(error),
             }
-            self.next_lifecycle_command_sequence = sequence
-                .checked_add(1)
-                .ok_or_else(|| protocol_violation("lifecycle command sequence exhausted"))?;
-        };
-        self.shared.borrow_mut().submit(
-            CommandEnvelope::new(command_id, HostCommand::Shutdown),
-            true,
-        )
+        }
     }
 
     /// Stable identity of the admitted ordered shutdown, when one exists.
@@ -1591,6 +1862,9 @@ impl HostCore {
         }
         if self.health.fault().is_some() {
             return HostDriveInterest::Faulted;
+        }
+        if self.shared.borrow().pending_command_authority.is_some() {
+            return HostDriveInterest::Draining;
         }
         if self.retained_journal.is_some() {
             return HostDriveInterest::WakeOnly;
@@ -1932,10 +2206,15 @@ impl HostCore {
         )
         .map_err(status_violation)?;
         self.shared.borrow_mut().store_status(status)?;
-        if matches!(
-            journal,
-            JournalState::CommittedVolatile | JournalState::Durable
-        ) {
+        let archive_ready = match journal {
+            JournalState::Durable => true,
+            JournalState::CommittedVolatile => {
+                self.shared.borrow().command_archive_requirement
+                    == ShutdownCommitRequirement::CommittedVolatile
+            }
+            JournalState::NotRequired | JournalState::Pending | JournalState::Failed(_) => false,
+        };
+        if archive_ready {
             self.shared
                 .borrow_mut()
                 .archive_terminal_command(command_id);
@@ -2901,6 +3180,7 @@ impl ManualHostDriver for HostCore {
         let events_before = self.events.published_total();
         let event_was_pressured = self.event_pressure.is_some();
         self.poll_journal_receipts()?;
+        let authority_blocked = self.shared.borrow_mut().poll_pending_command_authority()?;
         if self.event_pressure.is_some() {
             self.prepare_scientific_event_slot()?;
         }
@@ -2910,7 +3190,7 @@ impl ManualHostDriver for HostCore {
         let mut automatic_steps_skipped = 0;
         let mut explicit_step_applied = false;
 
-        let audit_blocked = if self.active_command_is_unresolved() {
+        let audit_blocked = if authority_blocked || self.active_command_is_unresolved() {
             true
         } else if self.retained_journal.is_none() {
             self.drain_pending_command_audits()?
@@ -2966,6 +3246,7 @@ impl ManualHostDriver for HostCore {
             && self.latched_fault.is_none()
             && self.event_pressure.is_none()
             && !event_was_pressured
+            && !authority_blocked
         {
             let budget = self.automatic_budget(elapsed_nanos, prior_speed);
             automatic_steps_due = budget.due;
@@ -3162,9 +3443,10 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 mod tests {
     use super::*;
     use crate::{
-        BrainProjectionRequest, ProjectionBroker, ProjectionCamera, ProjectionClientId,
-        ProjectionDetail, ProjectionLimits, ProjectionRanking, ProjectionRequest,
-        ProjectionRequestRevision, ProjectionSelection, ProjectionViewport, project_snapshot,
+        BrainProjectionRequest, CommandAuthorityLookupFailure, JournaledCommandAuthority,
+        ProjectionBroker, ProjectionCamera, ProjectionClientId, ProjectionDetail, ProjectionLimits,
+        ProjectionRanking, ProjectionRequest, ProjectionRequestRevision, ProjectionSelection,
+        ProjectionViewport, project_snapshot,
     };
     use scriptbots_core::{
         ActivationLayer, AgentData, AgentUid, BrainActivations, BrainInspection,
@@ -3174,7 +3456,7 @@ mod tests {
         SelectionMode, SelectionState, SelectionUpdate, TerrainLayer, Velocity,
         bound_brain_inspection,
     };
-    use std::{hint::black_box, time::Instant};
+    use std::{hint::black_box, sync::Mutex, time::Instant};
 
     fn world(persistence_interval: u32) -> WorldState {
         WorldState::new(ScriptBotsConfig {
@@ -4759,6 +5041,149 @@ mod tests {
         );
     }
 
+    struct ScriptedCommandAuthority {
+        outcomes: Mutex<HashMap<CommandId, VecDeque<CommandAuthorityLookup>>>,
+    }
+
+    impl CommandAuthorityReader for ScriptedCommandAuthority {
+        fn resolve_for_submit(
+            &self,
+            envelope: &CommandEnvelope,
+            _envelope_digest: [u8; blake3::OUT_LEN],
+            _policy: CommandClaimPolicy,
+        ) -> CommandAuthorityLookup {
+            self.resolve_status(envelope.command_id)
+        }
+
+        fn resolve_status(&self, command_id: CommandId) -> CommandAuthorityLookup {
+            self.outcomes
+                .lock()
+                .expect("scripted command authority lock")
+                .get_mut(&command_id)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(CommandAuthorityLookup::Absent)
+        }
+    }
+
+    struct AuthorityBackedVolatileJournal {
+        inner: VolatileJournal,
+        authority: Arc<dyn CommandAuthorityReader>,
+    }
+
+    impl JournalPort for AuthorityBackedVolatileJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            self.inner.try_admit(batch)
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            self.inner.poll_receipts(limit)
+        }
+
+        fn event_reader(&self, session_id: HostSessionId) -> Option<Arc<dyn EventJournalReader>> {
+            self.inner.event_reader(session_id)
+        }
+
+        fn command_authority_reader(
+            &self,
+            _session_id: HostSessionId,
+        ) -> Option<Arc<dyn CommandAuthorityReader>> {
+            Some(Arc::clone(&self.authority))
+        }
+
+        fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+            self.inner.shutdown_commit_requirement()
+        }
+    }
+
+    #[test]
+    fn durable_cache_miss_never_admits_until_authority_resolves() {
+        let command_id = CommandId::from_client_sequence(0x51, 7);
+        let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+        let digest = command_envelope_digest(&envelope).expect("canonical envelope digest");
+        let boundary = AppliedCommand {
+            tick: Tick(23),
+            revisions: HostRevisions {
+                control: ControlRevision::new(4),
+                scientific: ScientificRevision::new(23),
+                config: ConfigRevision::new(2),
+            },
+        };
+        let authority = JournaledCommandAuthority::try_new(
+            command_id,
+            digest,
+            Some(AdmissionSequence::new(9)),
+            ApplicationState::Applied(boundary),
+            JournalState::Durable,
+        )
+        .expect("valid durable authority");
+        let scripted = Arc::new(ScriptedCommandAuthority {
+            outcomes: Mutex::new(HashMap::from([(
+                command_id,
+                VecDeque::from([
+                    CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+                    CommandAuthorityLookup::Found(authority.clone()),
+                ]),
+            )])),
+        });
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(0x5151),
+            world(0),
+            options(true),
+            Box::new(AuthorityBackedVolatileJournal {
+                inner: VolatileJournal::with_capacity(64),
+                authority: scripted,
+            }),
+        )
+        .expect("authority-backed host");
+        let mut port = core.local_port();
+        let before_digest = core
+            .world
+            .world_digest_v1()
+            .expect("pre-lookup deterministic world digest");
+
+        let pending = port.submit(envelope.clone());
+        assert!(matches!(
+            pending,
+            Err(HostAccessError::CommandAuthorityLookup {
+                command_id: pending_id,
+                failure: CommandAuthorityLookupFailure::Pending,
+            }) if pending_id == command_id
+        ));
+        assert_eq!(port.queue_depth(), 0);
+        assert_eq!(core.world_tick(), Tick(0));
+        assert_eq!(
+            core.world
+                .world_digest_v1()
+                .expect("post-pending deterministic world digest"),
+            before_digest
+        );
+
+        assert_eq!(
+            port.submit(envelope.clone())
+                .expect("resolved exact durable retry"),
+            authority.status().clone()
+        );
+        assert_eq!(port.queue_depth(), 0);
+        assert_eq!(
+            port.command_status(command_id)
+                .expect("durable status lookup"),
+            Some(authority.status().clone())
+        );
+        assert!(matches!(
+            port.submit(CommandEnvelope::new(command_id, HostCommand::Pause)),
+            Err(HostAccessError::CommandIdCollision {
+                command_id: collision_id,
+            }) if collision_id == command_id
+        ));
+        assert_eq!(core.world_tick(), Tick(0));
+        assert_eq!(
+            core.world
+                .world_digest_v1()
+                .expect("post-collision deterministic world digest"),
+            before_digest
+        );
+    }
+
     #[test]
     fn shutdown_command_is_never_evicted_from_the_live_map() {
         let mut core = HostCore::new(HostSessionId::new(92), world(0), options(true))
@@ -5239,6 +5664,10 @@ mod tests {
             let mut state = self.state.borrow_mut();
             let count = limit.min(state.receipts.len());
             state.receipts.drain(..count).collect()
+        }
+
+        fn command_authority_mode(&self) -> CommandAuthorityMode {
+            CommandAuthorityMode::ProcessLocal
         }
     }
 

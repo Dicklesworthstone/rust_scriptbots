@@ -51,9 +51,10 @@ use scriptbots_core::{
     world_counters_digest_v1,
 };
 use scriptbots_runtime::{
-    ApplicationState, CommandId, EventCommitment, EventSequence, EventSequenceRange, HostSessionId,
-    JournalBatch, JournalBatchId, JournalFailure, JournalReceipt, JournalReceiptState,
-    JournaledScientificEvent, RunId, ShutdownCommitRequirement,
+    ApplicationState, CommandAuthorityLookup, CommandAuthorityLookupFailure, CommandClaimPolicy,
+    CommandId, EventCommitment, EventSequence, EventSequenceRange, HostSessionId, JournalBatch,
+    JournalBatchId, JournalFailure, JournalReceipt, JournalReceiptState, JournalState,
+    JournaledCommandAuthority, JournaledScientificEvent, RunId, ShutdownCommitRequirement,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
@@ -194,9 +195,10 @@ const SCRIPTBOTS_SCHEMA_V8_VERSION: i64 = 8;
 const SCRIPTBOTS_SCHEMA_V9_VERSION: i64 = 9;
 const SCRIPTBOTS_SCHEMA_V10_VERSION: i64 = 10;
 const SCRIPTBOTS_SCHEMA_V11_VERSION: i64 = 11;
+const SCRIPTBOTS_SCHEMA_V12_VERSION: i64 = 12;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 12;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 13;
 
 /// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
@@ -1084,6 +1086,97 @@ const SCRIPTBOTS_SCHEMA_V12: &str = r#"
     PRAGMA user_version = 12;
 "#;
 
+/// V13 migration: make a durable, run-scoped command claim precede runtime admission.
+///
+/// The normalized terminal projection is intentionally not the first owner of a `CommandId`: it
+/// is written only after application. This claim table is populated atomically on the storage
+/// worker before a cache-miss submission may enter HostCore, closing the absence/admission race
+/// and leaving an honest indeterminate claim after a crash before terminal archival.
+const SCRIPTBOTS_SCHEMA_V13: &str = r#"
+    CREATE TABLE host_command_claims (
+        run_id TEXT NOT NULL,
+        command_id TEXT NOT NULL CHECK (
+            length(command_id) = 32
+            AND command_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        host_session_id TEXT NOT NULL CHECK (
+            length(host_session_id) = 16
+            AND host_session_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        envelope_postcard_hex TEXT NOT NULL CHECK (
+            envelope_postcard_hex <> ''
+            AND length(envelope_postcard_hex) % 2 = 0
+            AND envelope_postcard_hex NOT GLOB '*[^0-9a-f]*'
+        ),
+        PRIMARY KEY (run_id, command_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id),
+        FOREIGN KEY (run_id, host_session_id)
+            REFERENCES host_journal_progress (run_id, host_session_id)
+    );
+    INSERT INTO host_command_claims (
+        run_id, command_id, host_session_id, envelope_postcard_hex
+    )
+        SELECT run_id, command_id, host_session_id, envelope_postcard_hex
+        FROM host_command_records
+        ORDER BY run_id ASC, command_id ASC, host_session_id ASC;
+
+    PRAGMA user_version = 13;
+"#;
+
+const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 8] = [
+    (
+        SCRIPTBOTS_SCHEMA_V6_VERSION,
+        "create_multi_run_schema",
+        SCRIPTBOTS_SCHEMA_V6,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_V7_VERSION,
+        "add_host_journal_archive",
+        SCRIPTBOTS_SCHEMA_V7,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_V8_VERSION,
+        "add_host_domain_event_projection",
+        SCRIPTBOTS_SCHEMA_V8,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_V9_VERSION,
+        "add_host_command_lifecycle_projection",
+        SCRIPTBOTS_SCHEMA_V9,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_V10_VERSION,
+        "add_replay_event_interaction_edges",
+        SCRIPTBOTS_SCHEMA_V10,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_V11_VERSION,
+        "drop_external_content_narrative_search",
+        SCRIPTBOTS_SCHEMA_V11,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_V12_VERSION,
+        "create_plain_content_narrative_search",
+        SCRIPTBOTS_SCHEMA_V12,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_VERSION,
+        "add_durable_command_claims",
+        SCRIPTBOTS_SCHEMA_V13,
+    ),
+];
+
+fn scriptbots_migration_runner_through(version: i64) -> MigrationRunner {
+    let mut runner = MigrationRunner::new();
+    for &(migration_version, name, sql) in &SCRIPTBOTS_MIGRATIONS {
+        if migration_version > version {
+            break;
+        }
+        runner = runner.add(migration_version, name, sql);
+    }
+    runner
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaObject {
     object_type: String,
@@ -1137,93 +1230,57 @@ fn refuse_lossy_command_lifecycle_migration(connection: &Connection) -> Result<(
     Ok(())
 }
 
+fn refuse_ambiguous_command_claim_migration(connection: &Connection) -> Result<(), StorageError> {
+    let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+    if !(SCRIPTBOTS_SCHEMA_V9_VERSION..SCRIPTBOTS_SCHEMA_VERSION).contains(&user_version) {
+        return Ok(());
+    }
+    let rows = connection.query(
+        "SELECT run_id, command_id, COUNT(*)
+         FROM host_command_records
+         GROUP BY run_id, command_id
+         HAVING COUNT(*) > 1
+         ORDER BY run_id ASC, command_id ASC
+         LIMIT 1",
+    )?;
+    let Some(row) = rows.first() else {
+        return Ok(());
+    };
+    let run_id: String = decode(row, 0, "host_command_records.run_id")?;
+    let command_id: String = decode(row, 1, "host_command_records.command_id")?;
+    let matches: i64 = decode(row, 2, "host_command_records.count")?;
+    Err(StorageError::InvalidData {
+        context: "host_command_claims.command_id",
+        reason: format!(
+            "refusing run-scoped command-claim migration: run {run_id} has {matches} terminal records for command {command_id}"
+        ),
+    })
+}
+
 fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
     // This preflight must precede MigrationRunner: its ledger, DDL, and user-version writes are
     // intentionally never attempted when old envelope-only archives cannot populate V9 exactly.
     refuse_lossy_command_lifecycle_migration(connection)?;
-    let result = MigrationRunner::new()
-        .add(
-            SCRIPTBOTS_SCHEMA_V6_VERSION,
-            "create_multi_run_schema",
-            SCRIPTBOTS_SCHEMA_V6,
-        )
-        .add(
-            SCRIPTBOTS_SCHEMA_V7_VERSION,
-            "add_host_journal_archive",
-            SCRIPTBOTS_SCHEMA_V7,
-        )
-        .add(
-            SCRIPTBOTS_SCHEMA_V8_VERSION,
-            "add_host_domain_event_projection",
-            SCRIPTBOTS_SCHEMA_V8,
-        )
-        .add(
-            SCRIPTBOTS_SCHEMA_V9_VERSION,
-            "add_host_command_lifecycle_projection",
-            SCRIPTBOTS_SCHEMA_V9,
-        )
-        .add(
-            SCRIPTBOTS_SCHEMA_V10_VERSION,
-            "add_replay_event_interaction_edges",
-            SCRIPTBOTS_SCHEMA_V10,
-        )
-        .add(
-            SCRIPTBOTS_SCHEMA_V11_VERSION,
-            "drop_external_content_narrative_search",
-            SCRIPTBOTS_SCHEMA_V11,
-        )
-        .add(
-            SCRIPTBOTS_SCHEMA_VERSION,
-            "create_plain_content_narrative_search",
-            SCRIPTBOTS_SCHEMA_V12,
-        )
-        .run(connection)?;
+    refuse_ambiguous_command_claim_migration(connection)?;
+    let result = scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_VERSION).run(connection)?;
     // Every suffix of the chain is a legal lineage: a database joins at whatever version it
     // was left at and runs forward from there. Enumerated rather than computed so that adding
     // a migration without extending this list fails loudly instead of accepting a gap.
+    const LINEAGE: [i64; 8] = [
+        SCRIPTBOTS_SCHEMA_V6_VERSION,
+        SCRIPTBOTS_SCHEMA_V7_VERSION,
+        SCRIPTBOTS_SCHEMA_V8_VERSION,
+        SCRIPTBOTS_SCHEMA_V9_VERSION,
+        SCRIPTBOTS_SCHEMA_V10_VERSION,
+        SCRIPTBOTS_SCHEMA_V11_VERSION,
+        SCRIPTBOTS_SCHEMA_V12_VERSION,
+        SCRIPTBOTS_SCHEMA_VERSION,
+    ];
     let applied_is_valid = result.applied.is_empty()
-        || result.applied == [SCRIPTBOTS_SCHEMA_VERSION]
-        || result.applied == [SCRIPTBOTS_SCHEMA_V11_VERSION, SCRIPTBOTS_SCHEMA_VERSION]
-        || result.applied
-            == [
-                SCRIPTBOTS_SCHEMA_V10_VERSION,
-                SCRIPTBOTS_SCHEMA_V11_VERSION,
-                SCRIPTBOTS_SCHEMA_VERSION,
-            ]
-        || result.applied
-            == [
-                SCRIPTBOTS_SCHEMA_V9_VERSION,
-                SCRIPTBOTS_SCHEMA_V10_VERSION,
-                SCRIPTBOTS_SCHEMA_V11_VERSION,
-                SCRIPTBOTS_SCHEMA_VERSION,
-            ]
-        || result.applied
-            == [
-                SCRIPTBOTS_SCHEMA_V8_VERSION,
-                SCRIPTBOTS_SCHEMA_V9_VERSION,
-                SCRIPTBOTS_SCHEMA_V10_VERSION,
-                SCRIPTBOTS_SCHEMA_V11_VERSION,
-                SCRIPTBOTS_SCHEMA_VERSION,
-            ]
-        || result.applied
-            == [
-                SCRIPTBOTS_SCHEMA_V7_VERSION,
-                SCRIPTBOTS_SCHEMA_V8_VERSION,
-                SCRIPTBOTS_SCHEMA_V9_VERSION,
-                SCRIPTBOTS_SCHEMA_V10_VERSION,
-                SCRIPTBOTS_SCHEMA_V11_VERSION,
-                SCRIPTBOTS_SCHEMA_VERSION,
-            ]
-        || result.applied
-            == [
-                SCRIPTBOTS_SCHEMA_V6_VERSION,
-                SCRIPTBOTS_SCHEMA_V7_VERSION,
-                SCRIPTBOTS_SCHEMA_V8_VERSION,
-                SCRIPTBOTS_SCHEMA_V9_VERSION,
-                SCRIPTBOTS_SCHEMA_V10_VERSION,
-                SCRIPTBOTS_SCHEMA_V11_VERSION,
-                SCRIPTBOTS_SCHEMA_VERSION,
-            ];
+        || LINEAGE
+            .iter()
+            .position(|version| Some(version) == result.applied.first())
+            .is_some_and(|start| result.applied == LINEAGE[start..]);
     if result.current != SCRIPTBOTS_SCHEMA_VERSION || !applied_is_valid {
         return Err(StorageError::InvalidData {
             context: "_schema_migrations",
@@ -1279,10 +1336,10 @@ fn schema_fingerprint(objects: &[SchemaObject]) -> String {
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
-fn canonical_schema_objects() -> Result<Vec<SchemaObject>, StorageError> {
+fn canonical_schema_objects_at(version: i64) -> Result<Vec<SchemaObject>, StorageError> {
     let connection = Connection::open(":memory:")?;
     let result = (|| {
-        install_scriptbots_schema(&connection)?;
+        scriptbots_migration_runner_through(version).run(&connection)?;
         read_schema_objects(&connection)
     })();
     let close_result = connection
@@ -1291,6 +1348,10 @@ fn canonical_schema_objects() -> Result<Vec<SchemaObject>, StorageError> {
     let objects = result?;
     close_result?;
     Ok(objects)
+}
+
+fn canonical_schema_objects() -> Result<Vec<SchemaObject>, StorageError> {
+    canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_VERSION)
 }
 
 const AGENT_COLUMNS: &[&str] = &[
@@ -4978,6 +5039,7 @@ fn load_finished_command_journal_record(
     expected_command_id: CommandId,
     payload_digest: &str,
     payload_bytes: usize,
+    expected_state: HostJournalState,
 ) -> Result<CommandJournalRecord, StorageError> {
     if payload_bytes == 0 || payload_bytes > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
         return Err(StorageError::InvalidData {
@@ -5037,7 +5099,7 @@ fn load_finished_command_journal_record(
         connection,
         run_id,
         batch_id,
-        HostJournalState::Durable,
+        expected_state,
         Some(&projection),
     )?;
     let transition_rows = connection.query_with_params(
@@ -6850,6 +6912,7 @@ impl StorageReader {
             command_id,
             &payload_digest,
             payload_bytes,
+            HostJournalState::Durable,
         )
     }
 
@@ -7021,6 +7084,7 @@ impl StorageReader {
                 command_id,
                 &payload_digest,
                 payload_bytes,
+                HostJournalState::Durable,
             )?);
             page_payload_bytes = next_page_bytes;
             prior_sequence = journal_sequence;
@@ -9718,7 +9782,10 @@ impl Storage {
                     reason: "recovery opened without an identity lease".to_owned(),
                 })
                 .and_then(|lease| lease.bind_connection(&validation_connection, &path))
-                .and_then(|()| Self::validate_existing_scriptbots_database(&validation_connection));
+                .and_then(|()| {
+                    Self::validate_supported_existing_scriptbots_database(&validation_connection)
+                        .map(|_| ())
+                });
             let run_selection = if validation.is_ok() && matches!(&run_open, RunOpen::RecoverSole) {
                 StorageReader::resolve_run_id(&validation_connection, None).map(Some)
             } else {
@@ -9748,6 +9815,8 @@ impl Storage {
         } else {
             Connection::open(&path)?
         };
+        conn.execute("PRAGMA foreign_keys = ON;")?;
+        conn.execute("PRAGMA synchronous = FULL;")?;
         if recover_existing {
             let validation = existing_lease
                 .as_ref()
@@ -9756,6 +9825,10 @@ impl Storage {
                     reason: "recovery opened without an identity lease".to_owned(),
                 })
                 .and_then(|lease| lease.bind_connection(&conn, &path))
+                .and_then(|()| {
+                    Self::validate_supported_existing_scriptbots_database(&conn).map(|_| ())
+                })
+                .and_then(|()| install_scriptbots_schema(&conn))
                 .and_then(|()| Self::validate_existing_scriptbots_database(&conn));
             if let Err(error) = validation {
                 if let Err(close_error) = conn.close_without_checkpoint() {
@@ -9778,8 +9851,6 @@ impl Storage {
             context: "runs.run_id",
             reason: "recovery did not resolve a selected run inside the writer lease".to_owned(),
         })?;
-        conn.execute("PRAGMA foreign_keys = ON;")?;
-        conn.execute("PRAGMA synchronous = FULL;")?;
         let mut storage = Self {
             path,
             run_id,
@@ -9805,6 +9876,15 @@ impl Storage {
         }
         if recover_existing
             && let Err(error) = Self::validate_all_persistence_invariants(
+                storage.connection()?,
+                storage.file_backed(),
+            )
+        {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
+        if recover_existing
+            && let Err(error) = Self::validate_all_host_journal_invariants(
                 storage.connection()?,
                 storage.file_backed(),
             )
@@ -9878,54 +9958,42 @@ impl Storage {
         Ok(storage)
     }
 
-    fn validate_existing_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
+    fn validate_supported_existing_scriptbots_schema(
+        connection: &Connection,
+    ) -> Result<i64, StorageError> {
+        let user_version = connection.query_row("PRAGMA user_version")?;
+        let user_version: i64 = decode(&user_version, 0, "pragma.user_version")?;
+        if !(SCRIPTBOTS_SCHEMA_V6_VERSION..=SCRIPTBOTS_SCHEMA_VERSION).contains(&user_version) {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_schema",
+                reason: format!(
+                    "unsupported ScriptBots schema v{user_version}; expected v{SCRIPTBOTS_SCHEMA_V6_VERSION}..=v{SCRIPTBOTS_SCHEMA_VERSION}"
+                ),
+            });
+        }
+
         let migrations = connection.query(
             "SELECT version, name FROM _schema_migrations
              ORDER BY version ASC",
         )?;
-        // Declared before the length check so the count and the message are DERIVED from the
-        // chain rather than restated as literals. The previous form said "exactly four ...
-        // through v9" in a hand-written string, which is the bd-u8ti defect: a schema bump
-        // leaves the assertion describing a version that no longer exists, and the reader
-        // trusts the sentence over the code.
-        let expected_migrations = [
-            (SCRIPTBOTS_SCHEMA_V6_VERSION, "create_multi_run_schema"),
-            (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
-            (
-                SCRIPTBOTS_SCHEMA_V8_VERSION,
-                "add_host_domain_event_projection",
-            ),
-            (
-                SCRIPTBOTS_SCHEMA_V9_VERSION,
-                "add_host_command_lifecycle_projection",
-            ),
-            (
-                SCRIPTBOTS_SCHEMA_V10_VERSION,
-                "add_replay_event_interaction_edges",
-            ),
-            (
-                SCRIPTBOTS_SCHEMA_V11_VERSION,
-                "drop_external_content_narrative_search",
-            ),
-            (
-                SCRIPTBOTS_SCHEMA_VERSION,
-                "create_plain_content_narrative_search",
-            ),
-        ];
+        let expected_migrations = SCRIPTBOTS_MIGRATIONS
+            .iter()
+            .take_while(|(version, _, _)| *version <= user_version)
+            .collect::<Vec<_>>();
         if migrations.len() != expected_migrations.len() {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_schema",
                 reason: format!(
-                    "expected exactly {} ScriptBots migrations through v{SCRIPTBOTS_SCHEMA_VERSION}, found {}",
+                    "expected exactly {} ScriptBots migrations through v{user_version}, found {}",
                     expected_migrations.len(),
                     migrations.len()
                 ),
             });
         }
-        for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
+        for (row, (version, name, _)) in migrations.iter().zip(expected_migrations) {
             let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
             let actual_name: String = decode(row, 1, "_schema_migrations.name")?;
-            if actual_version != version || actual_name != name {
+            if actual_version != *version || actual_name != *name {
                 return Err(StorageError::InvalidData {
                     context: "storage.recovery_schema",
                     reason: format!(
@@ -9935,18 +10003,7 @@ impl Storage {
             }
         }
 
-        let user_version = connection.query_row("PRAGMA user_version")?;
-        let user_version: i64 = decode(&user_version, 0, "pragma.user_version")?;
-        if user_version != SCRIPTBOTS_SCHEMA_VERSION {
-            return Err(StorageError::InvalidData {
-                context: "storage.recovery_schema",
-                reason: format!(
-                    "migration ledger is v{SCRIPTBOTS_SCHEMA_VERSION}, but PRAGMA user_version is {user_version}"
-                ),
-            });
-        }
-
-        let expected_schema = canonical_schema_objects()?;
+        let expected_schema = canonical_schema_objects_at(user_version)?;
         let actual_schema = read_schema_objects(connection)?;
         if actual_schema != expected_schema {
             let first_difference = expected_schema
@@ -9972,19 +10029,32 @@ impl Storage {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_schema",
                 reason: format!(
-                    "schema fingerprint mismatch: expected {}, found {}; {difference}",
+                    "v{user_version} schema fingerprint mismatch: expected {}, found {}; {difference}",
                     schema_fingerprint(&expected_schema),
                     schema_fingerprint(&actual_schema)
                 ),
             });
         }
 
+        Ok(user_version)
+    }
+
+    fn validate_existing_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
+        let version = Self::validate_supported_existing_scriptbots_schema(connection)?;
+        if version != SCRIPTBOTS_SCHEMA_VERSION {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_schema",
+                reason: format!(
+                    "migration ledger is v{version}, expected current v{SCRIPTBOTS_SCHEMA_VERSION}"
+                ),
+            });
+        }
         Ok(())
     }
 
-    fn validate_existing_scriptbots_database(connection: &Connection) -> Result<(), StorageError> {
-        Self::validate_existing_scriptbots_schema(connection)?;
-
+    fn validate_existing_scriptbots_database_contents(
+        connection: &Connection,
+    ) -> Result<(), StorageError> {
         let orphaned = connection.query_row(
             "SELECT COUNT(*)
              FROM runs
@@ -10004,6 +10074,19 @@ impl Storage {
             load_run_manifest(connection, run_id)?;
         }
         Ok(())
+    }
+
+    fn validate_supported_existing_scriptbots_database(
+        connection: &Connection,
+    ) -> Result<i64, StorageError> {
+        let version = Self::validate_supported_existing_scriptbots_schema(connection)?;
+        Self::validate_existing_scriptbots_database_contents(connection)?;
+        Ok(version)
+    }
+
+    fn validate_existing_scriptbots_database(connection: &Connection) -> Result<(), StorageError> {
+        Self::validate_existing_scriptbots_schema(connection)?;
+        Self::validate_existing_scriptbots_database_contents(connection)
     }
 
     fn initialize_schema(&mut self) -> Result<(), StorageError> {
@@ -10256,6 +10339,21 @@ impl Storage {
         )
     }
 
+    fn validate_all_host_journal_invariants(
+        connection: &Connection,
+        file_backed: bool,
+    ) -> Result<(), StorageError> {
+        let rows = connection.query("SELECT run_id FROM runs ORDER BY run_id ASC")?;
+        for row in rows {
+            Self::validate_host_journal_invariants_for_connection(
+                connection,
+                decode_run_id(&row, 0, "runs.run_id")?,
+                file_backed,
+            )?;
+        }
+        Ok(())
+    }
+
     fn validate_host_journal_invariants_for_connection(
         connection: &Connection,
         run_id: RunId,
@@ -10421,6 +10519,96 @@ impl Storage {
                     "command record ({session}, {command_id}) has no matching canonical archive ledger"
                 ),
             });
+        }
+        let command_claim_mismatch = connection.query_with_params(
+            "SELECT command.host_session_id, command.command_id
+             FROM host_command_records AS command
+             LEFT JOIN host_command_claims AS claim
+               ON claim.run_id = command.run_id
+              AND claim.command_id = command.command_id
+             WHERE command.run_id = ?1
+               AND (
+                    claim.command_id IS NULL
+                    OR claim.host_session_id <> command.host_session_id
+                    OR claim.envelope_postcard_hex <> command.envelope_postcard_hex
+               )
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = command_claim_mismatch.first() {
+            let session: String = decode(row, 0, "host_command_records.host_session_id")?;
+            let command_id: String = decode(row, 1, "host_command_records.command_id")?;
+            return Err(StorageError::InvalidData {
+                context: "host_command_claims.terminal_binding",
+                reason: format!(
+                    "command record ({session}, {command_id}) has no exact durable command claim"
+                ),
+            });
+        }
+        let claim_orphan = connection.query_with_params(
+            "SELECT claim.host_session_id, claim.command_id
+             FROM host_command_claims AS claim
+             LEFT JOIN host_journal_progress AS progress
+               ON progress.run_id = claim.run_id
+              AND progress.host_session_id = claim.host_session_id
+             WHERE claim.run_id = ?1 AND progress.host_session_id IS NULL
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if let Some(row) = claim_orphan.first() {
+            let session: String = decode(row, 0, "host_command_claims.host_session_id")?;
+            let command_id: String = decode(row, 1, "host_command_claims.command_id")?;
+            return Err(StorageError::InvalidData {
+                context: "host_command_claims.host_session_id",
+                reason: format!(
+                    "command claim ({session}, {command_id}) has no matching journal session"
+                ),
+            });
+        }
+        let mut claim_cursor = String::new();
+        loop {
+            let claims = connection.query_with_params(
+                "SELECT command_id, envelope_postcard_hex
+                 FROM host_command_claims
+                 WHERE run_id = ?1 AND command_id > ?2
+                 ORDER BY command_id ASC
+                 LIMIT ?3",
+                &[
+                    sqlite_run_id(run_id),
+                    claim_cursor.as_str().into(),
+                    page_limit.into(),
+                ],
+            )?;
+            if claims.is_empty() {
+                break;
+            }
+            for row in &claims {
+                let command_id_text: String = decode(row, 0, "host_command_claims.command_id")?;
+                let command_id: CommandId = serde_json::from_str(&format!("\"{command_id_text}\""))
+                    .map_err(|error| StorageError::InvalidData {
+                        context: "host_command_claims.command_id",
+                        reason: error.to_string(),
+                    })?;
+                let envelope_hex: String =
+                    decode(row, 1, "host_command_claims.envelope_postcard_hex")?;
+                let envelope = decode_command_envelope_postcard_hex(
+                    "host_command_claims.envelope_postcard_hex",
+                    &envelope_hex,
+                )?;
+                let canonical = encode_command_envelope_postcard_hex(
+                    "host_command_claims.envelope_postcard_hex",
+                    &envelope,
+                )?;
+                if envelope.command_id != command_id || canonical != envelope_hex {
+                    return Err(StorageError::InvalidData {
+                        context: "host_command_claims.envelope_postcard_hex",
+                        reason: format!(
+                            "command {command_id} claim is not its canonical envelope encoding"
+                        ),
+                    });
+                }
+                claim_cursor = command_id_text;
+            }
         }
         let application_orphan = connection.query_with_params(
             "SELECT transition.host_session_id, transition.command_id,
@@ -11561,6 +11749,230 @@ impl Storage {
         Ok(())
     }
 
+    fn resolve_command_authority(
+        &self,
+        session_id: HostSessionId,
+        command_id: CommandId,
+        request: &CommandAuthorityRequest,
+    ) -> Result<CommandAuthorityLookup, StorageError> {
+        let command_id_text = command_id.to_string();
+        let claim_rows = self.connection()?.query_with_params(
+            "SELECT host_session_id, envelope_postcard_hex
+             FROM host_command_claims
+             WHERE run_id = ?1 AND command_id = ?2",
+            &[sqlite_run_id(self.run_id), command_id_text.as_str().into()],
+        )?;
+        if claim_rows.is_empty() {
+            let CommandAuthorityRequest::Submit {
+                envelope_postcard_hex,
+                policy,
+            } = request
+            else {
+                return Ok(CommandAuthorityLookup::Absent);
+            };
+            if *policy == CommandClaimPolicy::CompareOnly {
+                return Ok(CommandAuthorityLookup::Absent);
+            }
+            let session = encode_journal_u64(session_id.get());
+            execute_transaction_with_retry(self.connection()?, |transaction| {
+                let inserted = transaction.execute_with_params(
+                    "INSERT INTO host_command_claims (
+                        run_id, command_id, host_session_id, envelope_postcard_hex
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        sqlite_run_id(self.run_id),
+                        command_id_text.as_str().into(),
+                        session.as_str().into(),
+                        envelope_postcard_hex.as_str().into(),
+                    ],
+                )?;
+                if inserted != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "durable command claim inserted {inserted} rows"
+                    )));
+                }
+                Ok(())
+            })?;
+            return Ok(CommandAuthorityLookup::Claimed);
+        }
+        let [claim] = claim_rows.as_slice() else {
+            return Ok(CommandAuthorityLookup::Failed(
+                CommandAuthorityLookupFailure::Ambiguous {
+                    matches: claim_rows.len(),
+                },
+            ));
+        };
+        let encoded_session: String = decode(claim, 0, "host_command_claims.host_session_id")?;
+        let claimed_session = HostSessionId::new(decode_journal_u64(
+            "host_command_claims.host_session_id",
+            &encoded_session,
+        )?);
+        let claimed_envelope: String =
+            decode(claim, 1, "host_command_claims.envelope_postcard_hex")?;
+        let decoded_claim = decode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            &claimed_envelope,
+        )?;
+        let canonical_claim = encode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            &decoded_claim,
+        )?;
+        if decoded_claim.command_id != command_id || canonical_claim != claimed_envelope {
+            return Err(StorageError::InvalidData {
+                context: "host_command_claims.envelope_postcard_hex",
+                reason: format!(
+                    "command {command_id} claim is not its canonical envelope encoding"
+                ),
+            });
+        }
+        if let CommandAuthorityRequest::Submit {
+            envelope_postcard_hex,
+            ..
+        } = request
+            && claimed_envelope.as_str() != envelope_postcard_hex.as_str()
+        {
+            return Ok(CommandAuthorityLookup::Collision);
+        }
+
+        let terminal_rows = self.connection()?.query_with_params(
+            "SELECT command.journal_sequence, archive.payload_version,
+                    archive.payload_digest, length(CAST(archive.payload_json AS BLOB)),
+                    ledger.state
+             FROM host_command_records AS command
+             LEFT JOIN host_journal_archive AS archive
+               ON archive.run_id = command.run_id
+              AND archive.host_session_id = command.host_session_id
+              AND archive.journal_sequence = command.journal_sequence
+             LEFT JOIN host_journal_batch_ledger AS ledger
+               ON ledger.run_id = command.run_id
+              AND ledger.host_session_id = command.host_session_id
+              AND ledger.journal_sequence = command.journal_sequence
+             WHERE command.run_id = ?1 AND command.host_session_id = ?2
+               AND command.command_id = ?3
+             LIMIT 2",
+            &[
+                sqlite_run_id(self.run_id),
+                encoded_session.as_str().into(),
+                command_id_text.as_str().into(),
+            ],
+        )?;
+        if terminal_rows.is_empty() {
+            if matches!(request, CommandAuthorityRequest::Submit { .. })
+                && claimed_session == session_id
+            {
+                return Ok(CommandAuthorityLookup::Claimed);
+            }
+            return Ok(CommandAuthorityLookup::Failed(
+                CommandAuthorityLookupFailure::Pending,
+            ));
+        }
+        let [terminal] = terminal_rows.as_slice() else {
+            return Ok(CommandAuthorityLookup::Failed(
+                CommandAuthorityLookupFailure::Ambiguous {
+                    matches: terminal_rows.len(),
+                },
+            ));
+        };
+        let journal: String = decode(terminal, 0, "host_command_records.journal_sequence")?;
+        let journal_sequence =
+            decode_journal_u64("host_command_records.journal_sequence", &journal)?;
+        let payload_version: Option<i64> =
+            decode(terminal, 1, "host_journal_archive.payload_version")?;
+        let payload_digest: Option<String> =
+            decode(terminal, 2, "host_journal_archive.payload_digest")?;
+        let payload_bytes: Option<i64> =
+            decode(terminal, 3, "host_journal_archive.payload_json.length")?;
+        let ledger_state: Option<String> = decode(terminal, 4, "host_journal_batch_ledger.state")?;
+        let Some(payload_digest) = payload_digest else {
+            return Err(StorageError::InvalidData {
+                context: "host_command_claims.archive_binding",
+                reason: format!("command {command_id} has no canonical archive"),
+            });
+        };
+        if payload_version != Some(i64::from(HOST_JOURNAL_ARCHIVE_VERSION)) {
+            return Err(StorageError::InvalidData {
+                context: "host_command_claims.archive_binding",
+                reason: format!(
+                    "command {command_id} is not bound to archive v{HOST_JOURNAL_ARCHIVE_VERSION}"
+                ),
+            });
+        }
+        let state = ledger_state
+            .as_deref()
+            .map(HostJournalState::decode)
+            .transpose()?;
+        let expected_state = if self.file_backed() {
+            HostJournalState::Durable
+        } else {
+            HostJournalState::CommittedVolatile
+        };
+        if state != Some(expected_state) {
+            return Ok(CommandAuthorityLookup::Failed(
+                CommandAuthorityLookupFailure::Pending,
+            ));
+        }
+        let payload_bytes = usize::try_from(payload_bytes.ok_or(StorageError::InvalidData {
+            context: "host_command_claims.archive_binding",
+            reason: format!("command {command_id} has no archive byte length"),
+        })?)
+        .map_err(|error| StorageError::InvalidData {
+            context: "host_command_claims.archive_binding",
+            reason: error.to_string(),
+        })?;
+        let record = load_finished_command_journal_record(
+            self.connection()?,
+            self.run_id,
+            claimed_session,
+            journal_sequence,
+            command_id,
+            &payload_digest,
+            payload_bytes,
+            expected_state,
+        )?;
+        let canonical_envelope = encode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            record.lifecycle.envelope(),
+        )?;
+        if canonical_envelope != claimed_envelope {
+            return Err(StorageError::InvalidData {
+                context: "host_command_claims.envelope_postcard_hex",
+                reason: format!(
+                    "command {command_id} claim differs from its canonical terminal lifecycle"
+                ),
+            });
+        }
+        let terminal = record
+            .lifecycle
+            .terminal()
+            .ok_or(StorageError::InvalidData {
+                context: "host_command_claims.lifecycle",
+                reason: format!("command {command_id} has no terminal application state"),
+            })?;
+        let envelope_bytes =
+            postcard::to_allocvec(record.lifecycle.envelope()).map_err(|error| {
+                StorageError::InvalidData {
+                    context: "host_command_claims.envelope_postcard_hex",
+                    reason: error.to_string(),
+                }
+            })?;
+        let authority = JournaledCommandAuthority::try_new(
+            command_id,
+            *blake3::hash(&envelope_bytes).as_bytes(),
+            record.lifecycle.admission_sequence(),
+            terminal.application().clone(),
+            if self.file_backed() {
+                JournalState::Durable
+            } else {
+                JournalState::CommittedVolatile
+            },
+        )
+        .map_err(|error| StorageError::InvalidData {
+            context: "host_command_claims.lifecycle",
+            reason: error.to_string(),
+        })?;
+        Ok(CommandAuthorityLookup::Found(authority))
+    }
+
     fn admit_host_journal_archive(
         &self,
         batch: &JournalBatch,
@@ -12080,6 +12492,59 @@ impl Storage {
                     });
                 }
                 _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_command_claim(
+        transaction: &Transaction<'_>,
+        run_id: RunId,
+        projection: &PreparedCommandProjection,
+    ) -> Result<(), FrankenError> {
+        let command_id = projection.command_id().to_string();
+        let session = encode_journal_u64(projection.batch_id.session_id().get());
+        let rows = transaction.query_with_params(
+            "SELECT host_session_id, envelope_postcard_hex
+             FROM host_command_claims
+             WHERE run_id = ?1 AND command_id = ?2",
+            &[sqlite_run_id(run_id), command_id.as_str().into()],
+        )?;
+        match rows.as_slice() {
+            [] => {
+                let inserted = transaction.execute_with_params(
+                    "INSERT INTO host_command_claims (
+                        run_id, command_id, host_session_id, envelope_postcard_hex
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        sqlite_run_id(run_id),
+                        command_id.as_str().into(),
+                        session.as_str().into(),
+                        projection.envelope_postcard_hex.as_str().into(),
+                    ],
+                )?;
+                if inserted != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "terminal command claim inserted {inserted} rows"
+                    )));
+                }
+            }
+            [row] => {
+                let claimed_session: String = row.get_typed(0)?;
+                let claimed_envelope: String = row.get_typed(1)?;
+                if claimed_session != session
+                    || claimed_envelope.as_str() != projection.envelope_postcard_hex.as_str()
+                {
+                    return Err(FrankenError::Internal(format!(
+                        "terminal command {command_id} conflicts with its durable pre-admission claim"
+                    )));
+                }
+            }
+            _ => {
+                return Err(FrankenError::Internal(format!(
+                    "terminal command {command_id} has {} durable claims",
+                    rows.len()
+                )));
             }
         }
         Ok(())
@@ -12725,6 +13190,7 @@ impl Storage {
                     }
                 }
                 if let Some(projection) = command {
+                    Self::bind_command_claim(transaction, self.run_id, projection)?;
                     Self::insert_command_projection(transaction, self.run_id, projection)?;
                 }
             } else if let Some(projection) = command {
@@ -14517,6 +14983,12 @@ enum StorageCommand {
     JournalAdmit {
         batch: Arc<JournalBatch>,
     },
+    ResolveCommandAuthority {
+        session_id: HostSessionId,
+        command_id: CommandId,
+        request: CommandAuthorityRequest,
+        reply: xchan::Sender<CommandAuthorityLookup>,
+    },
     Flush {
         reply: xchan::Sender<Result<FlushReceipt, StorageWorkerError>>,
     },
@@ -14532,6 +15004,15 @@ enum StorageCommand {
     DropMetricsTable {
         reply: xchan::Sender<Result<(), String>>,
     },
+}
+
+#[derive(Debug)]
+enum CommandAuthorityRequest {
+    Submit {
+        envelope_postcard_hex: String,
+        policy: CommandClaimPolicy,
+    },
+    Status,
 }
 
 #[cfg(test)]
@@ -16403,6 +16884,26 @@ fn storage_worker(
                     state.journal_sessions.remove(&session_id);
                 }
             }
+            StorageCommand::ResolveCommandAuthority {
+                session_id,
+                command_id,
+                request,
+                reply,
+            } => {
+                let outcome = storage
+                    .resolve_command_authority(session_id, command_id, &request)
+                    .unwrap_or_else(|error| {
+                        let message = error.to_string().chars().take(4_096).collect::<String>();
+                        let failure = match error {
+                            StorageError::InvalidData { .. } | StorageError::NoEvidence { .. } => {
+                                CommandAuthorityLookupFailure::Corrupt { message }
+                            }
+                            _ => CommandAuthorityLookupFailure::Unavailable { message },
+                        };
+                        CommandAuthorityLookup::Failed(failure)
+                    });
+                let _ = reply.try_send(outcome);
+            }
             StorageCommand::JournalAdmit { batch } => {
                 let batch_id = batch.id();
                 let session_id = batch_id.session_id();
@@ -17623,8 +18124,9 @@ mod tests {
         rng_domains::AgentRngCountersV1,
     };
     use scriptbots_runtime::{
-        CommandId, CommandStatus, HostCore, HostCoreOptions, HostLifecycle, HostSessionId,
-        JournalState, LocalHostPort, ManualInstant, NullFrontend, PlaybackSnapshot,
+        CommandEnvelope, CommandId, CommandStatus, HostCommand, HostCore, HostCoreOptions,
+        HostLifecycle, HostSessionId, JournalState, LocalHostPort, ManualInstant, NullFrontend,
+        PlaybackSnapshot,
     };
     use std::{
         fs,
@@ -18690,6 +19192,7 @@ mod tests {
             "host_journal_progress",
             "host_domain_event_batches",
             "host_domain_events",
+            "host_command_claims",
             "host_command_records",
             "host_command_application_transitions",
             "host_command_storage_transitions",
@@ -19813,9 +20316,10 @@ mod tests {
                 "drop_external_content_narrative_search",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V12_VERSION,
                 "create_plain_content_narrative_search",
             ),
+            (SCRIPTBOTS_SCHEMA_VERSION, "add_durable_command_claims"),
         ];
         assert_eq!(migrations.len(), expected.len());
         for (row, (expected_version, expected_name)) in migrations.iter().zip(expected) {
@@ -19843,6 +20347,218 @@ mod tests {
             "idempotent install duplicated its ledger"
         );
         connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn production_recovery_migrates_an_exact_v12_database_before_enabling_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-v12-production-recovery");
+        let path_string = path.to_string_lossy().to_string();
+        let session_id = HostSessionId::new(0x512);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
+        let command = frontend.step()?;
+        let mut next_nanos = 0;
+        let terminal = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert_eq!(terminal.journal(), &JournalState::Durable);
+        drop_fault_host(pipeline, core, frontend);
+
+        let connection = Connection::open(&path_string)?;
+        let record = connection.query_row(
+            "SELECT run_id, command_id, host_session_id, envelope_postcard_hex
+             FROM host_command_records",
+        )?;
+        let expected_run_id: String = decode(&record, 0, "host_command_records.run_id")?;
+        let expected_command_id: String = decode(&record, 1, "host_command_records.command_id")?;
+        let expected_session_id: String =
+            decode(&record, 2, "host_command_records.host_session_id")?;
+        let expected_envelope: String =
+            decode(&record, 3, "host_command_records.envelope_postcard_hex")?;
+        connection.execute_batch(
+            "DROP TABLE host_command_claims;
+             DELETE FROM _schema_migrations WHERE version = 13;
+             PRAGMA user_version = 12;",
+        )?;
+        assert_eq!(
+            read_schema_objects(&connection)?,
+            canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?,
+            "downgrade fixture must be the exact supported V12 schema"
+        );
+        connection.close()?;
+
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        recovered.shutdown()?;
+
+        let connection = open_with_flags(&path_string, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Storage::validate_existing_scriptbots_database(&connection)?;
+        let version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        assert_eq!(version, SCRIPTBOTS_SCHEMA_VERSION);
+        let claim_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'host_command_claims'",
+            )?
+            .get_typed(0)?;
+        assert_eq!(claim_table, 1);
+        let claim = connection.query_row(
+            "SELECT run_id, command_id, host_session_id, envelope_postcard_hex
+             FROM host_command_claims",
+        )?;
+        assert_eq!(
+            decode::<String>(&claim, 0, "host_command_claims.run_id")?,
+            expected_run_id
+        );
+        assert_eq!(
+            decode::<String>(&claim, 1, "host_command_claims.command_id")?,
+            expected_command_id
+        );
+        assert_eq!(
+            decode::<String>(&claim, 2, "host_command_claims.host_session_id")?,
+            expected_session_id
+        );
+        assert_eq!(
+            decode::<String>(&claim, 3, "host_command_claims.envelope_postcard_hex")?,
+            expected_envelope
+        );
+        assert!(
+            connection.query("PRAGMA foreign_key_check")?.is_empty(),
+            "V13 command-claim backfill violated its run/session foreign keys"
+        );
+        connection.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn production_recovery_refuses_ambiguous_v12_command_claims_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-v12-ambiguous-command-claims");
+        let path_string = path.to_string_lossy().to_string();
+        let session_id = HostSessionId::new(0x513);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
+        let command = frontend.step()?;
+        let mut next_nanos = 0;
+        let terminal = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert_eq!(terminal.journal(), &JournalState::Durable);
+        drop_fault_host(pipeline, core, frontend);
+
+        let connection = Connection::open(&path_string)?;
+        connection.execute_batch(
+            "DROP TABLE host_command_claims;
+             DELETE FROM _schema_migrations WHERE version = 13;
+             PRAGMA user_version = 12;
+             PRAGMA foreign_keys = OFF;
+             INSERT INTO host_command_records
+             SELECT
+                 run_id, '0000000000000514', command_id,
+                 source_client_namespace, client_sequence, admission_sequence,
+                 lifecycle_schema_version, expected_control_revision,
+                 expected_scientific_revision, expected_config_revision,
+                 envelope_postcard_hex, command_payload_postcard_hex,
+                 journal_sequence, terminal_tick, terminal_control_revision,
+                 terminal_scientific_revision, terminal_config_revision,
+                 scientific_event_sequence, archive_payload_digest,
+                 application_transition_count
+             FROM host_command_records
+             LIMIT 1;",
+        )?;
+        assert_eq!(
+            read_schema_objects(&connection)?,
+            canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?,
+            "ambiguous fixture must remain the exact supported V12 schema"
+        );
+        connection.close()?;
+
+        assert_recovery_refused_without_database_mutation(
+            &path,
+            "refusing run-scoped command-claim migration",
+        )
+    }
+
+    #[test]
+    fn durable_command_claim_is_run_scoped_and_precedes_fresh_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Storage::unattributed_memory_with_thresholds(1, 1, 1, 1)?;
+        storage.register_host_journal_session(HostSessionId::new(11))?;
+        let command_id = CommandId::from_client_sequence(0x434c_4149_4d, 7);
+        let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+        let encoded = encode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            &envelope,
+        )?;
+        let submit = CommandAuthorityRequest::Submit {
+            envelope_postcard_hex: encoded.clone(),
+            policy: CommandClaimPolicy::ReserveIfAbsent,
+        };
+
+        assert_eq!(
+            storage.resolve_command_authority(HostSessionId::new(11), command_id, &submit)?,
+            CommandAuthorityLookup::Claimed,
+            "the first worker-serialized claimant alone proves absence"
+        );
+        let claim_count: i64 = storage
+            .connection()?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM host_command_claims
+                 WHERE run_id = ?1 AND command_id = ?2",
+                &[sqlite_run_id(storage.run_id), command_id.to_string().into()],
+            )?
+            .get_typed(0)?;
+        assert_eq!(claim_count, 1);
+        assert_eq!(
+            storage.resolve_command_authority(
+                HostSessionId::new(12),
+                command_id,
+                &CommandAuthorityRequest::Status,
+            )?,
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+            "a pre-terminal durable claim is indeterminate, never absent"
+        );
+        assert_eq!(
+            storage.resolve_command_authority(HostSessionId::new(12), command_id, &submit)?,
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+            "an exact concurrent duplicate cannot steal or duplicate the first claim"
+        );
+
+        let changed = CommandEnvelope::new(command_id, HostCommand::Pause);
+        let changed = CommandAuthorityRequest::Submit {
+            envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &changed,
+            )?,
+            policy: CommandClaimPolicy::ReserveIfAbsent,
+        };
+        assert_eq!(
+            storage.resolve_command_authority(HostSessionId::new(12), command_id, &changed)?,
+            CommandAuthorityLookup::Collision,
+            "a changed envelope collides while the original claim is still indeterminate"
+        );
+        storage.connection()?.execute_with_params(
+            "UPDATE host_command_claims
+             SET envelope_postcard_hex = '00'
+             WHERE run_id = ?1 AND command_id = ?2",
+            &[sqlite_run_id(storage.run_id), command_id.to_string().into()],
+        )?;
+        let error = storage
+            .validate_host_journal_invariants()
+            .expect_err("a noncanonical pending claim must fail recovery validation");
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "host_command_claims.envelope_postcard_hex",
+                ..
+            }
+        ));
+        storage.close()?;
         Ok(())
     }
 
@@ -20155,7 +20871,7 @@ mod tests {
 
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 7);
+        assert_eq!(migrations.len(), 8);
         for (index, (expected_version, expected_name)) in [
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
@@ -20175,9 +20891,10 @@ mod tests {
                 "drop_external_content_narrative_search",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V12_VERSION,
                 "create_plain_content_narrative_search",
             ),
+            (SCRIPTBOTS_SCHEMA_VERSION, "add_durable_command_claims"),
         ]
         .into_iter()
         .enumerate()
@@ -20730,6 +21447,7 @@ mod tests {
         )?;
         assert_recovery_refused_without_database_mutation(&future, migration_count_fragment)?;
 
+        let unsupported_v5 = "unsupported ScriptBots schema v5";
         let legacy = temp_db_path("storage-recovery-legacy-v5-lineage");
         let legacy_connection = Connection::open(legacy.to_string_lossy().as_ref())?;
         legacy_connection.execute(
@@ -20745,7 +21463,7 @@ mod tests {
              PRAGMA user_version = 5;",
         )?;
         legacy_connection.close()?;
-        assert_recovery_refused_without_database_mutation(&legacy, migration_count_fragment)?;
+        assert_recovery_refused_without_database_mutation(&legacy, unsupported_v5)?;
 
         let v6_only = temp_db_path("storage-recovery-v6-only-lineage");
         let v6_connection = Connection::open(v6_only.to_string_lossy().as_ref())?;
@@ -20757,7 +21475,10 @@ mod tests {
             )
             .run(&v6_connection)?;
         v6_connection.close()?;
-        assert_recovery_refused_without_database_mutation(&v6_only, migration_count_fragment)?;
+        assert_recovery_refused_without_database_mutation(
+            &v6_only,
+            "database contains no registered runs",
+        )?;
 
         // The FOURTH version-pinned literal in this one test, and the one that survived a sweep
         // for the other three: they said "through v9" and "exactly four", this said "ledger is
@@ -20768,9 +21489,7 @@ mod tests {
         add_schema_object(&mismatched_user_version, "PRAGMA user_version = 5")?;
         assert_recovery_refused_without_database_mutation(
             &mismatched_user_version,
-            &format!(
-                "migration ledger is v{SCRIPTBOTS_SCHEMA_VERSION}, but PRAGMA user_version is 5"
-            ),
+            unsupported_v5,
         )?;
         Ok(())
     }
@@ -20793,7 +21512,8 @@ mod tests {
                 (9, 'add_host_command_lifecycle_projection', 'forged'),
                 (10, 'add_replay_event_interaction_edges', 'forged'),
                 (11, 'drop_external_content_narrative_search', 'forged'),
-                (12, 'create_plain_content_narrative_search', 'forged');
+                (12, 'create_plain_content_narrative_search', 'forged'),
+                (13, 'add_durable_command_claims', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -20803,7 +21523,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 12;",
+             PRAGMA user_version = 13;",
         )?;
         connection.close()?;
 

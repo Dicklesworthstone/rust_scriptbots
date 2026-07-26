@@ -24,6 +24,7 @@ use std::{
     fmt,
     mem::size_of,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use thiserror::Error;
 
@@ -2795,6 +2796,151 @@ impl JournalReceipt {
     }
 }
 
+/// Validated journal authority for one previously persisted command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournaledCommandAuthority {
+    envelope_digest: [u8; blake3::OUT_LEN],
+    status: CommandStatus,
+}
+
+impl JournaledCommandAuthority {
+    /// Reconstruct authority from a canonical envelope digest and terminal lifecycle.
+    pub fn try_new(
+        command_id: CommandId,
+        envelope_digest: [u8; blake3::OUT_LEN],
+        admission_sequence: Option<AdmissionSequence>,
+        application: ApplicationState,
+        journal: JournalState,
+    ) -> Result<Self, StatusCombinationError> {
+        if matches!(application, ApplicationState::Admitted) {
+            return Err(StatusCombinationError::JournaledAuthorityNotTerminal);
+        }
+        if !matches!(
+            journal,
+            JournalState::CommittedVolatile | JournalState::Durable
+        ) {
+            return Err(StatusCombinationError::JournaledAuthorityNotCommitted);
+        }
+        let status = CommandStatus::try_new(command_id, admission_sequence, application, journal)?;
+        Ok(Self {
+            envelope_digest,
+            status,
+        })
+    }
+
+    /// BLAKE3 digest of the canonical postcard-encoded command envelope.
+    #[must_use]
+    pub const fn envelope_digest(&self) -> [u8; blake3::OUT_LEN] {
+        self.envelope_digest
+    }
+
+    /// Authoritative terminal status reconstructed from durable lifecycle evidence.
+    #[must_use]
+    pub const fn status(&self) -> &CommandStatus {
+        &self.status
+    }
+}
+
+/// Whether a cache-miss submit may reserve a previously absent command identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandClaimPolicy {
+    /// Atomically reserve an absent identity for the requesting host session.
+    ReserveIfAbsent,
+    /// Compare against existing authority without creating a new claim.
+    CompareOnly,
+}
+
+/// Long-window command-authority guarantee advertised by a journal adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandAuthorityMode {
+    /// The adapter intentionally provides only bounded process-local idempotency.
+    ProcessLocal,
+    /// Cache misses require a durable authority reader and fail closed without one.
+    DurableRequired,
+}
+
+/// Typed fail-closed reason a durable command-authority lookup could not decide.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CommandAuthorityLookupFailure {
+    /// The bounded worker accepted the lookup, but its result is not ready yet.
+    #[error("lookup is pending")]
+    Pending,
+    /// The lookup client's bounded request set has no free entry.
+    #[error("lookup capacity {capacity} is exhausted")]
+    Capacity {
+        /// Maximum concurrent lookup requests.
+        capacity: usize,
+    },
+    /// The canonical envelope exceeds the adapter's bounded claim payload.
+    #[error("encoded command envelope has {bytes} bytes, exceeding limit {limit}")]
+    Oversized {
+        /// Canonical encoded envelope size.
+        bytes: usize,
+        /// Adapter maximum.
+        limit: usize,
+    },
+    /// The storage command lane cannot accept the request at this boundary.
+    #[error("lookup worker is busy")]
+    Busy,
+    /// The storage worker, lookup lane, or database is unavailable.
+    #[error("lookup worker is unavailable: {message}")]
+    Unavailable {
+        /// Bounded actionable diagnostic.
+        message: String,
+    },
+    /// The worker did not answer before the configured monotonic deadline.
+    #[error("lookup timed out after {waited:?}")]
+    Timeout {
+        /// Exact configured wait before the nonblocking poll declared timeout.
+        waited: Duration,
+    },
+    /// More than one durable record claimed the same run-scoped command id.
+    #[error("lookup found {matches} durable records for one command id")]
+    Ambiguous {
+        /// Bounded match count; queries stop after proving ambiguity.
+        matches: usize,
+    },
+    /// Durable bytes or their normalized projection failed validation.
+    #[error("durable command authority is corrupt: {message}")]
+    Corrupt {
+        /// Bounded actionable validation diagnostic.
+        message: String,
+    },
+}
+
+/// Nonblocking result of consulting the canonical durable command authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandAuthorityLookup {
+    /// One validated durable lifecycle owns the command id.
+    Found(JournaledCommandAuthority),
+    /// A durable claim owns the id for a different canonical envelope.
+    Collision,
+    /// The requesting host session owns the exact durable pre-admission claim.
+    Claimed,
+    /// The worker proved the id absent without reserving it.
+    Absent,
+    /// No trustworthy yes/no answer is available at this boundary.
+    Failed(CommandAuthorityLookupFailure),
+}
+
+/// Cloneable nonblocking cache-miss bridge to durable command authority.
+///
+/// Implementations may enqueue a bounded query to a connection-owning worker, but neither method
+/// may wait for database I/O, worker progress, or a contended lock. Callers retry a `Pending`
+/// result at a later host boundary.
+pub trait CommandAuthorityReader: Send + Sync {
+    /// Resolve and, when absent, reserve one exact command identity before fresh admission.
+    fn resolve_for_submit(
+        &self,
+        envelope: &CommandEnvelope,
+        envelope_digest: [u8; blake3::OUT_LEN],
+        policy: CommandClaimPolicy,
+    ) -> CommandAuthorityLookup;
+
+    /// Resolve status without reserving an absent identity.
+    fn resolve_status(&self, command_id: CommandId) -> CommandAuthorityLookup;
+}
+
 /// Runtime-neutral, nonblocking adapter boundary for host journal work.
 ///
 /// Implementations may enqueue work for another owner, but these methods must
@@ -2814,6 +2960,22 @@ pub trait JournalPort {
     /// covers the requested records.
     fn event_reader(&self, _session_id: HostSessionId) -> Option<Arc<dyn EventJournalReader>> {
         None
+    }
+
+    /// Optional run-scoped authority for command ids evicted from bounded runtime caches.
+    fn command_authority_reader(
+        &self,
+        _session_id: HostSessionId,
+    ) -> Option<Arc<dyn CommandAuthorityReader>> {
+        None
+    }
+
+    /// Whether this adapter requires durable long-window authority on every cache miss.
+    fn command_authority_mode(&self) -> CommandAuthorityMode {
+        match self.shutdown_commit_requirement() {
+            ShutdownCommitRequirement::CommittedVolatile => CommandAuthorityMode::ProcessLocal,
+            ShutdownCommitRequirement::Durable => CommandAuthorityMode::DurableRequired,
+        }
     }
 
     /// Commitment threshold that gates ordered host shutdown.
@@ -3097,6 +3259,12 @@ pub enum StatusCombinationError {
     /// Validation, overload, and lifecycle rejection happen before admission.
     #[error("a pre-admission rejection cannot have an admission sequence")]
     PreAdmissionRejectionWasAdmitted,
+    /// Durable command authority cannot represent a command that is still awaiting application.
+    #[error("journaled command authority requires a terminal application state")]
+    JournaledAuthorityNotTerminal,
+    /// Durable command authority requires a settled committed journal state.
+    #[error("journaled command authority requires committed volatile or durable journal state")]
+    JournaledAuthorityNotCommitted,
 }
 
 #[derive(Deserialize)]
@@ -4170,6 +4338,14 @@ pub enum HostAccessError {
     CommandIdCollision {
         /// Reused id whose original payload remains authoritative.
         command_id: CommandId,
+    },
+    /// Durable authority could not prove whether a cache-miss id is reusable.
+    #[error("durable command authority lookup for {command_id} failed: {failure}")]
+    CommandAuthorityLookup {
+        /// Stable id whose authority remains undecided.
+        command_id: CommandId,
+        /// Typed fail-closed disposition.
+        failure: CommandAuthorityLookupFailure,
     },
     /// The bounded pre-admission evidence lane cannot accept another terminal status.
     #[error("command evidence backpressure at capacity {capacity}")]
