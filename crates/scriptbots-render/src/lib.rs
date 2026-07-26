@@ -12685,7 +12685,7 @@ impl PerfStats {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PlaybackMode {
     Live,
     Paused,
@@ -18008,6 +18008,134 @@ mod command_characterization_tests {
         );
     }
 
+    /// A live production GPUI session, driven by real keystrokes (bd-jw6f).
+    ///
+    /// The coverage map this exists to close found that 18 of 27 HUD shortcuts
+    /// were never driven by any test, and that most of the ones which WERE
+    /// driven appeared only in keybinding-registry checks — which prove a
+    /// binding is registered, not that pressing it changes anything. A control
+    /// that silently does nothing passes that kind of test. So this fixture
+    /// dispatches through the same window the user types into and reads state
+    /// back off the production view afterwards.
+    struct ShortcutFixture {
+        app: gpui::TestApp,
+        hud: gpui::WindowHandle<SimulationView>,
+        world: Arc<Mutex<WorldState>>,
+        submitted: Arc<Mutex<Vec<ControlCommand>>>,
+    }
+
+    impl ShortcutFixture {
+        fn install() -> Self {
+            Self::install_with_agents(0)
+        }
+
+        /// Install with `agents` seeded, for controls whose effect is world-side
+        /// (selection) rather than view-local.
+        fn install_with_agents(agents: usize) -> Self {
+            let world = command_characterization_world();
+            {
+                let mut guard = world.lock().expect("seed shortcut world");
+                for _ in 0..agents {
+                    guard
+                        .try_spawn_agent(AgentData::default())
+                        .expect("default agent is finite");
+                }
+            }
+            // Two separate logs: `pending` is what the driver would drain, while
+            // `submitted` retains every intent for assertions. Draining must not
+            // erase the evidence a test is about to read.
+            let pending: Arc<Mutex<Vec<ControlCommand>>> = Arc::new(Mutex::new(Vec::new()));
+            let submitted: Arc<Mutex<Vec<ControlCommand>>> = Arc::new(Mutex::new(Vec::new()));
+            let drain = Arc::clone(&pending);
+            let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
+                Arc::new(move || {
+                    let mut commands = drain.lock().expect("shortcut command queue");
+                    std::mem::take(&mut *commands)
+                });
+            let record = Arc::clone(&submitted);
+            let submit = Arc::clone(&pending);
+            let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+                Arc::new(move |command| {
+                    record
+                        .lock()
+                        .expect("shortcut submitted log")
+                        .push(command.clone());
+                    submit.lock().expect("shortcut command queue").push(command);
+                    true
+                });
+            let step_world = Arc::clone(&world);
+            let simulation_step: WorldStepDriver =
+                Arc::new(move || step_world.lock().expect("shortcut world lock").step());
+            let session = Arc::new(GuiSession::new(
+                Arc::clone(&world),
+                simulation_step,
+                AnalyticsSnapshotProvider::empty(),
+                command_drain,
+                command_submit,
+            ));
+            let mut app = gpui::TestApp::new();
+            let windows = app
+                .update(|app| session.install(app))
+                .expect("install production GPUI shortcut session");
+            // One production repaint, so the view is in the state a user would
+            // actually be typing at rather than a freshly constructed one.
+            force_production_repaint(&mut app, windows.hud);
+            Self {
+                app,
+                hud: windows.hud,
+                world,
+                submitted,
+            }
+        }
+
+        /// Every control intent the view has submitted so far.
+        fn submitted(&self) -> Vec<ControlCommand> {
+            self.submitted
+                .lock()
+                .expect("shortcut submitted log")
+                .clone()
+        }
+
+        /// How many agents the WORLD currently marks selected.
+        ///
+        /// Read from the world rather than from any view-local mirror: selection
+        /// is scientific state, and a control that only updated a renderer's copy
+        /// of it would look correct here while the simulation disagreed.
+        fn selected_agents(&self) -> usize {
+            self.world
+                .lock()
+                .expect("shortcut world lock")
+                .runtime()
+                .iter()
+                .filter(|(_, entry)| matches!(entry.selection, SelectionState::Selected))
+                .count()
+        }
+
+        /// Dispatch a keystroke into the production HUD window.
+        ///
+        /// Every caller passes a literal that also appears in its own assertion
+        /// message, so a parse failure is self-identifying without formatting the
+        /// input into a panic here.
+        fn press(&mut self, keystroke: &str) {
+            let parsed = Keystroke::parse(keystroke).expect("test shortcut literal must parse");
+            self.app.update(|app| {
+                app.update_window(self.hud.into(), |_, window, app| {
+                    window.dispatch_keystroke(parsed, app);
+                })
+                .expect("dispatch production HUD shortcut");
+            });
+        }
+
+        /// Read a field off the production view.
+        fn read<T>(&mut self, probe: impl Fn(&SimulationView) -> T) -> T {
+            let hud = self
+                .app
+                .update(|app| self.hud.root(app))
+                .expect("production HUD root");
+            self.app.read_entity(&hud, |view, _| probe(view))
+        }
+    }
+
     fn force_production_repaint(
         app: &mut gpui::TestApp,
         handle: gpui::WindowHandle<SimulationView>,
@@ -18019,6 +18147,158 @@ mod command_characterization_tests {
             })
             .expect("draw production GPUI test window");
         });
+    }
+
+    /// bd-jw6f, tier 3 and the panel/accessibility group: every view-local HUD
+    /// toggle must change the state it names, and must toggle BACK.
+    ///
+    /// Both halves matter. Asserting only that the first press flips something
+    /// would pass for a control that latches on and can never be undone — from
+    /// the user's side that is just as broken as a control that does nothing,
+    /// and it is the failure a "did the handler run" test cannot see either.
+    ///
+    /// Table-driven on purpose: the coverage map's finding was that these
+    /// controls share one defect class, so they should share one proof and a
+    /// newly added toggle should be one line to cover.
+    #[test]
+    fn every_view_local_hud_toggle_changes_the_state_it_names_and_toggles_back() {
+        let cases: [(&str, &str, fn(&SimulationView) -> bool); 9] = [
+            ("d", "ToggleAgentDraw", |view| view.controls.draw_agents),
+            ("f", "ToggleFoodOverlay", |view| view.controls.draw_food),
+            ("ctrl-shift-o", "ToggleAgentOutline", |view| {
+                view.controls.agent_outline
+            }),
+            ("shift-f", "ToggleDebugOverlay", |view| view.debug.enabled),
+            ("1", "ToggleStatsPanel", |view| view.hud.stats_open),
+            ("2", "ToggleHistoryPanel", |view| view.hud.history_open),
+            ("3", "TogglePerfPanel", |view| view.hud.perf_open),
+            (",", "ToggleSettings", |view| view.settings_panel.open),
+            ("n", "ToggleNarration", |view| {
+                view.accessibility.narration_enabled
+            }),
+        ];
+
+        for (keystroke, action, probe) in cases {
+            let mut fixture = ShortcutFixture::install();
+            let before = fixture.read(probe);
+
+            fixture.press(keystroke);
+            let after = fixture.read(probe);
+            assert_ne!(
+                before, after,
+                "{action}: pressing '{keystroke}' must change the state it names \
+                 (was {before}, still {after})"
+            );
+
+            fixture.press(keystroke);
+            assert_eq!(
+                fixture.read(probe),
+                before,
+                "{action}: '{keystroke}' must toggle, not latch"
+            );
+        }
+    }
+
+    /// Selection is SCIENTIFIC state, so both shortcuts are proven against the
+    /// world rather than any renderer-side mirror. A control that only updated
+    /// the renderer's copy would read as working here while the simulation
+    /// disagreed — and selection feeds the inspector, the follow camera, and the
+    /// brain panel, so a stale copy misattributes every number they show.
+    #[test]
+    fn select_all_and_clear_selection_submit_selection_intents() {
+        let mut fixture = ShortcutFixture::install_with_agents(3);
+        assert!(
+            fixture.submitted().is_empty(),
+            "the fixture must start with no submitted intents"
+        );
+
+        fixture.press("ctrl-a");
+        let after_select = fixture.submitted();
+        assert!(
+            after_select.iter().any(|command| matches!(
+                command,
+                ControlCommand::UpdateSelection(update)
+                    if update.state == SelectionState::Selected && !update.agent_ids.is_empty()
+            )),
+            "SelectAll: 'ctrl-a' must submit a selection intent naming agents, got {after_select:?}"
+        );
+
+        fixture.press("escape");
+        let after_clear = fixture.submitted();
+        assert!(
+            after_clear.len() > after_select.len(),
+            "ClearSelection: 'escape' must submit an intent of its own, not silently do nothing"
+        );
+        assert!(
+            after_clear
+                .iter()
+                .skip(after_select.len())
+                .any(|command| matches!(
+                    command,
+                    ControlCommand::UpdateSelection(update) if update.state == SelectionState::None
+                )),
+            "ClearSelection: 'escape' must submit a CLEARING selection intent, got {after_clear:?}"
+        );
+
+        // The routing contract bd-37m established: the renderer submits intent
+        // and never writes selection itself. A handler that reached into the
+        // world directly would pass the assertions above and still be wrong.
+        assert_eq!(
+            fixture.selected_agents(),
+            0,
+            "the GPUI handler must not mutate world selection before the intent is drained"
+        );
+    }
+
+    /// The brush lives behind a mutex on the shared inspector rather than on the
+    /// view, so it gets its own probe — but the same two-way proof.
+    #[test]
+    fn the_brush_shortcut_toggles_the_shared_inspector_state() {
+        let mut fixture = ShortcutFixture::install();
+        let brush =
+            |view: &SimulationView| view.inspector.lock().expect("inspector lock").brush_enabled;
+        let before = fixture.read(brush);
+        fixture.press("b");
+        assert_ne!(
+            before,
+            fixture.read(brush),
+            "ToggleBrush: 'b' must change inspector.brush_enabled"
+        );
+        fixture.press("b");
+        assert_eq!(
+            fixture.read(brush),
+            before,
+            "ToggleBrush: 'b' must toggle, not latch"
+        );
+    }
+
+    /// Follow mode is a tri-state rather than a boolean, so "it changed" is not
+    /// enough — the two follow shortcuts must reach DIFFERENT modes, or one of
+    /// them is silently the other.
+    #[test]
+    fn the_two_follow_shortcuts_select_distinct_follow_modes() {
+        let follow = |view: &SimulationView| view.controls.follow_mode;
+
+        let mut oldest = ShortcutFixture::install();
+        let initial = oldest.read(follow);
+        oldest.press("o");
+        let after_oldest = oldest.read(follow);
+        assert_ne!(
+            initial, after_oldest,
+            "FollowOldest: 'o' must change controls.follow_mode"
+        );
+
+        let mut selected = ShortcutFixture::install();
+        selected.press("shift-s");
+        let after_selected = selected.read(follow);
+        assert_ne!(
+            initial, after_selected,
+            "FollowSelected: 'shift-s' must change controls.follow_mode"
+        );
+        assert_ne!(
+            after_oldest, after_selected,
+            "'o' and 'shift-s' must select different follow modes, not the same one"
+        );
     }
 
     #[test]
