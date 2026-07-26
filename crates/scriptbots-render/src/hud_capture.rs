@@ -30,8 +30,13 @@ use scriptbots_core::{
 
 use crate::{
     AnalyticsSnapshotProvider, CameraSnapshot, ControlCommand, GuiSession, GuiViewRole,
-    HUD_RAIL_WIDTH, WorldStepDriver,
+    WorldStepDriver,
 };
+
+// Only the real-pixel rail-band assertions read this, and those are macOS-only for the
+// reason recorded at `REAL_PIXEL_CAPTURE_IS_MACOS_ONLY` (bd-h9ca).
+#[cfg(target_os = "macos")]
+use crate::HUD_RAIL_WIDTH;
 
 // GPUI's test window reports a fixed 2× device scale. `HeadlessAppContext::open_window`
 // accepts logical pixels, while `capture_screenshot` returns device pixels, so divide
@@ -245,6 +250,34 @@ fn capture_view_with_overrides_and_camera(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Why every real-pixel capture test in this module is `cfg(target_os = "macos")`
+    /// (bd-h9ca).
+    ///
+    /// GPUI supplies an offscreen renderer on macOS ONLY. `gpui_platform::
+    /// current_headless_renderer` is `Some(MetalHeadlessRenderer)` under
+    /// `cfg(target_os = "macos")` and `None` under `cfg(not(...))`, by upstream design.
+    /// With `None`, `Window::render_to_image` fails with "render_to_image not available:
+    /// no HeadlessRenderer configured" and NOTHING can be captured. That is not a
+    /// misconfiguration on our side — this module already passes
+    /// `current_headless_renderer` to `HeadlessAppContext::with_platform` correctly.
+    ///
+    /// Three tests here were missing this gate while three others already had it, so on
+    /// the Linux rch fleet — which is where every agent runs `cargo test -p
+    /// scriptbots-render` — the crate reported three permanent failures that belonged to
+    /// nobody. A gate that is red everywhere it runs teaches agents to ignore red, which
+    /// is the same instrument defect bd-c7pg was raised to P1 for, one level up.
+    ///
+    /// The gate is COMPILE-TIME on purpose. A runtime skip would let these report as
+    /// passing on a machine that never rendered a pixel, which is exactly the hollow
+    /// coverage this crate's tests exist to refuse. Compiled out, the test count tells
+    /// the truth: on Linux these do not exist, on macOS they run and must pass.
+    ///
+    /// This narrows rather than weakens the assertions — `target_os = "macos"` is
+    /// literally the condition upstream keys the renderer on, so the gate and the
+    /// capability are the same predicate. bd-c7pg established its determinism result on
+    /// aarch64-apple-darwin, which is precisely where these still run.
+    const REAL_PIXEL_CAPTURE_IS_MACOS_ONLY: () = ();
 
     /// Panel background of the history card (`render_history_chart`). Deliberately NOT
     /// the stats card's `0x0b1120`, which is also the root container background and so
@@ -767,6 +800,10 @@ mod tests {
     /// Exact equality is the only honest assertion. A tolerance here would be a
     /// threshold tuned to hide the very noise the bead is about, which is the same
     /// defect wearing a different hat.
+    ///
+    /// macOS-gated for the reason given at [`REAL_PIXEL_CAPTURE_IS_MACOS_ONLY`]
+    /// (bd-h9ca).
+    #[cfg(target_os = "macos")]
     #[test]
     fn captures_of_one_world_are_byte_identical_when_perf_is_pinned() {
         let (w, h) = (
@@ -1000,6 +1037,10 @@ mod tests {
     /// would pass trivially if the rail never drew, so the closed capture must show the
     /// rail band LOSING that chrome. One assertion cannot be satisfied vacuously while
     /// the other holds.
+    ///
+    /// macOS-gated for the reason given at [`REAL_PIXEL_CAPTURE_IS_MACOS_ONLY`]
+    /// (bd-h9ca).
+    #[cfg(target_os = "macos")]
     #[test]
     fn toggling_the_rail_changes_only_the_rail_column() {
         std::fs::create_dir_all(probe_dir()).expect("probe output directory");
@@ -1081,6 +1122,10 @@ mod tests {
     /// The pair of assertions is what makes this non-vacuous. Requiring the panel colour
     /// to be absent from the centre would pass trivially if the panel failed to render at
     /// all, so the same colour must also be PRESENT in the right-hand band.
+    ///
+    /// macOS-gated for the reason given at [`REAL_PIXEL_CAPTURE_IS_MACOS_ONLY`]
+    /// (bd-h9ca).
+    #[cfg(target_os = "macos")]
     #[test]
     fn docked_hud_never_covers_the_world_centre_at_either_viewport() {
         std::fs::create_dir_all(probe_dir()).expect("probe output directory");
