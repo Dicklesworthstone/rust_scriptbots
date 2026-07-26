@@ -4746,8 +4746,17 @@ pub const KNOB_RANGES: &[KnobRange] = &[
     // Climate.
     KnobRange::live("temperature_discomfort_rate", 0.0, 10.0),
     // Evolution.
-    KnobRange::live("mutation.primary", 0.0, 1.0),
-    KnobRange::live("mutation.secondary", 0.0, 10.0),
+    //
+    // bd-dorx: "mutation.primary" and "mutation.secondary" were removed here. No
+    // `ScriptBotsConfig` field can ever produce those paths -- the config carries
+    // `reproduction_mutation_scale`, `reproduction_meta_mutation_chance` and
+    // `reproduction_meta_mutation_scale`. The similarly named `mutation_primary` /
+    // `mutation_secondary` belong to an agent PROJECTION struct, and `mutation.primary.*` elsewhere
+    // in the tree is an ANALYTICS METRIC name, a different namespace entirely. Range validation
+    // looks a path up and silently skips it when absent, so these two were inert rather than
+    // harmful, which is exactly how they survived. `bd_dorx_knob_ranges_declare_no_unexpected_
+    // unpublished_path` now pins this table against the published surface so a replacement cannot
+    // reappear unnoticed.
     KnobRange::live("reproduction_energy_threshold", 0.0, 2.0),
     KnobRange::live("reproduction_energy_cost", 0.0, 2.0),
     // Population.
@@ -13806,6 +13815,7 @@ pub mod narrative {
     };
     use serde::{Deserialize, Serialize};
     use std::collections::VecDeque;
+    use thiserror::Error;
 
     /// What kind of thing happened.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -13930,6 +13940,151 @@ pub mod narrative {
         EVENT_RECORD_SCHEMA_VERSION
     }
 
+    /// Current schema version for the feeder-neutral narrative input contract.
+    pub const NARRATIVE_INPUT_V1_SCHEMA_VERSION: u32 = 1;
+
+    /// Exact per-tick input consumed by the production narrative detector.
+    ///
+    /// This deliberately contains less data than [`TickSummary`]. Persisted-run
+    /// replay must store these exact values rather than reconstructing them from
+    /// emitted [`EventRecord`] rows or from a second, almost-equivalent metrics
+    /// model.
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NarrativeInputV1 {
+        /// Version of this input contract.
+        pub schema_version: u32,
+        /// Completed simulation tick represented by this input.
+        pub tick: Tick,
+        /// Population at the completed boundary.
+        pub agent_count: u64,
+        /// Mean agent energy at the completed boundary.
+        pub average_energy: f32,
+        /// Spike hits completed during this tick.
+        pub spike_hits: u32,
+    }
+
+    impl NarrativeInputV1 {
+        /// Build and validate one version-1 input.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`NarrativeInputError::NonFinite`] when `average_energy` is
+        /// not finite.
+        pub fn new(
+            tick: Tick,
+            agent_count: u64,
+            average_energy: f32,
+            spike_hits: u32,
+        ) -> Result<Self, NarrativeInputError> {
+            let input = Self {
+                schema_version: NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                tick,
+                agent_count,
+                average_energy,
+                spike_hits,
+            };
+            input.validate()?;
+            Ok(input)
+        }
+
+        fn validate(self) -> Result<(), NarrativeInputError> {
+            if self.schema_version != NARRATIVE_INPUT_V1_SCHEMA_VERSION {
+                return Err(NarrativeInputError::UnsupportedSchema {
+                    tick: self.tick.0,
+                    expected: NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                    actual: self.schema_version,
+                });
+            }
+            if !self.average_energy.is_finite() {
+                return Err(NarrativeInputError::NonFinite {
+                    tick: self.tick.0,
+                    field: "average_energy",
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl TryFrom<&TickSummary> for NarrativeInputV1 {
+        type Error = NarrativeInputError;
+
+        fn try_from(summary: &TickSummary) -> Result<Self, Self::Error> {
+            let agent_count = u64::try_from(summary.agent_count).map_err(|_| {
+                NarrativeInputError::AgentCountOutOfRange {
+                    tick: summary.tick.0,
+                    value: summary.agent_count,
+                }
+            })?;
+            Self::new(
+                summary.tick,
+                agent_count,
+                summary.average_energy,
+                summary.spike_hits,
+            )
+        }
+    }
+
+    /// Typed refusal from the narrative input or replay boundary.
+    #[derive(Debug, Clone, PartialEq, Eq, Error)]
+    pub enum NarrativeInputError {
+        /// A persisted feeder used a contract version this build cannot interpret.
+        #[error("narrative input at tick {tick} uses schema {actual}, expected schema {expected}")]
+        UnsupportedSchema {
+            /// Tick carried by the rejected input.
+            tick: u64,
+            /// Version supported by this build.
+            expected: u32,
+            /// Version presented by the feeder.
+            actual: u32,
+        },
+        /// A detector input was not finite.
+        #[error("narrative input `{field}` is non-finite at tick {tick}")]
+        NonFinite {
+            /// Tick carried by the rejected input.
+            tick: u64,
+            /// Rejected field.
+            field: &'static str,
+        },
+        /// A platform-sized population could not be represented by the stable contract.
+        #[error("narrative agent count {value} at tick {tick} does not fit in u64")]
+        AgentCountOutOfRange {
+            /// Tick carried by the rejected input.
+            tick: u64,
+            /// Rejected platform-sized value.
+            value: usize,
+        },
+        /// A feeder repeated a tick.
+        #[error("narrative input repeats tick {tick}")]
+        DuplicateTick {
+            /// Repeated tick.
+            tick: u64,
+        },
+        /// A feeder moved backwards.
+        #[error("narrative input tick {current} is older than the preceding tick {previous}")]
+        OutOfOrder {
+            /// Previously accepted tick.
+            previous: u64,
+            /// Rejected tick.
+            current: u64,
+        },
+        /// A supposedly complete per-tick feeder skipped history.
+        #[error(
+            "narrative input has a gap after tick {previous}: expected {expected}, got {actual}"
+        )]
+        TickGap {
+            /// Last contiguous tick.
+            previous: u64,
+            /// Required next tick.
+            expected: u64,
+            /// Tick presented by the feeder.
+            actual: u64,
+        },
+        /// A bounded replay cannot operate without at least one history slot.
+        #[error("narrative replay history capacity must be at least 1")]
+        ZeroHistoryCapacity,
+    }
+
     /// Stable UID (agent/species/island) for narrative events.
     /// Never a slotmap key (slotmap keys are reused after death, corrupting ancestry).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -14050,8 +14205,221 @@ pub mod narrative {
         }
     }
 
+    /// Production cadence and bounds needed to replay narrative detection.
+    ///
+    /// This is deliberately a runtime policy, not a persisted wire type:
+    /// storage must bind a run to fixed-width, versioned configuration
+    /// metadata before constructing it. One replay covers one stable policy
+    /// revision; a mid-run policy transition must be segmented or refused by
+    /// the persisted feeder rather than silently applied.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct NarrativeReplayPolicyV1 {
+        /// Completed ticks between detector passes; zero disables detection.
+        pub interval: u32,
+        /// Maximum per-tick inputs retained for each detector pass.
+        pub history_capacity: usize,
+        /// Maximum narrative events retained by the output ring.
+        pub event_capacity: usize,
+    }
+
+    impl NarrativeReplayPolicyV1 {
+        /// Validate replay bounds.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`NarrativeInputError::ZeroHistoryCapacity`] when the
+        /// history ring cannot retain even one input.
+        pub const fn new(
+            interval: u32,
+            history_capacity: usize,
+            event_capacity: usize,
+        ) -> Result<Self, NarrativeInputError> {
+            if history_capacity == 0 {
+                return Err(NarrativeInputError::ZeroHistoryCapacity);
+            }
+            Ok(Self {
+                interval,
+                history_capacity,
+                event_capacity,
+            })
+        }
+
+        /// Copy the exact production narration settings from a world config.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`NarrativeInputError::ZeroHistoryCapacity`] for a config
+        /// that has not passed [`super::ScriptBotsConfig::validate`].
+        pub const fn from_config(
+            config: &super::ScriptBotsConfig,
+        ) -> Result<Self, NarrativeInputError> {
+            Self::new(
+                config.narrative_interval,
+                config.history_capacity,
+                config.narrative_capacity,
+            )
+        }
+    }
+
+    /// Feeder-neutral driver that reproduces production cadence and bounds.
+    ///
+    /// The live world owns its own [`TickSummary`] ring for other consumers.
+    /// Offline detection instead feeds this driver persisted
+    /// [`NarrativeInputV1`] values. Both routes call the same
+    /// [`RunNarrative::observe_inputs`] kernel.
+    #[derive(Debug, Clone)]
+    pub struct NarrativeReplay {
+        policy: NarrativeReplayPolicyV1,
+        history: VecDeque<NarrativeInputV1>,
+        narrative: RunNarrative,
+        last_tick: Option<u64>,
+        dropped_inputs: u64,
+    }
+
+    impl NarrativeReplay {
+        /// Construct an empty replay driver.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`NarrativeInputError::ZeroHistoryCapacity`] for an invalid
+        /// policy.
+        pub fn new(policy: NarrativeReplayPolicyV1) -> Result<Self, NarrativeInputError> {
+            let policy = NarrativeReplayPolicyV1::new(
+                policy.interval,
+                policy.history_capacity,
+                policy.event_capacity,
+            )?;
+            Ok(Self {
+                policy,
+                // Do not allocate an attacker-selected capacity up front. The
+                // ring grows only as validated inputs actually arrive.
+                history: VecDeque::new(),
+                narrative: RunNarrative::default(),
+                last_tick: None,
+                dropped_inputs: 0,
+            })
+        }
+
+        /// Feed one complete per-tick input.
+        ///
+        /// # Errors
+        ///
+        /// Refuses unsupported schemas, non-finite values, repeated or
+        /// decreasing ticks, and gaps in the supposedly complete input stream.
+        pub fn push(&mut self, input: NarrativeInputV1) -> Result<(), NarrativeInputError> {
+            input.validate()?;
+            if let Some(previous) = self.last_tick {
+                validate_tick_pair(previous, input.tick.0)?;
+            }
+
+            if self.history.len() >= self.policy.history_capacity {
+                self.history.pop_front();
+                self.dropped_inputs = self.dropped_inputs.saturating_add(1);
+            }
+            self.history.push_back(input);
+            self.last_tick = Some(input.tick.0);
+
+            if self.policy.interval != 0
+                && input.tick.0.is_multiple_of(u64::from(self.policy.interval))
+            {
+                self.narrative
+                    .observe_inputs(self.history.iter().copied(), self.policy.event_capacity)?;
+            }
+            Ok(())
+        }
+
+        /// Feed a complete ordered input stream.
+        ///
+        /// # Errors
+        ///
+        /// Returns the first typed input or continuity refusal.
+        pub fn extend<I>(&mut self, inputs: I) -> Result<(), NarrativeInputError>
+        where
+            I: IntoIterator<Item = NarrativeInputV1>,
+        {
+            // A storage page is one retry unit. Apply it to a bounded candidate
+            // so an invalid tail cannot commit a valid prefix and make the same
+            // page fail as a duplicate on retry.
+            let mut candidate = self.clone();
+            for input in inputs {
+                candidate.push(input)?;
+            }
+            *self = candidate;
+            Ok(())
+        }
+
+        /// Replay one complete ordered input stream from an empty state.
+        ///
+        /// # Errors
+        ///
+        /// Returns the first invalid policy, input, or continuity refusal.
+        pub fn from_inputs<I>(
+            policy: NarrativeReplayPolicyV1,
+            inputs: I,
+        ) -> Result<Self, NarrativeInputError>
+        where
+            I: IntoIterator<Item = NarrativeInputV1>,
+        {
+            let mut replay = Self::new(policy)?;
+            replay.extend(inputs)?;
+            Ok(replay)
+        }
+
+        /// Exact policy driving this replay.
+        #[must_use]
+        pub const fn policy(&self) -> NarrativeReplayPolicyV1 {
+            self.policy
+        }
+
+        /// Bounded input history currently retained, oldest first.
+        #[must_use]
+        pub const fn history(&self) -> &VecDeque<NarrativeInputV1> {
+            &self.history
+        }
+
+        /// Narrative events produced by the canonical kernel, oldest first.
+        #[must_use]
+        pub const fn events(&self) -> &VecDeque<EventRecord> {
+            self.narrative.events()
+        }
+
+        /// Total inputs discarded when the replay history ring wrapped.
+        #[must_use]
+        pub const fn dropped_inputs(&self) -> u64 {
+            self.dropped_inputs
+        }
+
+        /// Total output events discarded when the narrative ring wrapped.
+        #[must_use]
+        pub const fn dropped_events(&self) -> u64 {
+            self.narrative.dropped_events()
+        }
+
+        /// Last-emitted tick per event kind, in deterministic insertion order.
+        #[must_use]
+        pub fn emission_watermarks(&self) -> &[(EventKind, u64)] {
+            self.narrative.emission_watermarks()
+        }
+
+        /// Events awaiting the next mirrored persistence drain.
+        ///
+        /// Exact pending-state parity requires the caller to invoke
+        /// [`Self::drain_pending_persistence`] at the same boundaries as the
+        /// live persistence lane. Event and watermark parity do not depend on
+        /// those drains.
+        #[must_use]
+        pub fn pending_persistence(&self) -> &[EventRecord] {
+            self.narrative.pending_persistence()
+        }
+
+        /// Drain canonical events that have not yet crossed persistence.
+        pub fn drain_pending_persistence(&mut self) -> Vec<EventRecord> {
+            self.narrative.drain_pending_persistence()
+        }
+    }
+
     /// Bounded, deduplicated stream of a run's narrative events.
-    #[derive(Debug, Default)]
+    #[derive(Debug, Default, Clone)]
     pub struct RunNarrative {
         events: VecDeque<EventRecord>,
         pending_persistence: Vec<EventRecord>,
@@ -14073,6 +14441,18 @@ pub mod narrative {
         #[must_use]
         pub const fn events(&self) -> &VecDeque<EventRecord> {
             &self.events
+        }
+
+        /// Events accepted by the kernel but not yet drained for persistence.
+        #[must_use]
+        pub fn pending_persistence(&self) -> &[EventRecord] {
+            &self.pending_persistence
+        }
+
+        /// Last-emitted tick per event kind, in deterministic insertion order.
+        #[must_use]
+        pub fn emission_watermarks(&self) -> &[(EventKind, u64)] {
+            &self.last_emitted
         }
 
         /// Drain events that have not yet been written to persistence.
@@ -14100,36 +14480,68 @@ pub mod narrative {
             Ok(())
         }
 
-        /// Run the detectors over the tick history and append anything new.
-        // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit. The
-        // usize→f64 metric cast is pinned for deterministic series encoding.
-        #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-        pub fn observe<'a, I>(&mut self, history: I, capacity: usize)
+        /// Convert live tick summaries and run the canonical detector kernel.
+        ///
+        /// # Errors
+        ///
+        /// Returns the first typed input or continuity refusal.
+        pub fn observe<'a, I>(
+            &mut self,
+            history: I,
+            capacity: usize,
+        ) -> Result<(), NarrativeInputError>
         where
             I: Iterator<Item = &'a TickSummary>,
         {
-            let summaries: Vec<&TickSummary> = history.collect();
-            if summaries.len() < 8 || capacity == 0 {
-                return;
+            let inputs = history
+                .map(NarrativeInputV1::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            self.observe_inputs(inputs, capacity)
+        }
+
+        /// Run production detection over feeder-neutral narrative inputs.
+        ///
+        /// This is the sole event-generation kernel shared by the live
+        /// [`TickSummary`] feeder and persisted-run replay.
+        ///
+        /// # Errors
+        ///
+        /// Returns the first unsupported schema, non-finite value, duplicate,
+        /// out-of-order tick, or history gap.
+        // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit. The
+        // u64→f64 metric cast is pinned for deterministic series encoding.
+        #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+        pub fn observe_inputs<I>(
+            &mut self,
+            history: I,
+            capacity: usize,
+        ) -> Result<(), NarrativeInputError>
+        where
+            I: IntoIterator<Item = NarrativeInputV1>,
+        {
+            let inputs: Vec<NarrativeInputV1> = history.into_iter().collect();
+            validate_input_sequence(&inputs)?;
+            if inputs.len() < 8 || capacity == 0 {
+                return Ok(());
             }
 
-            let population: Vec<Sample> = summaries
+            let population: Vec<Sample> = inputs
                 .iter()
-                .map(|s| Sample::new(s.tick.0, s.agent_count as f64))
+                .map(|input| Sample::new(input.tick.0, input.agent_count as f64))
                 .collect();
-            let energy: Vec<Sample> = summaries
+            let energy: Vec<Sample> = inputs
                 .iter()
-                .map(|s| Sample::new(s.tick.0, f64::from(s.average_energy)))
+                .map(|input| Sample::new(input.tick.0, f64::from(input.average_energy)))
                 .collect();
-            let combat: Vec<Sample> = summaries
+            let combat: Vec<Sample> = inputs
                 .iter()
-                .map(|s| Sample::new(s.tick.0, f64::from(s.spike_hits)))
+                .map(|input| Sample::new(input.tick.0, f64::from(input.spike_hits)))
                 .collect();
 
             // A warmup longer than the ring would silently detect nothing, so
             // scale it to the available history rather than trusting a default
             // that assumes a long series.
-            let warmup = (summaries.len() / 4).clamp(4, 64);
+            let warmup = (inputs.len() / 4).clamp(4, 64);
             let params = CusumParams {
                 warmup,
                 ..CusumParams::default()
@@ -14213,6 +14625,7 @@ pub mod narrative {
                     self.push(record, capacity);
                 }
             }
+            Ok(())
         }
 
         /// Is this change big enough that a human would want to hear about it?
@@ -14302,6 +14715,34 @@ pub mod narrative {
             self.pending_persistence.push(record.clone());
             self.events.push_back(record);
         }
+    }
+
+    fn validate_input_sequence(inputs: &[NarrativeInputV1]) -> Result<(), NarrativeInputError> {
+        for input in inputs {
+            input.validate()?;
+        }
+        for pair in inputs.windows(2) {
+            validate_tick_pair(pair[0].tick.0, pair[1].tick.0)?;
+        }
+        Ok(())
+    }
+
+    fn validate_tick_pair(previous: u64, current: u64) -> Result<(), NarrativeInputError> {
+        if current == previous {
+            return Err(NarrativeInputError::DuplicateTick { tick: current });
+        }
+        if current < previous {
+            return Err(NarrativeInputError::OutOfOrder { previous, current });
+        }
+        let expected = previous.saturating_add(1);
+        if current != expected {
+            return Err(NarrativeInputError::TickGap {
+                previous,
+                expected,
+                actual: current,
+            });
+        }
+        Ok(())
     }
 
     const fn regime_word(regime: Regime) -> &'static str {
@@ -20455,8 +20896,20 @@ impl WorldState {
         if interval == 0 || !next_tick.0.is_multiple_of(u64::from(interval)) {
             return;
         }
-        self.narrative
-            .observe(self.history.iter(), self.config.narrative_capacity);
+        if let Err(error) = self
+            .narrative
+            .observe(self.history.iter(), self.config.narrative_capacity)
+        {
+            // Narration is observational and must not change simulation state,
+            // but a poisoned feeder must be visible instead of turning into an
+            // apparently quiet run.
+            diag_error!(
+                target: "scriptbots::narrative",
+                tick = next_tick.0,
+                %error,
+                "live narrative input refused"
+            );
+        }
     }
 
     /// Recently detected narrative events, oldest first.
@@ -29993,13 +30446,299 @@ mod tests {
     }
 
     #[test]
+    fn narrative_input_contract_is_exact_and_fails_closed() {
+        let summary = TickSummary {
+            tick: Tick(41),
+            agent_count: 27,
+            births: 2,
+            deaths: 1,
+            total_energy: 19.25,
+            average_energy: 0.7125,
+            average_health: 0.8,
+            max_age: 900,
+            spike_hits: 3,
+        };
+        let input =
+            narrative::NarrativeInputV1::try_from(&summary).expect("finite summary is supported");
+        assert_eq!(
+            input.schema_version,
+            narrative::NARRATIVE_INPUT_V1_SCHEMA_VERSION
+        );
+        assert_eq!(input.tick, summary.tick);
+        assert_eq!(input.agent_count, 27);
+        assert_eq!(
+            input.average_energy.to_bits(),
+            summary.average_energy.to_bits()
+        );
+        assert_eq!(input.spike_hits, summary.spike_hits);
+
+        let negative_zero = narrative::NarrativeInputV1::new(Tick(42), 0, -0.0, 0)
+            .expect("negative zero is finite");
+        let encoded = postcard::to_allocvec(&negative_zero).expect("encode narrative input");
+        let decoded: narrative::NarrativeInputV1 =
+            postcard::from_bytes(&encoded).expect("decode narrative input");
+        assert_eq!(
+            decoded.average_energy.to_bits(),
+            (-0.0f32).to_bits(),
+            "the wire contract must not normalize signed zero"
+        );
+        let mut with_unknown =
+            serde_json::to_value(input).expect("serialize self-describing narrative input");
+        with_unknown
+            .as_object_mut()
+            .expect("struct serializes as an object")
+            .insert("future_field".to_owned(), serde_json::json!(1));
+        assert!(
+            serde_json::from_value::<narrative::NarrativeInputV1>(with_unknown).is_err(),
+            "V1 must refuse unknown fields instead of silently accepting schema drift"
+        );
+
+        let unsupported = narrative::NarrativeInputV1 {
+            schema_version: narrative::NARRATIVE_INPUT_V1_SCHEMA_VERSION + 1,
+            ..input
+        };
+        assert!(matches!(
+            narrative::RunNarrative::default().observe_inputs([unsupported], 8),
+            Err(narrative::NarrativeInputError::UnsupportedSchema {
+                tick: 41,
+                expected: narrative::NARRATIVE_INPUT_V1_SCHEMA_VERSION,
+                actual,
+            }) if actual == narrative::NARRATIVE_INPUT_V1_SCHEMA_VERSION + 1
+        ));
+
+        let poisoned = narrative::NarrativeInputV1 {
+            tick: Tick(42),
+            average_energy: f32::NAN,
+            ..input
+        };
+        assert!(matches!(
+            narrative::RunNarrative::default().observe_inputs([poisoned], 8),
+            Err(narrative::NarrativeInputError::NonFinite {
+                tick: 42,
+                field: "average_energy",
+            })
+        ));
+        assert!(matches!(
+            narrative::NarrativeReplayPolicyV1::new(30, 0, 256),
+            Err(narrative::NarrativeInputError::ZeroHistoryCapacity)
+        ));
+    }
+
+    #[test]
+    fn narrative_input_continuity_refuses_duplicates_disorder_and_gaps() {
+        let input = |tick| {
+            narrative::NarrativeInputV1::new(Tick(tick), 10, 1.0, 0)
+                .expect("finite narrative input")
+        };
+        let error_for = |ticks: &[u64]| {
+            narrative::RunNarrative::default()
+                .observe_inputs(ticks.iter().copied().map(input), 8)
+                .expect_err("invalid continuity must be typed")
+        };
+
+        assert!(matches!(
+            error_for(&[8, 8]),
+            narrative::NarrativeInputError::DuplicateTick { tick: 8 }
+        ));
+        assert!(matches!(
+            error_for(&[8, 7]),
+            narrative::NarrativeInputError::OutOfOrder {
+                previous: 8,
+                current: 7,
+            }
+        ));
+        assert!(matches!(
+            error_for(&[8, 10]),
+            narrative::NarrativeInputError::TickGap {
+                previous: 8,
+                expected: 9,
+                actual: 10,
+            }
+        ));
+
+        let policy = narrative::NarrativeReplayPolicyV1::new(2, 4, 8).expect("valid replay policy");
+        let mut replay = narrative::NarrativeReplay::new(policy).expect("replay");
+        replay.push(input(8)).expect("first tick");
+        assert!(matches!(
+            replay.push(input(8)),
+            Err(narrative::NarrativeInputError::DuplicateTick { tick: 8 })
+        ));
+        replay
+            .push(input(9))
+            .expect("a rejected duplicate must not poison replay state");
+        assert_eq!(
+            replay
+                .history()
+                .iter()
+                .map(|row| row.tick.0)
+                .collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+
+        let before_history = replay.history().clone();
+        let before_events = replay.events().clone();
+        let before_watermarks = replay.emission_watermarks().to_vec();
+        let before_pending = replay.pending_persistence().to_vec();
+        assert!(matches!(
+            replay.extend([input(10), input(12)]),
+            Err(narrative::NarrativeInputError::TickGap {
+                previous: 10,
+                expected: 11,
+                actual: 12,
+            })
+        ));
+        assert_eq!(
+            replay.history(),
+            &before_history,
+            "invalid page tails must not commit a valid prefix"
+        );
+        assert_eq!(replay.events(), &before_events);
+        assert_eq!(replay.emission_watermarks(), before_watermarks);
+        assert_eq!(replay.pending_persistence(), before_pending);
+        replay
+            .extend([input(10), input(11)])
+            .expect("the same page boundary remains retryable");
+    }
+
+    #[test]
+    fn narrative_feeder_neutral_replay_matches_incremental_live_kernel_nonvacuously() {
+        let mut values = vec![1000usize; 96];
+        values.extend(std::iter::repeat_n(200usize, 96));
+        values.extend(std::iter::repeat_n(1000usize, 96));
+        let history = narrative_history(&values);
+        let policy =
+            narrative::NarrativeReplayPolicyV1::new(16, 128, 8).expect("valid replay policy");
+
+        let mut live_history = VecDeque::with_capacity(policy.history_capacity);
+        let mut live_narrative = narrative::RunNarrative::default();
+        for summary in &history {
+            if live_history.len() >= policy.history_capacity {
+                live_history.pop_front();
+            }
+            live_history.push_back(summary.clone());
+            if summary.tick.0.is_multiple_of(u64::from(policy.interval)) {
+                live_narrative
+                    .observe(live_history.iter(), policy.event_capacity)
+                    .expect("live history is contiguous");
+            }
+        }
+
+        let inputs = history
+            .iter()
+            .map(narrative::NarrativeInputV1::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("synthetic summaries are valid");
+        let mut replay =
+            narrative::NarrativeReplay::from_inputs(policy, inputs).expect("offline replay");
+
+        assert!(
+            !live_narrative.events().is_empty(),
+            "parity fixture must prove more than two empty outputs"
+        );
+        assert_eq!(live_narrative.events(), replay.events());
+        assert_eq!(live_narrative.dropped_events(), replay.dropped_events());
+        assert_eq!(
+            live_narrative.emission_watermarks(),
+            replay.emission_watermarks(),
+            "dedupe/cooldown state is part of exact replay"
+        );
+        assert_eq!(
+            live_narrative.pending_persistence(),
+            replay.pending_persistence(),
+            "pending parity holds before either feeder drains"
+        );
+        assert_eq!(
+            replay.dropped_inputs(),
+            u64::try_from(history.len() - policy.history_capacity).expect("fixture length")
+        );
+        assert_eq!(
+            replay
+                .history()
+                .front()
+                .expect("wrapped history has a first row")
+                .tick
+                .0,
+            u64::try_from(history.len() - policy.history_capacity + 1).expect("fixture tick")
+        );
+        assert_eq!(
+            replay
+                .history()
+                .back()
+                .expect("wrapped history has a last row")
+                .tick
+                .0,
+            u64::try_from(history.len()).expect("fixture tick")
+        );
+        assert_eq!(
+            live_narrative.drain_pending_persistence(),
+            replay.drain_pending_persistence()
+        );
+    }
+
+    #[test]
+    fn narrative_replay_handles_empty_partial_and_disabled_policies() {
+        let empty_policy = narrative::NarrativeReplayPolicyV1::new(8, 4, 8).expect("valid policy");
+        let empty = narrative::NarrativeReplay::from_inputs(empty_policy, [])
+            .expect("empty stream is valid");
+        assert!(empty.history().is_empty());
+        assert!(empty.events().is_empty());
+        assert!(empty.emission_watermarks().is_empty());
+        assert!(empty.pending_persistence().is_empty());
+
+        let input = |tick| {
+            narrative::NarrativeInputV1::new(Tick(tick), 100, 1.0, 0)
+                .expect("finite narrative input")
+        };
+        let partial = narrative::NarrativeReplay::from_inputs(
+            narrative::NarrativeReplayPolicyV1::new(1, 8, 8).expect("valid policy"),
+            (1..8).map(input),
+        )
+        .expect("sub-eight stream");
+        assert!(partial.events().is_empty());
+        assert!(partial.emission_watermarks().is_empty());
+
+        let disabled = narrative::NarrativeReplay::from_inputs(
+            narrative::NarrativeReplayPolicyV1::new(0, 3, 8).expect("valid policy"),
+            (1..=5).map(input),
+        )
+        .expect("disabled detector still validates and bounds input");
+        assert_eq!(disabled.dropped_inputs(), 2);
+        assert_eq!(
+            disabled
+                .history()
+                .iter()
+                .map(|row| row.tick.0)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert!(disabled.events().is_empty());
+
+        let mut output_disabled_values = vec![1000usize; 64];
+        output_disabled_values.extend(std::iter::repeat_n(200usize, 64));
+        let output_disabled_inputs = narrative_history(&output_disabled_values)
+            .iter()
+            .map(narrative::NarrativeInputV1::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid disabled-output inputs");
+        let output_disabled = narrative::NarrativeReplay::from_inputs(
+            narrative::NarrativeReplayPolicyV1::new(1, 256, 0).expect("valid policy"),
+            output_disabled_inputs,
+        )
+        .expect("zero output capacity is a supported disabled policy");
+        assert!(output_disabled.events().is_empty());
+        assert!(output_disabled.emission_watermarks().is_empty());
+    }
+
+    #[test]
     fn narrative_detects_a_crash_and_names_it_in_deterministic_prose() {
         let mut values = vec![1000usize; 120];
         values.extend(std::iter::repeat_n(300usize, 120));
         let history = narrative_history(&values);
 
         let mut narrative = narrative::RunNarrative::default();
-        narrative.observe(history.iter(), 256);
+        narrative
+            .observe(history.iter(), 256)
+            .expect("valid contiguous history");
 
         let crash = narrative
             .events()
@@ -30028,7 +30767,9 @@ mod tests {
 
         let mut narrative = narrative::RunNarrative::default();
         assert_eq!(narrative.dropped_events(), 0);
-        narrative.observe(history.iter(), 3);
+        narrative
+            .observe(history.iter(), 3)
+            .expect("valid contiguous history");
 
         assert!(
             narrative.events().len() <= 3,
@@ -30088,7 +30829,9 @@ mod tests {
 
         let mut narrative = narrative::RunNarrative::default();
         for _ in 0..10 {
-            narrative.observe(history.iter(), 256);
+            narrative
+                .observe(history.iter(), 256)
+                .expect("valid contiguous history");
         }
         let crashes = narrative
             .events()
@@ -30130,7 +30873,9 @@ mod tests {
         let history = narrative_history(&values);
 
         let mut narrative = narrative::RunNarrative::default();
-        narrative.observe(history.iter(), 256);
+        narrative
+            .observe(history.iter(), 256)
+            .expect("valid contiguous history");
         assert!(
             narrative.events().is_empty(),
             "losing one agent out of 23 is not news: {:?}",
@@ -30142,7 +30887,9 @@ mod tests {
         values.extend(std::iter::repeat_n(3usize, 120));
         let history = narrative_history(&values);
         let mut narrative = narrative::RunNarrative::default();
-        narrative.observe(history.iter(), 256);
+        narrative
+            .observe(history.iter(), 256)
+            .expect("valid contiguous history");
         assert!(
             narrative
                 .events()
@@ -30156,7 +30903,9 @@ mod tests {
     fn narrative_is_quiet_on_a_flat_run() {
         let history = narrative_history(&[500usize; 200]);
         let mut narrative = narrative::RunNarrative::default();
-        narrative.observe(history.iter(), 256);
+        narrative
+            .observe(history.iter(), 256)
+            .expect("valid contiguous history");
         assert!(
             narrative.events().is_empty(),
             "a flat run has no story: {:?}",
@@ -30179,7 +30928,9 @@ mod tests {
                     s
                 })
                 .collect();
-            narrative.observe(history.iter(), 4);
+            narrative
+                .observe(history.iter(), 4)
+                .expect("valid contiguous history");
         }
         assert!(
             narrative.events().len() <= 4,
@@ -30249,6 +31000,74 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(run(), run(), "same seed must yield the same story");
+    }
+
+    #[test]
+    fn production_world_narrative_matches_feeder_neutral_replay() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            closed: true,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            reproduction_energy_threshold: f32::MAX,
+            rng_seed: Some(0x16_020_901),
+            ..ScriptBotsConfig::default()
+        };
+        let policy = narrative::NarrativeReplayPolicyV1::from_config(&config)
+            .expect("validated production policy");
+        let mut world = WorldState::new(config).expect("world");
+        for seed in 0..12 {
+            let mut agent = sample_agent(seed);
+            agent.health = 2.0;
+            world.spawn_agent(agent);
+        }
+
+        let mut inputs = Vec::new();
+        for _ in 0..96 {
+            let completion = world.step_outcome().expect("production step");
+            inputs.push(
+                narrative::NarrativeInputV1::try_from(&completion.outcome.summary)
+                    .expect("production summary is a valid narrative input"),
+            );
+        }
+        world
+            .enqueue_intervention(Intervention::Meteor {
+                region: Region::All,
+                lethality: 10.0,
+                scorch: 0.0,
+            })
+            .expect("deterministic extinction intervention");
+        for _ in 96..240 {
+            let completion = world.step_outcome().expect("production step");
+            inputs.push(
+                narrative::NarrativeInputV1::try_from(&completion.outcome.summary)
+                    .expect("production summary is a valid narrative input"),
+            );
+        }
+        let replay =
+            narrative::NarrativeReplay::from_inputs(policy, inputs).expect("canonical replay");
+
+        assert!(
+            !world.narrative_events().is_empty(),
+            "production parity fixture must exercise at least one emitted event"
+        );
+        assert_eq!(
+            world.narrative_events(),
+            replay.events(),
+            "live WorldState and feeder-neutral replay must emit identical complete records"
+        );
+        assert_eq!(
+            world.narrative_dropped_events(),
+            replay.dropped_events(),
+            "live and replay output rings must truncate identically"
+        );
     }
 
     #[test]
@@ -31307,10 +32126,15 @@ mod tests {
         // food_growth_rate = 1e9 sailed through from REST, from MCP, and
         // therefore from any agent driving them. The "a confused model can only
         // request what a human could" safety argument was simply not true.
+        // bd-dorx: the third entry was "mutation.primary", which this test relied on to produce a
+        // violation. That path is not one any ScriptBotsConfig can emit -- its KNOB_RANGES entry
+        // was stale and has been removed -- so the case was checking a range against a knob that
+        // could never be set. Swapped for a real published knob, preserving the "three distinct
+        // knobs violate at once" shape this test is actually about.
         let absurd = vec![
             ("food_growth_rate".to_owned(), 1e9),
             ("metabolism_drain".to_owned(), 50.0),
-            ("mutation.primary".to_owned(), 4.0),
+            ("reproduction_energy_threshold".to_owned(), 99.0),
         ];
         let violations = check_knob_ranges(&absurd);
         assert_eq!(
