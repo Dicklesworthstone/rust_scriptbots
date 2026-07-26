@@ -18250,6 +18250,74 @@ mod command_characterization_tests {
         );
     }
 
+    /// CyclePalette was "driven but not state-proven". The accessibility palette
+    /// is a five-way cycle, so proving it means more than "it changed": pressing
+    /// it five times must return to where it started, which a control that
+    /// advanced by two — or that saturated at the last entry — would fail.
+    #[test]
+    fn cycling_the_palette_advances_and_returns_to_where_it_started() {
+        let mut fixture = ShortcutFixture::install();
+        let palette = |view: &SimulationView| view.accessibility.palette;
+
+        let start = fixture.read(palette);
+        fixture.press("ctrl-p");
+        assert_ne!(
+            start,
+            fixture.read(palette),
+            "CyclePalette: 'ctrl-p' must advance the accessibility palette"
+        );
+
+        // Four more presses complete the five-entry cycle.
+        for _ in 0..4 {
+            fixture.press("ctrl-p");
+        }
+        assert_eq!(
+            fixture.read(palette),
+            start,
+            "CyclePalette must cycle through all five palettes and wrap, not saturate"
+        );
+    }
+
+    /// FitWorld was "driven but not state-proven". Proven by moving the camera
+    /// away first: asserting the post-press state alone would pass trivially if
+    /// the camera happened to already be fitted, which is exactly the vacuous
+    /// coverage this bead exists to replace.
+    #[test]
+    fn fit_world_returns_a_panned_camera_to_the_fitted_view() {
+        let mut fixture = ShortcutFixture::install();
+
+        // fit_world is a no-op until a render has recorded a base scale, so an
+        // unrecorded camera would make this test assert against the guard.
+        let fitted = fixture.read(|view| {
+            let camera = view.camera.lock().expect("camera lock");
+            (camera.zoom(), camera.offset())
+        });
+
+        fixture.read(|view| {
+            let mut camera = view.camera.lock().expect("camera lock");
+            camera.start_pan(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+            camera.update_pan(gpui::point(gpui::px(64.0), gpui::px(48.0)));
+            camera.end_pan();
+        });
+        let panned = fixture.read(|view| view.camera.lock().expect("camera lock").offset());
+        assert_ne!(
+            panned, fitted.1,
+            "fixture precondition: the camera must actually be off-centre before '0'"
+        );
+
+        fixture.press("0");
+        let after = fixture.read(|view| {
+            let camera = view.camera.lock().expect("camera lock");
+            (camera.zoom(), camera.offset())
+        });
+        assert_eq!(
+            after.1,
+            (0.0, 0.0),
+            "FitWorld: '0' must recentre the camera, got offset {:?}",
+            after.1
+        );
+    }
+
     /// The brush lives behind a mutex on the shared inspector rather than on the
     /// view, so it gets its own probe — but the same two-way proof.
     #[test]
