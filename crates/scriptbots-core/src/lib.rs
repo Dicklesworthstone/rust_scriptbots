@@ -42602,68 +42602,12 @@ mod tests {
                         }
                     }
                 }
-                if matches!(fault, LedgerFault::DropCombatPosting) {
-                    // bd-16g.11.2: stage a REAL spike hit. Combat is posted as a DERIVED delta
-                    // (`record_resource_change(Combat, before)` around `stage_combat`), so when
-                    // combat moves nothing the posted flow is zero -- and suppressing a zero
-                    // posting is a no-op. That is why this fault never turned the gate red:
-                    // `Combat`'s row in `KIND_TO_FAULTS` was nominal coverage, not real coverage.
-                    //
-                    // Combat was in fact unreachable by construction here. `stage_combat` gates on
-                    // `spike_lengths[idx] > 0.5`, default spike length is 0, and actuation only
-                    // walks it toward the commanded target at `spike_growth_rate` (0.005/tick), so
-                    // it cannot cross that floor inside the 64-tick window no matter what any
-                    // brain commands. Seeding 5.0 clears the floor and holds: the same 0.005/tick
-                    // walk needs ~900 ticks to decay back down.
-                    //
-                    // The commanded spike must come from a BRAIN, not from a write to `outputs`.
-                    // `stage_brains` runs before `stage_combat` and writes back unconditionally for
-                    // every agent, bound or not (an unbound one receives `default_outputs(sensors)`),
-                    // so a value staged into `outputs` between ticks is gone before combat reads it.
-                    // `LedgerAggressorBrain` commands `SpikeTarget = 1.0` every tick, which is how
-                    // `resource_ledger_attributes_ecology_combat_and_interventions` earns its
-                    // asserted non-zero `Combat` attribution.
-                    let handles: Vec<AgentId> = world.agents().iter_handles().collect();
-                    if handles.len() >= 2 {
-                        let attacker = handles[0];
-                        let victim = handles[1];
-                        // Drop the eligibility and aiming thresholds so the hit does not depend on
-                        // where the fixture's agents happen to have drifted.
-                        world.config.spike_min_length = 0.0;
-                        world.config.spike_alignment_cosine = 0.0;
-                        let aggressor = world
-                            .brain_registry_mut()
-                            .expect("combat fault registry mutation")
-                            .register("test.economy-fault-aggressor", |_rng| {
-                                Ok(Box::new(LedgerAggressorBrain))
-                            });
-                        assert!(
-                            world
-                                .bind_agent_brain(attacker, aggressor)
-                                .expect("combat fault aggressor brain"),
-                            "attacker must accept the aggressor brain"
-                        );
-                        let attacker_idx = world.agents.index_of(attacker).expect("attacker index");
-                        let victim_idx = world.agents.index_of(victim).expect("victim index");
-                        let columns = world.agents.columns_mut();
-                        // Victim directly ahead of the attacker and well inside
-                        // reach = spike_radius + spike_length.
-                        columns.positions_mut()[attacker_idx] = Position::new(40.0, 60.0);
-                        columns.positions_mut()[victim_idx] = Position::new(45.0, 60.0);
-                        columns.headings_mut()[attacker_idx] = 0.0;
-                        // Above both the 0.5 eligibility floor and spike_min_length.
-                        columns.spike_lengths_mut()[attacker_idx] = 5.0;
-                        // Something for the spike to actually take.
-                        columns.health_mut()[victim_idx] = 2.0;
-                        if let Some(runtime) = world.runtime.get_mut(attacker) {
-                            runtime.herbivore_tendency = 0.0;
-                            runtime.energy = 1.5;
-                        }
-                        if let Some(runtime) = world.runtime.get_mut(victim) {
-                            runtime.herbivore_tendency = 1.0;
-                        }
-                    }
-                }
+                // bd-16g.11.2 / bd-e6ff: a DropCombatPosting setup arm belongs here and is
+                // deliberately absent. Making Combat reachable HANGS this test -- see the revert
+                // rationale in dfaca98aa448 and the bead. Do not re-add one without first
+                // resolving that hang; the diagnosis (spike_lengths > 0.5 floor, and the fact that
+                // the commanded spike must come from a bound brain because stage_brains overwrites
+                // runtime.outputs before stage_combat reads them) is recorded on bd-16g.11.2.
                 if matches!(fault, LedgerFault::SkipDeathResidue) {
                     let agent = world.agents().iter_handles().next();
                     if let Some(agent) = agent {
