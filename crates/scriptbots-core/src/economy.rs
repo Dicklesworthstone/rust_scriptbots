@@ -577,6 +577,56 @@ pub struct ConservationVerdict {
     /// Set when the harness was run with a debugging tolerance override; a CI
     /// job must never produce artifacts with this set.
     pub tolerance_overridden: bool,
+    /// The exact tolerances this verdict was judged against (bd-16g.11.2).
+    ///
+    /// Recorded rather than left implicit so that LOOSENING A TOLERANCE IS A
+    /// VISIBLE DIFF IN THE ARTIFACT. A retained artifact that only says "pass"
+    /// cannot distinguish a healthy economy from a bar that was quietly lowered,
+    /// and the bead is explicit that a `--tolerance` flag a frustrated engineer
+    /// passes forever is the failure mode to prevent.
+    pub tolerances: ConservationTolerances,
+    /// Digest of the configuration the run was built from, when the caller knows
+    /// it. `None` for in-process gate use where the config is the fixture itself.
+    ///
+    /// The artifact is retained so a red CI run is diagnosable WITHOUT reproducing
+    /// it locally, and a residual series is not diagnosable without knowing which
+    /// world produced it.
+    pub config_digest: Option<String>,
+}
+
+/// The tolerance pair a [`ConservationVerdict`] was judged against.
+///
+/// These mirror the constants rather than shadowing them: the constants remain the
+/// single source of truth, and this type exists so the values TRAVEL WITH THE
+/// ARTIFACT. Both are relative bounds, scaled per stock by that stock's gross flow.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ConservationTolerances {
+    /// Per-tick relative bound; see [`EPOCH_RESIDUAL_RELATIVE_TOLERANCE`].
+    pub per_tick_relative: f64,
+    /// Cumulative relative bound; see [`CUMULATIVE_RESIDUAL_RELATIVE_TOLERANCE`].
+    pub cumulative_relative: f64,
+}
+
+impl Default for ConservationTolerances {
+    fn default() -> Self {
+        Self {
+            per_tick_relative: EPOCH_RESIDUAL_RELATIVE_TOLERANCE,
+            cumulative_relative: CUMULATIVE_RESIDUAL_RELATIVE_TOLERANCE,
+        }
+    }
+}
+
+impl ConservationVerdict {
+    /// Attach the digest of the configuration this verdict describes.
+    ///
+    /// Deliberately a builder rather than a parameter on [`evaluate_conservation`]:
+    /// the in-process gate callers do not have a digest to give, and widening that
+    /// signature would force every one of them to pass `None`.
+    #[must_use]
+    pub fn with_config_digest(mut self, digest: impl Into<String>) -> Self {
+        self.config_digest = Some(digest.into());
+        self
+    }
 }
 
 /// Relative bound for the cumulative criterion (bd-16g.11.2): catches a tiny
@@ -631,6 +681,8 @@ pub fn evaluate_conservation(seeds: &[SeedVerdict]) -> ConservationVerdict {
         pass: failures.is_empty(),
         failures,
         tolerance_overridden: false,
+        tolerances: ConservationTolerances::default(),
+        config_digest: None,
     }
 }
 
@@ -1567,5 +1619,67 @@ mod tests {
         assert!(json_epoch.contains(&epoch.epoch.to_string()));
         assert!(json_sankey.contains("External Sources"));
         assert!(json_table.contains("herbivore"));
+    }
+
+    /// The retained artifact must carry the bar it was judged against (bd-16g.11.2).
+    ///
+    /// This is the anti-quiet-loosening check. A verdict that records only `pass`
+    /// cannot distinguish a healthy economy from a tolerance someone lowered to get
+    /// CI green, and the bead is explicit that the danger is a `--tolerance` flag
+    /// passed forever rather than a reviewable diff. Asserting the artifact carries
+    /// the exact constants means loosening one shows up in the artifact, not just in
+    /// a source diff nobody re-reads.
+    #[test]
+    fn bd_16g_11_2_the_verdict_records_the_tolerances_it_was_judged_against() {
+        let verdict = evaluate_conservation(&[]);
+        assert_eq!(
+            verdict.tolerances.per_tick_relative, EPOCH_RESIDUAL_RELATIVE_TOLERANCE,
+            "the artifact must carry the per-tick bound actually applied"
+        );
+        assert_eq!(
+            verdict.tolerances.cumulative_relative, CUMULATIVE_RESIDUAL_RELATIVE_TOLERANCE,
+            "the artifact must carry the cumulative bound actually applied"
+        );
+        assert!(
+            !verdict.tolerance_overridden,
+            "a default evaluation is not an overridden one"
+        );
+        let json = serde_json::to_string(&verdict).expect("verdict serializes");
+        assert!(
+            json.contains("tolerances"),
+            "tolerances must survive serialization or the artifact cannot show them"
+        );
+    }
+
+    /// The verdict JSON must be byte-identical for identical inputs (bd-16g.11.2).
+    ///
+    /// The bead's reasoning is operational rather than aesthetic: "if the gate is
+    /// flaky, it will be disabled within a month, and then the economy is unguarded
+    /// again". A verdict that serializes differently run-to-run makes artifact diffing
+    /// useless, which is the first step toward the gate being ignored.
+    #[test]
+    fn bd_16g_11_2_verdict_json_is_byte_identical_for_identical_inputs() {
+        let first = serde_json::to_string(&evaluate_conservation(&[])).expect("first");
+        let second = serde_json::to_string(&evaluate_conservation(&[])).expect("second");
+        assert_eq!(
+            first, second,
+            "identical inputs must produce identical bytes"
+        );
+
+        let tagged = evaluate_conservation(&[]).with_config_digest("blake3:deadbeef");
+        let tagged_json = serde_json::to_string(&tagged).expect("tagged");
+        assert_eq!(
+            tagged.config_digest.as_deref(),
+            Some("blake3:deadbeef"),
+            "the digest builder must attach the digest it was given"
+        );
+        assert!(
+            tagged_json.contains("blake3:deadbeef"),
+            "a retained artifact is not diagnosable without knowing which world produced it"
+        );
+        assert_ne!(
+            tagged_json, first,
+            "attaching a digest must change the artifact, or it is not being recorded"
+        );
     }
 }
