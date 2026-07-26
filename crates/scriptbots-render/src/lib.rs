@@ -36,7 +36,7 @@ use scriptbots_core::{
     SelectedBrainTelemetryOutcome, SelectionMode, SelectionState, SelectionUpdate,
     SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile,
     TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver, apply_control_command,
-    tier_features,
+    tier_features, toroidal_delta,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
@@ -1981,17 +1981,6 @@ mod wgpu_paint_diagnostic_tests {
     }
 }
 
-fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
-    let mut delta = target - origin;
-    let half = extent * 0.5;
-    if delta > half {
-        delta -= extent;
-    } else if delta < -half {
-        delta += extent;
-    }
-    delta
-}
-
 fn env_flag(name: &str) -> bool {
     match std::env::var(name) {
         Ok(value) => {
@@ -2908,8 +2897,12 @@ impl SimulationView {
 
         for (idx, agent_id) in arena.iter_handles().enumerate() {
             let pos = positions[idx];
-            let dx = toroidal_delta(point.0, pos.x, extent_x);
-            let dy = toroidal_delta(point.1, pos.y, extent_y);
+            // Argument order swapped versus the removed private copy: that
+            // computed target - origin, core computes a - b. Both feed dist_sq
+            // below, so the sign is unused, but the swap keeps the value
+            // identical rather than relying on that (bd-ikts.4).
+            let dx = toroidal_delta(pos.x, point.0, extent_x);
+            let dy = toroidal_delta(pos.y, point.1, extent_y);
             let dist_sq = dx.mul_add(dx, dy * dy);
             if dist_sq <= radius_sq && best.is_none_or(|(_, best_dist)| dist_sq < best_dist) {
                 best = Some((agent_id, dist_sq));

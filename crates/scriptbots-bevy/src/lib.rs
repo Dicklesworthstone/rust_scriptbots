@@ -30,6 +30,7 @@ use scriptbots_core::{
     RenderTonemapMode, SelectedBrainTelemetryOutcome, SelectionMode, SelectionState,
     SelectionUpdate, SimulationCommand, TerrainKind, TickSummary, TierFeatures, TraitModifiers,
     WorldState, WorldStepDriver, apply_control_command, initial_tier_for, tier_features,
+    toroidal_delta,
     visual::{
         self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
     },
@@ -1131,17 +1132,6 @@ fn bounds_extent(bounds: (Vec2, Vec2)) -> Vec2 {
 fn fit_distance_for_extent(extent: Vec2, factor: f32) -> f32 {
     let max_extent = extent.max_element().max(200.0);
     (max_extent * factor).clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
-}
-
-fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
-    let mut delta = target - origin;
-    let half = extent * 0.5;
-    if delta > half {
-        delta -= extent;
-    } else if delta < -half {
-        delta += extent;
-    }
-    delta
 }
 
 fn encode_agent_id(id: AgentId) -> u64 {
@@ -3794,8 +3784,12 @@ fn handle_selection_input(
     let mut best_dist = f32::MAX;
 
     for agent in &snapshot.agents {
-        let dx = toroidal_delta(world_point.x, agent.position.x, world_size.x);
-        let dy = toroidal_delta(world_point.y, agent.position.y, world_size.y);
+        // Argument order swapped versus the removed private copy: that computed
+        // target - origin, core computes a - b. Both feed dist_sq below, so the
+        // sign is unused, but the swap keeps the value identical rather than
+        // relying on that (bd-ikts.4).
+        let dx = toroidal_delta(agent.position.x, world_point.x, world_size.x);
+        let dy = toroidal_delta(agent.position.y, world_point.y, world_size.y);
         let dist_sq = dx.mul_add(dx, dy * dy);
         if dist_sq <= radius_sq && dist_sq < best_dist {
             best_dist = dist_sq;
@@ -7410,8 +7404,9 @@ mod tests {
     fn test_toroidal_picking_across_wrap_seams() {
         let extent = 1000.0;
 
-        // Picking near origin (x=5) against an agent near wrap boundary (x=995)
-        let dx = toroidal_delta(5.0, 995.0, extent);
+        // Picking near origin (x=5) against an agent near wrap boundary (x=995).
+        // Argument order follows core's a - b convention (bd-ikts.4).
+        let dx = toroidal_delta(995.0, 5.0, extent);
         assert_eq!(
             dx.abs(),
             10.0,
@@ -7419,7 +7414,7 @@ mod tests {
         );
 
         // Distance across opposite seam (origin=990, target=10)
-        let dx_reverse = toroidal_delta(990.0, 10.0, extent);
+        let dx_reverse = toroidal_delta(10.0, 990.0, extent);
         assert_eq!(
             dx_reverse.abs(),
             20.0,
