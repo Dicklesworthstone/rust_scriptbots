@@ -643,7 +643,7 @@ impl SharedHostState {
             return Ok(None);
         };
         let policy =
-            if !self.audit_gate_closed && self.admission_lifecycle != HostLifecycle::Stopped {
+            if !self.audit_gate_closed && self.admission_lifecycle == HostLifecycle::Running {
                 CommandClaimPolicy::ReserveIfAbsent
             } else {
                 CommandClaimPolicy::CompareOnly
@@ -1845,6 +1845,9 @@ impl HostCore {
     /// retained by either live or archived idempotency authority are skipped,
     /// while the current sequence remains admissible before a successor is required.
     pub fn request_shutdown(&mut self) -> Result<CommandStatus, HostAccessError> {
+        self.shared
+            .borrow_mut()
+            .cancel_pending_non_shutdown_authority();
         if let Some(command_id) = self.shared.borrow().shutdown_command_id {
             return self
                 .shared
@@ -1854,9 +1857,6 @@ impl HostCore {
                 .map(|authority| authority.status.clone())
                 .ok_or_else(|| protocol_violation("shutdown command status is missing"));
         }
-        self.shared
-            .borrow_mut()
-            .cancel_pending_non_shutdown_authority();
 
         loop {
             let sequence = self.next_lifecycle_command_sequence;
@@ -1907,6 +1907,12 @@ impl HostCore {
             .pending_command_authority
             .as_ref()
             .map(|pending| pending.envelope.command_id)
+    }
+
+    /// Next admission sequence, exposed as a monotonic accounting cursor.
+    #[must_use]
+    pub(crate) fn admission_cursor(&self) -> AdmissionSequence {
+        self.shared.borrow().next_admission
     }
 
     /// Latest immutable host publication.

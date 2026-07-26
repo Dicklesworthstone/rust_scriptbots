@@ -1377,6 +1377,14 @@ mod asupersync_runner {
             if cancellation {
                 self.cancellation_observed = true;
             }
+            let started_at = self.provisional_shutdown_started_at.take().unwrap_or(now);
+            self.shutdown_started_at = Some(
+                self.shutdown_started_at
+                    .map_or(started_at, |existing| existing.min(started_at)),
+            );
+            self.state
+                .command_ingress_open
+                .store(false, Ordering::Release);
             if self.shutdown_command_id.is_none() {
                 let status = match self.host.request_shutdown() {
                     Ok(status) => status,
@@ -1392,14 +1400,6 @@ mod asupersync_runner {
                 self.shutdown_command_id = Some(status.command_id());
                 self.metrics.shutdown_requests = self.metrics.shutdown_requests.saturating_add(1);
             }
-            let started_at = self.provisional_shutdown_started_at.take().unwrap_or(now);
-            self.shutdown_started_at = Some(
-                self.shutdown_started_at
-                    .map_or(started_at, |existing| existing.min(started_at)),
-            );
-            self.state
-                .command_ingress_open
-                .store(false, Ordering::Release);
             Ok(())
         }
 
@@ -1675,6 +1675,10 @@ mod asupersync_runner {
                 state.register_runner_waker(task_cx.waker());
                 if !self.cancellation_observed && self.should_cancel(cx) {
                     return Poll::Ready(DriverWake::Cancellation);
+                }
+                if self.receiver.is_closed() && self.controller_state == ControllerState::Connected
+                {
+                    return Poll::Ready(DriverWake::Disconnected);
                 }
                 match sleep.as_mut().poll(task_cx) {
                     Poll::Ready(()) => Poll::Ready(DriverWake::Deadline),
@@ -2591,7 +2595,9 @@ mod tests {
                         CommandAuthorityLookup::Failed(
                             crate::CommandAuthorityLookupFailure::Pending,
                         ),
-                        CommandAuthorityLookup::Absent,
+                        CommandAuthorityLookup::Failed(
+                            crate::CommandAuthorityLookupFailure::Pending,
+                        ),
                     ]),
                 ),
                 (

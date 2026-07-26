@@ -40,7 +40,7 @@ use crate::{
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Default bound for the pre-admission ingress channel.
@@ -260,27 +260,33 @@ impl ChannelHostPort {
         }
     }
 
-    fn enqueue(&self, message: IngressMessage) -> Result<(), HostAccessError> {
+    fn enqueue(&self, message: IngressMessage, started: Instant) -> Result<(), HostAccessError> {
+        if started.elapsed() >= self.submit_deadline {
+            return Err(Self::protocol_violation(format!(
+                "channel host submission exceeded {:?}",
+                self.submit_deadline
+            )));
+        }
         match self.sender.try_send(message) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(message)) => {
                 // `SyncSender::send_timeout` is unstable; park briefly between retries inside the
                 // configured deadline instead of blocking without bound.
                 const RETRY_PARK: Duration = Duration::from_millis(2);
-                let started = std::time::Instant::now();
                 let mut pending = message;
                 loop {
                     match self.sender.try_send(pending) {
                         Ok(()) => return Ok(()),
                         Err(TrySendError::Full(returned)) => {
-                            if started.elapsed() >= self.submit_deadline {
+                            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+                            if remaining.is_zero() {
                                 return Err(Self::protocol_violation(format!(
                                     "channel host did not drain ingress within {:?}",
                                     self.submit_deadline
                                 )));
                             }
                             pending = returned;
-                            std::thread::park_timeout(RETRY_PARK);
+                            std::thread::park_timeout(RETRY_PARK.min(remaining));
                         }
                         Err(TrySendError::Disconnected(_)) => {
                             return Err(HostAccessError::Disconnected);
@@ -299,13 +305,17 @@ impl HostPort for ChannelHostPort {
     }
 
     fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
-        let started = std::time::Instant::now();
+        const RETRY_PARK: Duration = Duration::from_millis(2);
+        let started = Instant::now();
         loop {
             let (reply, reply_rx) = std::sync::mpsc::channel();
-            self.enqueue(IngressMessage::Command {
-                envelope: envelope.clone(),
-                reply,
-            })?;
+            self.enqueue(
+                IngressMessage::Command {
+                    envelope: envelope.clone(),
+                    reply,
+                },
+                started,
+            )?;
             let remaining = self.submit_deadline.saturating_sub(started.elapsed());
             let result = reply_rx
                 .recv_timeout(remaining)
@@ -320,10 +330,18 @@ impl HostPort for ChannelHostPort {
                 Err(HostAccessError::CommandAuthorityLookup {
                     failure:
                         crate::CommandAuthorityLookupFailure::Pending
-                        | crate::CommandAuthorityLookupFailure::Busy,
+                        | crate::CommandAuthorityLookupFailure::Busy
+                        | crate::CommandAuthorityLookupFailure::Capacity { .. },
                     ..
-                }) if started.elapsed() < self.submit_deadline => {
-                    std::thread::park_timeout(Duration::from_millis(2));
+                }) => {
+                    let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(Self::protocol_violation(format!(
+                            "channel host admission did not resolve within {:?}",
+                            self.submit_deadline
+                        )));
+                    }
+                    std::thread::park_timeout(RETRY_PARK.min(remaining));
                 }
                 result => return result,
             }
@@ -342,10 +360,11 @@ impl HostPort for ChannelHostPort {
         {
             return Ok(Some(status));
         }
-        let started = std::time::Instant::now();
+        const RETRY_PARK: Duration = Duration::from_millis(2);
+        let started = Instant::now();
         loop {
             let (reply, reply_rx) = std::sync::mpsc::channel();
-            self.enqueue(IngressMessage::CommandStatus { command_id, reply })?;
+            self.enqueue(IngressMessage::CommandStatus { command_id, reply }, started)?;
             let remaining = self.submit_deadline.saturating_sub(started.elapsed());
             let result = reply_rx
                 .recv_timeout(remaining)
@@ -360,10 +379,18 @@ impl HostPort for ChannelHostPort {
                 Err(HostAccessError::CommandAuthorityLookup {
                     failure:
                         crate::CommandAuthorityLookupFailure::Pending
-                        | crate::CommandAuthorityLookupFailure::Busy,
+                        | crate::CommandAuthorityLookupFailure::Busy
+                        | crate::CommandAuthorityLookupFailure::Capacity { .. },
                     ..
-                }) if started.elapsed() < self.submit_deadline => {
-                    std::thread::park_timeout(Duration::from_millis(2));
+                }) => {
+                    let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(Self::protocol_violation(format!(
+                            "channel host status lookup did not resolve within {:?}",
+                            self.submit_deadline
+                        )));
+                    }
+                    std::thread::park_timeout(RETRY_PARK.min(remaining));
                 }
                 result => return result,
             }
@@ -553,11 +580,10 @@ impl ChannelHostDriver {
         }
     }
 
-    fn process_ingress(&mut self, message: IngressMessage) -> usize {
+    fn process_ingress(&mut self, message: IngressMessage) {
         match message {
             IngressMessage::Command { envelope, reply } => {
                 let result = self.host.submit(envelope);
-                let admitted = usize::from(result.is_ok());
                 if let Ok(status) = &result {
                     if let Ok(mut board) = self.statuses.write() {
                         board.insert(status.clone(), self.status_board_capacity);
@@ -566,7 +592,6 @@ impl ChannelHostDriver {
                 // A client that timed out is unreachable; the admission
                 // remains authoritative and mirrored either way.
                 let _ = reply.send(result);
-                admitted
             }
             IngressMessage::CommandStatus { command_id, reply } => {
                 let result = self.port.command_status(command_id);
@@ -576,24 +601,22 @@ impl ChannelHostDriver {
                     board.insert(status.clone(), self.status_board_capacity);
                 }
                 let _ = reply.send(result);
-                0
             }
-            IngressMessage::Wake => 0,
+            IngressMessage::Wake => {}
         }
     }
 
-    fn drain_ingress(&mut self) -> Result<usize, ChannelDriveError> {
-        let mut admitted = 0;
+    fn drain_ingress(&mut self) {
         let mut processed = 0;
         if let Some(message) = self.pending_ingress.take() {
             processed += 1;
-            admitted += self.process_ingress(message);
+            self.process_ingress(message);
         }
         while processed < self.ingress_drain_budget {
             match self.receiver.try_recv() {
                 Ok(message) => {
                     processed += 1;
-                    admitted += self.process_ingress(message);
+                    self.process_ingress(message);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -602,7 +625,6 @@ impl ChannelHostDriver {
                 }
             }
         }
-        Ok(admitted)
     }
 
     fn retain_waited_ingress(&mut self, message: IngressMessage) -> Result<(), HostAccessError> {
@@ -659,7 +681,8 @@ impl ChannelHostDriver {
     ///
     /// Returns [`ChannelDriveError`] when admission or the schedule fails.
     pub fn step(&mut self, now: ManualInstant) -> Result<ChannelStepReport, ChannelDriveError> {
-        let admitted = self.drain_ingress()?;
+        let admission_before = self.host.core().admission_cursor();
+        self.drain_ingress();
         let mut interest = self.host.drive_interest();
         let mut drove = false;
         match interest {
@@ -707,6 +730,16 @@ impl ChannelHostDriver {
         {
             interest = HostDriveInterest::Draining;
         }
+        let admission_after = self.host.core().admission_cursor();
+        let admitted = admission_after
+            .get()
+            .checked_sub(admission_before.get())
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| {
+                ChannelHostPort::protocol_violation(
+                    "channel host admission cursor regressed or exceeded platform usize",
+                )
+            })?;
         Ok(ChannelStepReport {
             admitted,
             drove,
@@ -777,10 +810,13 @@ impl ChannelHostDriver {
 mod tests {
     use super::*;
     use crate::{
-        ApplicationState, HostCommand, HostCore, HostCoreOptions, HostLifecycle, PlaybackSnapshot,
-        RejectionReason,
+        ApplicationState, CommandAuthorityLookup, CommandAuthorityMode, CommandAuthorityReader,
+        CommandClaimPolicy, HostCommand, HostCore, HostCoreOptions, HostLifecycle,
+        JournalAdmission, JournalBatch, JournalPort, JournalReceipt, PlaybackSnapshot,
+        RejectionReason, ShutdownCommitRequirement, VolatileJournal,
     };
     use scriptbots_core::ScriptBotsConfig;
+    use std::sync::Mutex;
 
     fn test_host(paused: bool) -> FixedDeadlineHost {
         let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
@@ -808,6 +844,89 @@ mod tests {
             maintenance_period: Duration::from_millis(2),
             ..ChannelHostOptions::default()
         }
+    }
+
+    struct ScriptedChannelAuthority {
+        outcomes: Mutex<HashMap<CommandId, VecDeque<CommandAuthorityLookup>>>,
+    }
+
+    impl CommandAuthorityReader for ScriptedChannelAuthority {
+        fn resolve_for_submit(
+            &self,
+            envelope: &CommandEnvelope,
+            _envelope_digest: [u8; blake3::OUT_LEN],
+            _policy: CommandClaimPolicy,
+        ) -> CommandAuthorityLookup {
+            self.resolve_status(envelope.command_id)
+        }
+
+        fn resolve_status(&self, command_id: CommandId) -> CommandAuthorityLookup {
+            self.outcomes
+                .lock()
+                .expect("scripted channel authority lock")
+                .get_mut(&command_id)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(CommandAuthorityLookup::Absent)
+        }
+    }
+
+    struct ChannelAuthorityJournal {
+        inner: VolatileJournal,
+        authority: Arc<dyn CommandAuthorityReader>,
+    }
+
+    impl JournalPort for ChannelAuthorityJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            self.inner.try_admit(batch)
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            self.inner.poll_receipts(limit)
+        }
+
+        fn command_authority_reader(
+            &self,
+            _session_id: HostSessionId,
+        ) -> Option<Arc<dyn CommandAuthorityReader>> {
+            Some(Arc::clone(&self.authority))
+        }
+
+        fn command_authority_mode(&self) -> CommandAuthorityMode {
+            CommandAuthorityMode::DurableRequired
+        }
+
+        fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+            self.inner.shutdown_commit_requirement()
+        }
+    }
+
+    fn authority_test_host(authority: Arc<dyn CommandAuthorityReader>) -> FixedDeadlineHost {
+        let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("deterministic authority world");
+        let options = HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                ..PlaybackSnapshot::default()
+            },
+            tick_period_nanos: 1_000_000_000,
+            snapshot_interval_ticks: 1,
+            ..HostCoreOptions::default()
+        };
+        let core = HostCore::with_journal(
+            HostSessionId::new(0x7171),
+            world,
+            options,
+            Box::new(ChannelAuthorityJournal {
+                inner: VolatileJournal::with_capacity(64),
+                authority,
+            }),
+        )
+        .expect("channel authority host");
+        FixedDeadlineHost::new(core)
     }
 
     /// Spawn the !Send driver on its owner thread and hand the port back.
@@ -1392,6 +1511,7 @@ mod tests {
             .run(move || ManualInstant::from_nanos(1_000_000 + start.elapsed().as_nanos() as u64))
             .expect("run");
         assert_eq!(receipt.outcome, ChannelRunOutcome::ControllerDisconnected);
+        assert_eq!(receipt.commands_admitted, 1);
     }
 
     #[test]
@@ -1411,6 +1531,79 @@ mod tests {
             .submit(CommandEnvelope::new(CommandId::new(61), HostCommand::Pause))
             .expect_err("stalled owner must fail truthfully");
         assert!(matches!(error, HostAccessError::ProtocolViolation { .. }));
+    }
+
+    #[test]
+    fn enqueue_cannot_restart_an_expired_outer_submission_deadline() {
+        let (mut driver, port) =
+            ChannelHostDriver::new(test_host(false), fast_options()).expect("driver");
+        let expired = Instant::now()
+            .checked_sub(port.submit_deadline)
+            .expect("test deadline subtraction");
+
+        let error = port
+            .enqueue(IngressMessage::Wake, expired)
+            .expect_err("expired submission must not enter ingress");
+        assert!(matches!(error, HostAccessError::ProtocolViolation { .. }));
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn admission_accounting_includes_claim_resolved_by_drive_but_not_exact_retry() {
+        let command_id = CommandId::new(62);
+        let envelope = CommandEnvelope::new(command_id, HostCommand::Pause);
+        let authority = Arc::new(ScriptedChannelAuthority {
+            outcomes: Mutex::new(HashMap::from([(
+                command_id,
+                VecDeque::from([
+                    CommandAuthorityLookup::Failed(crate::CommandAuthorityLookupFailure::Pending),
+                    CommandAuthorityLookup::Claimed,
+                ]),
+            )])),
+        });
+        let (mut driver, port) =
+            ChannelHostDriver::new(authority_test_host(authority), fast_options())
+                .expect("channel authority driver");
+
+        let (first_reply, first_receipt) = std::sync::mpsc::channel();
+        port.sender
+            .try_send(IngressMessage::Command {
+                envelope: envelope.clone(),
+                reply: first_reply,
+            })
+            .expect("first authority ingress");
+        let first = driver
+            .step(ManualInstant::from_nanos(0))
+            .expect("claim resolves during owner drive");
+        assert_eq!(first.admitted, 1);
+        assert!(matches!(
+            first_receipt.recv().expect("first authority reply"),
+            Err(HostAccessError::CommandAuthorityLookup {
+                command_id: pending_id,
+                failure: crate::CommandAuthorityLookupFailure::Pending,
+            }) if pending_id == command_id
+        ));
+
+        let (retry_reply, retry_receipt) = std::sync::mpsc::channel();
+        port.sender
+            .try_send(IngressMessage::Command {
+                envelope,
+                reply: retry_reply,
+            })
+            .expect("exact retry ingress");
+        let retry = driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("exact retry boundary");
+        assert_eq!(retry.admitted, 0);
+        let status = retry_receipt
+            .recv()
+            .expect("exact retry reply")
+            .expect("exact retry status");
+        assert_eq!(status.command_id(), command_id);
+        assert!(matches!(status.application(), ApplicationState::Applied(_)));
     }
 
     #[test]
@@ -1468,7 +1661,7 @@ mod tests {
 
         let next_due = driver.host.next_deadline().expect("next running deadline");
         let second = driver.step(next_due).expect("queued-command boundary");
-        assert_eq!(second.admitted, 1);
+        assert_eq!(second.admitted, 0);
         let status = receipt
             .recv_timeout(Duration::from_secs(1))
             .expect("queued command reply")
@@ -1540,8 +1733,8 @@ mod tests {
         status_lock.join().expect("status lock holder");
 
         assert_eq!(
-            first.admitted, DEFAULT_CHANNEL_INGRESS_DRAIN_BUDGET,
-            "producer refill must remain queued after the explicit boundary budget"
+            first.admitted, 0,
+            "validation rejections must not be counted as admissions"
         );
         assert!(first.drove, "the due host deadline must still advance");
         assert_eq!(
@@ -1563,7 +1756,7 @@ mod tests {
 
         let next_due = driver.host.next_deadline().expect("next running deadline");
         let second = driver.step(next_due).expect("second bounded boundary");
-        assert_eq!(second.admitted, 1);
+        assert_eq!(second.admitted, 0);
         let status = last_receipt
             .recv_timeout(Duration::from_secs(1))
             .expect("refilled command reply")
@@ -1616,10 +1809,7 @@ mod tests {
 
         fn process(driver: &mut ChannelHostDriver, envelope: CommandEnvelope) -> CommandStatus {
             let (reply, receipt) = std::sync::mpsc::channel();
-            assert_eq!(
-                driver.process_ingress(IngressMessage::Command { envelope, reply }),
-                1
-            );
+            driver.process_ingress(IngressMessage::Command { envelope, reply });
             receipt
                 .recv()
                 .expect("authoritative admission reply")
@@ -1660,8 +1850,10 @@ mod tests {
         let retry = process(&mut driver, archived_envelope);
         assert_eq!(retry, archived);
         assert!(
-            port.command_status(archived_id)
-                .expect("mirrored lookup")
+            port.statuses
+                .read()
+                .expect("status board lock")
+                .get(archived_id)
                 .is_none(),
             "the terminal retry must evict itself before the retained admission"
         );
