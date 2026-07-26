@@ -24,6 +24,9 @@ fn catalog_dir() -> PathBuf {
 }
 
 fn binary() -> PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_scriptbots-app") {
+        return PathBuf::from(path);
+    }
     let mut path = std::env::current_exe().expect("test exe");
     path.pop();
     if path.ends_with("deps") {
@@ -52,6 +55,7 @@ struct HeadlessSummaryDto {
     total_deaths: usize,
     total_spike_hits: u64,
     ticks_simulated: u64,
+    world_digest: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -83,7 +87,7 @@ fn launch_scenario(
         .env("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT", report_path)
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "0")
         .env("SCRIPTBOTS_CONTROL_MCP", "disabled")
-        .env("RUST_LOG", "info")
+        .env("RUST_LOG", "scriptbots_app=info,info")
         .env("RUST_LOG_STYLE", "never")
         .args([
             "--scenario",
@@ -96,34 +100,47 @@ fn launch_scenario(
     command.output().expect("the app binary runs")
 }
 
-fn parse_digest(stderr: &str) -> String {
-    for line in stderr.lines() {
+fn parse_digest(stdout: &str, stderr: &str) -> String {
+    for line in stderr.lines().chain(stdout.lines()) {
         if let Some(index) = line.find("world_digest=") {
-            return line[index + "world_digest=".len()..]
+            let raw = &line[index + "world_digest=".len()..];
+            let token = raw
                 .split_whitespace()
                 .next()
                 .expect("digest token")
-                .to_owned();
+                .trim_matches('"')
+                .trim_matches(',');
+            return token.to_owned();
         }
     }
-    panic!("no world digest found in run output:\n{stderr}");
+    panic!(
+        "no world digest found in run output:\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+    );
 }
 
 fn run_cohort(document_path: &Path, seed: u64, frames: u64) -> CohortRun {
     let dir = run_dir(&format!("s{seed}"));
     let report_path = dir.join("report.json");
     let output = launch_scenario(document_path, seed, frames, &report_path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "=== LAUNCH RUN (seed={seed}, status={:?}) ===",
+        output.status
+    );
+    eprintln!("--- STDOUT ---\n{stdout}");
+    eprintln!("--- STDERR ---\n{stderr}");
     assert!(
         output.status.success(),
-        "scenario run failed for seed {seed}:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "scenario run failed for seed {seed}:\nstdout: {stdout}\nstderr: {stderr}"
     );
     let report: HeadlessReportDto =
         serde_json::from_slice(&std::fs::read(&report_path).expect("headless report exists"))
             .expect("headless report parses");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let world_digest = parse_digest(&stderr);
+    let world_digest = match report.summary.world_digest.clone() {
+        Some(d) => d,
+        None => parse_digest(&stdout, &stderr),
+    };
     let _ = std::fs::remove_dir_all(&dir);
     CohortRun {
         summary: report.summary,
