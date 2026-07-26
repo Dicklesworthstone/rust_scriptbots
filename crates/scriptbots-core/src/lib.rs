@@ -4198,6 +4198,156 @@ pub struct SensorAttribution {
     pub truncated: usize,
 }
 
+/// Sensor-vector indices for one eye: `[density, red, green, blue]`.
+///
+/// The layout is IRREGULAR and that is deliberate legacy parity, not an
+/// oversight: eye blocks start at 0, 5, 12 and 21, interleaved with food,
+/// sound, smell, health, clock, hearing, blood and temperature channels. The
+/// strides are 5, 7 and 9.
+///
+/// This table exists so no frontend re-derives it. A renderer that assumed a
+/// regular `eye * 4` stride would read food as eye 1's density and clocks as
+/// eye 3's, and the resulting panel would look plausible while being wrong —
+/// which is precisely the failure `bd-hzi1` forbids by saying sensor math must
+/// not be duplicated in a frontend.
+const EYE_CHANNEL_INDICES: [[usize; 4]; NUM_EYES] = [
+    [0, 1, 2, 3],
+    [5, 6, 7, 8],
+    [12, 13, 14, 15],
+    [21, 22, 23, 24],
+];
+
+/// Sensor-vector indices for `eye`, or `None` when the index is out of range.
+#[must_use]
+pub fn eye_channel_indices(eye: usize) -> Option<[usize; 4]> {
+    EYE_CHANNEL_INDICES.get(eye).copied()
+}
+
+/// One neighbour's contribution to a single eye.
+///
+/// Distinct from [`SensorContribution`], which spans all eyes: the values here
+/// are already narrowed to the selected cone, so a panel cannot accidentally
+/// display a neighbour's whole-agent total beside one cone's readout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EyeContribution {
+    /// Transient live handle for the neighbour.
+    pub source: AgentId,
+    /// Stable identity, used for deterministic ties.
+    pub source_uid: AgentUid,
+    /// Bearing from the observer's heading, radians, wrapped to `[-pi, pi]`.
+    pub bearing: f32,
+    /// Toroidal distance to the neighbour.
+    pub distance: f32,
+    /// The neighbour's body colour as the observer sees it.
+    pub color: [f32; 3],
+    /// Density this neighbour added to THIS eye.
+    pub density: f32,
+    /// Red/green/blue this neighbour added to THIS eye.
+    pub rgb: [f32; 3],
+    /// Ranking key: this neighbour's total contribution to THIS eye.
+    pub total: f32,
+}
+
+/// What one eye sees, and which neighbours put it there.
+///
+/// Produced by [`SensorAttribution::for_eye`]. Renderer-neutral by
+/// construction: it is a filtered projection of an existing attribution, so a
+/// frontend consuming it performs no sensor physics of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EyeAttribution {
+    /// Observer.
+    pub agent: AgentId,
+    /// Completed boundary the parent attribution was sampled at.
+    pub tick: Tick,
+    /// Which eye, in `0..NUM_EYES`.
+    pub eye: usize,
+    /// Raw `[density, r, g, b]` for this eye, before the brain-facing clamp.
+    pub raw: [f32; 4],
+    /// Clamped `[density, r, g, b]` for this eye.
+    pub clamped: [f32; 4],
+    /// Which of this eye's four channels saturated.
+    pub saturated: [bool; 4],
+    /// Neighbours contributing to THIS eye, strongest first, ties by uid.
+    pub contributions: Vec<EyeContribution>,
+    /// Contributors the PARENT attribution dropped to honour its bound.
+    ///
+    /// Carried through rather than recomputed: some of those dropped
+    /// neighbours may have contributed to this eye, so a per-eye panel that
+    /// reported zero truncation would be claiming completeness it cannot have.
+    pub parent_truncated: usize,
+    /// Retained contributors that contribute nothing to this eye.
+    ///
+    /// Reported so an empty cone reads as "nobody is in this cone" rather than
+    /// as a missing-data bug.
+    pub filtered_out: usize,
+}
+
+impl SensorAttribution {
+    /// Narrow this attribution to a single eye.
+    ///
+    /// Returns `None` for an out-of-range eye index. A neighbour is included
+    /// when it contributes non-zero density or colour to this eye; ordering
+    /// matches the parent contract exactly — strongest first, ties broken by
+    /// stable `AgentUid` — so the same world always explains itself the same
+    /// way regardless of which cone is selected.
+    #[must_use]
+    pub fn for_eye(&self, eye: usize) -> Option<EyeAttribution> {
+        let indices = eye_channel_indices(eye)?;
+        let pick = |src: &[f32; INPUT_SIZE]| -> [f32; 4] {
+            [
+                src[indices[0]],
+                src[indices[1]],
+                src[indices[2]],
+                src[indices[3]],
+            ]
+        };
+
+        let mut contributions = Vec::new();
+        let mut filtered_out = 0usize;
+        for contribution in &self.contributions {
+            let density = contribution.eye_density[eye];
+            let rgb = contribution.eye_rgb[eye];
+            let total = density + rgb[0] + rgb[1] + rgb[2];
+            if density == 0.0 && rgb == [0.0, 0.0, 0.0] {
+                filtered_out += 1;
+                continue;
+            }
+            contributions.push(EyeContribution {
+                source: contribution.source,
+                source_uid: contribution.source_uid,
+                bearing: contribution.bearing,
+                distance: contribution.distance,
+                color: contribution.color,
+                density,
+                rgb,
+                total,
+            });
+        }
+        contributions.sort_by(|a, b| {
+            b.total
+                .total_cmp(&a.total)
+                .then_with(|| a.source_uid.cmp(&b.source_uid))
+        });
+
+        Some(EyeAttribution {
+            agent: self.agent,
+            tick: self.tick,
+            eye,
+            raw: pick(&self.raw),
+            clamped: pick(&self.clamped),
+            saturated: [
+                self.saturated[indices[0]],
+                self.saturated[indices[1]],
+                self.saturated[indices[2]],
+                self.saturated[indices[3]],
+            ],
+            contributions,
+            parent_truncated: self.truncated,
+            filtered_out,
+        })
+    }
+}
+
 /// The admissible range of one externally-settable configuration knob.
 ///
 /// # Why ranges exist at all
@@ -30188,6 +30338,162 @@ mod tests {
         );
         assert!(attribution.saturated[smell_index]);
         assert!((attribution.clamped[smell_index] - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// bd-hzi1: the eye channel table must match what `stage_sense` actually
+    /// writes. This is the whole reason the table exists — the layout is
+    /// irregular (strides 5, 7, 9) and a frontend guessing `eye * 4` would read
+    /// food as eye 1 density and clocks as eye 3 density.
+    #[test]
+    fn eye_channel_indices_match_the_documented_irregular_layout() {
+        assert_eq!(eye_channel_indices(0), Some([0, 1, 2, 3]));
+        assert_eq!(eye_channel_indices(1), Some([5, 6, 7, 8]));
+        assert_eq!(eye_channel_indices(2), Some([12, 13, 14, 15]));
+        assert_eq!(eye_channel_indices(3), Some([21, 22, 23, 24]));
+        assert_eq!(eye_channel_indices(NUM_EYES), None);
+        assert_eq!(eye_channel_indices(usize::MAX), None);
+
+        // A regular stride would be wrong for every eye past the first.
+        for eye in 1..NUM_EYES {
+            assert_ne!(
+                eye_channel_indices(eye).expect("eye in range")[0],
+                eye * 4,
+                "eye {eye} density must NOT sit at a regular eye*4 stride"
+            );
+        }
+        // Every index is distinct and inside the sensor vector.
+        let mut all: Vec<usize> = (0..NUM_EYES)
+            .flat_map(|e| eye_channel_indices(e).expect("eye in range"))
+            .collect();
+        all.sort_unstable();
+        let count = all.len();
+        all.dedup();
+        assert_eq!(all.len(), count, "eye channel indices must not overlap");
+        assert!(all.iter().all(|&i| i < INPUT_SIZE));
+    }
+
+    /// A cone view must show only the neighbours in THAT cone, and must keep
+    /// the parent's deterministic order so selecting a cone never reorders the
+    /// same world's explanation.
+    #[test]
+    fn for_eye_filters_to_the_selected_cone_and_keeps_deterministic_order() {
+        let attribution = SensorAttribution {
+            agent: AgentId::null(),
+            tick: Tick(7),
+            raw: [0.0; INPUT_SIZE],
+            clamped: [0.0; INPUT_SIZE],
+            saturated: [false; INPUT_SIZE],
+            truncated: 3,
+            contributions: vec![
+                // Contributes only to eye 1.
+                sample_contribution(AgentUid(10), 1, 0.5, [0.0, 0.0, 0.0]),
+                // Contributes only to eye 0, and more strongly.
+                sample_contribution(AgentUid(11), 0, 0.9, [0.0, 0.0, 0.0]),
+                // Ties with uid 11 on eye 0 total; uid must break the tie.
+                sample_contribution(AgentUid(12), 0, 0.9, [0.0, 0.0, 0.0]),
+            ],
+        };
+
+        let eye0 = attribution.for_eye(0).expect("eye 0 in range");
+        assert_eq!(eye0.eye, 0);
+        assert_eq!(eye0.tick, Tick(7));
+        let uids: Vec<u64> = eye0.contributions.iter().map(|c| c.source_uid.0).collect();
+        assert_eq!(uids, vec![11, 12], "strongest first, ties by ascending uid");
+        assert_eq!(eye0.filtered_out, 1, "the eye-1-only neighbour is excluded");
+        assert_eq!(
+            eye0.parent_truncated, 3,
+            "parent truncation must carry through; dropped neighbours may have \
+             contributed to this cone, so reporting 0 would overclaim completeness"
+        );
+
+        let eye1 = attribution.for_eye(1).expect("eye 1 in range");
+        assert_eq!(
+            eye1.contributions
+                .iter()
+                .map(|c| c.source_uid.0)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(eye1.filtered_out, 2);
+    }
+
+    /// An empty cone is a real answer, not missing data, and an out-of-range
+    /// eye is refused rather than silently clamped to a neighbouring cone.
+    #[test]
+    fn for_eye_handles_empty_cones_and_rejects_out_of_range() {
+        let attribution = SensorAttribution {
+            agent: AgentId::null(),
+            tick: Tick(1),
+            raw: [0.0; INPUT_SIZE],
+            clamped: [0.0; INPUT_SIZE],
+            saturated: [false; INPUT_SIZE],
+            truncated: 0,
+            contributions: vec![sample_contribution(AgentUid(1), 0, 0.4, [0.1, 0.0, 0.0])],
+        };
+        let empty = attribution.for_eye(2).expect("eye 2 in range");
+        assert!(empty.contributions.is_empty());
+        assert_eq!(empty.filtered_out, 1);
+        assert!(attribution.for_eye(NUM_EYES).is_none());
+    }
+
+    /// Per-eye saturation and raw/clamped values must be lifted from the
+    /// irregular indices, not from a guessed stride.
+    #[test]
+    fn for_eye_reports_that_eyes_own_saturation_and_values() {
+        let mut raw = [0.0_f32; INPUT_SIZE];
+        let mut clamped = [0.0_f32; INPUT_SIZE];
+        let mut saturated = [false; INPUT_SIZE];
+        // Eye 2 density lives at index 12, its red at 13.
+        raw[12] = 2.4;
+        clamped[12] = 1.0;
+        saturated[12] = true;
+        raw[13] = 0.25;
+        clamped[13] = 0.25;
+
+        let attribution = SensorAttribution {
+            agent: AgentId::null(),
+            tick: Tick(2),
+            raw,
+            clamped,
+            saturated,
+            truncated: 0,
+            contributions: Vec::new(),
+        };
+        let eye2 = attribution.for_eye(2).expect("eye 2 in range");
+        assert!((eye2.raw[0] - 2.4).abs() < 1e-6);
+        assert!((eye2.clamped[0] - 1.0).abs() < 1e-6);
+        assert!(eye2.saturated[0], "eye 2 density saturation must surface");
+        assert!((eye2.raw[1] - 0.25).abs() < 1e-6);
+        assert!(!eye2.saturated[1]);
+        // Eye 0 must be unaffected by eye 2's saturation.
+        let eye0 = attribution.for_eye(0).expect("eye 0 in range");
+        assert!(!eye0.saturated[0]);
+    }
+
+    fn sample_contribution(
+        uid: AgentUid,
+        eye: usize,
+        density: f32,
+        rgb: [f32; 3],
+    ) -> SensorContribution {
+        let mut eye_density = [0.0_f32; NUM_EYES];
+        let mut eye_rgb = [[0.0_f32; 3]; NUM_EYES];
+        eye_density[eye] = density;
+        eye_rgb[eye] = rgb;
+        SensorContribution {
+            source: AgentId::null(),
+            source_uid: uid,
+            bearing: 0.0,
+            distance: 1.0,
+            color: [0.5, 0.5, 0.5],
+            eye_density,
+            eye_rgb,
+            smell: 0.0,
+            sound: 0.0,
+            hearing: 0.0,
+            blood: 0.0,
+            total: density + rgb[0] + rgb[1] + rgb[2],
+        }
     }
 
     #[test]
