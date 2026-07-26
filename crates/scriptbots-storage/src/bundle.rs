@@ -2,7 +2,8 @@
 
 use crate::{RunManifestRecord, StorageError, StorageReader};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -51,6 +52,28 @@ pub enum BundleError {
         manifest_run_id: String,
         db_run_id: String,
     },
+    #[error(
+        "bounded bundle verification limit `{resource}` exceeded at {path}: observed {observed}, limit {limit}"
+    )]
+    VerificationLimitExceeded {
+        resource: &'static str,
+        path: PathBuf,
+        observed: u64,
+        limit: u64,
+    },
+    #[error("bounded bundle verification requires a regular file at {0}")]
+    NonRegularFile(PathBuf),
+    #[error(
+        "bounded semantic verification of database-backed bundle {0} is unavailable: the pinned FrankenSQLite engine cannot interrupt a running statement; verify it in an isolated trusted workflow instead"
+    )]
+    BoundedDatabaseVerificationUnavailable(PathBuf),
+    #[error("bundle manifest projects run_id {projected_run_id}, but embeds {manifest_run_id}")]
+    RunIdProjectionMismatch {
+        projected_run_id: String,
+        manifest_run_id: String,
+    },
+    #[error("bundle manifest lists artifact path more than once: {0}")]
+    DuplicateArtifactPath(PathBuf),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,6 +115,15 @@ pub struct RunBundleVerificationResult {
     pub verified_at_utc: String,
 }
 
+/// Hard byte and cardinality caps for untrusted artifact-only bundle verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunBundleVerificationLimits {
+    pub max_manifest_bytes: u64,
+    pub max_artifacts: usize,
+    pub max_artifact_bytes: u64,
+    pub max_total_artifact_bytes: u64,
+}
+
 /// Reject any artifact path that is not relative and contained by the bundle directory.
 ///
 /// `verify_run_bundle` has always refused absolute and `..`-bearing entries on read.
@@ -102,9 +134,12 @@ pub struct RunBundleVerificationResult {
 fn validate_relative_path(relative_path: &str) -> Result<&Path, BundleError> {
     let path = Path::new(relative_path);
     let escapes = path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
         || relative_path.is_empty();
     if escapes {
         return Err(BundleError::NonPortablePath(path.to_path_buf()));
@@ -350,6 +385,221 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
     })
 }
 
+/// Verify an artifact-only bundle while enforcing hard read and cardinality caps.
+///
+/// This entry point opens each file once, validates the opened handle, and streams
+/// at most the declared byte count plus one byte through BLAKE3. It never allocates
+/// from an artifact's declared size. Database-backed bundles are refused explicitly:
+/// the pinned FrankenSQLite engine cannot interrupt an already-running statement,
+/// so advertising that semantic database verification as bounded would be false.
+pub fn verify_run_bundle_bounded(
+    bundle_dir: &Path,
+    limits: RunBundleVerificationLimits,
+) -> Result<RunBundleVerificationResult, BundleError> {
+    let manifest_path = bundle_dir.join("bundle_manifest.json");
+    let manifest_data =
+        read_file_bounded(&manifest_path, limits.max_manifest_bytes, "manifest_bytes")?;
+    let bundle: RunBundleV1 = serde_json::from_slice(&manifest_data)?;
+    if bundle.bundle_version != RUN_BUNDLE_SCHEMA_VERSION {
+        return Err(BundleError::InvalidManifest(manifest_path));
+    }
+    let manifest_run_id = bundle.manifest.run_id.to_string();
+    if bundle.digests.run_id != manifest_run_id {
+        return Err(BundleError::RunIdProjectionMismatch {
+            projected_run_id: bundle.digests.run_id,
+            manifest_run_id,
+        });
+    }
+    if bundle.artifacts.len() > limits.max_artifacts {
+        return Err(BundleError::VerificationLimitExceeded {
+            resource: "artifact_count",
+            path: bundle_dir.to_path_buf(),
+            observed: u64::try_from(bundle.artifacts.len()).unwrap_or(u64::MAX),
+            limit: u64::try_from(limits.max_artifacts).unwrap_or(u64::MAX),
+        });
+    }
+
+    let db_path = bundle_dir.join("run.db");
+    match fs::symlink_metadata(&db_path) {
+        Ok(_) => {
+            return Err(BundleError::BoundedDatabaseVerificationUnavailable(db_path));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(BundleError::Io {
+                path: db_path,
+                error,
+            });
+        }
+    }
+
+    let mut total_bytes = 0_u64;
+    let mut artifact_paths = std::collections::BTreeSet::new();
+    for entry in &bundle.artifacts {
+        let rel_path = validate_relative_path(&entry.relative_path)?;
+        let normalized_path = rel_path.components().collect::<PathBuf>();
+        if !artifact_paths.insert(normalized_path.clone()) {
+            return Err(BundleError::DuplicateArtifactPath(normalized_path));
+        }
+        if is_database_artifact(entry, &normalized_path) {
+            return Err(BundleError::BoundedDatabaseVerificationUnavailable(
+                bundle_dir.join(normalized_path),
+            ));
+        }
+        let full_path = bundle_dir.join(&normalized_path);
+        if entry.bytes_len > limits.max_artifact_bytes {
+            return Err(BundleError::VerificationLimitExceeded {
+                resource: "artifact_bytes",
+                path: full_path,
+                observed: entry.bytes_len,
+                limit: limits.max_artifact_bytes,
+            });
+        }
+        total_bytes = total_bytes.checked_add(entry.bytes_len).ok_or_else(|| {
+            BundleError::VerificationLimitExceeded {
+                resource: "total_artifact_bytes",
+                path: bundle_dir.to_path_buf(),
+                observed: u64::MAX,
+                limit: limits.max_total_artifact_bytes,
+            }
+        })?;
+        if total_bytes > limits.max_total_artifact_bytes {
+            return Err(BundleError::VerificationLimitExceeded {
+                resource: "total_artifact_bytes",
+                path: bundle_dir.to_path_buf(),
+                observed: total_bytes,
+                limit: limits.max_total_artifact_bytes,
+            });
+        }
+        let actual_hash = hash_file_exact_bounded(&full_path, entry.bytes_len)?;
+        if actual_hash != entry.blake3_hex {
+            return Err(BundleError::HashMismatch {
+                path: rel_path.to_path_buf(),
+                expected: entry.blake3_hex.clone(),
+                actual: actual_hash,
+            });
+        }
+    }
+
+    Ok(RunBundleVerificationResult {
+        bundle_version: bundle.bundle_version,
+        run_id: bundle.manifest.run_id.to_string(),
+        max_tick: bundle.digests.max_tick,
+        total_artifacts_verified: bundle.artifacts.len(),
+        total_bytes_verified: total_bytes,
+        reproducible: bundle.manifest.reproducible,
+        verified_at_utc: current_timestamp(),
+    })
+}
+
+fn is_database_artifact(entry: &RunBundleArtifactEntry, path: &Path) -> bool {
+    let artifact_type = entry.artifact_type.to_ascii_lowercase();
+    matches!(
+        artifact_type.as_str(),
+        "database" | "sqlite" | "frankensqlite"
+    ) || path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("db")
+            || extension.eq_ignore_ascii_case("sqlite")
+            || extension.eq_ignore_ascii_case("sqlite3")
+    })
+}
+
+fn read_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+    resource: &'static str,
+) -> Result<Vec<u8>, BundleError> {
+    let file = File::open(path).map_err(|error| BundleError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    let metadata = file.metadata().map_err(|error| BundleError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    if !metadata.is_file() {
+        return Err(BundleError::NonRegularFile(path.to_path_buf()));
+    }
+    if metadata.len() > max_bytes {
+        return Err(BundleError::VerificationLimitExceeded {
+            resource,
+            path: path.to_path_buf(),
+            observed: metadata.len(),
+            limit: max_bytes,
+        });
+    }
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.len().min(max_bytes)).unwrap_or(usize::MAX));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| BundleError::Io {
+            path: path.to_path_buf(),
+            error,
+        })?;
+    let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if observed > max_bytes {
+        return Err(BundleError::VerificationLimitExceeded {
+            resource,
+            path: path.to_path_buf(),
+            observed,
+            limit: max_bytes,
+        });
+    }
+    Ok(bytes)
+}
+
+fn hash_file_exact_bounded(path: &Path, expected_bytes: u64) -> Result<String, BundleError> {
+    let file = File::open(path).map_err(|error| BundleError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    let metadata = file.metadata().map_err(|error| BundleError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    if !metadata.is_file() {
+        return Err(BundleError::NonRegularFile(path.to_path_buf()));
+    }
+    if metadata.len() != expected_bytes {
+        return Err(BundleError::HashMismatch {
+            path: path.to_path_buf(),
+            expected: format!("{expected_bytes} bytes"),
+            actual: format!("{} bytes", metadata.len()),
+        });
+    }
+
+    let mut reader = file.take(expected_bytes.saturating_add(1));
+    let mut hasher = blake3::Hasher::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| BundleError::Io {
+            path: path.to_path_buf(),
+            error,
+        })?;
+        if read == 0 {
+            break;
+        }
+        observed = observed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if observed > expected_bytes {
+            return Err(BundleError::HashMismatch {
+                path: path.to_path_buf(),
+                expected: format!("{expected_bytes} bytes"),
+                actual: format!("more than {expected_bytes} bytes"),
+            });
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if observed != expected_bytes {
+        return Err(BundleError::HashMismatch {
+            path: path.to_path_buf(),
+            expected: format!("{expected_bytes} bytes"),
+            actual: format!("{observed} bytes"),
+        });
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +660,19 @@ mod tests {
         assert_eq!(verification.bundle_version, RUN_BUNDLE_SCHEMA_VERSION);
         assert_eq!(verification.total_artifacts_verified, 3);
         assert!(verification.total_bytes_verified > 0);
+        let bounded = verify_run_bundle_bounded(
+            &bundle_dir,
+            RunBundleVerificationLimits {
+                max_manifest_bytes: 1024 * 1024,
+                max_artifacts: 8,
+                max_artifact_bytes: 1024 * 1024,
+                max_total_artifact_bytes: 4 * 1024 * 1024,
+            },
+        );
+        assert!(matches!(
+            bounded,
+            Err(BundleError::BoundedDatabaseVerificationUnavailable(_))
+        ));
 
         // Tamper test: modify one artifact and verify it fails with HashMismatch
         let db_dst = bundle_dir.join("run.db");
@@ -466,6 +729,91 @@ mod tests {
             verification.total_bytes_verified,
             (summary_csv.len() + notes.len()) as u64
         );
+        let bounded = verify_run_bundle_bounded(
+            &bundle_dir,
+            RunBundleVerificationLimits {
+                max_manifest_bytes: 1024 * 1024,
+                max_artifacts: 4,
+                max_artifact_bytes: 1024,
+                max_total_artifact_bytes: 2048,
+            },
+        )?;
+        assert_eq!(bounded.total_artifacts_verified, 2);
+        assert_eq!(
+            bounded.total_bytes_verified,
+            verification.total_bytes_verified
+        );
+
+        let capped = verify_run_bundle_bounded(
+            &bundle_dir,
+            RunBundleVerificationLimits {
+                max_manifest_bytes: 1024 * 1024,
+                max_artifacts: 4,
+                max_artifact_bytes: 1,
+                max_total_artifact_bytes: 2048,
+            },
+        );
+        assert!(matches!(
+            capped,
+            Err(BundleError::VerificationLimitExceeded {
+                resource: "artifact_bytes",
+                ..
+            })
+        ));
+
+        let mut database_alias = bundle.clone();
+        database_alias.artifacts[0].relative_path = "nested/renamed.sqlite".to_owned();
+        database_alias.artifacts[0].artifact_type = "database".to_owned();
+        fs::create_dir_all(bundle_dir.join("nested"))?;
+        fs::write(bundle_dir.join("nested/renamed.sqlite"), summary_csv)?;
+        database_alias.artifacts[0].blake3_hex = hash_hex(summary_csv);
+        database_alias.artifacts[0].bytes_len = summary_csv.len() as u64;
+        write_bundle_manifest(&bundle_dir, &database_alias)?;
+        assert!(matches!(
+            verify_run_bundle_bounded(
+                &bundle_dir,
+                RunBundleVerificationLimits {
+                    max_manifest_bytes: 1024 * 1024,
+                    max_artifacts: 4,
+                    max_artifact_bytes: 1024,
+                    max_total_artifact_bytes: 2048,
+                },
+            ),
+            Err(BundleError::BoundedDatabaseVerificationUnavailable(_))
+        ));
+
+        let mut duplicate = bundle.clone();
+        duplicate.artifacts.push(duplicate.artifacts[0].clone());
+        write_bundle_manifest(&bundle_dir, &duplicate)?;
+        assert!(matches!(
+            verify_run_bundle_bounded(
+                &bundle_dir,
+                RunBundleVerificationLimits {
+                    max_manifest_bytes: 1024 * 1024,
+                    max_artifacts: 4,
+                    max_artifact_bytes: 1024,
+                    max_total_artifact_bytes: 2048,
+                },
+            ),
+            Err(BundleError::DuplicateArtifactPath(_))
+        ));
+
+        let mut contradictory = bundle.clone();
+        contradictory.digests.run_id = "different-run".to_owned();
+        write_bundle_manifest(&bundle_dir, &contradictory)?;
+        assert!(matches!(
+            verify_run_bundle_bounded(
+                &bundle_dir,
+                RunBundleVerificationLimits {
+                    max_manifest_bytes: 1024 * 1024,
+                    max_artifacts: 4,
+                    max_artifact_bytes: 1024,
+                    max_total_artifact_bytes: 2048,
+                },
+            ),
+            Err(BundleError::RunIdProjectionMismatch { .. })
+        ));
+        write_bundle_manifest(&bundle_dir, &bundle)?;
 
         // Tampering with a nested artifact is caught by the same checksum loop.
         fs::write(bundle_dir.join("exports/summary.csv"), b"tampered")?;

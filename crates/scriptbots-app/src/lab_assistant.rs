@@ -104,7 +104,9 @@ impl ExperimentExecutor for MatchedSeedExecutor {
             2,
             &output_dir,
         );
-        let status = runner.execute_batch(&output_dir.join("status.json"))?;
+        let status = runner
+            .execute_batch(&output_dir.join("status.json"))
+            .map_err(|error| error.to_string())?;
         execution_receipt(spec, &status)
     }
 }
