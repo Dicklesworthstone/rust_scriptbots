@@ -1,26 +1,63 @@
-//! Canvas ramps, heading whiskers, hillshading, water shimmer, and day/night tint (bd-2z0.14.2.1.2).
+//! Sub-cell heading encoding for the `FrankenTUI` world canvas (bd-2z0.14.2.1).
+//!
+//! # What is deliberately NOT here
+//!
+//! This module previously also carried `hillshade_multiplier`,
+//! `water_shimmer_alpha`, `food_pulse_glow`, and `day_night_tint_factor`. Each
+//! was a terminal-local re-derivation of a curve that
+//! [`scriptbots_core::visual`] already defines for every surface:
+//!
+//! | removed here            | shared definition                            |
+//! |-------------------------|----------------------------------------------|
+//! | `hillshade_multiplier`  | [`visual::terrain_normal_light_factor`]      |
+//! | `water_shimmer_alpha`   | [`visual::shimmer`]                          |
+//! | `food_pulse_glow`       | [`visual::shimmer`]                          |
+//! | `day_night_tint_factor` | [`visual::daylight_factor`]                  |
+//!
+//! Keeping both sets meant the terminal could report a different time of day, or
+//! a different point in a cell's pulse, than Bevy or GPUI showed for the same
+//! tick — which is exactly the cross-surface equivalence this canvas is supposed
+//! to demonstrate. The canvas now calls the shared functions directly, so the
+//! only thing left in this module is the piece that has no shared equivalent:
+//! how a heading becomes a neighbouring SUB-PIXEL, which is a fact about the
+//! braille grid and about nothing else.
+//!
+//! [`visual::terrain_normal_light_factor`]: scriptbots_core::visual::terrain_normal_light_factor
+//! [`visual::shimmer`]: scriptbots_core::visual::shimmer
+//! [`visual::daylight_factor`]: scriptbots_core::visual::daylight_factor
+//! [`scriptbots_core::visual`]: scriptbots_core::visual
 
-use std::f32::consts::PI;
+use std::f32::consts::{PI, TAU};
 
-/// Heading whisker sector (8 directional sectors).
+/// One of the eight compass sectors a heading is quantized into.
+///
+/// The sector index matches the terminal's arrow glyphs exactly (`→ ↗ ↑ ↖ ← ↙ ↓
+/// ↘` for 0..=7), so the canvas whisker and the flat map's arrow can never
+/// disagree about which way an agent is facing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadingSector {
-    North = 0,
+    East = 0,
     NorthEast = 1,
-    East = 2,
-    SouthEast = 3,
-    South = 4,
+    North = 2,
+    NorthWest = 3,
+    West = 4,
     SouthWest = 5,
-    West = 6,
-    NorthWest = 7,
+    South = 6,
+    SouthEast = 7,
 }
 
 impl HeadingSector {
+    /// Quantize a world heading in radians (0 = east, increasing counterclockwise).
+    ///
+    /// A non-finite heading is reported as [`Self::East`] rather than panicking:
+    /// one corrupt agent must not be able to take down the frame loop.
+    #[must_use]
     pub fn from_angle(radians: f32) -> Self {
-        let normalized = (radians % (2.0 * PI) + 2.0 * PI) % (2.0 * PI);
-        let sector = ((normalized + PI / 8.0) / (PI / 4.0)).floor() as usize % 8;
+        if !radians.is_finite() {
+            return Self::East;
+        }
+        let sector = ((radians.rem_euclid(TAU) / (PI / 4.0)).round() as i32) & 7;
         match sector {
-            0 => Self::East,
             1 => Self::NorthEast,
             2 => Self::North,
             3 => Self::NorthWest,
@@ -28,61 +65,38 @@ impl HeadingSector {
             5 => Self::SouthWest,
             6 => Self::South,
             7 => Self::SouthEast,
-            _ => Self::North,
+            _ => Self::East,
         }
     }
 
-    /// Braille dot pattern mask for heading whisker display.
-    pub const fn braille_dot_mask(self) -> u8 {
+    /// The neighbouring sub-pixel offset `(dx, dy)` in the direction of travel.
+    ///
+    /// Screen space, so `dy` grows DOWNWARD: north is `(0, -1)`. All eight
+    /// offsets are distinct, which is what makes the whisker readable — an
+    /// encoding that collapsed two sectors onto the same dot would render two
+    /// different headings identically.
+    #[must_use]
+    pub const fn whisker_offset(self) -> (i32, i32) {
         match self {
-            Self::North => 0b0000_0001,
-            Self::NorthEast => 0b0000_1001,
-            Self::East => 0b0000_1000,
-            Self::SouthEast => 0b0100_1000,
-            Self::South => 0b0100_0000,
-            Self::SouthWest => 0b0100_0000,
-            Self::West => 0b0000_0010,
-            Self::NorthWest => 0b0000_0011,
+            Self::East => (1, 0),
+            Self::NorthEast => (1, -1),
+            Self::North => (0, -1),
+            Self::NorthWest => (-1, -1),
+            Self::West => (-1, 0),
+            Self::SouthWest => (-1, 1),
+            Self::South => (0, 1),
+            Self::SouthEast => (1, 1),
         }
     }
-}
-
-/// Compute hillshading intensity multiplier from elevation gradients (dz_dx, dz_dy).
-pub fn hillshade_multiplier(dz_dx: f32, dz_dy: f32) -> f32 {
-    let light_x = -0.707;
-    let light_y = 0.707;
-    let dot = -(dz_dx * light_x + dz_dy * light_y);
-    (1.0 + dot * 0.4).clamp(0.4, 1.6)
-}
-
-/// Compute water shimmer alpha offset based on tick phase and position hash.
-pub fn water_shimmer_alpha(tick: u64, cell_x: u32, cell_y: u32) -> f32 {
-    let phase = (tick as f32 * 0.1) + (cell_x as f32 * 0.3) + (cell_y as f32 * 0.5);
-    (phase.sin() * 0.15 + 0.85).clamp(0.7, 1.0)
-}
-
-/// Compute food pulse glow intensity from tick phase.
-pub fn food_pulse_glow(tick: u64) -> f32 {
-    let phase = tick as f32 * 0.05;
-    (phase.sin() * 0.2 + 0.8).clamp(0.6, 1.0)
-}
-
-/// Compute day/night brightness tint factor from time tick.
-pub fn day_night_tint_factor(tick: u64, day_cycle_ticks: u64) -> f32 {
-    if day_cycle_ticks == 0 {
-        return 1.0;
-    }
-    let cycle_pos = (tick % day_cycle_ticks) as f32 / day_cycle_ticks as f32;
-    let sun_angle = cycle_pos * 2.0 * PI;
-    (sun_angle.sin() * 0.4 + 0.6).clamp(0.2, 1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
-    fn test_heading_sector_encoding() {
+    fn cardinal_angles_map_to_their_sectors() {
         assert_eq!(HeadingSector::from_angle(0.0), HeadingSector::East);
         assert_eq!(HeadingSector::from_angle(PI / 2.0), HeadingSector::North);
         assert_eq!(HeadingSector::from_angle(PI), HeadingSector::West);
@@ -90,22 +104,87 @@ mod tests {
             HeadingSector::from_angle(3.0 * PI / 2.0),
             HeadingSector::South
         );
-
-        assert!(HeadingSector::North.braille_dot_mask() > 0);
+        // Wrapping and negative headings resolve to the same sectors.
+        assert_eq!(HeadingSector::from_angle(TAU), HeadingSector::East);
+        assert_eq!(HeadingSector::from_angle(-PI / 2.0), HeadingSector::South);
     }
 
     #[test]
-    fn test_hillshading_and_tint_curves() {
-        let flat = hillshade_multiplier(0.0, 0.0);
-        assert_eq!(flat, 1.0);
+    fn diagonal_angles_map_to_their_sectors() {
+        for (index, expected) in [
+            HeadingSector::East,
+            HeadingSector::NorthEast,
+            HeadingSector::North,
+            HeadingSector::NorthWest,
+            HeadingSector::West,
+            HeadingSector::SouthWest,
+            HeadingSector::South,
+            HeadingSector::SouthEast,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let angle = index as f32 * (PI / 4.0);
+            assert_eq!(
+                HeadingSector::from_angle(angle),
+                expected,
+                "sector {index} at {angle} rad"
+            );
+        }
+    }
 
-        let steep = hillshade_multiplier(1.0, -1.0);
-        assert!(steep > 1.0);
+    /// The whole point of the whisker: eight headings must produce eight
+    /// distinguishable dots. A collision would silently render two directions
+    /// the same.
+    #[test]
+    fn every_sector_has_a_distinct_unit_offset() {
+        let sectors = [
+            HeadingSector::East,
+            HeadingSector::NorthEast,
+            HeadingSector::North,
+            HeadingSector::NorthWest,
+            HeadingSector::West,
+            HeadingSector::SouthWest,
+            HeadingSector::South,
+            HeadingSector::SouthEast,
+        ];
+        let offsets: BTreeSet<(i32, i32)> = sectors.iter().map(|s| s.whisker_offset()).collect();
+        assert_eq!(offsets.len(), 8, "all eight offsets distinct: {offsets:?}");
+        for sector in sectors {
+            let (dx, dy) = sector.whisker_offset();
+            assert!(
+                dx.abs() <= 1 && dy.abs() <= 1 && (dx != 0 || dy != 0),
+                "{sector:?} must be a nonzero unit step, got ({dx},{dy})"
+            );
+        }
+    }
 
-        let tint = day_night_tint_factor(500, 1000);
-        assert!(tint >= 0.2 && tint <= 1.0);
+    /// The offset must point the same way the sector's angle does: `dx` follows
+    /// `cos`, and `dy` follows `-sin` because screen rows grow downward.
+    #[test]
+    fn offsets_agree_with_the_angle_they_came_from() {
+        for step in 0..8 {
+            let angle = step as f32 * (PI / 4.0);
+            let (dx, dy) = HeadingSector::from_angle(angle).whisker_offset();
+            assert_eq!(
+                dx,
+                angle.cos().round() as i32,
+                "dx follows cos at {angle} rad"
+            );
+            assert_eq!(
+                dy,
+                (-angle.sin()).round() as i32,
+                "dy follows -sin at {angle} rad"
+            );
+        }
+    }
 
-        let glow = food_pulse_glow(10);
-        assert!(glow >= 0.6 && glow <= 1.0);
+    #[test]
+    fn non_finite_headings_do_not_panic() {
+        assert_eq!(HeadingSector::from_angle(f32::NAN), HeadingSector::East);
+        assert_eq!(
+            HeadingSector::from_angle(f32::INFINITY),
+            HeadingSector::East
+        );
     }
 }

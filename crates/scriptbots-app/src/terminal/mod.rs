@@ -63,6 +63,8 @@ pub mod command_palette;
 pub mod frankentui_shell;
 pub mod paint;
 
+use canvas_ramps::HeadingSector;
+
 const TARGET_SIM_HZ: f32 = 60.0;
 const MAX_STEPS_PER_FRAME: usize = 240;
 const UI_TICK_MILLIS: u64 = 100;
@@ -386,6 +388,11 @@ struct TerminalApp<'a> {
     last_draw: Instant,
     palette: Palette,
     terrain: TerrainView,
+    /// Resolved `(cycle_ticks, start_phase)` for [`visual::daylight_factor`],
+    /// read once from the run's render settings. It is presentation-only and is
+    /// captured alongside the terrain so the canvas never re-reads config while
+    /// painting.
+    day_night: (u32, f32),
     event_log: VecDeque<EventEntry>,
     last_event_tick: u64,
     snapshot: Snapshot,
@@ -444,12 +451,15 @@ struct TerminalApp<'a> {
 impl<'a> TerminalApp<'a> {
     fn new(renderer: &TerminalRenderer, ctx: RendererContext<'a>) -> Self {
         let palette = Palette::detect();
-        let terrain = {
+        let (terrain, day_night) = {
             let world = ctx
                 .world
                 .lock()
                 .expect("world mutex poisoned while capturing terrain");
-            TerrainView::from(world.terrain())
+            (
+                TerrainView::from(world.terrain()),
+                world.config().render.resolved_day_night(),
+            )
         };
         let mut app = Self {
             world: Arc::clone(&ctx.world),
@@ -469,6 +479,7 @@ impl<'a> TerminalApp<'a> {
             last_draw: Instant::now(),
             palette,
             terrain,
+            day_night,
             event_log: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
             last_event_tick: 0,
             snapshot: Snapshot::default(),
@@ -1428,6 +1439,7 @@ impl<'a> TerminalApp<'a> {
                     scratch: &mut self.map_scratch,
                     stamp: self.map_stamp,
                     canvas,
+                    day_night: self.day_night,
                 },
                 inner,
             );
@@ -3392,25 +3404,69 @@ struct TerrainView {
     width: u32,
     height: u32,
     kinds: Vec<TerrainKind>,
+    /// Per-tile normalized elevation, parallel to `kinds`. Only the sub-cell
+    /// canvas reads it, to build the hillshade gradient; the flat map ignores it.
+    elevations: Vec<f32>,
 }
 
 impl TerrainView {
     fn from(terrain: &TerrainLayer) -> Self {
+        let tiles = terrain.tiles();
         Self {
             width: terrain.width(),
             height: terrain.height(),
-            kinds: terrain.tiles().iter().map(|tile| tile.kind).collect(),
+            kinds: tiles.iter().map(|tile| tile.kind).collect(),
+            elevations: tiles.iter().map(|tile| tile.elevation).collect(),
         }
     }
 
-    fn sample(&self, u: f32, v: f32) -> TerrainKind {
+    /// Tile coordinates for a normalized world point, or `None` for an empty view.
+    fn tile_coords(&self, u: f32, v: f32) -> Option<(u32, u32)> {
         if self.width == 0 || self.height == 0 || self.kinds.is_empty() {
-            return TerrainKind::Grass;
+            return None;
         }
-        let x = ((u.clamp(0.0, 0.9999)) * self.width as f32).floor() as usize;
-        let y = ((v.clamp(0.0, 0.9999)) * self.height as f32).floor() as usize;
-        let idx = y.saturating_mul(self.width as usize) + x;
+        let x = ((u.clamp(0.0, 0.9999)) * self.width as f32).floor() as u32;
+        let y = ((v.clamp(0.0, 0.9999)) * self.height as f32).floor() as u32;
+        Some((x.min(self.width - 1), y.min(self.height - 1)))
+    }
+
+    fn sample(&self, u: f32, v: f32) -> TerrainKind {
+        let Some((x, y)) = self.tile_coords(u, v) else {
+            return TerrainKind::Grass;
+        };
+        let idx = (y as usize).saturating_mul(self.width as usize) + x as usize;
         self.kinds.get(idx).copied().unwrap_or(TerrainKind::Grass)
+    }
+
+    /// Elevation of one tile, clamped to the grid (edges repeat rather than wrap:
+    /// a wrapped neighbour would light the world seam as a false cliff).
+    fn elevation_at(&self, x: u32, y: u32) -> f32 {
+        if self.width == 0 || self.height == 0 {
+            return 0.0;
+        }
+        let x = x.min(self.width - 1) as usize;
+        let y = y.min(self.height - 1) as usize;
+        let idx = y.saturating_mul(self.width as usize) + x;
+        self.elevations.get(idx).copied().unwrap_or(0.0)
+    }
+
+    /// Central-difference elevation gradient `[dh/dx, dh/dy]` in elevation units
+    /// per tile, for [`scriptbots_core::visual::terrain_normal_light_factor`].
+    ///
+    /// Flat ground yields `[0, 0]`, which that function maps to exactly `1.0`, so
+    /// a world with no relief is neither darkened nor brightened by hillshading.
+    fn elevation_gradient(&self, u: f32, v: f32) -> [f32; 2] {
+        if self.elevations.len() != self.kinds.len() {
+            return [0.0, 0.0];
+        }
+        let Some((x, y)) = self.tile_coords(u, v) else {
+            return [0.0, 0.0];
+        };
+        let left = self.elevation_at(x.saturating_sub(1), y);
+        let right = self.elevation_at(x.saturating_add(1), y);
+        let up = self.elevation_at(x, y.saturating_sub(1));
+        let down = self.elevation_at(x, y.saturating_add(1));
+        [(right - left) * 0.5, (down - up) * 0.5]
     }
 }
 
@@ -5179,6 +5235,8 @@ struct MapWidget<'a> {
     /// Sub-cell canvas, when the view has one and the terminal can show it.
     /// `None` selects the flat one-glyph-per-cell map.
     canvas: Option<&'a mut SubCellBuffer>,
+    /// Resolved `(cycle_ticks, start_phase)` for the shared daylight curve.
+    day_night: (u32, f32),
 }
 
 /// Terrain alpha, deliberately below [`subcell::ALPHA_SOLID`]: terrain must land
@@ -5189,6 +5247,36 @@ const CANVAS_TERRAIN_ALPHA: f32 = 0.35;
 /// Normalized food below this doesn't earn a dot; without a floor, grid noise
 /// lights the whole map and the density gain is wasted.
 const CANVAS_FOOD_THRESHOLD: f32 = 0.18;
+
+/// Fraction of terrain brightness that survives midnight.
+///
+/// [`visual::daylight_factor`] bottoms out at [`visual::DAYLIGHT_NIGHT_FLOOR`]
+/// (0.15). A GPU surface can render terrain that dark and still read, because it
+/// has thousands of shades per tile; a terminal cell has one background color and
+/// a 256-entry palette, so scaling straight by the raw factor collapses the whole
+/// map into the same near-black bucket and the biome ramp disappears. The shared
+/// daylight SIGNAL is unchanged — this only remaps its output into the brightness
+/// band a terminal can still resolve.
+const CANVAS_NIGHT_FLOOR: f32 = 0.45;
+
+/// Half-depth of the water shimmer swing, applied to water terrain brightness.
+///
+/// Phase comes from [`visual::shimmer`], so a cell pulses in lockstep with the
+/// same cell on the GPU surfaces and in replay; only the amplitude is per-surface.
+const CANVAS_WATER_SHIMMER_SWING: f32 = 0.12;
+
+/// Half-depth of the food pulse swing, applied to food ink brightness.
+const CANVAS_FOOD_PULSE_SWING: f32 = 0.15;
+
+/// Brightness of a heading whisker relative to the agent's own dot. Dim enough
+/// that a whisker never reads as a second agent, bright enough to see the sector.
+const CANVAS_WHISKER_DIM: f32 = 0.45;
+
+/// Brightness multiplier applied to a boosted agent's dot.
+const CANVAS_BOOST_FLARE: f32 = 1.6;
+
+/// Spike length above which the canvas paints an attack cue.
+const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
 
 impl MapWidget<'_> {
     /// Paint the world into the sub-cell buffer and blit the composed frame.
@@ -5209,6 +5297,7 @@ impl MapWidget<'_> {
         // Repaint from world state every frame. Higher layers must be cleared
         // first: `set` only replaces when the incoming layer is at least the
         // stored one, so last frame's agent dots would otherwise survive.
+        canvas.clear_layer(Layer::Cues);
         canvas.clear_layer(Layer::Agents);
         canvas.clear_layer(Layer::Food);
 
@@ -5220,33 +5309,146 @@ impl MapWidget<'_> {
         let inv_w = 1.0 / f32::from(sub_w);
         let inv_h = 1.0 / f32::from(sub_h);
 
+        // Environment modulation comes from the renderer-neutral visual semantics
+        // so the terminal, Bevy, and GPUI agree on what time of day it is and on
+        // which cell is mid-pulse. Only the theme colors below are TUI-local.
+        let tick = ctx.snapshot.tick;
+        let daylight = visual::daylight_factor(tick, ctx.day_night.0, ctx.day_night.1);
+        let day_scale = CANVAS_NIGHT_FLOOR + (1.0 - CANVAS_NIGHT_FLOOR) * daylight;
+
         for sy in 0..sub_h {
             let v = (f32::from(sy) + 0.5) * inv_h;
             for sx in 0..sub_w {
                 let u = (f32::from(sx) + 0.5) * inv_w;
                 let kind = ctx.terrain.sample(u, v);
                 let base = ctx.palette.terrain_canvas_rgb(kind);
+
+                // Hillshade: the shared normal-light term keyed on terrain kind, so
+                // rock reads craggy and water flat from the same elevation slope.
+                let gradient = ctx.terrain.elevation_gradient(u, v);
+                let mut scale =
+                    visual::terrain_normal_light_factor(kind, gradient, daylight) * day_scale;
+
+                // Water shimmer is phase-locked per WORLD tile, not per screen cell:
+                // keying it on the terminal grid would make the pattern crawl as the
+                // user resizes the pane, which is motion the world never had.
+                if matches!(kind, TerrainKind::DeepWater | TerrainKind::ShallowWater)
+                    && let Some((tx, ty)) = ctx.terrain.tile_coords(u, v)
+                {
+                    let pulse = visual::shimmer(tick, tx, ty);
+                    scale *=
+                        1.0 - CANVAS_WATER_SHIMMER_SWING + 2.0 * CANVAS_WATER_SHIMMER_SWING * pulse;
+                }
+
                 canvas.set(
                     Layer::Terrain,
                     sx,
                     sy,
-                    [base[0], base[1], base[2], CANVAS_TERRAIN_ALPHA],
+                    [
+                        (base[0] * scale).clamp(0.0, 1.0),
+                        (base[1] * scale).clamp(0.0, 1.0),
+                        (base[2] * scale).clamp(0.0, 1.0),
+                        CANVAS_TERRAIN_ALPHA,
+                    ],
                 );
+
                 let food = ctx.snapshot.food.sample(u, v);
                 if food > CANVAS_FOOD_THRESHOLD {
                     let ink = ctx.palette.food_canvas_rgb(kind, food);
-                    canvas.set(Layer::Food, sx, sy, [ink[0], ink[1], ink[2], 1.0]);
+                    // Food keeps its own pulse phase (same shared function, same
+                    // tile) and stays above the night floor: a dot that dims into
+                    // the background is indistinguishable from food that was eaten.
+                    let pulse = ctx
+                        .terrain
+                        .tile_coords(u, v)
+                        .map_or(0.5, |(tx, ty)| visual::shimmer(tick, tx, ty));
+                    let glow = (1.0 - CANVAS_FOOD_PULSE_SWING
+                        + 2.0 * CANVAS_FOOD_PULSE_SWING * pulse)
+                        * day_scale.max(CANVAS_NIGHT_FLOOR);
+                    canvas.set(
+                        Layer::Food,
+                        sx,
+                        sy,
+                        [
+                            (ink[0] * glow).clamp(0.0, 1.0),
+                            (ink[1] * glow).clamp(0.0, 1.0),
+                            (ink[2] * glow).clamp(0.0, 1.0),
+                            1.0,
+                        ],
+                    );
                 }
             }
         }
 
         let span_w = f32::from(sub_w);
         let span_h = f32::from(sub_h);
-        for agent in &ctx.snapshot.agents {
+        let agent_dot = |agent: &AgentViz| {
             let sx = (agent.position.0 * span_w).floor().clamp(0.0, span_w - 1.0) as u16;
             let sy = (agent.position.1 * span_h).floor().clamp(0.0, span_h - 1.0) as u16;
+            (sx, sy)
+        };
+
+        // Whiskers first, bodies second. Both write the Agents layer, and `set`
+        // replaces within a layer, so the second pass guarantees a body dot always
+        // wins the sub-pixel over any neighbour's whisker. One interleaved pass
+        // would let paint order decide, which is how an agent goes missing.
+        for agent in &ctx.snapshot.agents {
+            let (sx, sy) = agent_dot(agent);
+            let (dx, dy) = HeadingSector::from_angle(agent.heading).whisker_offset();
+            let (Ok(wx), Ok(wy)) = (
+                u16::try_from(i32::from(sx) + dx),
+                u16::try_from(i32::from(sy) + dy),
+            ) else {
+                continue;
+            };
             let ink = ctx.palette.agent_canvas_rgb(agent.diet, agent.energy);
-            canvas.set(Layer::Agents, sx, sy, [ink[0], ink[1], ink[2], 1.0]);
+            canvas.set(
+                Layer::Agents,
+                wx,
+                wy,
+                [
+                    ink[0] * CANVAS_WHISKER_DIM,
+                    ink[1] * CANVAS_WHISKER_DIM,
+                    ink[2] * CANVAS_WHISKER_DIM,
+                    1.0,
+                ],
+            );
+        }
+
+        for agent in &ctx.snapshot.agents {
+            let (sx, sy) = agent_dot(agent);
+            let ink = ctx.palette.agent_canvas_rgb(agent.diet, agent.energy);
+            // Boost is the one agent state with no other channel on this canvas:
+            // a dot is a dot regardless of speed, so flare it instead.
+            let flare = if agent.boosted {
+                CANVAS_BOOST_FLARE
+            } else {
+                1.0
+            };
+            canvas.set(
+                Layer::Agents,
+                sx,
+                sy,
+                [
+                    (ink[0] * flare).clamp(0.0, 1.0),
+                    (ink[1] * flare).clamp(0.0, 1.0),
+                    (ink[2] * flare).clamp(0.0, 1.0),
+                    1.0,
+                ],
+            );
+
+            // An extended spike is an attack in progress. It goes on the Cues
+            // layer, above every body, because a strike that another agent's dot
+            // could hide is a strike the observer never sees.
+            if agent.spike_length > CANVAS_SPIKE_THRESHOLD {
+                let (dx, dy) = HeadingSector::from_angle(agent.heading).whisker_offset();
+                if let (Ok(tx), Ok(ty)) = (
+                    u16::try_from(i32::from(sx) + dx * 2),
+                    u16::try_from(i32::from(sy) + dy * 2),
+                ) {
+                    canvas.set(Layer::Cues, tx, ty, [1.0, 0.32, 0.16, 1.0]);
+                }
+            }
         }
 
         // Quantize through the engine's own quantizer so a 256-color terminal is
@@ -5376,7 +5578,64 @@ mod tests {
             width: 1,
             height: 1,
             kinds: vec![TerrainKind::Grass],
+            elevations: vec![0.5],
         }
+    }
+
+    /// The default day/night resolution, so canvas tests exercise the same
+    /// daylight curve the app resolves at launch rather than a test-only one.
+    fn canvas_test_day_night() -> (u32, f32) {
+        visual::resolve_day_night(None, None)
+    }
+
+    /// Render one canvas frame and hand back the composed buffer.
+    fn render_canvas_frame(
+        snapshot: &Snapshot,
+        terrain: &TerrainView,
+        cells: (u16, u16),
+        day_night: (u32, f32),
+    ) -> Buffer {
+        let palette = Palette::test_backend_evidence();
+        let mut scratch =
+            vec![CellOccupancy::default(); usize::from(cells.0) * usize::from(cells.1)];
+        let mut canvas = SubCellBuffer::new(cells.0, cells.1, SubCellMode::Braille);
+        let area = Rect::new(0, 0, cells.0, cells.1);
+        let mut buf = Buffer::empty(area);
+        MapWidget {
+            snapshot,
+            terrain,
+            palette: &palette,
+            scratch: &mut scratch,
+            stamp: 1,
+            canvas: Some(&mut canvas),
+            day_night,
+        }
+        .render(area, &mut buf);
+        buf
+    }
+
+    /// The braille bit a sub-pixel `(x, y)` contributes to its terminal cell.
+    const fn braille_bit(sub_x: u16, sub_y: u16) -> u32 {
+        const BITS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+        BITS[(sub_y % 4) as usize][(sub_x % 2) as usize]
+    }
+
+    fn cell_fg(buf: &Buffer, x: u16, y: u16) -> (u8, u8, u8) {
+        match buf[(x, y)].style().fg {
+            Some(Color::Rgb(r, g, b)) => (r, g, b),
+            other => panic!("expected an RGB foreground at ({x},{y}), got {other:?}"),
+        }
+    }
+
+    fn cell_bg(buf: &Buffer, x: u16, y: u16) -> (u8, u8, u8) {
+        match buf[(x, y)].style().bg {
+            Some(Color::Rgb(r, g, b)) => (r, g, b),
+            other => panic!("expected an RGB background at ({x},{y}), got {other:?}"),
+        }
+    }
+
+    fn luminance(rgb: (u8, u8, u8)) -> f32 {
+        0.2126 * f32::from(rgb.0) + 0.7152 * f32::from(rgb.1) + 0.0722 * f32::from(rgb.2)
     }
 
     fn canvas_test_agent(x: f32, y: f32) -> AgentViz {
@@ -5401,31 +5660,22 @@ mod tests {
     /// (0.13,0.13) on dot (1,1) — both inside terminal cell (0,0).
     ///
     /// Expected glyph pins the Unicode braille bit layout through the real
-    /// render path: dot(0,0)=0x01 and dot(1,1)=0x10, so U+2800+0x11 = U+2811.
+    /// render path: body dot(0,0)=0x01, body dot(1,1)=0x10, and the east-facing
+    /// heading whisker of the first agent at dot(1,0)=0x08. The second agent's
+    /// whisker lands at sub-pixel (2,1), which belongs to the next cell.
     #[test]
     fn sub_cell_canvas_resolves_two_agents_inside_one_terminal_cell() {
         let mut snapshot = Snapshot::default();
         snapshot.agents = vec![canvas_test_agent(0.0, 0.0), canvas_test_agent(0.13, 0.13)];
         let terrain = canvas_test_terrain();
-        let palette = Palette::test_backend_evidence();
-        let mut scratch = vec![CellOccupancy::default(); 8];
-        let mut canvas = SubCellBuffer::new(4, 2, SubCellMode::Braille);
-        let area = Rect::new(0, 0, 4, 2);
-        let mut buf = Buffer::empty(area);
+        let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
 
-        MapWidget {
-            snapshot: &snapshot,
-            terrain: &terrain,
-            palette: &palette,
-            scratch: &mut scratch,
-            stamp: 1,
-            canvas: Some(&mut canvas),
-        }
-        .render(area, &mut buf);
-
+        let expected =
+            char::from_u32(0x2800 | braille_bit(0, 0) | braille_bit(1, 1) | braille_bit(1, 0))
+                .expect("braille code point");
         assert_eq!(
             buf[(0, 0)].symbol(),
-            "\u{2811}",
+            expected.to_string(),
             "two agents in one cell must occupy two distinct braille dots"
         );
     }
@@ -5437,21 +5687,7 @@ mod tests {
     fn sub_cell_canvas_puts_terrain_in_the_background_not_the_dots() {
         let snapshot = Snapshot::default();
         let terrain = canvas_test_terrain();
-        let palette = Palette::test_backend_evidence();
-        let mut scratch = vec![CellOccupancy::default(); 8];
-        let mut canvas = SubCellBuffer::new(4, 2, SubCellMode::Braille);
-        let area = Rect::new(0, 0, 4, 2);
-        let mut buf = Buffer::empty(area);
-
-        MapWidget {
-            snapshot: &snapshot,
-            terrain: &terrain,
-            palette: &palette,
-            scratch: &mut scratch,
-            stamp: 1,
-            canvas: Some(&mut canvas),
-        }
-        .render(area, &mut buf);
+        let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
 
         let cell = &buf[(1, 1)];
         assert_eq!(
@@ -5485,6 +5721,7 @@ mod tests {
             scratch: &mut scratch,
             stamp: 1,
             canvas: None,
+            day_night: canvas_test_day_night(),
         }
         .render(area, &mut buf);
 
@@ -5499,6 +5736,222 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A heading must be visible in the canvas, and it must be visible in the
+    /// direction the agent is actually facing. All eight sectors are driven
+    /// through the real render path and checked against the sub-pixel the
+    /// shared [`HeadingSector`] encoding names — so a whisker wired to the wrong
+    /// axis, or to a sector table that collapses two directions, fails here.
+    #[test]
+    fn heading_whisker_lights_the_sub_pixel_the_agent_faces() {
+        let terrain = canvas_test_terrain();
+        // Centre of a 4x4 cell area = an 8x16 braille grid; (0.5, 0.5) lands on
+        // sub-pixel (4, 8), which has a neighbour in every direction.
+        for step in 0..8_u16 {
+            let heading = f32::from(step) * (PI / 4.0);
+            let mut agent = canvas_test_agent(0.5, 0.5);
+            agent.heading = heading;
+            let mut snapshot = Snapshot::default();
+            snapshot.agents = vec![agent];
+
+            let buf = render_canvas_frame(&snapshot, &terrain, (4, 4), canvas_test_day_night());
+
+            let (dx, dy) = HeadingSector::from_angle(heading).whisker_offset();
+            let (wx, wy) = (
+                u16::try_from(4 + dx).expect("whisker stays on the grid"),
+                u16::try_from(8 + dy).expect("whisker stays on the grid"),
+            );
+            let symbol = buf[(wx / 2, wy / 4)].symbol();
+            let code = symbol.chars().next().map(u32::from).expect("one glyph");
+            assert!(
+                code & braille_bit(wx, wy) != 0,
+                "heading {heading} rad must light sub-pixel ({wx},{wy}); glyph was {symbol:?}"
+            );
+        }
+    }
+
+    /// A whisker must never be mistaken for a second agent: it is painted at a
+    /// fraction of the body's brightness, and a body always wins a sub-pixel a
+    /// neighbour's whisker also wanted.
+    #[test]
+    fn a_body_dot_outranks_a_neighbours_whisker() {
+        let terrain = canvas_test_terrain();
+        // 4x2 cells = an 8x8 grid. An east-facing agent on sub-pixel (0,0) puts
+        // its whisker on (1,0); a second agent's BODY sits on that same pixel.
+        let mut leader = canvas_test_agent(0.0, 0.0);
+        leader.heading = 0.0;
+        let follower = canvas_test_agent(0.13, 0.0);
+        let mut snapshot = Snapshot::default();
+        snapshot.agents = vec![leader, follower];
+        let with_body = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
+
+        let mut lone = Snapshot::default();
+        let mut solo = canvas_test_agent(0.0, 0.0);
+        solo.heading = 0.0;
+        lone.agents = vec![solo];
+        let whisker_only = render_canvas_frame(&lone, &terrain, (4, 2), canvas_test_day_night());
+
+        assert!(
+            luminance(cell_fg(&with_body, 0, 0)) > luminance(cell_fg(&whisker_only, 0, 0)),
+            "a body on the whisker's pixel must brighten the cell, not be erased by it"
+        );
+    }
+
+    /// Boost has no other channel on this canvas — a dot is a dot regardless of
+    /// speed — so it must change the dot's brightness or it is invisible.
+    #[test]
+    fn boosted_agents_flare_brighter_than_unboosted_ones() {
+        let terrain = canvas_test_terrain();
+        let render = |boosted: bool| {
+            let mut agent = canvas_test_agent(0.0, 0.0);
+            agent.boosted = boosted;
+            let mut snapshot = Snapshot::default();
+            snapshot.agents = vec![agent];
+            let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
+            luminance(cell_fg(&buf, 0, 0))
+        };
+        assert!(
+            render(true) > render(false),
+            "a boosted agent must read brighter than an idle one"
+        );
+    }
+
+    /// An extended spike is an attack in progress. It paints on the Cues layer,
+    /// which outranks every body, so a strike can never be hidden behind another
+    /// agent's dot — and it lands two sub-pixels ahead, not on the attacker.
+    #[test]
+    fn an_extended_spike_paints_a_cue_ahead_of_the_attacker() {
+        let terrain = canvas_test_terrain();
+        let mut attacker = canvas_test_agent(0.5, 0.5);
+        attacker.heading = 0.0; // east
+        attacker.spike_length = 1.0;
+        // A second agent sits exactly where the cue lands; the cue must still win.
+        let shield = canvas_test_agent(0.76, 0.5);
+        let mut snapshot = Snapshot::default();
+        snapshot.agents = vec![attacker, shield];
+        let armed = render_canvas_frame(&snapshot, &terrain, (4, 4), canvas_test_day_night());
+
+        let mut idle_snapshot = Snapshot::default();
+        let mut idle = canvas_test_agent(0.5, 0.5);
+        idle.heading = 0.0;
+        idle_snapshot.agents = vec![idle, canvas_test_agent(0.76, 0.5)];
+        let idle_frame =
+            render_canvas_frame(&idle_snapshot, &terrain, (4, 4), canvas_test_day_night());
+
+        // Sub-pixel (4,8) + 2 east = (6,8), which is terminal cell (3,2).
+        let armed_fg = cell_fg(&armed, 3, 2);
+        let idle_fg = cell_fg(&idle_frame, 3, 2);
+        assert_ne!(
+            armed_fg, idle_fg,
+            "an extended spike must change what the cell ahead of the attacker shows"
+        );
+        // Theme-independent: the cue is hot, so it can only push the cell's red
+        // channel up relative to the same scene with the spike retracted.
+        assert!(
+            armed_fg.0 > idle_fg.0,
+            "the attack cue must warm the cell ahead: armed {armed_fg:?} vs idle {idle_fg:?}"
+        );
+    }
+
+    /// Day and night must come from the SHARED daylight curve, not a
+    /// terminal-local one: the same tick has to mean the same time of day here as
+    /// it does on the GPU surfaces. Driving noon and midnight through the real
+    /// render path proves the canvas is reading that curve at all.
+    #[test]
+    fn terrain_brightness_follows_the_shared_daylight_curve() {
+        let terrain = canvas_test_terrain();
+        let cycle = 1_000_u32;
+        let background_at = |tick: u64| {
+            let mut snapshot = Snapshot::default();
+            snapshot.tick = tick;
+            let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), (cycle, 0.0));
+            luminance(cell_bg(&buf, 1, 1))
+        };
+        // With start_phase 0.0, phase 0.25 of the cycle is noon and 0.75 midnight.
+        let noon = background_at(u64::from(cycle) / 4);
+        let midnight = background_at(u64::from(cycle) * 3 / 4);
+        assert!(
+            visual::daylight_factor(u64::from(cycle) / 4, cycle, 0.0)
+                > visual::daylight_factor(u64::from(cycle) * 3 / 4, cycle, 0.0),
+            "fixture assumption broken: the shared curve must call this noon and midnight"
+        );
+        assert!(
+            noon > midnight,
+            "terrain must darken at night: noon {noon}, midnight {midnight}"
+        );
+        assert!(
+            midnight > 0.0,
+            "night must not collapse the map to pure black: {midnight}"
+        );
+    }
+
+    /// Hillshade must actually consume the elevation field. Identical color,
+    /// identical daylight, different slope — the rendered background has to
+    /// differ, or the gradient is being computed and thrown away.
+    #[test]
+    fn sloped_terrain_shades_differently_from_flat_terrain() {
+        let flat = TerrainView {
+            width: 3,
+            height: 1,
+            kinds: vec![TerrainKind::Rock; 3],
+            elevations: vec![0.5, 0.5, 0.5],
+        };
+        let sloped = TerrainView {
+            width: 3,
+            height: 1,
+            kinds: vec![TerrainKind::Rock; 3],
+            elevations: vec![0.0, 0.5, 1.0],
+        };
+        let snapshot = Snapshot::default();
+        let sample = |terrain: &TerrainView| {
+            let buf = render_canvas_frame(&snapshot, terrain, (3, 2), canvas_test_day_night());
+            luminance(cell_bg(&buf, 1, 0))
+        };
+        let flat_luma = sample(&flat);
+        let sloped_luma = sample(&sloped);
+        assert!(
+            (flat_luma - sloped_luma).abs() > 0.5,
+            "a lit slope must not render identically to flat ground: {flat_luma} vs {sloped_luma}"
+        );
+    }
+
+    /// Water shimmer is phase-locked to the shared per-cell pulse, so the same
+    /// tile must move between ticks and two renders of the SAME tick must be
+    /// byte-identical. A shimmer keyed on wall-clock or on screen position would
+    /// fail the second half.
+    #[test]
+    fn water_shimmer_advances_with_the_tick_and_is_deterministic() {
+        let water = TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::DeepWater],
+            elevations: vec![0.5],
+        };
+        let frame_at = |tick: u64| {
+            let mut snapshot = Snapshot::default();
+            snapshot.tick = tick;
+            render_canvas_frame(&snapshot, &water, (4, 2), (0, 0.0))
+        };
+        // A zero-length day cycle pins daylight to the static value, so the only
+        // thing that can still vary between these frames is the shimmer. Sweep
+        // the period rather than picking one offset: a single sample can land
+        // where two phases happen to quantize to the same byte, which would make
+        // a working shimmer look dead.
+        let base = cell_bg(&frame_at(0), 1, 1);
+        let moved =
+            (1..visual::SHIMMER_PERIOD_TICKS).any(|tick| cell_bg(&frame_at(tick), 1, 1) != base);
+        assert!(
+            moved,
+            "water must shimmer somewhere within one shared period"
+        );
+
+        let quarter = visual::SHIMMER_PERIOD_TICKS / 4;
+        assert_eq!(
+            frame_at(quarter),
+            frame_at(quarter),
+            "the same tick must produce a byte-identical frame"
+        );
     }
 
     /// Shared scenario identity for renderer contexts built by tests.
