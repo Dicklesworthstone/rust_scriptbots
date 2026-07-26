@@ -11,9 +11,10 @@ use ft_core::ExecutionMode;
 use scriptbots_core::{
     BrainAdapterIdentityV1, BrainBatchArchitectureKey, BrainBatchEvaluator, BrainEnvelopeKind,
     BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId,
-    BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection, BrainInspectionError,
-    BrainInspectionSnapshot, BrainProtocolError, INPUT_SIZE, MAX_BRAIN_GENOME_PAYLOAD_BYTES,
-    MutationRates, OUTPUT_SIZE, OffspringStatePolicy, OutputChannel, RandomStream,
+    BrainGenomeEnvelope, BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainHeredityExclusionV1,
+    BrainInspection, BrainInspectionError, BrainInspectionSnapshot, BrainProtocolError, INPUT_SIZE,
+    MAX_BRAIN_GENOME_PAYLOAD_BYTES, MutationRates, OUTPUT_SIZE, OffspringStatePolicy,
+    OutputChannel, RandomStream,
 };
 
 /// Stable registry label for the Frankentorch brain family.
@@ -670,6 +671,10 @@ impl BrainFamilyCodec for FtBrainFamily {
             ADAPTER_SEMANTIC_VERSION,
             &descriptor,
         )
+    }
+
+    fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+        BrainHeredityCapabilityV1::excluded(BrainHeredityExclusionV1::NoCanonicalLocusSchema)
     }
 
     fn random_genome_material(

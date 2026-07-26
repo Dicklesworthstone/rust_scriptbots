@@ -25,12 +25,13 @@ use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig};
 use scriptbots_core::{
     AgentData, AgentId, AnalyticsStride, BrainAdapterIdentityV1, BrainBatchArchitectureKey,
     BrainBatchEvaluator, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
-    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection,
-    BrainInspectionError, BrainInspectionSnapshot, BrainProtocolError,
-    DYNAMIC_WORLD_SNAPSHOT_SCHEMA, DynamicWorldSnapshot, Generation, INPUT_SIZE, MutationRates,
-    OUTPUT_SIZE, OffspringStatePolicy, Position, RandomStream, RuleBasedMapGenerator,
-    ScriptBotsConfig, TerrainKind, TileSpec, TilesetSpec, Velocity,
-    WORLD_STEP_OUTCOME_PROFILE_SCHEMA, WorldState, WorldStepProfiler, WorldStepStage,
+    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial,
+    BrainHeredityCapabilityV1, BrainHeredityExclusionV1, BrainInspection, BrainInspectionError,
+    BrainInspectionSnapshot, BrainProtocolError, DYNAMIC_WORLD_SNAPSHOT_SCHEMA,
+    DynamicWorldSnapshot, Generation, INPUT_SIZE, MutationRates, OUTPUT_SIZE, OffspringStatePolicy,
+    Position, RandomStream, RuleBasedMapGenerator, ScriptBotsConfig, TerrainKind, TileSpec,
+    TilesetSpec, Velocity, WORLD_STEP_OUTCOME_PROFILE_SCHEMA, WorldState, WorldStepProfiler,
+    WorldStepStage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -315,6 +316,10 @@ impl BrainFamilyCodec for DenseBenchFamily {
             1,
             b"scriptbots.bench-dense-25x16x9.adapter-semantics.v1",
         )
+    }
+
+    fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+        BrainHeredityCapabilityV1::excluded(BrainHeredityExclusionV1::NoCanonicalLocusSchema)
     }
 
     fn random_genome_material(

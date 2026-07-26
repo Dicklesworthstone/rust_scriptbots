@@ -4,9 +4,10 @@ use rand::Rng;
 use scriptbots_core::{
     ActivationLayer, BrainActivations, BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator,
     BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope,
-    BrainGenomeMaterial, BrainInspection, BrainInspectionError, BrainInspectionLimits,
-    BrainInspectionSnapshot, BrainProtocolError, MutationRates, OffspringStatePolicy, RandomStream,
-    bound_brain_inspection,
+    BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainInspection, BrainInspectionError,
+    BrainInspectionLimits, BrainInspectionSnapshot, BrainLocusSchemaIdentityV1,
+    BrainMutationTrialGroupV1, BrainProtocolError, MutationRates, OffspringStatePolicy,
+    RandomStream, bound_brain_inspection,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -25,6 +26,7 @@ const DWRAON_FAMILY_NAME: &str = "dwraon-baseline";
 const ADAPTER_SEMANTIC_VERSION: u32 = 2;
 const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.dwraon-baseline.adapter-semantics.v2";
 const GENOME_SCHEMA_VERSION: u32 = 1;
+const LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.dwraon-baseline.locus-schema.node-ascending:[NodeBias,NodeDamping,NodeKind(operator,conn=4),connection-ascending:[NodeWeight,NodeTarget,NodeKind(inverted)]]";
 const GENOME_CODEC_VERSION: u16 = 1;
 const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_CODEC_VERSION: u16 = 1;
@@ -747,6 +749,24 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
         )
     }
 
+    fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+        let triple_rate_trials =
+            u32::try_from(BRAIN_SIZE * 2).expect("DWRAON triple-rate gate count fits u32");
+        let primary_rate_trials =
+            u32::try_from(BRAIN_SIZE * 3).expect("DWRAON primary-rate gate count fits u32");
+        BrainHeredityCapabilityV1::locus_capable(
+            BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                self.family_id(),
+                GENOME_SCHEMA_VERSION,
+                LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR,
+            ),
+            vec![
+                BrainMutationTrialGroupV1::new(triple_rate_trials, 3, 1),
+                BrainMutationTrialGroupV1::new(primary_rate_trials, 1, 1),
+            ],
+        )
+    }
+
     fn random_genome_material(
         &self,
         rng: &mut dyn RandomStream,
@@ -1081,6 +1101,25 @@ mod tests {
             identity.to_string(),
             "728eb71692caeabfc7837d950d2342601dde7ffa1352208ce20872669e6e12d0",
             "update only after reviewing an intentional DWRAON executable-semantics change"
+        );
+    }
+
+    #[test]
+    fn heredity_capability_matches_dwraon_mutation_gates() {
+        let BrainHeredityCapabilityV1::LocusCapable {
+            locus_schema,
+            mutation_trials,
+        } = DwraonFamilyAdapter::default().heredity_capability()
+        else {
+            panic!("DWRAON must remain locus-capable");
+        };
+        assert_eq!(locus_schema.semantic_version(), GENOME_SCHEMA_VERSION);
+        assert_eq!(
+            mutation_trials,
+            vec![
+                BrainMutationTrialGroupV1::new(400, 3, 1),
+                BrainMutationTrialGroupV1::new(600, 1, 1),
+            ]
         );
     }
 

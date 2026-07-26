@@ -35,8 +35,8 @@ use scriptbots_core::genome_diff::{LocusValue, diff_genomes};
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BirthOrigin, BrainAdapterIdentityV1, BrainEvaluator,
     BrainEvaluatorStateEnvelope, BrainFamilyAdapter, BrainFamilyCodec, BrainGenomeDerivation,
-    BrainGenomeEnvelope, BrainGenomeMaterial, BrainProtocolError, MutationRates,
-    OffspringStatePolicy, Position, RandomStream, ScriptBotsConfig, WorldState,
+    BrainGenomeEnvelope, BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainProtocolError,
+    MutationRates, OffspringStatePolicy, Position, RandomStream, ScriptBotsConfig, WorldState,
 };
 
 const ASSEMBLY_KIND: &str = AssemblyBrain::KIND.as_str();
@@ -756,6 +756,9 @@ impl BrainFamilyCodec for SabotagedMutationFamily {
     }
     fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
         self.inner.adapter_identity()
+    }
+    fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+        self.inner.heredity_capability()
     }
     fn random_genome_material(
         &self,

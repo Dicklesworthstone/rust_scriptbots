@@ -3,8 +3,9 @@
 use rand::Rng;
 use scriptbots_core::{
     BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
-    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection,
-    BrainInspectionError, BrainInspectionSnapshot, BrainProtocolError, MutationRates,
+    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial,
+    BrainHeredityCapabilityV1, BrainInspection, BrainInspectionError, BrainInspectionSnapshot,
+    BrainLocusSchemaIdentityV1, BrainMutationTrialGroupV1, BrainProtocolError, MutationRates,
     OffspringStatePolicy, RandomStream,
 };
 use std::any::Any;
@@ -21,6 +22,8 @@ const ASSEMBLY_FAMILY_ID: &str = "assembly";
 const ADAPTER_SEMANTIC_VERSION: u32 = 2;
 const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.assembly.adapter-semantics.v2";
 const ASSEMBLY_GENOME_SCHEMA_VERSION: u32 = 1;
+const LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR: &[u8] =
+    b"scriptbots.assembly.locus-schema.cell-index-ascending:[Cell]";
 const ASSEMBLY_GENOME_CODEC_VERSION: u16 = 1;
 const ASSEMBLY_STATE_SCHEMA_VERSION: u32 = 1;
 const ASSEMBLY_STATE_CODEC_VERSION: u16 = 1;
@@ -350,6 +353,19 @@ impl BrainFamilyCodec for AssemblyFamilyAdapter {
             self.family_id(),
             ADAPTER_SEMANTIC_VERSION,
             ADAPTER_SEMANTIC_DESCRIPTOR,
+        )
+    }
+
+    fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+        let mutation_trials =
+            u32::try_from(BRAIN_SIZE).expect("Assembly mutation gate count fits u32");
+        BrainHeredityCapabilityV1::locus_capable(
+            BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                self.family_id(),
+                ASSEMBLY_GENOME_SCHEMA_VERSION,
+                LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR,
+            ),
+            vec![BrainMutationTrialGroupV1::new(mutation_trials, 1, 1)],
         )
     }
 
@@ -727,6 +743,27 @@ mod tests {
             identity.to_string(),
             "424ea6759de4b0c676bb7e37b0d8471d6c0ef8bc664078736ac425a31086622c",
             "update only after reviewing an intentional Assembly executable-semantics change"
+        );
+    }
+
+    #[test]
+    fn heredity_capability_matches_assembly_mutation_gates() {
+        let BrainHeredityCapabilityV1::LocusCapable {
+            locus_schema,
+            mutation_trials,
+        } = AssemblyFamilyAdapter::new()
+            .expect("canonical Assembly adapter")
+            .heredity_capability()
+        else {
+            panic!("Assembly must remain locus-capable");
+        };
+        assert_eq!(
+            locus_schema.semantic_version(),
+            ASSEMBLY_GENOME_SCHEMA_VERSION
+        );
+        assert_eq!(
+            mutation_trials,
+            vec![BrainMutationTrialGroupV1::new(200, 1, 1)]
         );
     }
 

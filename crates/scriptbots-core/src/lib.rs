@@ -2592,7 +2592,9 @@ type BrainSpawner = Box<
 struct BrainEntry {
     kind: Cow<'static, str>,
     factory_state_digest: Option<u64>,
+    legacy_heredity_exclusion: Option<BrainHeredityExclusionV1>,
     adapter_identity: Option<BrainAdapterIdentityV1>,
+    heredity_capability: Option<BrainHeredityCapabilityV1>,
     spawner: Option<BrainSpawner>,
     protocol_adapter: Option<Box<dyn BrainFamilyAdapter>>,
 }
@@ -2613,6 +2615,106 @@ impl std::fmt::Debug for BrainRegistry {
     }
 }
 
+fn project_protocol_heredity_capability(
+    stable_identity: &str,
+    entry: &BrainEntry,
+    adapter: &dyn BrainFamilyAdapter,
+) -> Result<
+    (
+        BrainFamilyId,
+        BrainAdapterIdentityV1,
+        BrainHeredityCapabilityV1,
+    ),
+    BrainProtocolError,
+> {
+    if entry.spawner.is_some() {
+        return Err(invalid_heredity_capability(
+            stable_identity,
+            "protocol registry entry also contains a legacy spawner",
+        ));
+    }
+    if entry.legacy_heredity_exclusion.is_some() {
+        return Err(invalid_heredity_capability(
+            stable_identity,
+            "protocol registry entry unexpectedly carries a legacy exclusion",
+        ));
+    }
+    let captured_identity = entry.adapter_identity.ok_or_else(|| {
+        invalid_heredity_capability(
+            stable_identity,
+            "protocol registry entry is missing its captured adapter identity",
+        )
+    })?;
+    let live_identity = adapter.adapter_identity();
+    if captured_identity != live_identity {
+        return Err(invalid_heredity_capability(
+            stable_identity,
+            format!(
+                "captured adapter identity {captured_identity} drifted from live identity \
+                 {live_identity}"
+            ),
+        ));
+    }
+    let captured_capability = entry.heredity_capability.clone().ok_or_else(|| {
+        invalid_heredity_capability(
+            stable_identity,
+            "protocol registry entry is missing its captured heredity capability",
+        )
+    })?;
+    let live_capability = canonicalize_protocol_heredity_capability(
+        adapter.family_id(),
+        adapter.heredity_capability(),
+    )?;
+    if captured_capability != live_capability {
+        return Err(invalid_heredity_capability(
+            stable_identity,
+            "captured heredity capability drifted from the live adapter declaration",
+        ));
+    }
+    Ok((
+        adapter.family_id().clone(),
+        captured_identity,
+        captured_capability,
+    ))
+}
+
+fn project_legacy_heredity_capability(
+    stable_identity: &str,
+    entry: &BrainEntry,
+) -> Result<BrainHeredityCapabilityV1, BrainProtocolError> {
+    if entry.spawner.is_none() {
+        return Err(invalid_heredity_capability(
+            stable_identity,
+            "registry entry has neither a protocol adapter nor a legacy spawner",
+        ));
+    }
+    if entry.adapter_identity.is_some() {
+        return Err(invalid_heredity_capability(
+            stable_identity,
+            "legacy registry entry unexpectedly carries a protocol adapter identity",
+        ));
+    }
+    if entry.heredity_capability.is_some() {
+        return Err(invalid_heredity_capability(
+            stable_identity,
+            "legacy registry entry unexpectedly carries a protocol heredity capability",
+        ));
+    }
+    let exclusion = entry.legacy_heredity_exclusion.ok_or_else(|| {
+        invalid_heredity_capability(
+            stable_identity,
+            "legacy registry entry has no explicit reviewed heredity exclusion",
+        )
+    })?;
+    if exclusion != BrainHeredityExclusionV1::NoVersionedGenomeProtocol {
+        return Err(invalid_heredity_capability(
+            stable_identity,
+            "legacy runner exclusion must be no_versioned_genome_protocol",
+        ));
+    }
+    Ok(BrainHeredityCapabilityV1::excluded(exclusion))
+}
+
 impl BrainRegistry {
     /// Construct an empty registry.
     #[must_use]
@@ -2628,7 +2730,27 @@ impl BrainRegistry {
             + Sync
             + 'static,
     {
-        self.register_inner(kind, None, factory)
+        self.register_inner(kind, None, None, factory)
+    }
+
+    /// Register a legacy runner with an explicit reviewed heredity exclusion.
+    ///
+    /// Callers that intend to project the live registry into the heredity proof contract must use
+    /// this API (or its state-digest counterpart) rather than [`Self::register`]. The latter
+    /// deliberately leaves the disposition undeclared so projection fails closed.
+    pub fn register_with_heredity_exclusion<F>(
+        &mut self,
+        kind: impl Into<Cow<'static, str>>,
+        heredity_exclusion: BrainHeredityExclusionV1,
+        factory: F,
+    ) -> u64
+    where
+        F: Fn(&mut dyn RandomStream) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_inner(kind, None, Some(heredity_exclusion), factory)
     }
 
     /// Registers a factory together with a stable digest of captured construction state.
@@ -2649,13 +2771,36 @@ impl BrainRegistry {
             + Sync
             + 'static,
     {
-        self.register_inner(kind, Some(factory_state_digest), factory)
+        self.register_inner(kind, Some(factory_state_digest), None, factory)
+    }
+
+    /// Register a state-attested legacy runner with an explicit reviewed heredity exclusion.
+    pub fn register_with_state_digest_and_heredity_exclusion<F>(
+        &mut self,
+        kind: impl Into<Cow<'static, str>>,
+        factory_state_digest: u64,
+        heredity_exclusion: BrainHeredityExclusionV1,
+        factory: F,
+    ) -> u64
+    where
+        F: Fn(&mut dyn RandomStream) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_inner(
+            kind,
+            Some(factory_state_digest),
+            Some(heredity_exclusion),
+            factory,
+        )
     }
 
     fn register_inner<F>(
         &mut self,
         kind: impl Into<Cow<'static, str>>,
         factory_state_digest: Option<u64>,
+        legacy_heredity_exclusion: Option<BrainHeredityExclusionV1>,
         factory: F,
     ) -> u64
     where
@@ -2671,7 +2816,9 @@ impl BrainRegistry {
             BrainEntry {
                 kind: kind.into(),
                 factory_state_digest,
+                legacy_heredity_exclusion,
                 adapter_identity: None,
+                heredity_capability: None,
                 spawner: Some(Box::new(factory)),
                 protocol_adapter: None,
             },
@@ -2698,6 +2845,9 @@ impl BrainRegistry {
         }) {
             return Err(BrainProtocolError::DuplicateFamily { family_id });
         }
+        let heredity_capability =
+            canonicalize_protocol_heredity_capability(&family_id, adapter.heredity_capability())?;
+        validate_protocol_heredity_capability(adapter.as_ref(), &heredity_capability)?;
 
         let key = self.next_key;
         self.next_key += 1;
@@ -2706,7 +2856,9 @@ impl BrainRegistry {
             BrainEntry {
                 kind: kind.into(),
                 factory_state_digest: None,
+                legacy_heredity_exclusion: None,
                 adapter_identity: Some(adapter_identity),
+                heredity_capability: Some(heredity_capability),
                 spawner: None,
                 protocol_adapter: Some(adapter),
             },
@@ -2775,6 +2927,82 @@ impl BrainRegistry {
             .collect();
         descriptors.sort_unstable_by_key(|(key, _)| *key);
         descriptors
+    }
+
+    /// Project the exact live registry into the canonical typed heredity contract.
+    ///
+    /// The returned descriptors are ordered by stable family identity rather than opaque
+    /// registration key. The digest deliberately excludes those keys, so two registries
+    /// containing the same families and declarations have identical capability digests even when
+    /// constructed in different insertion orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed protocol error when any live entry is incomplete, duplicated, malformed,
+    /// or has drifted from the adapter identity and heredity capability captured at registration.
+    pub fn heredity_capabilities(
+        &self,
+    ) -> Result<BrainRegistryHereditySnapshotV1, BrainProtocolError> {
+        let mut live_entries = self
+            .entries
+            .iter()
+            .map(|(&registry_key, entry)| {
+                let stable_identity = entry.protocol_adapter.as_ref().map_or_else(
+                    || format!("legacy:{}", entry.kind),
+                    |adapter| format!("protocol:{}", adapter.family_id()),
+                );
+                (stable_identity, registry_key, entry)
+            })
+            .collect::<Vec<_>>();
+        live_entries.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        for pair in live_entries.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(BrainProtocolError::DuplicateHeredityIdentity {
+                    identity: pair[0].0.clone(),
+                });
+            }
+        }
+
+        let mut descriptors = Vec::with_capacity(live_entries.len());
+        for (stable_identity, registry_key, entry) in live_entries {
+            if entry.kind.trim().is_empty() {
+                return Err(invalid_heredity_capability(
+                    stable_identity,
+                    "registered kind must not be empty",
+                ));
+            }
+
+            let (family_id, adapter_identity, capability) =
+                if let Some(adapter) = entry.protocol_adapter.as_deref() {
+                    let (family_id, adapter_identity, capability) =
+                        project_protocol_heredity_capability(&stable_identity, entry, adapter)?;
+                    (Some(family_id), Some(adapter_identity), capability)
+                } else {
+                    (
+                        None,
+                        None,
+                        project_legacy_heredity_capability(&stable_identity, entry)?,
+                    )
+                };
+
+            descriptors.push(BrainRegistryHeredityDescriptorV1 {
+                registry_key,
+                kind: entry.kind.to_string(),
+                family_id,
+                adapter_identity,
+                capability_version: BRAIN_HEREDITY_CAPABILITY_VERSION_V1,
+                capability,
+            });
+        }
+
+        let capability_digest = heredity_capability_digest_v1(&descriptors);
+        Ok(BrainRegistryHereditySnapshotV1 {
+            capability_version: BRAIN_HEREDITY_CAPABILITY_VERSION_V1,
+            descriptors,
+            capability_digest,
+        })
     }
 
     /// Pick a random registered brain key, if any.
@@ -8371,6 +8599,535 @@ impl fmt::Display for BrainAdapterIdentityV1 {
     }
 }
 
+/// Schema revision for the typed heredity capability contract.
+pub const BRAIN_HEREDITY_CAPABILITY_VERSION_V1: u16 = 1;
+
+/// Domain used by family-owned typed-locus schema identities.
+const BRAIN_LOCUS_SCHEMA_IDENTITY_V1_CONTEXT: &str =
+    "rust-scriptbots.brain-locus-schema-identity.v1";
+
+#[must_use]
+fn heredity_len_u64(len: usize) -> u64 {
+    u64::try_from(len).expect("bounded heredity metadata length fits u64")
+}
+
+/// Stable family-owned identity for the meaning and ordering of decoded genome loci.
+///
+/// This identity is deliberately separate from [`BrainAdapterIdentityV1`]. An adapter may change
+/// evaluation internals without changing its locus vocabulary, while reordering or retyping loci
+/// must change this identity even if the opaque genome bytes remain wire-compatible.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct BrainLocusSchemaIdentityV1 {
+    family_id: BrainFamilyId,
+    semantic_version: u32,
+    digest: [u8; 32],
+}
+
+impl BrainLocusSchemaIdentityV1 {
+    /// Derive a locus-schema identity from stable family-owned semantic material.
+    #[must_use]
+    pub fn from_semantic_descriptor(
+        family_id: &BrainFamilyId,
+        semantic_version: u32,
+        semantic_material: &[u8],
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key(BRAIN_LOCUS_SCHEMA_IDENTITY_V1_CONTEXT);
+        let family = family_id.as_str().as_bytes();
+        hasher.update(&heredity_len_u64(family.len()).to_le_bytes());
+        hasher.update(family);
+        hasher.update(&semantic_version.to_le_bytes());
+        hasher.update(&heredity_len_u64(semantic_material.len()).to_le_bytes());
+        hasher.update(semantic_material);
+        Self {
+            family_id: family_id.clone(),
+            semantic_version,
+            digest: *hasher.finalize().as_bytes(),
+        }
+    }
+
+    /// Brain family whose canonical locus vocabulary this identity describes.
+    #[must_use]
+    pub const fn family_id(&self) -> &BrainFamilyId {
+        &self.family_id
+    }
+
+    /// Family-owned semantic revision included in the digest input.
+    #[must_use]
+    pub const fn semantic_version(&self) -> u32 {
+        self.semantic_version
+    }
+
+    /// Borrow the exact 32-byte BLAKE3 attestation digest.
+    #[must_use]
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+impl fmt::Debug for BrainLocusSchemaIdentityV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrainLocusSchemaIdentityV1")
+            .field("family_id", &self.family_id)
+            .field("semantic_version", &self.semantic_version)
+            .field("digest", &self.to_string())
+            .finish()
+    }
+}
+
+impl fmt::Display for BrainLocusSchemaIdentityV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.digest {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// One independent Bernoulli group in a family's exact aggregate mutation-gate model.
+///
+/// The comparison threshold is
+/// `clamp(primary_rate * primary_rate_numerator / primary_rate_denominator, 0, 1)`.
+/// Arithmetic is performed in `f32`, in the same multiply-then-divide order as production
+/// mutation gates. [`Self::effective_probability`] then accounts for the exact 24-bit lattice
+/// sampled by `rand`'s standard `f32` distribution. The group counts aggregate gate attempts, not
+/// their temporal draw order and not necessarily changed loci: a selected replacement can
+/// reproduce the previous value. Multiple groups are convolved by the proof harness.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct BrainMutationTrialGroupV1 {
+    trials_per_offspring: u32,
+    primary_rate_numerator: u16,
+    primary_rate_denominator: u16,
+}
+
+impl BrainMutationTrialGroupV1 {
+    /// Declare a bounded group of identically distributed mutation gates.
+    #[must_use]
+    pub const fn new(
+        trials_per_offspring: u32,
+        primary_rate_numerator: u16,
+        primary_rate_denominator: u16,
+    ) -> Self {
+        Self {
+            trials_per_offspring,
+            primary_rate_numerator,
+            primary_rate_denominator,
+        }
+    }
+
+    /// Number of independent mutation-gate attempts evaluated for one offspring.
+    #[must_use]
+    pub const fn trials_per_offspring(self) -> u32 {
+        self.trials_per_offspring
+    }
+
+    /// Numerator applied to [`MutationRates::primary`].
+    #[must_use]
+    pub const fn primary_rate_numerator(self) -> u16 {
+        self.primary_rate_numerator
+    }
+
+    /// Denominator applied to [`MutationRates::primary`].
+    #[must_use]
+    pub const fn primary_rate_denominator(self) -> u16 {
+        self.primary_rate_denominator
+    }
+
+    /// Evaluate the group's exact Bernoulli probability on `rand`'s uniform `f32` lattice.
+    #[must_use]
+    pub fn effective_probability(self, primary_rate: f32) -> f64 {
+        let threshold = primary_rate * f32::from(self.primary_rate_numerator)
+            / f32::from(self.primary_rate_denominator);
+        let threshold = threshold.clamp(0.0, 1.0);
+        if threshold.is_nan() {
+            return f64::NAN;
+        }
+        if threshold <= 0.0 {
+            return 0.0;
+        }
+        if threshold >= 1.0 {
+            return 1.0;
+        }
+
+        // `StandardUniform<f32>` samples one of 2^24 equally likely values `n / 2^24`.
+        // Exactly `ceil(threshold * 2^24)` of them satisfy `sample < threshold`.
+        const SAMPLE_CARDINALITY: f64 = 16_777_216.0;
+        (f64::from(threshold) * SAMPLE_CARDINALITY).ceil() / SAMPLE_CARDINALITY
+    }
+
+    fn validate(self) -> Result<(), &'static str> {
+        if self.trials_per_offspring == 0 {
+            return Err("mutation gate count must be nonzero");
+        }
+        if self.primary_rate_numerator == 0 {
+            return Err("mutation-rate numerator must be nonzero");
+        }
+        if self.primary_rate_denominator == 0 {
+            return Err("mutation-rate denominator must be nonzero");
+        }
+        Ok(())
+    }
+}
+
+/// Reviewed reason why an installed brain family cannot participate in typed heredity proof.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainHeredityExclusionV1 {
+    /// A legacy runner has no versioned genome protocol adapter.
+    NoVersionedGenomeProtocol,
+    /// The versioned adapter cannot decode opaque genome bytes into canonical typed loci.
+    NoCanonicalLocusSchema,
+}
+
+/// Family-owned declaration that drives automatic heredity-proof enrollment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrainHeredityCapabilityV1 {
+    /// The adapter exposes canonical typed loci and an exact aggregate mutation-gate model.
+    LocusCapable {
+        /// Stable identity for locus meaning and order.
+        locus_schema: BrainLocusSchemaIdentityV1,
+        /// Independent aggregate mutation-gate groups, canonically ordered by the live registry.
+        mutation_trials: Vec<BrainMutationTrialGroupV1>,
+    },
+    /// The installed family is intentionally outside typed heredity proof.
+    Excluded {
+        /// Typed, reviewable reason; free-form exclusions are deliberately forbidden.
+        reason: BrainHeredityExclusionV1,
+    },
+}
+
+impl BrainHeredityCapabilityV1 {
+    /// Construct a locus-capable declaration.
+    #[must_use]
+    pub fn locus_capable(
+        locus_schema: BrainLocusSchemaIdentityV1,
+        mutation_trials: Vec<BrainMutationTrialGroupV1>,
+    ) -> Self {
+        Self::LocusCapable {
+            locus_schema,
+            mutation_trials,
+        }
+    }
+
+    /// Construct an explicit typed exclusion.
+    #[must_use]
+    pub const fn excluded(reason: BrainHeredityExclusionV1) -> Self {
+        Self::Excluded { reason }
+    }
+}
+
+/// One live registry entry projected into the typed heredity-discovery contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrainRegistryHeredityDescriptorV1 {
+    /// Opaque key used to look the exact adapter up in this registry instance.
+    pub registry_key: u64,
+    /// Production kind label attached at registration.
+    pub kind: String,
+    /// Versioned protocol identity, absent only for legacy runner entries.
+    pub family_id: Option<BrainFamilyId>,
+    /// Executable adapter identity, absent only for legacy runner entries.
+    pub adapter_identity: Option<BrainAdapterIdentityV1>,
+    /// Capability schema revision.
+    pub capability_version: u16,
+    /// Typed capability or exclusion.
+    pub capability: BrainHeredityCapabilityV1,
+}
+
+impl BrainRegistryHeredityDescriptorV1 {
+    #[must_use]
+    fn stable_identity(&self) -> String {
+        self.family_id.as_ref().map_or_else(
+            || format!("legacy:{}", self.kind),
+            |family_id| format!("protocol:{family_id}"),
+        )
+    }
+}
+
+/// Insertion-order-independent digest of one live registry's heredity capabilities.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct BrainHeredityCapabilityDigestV1([u8; 32]);
+
+impl BrainHeredityCapabilityDigestV1 {
+    /// Borrow the exact 32-byte BLAKE3 digest.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for BrainHeredityCapabilityDigestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("BrainHeredityCapabilityDigestV1")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl fmt::Display for BrainHeredityCapabilityDigestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Canonically ordered read-only heredity projection of the live [`BrainRegistry`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrainRegistryHereditySnapshotV1 {
+    /// Capability contract revision.
+    pub capability_version: u16,
+    /// Descriptors sorted by stable family identity, never opaque registration key.
+    pub descriptors: Vec<BrainRegistryHeredityDescriptorV1>,
+    /// Digest over stable identities and declarations; opaque keys are deliberately excluded.
+    pub capability_digest: BrainHeredityCapabilityDigestV1,
+}
+
+const BRAIN_HEREDITY_CAPABILITY_DIGEST_V1_CONTEXT: &str =
+    "rust-scriptbots.brain-heredity-capability-digest.v1";
+
+fn heredity_digest_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&heredity_len_u64(bytes.len()).to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[must_use]
+fn heredity_capability_digest_v1(
+    descriptors: &[BrainRegistryHeredityDescriptorV1],
+) -> BrainHeredityCapabilityDigestV1 {
+    let mut hasher = blake3::Hasher::new_derive_key(BRAIN_HEREDITY_CAPABILITY_DIGEST_V1_CONTEXT);
+    hasher.update(&BRAIN_HEREDITY_CAPABILITY_VERSION_V1.to_le_bytes());
+    hasher.update(&heredity_len_u64(descriptors.len()).to_le_bytes());
+    for descriptor in descriptors {
+        heredity_digest_bytes(&mut hasher, descriptor.stable_identity().as_bytes());
+        heredity_digest_bytes(&mut hasher, descriptor.kind.as_bytes());
+        match &descriptor.family_id {
+            Some(family_id) => {
+                hasher.update(&[1]);
+                heredity_digest_bytes(&mut hasher, family_id.as_str().as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        match descriptor.adapter_identity {
+            Some(identity) => {
+                hasher.update(&[1]);
+                hasher.update(&identity.semantic_version().to_le_bytes());
+                hasher.update(identity.digest());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&descriptor.capability_version.to_le_bytes());
+        match &descriptor.capability {
+            BrainHeredityCapabilityV1::LocusCapable {
+                locus_schema,
+                mutation_trials,
+            } => {
+                hasher.update(&[0]);
+                heredity_digest_bytes(&mut hasher, locus_schema.family_id().as_str().as_bytes());
+                hasher.update(&locus_schema.semantic_version().to_le_bytes());
+                hasher.update(locus_schema.digest());
+                hasher.update(&heredity_len_u64(mutation_trials.len()).to_le_bytes());
+                for group in mutation_trials {
+                    hasher.update(&group.trials_per_offspring().to_le_bytes());
+                    hasher.update(&group.primary_rate_numerator().to_le_bytes());
+                    hasher.update(&group.primary_rate_denominator().to_le_bytes());
+                }
+            }
+            BrainHeredityCapabilityV1::Excluded { reason } => {
+                hasher.update(&[1]);
+                hasher.update(&[match reason {
+                    BrainHeredityExclusionV1::NoVersionedGenomeProtocol => 0,
+                    BrainHeredityExclusionV1::NoCanonicalLocusSchema => 1,
+                }]);
+            }
+        }
+    }
+    BrainHeredityCapabilityDigestV1(*hasher.finalize().as_bytes())
+}
+
+#[must_use]
+fn invalid_heredity_capability(
+    identity: impl Into<String>,
+    detail: impl Into<String>,
+) -> BrainProtocolError {
+    BrainProtocolError::InvalidHeredityCapability {
+        identity: identity.into(),
+        detail: detail.into(),
+    }
+}
+
+fn canonicalize_protocol_heredity_capability(
+    family_id: &BrainFamilyId,
+    capability: BrainHeredityCapabilityV1,
+) -> Result<BrainHeredityCapabilityV1, BrainProtocolError> {
+    let BrainHeredityCapabilityV1::LocusCapable {
+        locus_schema,
+        mutation_trials,
+    } = capability
+    else {
+        return Ok(capability);
+    };
+    let identity = format!("protocol:{family_id}");
+    if locus_schema.family_id() != family_id {
+        return Err(invalid_heredity_capability(
+            identity,
+            format!(
+                "locus schema belongs to `{}`, not the registered family `{family_id}`",
+                locus_schema.family_id()
+            ),
+        ));
+    }
+    if locus_schema.semantic_version() == 0 {
+        return Err(invalid_heredity_capability(
+            identity,
+            "locus schema semantic version must be nonzero",
+        ));
+    }
+    if mutation_trials.is_empty() {
+        return Err(invalid_heredity_capability(
+            identity,
+            "locus-capable family declared no mutation gate groups",
+        ));
+    }
+
+    let mut normalized = Vec::with_capacity(mutation_trials.len());
+    for (group_index, group) in mutation_trials.into_iter().enumerate() {
+        group.validate().map_err(|detail| {
+            invalid_heredity_capability(
+                identity.clone(),
+                format!("mutation gate group {group_index}: {detail}"),
+            )
+        })?;
+        normalized.push(group);
+    }
+    normalized.sort_unstable_by_key(|group| {
+        (group.primary_rate_numerator, group.primary_rate_denominator)
+    });
+
+    let mut canonical: Vec<BrainMutationTrialGroupV1> = Vec::with_capacity(normalized.len());
+    for group in normalized {
+        if let Some(previous) = canonical.last_mut()
+            && previous.primary_rate_numerator == group.primary_rate_numerator
+            && previous.primary_rate_denominator == group.primary_rate_denominator
+        {
+            previous.trials_per_offspring = previous
+                .trials_per_offspring
+                .checked_add(group.trials_per_offspring)
+                .ok_or_else(|| {
+                    invalid_heredity_capability(
+                        identity.clone(),
+                        "canonical mutation gate count overflowed u32",
+                    )
+                })?;
+        } else {
+            canonical.push(group);
+        }
+    }
+    Ok(BrainHeredityCapabilityV1::locus_capable(
+        locus_schema,
+        canonical,
+    ))
+}
+
+type BrainGenomeLociV1 = Vec<(crate::genome_diff::Locus, crate::genome_diff::LocusValue)>;
+
+fn validate_claimed_genome_loci(
+    identity: &str,
+    decoded_loci: Result<BrainGenomeLociV1, BrainProtocolError>,
+) -> Result<(), BrainProtocolError> {
+    let loci = decoded_loci.map_err(|error| {
+        invalid_heredity_capability(
+            identity,
+            format!("claimed locus capability but decoding failed: {error}"),
+        )
+    })?;
+    if loci.is_empty() {
+        return Err(invalid_heredity_capability(
+            identity,
+            "claimed locus capability but decoded zero loci",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for (index, (locus, value)) in loci.iter().copied().enumerate() {
+        if !seen.insert(locus) {
+            return Err(invalid_heredity_capability(
+                identity,
+                format!("decoded duplicate locus {locus:?} at canonical index {index}"),
+            ));
+        }
+        if matches!(value, crate::genome_diff::LocusValue::Scalar(value) if !value.is_finite()) {
+            return Err(invalid_heredity_capability(
+                identity,
+                format!("decoded non-finite scalar at locus {locus:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_genome_loci_exclusion(
+    identity: &str,
+    family_id: &BrainFamilyId,
+    reason: BrainHeredityExclusionV1,
+    decoded_loci: Result<BrainGenomeLociV1, BrainProtocolError>,
+) -> Result<(), BrainProtocolError> {
+    if reason == BrainHeredityExclusionV1::NoVersionedGenomeProtocol {
+        return Err(invalid_heredity_capability(
+            identity,
+            "a registered protocol adapter cannot claim no versioned genome protocol",
+        ));
+    }
+    match decoded_loci {
+        Err(BrainProtocolError::GenomeLociUnavailable {
+            family_id: unavailable_family,
+        }) if &unavailable_family == family_id => Ok(()),
+        Err(error) => Err(invalid_heredity_capability(
+            identity,
+            format!("excluded adapter returned an unexpected locus-decoder error: {error}"),
+        )),
+        Ok(loci) => Err(invalid_heredity_capability(
+            identity,
+            format!(
+                "explicit exclusion is false: the adapter decoded {} canonical loci",
+                loci.len()
+            ),
+        )),
+    }
+}
+
+fn validate_protocol_heredity_capability(
+    adapter: &dyn BrainFamilyAdapter,
+    capability: &BrainHeredityCapabilityV1,
+) -> Result<(), BrainProtocolError> {
+    let identity = format!("protocol:{}", adapter.family_id());
+    let adapter_identity = adapter.adapter_identity();
+    let mut seed_bytes = [0_u8; 8];
+    seed_bytes.copy_from_slice(&adapter_identity.digest()[..8]);
+    let mut rng = SmallRngStream::seed_from_u64(u64::from_le_bytes(seed_bytes));
+    let genome = adapter.random_genome(BrainProvenance::default(), &mut rng)?;
+    let decoded_loci = adapter.genome_loci(&genome);
+
+    match capability {
+        BrainHeredityCapabilityV1::LocusCapable { .. } => {
+            validate_claimed_genome_loci(&identity, decoded_loci)
+        }
+        BrainHeredityCapabilityV1::Excluded { reason } => {
+            validate_genome_loci_exclusion(&identity, adapter.family_id(), *reason, decoded_loci)
+        }
+    }
+}
+
 /// Domain used by the one core-owned brain-genome material hash.
 const BRAIN_GENOME_HASH_CONTEXT: &str = "rust-scriptbots.brain-genome-material.v1";
 
@@ -8926,6 +9683,12 @@ pub enum BrainProtocolError {
         /// Validation failure detail.
         detail: String,
     },
+    /// A versioned family intentionally has no canonical typed-locus schema.
+    #[error("brain family `{family_id}` does not expose canonical typed genome loci")]
+    GenomeLociUnavailable {
+        /// Family whose opaque genome cannot be decoded into loci.
+        family_id: BrainFamilyId,
+    },
     /// An envelope payload failed family-level validation.
     #[error("invalid {kind} payload for brain family `{family_id}`: {detail}")]
     InvalidPayload {
@@ -8941,6 +9704,20 @@ pub enum BrainProtocolError {
     DuplicateFamily {
         /// The duplicate family.
         family_id: BrainFamilyId,
+    },
+    /// A live registry entry's typed heredity declaration was missing or contradicted its adapter.
+    #[error("invalid heredity capability for `{identity}`: {detail}")]
+    InvalidHeredityCapability {
+        /// Stable protocol or legacy identity of the rejected entry.
+        identity: String,
+        /// Exact contract violation.
+        detail: String,
+    },
+    /// Two live registry entries projected to the same stable heredity identity.
+    #[error("duplicate live heredity identity `{identity}`")]
+    DuplicateHeredityIdentity {
+        /// Duplicate stable identity.
+        identity: String,
     },
     /// The family is not registered.
     #[error("brain family `{family_id}` is not registered")]
@@ -9143,6 +9920,14 @@ pub trait BrainFamilyCodec: Send + Sync {
     /// process state.
     fn adapter_identity(&self) -> BrainAdapterIdentityV1;
 
+    /// Declare whether this exact adapter participates in typed heredity proof.
+    ///
+    /// This declaration is mandatory so a newly registered protocol family cannot disappear from
+    /// the proof matrix merely because a test author forgot to add a second family list. A
+    /// locus-capable declaration must agree with [`Self::genome_loci`]; an exclusion is actively
+    /// checked and rejected if the adapter successfully exposes loci.
+    fn heredity_capability(&self) -> BrainHeredityCapabilityV1;
+
     /// Generate provenance-free heritable material from the supplied deterministic stream.
     fn random_genome_material(
         &self,
@@ -9163,10 +9948,8 @@ pub trait BrainFamilyCodec: Send + Sync {
     ) -> Result<Vec<(crate::genome_diff::Locus, crate::genome_diff::LocusValue)>, BrainProtocolError>
     {
         let _ = genome;
-        Err(BrainProtocolError::InvalidPayload {
-            kind: BrainEnvelopeKind::Genome,
+        Err(BrainProtocolError::GenomeLociUnavailable {
             family_id: self.family_id().clone(),
-            detail: "family does not expose typed genome loci for structural diffing".to_owned(),
         })
     }
 
@@ -33737,6 +34520,16 @@ mod tests {
     const FIXTURE_STATE_SCHEMA: u32 = 11;
     const FIXTURE_STATE_CODEC: u16 = 5;
 
+    #[derive(Debug, Clone, Copy)]
+    enum FixtureLocusMode {
+        Unavailable,
+        Finite,
+        Empty,
+        Duplicate,
+        NonFinite,
+        Malformed,
+    }
+
     #[derive(Debug)]
     // bd-tqpj: the independent batch/evaluation bool flags mirror the fixture family's orthogonal failure modes.
     #[allow(clippy::struct_excessive_bools)]
@@ -33753,6 +34546,8 @@ mod tests {
         batch_truncates_checkpoint: bool,
         reconstruction_failure: Option<(i8, i16)>,
         batch_probe: Option<Arc<Mutex<Vec<Vec<i8>>>>>,
+        locus_mode: FixtureLocusMode,
+        heredity_capability: BrainHeredityCapabilityV1,
     }
 
     impl FixtureBrainFamily {
@@ -33770,7 +34565,39 @@ mod tests {
                 batch_truncates_checkpoint: false,
                 reconstruction_failure: None,
                 batch_probe: None,
+                locus_mode: FixtureLocusMode::Unavailable,
+                heredity_capability: BrainHeredityCapabilityV1::excluded(
+                    BrainHeredityExclusionV1::NoCanonicalLocusSchema,
+                ),
             }
+        }
+
+        fn with_locus_contract(
+            id: &str,
+            locus_mode: FixtureLocusMode,
+            heredity_capability: BrainHeredityCapabilityV1,
+        ) -> Self {
+            let mut family = Self::new(id);
+            family.locus_mode = locus_mode;
+            family.heredity_capability = heredity_capability;
+            family
+        }
+
+        fn locus_capable(id: &str, locus_mode: FixtureLocusMode) -> Self {
+            let family_id = BrainFamilyId::new(id).expect("valid fixture family id");
+            let locus_schema = BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                &family_id,
+                1,
+                b"fixture gain then bias loci",
+            );
+            Self::with_locus_contract(
+                id,
+                locus_mode,
+                BrainHeredityCapabilityV1::locus_capable(
+                    locus_schema,
+                    vec![BrainMutationTrialGroupV1::new(1, 1, 1)],
+                ),
+            )
         }
 
         fn with_policy(id: &str, offspring_policy: OffspringStatePolicy) -> Self {
@@ -34061,6 +34888,10 @@ mod tests {
             BrainAdapterIdentityV1::from_semantic_descriptor(&self.id, 1, &semantic_material)
         }
 
+        fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+            self.heredity_capability.clone()
+        }
+
         fn random_genome_material(
             &self,
             rng: &mut dyn RandomStream,
@@ -34071,6 +34902,40 @@ mod tests {
 
         fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
             self.decode_genome(genome).map(|_| ())
+        }
+
+        fn genome_loci(
+            &self,
+            genome: &BrainGenomeEnvelope,
+        ) -> Result<
+            Vec<(crate::genome_diff::Locus, crate::genome_diff::LocusValue)>,
+            BrainProtocolError,
+        > {
+            use crate::genome_diff::{Locus, LocusValue};
+
+            let (gain, bias) = self.decode_genome(genome)?;
+            match self.locus_mode {
+                FixtureLocusMode::Unavailable => Err(BrainProtocolError::GenomeLociUnavailable {
+                    family_id: self.id.clone(),
+                }),
+                FixtureLocusMode::Finite => Ok(vec![
+                    (Locus::Hyper(0), LocusValue::Scalar(f32::from(gain))),
+                    (Locus::Hyper(1), LocusValue::Scalar(f32::from(bias))),
+                ]),
+                FixtureLocusMode::Empty => Ok(Vec::new()),
+                FixtureLocusMode::Duplicate => Ok(vec![
+                    (Locus::Hyper(0), LocusValue::Scalar(f32::from(gain))),
+                    (Locus::Hyper(0), LocusValue::Scalar(f32::from(bias))),
+                ]),
+                FixtureLocusMode::NonFinite => {
+                    Ok(vec![(Locus::Hyper(0), LocusValue::Scalar(f32::NAN))])
+                }
+                FixtureLocusMode::Malformed => Err(BrainProtocolError::InvalidPayload {
+                    kind: BrainEnvelopeKind::Genome,
+                    family_id: self.id.clone(),
+                    detail: "fixture injected a locus decoder failure".to_owned(),
+                }),
+            }
         }
 
         fn validate_evaluator_state(
@@ -35012,7 +35877,11 @@ mod tests {
     #[test]
     fn protocol_registry_population_selection_excludes_legacy_entries() {
         let mut registry = BrainRegistry::new();
-        let legacy = registry.register("legacy-explicit", |_rng| Ok(Box::new(StubBrain)));
+        let legacy = registry.register_with_heredity_exclusion(
+            "legacy-explicit",
+            BrainHeredityExclusionV1::NoVersionedGenomeProtocol,
+            |_rng| Ok(Box::new(StubBrain)),
+        );
         let protocol = registry
             .register_family(
                 "protocol-population",
@@ -35047,6 +35916,494 @@ mod tests {
                  an explicitly selectable legacy runner"
             );
         }
+    }
+
+    #[test]
+    fn live_heredity_projection_is_canonical_and_insertion_order_independent() {
+        let mut left = BrainRegistry::new();
+        left.register_with_heredity_exclusion(
+            "legacy-explicit",
+            BrainHeredityExclusionV1::NoVersionedGenomeProtocol,
+            |_rng| Ok(Box::new(StubBrain)),
+        );
+        left.register_family(
+            "shared-alias",
+            Box::new(FixtureBrainFamily::new("fixture-zeta")),
+        )
+        .expect("left zeta");
+        left.register_family(
+            "shared-alias",
+            Box::new(FixtureBrainFamily::new("fixture-alpha")),
+        )
+        .expect("left alpha");
+
+        let mut right = BrainRegistry::new();
+        right
+            .register_family(
+                "shared-alias",
+                Box::new(FixtureBrainFamily::new("fixture-alpha")),
+            )
+            .expect("right alpha");
+        right
+            .register_family(
+                "shared-alias",
+                Box::new(FixtureBrainFamily::new("fixture-zeta")),
+            )
+            .expect("right zeta");
+        right.register_with_heredity_exclusion(
+            "legacy-explicit",
+            BrainHeredityExclusionV1::NoVersionedGenomeProtocol,
+            |_rng| Ok(Box::new(StubBrain)),
+        );
+
+        let left_snapshot = left.heredity_capabilities().expect("left projection");
+        let right_snapshot = right.heredity_capabilities().expect("right projection");
+        let left_identities = left_snapshot
+            .descriptors
+            .iter()
+            .map(BrainRegistryHeredityDescriptorV1::stable_identity)
+            .collect::<Vec<_>>();
+        let right_identities = right_snapshot
+            .descriptors
+            .iter()
+            .map(BrainRegistryHeredityDescriptorV1::stable_identity)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            left_identities,
+            [
+                "legacy:legacy-explicit",
+                "protocol:fixture-alpha",
+                "protocol:fixture-zeta"
+            ]
+        );
+        assert_eq!(left_identities, right_identities);
+        assert_ne!(
+            left_snapshot
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor.registry_key)
+                .collect::<Vec<_>>(),
+            right_snapshot
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor.registry_key)
+                .collect::<Vec<_>>(),
+            "opaque registry keys should demonstrate the reversed insertion order"
+        );
+        assert_eq!(
+            left_snapshot.capability_digest, right_snapshot.capability_digest,
+            "capability evidence must not depend on opaque registration keys"
+        );
+        assert!(matches!(
+            &left_snapshot.descriptors[0].capability,
+            BrainHeredityCapabilityV1::Excluded {
+                reason: BrainHeredityExclusionV1::NoVersionedGenomeProtocol
+            }
+        ));
+        assert!(left_snapshot.descriptors[0].family_id.is_none());
+        assert!(left_snapshot.descriptors[0].adapter_identity.is_none());
+        for descriptor in &left_snapshot.descriptors[1..] {
+            assert!(matches!(
+                &descriptor.capability,
+                BrainHeredityCapabilityV1::Excluded {
+                    reason: BrainHeredityExclusionV1::NoCanonicalLocusSchema
+                }
+            ));
+            assert!(descriptor.family_id.is_some());
+            assert!(descriptor.adapter_identity.is_some());
+        }
+    }
+
+    #[test]
+    fn heredity_projection_handles_empty_and_duplicate_legacy_identities() {
+        let empty = BrainRegistry::new()
+            .heredity_capabilities()
+            .expect("empty registry projection");
+        assert!(empty.descriptors.is_empty());
+        assert_eq!(
+            empty.capability_version,
+            BRAIN_HEREDITY_CAPABILITY_VERSION_V1
+        );
+
+        let mut duplicate_legacy = BrainRegistry::new();
+        duplicate_legacy.register_with_heredity_exclusion(
+            "duplicate-kind",
+            BrainHeredityExclusionV1::NoVersionedGenomeProtocol,
+            |_rng| Ok(Box::new(StubBrain)),
+        );
+        duplicate_legacy.register_with_heredity_exclusion(
+            "duplicate-kind",
+            BrainHeredityExclusionV1::NoVersionedGenomeProtocol,
+            |_rng| Ok(Box::new(StubBrain)),
+        );
+        assert!(matches!(
+            duplicate_legacy.heredity_capabilities(),
+            Err(BrainProtocolError::DuplicateHeredityIdentity { identity })
+                if identity == "legacy:duplicate-kind"
+        ));
+
+        let mut undeclared = BrainRegistry::new();
+        undeclared.register("undeclared-legacy", |_rng| Ok(Box::new(StubBrain)));
+        assert!(matches!(
+            undeclared.heredity_capabilities(),
+            Err(BrainProtocolError::InvalidHeredityCapability { identity, detail })
+                if identity == "legacy:undeclared-legacy"
+                    && detail.contains("no explicit reviewed heredity exclusion")
+        ));
+
+        let mut wrong_exclusion = BrainRegistry::new();
+        wrong_exclusion.register_with_heredity_exclusion(
+            "wrong-legacy-exclusion",
+            BrainHeredityExclusionV1::NoCanonicalLocusSchema,
+            |_rng| Ok(Box::new(StubBrain)),
+        );
+        assert!(matches!(
+            wrong_exclusion.heredity_capabilities(),
+            Err(BrainProtocolError::InvalidHeredityCapability { identity, detail })
+                if identity == "legacy:wrong-legacy-exclusion"
+                    && detail.contains("must be no_versioned_genome_protocol")
+        ));
+    }
+
+    #[test]
+    fn heredity_projection_rejects_incomplete_protocol_entries() {
+        fn registered_fixture() -> (BrainRegistry, u64) {
+            let mut registry = BrainRegistry::new();
+            let key = registry
+                .register_family(
+                    "fixture-kind",
+                    Box::new(FixtureBrainFamily::new("fixture-incomplete")),
+                )
+                .expect("valid fixture registration");
+            (registry, key)
+        }
+
+        let (mut missing_capability, capability_key) = registered_fixture();
+        missing_capability
+            .entries
+            .get_mut(&capability_key)
+            .expect("registered entry")
+            .heredity_capability = None;
+        assert!(matches!(
+            missing_capability.heredity_capabilities(),
+            Err(BrainProtocolError::InvalidHeredityCapability { detail, .. })
+                if detail.contains("missing its captured heredity capability")
+        ));
+
+        let (mut missing_adapter, adapter_key) = registered_fixture();
+        missing_adapter
+            .entries
+            .get_mut(&adapter_key)
+            .expect("registered entry")
+            .protocol_adapter = None;
+        assert!(matches!(
+            missing_adapter.heredity_capabilities(),
+            Err(BrainProtocolError::InvalidHeredityCapability { detail, .. })
+                if detail.contains("neither a protocol adapter nor a legacy spawner")
+        ));
+    }
+
+    #[test]
+    fn heredity_projection_actively_rejects_false_or_malformed_declarations() {
+        fn rejection(family: FixtureBrainFamily) -> String {
+            let mut registry = BrainRegistry::new();
+            let registration = registry.register_family("fixture-kind", Box::new(family));
+            match registration {
+                Err(BrainProtocolError::InvalidHeredityCapability { detail, .. }) => detail,
+                Err(other) => panic!("expected invalid heredity declaration, found {other:?}"),
+                Ok(_) => match registry.heredity_capabilities() {
+                    Err(BrainProtocolError::InvalidHeredityCapability { detail, .. }) => detail,
+                    other => panic!("expected invalid heredity declaration, found {other:?}"),
+                },
+            }
+        }
+
+        let false_exclusion = FixtureBrainFamily::with_locus_contract(
+            "fixture-false-exclusion",
+            FixtureLocusMode::Finite,
+            BrainHeredityCapabilityV1::excluded(BrainHeredityExclusionV1::NoCanonicalLocusSchema),
+        );
+        assert!(rejection(false_exclusion).contains("explicit exclusion is false"));
+        let broken_exclusion = FixtureBrainFamily::with_locus_contract(
+            "fixture-broken-exclusion",
+            FixtureLocusMode::Malformed,
+            BrainHeredityCapabilityV1::excluded(BrainHeredityExclusionV1::NoCanonicalLocusSchema),
+        );
+        assert!(
+            rejection(broken_exclusion).contains("unexpected locus-decoder error"),
+            "an arbitrary codec failure must not be laundered as a reviewed exclusion"
+        );
+        assert!(
+            rejection(FixtureBrainFamily::locus_capable(
+                "fixture-empty-loci",
+                FixtureLocusMode::Empty
+            ))
+            .contains("decoded zero loci")
+        );
+        assert!(
+            rejection(FixtureBrainFamily::locus_capable(
+                "fixture-duplicate-loci",
+                FixtureLocusMode::Duplicate
+            ))
+            .contains("decoded duplicate locus")
+        );
+        assert!(
+            rejection(FixtureBrainFamily::locus_capable(
+                "fixture-non-finite-locus",
+                FixtureLocusMode::NonFinite
+            ))
+            .contains("decoded non-finite scalar")
+        );
+
+        let malformed_id =
+            BrainFamilyId::new("fixture-malformed-model").expect("valid fixture family id");
+        let malformed_schema = BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+            &malformed_id,
+            1,
+            b"fixture malformed mutation model",
+        );
+        let malformed_model = FixtureBrainFamily::with_locus_contract(
+            malformed_id.as_str(),
+            FixtureLocusMode::Finite,
+            BrainHeredityCapabilityV1::locus_capable(
+                malformed_schema,
+                vec![BrainMutationTrialGroupV1::new(0, 1, 1)],
+            ),
+        );
+        assert!(rejection(malformed_model).contains("gate count must be nonzero"));
+        let zero_denominator = FixtureBrainFamily::with_locus_contract(
+            "fixture-zero-denominator",
+            FixtureLocusMode::Finite,
+            BrainHeredityCapabilityV1::locus_capable(
+                BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                    &BrainFamilyId::new("fixture-zero-denominator")
+                        .expect("valid fixture family id"),
+                    1,
+                    b"fixture zero denominator",
+                ),
+                vec![BrainMutationTrialGroupV1::new(1, 1, 0)],
+            ),
+        );
+        assert!(rejection(zero_denominator).contains("denominator must be nonzero"));
+
+        let zero_schema_id =
+            BrainFamilyId::new("fixture-zero-schema").expect("valid fixture family id");
+        let zero_schema = FixtureBrainFamily::with_locus_contract(
+            zero_schema_id.as_str(),
+            FixtureLocusMode::Finite,
+            BrainHeredityCapabilityV1::locus_capable(
+                BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                    &zero_schema_id,
+                    0,
+                    b"invalid zero schema",
+                ),
+                vec![BrainMutationTrialGroupV1::new(1, 1, 1)],
+            ),
+        );
+        assert!(rejection(zero_schema).contains("semantic version must be nonzero"));
+    }
+
+    #[test]
+    fn heredity_projection_diagnostics_are_stable_and_schema_is_family_bound() {
+        let registered_id =
+            BrainFamilyId::new("fixture-schema-owner").expect("valid registered family");
+        let other_id = BrainFamilyId::new("fixture-other-schema").expect("valid other family");
+        let wrong_family = FixtureBrainFamily::with_locus_contract(
+            registered_id.as_str(),
+            FixtureLocusMode::Finite,
+            BrainHeredityCapabilityV1::locus_capable(
+                BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                    &other_id,
+                    1,
+                    b"schema belonging to the wrong family",
+                ),
+                vec![BrainMutationTrialGroupV1::new(1, 1, 1)],
+            ),
+        );
+        let mut wrong_family_registry = BrainRegistry::new();
+        assert!(matches!(
+            wrong_family_registry.register_family("fixture-kind", Box::new(wrong_family)),
+            Err(BrainProtocolError::InvalidHeredityCapability { identity, detail })
+                if identity == "protocol:fixture-schema-owner"
+                    && detail.contains("fixture-other-schema")
+        ));
+
+        fn first_rejected_identity(reverse: bool) -> String {
+            let mut registry = BrainRegistry::new();
+            let ids = if reverse {
+                ["fixture-zeta-invalid", "fixture-alpha-invalid"]
+            } else {
+                ["fixture-alpha-invalid", "fixture-zeta-invalid"]
+            };
+            for id in ids {
+                registry.register(id, |_rng| Ok(Box::new(StubBrain)));
+            }
+            match registry.heredity_capabilities() {
+                Err(BrainProtocolError::InvalidHeredityCapability { identity, .. }) => identity,
+                other => panic!("expected deterministic capability rejection, found {other:?}"),
+            }
+        }
+        assert_eq!(
+            first_rejected_identity(false),
+            "legacy:fixture-alpha-invalid"
+        );
+        assert_eq!(
+            first_rejected_identity(true),
+            "legacy:fixture-alpha-invalid"
+        );
+    }
+
+    #[test]
+    fn mutation_gate_groups_are_canonical_and_preserve_f32_probability_arithmetic() {
+        fn registry_with_groups(groups: Vec<BrainMutationTrialGroupV1>) -> BrainRegistry {
+            let family_id =
+                BrainFamilyId::new("fixture-gate-groups").expect("valid fixture family");
+            let capability = BrainHeredityCapabilityV1::locus_capable(
+                BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                    &family_id,
+                    1,
+                    b"fixture gate-group schema",
+                ),
+                groups,
+            );
+            let mut registry = BrainRegistry::new();
+            registry
+                .register_family(
+                    "fixture-kind",
+                    Box::new(FixtureBrainFamily::with_locus_contract(
+                        family_id.as_str(),
+                        FixtureLocusMode::Finite,
+                        capability,
+                    )),
+                )
+                .expect("gate-group fixture registration");
+            registry
+        }
+
+        let left = registry_with_groups(vec![
+            BrainMutationTrialGroupV1::new(2, 3, 1),
+            BrainMutationTrialGroupV1::new(4, 1, 1),
+            BrainMutationTrialGroupV1::new(5, 1, 1),
+        ])
+        .heredity_capabilities()
+        .expect("left canonical groups");
+        let right = registry_with_groups(vec![
+            BrainMutationTrialGroupV1::new(5, 1, 1),
+            BrainMutationTrialGroupV1::new(2, 3, 1),
+            BrainMutationTrialGroupV1::new(4, 1, 1),
+        ])
+        .heredity_capabilities()
+        .expect("right canonical groups");
+        assert_eq!(left.capability_digest, right.capability_digest);
+        assert_eq!(
+            left.descriptors[0].capability,
+            right.descriptors[0].capability
+        );
+        let BrainHeredityCapabilityV1::LocusCapable {
+            mutation_trials, ..
+        } = &left.descriptors[0].capability
+        else {
+            panic!("fixture capability was not locus-capable");
+        };
+        assert_eq!(
+            mutation_trials.as_slice(),
+            [
+                BrainMutationTrialGroupV1::new(9, 1, 1),
+                BrainMutationTrialGroupV1::new(2, 3, 1),
+            ]
+        );
+
+        let primary = 0.1_f32;
+        assert_eq!(
+            BrainMutationTrialGroupV1::new(1, 3, 1)
+                .effective_probability(primary)
+                .to_bits(),
+            (5_033_165.0_f64 / 16_777_216.0).to_bits(),
+            "triple-rate probability must match the exact StandardUniform f32 lattice"
+        );
+        let primary_probability =
+            BrainMutationTrialGroupV1::new(1, 1, 1).effective_probability(primary);
+        assert_eq!(
+            primary_probability.to_bits(),
+            (1_677_722.0_f64 / 16_777_216.0).to_bits(),
+            "primary-rate probability must round upward to the first admitted f32 sample"
+        );
+        assert_ne!(
+            primary_probability.to_bits(),
+            f64::from(primary).to_bits(),
+            "the comparison threshold is not generally the discrete Bernoulli probability"
+        );
+
+        let unreduced = registry_with_groups(vec![
+            BrainMutationTrialGroupV1::new(9, 1, 1),
+            BrainMutationTrialGroupV1::new(2, 6, 2),
+        ])
+        .heredity_capabilities()
+        .expect("unreduced arithmetic groups");
+        assert_ne!(
+            left.capability_digest, unreduced.capability_digest,
+            "rationally equivalent ratios must retain their exact f32 multiply/divide schedule"
+        );
+    }
+
+    #[test]
+    fn valid_locus_capability_projection_is_read_only_and_digest_neutral() {
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xCA9A_B111),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("capability world");
+        world
+            .register_brain_family(
+                "fixture-capable",
+                Box::new(FixtureBrainFamily::locus_capable(
+                    "fixture-capable",
+                    FixtureLocusMode::Finite,
+                )),
+            )
+            .expect("capable fixture registration");
+
+        let before = world
+            .world_digest_v1()
+            .expect("digest before introspection");
+        let snapshot = world
+            .brain_registry()
+            .heredity_capabilities()
+            .expect("valid capability projection");
+        let after = world.world_digest_v1().expect("digest after introspection");
+        assert_eq!(
+            before, after,
+            "read-only capability discovery changed science"
+        );
+        assert_eq!(snapshot.descriptors.len(), 1);
+        let BrainHeredityCapabilityV1::LocusCapable {
+            mutation_trials, ..
+        } = &snapshot.descriptors[0].capability
+        else {
+            panic!("fixture capability was not retained");
+        };
+        assert_eq!(
+            mutation_trials.as_slice(),
+            &[BrainMutationTrialGroupV1::new(1, 1, 1)]
+        );
+        assert_eq!(
+            BrainMutationTrialGroupV1::new(1, 3, 2)
+                .effective_probability(0.8)
+                .to_bits(),
+            1.0_f64.to_bits(),
+            "effective mutation probabilities saturate at one exactly like a uniform gate"
+        );
+        assert!(
+            serde_json::from_value::<BrainHeredityCapabilityV1>(serde_json::json!({
+                "disposition": "excluded",
+                "reason": "no_canonical_locus_schema",
+                "invented": true
+            }))
+            .is_err(),
+            "versioned capability payloads must reject unknown fields"
+        );
     }
 
     #[test]

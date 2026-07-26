@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use scriptbots_brain::{Brain, BrainCloneError, BrainKind, BrainMutationError, into_runner};
 use scriptbots_core::{
-    ActivationLayer, BrainActivations, BrainInspection, BrainInspectionError,
-    BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner, BrainSpawnError,
-    NeuroflowActivationKind, NeuroflowSettings, RandomStream, ScientificStateError, WorldState,
-    bound_brain_inspection,
+    ActivationLayer, BrainActivations, BrainHeredityExclusionV1, BrainInspection,
+    BrainInspectionError, BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner,
+    BrainSpawnError, NeuroflowActivationKind, NeuroflowSettings, RandomStream,
+    ScientificStateError, WorldState, bound_brain_inspection,
 };
 use std::sync::Arc;
 #[cfg(test)]
@@ -439,10 +439,14 @@ impl NeuroflowBrain {
         let config = Arc::new(config);
         let key = world
             .brain_registry_mut()?
-            .register(Self::KIND.as_str(), move |rng| {
-                Self::runner((*config).clone(), rng)
-                    .map_err(|source| BrainSpawnError::new(Self::KIND.as_str(), source))
-            });
+            .register_with_heredity_exclusion(
+                Self::KIND.as_str(),
+                BrainHeredityExclusionV1::NoVersionedGenomeProtocol,
+                move |rng| {
+                    Self::runner((*config).clone(), rng)
+                        .map_err(|source| BrainSpawnError::new(Self::KIND.as_str(), source))
+                },
+            );
         Ok(key)
     }
 

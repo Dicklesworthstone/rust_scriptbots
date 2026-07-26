@@ -3,9 +3,10 @@
 use rand::Rng;
 use scriptbots_core::{
     BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
-    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection,
-    BrainInspectionError, BrainInspectionLimits, BrainInspectionSnapshot, BrainProtocolError,
-    MutationRates, OffspringStatePolicy, RandomStream, bound_brain_inspection,
+    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial,
+    BrainHeredityCapabilityV1, BrainInspection, BrainInspectionError, BrainInspectionLimits,
+    BrainInspectionSnapshot, BrainLocusSchemaIdentityV1, BrainMutationTrialGroupV1,
+    BrainProtocolError, MutationRates, OffspringStatePolicy, RandomStream, bound_brain_inspection,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -25,6 +26,7 @@ const MLP_FAMILY_ID: &str = "mlp-baseline";
 const ADAPTER_SEMANTIC_VERSION: u32 = 3;
 const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.adapter-semantics.v3";
 const GENOME_SCHEMA_VERSION: u32 = 1;
+const LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.locus-schema.node-ascending:[NodeBias,NodeDamping,NodeGain,connection-ascending:[NodeWeight,NodeKind,NodeTarget]]";
 const GENOME_CODEC_VERSION: u16 = 1;
 const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_CODEC_VERSION: u16 = 1;
@@ -820,6 +822,19 @@ impl BrainFamilyCodec for MlpBrainFamily {
         )
     }
 
+    fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+        let mutation_trials =
+            u32::try_from(BRAIN_SIZE * 6).expect("MLP mutation gate count fits u32");
+        BrainHeredityCapabilityV1::locus_capable(
+            BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                self.family_id(),
+                GENOME_SCHEMA_VERSION,
+                LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR,
+            ),
+            vec![BrainMutationTrialGroupV1::new(mutation_trials, 1, 1)],
+        )
+    }
+
     fn random_genome_material(
         &self,
         rng: &mut dyn RandomStream,
@@ -1164,6 +1179,22 @@ mod tests {
             identity.to_string(),
             "8fbb8b2a3cbbf4efb5744f9404ca1d82fe28ccf56b2e2e33230cb53408543177",
             "update only after reviewing an intentional MLP executable-semantics change"
+        );
+    }
+
+    #[test]
+    fn heredity_capability_matches_mlp_mutation_gates() {
+        let BrainHeredityCapabilityV1::LocusCapable {
+            locus_schema,
+            mutation_trials,
+        } = MlpBrainFamily::new().heredity_capability()
+        else {
+            panic!("MLP must remain locus-capable");
+        };
+        assert_eq!(locus_schema.semantic_version(), GENOME_SCHEMA_VERSION);
+        assert_eq!(
+            mutation_trials,
+            vec![BrainMutationTrialGroupV1::new(1_200, 1, 1)]
         );
     }
 
