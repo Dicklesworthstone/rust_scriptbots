@@ -87,6 +87,10 @@ const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
 const MAX_STORAGE_QUERY_PAGE: usize = 4_096;
 const MAX_NARRATIVE_QUERY_BYTES: usize = 1_024;
 const MAX_HOST_JOURNAL_ARCHIVE_BYTES: usize = 256 << 20;
+// A command is control-plane input, not a scientific snapshot. Keeping its canonical durable
+// claim below one MiB prevents one corrupt row or selection request from monopolizing the bounded
+// storage lane while leaving ample room for the complete configuration envelope.
+const MAX_COMMAND_ENVELOPE_BYTES: usize = 1 << 20;
 const OUTBOX_PAYLOAD_VERSION: u32 = 4;
 const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
 /// Sequence namespace reserved for core-owned pairwise interaction ordinals.
@@ -5885,6 +5889,32 @@ fn checked_query_limit(context: &'static str, limit: usize) -> Result<i64, Stora
     checked_i64(context, limit)
 }
 
+fn checked_command_envelope_hex_bytes(
+    context: &'static str,
+    raw_hex_bytes: i64,
+    maximum_envelope_bytes: usize,
+) -> Result<usize, StorageError> {
+    let hex_bytes = checked_usize(context, raw_hex_bytes)?;
+    let maximum_envelope_bytes = maximum_envelope_bytes.min(MAX_COMMAND_ENVELOPE_BYTES);
+    let maximum_hex_bytes =
+        maximum_envelope_bytes
+            .checked_mul(2)
+            .ok_or_else(|| StorageError::InvalidData {
+                context,
+                reason: "command-envelope hex bound exceeds the platform allocation range"
+                    .to_owned(),
+            })?;
+    if hex_bytes == 0 || !hex_bytes.is_multiple_of(2) || hex_bytes > maximum_hex_bytes {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: format!(
+                "command envelope has {hex_bytes} hex bytes outside the bounded even range 2..={maximum_hex_bytes}"
+            ),
+        });
+    }
+    Ok(hex_bytes / 2)
+}
+
 /// Turn user text into one literal FTS5 phrase.
 ///
 /// FTS operators are deliberately unavailable through this API. SQLite's documented FTS5
@@ -6392,11 +6422,8 @@ impl StorageReader {
             .bind_connection(&conn, path)
             .and_then(|()| Storage::validate_existing_scriptbots_database(&conn))
             .and_then(|()| Storage::validate_all_persistence_invariants(&conn, true))
+            .and_then(|()| Storage::validate_all_host_journal_invariants(&conn, true))
             .and_then(|()| Self::resolve_run_id(&conn, requested_run_id))
-            .and_then(|run_id| {
-                Storage::validate_host_journal_invariants_for_connection(&conn, run_id, true, false)
-                    .map(|()| run_id)
-            })
             .and_then(|run_id| existing_lease.verify_path(path).map(|()| run_id));
         let run_id = match validation {
             Ok(run_id) => run_id,
@@ -10632,7 +10659,7 @@ impl Storage {
             let mut claim_cursor = String::new();
             loop {
                 let claims = connection.query_with_params(
-                    "SELECT command_id, envelope_postcard_hex
+                    "SELECT command_id, length(CAST(envelope_postcard_hex AS BLOB))
                      FROM host_command_claims
                      WHERE run_id = ?1 AND command_id > ?2
                      ORDER BY command_id ASC
@@ -10655,8 +10682,29 @@ impl Storage {
                         context: "host_command_claims.command_id",
                         reason: error.to_string(),
                     })?;
-                    let envelope_hex: String =
-                        decode(row, 1, "host_command_claims.envelope_postcard_hex")?;
+                    let raw_hex_bytes: i64 =
+                        decode(row, 1, "host_command_claims.envelope_postcard_hex.length")?;
+                    checked_command_envelope_hex_bytes(
+                        "host_command_claims.envelope_postcard_hex",
+                        raw_hex_bytes,
+                        MAX_COMMAND_ENVELOPE_BYTES,
+                    )?;
+                    let envelope_row = connection.query_row_with_params(
+                        "SELECT envelope_postcard_hex
+                         FROM host_command_claims
+                         WHERE run_id = ?1 AND command_id = ?2
+                           AND length(CAST(envelope_postcard_hex AS BLOB)) = ?3",
+                        &[
+                            sqlite_run_id(run_id),
+                            command_id_text.as_str().into(),
+                            raw_hex_bytes.into(),
+                        ],
+                    )?;
+                    let envelope_hex: String = decode(
+                        &envelope_row,
+                        0,
+                        "host_command_claims.envelope_postcard_hex",
+                    )?;
                     let envelope = decode_command_envelope_postcard_hex(
                         "host_command_claims.envelope_postcard_hex",
                         &envelope_hex,
@@ -11844,6 +11892,25 @@ impl Storage {
             ..
         } = request
         {
+            let envelope_bytes = checked_command_envelope_hex_bytes(
+                "host_command_claims.envelope_postcard_hex",
+                i64::try_from(envelope_postcard_hex.len()).map_err(|error| {
+                    StorageError::InvalidData {
+                        context: "host_command_claims.envelope_postcard_hex",
+                        reason: error.to_string(),
+                    }
+                })?,
+                MAX_COMMAND_ENVELOPE_BYTES,
+            )?;
+            let request_limit = request.max_envelope_bytes().min(MAX_COMMAND_ENVELOPE_BYTES);
+            if envelope_bytes > request_limit {
+                return Ok(CommandAuthorityLookup::Failed(
+                    CommandAuthorityLookupFailure::Oversized {
+                        bytes: envelope_bytes,
+                        limit: request_limit,
+                    },
+                ));
+            }
             let envelope = decode_command_envelope_postcard_hex(
                 "host_command_claims.envelope_postcard_hex",
                 envelope_postcard_hex,
@@ -11862,15 +11929,17 @@ impl Storage {
             }
         }
         let claim_rows = self.connection()?.query_with_params(
-            "SELECT host_session_id, envelope_postcard_hex
+            "SELECT host_session_id, length(CAST(envelope_postcard_hex AS BLOB))
              FROM host_command_claims
-             WHERE run_id = ?1 AND command_id = ?2",
+             WHERE run_id = ?1 AND command_id = ?2
+             LIMIT 2",
             &[sqlite_run_id(self.run_id), command_id_text.as_str().into()],
         )?;
         if claim_rows.is_empty() {
             let CommandAuthorityRequest::Submit {
                 envelope_postcard_hex,
                 policy,
+                ..
             } = request
             else {
                 return Ok(CommandAuthorityLookup::Absent);
@@ -11912,8 +11981,38 @@ impl Storage {
             "host_command_claims.host_session_id",
             &encoded_session,
         )?);
-        let claimed_envelope: String =
-            decode(claim, 1, "host_command_claims.envelope_postcard_hex")?;
+        let raw_hex_bytes: i64 =
+            decode(claim, 1, "host_command_claims.envelope_postcard_hex.length")?;
+        let claimed_envelope_bytes = checked_command_envelope_hex_bytes(
+            "host_command_claims.envelope_postcard_hex",
+            raw_hex_bytes,
+            MAX_COMMAND_ENVELOPE_BYTES,
+        )?;
+        let request_limit = request.max_envelope_bytes().min(MAX_COMMAND_ENVELOPE_BYTES);
+        if claimed_envelope_bytes > request_limit {
+            return Ok(CommandAuthorityLookup::Failed(
+                CommandAuthorityLookupFailure::Oversized {
+                    bytes: claimed_envelope_bytes,
+                    limit: request_limit,
+                },
+            ));
+        }
+        let claimed_envelope_row = self.connection()?.query_row_with_params(
+            "SELECT envelope_postcard_hex
+             FROM host_command_claims
+             WHERE run_id = ?1 AND command_id = ?2
+               AND length(CAST(envelope_postcard_hex AS BLOB)) = ?3",
+            &[
+                sqlite_run_id(self.run_id),
+                command_id_text.as_str().into(),
+                raw_hex_bytes.into(),
+            ],
+        )?;
+        let claimed_envelope: String = decode(
+            &claimed_envelope_row,
+            0,
+            "host_command_claims.envelope_postcard_hex",
+        )?;
         let decoded_claim = decode_command_envelope_postcard_hex(
             "host_command_claims.envelope_postcard_hex",
             &claimed_envelope,
@@ -15107,6 +15206,7 @@ enum StorageCommand {
         command_id: CommandId,
         request: CommandAuthorityRequest,
         reply: xchan::Sender<CommandAuthorityLookup>,
+        permit: Option<InFlightPermit>,
     },
     Flush {
         reply: xchan::Sender<Result<FlushReceipt, StorageWorkerError>>,
@@ -15130,8 +15230,22 @@ enum CommandAuthorityRequest {
     Submit {
         envelope_postcard_hex: String,
         policy: CommandClaimPolicy,
+        max_envelope_bytes: usize,
     },
-    Status,
+    Status {
+        max_envelope_bytes: usize,
+    },
+}
+
+impl CommandAuthorityRequest {
+    const fn max_envelope_bytes(&self) -> usize {
+        match self {
+            Self::Submit {
+                max_envelope_bytes, ..
+            }
+            | Self::Status { max_envelope_bytes } => *max_envelope_bytes,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -17008,6 +17122,7 @@ fn storage_worker(
                 command_id,
                 request,
                 reply,
+                permit,
             } => {
                 let outcome = storage
                     .resolve_command_authority(session_id, command_id, &request)
@@ -17021,6 +17136,8 @@ fn storage_worker(
                         };
                         CommandAuthorityLookup::Failed(failure)
                     });
+                drop(request);
+                drop(permit);
                 let _ = reply.try_send(outcome);
             }
             StorageCommand::JournalAdmit { batch } => {
@@ -20238,6 +20355,37 @@ mod tests {
         Ok(())
     }
 
+    fn assert_finished_reader_refused_without_database_mutation(
+        path: &Path,
+        expected_error_fragment: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let before = fs::read(path)?;
+        let path_string = path.to_string_lossy().to_string();
+        let error = match StorageReader::open_finished(&path_string) {
+            Ok(reader) => {
+                reader.close()?;
+                return Err(format!(
+                    "finished reader unexpectedly accepted malformed database at {}",
+                    path.display()
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "finished reader for {} produced the wrong refusal:\n  expected to contain: {expected_error_fragment:?}\n  actual: {error}",
+            path.display()
+        );
+        assert_eq!(
+            fs::read(path)?,
+            before,
+            "refused finished-reader open mutated {}",
+            path.display()
+        );
+        Ok(())
+    }
+
     fn create_valid_database(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let path_string = path.to_string_lossy().to_string();
         let mut storage = StoragePipeline::create_unattributed_file(&path_string)?;
@@ -20553,6 +20701,54 @@ mod tests {
     }
 
     #[test]
+    fn production_recovery_migrates_committed_volatile_v12_command_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-v12-committed-command-authority");
+        let path_string = path.to_string_lossy().to_string();
+        let session_id = HostSessionId::new(0x514);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path_string, session_id);
+        arm_host_journal_fault(&path_string, HostJournalFaultPoint::BeforeDurableMarker);
+        let command = frontend.step()?;
+        let mut next_nanos = 0;
+        let status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
+        assert_journal_fault_status(
+            &pipeline,
+            &status,
+            HostJournalFaultPoint::BeforeDurableMarker,
+            FailureCommitState::Committed,
+        );
+        drop_fault_host(pipeline, core, frontend);
+        assert_eq!(
+            journal_database_snapshot(&path_string)
+                .ledger_state
+                .as_deref(),
+            Some("committed_volatile")
+        );
+
+        let connection = Connection::open(&path_string)?;
+        connection.execute_batch(
+            "DROP TABLE host_command_claims;
+             DELETE FROM _schema_migrations WHERE version = 13;
+             PRAGMA user_version = 12;",
+        )?;
+        assert_eq!(
+            read_schema_objects(&connection)?,
+            canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?
+        );
+        connection.close()?;
+
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        recovered.shutdown()?;
+        assert_complete_journal_prefix(&journal_database_snapshot(&path_string), 1, 1);
+        Ok(())
+    }
+
+    #[test]
     fn production_recovery_refuses_admitted_v12_command_without_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-v12-admitted-command-claim-refusal");
@@ -20694,6 +20890,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one recovery-attestation matrix covers admitted preclaim loss plus both global orphan identity branches across writer and finished-reader opens"
+    )]
     fn recovery_refuses_missing_preclaim_and_unknown_run_claim_without_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let missing = temp_db_path("storage-current-missing-command-preclaim");
@@ -20753,6 +20953,95 @@ mod tests {
         assert_recovery_refused_without_database_mutation(
             &orphan,
             "has no matching registered run and journal session",
+        )?;
+        assert_finished_reader_refused_without_database_mutation(
+            &orphan,
+            "has no matching registered run and journal session",
+        )?;
+
+        let missing_session = temp_db_path("storage-current-missing-session-command-claim");
+        create_valid_database(&missing_session)?;
+        let missing_session_string = missing_session.to_string_lossy().to_string();
+        let command_id = CommandId::from_client_sequence(0x4d49_5353_494e, 1);
+        let envelope = encode_command_envelope_postcard_hex(
+            "host_command_claims.envelope_postcard_hex",
+            &CommandEnvelope::new(command_id, HostCommand::Step),
+        )?;
+        let connection = Connection::open(&missing_session_string)?;
+        let run_id: String = connection
+            .query_row("SELECT run_id FROM runs LIMIT 1")?
+            .get_typed(0)?;
+        connection.execute("PRAGMA foreign_keys = OFF")?;
+        connection.execute_with_params(
+            "INSERT INTO host_command_claims (
+                run_id, command_id, host_session_id, envelope_postcard_hex
+             ) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                run_id.into(),
+                command_id.to_string().into(),
+                encode_journal_u64(0x518).into(),
+                envelope.into(),
+            ],
+        )?;
+        connection.close()?;
+        assert_recovery_refused_without_database_mutation(
+            &missing_session,
+            "has no matching registered run and journal session",
+        )?;
+        assert_finished_reader_refused_without_database_mutation(
+            &missing_session,
+            "has no matching registered run and journal session",
+        )
+    }
+
+    #[test]
+    fn recovery_bounds_pending_claim_bytes_before_loading_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-current-oversized-command-claim");
+        create_valid_database(&path)?;
+        let path_string = path.to_string_lossy().to_string();
+        let connection = Connection::open(&path_string)?;
+        let run_id: String = connection
+            .query_row("SELECT run_id FROM runs LIMIT 1")?
+            .get_typed(0)?;
+        let session = encode_journal_u64(0x519);
+        connection.execute_with_params(
+            "INSERT INTO host_journal_progress (
+                run_id, host_session_id,
+                admitted_journal_prefix, applied_journal_prefix,
+                committed_volatile_journal_prefix, durable_journal_prefix,
+                admitted_event_prefix, applied_event_prefix,
+                committed_volatile_event_prefix, durable_event_prefix,
+                shutdown_sequence
+             ) VALUES (
+                ?1, ?2,
+                '0000000000000000', '0000000000000000',
+                '0000000000000000', '0000000000000000',
+                '0000000000000000', '0000000000000000',
+                '0000000000000000', '0000000000000000',
+                NULL
+             )",
+            &[run_id.as_str().into(), session.as_str().into()],
+        )?;
+        let command_id = CommandId::from_client_sequence(0x4f56_4552_5349, 1);
+        let oversized_hex = "00".repeat(MAX_COMMAND_ENVELOPE_BYTES + 1);
+        connection.execute_with_params(
+            "INSERT INTO host_command_claims (
+                run_id, command_id, host_session_id, envelope_postcard_hex
+             ) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                run_id.into(),
+                command_id.to_string().into(),
+                session.into(),
+                oversized_hex.into(),
+            ],
+        )?;
+        connection.close()?;
+
+        assert_recovery_refused_without_database_mutation(&path, "outside the bounded even range")?;
+        assert_finished_reader_refused_without_database_mutation(
+            &path,
+            "outside the bounded even range",
         )
     }
 
@@ -20770,7 +21059,34 @@ mod tests {
         let submit = CommandAuthorityRequest::Submit {
             envelope_postcard_hex: encoded.clone(),
             policy: CommandClaimPolicy::ReserveIfAbsent,
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
         };
+
+        let wrong_envelope =
+            CommandEnvelope::new(CommandId::new(command_id.get() + 1), HostCommand::Step);
+        let wrong_submit = CommandAuthorityRequest::Submit {
+            envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &wrong_envelope,
+            )?,
+            policy: CommandClaimPolicy::ReserveIfAbsent,
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        let mismatch = storage
+            .resolve_command_authority(HostSessionId::new(11), command_id, &wrong_submit)
+            .expect_err("lookup identity must match the embedded canonical command id");
+        assert!(matches!(
+            mismatch,
+            StorageError::InvalidData {
+                context: "host_command_claims.envelope_postcard_hex",
+                ..
+            }
+        ));
+        let claim_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM host_command_claims")?
+            .get_typed(0)?;
+        assert_eq!(claim_count, 0, "mismatched envelope inserted a claim");
 
         assert_eq!(
             storage.resolve_command_authority(HostSessionId::new(11), command_id, &submit)?,
@@ -20790,7 +21106,9 @@ mod tests {
             storage.resolve_command_authority(
                 HostSessionId::new(12),
                 command_id,
-                &CommandAuthorityRequest::Status,
+                &CommandAuthorityRequest::Status {
+                    max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+                },
             )?,
             CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
             "a pre-terminal durable claim is indeterminate, never absent"
@@ -20808,6 +21126,7 @@ mod tests {
                 &changed,
             )?,
             policy: CommandClaimPolicy::ReserveIfAbsent,
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
         };
         assert_eq!(
             storage.resolve_command_authority(HostSessionId::new(12), command_id, &changed)?,

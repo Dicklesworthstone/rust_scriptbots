@@ -2,8 +2,9 @@
 
 use super::{
     AdmissionState, CommandAuthorityRequest, DEFAULT_COMMAND_CAPACITY, ExistingStorageLease,
-    InFlightPermit, MAX_STORAGE_QUERY_PAGE, MAX_STORAGE_WAIT_TIMEOUT, Storage, StorageBuffer,
-    StorageCommand, StorageError, load_host_journal_index, read_host_journal_events,
+    InFlightPermit, MAX_COMMAND_ENVELOPE_BYTES, MAX_STORAGE_QUERY_PAGE, MAX_STORAGE_WAIT_TIMEOUT,
+    Storage, StorageBuffer, StorageCommand, StorageError, load_host_journal_index,
+    read_host_journal_events,
 };
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
@@ -55,7 +56,7 @@ pub struct StorageJournalOptions {
     pub receipt_timeout: Duration,
     /// Largest exact [`JournalBatch`] allocation accepted by the adapter.
     pub max_batch_bytes: usize,
-    /// Largest total accepted allocation awaiting terminal receipts.
+    /// Largest total accepted journal and durable-authority allocation awaiting worker progress.
     pub max_inflight_bytes: usize,
     /// Recent durable event identities retained for nonblocking eviction checks.
     pub event_cache_capacity: usize,
@@ -750,6 +751,59 @@ impl HostCommandPostcardV1 {
     }
 }
 
+#[derive(serde::Serialize)]
+enum HostCommandPostcardRefV1<'a> {
+    Pause,
+    Resume,
+    SetSpeedBits(u32),
+    Step,
+    UpdateConfig(&'a ScriptBotsConfig),
+    Shutdown,
+    UpdateSelection(&'a SelectionUpdate),
+    AdjustAgentMutationRates {
+        agent_uid: u64,
+        delta_primary_bits: u32,
+        delta_secondary_bits: u32,
+    },
+    SpawnAgent {
+        herbivore_tendency_bits: u32,
+    },
+    SpawnCrossover {
+        parent_a: u64,
+        parent_b: u64,
+    },
+}
+
+impl<'a> HostCommandPostcardRefV1<'a> {
+    fn from_runtime(command: &'a HostCommand) -> Self {
+        match command {
+            HostCommand::Pause => Self::Pause,
+            HostCommand::Resume => Self::Resume,
+            HostCommand::SetSpeed(speed) => Self::SetSpeedBits(speed.to_bits()),
+            HostCommand::Step => Self::Step,
+            HostCommand::UpdateConfig(config) => Self::UpdateConfig(config),
+            HostCommand::Shutdown => Self::Shutdown,
+            HostCommand::UpdateSelection(update) => Self::UpdateSelection(update),
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid,
+                delta_primary,
+                delta_secondary,
+            } => Self::AdjustAgentMutationRates {
+                agent_uid: agent_uid.get(),
+                delta_primary_bits: delta_primary.to_bits(),
+                delta_secondary_bits: delta_secondary.to_bits(),
+            },
+            HostCommand::SpawnAgent { herbivore_tendency } => Self::SpawnAgent {
+                herbivore_tendency_bits: herbivore_tendency.to_bits(),
+            },
+            HostCommand::SpawnCrossover { parent_a, parent_b } => Self::SpawnCrossover {
+                parent_a: parent_a.get(),
+                parent_b: parent_b.get(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct CommandEnvelopePostcardV1 {
@@ -782,6 +836,29 @@ impl CommandEnvelopePostcardV1 {
                 .map(ScientificRevision::new),
             expected_config_revision: self.expected_config_revision.map(ConfigRevision::new),
             command: self.command.into_runtime(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CommandEnvelopePostcardRefV1<'a> {
+    command_id: u128,
+    expected_control_revision: Option<u64>,
+    expected_scientific_revision: Option<u64>,
+    expected_config_revision: Option<u64>,
+    command: HostCommandPostcardRefV1<'a>,
+}
+
+impl<'a> CommandEnvelopePostcardRefV1<'a> {
+    fn from_runtime(envelope: &'a CommandEnvelope) -> Self {
+        Self {
+            command_id: envelope.command_id.get(),
+            expected_control_revision: envelope.expected_control_revision.map(|value| value.get()),
+            expected_scientific_revision: envelope
+                .expected_scientific_revision
+                .map(|value| value.get()),
+            expected_config_revision: envelope.expected_config_revision.map(|value| value.get()),
+            command: HostCommandPostcardRefV1::from_runtime(&envelope.command),
         }
     }
 }
@@ -1077,6 +1154,44 @@ fn encode_lower_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+struct LowerHexWriter {
+    encoded: String,
+}
+
+impl LowerHexWriter {
+    fn for_postcard_bytes(
+        context: &'static str,
+        postcard_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        let capacity = postcard_bytes
+            .checked_mul(2)
+            .ok_or_else(|| StorageError::InvalidData {
+                context,
+                reason: "postcard hex length exceeds the platform allocation range".to_owned(),
+            })?;
+        Ok(Self {
+            encoded: String::with_capacity(capacity),
+        })
+    }
+}
+
+impl Write for LowerHexWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        for byte in bytes {
+            self.encoded
+                .push(char::from(DIGITS[usize::from(byte >> 4)]));
+            self.encoded
+                .push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn decode_lower_hex(context: &'static str, encoded: &str) -> Result<Vec<u8>, StorageError> {
     fn nibble(byte: u8) -> Option<u8> {
         match byte {
@@ -1134,7 +1249,52 @@ pub(super) fn encode_command_envelope_postcard_hex(
     context: &'static str,
     envelope: &CommandEnvelope,
 ) -> Result<String, StorageError> {
-    encode_postcard_hex(context, &CommandEnvelopePostcardV1::from_runtime(envelope))
+    let postcard_bytes = command_envelope_postcard_size(context, envelope)?;
+    encode_command_envelope_postcard_hex_with_size(context, envelope, postcard_bytes)
+}
+
+fn command_envelope_postcard_size(
+    context: &'static str,
+    envelope: &CommandEnvelope,
+) -> Result<usize, StorageError> {
+    postcard::experimental::serialized_size(&CommandEnvelopePostcardRefV1::from_runtime(envelope))
+        .map_err(|error| StorageError::InvalidData {
+            context,
+            reason: error.to_string(),
+        })
+}
+
+fn encode_command_envelope_postcard_hex_with_size(
+    context: &'static str,
+    envelope: &CommandEnvelope,
+    postcard_bytes: usize,
+) -> Result<String, StorageError> {
+    let writer = LowerHexWriter::for_postcard_bytes(context, postcard_bytes)?;
+    let writer = postcard::to_io(
+        &CommandEnvelopePostcardRefV1::from_runtime(envelope),
+        writer,
+    )
+    .map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })?;
+    let expected_hex_bytes =
+        postcard_bytes
+            .checked_mul(2)
+            .ok_or_else(|| StorageError::InvalidData {
+                context,
+                reason: "postcard hex length exceeds the platform allocation range".to_owned(),
+            })?;
+    if writer.encoded.len() != expected_hex_bytes {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: format!(
+                "postcard encoder produced {} hex bytes after sizing {postcard_bytes} binary bytes",
+                writer.encoded.len()
+            ),
+        });
+    }
+    Ok(writer.encoded)
 }
 
 pub(super) fn decode_command_envelope_postcard_hex(
@@ -2496,6 +2656,8 @@ struct StorageCommandAuthorityReader {
     capacity: usize,
     timeout: Duration,
     max_envelope_bytes: usize,
+    inflight_bytes: Arc<AtomicUsize>,
+    max_inflight_bytes: usize,
     pending: Mutex<HashMap<CommandAuthorityLookupKey, PendingCommandAuthorityLookup>>,
 }
 
@@ -2506,23 +2668,35 @@ impl StorageCommandAuthorityReader {
         capacity: usize,
         timeout: Duration,
         max_envelope_bytes: usize,
+        inflight_bytes: Arc<AtomicUsize>,
+        max_inflight_bytes: usize,
     ) -> Self {
         Self {
             session_id,
             tx,
             capacity,
             timeout,
-            max_envelope_bytes,
+            max_envelope_bytes: max_envelope_bytes
+                .min(max_inflight_bytes / 2)
+                .min(MAX_COMMAND_ENVELOPE_BYTES),
+            inflight_bytes,
+            max_inflight_bytes,
             pending: Mutex::new(HashMap::with_capacity(capacity)),
         }
     }
 
-    fn resolve(
+    fn resolve<F>(
         &self,
         key: CommandAuthorityLookupKey,
         command_id: CommandId,
-        request: CommandAuthorityRequest,
-    ) -> CommandAuthorityLookup {
+        build_request: F,
+    ) -> CommandAuthorityLookup
+    where
+        F: FnOnce() -> Result<
+            (CommandAuthorityRequest, Option<InFlightPermit>),
+            CommandAuthorityLookup,
+        >,
+    {
         let mut pending = match self.pending.try_lock() {
             Ok(pending) => pending,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -2567,12 +2741,17 @@ impl StorageCommandAuthorityReader {
                 capacity: self.capacity,
             });
         }
+        let (request, permit) = match build_request() {
+            Ok(request) => request,
+            Err(outcome) => return outcome,
+        };
         let (reply_tx, reply_rx) = xchan::bounded(1);
         let command = StorageCommand::ResolveCommandAuthority {
             session_id: self.session_id,
             command_id,
             request,
             reply: reply_tx,
+            permit,
         };
         match self.tx.try_send(command) {
             Ok(()) => {
@@ -2604,24 +2783,6 @@ impl CommandAuthorityReader for StorageCommandAuthorityReader {
         envelope_digest: [u8; blake3::OUT_LEN],
         policy: CommandClaimPolicy,
     ) -> CommandAuthorityLookup {
-        let envelope_postcard_hex = match encode_command_envelope_postcard_hex(
-            "host_command_claims.envelope_postcard_hex",
-            envelope,
-        ) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                return CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Corrupt {
-                    message: error.to_string(),
-                });
-            }
-        };
-        let envelope_bytes = envelope_postcard_hex.len() / 2;
-        if envelope_bytes > self.max_envelope_bytes {
-            return CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Oversized {
-                bytes: envelope_bytes,
-                limit: self.max_envelope_bytes,
-            });
-        }
         self.resolve(
             CommandAuthorityLookupKey::Submit {
                 command_id: envelope.command_id,
@@ -2629,9 +2790,60 @@ impl CommandAuthorityReader for StorageCommandAuthorityReader {
                 policy,
             },
             envelope.command_id,
-            CommandAuthorityRequest::Submit {
-                envelope_postcard_hex,
-                policy,
+            || {
+                let envelope_bytes = command_envelope_postcard_size(
+                    "host_command_claims.envelope_postcard_hex",
+                    envelope,
+                )
+                .map_err(|error| {
+                    CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Corrupt {
+                        message: error.to_string(),
+                    })
+                })?;
+                if envelope_bytes > self.max_envelope_bytes {
+                    return Err(CommandAuthorityLookup::Failed(
+                        CommandAuthorityLookupFailure::Oversized {
+                            bytes: envelope_bytes,
+                            limit: self.max_envelope_bytes,
+                        },
+                    ));
+                }
+                let Some(hex_bytes) = envelope_bytes.checked_mul(2) else {
+                    return Err(CommandAuthorityLookup::Failed(
+                        CommandAuthorityLookupFailure::Oversized {
+                            bytes: usize::MAX,
+                            limit: self.max_envelope_bytes,
+                        },
+                    ));
+                };
+                let permit = InFlightPermit::try_acquire(
+                    &self.inflight_bytes,
+                    hex_bytes,
+                    self.max_inflight_bytes,
+                )
+                .map_err(|_| {
+                    CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Capacity {
+                        capacity: self.capacity,
+                    })
+                })?;
+                let envelope_postcard_hex = encode_command_envelope_postcard_hex_with_size(
+                    "host_command_claims.envelope_postcard_hex",
+                    envelope,
+                    envelope_bytes,
+                )
+                .map_err(|error| {
+                    CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Corrupt {
+                        message: error.to_string(),
+                    })
+                })?;
+                Ok((
+                    CommandAuthorityRequest::Submit {
+                        envelope_postcard_hex,
+                        policy,
+                        max_envelope_bytes: self.max_envelope_bytes,
+                    },
+                    Some(permit),
+                ))
             },
         )
     }
@@ -2640,7 +2852,14 @@ impl CommandAuthorityReader for StorageCommandAuthorityReader {
         self.resolve(
             CommandAuthorityLookupKey::Status(command_id),
             command_id,
-            CommandAuthorityRequest::Status,
+            || {
+                Ok((
+                    CommandAuthorityRequest::Status {
+                        max_envelope_bytes: self.max_envelope_bytes,
+                    },
+                    None,
+                ))
+            },
         )
     }
 }
@@ -2677,12 +2896,15 @@ impl StorageJournalPort {
         options: StorageJournalOptions,
         shutdown_requirement: ShutdownCommitRequirement,
     ) -> Self {
+        let inflight_bytes = Arc::new(AtomicUsize::new(0));
         let command_reader = Some(Arc::new(StorageCommandAuthorityReader::new(
             publisher.inner.session_id,
             tx.clone(),
             options.admission_capacity,
             options.receipt_timeout,
             options.max_batch_bytes,
+            Arc::clone(&inflight_bytes),
+            options.max_inflight_bytes,
         )) as Arc<dyn CommandAuthorityReader>);
         Self {
             session_id: publisher.inner.session_id,
@@ -2696,7 +2918,7 @@ impl StorageJournalPort {
             receipt_timeout: options.receipt_timeout,
             max_batch_bytes: options.max_batch_bytes,
             max_inflight_bytes: options.max_inflight_bytes,
-            inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            inflight_bytes,
             reader: publisher.reader(),
             command_reader,
             shutdown_requirement,
@@ -2706,7 +2928,7 @@ impl StorageJournalPort {
         }
     }
 
-    /// Exact bytes accepted but not yet observed through terminal receipts.
+    /// Exact journal and durable-authority bytes accepted but not yet released by worker progress.
     #[must_use]
     pub fn inflight_bytes(&self) -> usize {
         self.inflight_bytes
@@ -3195,11 +3417,14 @@ mod tests {
         let first_id = CommandId::new(1);
         let second_id = CommandId::new(2);
         let (worker_tx, worker_rx) = xchan::bounded(2);
+        let inflight_bytes = Arc::new(AtomicUsize::new(0));
         let reader = StorageCommandAuthorityReader::new(
             session_id,
             worker_tx,
             1,
             Duration::from_secs(60),
+            1_024,
+            inflight_bytes,
             1_024,
         );
 
@@ -3235,6 +3460,180 @@ mod tests {
             reader.resolve_status(first_id),
             CommandAuthorityLookup::Collision
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one allocation-boundary test covers frozen encoding, pre-allocation oversize refusal, shared byte-capacity refusal, and permit release"
+    )]
+    fn command_authority_sizes_before_encoding_and_holds_a_global_byte_permit() {
+        let session_id = HostSessionId::new(0x408);
+        let (worker_tx, worker_rx) = xchan::bounded(2);
+        let inflight_bytes = Arc::new(AtomicUsize::new(0));
+        let reader = StorageCommandAuthorityReader::new(
+            session_id,
+            worker_tx.clone(),
+            2,
+            Duration::from_secs(60),
+            32,
+            Arc::clone(&inflight_bytes),
+            1_024,
+        );
+        let compatibility = CommandEnvelope::new(
+            CommandId::new(9),
+            HostCommand::UpdateSelection(SelectionUpdate {
+                mode: scriptbots_core::SelectionMode::Replace,
+                agent_ids: vec![7, 11],
+                state: scriptbots_core::SelectionState::Selected,
+            }),
+        );
+        assert_eq!(
+            encode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &compatibility,
+            )
+            .expect("borrowed envelope encoding"),
+            encode_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &CommandEnvelopePostcardV1::from_runtime(&compatibility),
+            )
+            .expect("owned envelope encoding"),
+            "bounded borrowed encoding changed the durable postcard contract"
+        );
+        let oversized = CommandEnvelope::new(
+            CommandId::new(1),
+            HostCommand::UpdateSelection(SelectionUpdate {
+                mode: scriptbots_core::SelectionMode::Replace,
+                agent_ids: vec![7; 128],
+                state: scriptbots_core::SelectionState::Selected,
+            }),
+        );
+        assert!(matches!(
+            reader.resolve_for_submit(
+                &oversized,
+                [0; blake3::OUT_LEN],
+                CommandClaimPolicy::ReserveIfAbsent,
+            ),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Oversized {
+                limit: 32,
+                ..
+            })
+        ));
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(xchan::TryRecvError::Empty)
+        ));
+
+        let step = CommandEnvelope::new(CommandId::new(2), HostCommand::Step);
+        let step_bytes =
+            command_envelope_postcard_size("host_command_claims.envelope_postcard_hex", &step)
+                .expect("step envelope size");
+        let step_hex_bytes = step_bytes.checked_mul(2).expect("step hex size");
+        let impossible = StorageCommandAuthorityReader::new(
+            session_id,
+            worker_tx.clone(),
+            2,
+            Duration::from_secs(60),
+            1_024,
+            Arc::new(AtomicUsize::new(0)),
+            step_hex_bytes - 1,
+        );
+        assert!(matches!(
+            impossible.resolve_for_submit(
+                &step,
+                [1; blake3::OUT_LEN],
+                CommandClaimPolicy::ReserveIfAbsent,
+            ),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Oversized {
+                bytes,
+                limit,
+            }) if bytes == step_bytes && limit == step_bytes - 1
+        ));
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(xchan::TryRecvError::Empty)
+        ));
+
+        let preoccupied_bytes = Arc::new(AtomicUsize::new(1));
+        let byte_starved = StorageCommandAuthorityReader::new(
+            session_id,
+            worker_tx.clone(),
+            2,
+            Duration::from_secs(60),
+            1_024,
+            Arc::clone(&preoccupied_bytes),
+            step_hex_bytes,
+        );
+        assert_eq!(
+            byte_starved.resolve_for_submit(
+                &step,
+                [1; blake3::OUT_LEN],
+                CommandClaimPolicy::ReserveIfAbsent,
+            ),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Capacity { capacity: 2 })
+        );
+        assert_eq!(preoccupied_bytes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(xchan::TryRecvError::Empty)
+        ));
+
+        let exact_bytes = Arc::new(AtomicUsize::new(0));
+        let exact_reader = StorageCommandAuthorityReader::new(
+            session_id,
+            worker_tx,
+            2,
+            Duration::from_secs(60),
+            1_024,
+            Arc::clone(&exact_bytes),
+            step_hex_bytes,
+        );
+        assert_eq!(
+            exact_reader.resolve_for_submit(
+                &step,
+                [1; blake3::OUT_LEN],
+                CommandClaimPolicy::ReserveIfAbsent,
+            ),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending)
+        );
+        assert_eq!(exact_bytes.load(Ordering::SeqCst), step_hex_bytes);
+        assert_eq!(
+            exact_reader.resolve_for_submit(
+                &step,
+                [1; blake3::OUT_LEN],
+                CommandClaimPolicy::ReserveIfAbsent,
+            ),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+            "an exact poll must not reacquire a byte permit before checking its pending reply"
+        );
+        let (reply, permit) = match worker_rx
+            .try_recv()
+            .expect("accepted authority request reaches the worker lane")
+        {
+            StorageCommand::ResolveCommandAuthority {
+                reply,
+                permit: Some(permit),
+                ..
+            } => (reply, permit),
+            other => panic!("unexpected storage command: {other:?}"),
+        };
+        reply
+            .try_send(CommandAuthorityLookup::Collision)
+            .expect("worker publishes exact authority truth");
+        assert_eq!(
+            exact_reader.resolve_for_submit(
+                &step,
+                [1; blake3::OUT_LEN],
+                CommandClaimPolicy::ReserveIfAbsent,
+            ),
+            CommandAuthorityLookup::Collision,
+            "a ready exact result must remain readable while its request owns all byte capacity"
+        );
+        drop(permit);
+        assert_eq!(exact_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
