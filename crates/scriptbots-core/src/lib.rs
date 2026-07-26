@@ -21345,6 +21345,9 @@ impl WorldState {
                 continue;
             };
             let parent_energy_before_debit = parent_runtime_snapshot.energy;
+            // The per-tick accrual above is outside the queued-birth transaction: a rejected
+            // admission or a completed tick with a later spawn fault keeps that progress. Capture
+            // immediately before the birth reset so abort refunds only birth-specific state.
             let parent_reproduction_counter_before_reset =
                 parent_runtime_snapshot.reproduction_counter;
             let mut population_rng = offspring_substream(
@@ -32583,7 +32586,7 @@ mod tests {
     }
 
     #[test]
-    fn population_factory_failure_aborts_and_refunds_queued_births() {
+    fn population_factory_failure_refunds_birth_but_preserves_tick_accrual() {
         #[derive(Debug, Error)]
         #[error("deliberate population construction failure")]
         struct DeliberatePopulationFailure;
@@ -32652,7 +32655,11 @@ mod tests {
             .agent_runtime(parent)
             .expect("surviving parent runtime");
         assert!((parent_runtime.energy - 1.0).abs() < f32::EPSILON);
-        assert!((parent_runtime.reproduction_counter - 1.0).abs() < f32::EPSILON);
+        assert!(
+            (parent_runtime.reproduction_counter - 2.0).abs() < f32::EPSILON,
+            "spawn failure must refund the birth reset while preserving the completed tick's \
+             reproduction accrual"
+        );
         assert_eq!(
             world
                 .agent_rng_counters(parent)
@@ -32662,7 +32669,7 @@ mod tests {
     }
 
     #[test]
-    fn offspring_snapshot_and_mutation_failures_are_terminal_and_refunded() {
+    fn offspring_failures_refund_birth_but_preserve_tick_accrual() {
         #[derive(Clone, Copy)]
         enum FailureMode {
             Snapshot,
@@ -32795,7 +32802,11 @@ mod tests {
                 .agent_runtime(parent)
                 .expect("surviving parent runtime");
             assert!((parent_runtime.energy - 1.0).abs() < f32::EPSILON);
-            assert!((parent_runtime.reproduction_counter - 1.0).abs() < f32::EPSILON);
+            assert!(
+                (parent_runtime.reproduction_counter - 2.0).abs() < f32::EPSILON,
+                "offspring failure must refund the birth reset while preserving the completed \
+                 tick's reproduction accrual"
+            );
             assert_eq!(
                 world
                     .agent_rng_counters(parent)
@@ -38996,6 +39007,16 @@ mod tests {
             .stage_reproduction()
             .expect("rejected keyed admission");
         assert!(rejected.pending_spawns.is_empty());
+        assert!(
+            (rejected
+                .agent_runtime(rejected_parent)
+                .expect("rejected parent runtime")
+                .reproduction_counter
+                - 2.0)
+                .abs()
+                < f32::EPSILON,
+            "admission rejection must preserve the tick's reproduction accrual"
+        );
         assert_eq!(
             rejected
                 .agent_rng_counters(rejected_parent)
@@ -39032,6 +39053,10 @@ mod tests {
         );
         let energy_before_debit = order.parent_energy_before_debit;
         let reproduction_counter_before_reset = order.parent_reproduction_counter_before_reset;
+        assert!(
+            (reproduction_counter_before_reset - 2.0).abs() < f32::EPSILON,
+            "queued-birth preimage must include the tick's reproduction accrual"
+        );
 
         admitted.abort_pending_spawns();
         assert!(admitted.pending_spawns.is_empty());
