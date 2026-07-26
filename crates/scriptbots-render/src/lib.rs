@@ -13779,6 +13779,118 @@ fn palette_color(color: Rgba, palette: ColorPaletteMode, palette_is_natural: boo
 /// cost (bd-2z0.7.12).
 const DETAIL_MIN_PX: f32 = 18.0;
 
+/// Smallest terrain cell size (in px) at which the per-tile slope and water
+/// accent strokes still carry information (bd-2z0.7.12).
+///
+/// Those two strokes are the dominant path source in the interim HUD: each
+/// emits ONE `PathBuilder` per tile, so a 40x40 world contributes up to 1,600
+/// paths on its own, which is what overflows the default 2 MiB Metal instance
+/// buffer and forces the 2 -> 4 -> 8 -> 16 MiB escalation with a full scene
+/// re-render per retry (VioletHawk's census: ~4.2-5.2k paths and a flat ~14.9k
+/// quads regardless of population, so the cost does not come from agents).
+///
+/// Below this size the accent cannot be seen rather than merely being small: a
+/// stroke whose width is clamped to at least 0.5px, drawn corner-to-corner
+/// inside a cell under two pixels across, has no readable direction left. It is
+/// the same argument as [`DETAIL_MIN_PX`] one layer down, and it removes paths
+/// exactly where there are most of them — zoomed out, where tile count peaks.
+///
+/// Deliberately conservative. The threshold is not a quality dial: at 2px the
+/// stroke is already sub-pixel, so nothing legible is dropped, and no colour or
+/// width is quantised, so every accent that IS drawn is pixel-identical to
+/// before. A larger threshold would trade real visual information for buffer
+/// headroom and needs the live Metal evidence this bead requires.
+const TERRAIN_ACCENT_MIN_CELL_PX: f32 = 2.0;
+
+/// Whether per-tile terrain accent strokes are legible at this cell size.
+///
+/// The single decision point, so the painter and its tests cannot disagree
+/// about where the cutoff is.
+fn terrain_accents_are_legible(cell_px: f32) -> bool {
+    cell_px >= TERRAIN_ACCENT_MIN_CELL_PX
+}
+
+#[cfg(test)]
+mod terrain_accent_budget_tests {
+    use super::*;
+
+    /// `paint_terrain_layer` emits at most one slope accent and one water
+    /// caustic per tile, and both are gated on the same legibility decision.
+    /// This mirrors that arithmetic so a budget can be asserted without a
+    /// `Window`; the painter and this share `terrain_accents_are_legible`, so
+    /// the CUTOFF cannot drift even though the counting is restated.
+    fn accent_paths_for(tiles: usize, sloped: usize, water: usize, cell_px: f32) -> usize {
+        assert!(
+            sloped <= tiles && water <= tiles,
+            "fixture must be coherent"
+        );
+        if terrain_accents_are_legible(cell_px) {
+            sloped + water
+        } else {
+            0
+        }
+    }
+
+    /// The defect, stated as arithmetic: one path per qualifying tile.
+    ///
+    /// A 40x40 world whose tiles mostly slope or hold water emits well over a
+    /// thousand paths from terrain alone, which is what pushes the frame past
+    /// the default 2 MiB Metal instance buffer.
+    #[test]
+    fn a_zoomed_in_world_still_pays_one_path_per_qualifying_tile() {
+        let paths = accent_paths_for(1_600, 900, 400, 12.0);
+        assert_eq!(
+            paths, 1_300,
+            "at legible zoom every qualifying tile still emits its own path; \
+             this is the cost the bead is about, not something the cull hides"
+        );
+    }
+
+    /// Zoomed out — where tile counts peak and the buffer actually overflows —
+    /// the accents are sub-pixel and contribute nothing, so they are not paid for.
+    #[test]
+    fn a_zoomed_out_world_pays_nothing_for_illegible_accents() {
+        assert_eq!(
+            accent_paths_for(1_600, 900, 400, 1.0),
+            0,
+            "a 1px cell cannot show a corner-to-corner stroke"
+        );
+        assert_eq!(accent_paths_for(10_000, 6_000, 3_000, 1.9), 0);
+    }
+
+    /// The threshold is a step, and it sits exactly where documented. Pinning
+    /// both sides stops a later "small tidy" from moving it silently.
+    #[test]
+    fn the_legibility_cutoff_is_exactly_the_documented_threshold() {
+        assert!(!terrain_accents_are_legible(
+            TERRAIN_ACCENT_MIN_CELL_PX - 0.01
+        ));
+        assert!(terrain_accents_are_legible(TERRAIN_ACCENT_MIN_CELL_PX));
+        assert!(terrain_accents_are_legible(
+            TERRAIN_ACCENT_MIN_CELL_PX + 0.01
+        ));
+        // The ceiling on the threshold itself is documented on the constant
+        // rather than asserted here: `assert!` over a const comparison is a
+        // tautology clippy rejects under -D warnings, and it would only restate
+        // a value this test already reads from the constant.
+    }
+
+    /// Degenerate and hostile zoom values must not panic or silently invert the
+    /// decision. `cell_px` is `(cell_world * scale).max(1.0)` upstream, but this
+    /// helper is the shared authority and should not depend on that clamp.
+    #[test]
+    fn extreme_zoom_values_are_answered_without_panicking() {
+        assert!(!terrain_accents_are_legible(0.0));
+        assert!(!terrain_accents_are_legible(-5.0));
+        assert!(
+            !terrain_accents_are_legible(f32::NAN),
+            "NaN must not be legible"
+        );
+        assert!(terrain_accents_are_legible(f32::INFINITY));
+        assert!(terrain_accents_are_legible(4_096.0));
+    }
+}
+
 const AGENT_LOD_DIET_BINS: usize = 8;
 const AGENT_LOD_LUMA_BINS: usize = 8;
 const AGENT_LOD_BODY_BINS: usize = AGENT_LOD_DIET_BINS * AGENT_LOD_LUMA_BINS;
@@ -14710,6 +14822,9 @@ fn paint_terrain_layer(
 
     let cell_world = terrain.cell_size as f32;
     let cell_px = (cell_world * scale).max(1.0);
+    // Hoisted out of the per-tile loop: it depends only on the zoom level, and
+    // it decides whether the two dominant path sources emit at all (bd-2z0.7.12).
+    let accents_legible = terrain_accents_are_legible(cell_px);
     let highlight_shift = (daylight * 0.45 + 0.35).clamp(0.2, 0.9);
 
     // Adaptive tiling: when zoomed out, render coarse blocks to reduce draw calls while
@@ -14781,7 +14896,7 @@ fn paint_terrain_layer(
             let cell_bounds = Bounds::new(point(px_xu, px_yu), size(px(cell_px), px(cell_px)));
             window.paint_quad(fill(cell_bounds, Background::from(surface)));
 
-            if tile.slope > 0.12 {
+            if tile.slope > 0.12 && accents_legible {
                 let stroke_width = (0.55 + tile.slope * 1.1) * scale.clamp(0.6, 3.0);
                 let accent = terrain_slope_accent_color(tile, highlight_shift, palette);
                 let mut builder = PathBuilder::stroke(px(stroke_width.min(cell_px * 0.85)));
@@ -14811,10 +14926,12 @@ fn paint_terrain_layer(
                 window.paint_quad(fill(bloom_bounds, Background::from(blossom)));
             }
 
-            if matches!(
-                tile.kind,
-                TerrainKind::ShallowWater | TerrainKind::DeepWater
-            ) {
+            if accents_legible
+                && matches!(
+                    tile.kind,
+                    TerrainKind::ShallowWater | TerrainKind::DeepWater
+                )
+            {
                 let caustic = terrain_water_caustic_color(tile, daylight, palette);
                 let wave_height =
                     (cell_px * 0.12 + tile.accent * cell_px * 0.18).min(cell_px * 0.35);
