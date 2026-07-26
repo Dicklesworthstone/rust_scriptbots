@@ -16,26 +16,59 @@ cd "$repo_root"
 
 run_exact_test() {
   local test_name="$1"
-  shift
+  local evidence_required="$2"
+  shift 2
   printf 'command-authority-e2e: running exact proof %s through rch\n' "$test_name"
   rch exec -- cargo test -p scriptbots-storage "$@" "$test_name" -- --exact --nocapture 2>&1 |
-    awk -v test_name="$test_name" '
+    awk -v test_name="$test_name" -v evidence_required="$evidence_required" '
       { print }
       /test result: ok\. 1 passed; 0 failed;/ { witnessed = 1 }
+      /"schema":"scriptbots.command-authority.evidence.v1"/ {
+        complete_evidence = 1
+        required_fields[1] = "\"command_id\":"
+        required_fields[2] = "\"envelope_digest\":"
+        required_fields[3] = "\"authority_phase\":"
+        required_fields[4] = "\"cache_result\":"
+        required_fields[5] = "\"durable_lookup\":"
+        required_fields[6] = "\"application_status\":"
+        required_fields[7] = "\"journal_status\":"
+        required_fields[8] = "\"admission_sequence\":"
+        required_fields[9] = "\"host_lifecycle\":"
+        required_fields[10] = "\"disposition\":"
+        required_fields[11] = "\"tick\":"
+        required_fields[12] = "\"world_digest\":"
+        required_fields[13] = "\"recovery\":"
+        for (field_index = 1; field_index <= 13; field_index++) {
+          if (index($0, required_fields[field_index]) == 0) {
+            complete_evidence = 0
+          }
+        }
+        if (complete_evidence) {
+          witnessed_evidence = 1
+        }
+      }
       END {
+        failed = 0
         if (!witnessed) {
           printf "command-authority-e2e: exact proof %s did not report one passing test\n", test_name > "/dev/stderr"
-          exit 1
+          failed = 1
         }
+        if (evidence_required == "1" && !witnessed_evidence) {
+          printf "command-authority-e2e: exact proof %s emitted no complete structured authority evidence\n", test_name > "/dev/stderr"
+          failed = 1
+        }
+        exit failed
       }
     '
 }
 
 run_exact_test \
   file_command_authority_survives_cache_eviction_and_restart \
+  1 \
   --test storage_journal
 run_exact_test \
   file_channel_concurrent_exact_duplicate_clients_apply_once_and_persist_authority \
+  1 \
   --test storage_journal
 
 crash_window_tests=(
@@ -51,5 +84,5 @@ crash_window_tests=(
   host_journal_reopen_scan_fault_releases_the_writer_without_mutation
 )
 for test_name in "${crash_window_tests[@]}"; do
-  run_exact_test "$test_name" --lib
+  run_exact_test "$test_name" 0 --lib
 done
