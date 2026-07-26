@@ -217,9 +217,14 @@ impl Default for MiParams {
 
 /// Smallest series length admitting a non-degenerate circular time-shift surrogate (bd-r4ja).
 ///
-/// The shift is drawn from `k_min..=k_max` with `k_min = max(n/10, 1)` and `k_max = n - k_min`.
-/// That range is empty until `n > 2`, so below this a circular surrogate cannot be formed at all
-/// and the estimator must refuse rather than fall back to a different null.
+/// The shift is drawn from `k_min..=k_max`, where `k_min` is the series' measured decorrelation
+/// lag (see [`decorrelation_lag`]) and `k_max = n - k_min`. That range is empty until `n > 2` even
+/// at the smallest possible lag, so below this a circular surrogate cannot be formed at all and
+/// the estimator must refuse rather than fall back to a different null.
+///
+/// The measured lag is bounded above by `n/4` so a degenerate series still receives its point
+/// estimate: a perfectly periodic signal never decorrelates under any shift, but its mutual
+/// information is still well defined, and only its p-value is uninformative.
 pub const MIN_CIRCULAR_SURROGATE_SAMPLES: usize = 3;
 
 /// Largest bin count the dense estimators will allocate for (bd-r4ja).
@@ -250,6 +255,39 @@ pub const SURROGATE_IDENTITY: &str = "circular-shift";
 #[must_use]
 pub fn uniform_bin_edges(bins: usize) -> Vec<f64> {
     (0..=bins).map(|i| i as f64 / bins as f64).collect()
+}
+
+/// First lag at which a series' sample autocorrelation falls inside the white-noise band
+/// `2/sqrt(n)`, capped at `max_lag` (bd-r4ja).
+///
+/// The circular-shift null is only a valid null if the shifted copy is decorrelated from the
+/// original. The previous fixed `n/10` offset asserted that without measuring it, and it is wrong
+/// in both directions: for a strongly autocorrelated series `n/10` can be shorter than the
+/// decorrelation time, so the "null" still carries the very dependence it exists to remove and
+/// the test loses power; for white noise it needlessly shrinks the space of admissible shifts.
+///
+/// A constant series has no autocorrelation structure to respect -- every shift is equivalent --
+/// so it reports lag 1 rather than dividing by a zero variance.
+fn decorrelation_lag(series: &[f64], max_lag: usize) -> usize {
+    let n = series.len();
+    if n < 3 || max_lag == 0 {
+        return 1;
+    }
+    let mean = series.iter().sum::<f64>() / n as f64;
+    let variance: f64 = series.iter().map(|v| (v - mean) * (v - mean)).sum();
+    if variance <= 0.0 {
+        return 1;
+    }
+    let band = 2.0 / (n as f64).sqrt();
+    for lag in 1..=max_lag {
+        let covariance: f64 = (0..n - lag)
+            .map(|i| (series[i] - mean) * (series[i + lag] - mean))
+            .sum();
+        if (covariance / variance).abs() <= band {
+            return lag;
+        }
+    }
+    max_lag
 }
 
 /// Computes discretized bin index for `v` in `[0.0, 1.0]` over `bins`.
@@ -313,7 +351,18 @@ pub fn compute_mi(
     let mut surrogates = Vec::with_capacity(r_runs);
     let mut ge_count = 0usize;
 
-    let k_min = (n / 10).max(1);
+    // bd-r4ja: the minimum shift is the emitter's measured decorrelation lag, not a fixed n/10,
+    // bounded above by n/4 so the shift range stays non-empty.
+    //
+    // The bound is not cosmetic. A perfectly periodic series -- the analytic copy-channel fixture
+    // below is `i % 2` -- has |autocorrelation| = 1 at every lag and never enters the white-noise
+    // band, so an unbounded lag would collapse the range and refuse the call. That would be the
+    // wrong answer: the point estimate is perfectly well defined (exactly 1 bit for that fixture)
+    // and only the NULL is degenerate. Refusing the estimate because the surrogate is weak
+    // conflates two separate things. A series with no decorrelating shift still gets its estimate;
+    // its p-value simply approaches 1, which is the honest report that a circular null cannot
+    // distinguish this dependence from the series' own structure.
+    let k_min = decorrelation_lag(emitter, n / 2).clamp(1, (n / 4).max(1));
     let k_max = n.saturating_sub(k_min);
 
     let shifted_emitter = if k_max > k_min {
@@ -511,7 +560,9 @@ pub fn compute_te(
     let mut surrogates = Vec::with_capacity(r_runs);
     let mut ge_count = 0usize;
 
-    let k_min = (n / 10).max(1);
+    // bd-r4ja: same autocorrelation-grounded, n/4-bounded offset as `compute_mi`, measured on the
+    // series that actually gets shifted -- the emitter's current-value column.
+    let k_min = decorrelation_lag(&e_curr, n / 2).clamp(1, (n / 4).max(1));
     let k_max = n.saturating_sub(k_min);
     let mut shifted_e = vec![0.0f64; n];
 
@@ -675,6 +726,51 @@ mod tests {
             "Copy channel 2 symbols should be ~1 bit, got {}",
             est.bits_corrected
         );
+    }
+
+    /// The circular offset must be measured from the data, not assumed (bd-r4ja).
+    ///
+    /// Pins the property that actually matters: a slowly varying signal must demand a longer
+    /// minimum shift than white noise, because a shift shorter than its decorrelation time leaves
+    /// the surrogate still carrying the dependence the null is supposed to remove.
+    #[test]
+    fn bd_r4ja_decorrelation_lag_is_longer_for_a_correlated_series_than_for_noise() {
+        let mut rng = SmallRngStream::seed_from_u64(0x0FF1_CE);
+        let noise: Vec<f64> = (0..400).map(|_| rng.random_range(0.0..1.0)).collect();
+
+        // A slow triangular sweep: adjacent samples are nearly identical, so the autocorrelation
+        // decays only over many lags.
+        let correlated: Vec<f64> = (0..400)
+            .map(|i| {
+                let phase = f64::from(i % 200) / 200.0;
+                if phase < 0.5 {
+                    phase * 2.0
+                } else {
+                    (1.0 - phase) * 2.0
+                }
+            })
+            .collect();
+
+        let noise_lag = decorrelation_lag(&noise, 200);
+        let correlated_lag = decorrelation_lag(&correlated, 200);
+
+        assert!(
+            noise_lag < correlated_lag,
+            "white noise decorrelates faster than a slow sweep: noise={noise_lag}, \
+             correlated={correlated_lag}"
+        );
+        assert!(
+            noise_lag <= 4,
+            "independent draws should fall inside the 2/sqrt(n) band almost immediately, got \
+             {noise_lag}"
+        );
+    }
+
+    /// A constant series has no autocorrelation structure and must not divide by a zero variance
+    /// (bd-r4ja).
+    #[test]
+    fn bd_r4ja_decorrelation_lag_handles_a_constant_series() {
+        assert_eq!(decorrelation_lag(&[0.5; 64], 32), 1);
     }
 
     /// Both estimators must report enough provenance to reproduce and compare their own output:
