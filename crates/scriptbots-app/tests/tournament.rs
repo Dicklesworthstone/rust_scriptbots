@@ -5,8 +5,9 @@
 //! qualifier that can never be lost, and the null-tournament bias probe.
 
 use scriptbots_app::tournament::{
-    EloRating, FamilyOutcome, FamilyScore, MatchOutcome, MatchResult, OrderPolicy, TournamentError,
+    EloRating, FamilyScore, MatchOutcome, MatchResult, OrderPolicy, TournamentError,
     TournamentHarness, TournamentSpec, enforce_no_config_drift, plan, run_match, run_tournament,
+    run_tournament_with_jobs,
 };
 use scriptbots_brain::BrainKind;
 use scriptbots_core::ScriptBotsConfig;
@@ -59,10 +60,12 @@ fn matches_reproduce_byte_identical_outcomes() {
 }
 
 #[test]
-fn seed_allocation_is_identical_across_order_assignments() {
+fn seed_allocation_is_deterministic_across_order_assignments() {
     let spec = two_family_spec(50);
     let plans = plan(&spec).expect("balanced plan");
+    let replayed = plan(&spec).expect("replayed balanced plan");
     assert_eq!(plans.len(), 2);
+    assert_eq!(plans, replayed, "seed allocation is pure and repeatable");
     // The two assignments share the root seed; their hash-allocated seeds must differ by
     // match index but recompute identically every time.
     assert_ne!(plans[0].world_seed, plans[1].world_seed);
@@ -116,7 +119,8 @@ fn null_tournament_arms_are_indistinguishable_beyond_seed_noise() {
                 .outcome
                 .per_family
                 .get(family.as_str())
-                .map_or(0.5, |outcome: &FamilyOutcome| outcome.survival_share)
+                .unwrap_or_else(|| panic!("missing outcome row for {}", family.as_str()))
+                .survival_share
         };
         let gap = (share_of(MLP_A) - share_of(MLP_B)).abs();
         gap_max = gap_max.max(gap);
@@ -138,7 +142,8 @@ fn null_tournament_arms_are_indistinguishable_beyond_seed_noise() {
 fn run_tournament_reproduces_identical_report_sets() {
     let spec = two_family_spec(120);
     let first = run_tournament(&spec, &small_world()).expect("tournament one");
-    let second = run_tournament(&spec, &small_world()).expect("tournament two");
+    let second =
+        run_tournament_with_jobs(&spec, &small_world(), 8).expect("parallel tournament two");
     assert_eq!(first.len(), 2, "two assignments");
     assert_eq!(first.len(), second.len());
     for (a, b) in first.iter().zip(second.iter()) {
