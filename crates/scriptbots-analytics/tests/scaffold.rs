@@ -231,8 +231,18 @@ fn narrative_timeline_orders_serializes_and_limits_replay_events() {
     assert_eq!(out.machine["events"][0]["seq"], 0);
     assert_eq!(
         out.machine["events"][0]["event"],
+        // The three positional keys are asserted EXPLICITLY, not tolerated. `ReplayEvent`
+        // gained `position`, `counterpart` and `counterpart_position`, and this report
+        // serializes the whole event, so they are now part of its published JSON shape --
+        // an offline consumer parsing this report will see them. Pinning them as null here
+        // is the assertion that the timeline reports what the event actually carries: if a
+        // pairwise kind ever populates them and this report silently kept emitting null,
+        // that is a drop this test now catches rather than a shape it happens to ignore.
         json!({
             "agent_uid": null,
+            "position": null,
+            "counterpart": null,
+            "counterpart_position": null,
             "kind": {
                 "RngSample": {
                     "scope": "World",
@@ -248,6 +258,9 @@ fn narrative_timeline_orders_serializes_and_limits_replay_events() {
         out.machine["events"][1]["event"],
         json!({
             "agent_uid": null,
+            "position": null,
+            "counterpart": null,
+            "counterpart_position": null,
             "kind": {"BrainOutputs": {"outputs": [0.5, -0.25]}}
         })
     );
