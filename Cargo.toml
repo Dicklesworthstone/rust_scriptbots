@@ -59,7 +59,16 @@ ft-core = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/fran
 ft-kernel-cpu = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-nn = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-optim = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
-ftui = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "15cc65438a2095fbe8dd0dfce9adcfc7edab7612", default-features = false, features = ["crossterm"] }
+# PREPARED, NOT ADOPTED (bd-phj8). No workspace crate consumes `ftui.workspace`,
+# so Cargo never resolves this entry and a wrong `rev` cannot fail a build — which
+# is exactly how the previous value survived: it was
+# `15cc65438a2095fbe8dd0dfce9adcfc7edab7612`, an object that does not exist
+# upstream. Note the shared `15cc6543` prefix with the real commit: a short SHA
+# expanded with a fabricated tail. Corrected to the verified object from
+# bd-2z0.6.3.1, confirmed present via `git cat-file -t` against the local
+# frankentui git db. `frankentui_pin_matches_the_documented_revision` fails if
+# this line and docs/terminal_stack_and_frankentui_pin.md ever disagree again.
+ftui = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "15cc6543f76b814394c590f9e7719dedd6684e4c", default-features = false, features = ["crossterm"] }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", rev = "5f8a7413a31769e0882357f90dc424b3962ac72d" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", rev = "5f8a7413a31769e0882357f90dc424b3962ac72d", features = ["font-kit"] }
 kira = "0.10.1"

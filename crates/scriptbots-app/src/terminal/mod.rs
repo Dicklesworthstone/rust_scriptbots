@@ -7519,6 +7519,126 @@ mod tests {
         );
     }
 
+    /// The FrankenTUI pin in the workspace manifest must match the revision the
+    /// terminal-stack document records (bd-phj8).
+    ///
+    /// THE HAZARD THIS EXISTS FOR, which is general and not an ftui quirk: Cargo
+    /// only resolves a `[workspace.dependencies]` entry when some crate actually
+    /// depends on it. No workspace crate consumes `ftui.workspace`, so the entry
+    /// is never fetched, never reaches `Cargo.lock`, and a wrong `rev` cannot
+    /// fail any build. **An unconsumed pin is unverified by construction.** The
+    /// previous value, `15cc65438a2095fbe8dd0dfce9adcfc7edab7612`, was not an
+    /// object in the upstream repository at all and survived exactly that way —
+    /// no amount of compiling could have caught it.
+    ///
+    /// This cannot check that the SHA exists upstream (that needs the network and
+    /// a fetched git db), so it checks the next best invariant: the manifest and
+    /// the document that justifies it cannot disagree. A future edit to either
+    /// one alone fails here.
+    #[test]
+    fn frankentui_pin_matches_the_documented_revision() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root is two levels above this crate");
+
+        let manifest =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("read workspace Cargo.toml");
+        let pin_line = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with("ftui = "))
+            .expect("the workspace must declare an ftui pin");
+        let manifest_rev = extract_rev(pin_line).expect("the ftui pin must carry a rev");
+
+        let doc = std::fs::read_to_string(root.join("docs/terminal_stack_and_frankentui_pin.md"))
+            .expect("read the terminal stack document");
+        // Compare against the DECLARED field, not "appears anywhere in the file".
+        // The document deliberately quotes the old bad SHA in its history note, so
+        // a `contains` check matches it and passes for the very value this guard
+        // exists to reject — verified by re-injecting the bad pin and watching an
+        // earlier version of this test go green.
+        let documented_rev = doc
+            .lines()
+            .find(|line| line.contains("**Pinned Revision**"))
+            .and_then(|line| line.split('`').nth(1))
+            .expect("the document must declare a Pinned Revision")
+            .to_owned();
+        assert_eq!(
+            manifest_rev, documented_rev,
+            "Cargo.toml pins ftui at {manifest_rev} but \
+             docs/terminal_stack_and_frankentui_pin.md declares {documented_rev}. \
+             One of the two was edited alone; an unconsumed pin is never resolved, \
+             so nothing else will catch the drift (bd-phj8)."
+        );
+
+        // A full SHA-1, not a short prefix. The previous bad value was a real
+        // short SHA with a fabricated tail, so length alone is not proof — but a
+        // truncated pin would let Cargo resolve something the document never
+        // reviewed.
+        assert_eq!(
+            manifest_rev.len(),
+            40,
+            "ftui rev {manifest_rev} is not a full 40-character SHA"
+        );
+        assert!(
+            manifest_rev.chars().all(|c| c.is_ascii_hexdigit()),
+            "ftui rev {manifest_rev} is not hexadecimal"
+        );
+    }
+
+    /// Pull `rev = "..."` out of a Cargo dependency line.
+    fn extract_rev(line: &str) -> Option<String> {
+        let after = line.split("rev = \"").nth(1)?;
+        after.split('"').next().map(str::to_owned)
+    }
+
+    /// The pin is declared but deliberately NOT adopted, and the document must
+    /// say so. If a crate ever consumes `ftui.workspace`, adoption became real
+    /// and the franken-integration record has to be updated with it rather than
+    /// silently diverging (AGENTS.md routes franken adoption through
+    /// docs/franken_integration.md).
+    #[test]
+    fn an_unadopted_frankentui_pin_is_declared_as_such() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+
+        let mut consumers: Vec<String> = Vec::new();
+        let crates_dir = root.join("crates");
+        for entry in std::fs::read_dir(&crates_dir)
+            .expect("read crates dir")
+            .flatten()
+        {
+            let manifest = entry.path().join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            if text.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("ftui") && line.contains("workspace")
+            }) {
+                consumers.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+
+        let doc = std::fs::read_to_string(root.join("docs/terminal_stack_and_frankentui_pin.md"))
+            .expect("read the terminal stack document");
+        if consumers.is_empty() {
+            assert!(
+                doc.contains("PREPARED, NOT ADOPTED"),
+                "nothing consumes ftui, so the document must say the pin is prepared \
+                 and not adopted — otherwise it reads as a shipped dependency (bd-phj8)"
+            );
+        } else {
+            assert!(
+                !doc.contains("PREPARED, NOT ADOPTED"),
+                "{consumers:?} now consume ftui, so the document must stop calling the \
+                 pin unadopted and the franken-integration record must be updated"
+            );
+        }
+    }
+
     /// Self-exclusion marker: this guard's own text must never feed itself.
     /// bd-ikts.5 lost time twice to guards that matched their own literals.
     const TERMINAL_DUPLICATE_GUARD_MARKER: &str = "fn no_two_terminal_modules_define_the_same_item";
