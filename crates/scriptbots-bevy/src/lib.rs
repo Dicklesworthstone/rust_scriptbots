@@ -3593,19 +3593,29 @@ mod quality_tier_consumer_tests {
     #[test]
     fn the_bloom_tier_feature_has_a_live_consumer() {
         let source = include_str!("lib.rs");
-        let production = source
-            .split_once("#[cfg(test)]\nmod quality_tier_consumer_tests")
-            .map_or(source, |(before, _)| before);
+        // Deliberately NOT the split-at-the-test-module trick the sibling test
+        // uses. Production code in this file continues well past that module —
+        // `apply_tier_to_bloom` lives ~1000 lines after it — so slicing at the
+        // boundary silently hides the very consumer this asserts on, and the
+        // test fails while the code is correct.
+        //
+        // Instead match the CALL form — leading dot, trailing semicolon — and
+        // require MORE THAN ONE occurrence. Each needle necessarily matches the
+        // string literal in the assertion that names it, so `contains` alone
+        // would still hold after the production code was deleted: the test would
+        // be quoting itself and calling that proof. Counting makes the extra
+        // occurrence, the real call site, the thing being asserted.
+        let sites = |needle: &str| source.matches(needle).count();
         assert!(
-            production.contains("effective.features.bloom"),
+            sites("effective.features.bloom") > 1,
             "the bloom tier feature must be read by production code, not only logged"
         );
         assert!(
-            production.contains("insert(Bloom::NATURAL)"),
+            sites(".insert(Bloom::NATURAL);") > 1,
             "reading the flag is not enough; a Bloom component must actually be attached"
         );
         assert!(
-            production.contains("remove::<Bloom>()"),
+            sites(".remove::<Bloom>();") > 1,
             "a tier step DOWN must be able to take bloom away again, or the effect \
              is one-way and the tier still does not describe the frame"
         );
