@@ -67,7 +67,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, debug_span, info, warn};
 
 const DEFAULT_TICK_BUFFER: usize = 32;
 const DEFAULT_AGENT_BUFFER: usize = 1024;
@@ -84,6 +84,7 @@ const DEFAULT_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
 const MAX_STORAGE_QUERY_PAGE: usize = 4_096;
+const MAX_NARRATIVE_QUERY_BYTES: usize = 1_024;
 const MAX_HOST_JOURNAL_ARCHIVE_BYTES: usize = 256 << 20;
 const OUTBOX_PAYLOAD_VERSION: u32 = 4;
 const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
@@ -191,9 +192,11 @@ const SCRIPTBOTS_SCHEMA_V6_VERSION: i64 = 6;
 const SCRIPTBOTS_SCHEMA_V7_VERSION: i64 = 7;
 const SCRIPTBOTS_SCHEMA_V8_VERSION: i64 = 8;
 const SCRIPTBOTS_SCHEMA_V9_VERSION: i64 = 9;
+const SCRIPTBOTS_SCHEMA_V10_VERSION: i64 = 10;
+const SCRIPTBOTS_SCHEMA_V11_VERSION: i64 = 11;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 10;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 12;
 
 /// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
@@ -1045,6 +1048,42 @@ const SCRIPTBOTS_SCHEMA_V10: &str = r#"
     PRAGMA user_version = 10;
 "#;
 
+/// V11 migration: retire the unwritten external-content FTS declaration.
+///
+/// Pinned FrankenSQLite rejects dropping and recreating a live virtual table under the same
+/// name inside one transaction. `MigrationRunner` gives every migration its own transaction,
+/// so the replacement is intentionally split across V11 and V12. A crash after this migration
+/// leaves an explicit V11 database with no search table; rerunning the chain creates and
+/// backfills the final table exactly once.
+const SCRIPTBOTS_SCHEMA_V11: &str = r#"
+    DROP TABLE run_events_fts;
+
+    PRAGMA user_version = 11;
+"#;
+
+/// V12 migration: create and backfill the plain-content narrative search index.
+///
+/// `run_events` has a composite primary key, so its hidden SQLite rowid is not durable across
+/// `VACUUM` or a table rebuild and cannot honestly serve as the search identity. The plain
+/// index therefore stores the complete canonical `(run_id, tick, kind, metric)` key and joins
+/// on it. The first three columns preserve the frozen V6 virtual-table prefix; the two appended
+/// unindexed columns complete the durable identity.
+const SCRIPTBOTS_SCHEMA_V12: &str = r#"
+    CREATE VIRTUAL TABLE run_events_fts USING fts5(
+        run_id UNINDEXED,
+        kind,
+        human_text,
+        tick UNINDEXED,
+        metric UNINDEXED
+    );
+    INSERT INTO run_events_fts(run_id, kind, human_text, tick, metric)
+        SELECT run_id, kind, human_text, tick, metric
+        FROM run_events
+        ORDER BY run_id ASC, tick ASC, kind ASC, metric ASC;
+
+    PRAGMA user_version = 12;
+"#;
+
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaObject {
     object_type: String,
@@ -1124,9 +1163,19 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
             SCRIPTBOTS_SCHEMA_V9,
         )
         .add(
-            SCRIPTBOTS_SCHEMA_VERSION,
+            SCRIPTBOTS_SCHEMA_V10_VERSION,
             "add_replay_event_interaction_edges",
             SCRIPTBOTS_SCHEMA_V10,
+        )
+        .add(
+            SCRIPTBOTS_SCHEMA_V11_VERSION,
+            "drop_external_content_narrative_search",
+            SCRIPTBOTS_SCHEMA_V11,
+        )
+        .add(
+            SCRIPTBOTS_SCHEMA_VERSION,
+            "create_plain_content_narrative_search",
+            SCRIPTBOTS_SCHEMA_V12,
         )
         .run(connection)?;
     // Every suffix of the chain is a legal lineage: a database joins at whatever version it
@@ -1134,11 +1183,26 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
     // a migration without extending this list fails loudly instead of accepting a gap.
     let applied_is_valid = result.applied.is_empty()
         || result.applied == [SCRIPTBOTS_SCHEMA_VERSION]
-        || result.applied == [SCRIPTBOTS_SCHEMA_V9_VERSION, SCRIPTBOTS_SCHEMA_VERSION]
+        || result.applied == [SCRIPTBOTS_SCHEMA_V11_VERSION, SCRIPTBOTS_SCHEMA_VERSION]
+        || result.applied
+            == [
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
+                SCRIPTBOTS_SCHEMA_VERSION,
+            ]
+        || result.applied
+            == [
+                SCRIPTBOTS_SCHEMA_V9_VERSION,
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
+                SCRIPTBOTS_SCHEMA_VERSION,
+            ]
         || result.applied
             == [
                 SCRIPTBOTS_SCHEMA_V8_VERSION,
                 SCRIPTBOTS_SCHEMA_V9_VERSION,
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
                 SCRIPTBOTS_SCHEMA_VERSION,
             ]
         || result.applied
@@ -1146,6 +1210,8 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
                 SCRIPTBOTS_SCHEMA_V7_VERSION,
                 SCRIPTBOTS_SCHEMA_V8_VERSION,
                 SCRIPTBOTS_SCHEMA_V9_VERSION,
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
                 SCRIPTBOTS_SCHEMA_VERSION,
             ]
         || result.applied
@@ -1154,6 +1220,8 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
                 SCRIPTBOTS_SCHEMA_V7_VERSION,
                 SCRIPTBOTS_SCHEMA_V8_VERSION,
                 SCRIPTBOTS_SCHEMA_V9_VERSION,
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
                 SCRIPTBOTS_SCHEMA_VERSION,
             ];
     if result.current != SCRIPTBOTS_SCHEMA_VERSION || !applied_is_valid {
@@ -2753,6 +2821,28 @@ fn manifest_projection_error(reason: impl Into<String>) -> StorageError {
     }
 }
 
+/// Stable caller-input failures for narrative search and tick-window reads.
+///
+/// Frontends can map these variants to typed client errors without parsing a database error or
+/// a human message. Database/corruption failures remain separate [`StorageError`] variants.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum NarrativeQueryError {
+    #[error("narrative query is empty")]
+    Empty,
+    #[error("narrative query is {bytes} bytes; maximum is {max}")]
+    TooLong { bytes: usize, max: usize },
+    #[error("narrative query contains a NUL character")]
+    ContainsNul,
+    #[error("narrative tick range must be non-empty and half-open, found [{start}, {end})")]
+    InvalidTickRange { start: u64, end: u64 },
+    #[error("{field} tick {value} exceeds the i64 range supported by storage")]
+    TickOutOfRange { field: &'static str, value: u64 },
+    #[error("narrative result limit {limit} exceeds the bounded maximum {max}")]
+    LimitTooLarge { limit: usize, max: usize },
+    #[error("narrative tick window exceeds the bounded maximum of {max} rows")]
+    AroundWindowTooDense { max: usize },
+}
+
 /// Storage error wrapper.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -2822,6 +2912,9 @@ pub enum StorageError {
     Closed,
     #[error("storage transaction is terminally failed; buffered rows will not be replayed")]
     TerminallyFailed,
+    /// A narrative search caller supplied invalid or too-dense bounded input.
+    #[error(transparent)]
+    NarrativeQuery(#[from] NarrativeQueryError),
     /// A narrative event failed its versioned typed persistence contract.
     #[error(transparent)]
     RunEvent(#[from] RunEventDecodeError),
@@ -3503,6 +3596,56 @@ impl PersistedRunEvent {
     #[must_use]
     pub fn into_parts(self) -> (RunEventIdentity, EventRecord) {
         (self.identity, self.record)
+    }
+}
+
+/// One run-scoped narrative search result.
+///
+/// Full-text searches always carry a finite BM25 score. A chronological
+/// [`StorageReader::narrative_around_tick`] scan has no relevance calculation and therefore
+/// returns `None` instead of inventing a score. The complete typed event remains available so
+/// search surfaces cannot silently discard its window, subject, or numeric evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NarrativeHit {
+    event: PersistedRunEvent,
+    rank: Option<f64>,
+}
+
+impl NarrativeHit {
+    #[must_use]
+    pub const fn event(&self) -> &PersistedRunEvent {
+        &self.event
+    }
+
+    #[must_use]
+    pub const fn tick(&self) -> Tick {
+        self.event.record.tick
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> EventKind {
+        self.event.record.kind
+    }
+
+    #[must_use]
+    pub const fn severity(&self) -> f32 {
+        self.event.record.severity
+    }
+
+    #[must_use]
+    pub fn human_text(&self) -> &str {
+        &self.event.record.human_text
+    }
+
+    /// BM25 score for a full-text hit; lower is more relevant.
+    #[must_use]
+    pub const fn rank(&self) -> Option<f64> {
+        self.rank
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (PersistedRunEvent, Option<f64>) {
+        (self.event, self.rank)
     }
 }
 
@@ -5642,6 +5785,55 @@ fn checked_query_limit(context: &'static str, limit: usize) -> Result<i64, Stora
         });
     }
     checked_i64(context, limit)
+}
+
+/// Turn user text into one literal FTS5 phrase.
+///
+/// FTS operators are deliberately unavailable through this API. SQLite's documented FTS5
+/// string grammar escapes an embedded quote by doubling it, so even input containing quotes,
+/// parentheses, column selectors, or boolean operators remains data rather than query syntax.
+fn narrative_match_query(query: &str) -> Result<String, StorageError> {
+    if query.len() > MAX_NARRATIVE_QUERY_BYTES {
+        return Err(NarrativeQueryError::TooLong {
+            bytes: query.len(),
+            max: MAX_NARRATIVE_QUERY_BYTES,
+        }
+        .into());
+    }
+    if query.contains('\0') {
+        return Err(NarrativeQueryError::ContainsNul.into());
+    }
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(NarrativeQueryError::Empty.into());
+    }
+    Ok(format!("\"{}\"", query.replace('"', "\"\"")))
+}
+
+fn checked_narrative_limit(limit: usize) -> Result<i64, StorageError> {
+    if limit > MAX_STORAGE_QUERY_PAGE {
+        return Err(NarrativeQueryError::LimitTooLarge {
+            limit,
+            max: MAX_STORAGE_QUERY_PAGE,
+        }
+        .into());
+    }
+    checked_i64("narrative_search.limit", limit)
+}
+
+fn checked_narrative_tick(field: &'static str, tick: u64) -> Result<i64, StorageError> {
+    i64::try_from(tick)
+        .map_err(|_| NarrativeQueryError::TickOutOfRange { field, value: tick }.into())
+}
+
+fn checked_narrative_tick_range(start: u64, end: u64) -> Result<(i64, i64), StorageError> {
+    if start >= end {
+        return Err(NarrativeQueryError::InvalidTickRange { start, end }.into());
+    }
+    Ok((
+        checked_narrative_tick("start", start)?,
+        checked_narrative_tick("end", end)?,
+    ))
 }
 
 fn checked_tick_window(
@@ -7946,6 +8138,164 @@ impl StorageReader {
         Ok(events)
     }
 
+    /// Search this run's narrative text as one literal FTS5 phrase.
+    ///
+    /// The optional tick range is half-open (`start..end`). Results are ordered by ascending
+    /// BM25 score (SQLite FTS5 assigns lower scores to better matches), followed by the
+    /// canonical `(tick, kind, metric)` identity as a deterministic tie-break. `limit` is
+    /// capped by the storage-wide 4096-row page ceiling. BM25 statistics cover the complete
+    /// database corpus, even though returned rows are scoped to this reader's run, so scores are
+    /// stable only while that database is unchanged and must not be compared across databases.
+    /// These are result and input bounds, not a hard execution-time bound; like every
+    /// [`StorageReader`] SQL method, this is explicitly an offline/reporting API.
+    pub fn search_narrative(
+        &self,
+        query: &str,
+        tick_range: Option<(u64, u64)>,
+        limit: usize,
+    ) -> Result<Vec<NarrativeHit>, StorageError> {
+        let started = Instant::now();
+        let match_query = narrative_match_query(query)?;
+        let bound = checked_narrative_limit(limit)?;
+        let (start_tick, end_tick) = tick_range.map_or(
+            Ok((SqliteValue::Null, SqliteValue::Null)),
+            |(start, end)| {
+                checked_narrative_tick_range(start, end)
+                    .map(|(start, end)| (start.into(), end.into()))
+            },
+        )?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let span = debug_span!(
+            "storage.narrative_search",
+            run_id = %self.run_id,
+            query_bytes = query.len(),
+            tick_range = ?tick_range,
+            limit
+        );
+        let _entered = span.enter();
+        let parsed_query_digest = blake3::hash(match_query.as_bytes()).to_hex();
+        debug!(
+            run_id = %self.run_id,
+            parsed_query_digest = %parsed_query_digest,
+            parsed_query_bytes = match_query.len(),
+            "parsed bounded narrative search"
+        );
+        let rows = self.connection()?.query_with_params(
+            "SELECT events.tick, events.kind, events.severity, events.magnitude,
+                    events.window_start, events.window_end, events.metric,
+                    events.before_value, events.after_value, events.score,
+                    events.subject_ref, events.human_text, events.schema_version,
+                    bm25(run_events_fts)
+             FROM run_events_fts
+             JOIN run_events AS events
+               ON events.run_id = run_events_fts.run_id
+              AND run_events_fts.tick = CAST(events.tick AS TEXT)
+              AND events.kind = run_events_fts.kind
+              AND events.metric = run_events_fts.metric
+             WHERE run_events_fts MATCH ?1
+               AND events.run_id = ?2
+               AND (?3 IS NULL OR events.tick >= ?3)
+               AND (?4 IS NULL OR events.tick < ?4)
+             ORDER BY bm25(run_events_fts) ASC,
+                      events.tick ASC, events.kind ASC, events.metric ASC
+             LIMIT ?5",
+            &[
+                match_query.as_str().into(),
+                sqlite_run_id(self.run_id),
+                start_tick,
+                end_tick,
+                bound.into(),
+            ],
+        )?;
+        let mut hits = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rank: f64 = decode(&row, 13, "run_events_fts.rank")?;
+            if !rank.is_finite() {
+                return Err(StorageError::InvalidData {
+                    context: "run_events_fts.rank",
+                    reason: format!("BM25 returned non-finite score {rank}"),
+                });
+            }
+            hits.push(NarrativeHit {
+                event: persisted_run_event_from_row(&run_event_row_from_query_row(&row)?)?,
+                rank: Some(rank),
+            });
+        }
+        debug!(
+            run_id = %self.run_id,
+            row_count = hits.len(),
+            elapsed_micros = started.elapsed().as_micros(),
+            "completed bounded narrative search"
+        );
+        Ok(hits)
+    }
+
+    /// Load the bounded chronological narrative window centered on `tick`.
+    ///
+    /// This is a relational tick scan rather than an FTS query, so returned hits have no BM25
+    /// rank. The inclusive window is saturated at zero and `i64::MAX`. A window containing more
+    /// than [`MAX_STORAGE_QUERY_PAGE`] rows returns a typed refusal instead of silently
+    /// truncating the chronology.
+    pub fn narrative_around_tick(
+        &self,
+        tick: u64,
+        window: u64,
+    ) -> Result<Vec<NarrativeHit>, StorageError> {
+        let started = Instant::now();
+        checked_narrative_tick("center", tick)?;
+        let start_tick = checked_narrative_tick("start", tick.saturating_sub(window))?;
+        let end_tick =
+            checked_narrative_tick("end", tick.saturating_add(window).min(i64::MAX as u64))?;
+        let probe_limit = checked_i64(
+            "narrative_around_tick.probe_limit",
+            MAX_STORAGE_QUERY_PAGE + 1,
+        )?;
+        let span = debug_span!(
+            "storage.narrative_around_tick",
+            run_id = %self.run_id,
+            tick,
+            window
+        );
+        let _entered = span.enter();
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick, kind, severity, magnitude, window_start, window_end,
+                    metric, before_value, after_value, score, subject_ref, human_text,
+                    schema_version
+             FROM run_events
+             WHERE run_id = ?1 AND tick >= ?2 AND tick <= ?3
+             ORDER BY tick ASC, kind ASC, metric ASC
+             LIMIT ?4",
+            &[
+                sqlite_run_id(self.run_id),
+                start_tick.into(),
+                end_tick.into(),
+                probe_limit.into(),
+            ],
+        )?;
+        if rows.len() > MAX_STORAGE_QUERY_PAGE {
+            return Err(NarrativeQueryError::AroundWindowTooDense {
+                max: MAX_STORAGE_QUERY_PAGE,
+            }
+            .into());
+        }
+        let mut hits = Vec::with_capacity(rows.len());
+        for row in rows {
+            hits.push(NarrativeHit {
+                event: persisted_run_event_from_row(&run_event_row_from_query_row(&row)?)?,
+                rank: None,
+            });
+        }
+        debug!(
+            run_id = %self.run_id,
+            row_count = hits.len(),
+            elapsed_micros = started.elapsed().as_micros(),
+            "completed bounded narrative tick-window scan"
+        );
+        Ok(hits)
+    }
+
     pub fn recent_metrics(&self, limit: usize) -> Result<Vec<PersistedMetric>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -9504,6 +9854,10 @@ impl Storage {
             storage.terminally_failed = true;
             return Err(error);
         }
+        if let Err(error) = storage.validate_persistence_invariants() {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
         storage.next_batch_id =
             storage
                 .persistence_watermarks()?
@@ -9546,8 +9900,16 @@ impl Storage {
                 "add_host_command_lifecycle_projection",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
                 "add_replay_event_interaction_edges",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
+                "drop_external_content_narrative_search",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "create_plain_content_narrative_search",
             ),
         ];
         if migrations.len() != expected_migrations.len() {
@@ -10647,6 +11009,59 @@ impl Storage {
                     ),
                 });
             }
+        }
+        Self::validate_run_event_search_index(connection, run_id)?;
+        Ok(())
+    }
+
+    fn validate_run_event_search_index(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<(), StorageError> {
+        let row = connection.query_row_with_params(
+            "SELECT
+                (SELECT COUNT(*) FROM run_events WHERE run_id = ?1),
+                (SELECT COUNT(*) FROM run_events_fts WHERE run_id = ?1),
+                (SELECT COUNT(*)
+                 FROM run_events AS events
+                 LEFT JOIN run_events_fts AS search
+                   ON search.run_id = events.run_id
+                  AND search.tick = CAST(events.tick AS TEXT)
+                  AND search.kind = events.kind
+                  AND search.metric = events.metric
+                 WHERE events.run_id = ?1 AND search.rowid IS NULL),
+                (SELECT COUNT(*)
+                 FROM run_events_fts AS search
+                 LEFT JOIN run_events AS events
+                   ON events.run_id = search.run_id
+                  AND search.tick = CAST(events.tick AS TEXT)
+                  AND events.kind = search.kind
+                  AND events.metric = search.metric
+                 WHERE search.run_id = ?1 AND events.run_id IS NULL),
+                (SELECT COUNT(*)
+                 FROM run_events_fts AS search
+                 JOIN run_events AS events
+                   ON events.run_id = search.run_id
+                  AND search.tick = CAST(events.tick AS TEXT)
+                  AND events.kind = search.kind
+                  AND events.metric = search.metric
+                 WHERE search.run_id = ?1
+                   AND search.human_text != events.human_text)",
+            &[sqlite_run_id(run_id)],
+        )?;
+        let relational: i64 = decode(&row, 0, "run_events.search_relational_count")?;
+        let indexed: i64 = decode(&row, 1, "run_events.search_indexed_count")?;
+        let missing: i64 = decode(&row, 2, "run_events.search_missing_count")?;
+        let orphaned: i64 = decode(&row, 3, "run_events.search_orphaned_count")?;
+        let mismatched: i64 = decode(&row, 4, "run_events.search_mismatched_count")?;
+        if relational != indexed || missing != 0 || orphaned != 0 || mismatched != 0 {
+            return Err(StorageError::InvalidData {
+                context: "run_events_fts.completeness",
+                reason: format!(
+                    "run {run_id} has relational/indexed/missing/orphaned/mismatched \
+                     narrative rows {relational}/{indexed}/{missing}/{orphaned}/{mismatched}"
+                ),
+            });
         }
         Ok(())
     }
@@ -13182,6 +13597,9 @@ impl Storage {
                 metric, before_value, after_value, score, subject_ref, human_text,
                 schema_version
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+        let search_sql = "insert into run_events_fts (
+                run_id, tick, kind, metric, human_text
+            ) values (?1, ?2, ?3, ?4, ?5)";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -13204,6 +13622,22 @@ impl Storage {
                     row.schema_version.into(),
                 ],
             )?;
+            let indexed = tx.execute_with_params(
+                search_sql,
+                &[
+                    sqlite_run_id(run_id),
+                    row.tick.into(),
+                    row.kind.as_str().into(),
+                    row.metric.as_str().into(),
+                    row.human_text.as_str().into(),
+                ],
+            )?;
+            if indexed != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "narrative search index inserted {indexed} rows for run {run_id}, tick {}, kind {:?}, metric {:?}",
+                    row.tick, row.kind, row.metric
+                )));
+            }
         }
         Ok(())
     }
@@ -13639,7 +14073,18 @@ impl Storage {
     /// Compact storage after first durably flushing every buffered row.
     pub fn optimize(&mut self) -> Result<(), StorageError> {
         self.flush()?;
+        self.finalize_applied_outbox()?;
+        self.optimize_narrative_search()?;
         self.connection()?.execute("VACUUM;")?;
+        Ok(())
+    }
+
+    fn optimize_narrative_search(&self) -> Result<(), StorageError> {
+        // The pinned e536d7f8 engine accepts this standard FTS5 maintenance command but its
+        // Optimize branch is currently a compatibility no-op. Keep the owner-thread hook so
+        // clean shutdowns exercise the supported contract without claiming a segment merge.
+        self.connection()?
+            .execute("INSERT INTO run_events_fts(run_events_fts) VALUES('optimize')")?;
         Ok(())
     }
 
@@ -13707,6 +14152,7 @@ impl Storage {
     pub fn close(mut self) -> Result<(), StorageError> {
         self.flush()?;
         self.finalize_applied_outbox()?;
+        self.optimize_narrative_search()?;
         self.log_interaction_run_summary()?;
         let connection = self.conn.take().ok_or(StorageError::Closed)?;
         Self::truncate_wal_before_close(&connection, &self.path);
@@ -19265,6 +19711,79 @@ mod tests {
         Ok(())
     }
 
+    fn assert_plain_narrative_fts_schema(
+        connection: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fts_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'run_events_fts'",
+            )?
+            .get_typed(0)?;
+        assert!(fts_sql.contains("USING fts5"));
+        assert!(
+            !fts_sql.contains("content=")
+                && !fts_sql.contains("content =")
+                && !fts_sql.contains("content_rowid"),
+            "narrative search table is not plain-content: {fts_sql}"
+        );
+        assert_eq!(
+            table_columns(connection, "run_events_fts")?,
+            ["run_id", "kind", "human_text", "tick", "metric"]
+        );
+        let shadow_tables = connection
+            .query(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name LIKE 'run_events_fts_%'
+                 ORDER BY name",
+            )?
+            .into_iter()
+            .map(|row| row.get_typed::<String>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            shadow_tables,
+            [
+                "run_events_fts_config",
+                "run_events_fts_content",
+                "run_events_fts_data",
+                "run_events_fts_docsize",
+                "run_events_fts_idx",
+            ]
+        );
+        let triggers: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'trigger' AND tbl_name IN ('run_events', 'run_events_fts')",
+            )?
+            .get_typed(0)?;
+        assert_eq!(triggers, 0, "worker writes, not triggers, own index parity");
+        Ok(())
+    }
+
+    fn narrative_maintenance_snapshot(
+        connection: &Connection,
+    ) -> Result<Vec<(String, String, String, String, f64)>, StorageError> {
+        connection
+            .query(
+                "SELECT run_id, tick, kind, metric, bm25(run_events_fts)
+                 FROM run_events_fts
+                 WHERE run_events_fts MATCH '\"maintenance token\"'
+                 ORDER BY bm25(run_events_fts) ASC,
+                          tick ASC, kind ASC, metric ASC",
+            )?
+            .iter()
+            .map(|row| {
+                Ok((
+                    decode(row, 0, "run_events_fts.run_id")?,
+                    decode(row, 1, "run_events_fts.tick")?,
+                    decode(row, 2, "run_events_fts.kind")?,
+                    decode(row, 3, "run_events_fts.metric")?,
+                    decode(row, 4, "run_events_fts.rank")?,
+                ))
+            })
+            .collect()
+    }
+
     #[test]
     fn fresh_schema_records_exact_ledger_and_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -19286,8 +19805,16 @@ mod tests {
                 "add_host_command_lifecycle_projection",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
                 "add_replay_event_interaction_edges",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
+                "drop_external_content_narrative_search",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "create_plain_content_narrative_search",
             ),
         ];
         assert_eq!(migrations.len(), expected.len());
@@ -19303,6 +19830,7 @@ mod tests {
         }
         let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
         assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
+        assert_plain_narrative_fts_schema(&connection)?;
 
         install_scriptbots_schema(&connection)?;
         assert_eq!(read_schema_objects(&connection)?, first_schema);
@@ -19314,6 +19842,171 @@ mod tests {
             i64::try_from(expected.len())?,
             "idempotent install duplicated its ledger"
         );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_optimize_preserves_narrative_identities_and_ranks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut storage = Storage::unattributed_memory_with_thresholds(1, 1, 1, 1)?;
+        let mut batch = sample_batch(72, 7.2);
+        batch.narrative_events = vec![
+            EventRecord {
+                schema_version: EVENT_RECORD_SCHEMA_VERSION,
+                tick: Tick(71),
+                kind: EventKind::PopulationBoom,
+                severity: 0.75,
+                magnitude: 4.0,
+                window: (70, 71),
+                metric: "maintenance.a".to_owned(),
+                before: 8.0,
+                after: 12.0,
+                score: 3.0,
+                subject: None,
+                human_text: "maintenance token population increased".to_owned(),
+            },
+            EventRecord {
+                schema_version: EVENT_RECORD_SCHEMA_VERSION,
+                tick: Tick(72),
+                kind: EventKind::DietShift,
+                severity: 0.5,
+                magnitude: 0.25,
+                window: (71, 72),
+                metric: "maintenance.b".to_owned(),
+                before: 0.25,
+                after: 0.5,
+                score: 2.0,
+                subject: Some(SubjectRef::Species(7)),
+                human_text: "maintenance token diet shifted".to_owned(),
+            },
+        ];
+        storage.persist(&batch)?;
+        Storage::validate_run_event_search_index(storage.connection()?, storage.run_id())?;
+        let before = narrative_maintenance_snapshot(storage.connection()?)?;
+        assert_eq!(before.len(), 2);
+
+        storage.optimize()?;
+
+        Storage::validate_run_event_search_index(storage.connection()?, storage.run_id())?;
+        let after = narrative_maintenance_snapshot(storage.connection()?)?;
+        assert_eq!(
+            after, before,
+            "explicit maintenance changed narrative identities or BM25 scores"
+        );
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v10_upgrade_replaces_external_fts_with_plain_content_and_backfills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        let v10 = MigrationRunner::new()
+            .add(
+                SCRIPTBOTS_SCHEMA_V6_VERSION,
+                "create_multi_run_schema",
+                SCRIPTBOTS_SCHEMA_V6,
+            )
+            .add(
+                SCRIPTBOTS_SCHEMA_V7_VERSION,
+                "add_host_journal_archive",
+                SCRIPTBOTS_SCHEMA_V7,
+            )
+            .add(
+                SCRIPTBOTS_SCHEMA_V8_VERSION,
+                "add_host_domain_event_projection",
+                SCRIPTBOTS_SCHEMA_V8,
+            )
+            .add(
+                SCRIPTBOTS_SCHEMA_V9_VERSION,
+                "add_host_command_lifecycle_projection",
+                SCRIPTBOTS_SCHEMA_V9,
+            )
+            .add(
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
+                "add_replay_event_interaction_edges",
+                SCRIPTBOTS_SCHEMA_V10,
+            )
+            .run(&connection)?;
+        assert_eq!(v10.current, SCRIPTBOTS_SCHEMA_V10_VERSION);
+
+        connection.execute("PRAGMA foreign_keys = OFF")?;
+        connection.execute(
+            "INSERT INTO run_events (
+                run_id, tick, kind, severity, magnitude, window_start, window_end,
+                metric, before_value, after_value, score, subject_ref, human_text,
+                schema_version
+             ) VALUES (
+                'upgrade-run', 7, 'population_crash', 0.8, 12.0, 3, 7,
+                'population', 40.0, 28.0, 5.0, NULL,
+                'drought caused population crash', 1
+             );
+             INSERT INTO run_events (
+                run_id, tick, kind, severity, magnitude, window_start, window_end,
+                metric, before_value, after_value, score, subject_ref, human_text,
+                schema_version
+             ) VALUES (
+                'upgrade-run', 9, 'diet_shift', 0.5, 0.25, 7, 9,
+                'diet.mix', 0.25, 0.5, 3.0, 'species:7',
+                'unicode café diet shift', 1
+             )",
+        )?;
+
+        let interrupted = MigrationRunner::new()
+            .add(
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
+                "drop_external_content_narrative_search",
+                SCRIPTBOTS_SCHEMA_V11,
+            )
+            .run(&connection)?;
+        assert_eq!(interrupted.current, SCRIPTBOTS_SCHEMA_V11_VERSION);
+        assert_eq!(interrupted.applied, [SCRIPTBOTS_SCHEMA_V11_VERSION]);
+        let search_tables_during_interruption: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'run_events_fts'",
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            search_tables_during_interruption, 0,
+            "the explicit V11 crash boundary must not retain the external index"
+        );
+
+        install_scriptbots_schema(&connection)?;
+        let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
+        assert_plain_narrative_fts_schema(&connection)?;
+        let backfilled = connection.query(
+            "SELECT run_id, tick, kind, metric, human_text
+             FROM run_events_fts
+             WHERE run_events_fts MATCH '\"population crash\"'
+             ORDER BY tick",
+        )?;
+        assert_eq!(backfilled.len(), 1);
+        assert_eq!(
+            decode::<String>(&backfilled[0], 0, "run_events_fts.run_id")?,
+            "upgrade-run"
+        );
+        assert_eq!(
+            decode::<String>(&backfilled[0], 1, "run_events_fts.tick")?,
+            "7"
+        );
+        let unicode_hits: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM run_events_fts
+                 WHERE run_events_fts MATCH 'café'",
+            )?
+            .get_typed(0)?;
+        assert_eq!(unicode_hits, 1);
+        let indexed_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM run_events_fts")?
+            .get_typed(0)?;
+        assert_eq!(indexed_rows, 2);
+
+        let schema_after_upgrade = read_schema_objects(&connection)?;
+        install_scriptbots_schema(&connection)?;
+        assert_eq!(read_schema_objects(&connection)?, schema_after_upgrade);
         connection.close()?;
         Ok(())
     }
@@ -19462,7 +20155,7 @@ mod tests {
 
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 5);
+        assert_eq!(migrations.len(), 7);
         for (index, (expected_version, expected_name)) in [
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
@@ -19474,8 +20167,16 @@ mod tests {
                 "add_host_command_lifecycle_projection",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V10_VERSION,
                 "add_replay_event_interaction_edges",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_V11_VERSION,
+                "drop_external_content_narrative_search",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "create_plain_content_narrative_search",
             ),
         ]
         .into_iter()
@@ -20090,7 +20791,9 @@ mod tests {
                 (7, 'add_host_journal_archive', 'forged'),
                 (8, 'add_host_domain_event_projection', 'forged'),
                 (9, 'add_host_command_lifecycle_projection', 'forged'),
-                (10, 'add_replay_event_interaction_edges', 'forged');
+                (10, 'add_replay_event_interaction_edges', 'forged'),
+                (11, 'drop_external_content_narrative_search', 'forged'),
+                (12, 'create_plain_content_narrative_search', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -20100,7 +20803,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 10;",
+             PRAGMA user_version = 12;",
         )?;
         connection.close()?;
 

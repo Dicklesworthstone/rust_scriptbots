@@ -11,15 +11,15 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    RunEventDecodeError, RunEventField, RunEventIdentity, RunManifestRecord, Storage,
-    StorageDeadlines, StorageError, StoragePipeline, StorageReader,
+    NarrativeQueryError, RunEventDecodeError, RunEventField, RunEventIdentity, RunManifestRecord,
+    Storage, StorageDeadlines, StorageError, StoragePipeline, StorageReader,
 };
 use std::{
     fs,
     io::Write,
     process::Command,
     sync::{Arc, LazyLock, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[test]
@@ -355,6 +355,14 @@ fn narrative_events_recover_as_byte_identical_typed_records_with_stable_identiti
             .into_iter()
             .map(|event| event.into_parts())
             .collect::<Vec<_>>();
+        let recovered_search = reader
+            .search_narrative("seed", None, 64)
+            .expect("recovered events are indexed in the same applied transaction");
+        assert_eq!(
+            recovered_search.len(),
+            expected.len(),
+            "every recovered relational narrative row must be searchable"
+        );
         reader.close().expect("typed reader closes");
         assert_eq!(
             serde_json::to_vec(&first).expect("first read serializes"),
@@ -444,6 +452,338 @@ fn narrative_events_recover_as_byte_identical_typed_records_with_stable_identiti
 
         let _ = fs::remove_file(&path);
     }
+}
+
+#[test]
+fn narrative_search_is_ranked_bounded_literal_and_run_scoped() {
+    let logs = narrative_log_buffer();
+    let seed = 0xF75_u64;
+    let path = narrative_test_path("search", seed);
+    let path_str = path.to_str().expect("utf8 path");
+    let run_a = RunId::new(0xA);
+    let run_b = RunId::new(0xB);
+
+    let mut events = curated_narrative_events(seed);
+    let base = events[0].tick.0;
+    events[0].human_text = "drought drought caused population crash".to_owned();
+    events[1].human_text = "drought caused a diet shift".to_owned();
+    events[2].human_text = "clima café recovered energy".to_owned();
+    let mut literal = events[0].clone();
+    literal.tick = Tick(literal.tick.0 + 1);
+    literal.metric = "quoted.operator".to_owned();
+    literal.human_text = "literal OR quote \"danger\"".to_owned();
+    events.push(literal);
+    let mut tie_a = events[0].clone();
+    tie_a.tick = Tick(base + 4);
+    tie_a.metric = "tie.a".to_owned();
+    tie_a.human_text = "equal tie token".to_owned();
+    let mut tie_b = tie_a.clone();
+    tie_b.tick = Tick(tie_a.tick.0 + 1);
+    tie_b.metric = "tie.b".to_owned();
+    events.extend([tie_a, tie_b]);
+
+    let mut manifest_a = RunManifestRecord::unattributed(run_a);
+    manifest_a.root_seed = seed;
+    let mut pipeline =
+        StoragePipeline::create_new_file_for_run_with_thresholds(path_str, manifest_a, 1, 1, 1, 1)
+            .expect("search run A opens");
+    pipeline
+        .submit(&narrative_batch(events.clone()))
+        .expect("search events admit");
+    pipeline.shutdown().expect("search run A shuts down");
+
+    let mut run_b_event = curated_narrative_events(seed + 1)
+        .into_iter()
+        .next()
+        .expect("run B event");
+    run_b_event.human_text = "drought belongs only to run B".to_owned();
+    let mut manifest_b = RunManifestRecord::unattributed(run_b);
+    manifest_b.root_seed = seed + 1;
+    let mut pipeline =
+        StoragePipeline::append_run(path_str, manifest_b).expect("search run B appends");
+    pipeline
+        .submit(&narrative_batch(vec![run_b_event]))
+        .expect("run B search event admits");
+    pipeline.shutdown().expect("search run B shuts down");
+
+    let reader_a = StorageReader::open_for_run(path_str, run_a).expect("run A reader opens");
+    let started = Instant::now();
+    let drought = reader_a
+        .search_narrative("drought", None, 16)
+        .expect("literal drought search");
+    let elapsed = started.elapsed();
+    assert_eq!(drought.len(), 2, "run B must not leak into run A results");
+    assert_eq!(
+        drought[0].human_text(),
+        "drought drought caused population crash",
+        "the repeat-heavy document should receive the better BM25 score"
+    );
+    assert!(
+        drought
+            .windows(2)
+            .all(|pair| pair[0].rank().expect("rank") <= pair[1].rank().expect("rank")),
+        "BM25 results are not ordered best-first: {drought:?}"
+    );
+    let repeated = reader_a
+        .search_narrative("drought", None, 16)
+        .expect("repeat search");
+    assert_eq!(
+        drought
+            .iter()
+            .map(|hit| (hit.event().identity().clone(), hit.rank()))
+            .collect::<Vec<_>>(),
+        repeated
+            .iter()
+            .map(|hit| (hit.event().identity().clone(), hit.rank()))
+            .collect::<Vec<_>>(),
+        "BM25 scores and canonical tie-break order changed between identical reads"
+    );
+    assert_eq!(
+        reader_a
+            .search_narrative("drought", None, 1)
+            .expect("limited search")
+            .len(),
+        1
+    );
+    assert!(
+        reader_a
+            .search_narrative("drought", None, 0)
+            .expect("zero-result limit")
+            .is_empty()
+    );
+    assert_eq!(
+        reader_a
+            .search_narrative("drought", Some((base + 2, base + 4)), 16)
+            .expect("tick-filtered search")
+            .len(),
+        1
+    );
+    let unicode = reader_a
+        .search_narrative("cafe", None, 16)
+        .expect("unicode61 diacritic-normalized search");
+    assert_eq!(unicode.len(), 1);
+    assert_eq!(unicode[0].human_text(), "clima café recovered energy");
+    assert_eq!(
+        reader_a
+            .search_narrative("café", None, 16)
+            .expect("non-ASCII literal query")
+            .len(),
+        1
+    );
+    let ties = reader_a
+        .search_narrative("tie token", None, 16)
+        .expect("equal-score tie search");
+    assert_eq!(ties.len(), 2);
+    assert_eq!(ties[0].rank(), ties[1].rank());
+    assert!(
+        ties[0].event().identity() < ties[1].event().identity(),
+        "equal BM25 scores must use canonical identity order"
+    );
+    let quoted = reader_a
+        .search_narrative("literal OR quote \"danger\"", None, 16)
+        .expect("quoted operator-like input remains literal");
+    assert_eq!(quoted.len(), 1);
+    assert!(
+        reader_a
+            .search_narrative("drought' OR 1=1 --", None, 16)
+            .expect("SQL-shaped text remains a bound literal")
+            .is_empty()
+    );
+    assert!(matches!(
+        reader_a.search_narrative("   ", None, 16),
+        Err(StorageError::NarrativeQuery(NarrativeQueryError::Empty))
+    ));
+    assert!(matches!(
+        reader_a.search_narrative(&"x".repeat(1_025), None, 16),
+        Err(StorageError::NarrativeQuery(
+            NarrativeQueryError::TooLong { .. }
+        ))
+    ));
+    assert!(matches!(
+        reader_a.search_narrative(&format!("needle{}", " ".repeat(1_025)), None, 16),
+        Err(StorageError::NarrativeQuery(
+            NarrativeQueryError::TooLong { .. }
+        ))
+    ));
+    assert!(matches!(
+        reader_a.search_narrative("nul\0byte", None, 16),
+        Err(StorageError::NarrativeQuery(
+            NarrativeQueryError::ContainsNul
+        ))
+    ));
+    assert!(matches!(
+        reader_a.search_narrative("drought", Some((base, base)), 16),
+        Err(StorageError::NarrativeQuery(
+            NarrativeQueryError::InvalidTickRange { .. }
+        ))
+    ));
+    assert!(matches!(
+        reader_a.search_narrative("drought", Some((base + 1, base)), 16),
+        Err(StorageError::NarrativeQuery(
+            NarrativeQueryError::InvalidTickRange { .. }
+        ))
+    ));
+    assert!(matches!(
+        reader_a.search_narrative("drought", None, 4_097),
+        Err(StorageError::NarrativeQuery(
+            NarrativeQueryError::LimitTooLarge { .. }
+        ))
+    ));
+    let around = reader_a
+        .narrative_around_tick(base + 1, 1)
+        .expect("bounded tick window");
+    assert_eq!(around.len(), 3);
+    assert_eq!(
+        around.iter().map(|hit| hit.tick().0).collect::<Vec<_>>(),
+        [base, base, base + 1],
+        "tick-window results must preserve canonical chronological order"
+    );
+    assert!(
+        around[0].event().identity() < around[1].event().identity(),
+        "same-tick results must use the canonical identity tie-break"
+    );
+    assert!(around.iter().all(|hit| hit.rank().is_none()));
+    assert_eq!(
+        reader_a
+            .narrative_around_tick(0, u64::MAX)
+            .expect("saturated tick window")
+            .len(),
+        events.len(),
+        "zero and i64::MAX window saturation must retain all in-range rows"
+    );
+    reader_a.close().expect("run A reader closes");
+
+    let reader_b = StorageReader::open_for_run(path_str, run_b).expect("run B reader opens");
+    let run_b_hits = reader_b
+        .search_narrative("drought", None, 16)
+        .expect("run B search");
+    assert_eq!(run_b_hits.len(), 1);
+    assert_eq!(run_b_hits[0].human_text(), "drought belongs only to run B");
+    reader_b.close().expect("run B reader closes");
+
+    eprintln!(
+        "narrative-search measurement: rows={} elapsed_us={}",
+        drought.len(),
+        elapsed.as_micros()
+    );
+    let run_a_log_key = format!("run_id={run_a}");
+    assert!(
+        logs.records_for("completed bounded narrative search")
+            .iter()
+            .any(|line| {
+                line.contains(&run_a_log_key)
+                    && line.contains("row_count=2")
+                    && line.contains("elapsed_micros=")
+            }),
+        "search tracing omitted run, row-count, or duration evidence"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+#[ignore = "10k-event observation lane; run explicitly through RCH"]
+fn narrative_search_records_10k_event_latency_distribution() {
+    const EVENT_COUNT: u64 = 10_000;
+    const SAMPLE_COUNT: usize = 20;
+
+    let logs = narrative_log_buffer();
+    let seed = 10_000_u64;
+    let path = narrative_test_path("10k-latency", seed);
+    let path_str = path.to_str().expect("utf8 path");
+    let run_id = RunId::new(10_000);
+    let events = (0_u64..EVENT_COUNT)
+        .map(|tick| EventRecord {
+            schema_version: EVENT_RECORD_SCHEMA_VERSION,
+            tick: Tick(tick),
+            kind: EventKind::PopulationBoom,
+            severity: 0.5,
+            magnitude: 1.0,
+            window: (tick.saturating_sub(1), tick),
+            metric: format!("latency.{tick:05}"),
+            before: 1.0,
+            after: 2.0,
+            score: 1.0,
+            subject: None,
+            human_text: if tick % 100 == 0 {
+                format!("latency needle population event {tick}")
+            } else {
+                format!("background narrative population event {tick}")
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let mut manifest = RunManifestRecord::unattributed(run_id);
+    manifest.root_seed = seed;
+    let mut pipeline =
+        StoragePipeline::create_new_file_for_run_with_thresholds(path_str, manifest, 1, 1, 1, 1)
+            .expect("10k measurement pipeline opens");
+    pipeline
+        .submit(&narrative_batch(events))
+        .expect("10k narrative batch admits through the normal outbox path");
+    pipeline
+        .shutdown()
+        .expect("10k measurement pipeline shuts down");
+
+    let reader = StorageReader::open_for_run(path_str, run_id).expect("10k reader opens");
+    let warmup = reader
+        .search_narrative("latency needle", None, 256)
+        .expect("10k search warmup");
+    assert_eq!(warmup.len(), 100);
+    let expected = warmup
+        .iter()
+        .map(|hit| (hit.event().identity().clone(), hit.rank()))
+        .collect::<Vec<_>>();
+    let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+    for sample in 0..SAMPLE_COUNT {
+        let started = Instant::now();
+        let hits = reader
+            .search_narrative("latency needle", None, 256)
+            .expect("10k timed search");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.event().identity().clone(), hit.rank()))
+                .collect::<Vec<_>>(),
+            expected,
+            "10k query identities or BM25 scores changed at sample {sample}"
+        );
+        eprintln!(
+            "narrative-search-10k sample={} rows={} elapsed_us={}",
+            sample + 1,
+            hits.len(),
+            elapsed.as_micros()
+        );
+        samples.push(elapsed);
+    }
+    samples.sort_unstable();
+    let p50 = samples[SAMPLE_COUNT / 2];
+    let p95 = samples[(SAMPLE_COUNT * 95).div_ceil(100) - 1];
+    eprintln!(
+        "narrative-search-10k summary events={EVENT_COUNT} matches={} samples={SAMPLE_COUNT} p50_us={} p95_us={} target_us=10000",
+        expected.len(),
+        p50.as_micros(),
+        p95.as_micros()
+    );
+    assert!(matches!(
+        reader.narrative_around_tick(EVENT_COUNT / 2, EVENT_COUNT),
+        Err(StorageError::NarrativeQuery(
+            NarrativeQueryError::AroundWindowTooDense { max: 4_096 }
+        ))
+    ));
+    reader.close().expect("10k reader closes");
+
+    let run_log_key = format!("run_id={run_id}");
+    assert!(
+        logs.records_for("completed bounded narrative search")
+            .iter()
+            .any(|line| {
+                line.contains(&run_log_key)
+                    && line.contains("row_count=100")
+                    && line.contains("elapsed_micros=")
+            }),
+        "10k search tracing omitted run, row-count, or duration evidence"
+    );
+    let _ = fs::remove_file(&path);
 }
 
 fn create_narrative_fixture(path: &str, event: EventRecord) {
