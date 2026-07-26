@@ -11,19 +11,5 @@ description.workspace = true
 ordered-float = { workspace = true }
 thiserror = { workspace = true }
 
-[features]
-default = ["grid"]
-grid = []
-rstar = ["dep:rstar"]
-kd = ["dep:kiddo"]
-
-[dependencies.rstar]
-workspace = true
-optional = true
-
-[dependencies.kiddo]
-workspace = true
-optional = true
-
 [lints]
 workspace = true

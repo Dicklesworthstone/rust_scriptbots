@@ -1465,7 +1465,7 @@ stable target floors with byte-stable wire-compatibility proof,
 
 **Core numerical/indexing family:** [Completed — `rayon`, `slotmap`, and
 `wide` stable target floors plus live uniform-grid conformance; unused
-`rstar`/`kiddo` declarations remain explicitly unimplemented and unclaimed,
+`rstar`/`kiddo` declarations were subsequently removed under `bd-d1wb`,
 `bd-2z0.8.5`, Codex, 2026-07-12]
 
 These candidates were checked against live crates.io records on 2026-07-11. Registry metadata establishes a candidate version, not its migration risk. Release notes, changelog, repository, features, and security research are still required before the bead becomes actionable. They are manifest lower-bound candidates plus a committed lock, not universal exact `=version` requirements.
@@ -1518,7 +1518,7 @@ Static source search found no current use for the following direct declarations.
 
 Workspace Candle/Tract/Tch declarations are redundant because the brain-ml crate redeclares them. More importantly, none of those backend crates is used by the placeholder’s evaluation code. Disable/remove their current default surface and reintroduce each only with a real implementation bead.
 
-Optional `rstar` and `kiddo` features advertise implementations that do not exist. Implement and test them before upgrading, or remove the fictional features.
+[Completed — `bd-d1wb`, IvoryCondor, 2026-07-26] Removed the dependency-only `rstar`/`kd` feature declarations, their `rstar`/`kiddo` dependencies, and the no-op `grid` feature. The uniform grid is unconditional; alternate backends must ship real implementations and conformance coverage before gaining feature flags.
 
 The same slice should relocate rather than delete declarations whose scope is
 wrong: app `rand` and render's `scriptbots-brain` edge are integration-test
@@ -1565,8 +1565,8 @@ The following are architectural migrations, not routine bumps:
 | `toml` | `1.1.2+spec-1.1.0` | config corpus and formatted-output review |
 | `pollster` | `1.0.1` | update after renderer/WGPU family |
 | `kira` | `0.12.1` | cpal-only feature and audio smoke |
-| `rstar` | `0.13.0` | real implementation/conformance first |
-| `kiddo` | `5.3.2` | real implementation/conformance first |
+| `rstar` (not declared) | `0.13.0` | reintroduce only with a real implementation and conformance |
+| `kiddo` (not declared) | `5.3.2` | reintroduce only with a real implementation and conformance |
 | Candle | `0.11.0` | real model evaluator/genome semantics first |
 | Tract | `0.23.4` | MSRV >=1.91, security/facade/ndarray migration, real ONNX tests |
 | Tch | `0.24.0` | exact libtorch/PyTorch 2.11 provisioning and native CI |

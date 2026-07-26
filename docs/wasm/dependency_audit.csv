@@ -16,8 +16,8 @@ candle-core,0.4.1,adapt,"Has wasm support but needs feature selection","Disable 
 candle-nn,0.4.1,adapt,"Same as candle-core","Gate behind `ml` feature; document wasm opt-in",Brain Team,Phase 5
 tract-onnx,0.21.6,native-only,"Relies on `tract-linalg` with pthreads/native code","Disable in wasm builds; explore ONNX Runtime wasm later",Brain Team,Phase 5
 tch,0.18.0,native-only,"Wrapper over libtorch (native binaries)","Disable for wasm crate",Brain Team,Phase 5
-rstar,0.12.2,ready,"Pure Rust spatial index",None required,Web Crate Owner,Phase 2
-kiddo,4.2.0,ready,"Pure Rust kd-tree",None required,Web Crate Owner,Phase 2
+rstar,0.12.2,removed,"Dependency-only feature had no implementation","Reintroduce only with a real backend and conformance coverage",Index Owner,N/A
+kiddo,4.2.0,removed,"Dependency-only feature had no implementation","Reintroduce only with a real backend and conformance coverage",Index Owner,N/A
 neuroflow,0.2.0,adapt,"Pure Rust but uses std threads in some examples","Audit features; consider disabling parallel training",Brain Team,Phase 5
 tracing,0.1.40,adapt,"Core works; subscriber choices limited on wasm","Use `tracing-wasm` for console logging",Web Crate Owner,Phase 2
 tracing-subscriber,0.3.18,adapt,"Default registry uses OS time/thread locals","Replace with `tracing-wasm` or custom layer",Web Crate Owner,Phase 2

@@ -372,7 +372,7 @@ declaring package when occurrences have different dispositions.
 | [gpui](https://github.com/zed-industries/zed/commit/5f8a7413a31769e0882357f90dc424b3962ac72d) | render; Git package 0.2.2 at exact Zed revision | published 0.2.2; Apache-2.0; undeclared | PIN; `bd-2z0.8.12`; retain/retire only after direct-texture and live-window gate. |
 | [image](https://crates.io/crates/image/0.25.10) | app, Bevy, render, world-gfx dev; 0.25.10 | 0.25.10; MIT/Apache; 1.88 | PARTIAL REMOVE app occurrence; keep three render/test uses; `bd-2z0.8.2` and `.8.11`. |
 | [js-sys](https://crates.io/crates/js-sys/0.3.103) | web; 0.3.103 | 0.3.103; MIT/Apache; 1.77 | KEEP; `bd-2z0.8.13`; wasm-pack/browser proof. |
-| [kiddo](https://crates.io/crates/kiddo/5.3.2) | optional index feature; 4.2.1 but no implementation reference | 5.3.2; MIT/Apache; 1.85 | HOLD/remove fictional feature or implement first; `bd-2z0.8.5`; neighbor-query conformance. |
+| [kiddo](https://crates.io/crates/kiddo/5.3.2) | **REMOVED 2026-07-26:** dependency-only `kd` feature had no implementation | 5.3.2; MIT/Apache; 1.85 | Reintroduce only with a real backend and neighbor-query conformance; `bd-d1wb`. |
 | [kira](https://crates.io/crates/kira/0.12.1) | optional render audio; 0.10.8 | 0.12.1; MIT/Apache; undeclared | MIGRATE after renderer boundary; `bd-2z0.8.11`; cpal feature audit and audio smoke. |
 | [libc](https://crates.io/crates/libc/0.2.186) | app Unix priority helper; 0.2.186 | 0.2.186; MIT/Apache; 1.65 | RELOCATE to Unix target; `bd-2z0.8.2/.8.13`; macOS/Linux startup tests. |
 | [mcp-protocol-sdk](https://crates.io/crates/mcp-protocol-sdk/0.5.1) | app; 0.5.1 | 0.5.1; MIT; 1.85 | KEEP/PIN range; `bd-2z0.8.7`; protocol conformance and lifecycle tests before any source change. |
@@ -389,7 +389,7 @@ declaring package when occurrences have different dispositions.
 | [rayon](https://crates.io/crates/rayon/1.12.0) | core optional uses 1.12.0; brain occurrence dead | 1.12.0; MIT/Apache; 1.80 | PARTIAL REMOVE brain; keep core behind explicit product feature/thread budget; `bd-2z0.8.2/.8.5`. |
 | [reqwest](https://crates.io/crates/reqwest/0.13.4) | app control CLI; 0.12.28 | 0.13.4; MIT/Apache; 1.85 | MIGRATE; `bd-2z0.8.7`; explicit rustls/default-feature decision and real control E2E. |
 | [ron](https://crates.io/crates/ron/0.12.2) | app direct 0.8.1; graph also 0.10.1 | 0.12.2; MIT/Apache; 1.64 | MIGRATE; `bd-2z0.8.3`; scenario/config corpus golden round trips. |
-| [rstar](https://crates.io/crates/rstar/0.13.0) | optional index feature; 0.12.2 but no implementation reference | 0.13.0; MIT/Apache; 1.85 | HOLD/remove fictional feature or implement first; `bd-2z0.8.5`; neighbor-query conformance. |
+| [rstar](https://crates.io/crates/rstar/0.13.0) | **REMOVED 2026-07-26:** dependency-only feature had no implementation | 0.13.0; MIT/Apache; 1.85 | Reintroduce only with a real backend and neighbor-query conformance; `bd-d1wb`. |
 | [serde](https://crates.io/crates/serde/1.0.228) | app, brain, brain-ml, brain-neuro, core, index, render, storage, web; 1.0.228; brain-ml and render occurrences dead | 1.0.228; MIT/Apache; 1.56 | PARTIAL REMOVE two dead occurrences and the redundant brain-neuro `derive` feature repeat; keep seven owners; `bd-2z0.8.2`, floor update in `.8.3`. |
 | [serde-wasm-bindgen](https://crates.io/crates/serde-wasm-bindgen/0.6.5) | web; 0.6.5 | 0.6.5; MIT; undeclared | KEEP; `bd-2z0.8.13`; canonical browser serialization tests. |
 | [serde_json](https://crates.io/crates/serde_json/1.0.150) | app, brain-neuro, core, storage; 1.0.150 | 1.0.150; MIT/Apache; 1.71 | KEEP; `bd-2z0.8.3`; manifest/replay/config goldens. |
@@ -459,7 +459,7 @@ than crates.io.
 | core default | `parallel + simd_wide` | Keep until scalar/serial oracle exists; then test four explicit product lanes in `.8.5`. |
 | brain default | MLP + DWRAON + `experimental`, where experimental enables Assembly | Remove “experimental by default” ambiguity after brain-family conformance; `bd-2z0.3/.8.6`. |
 | brain-ml | backend features only enable heavy crates and change a label; tick still copies sensors to outputs | Quarantine from defaults and rebuild honest adapters under `.8.10`; do not upgrade fake backends. |
-| index | `rstar` and `kd` only enable dependencies; source implements only the uniform grid | Implement conformance-backed adapters or remove fictional features before updating; `.8.5`. |
+| index | source implements only the unconditional uniform grid; dependency-only `rstar` and `kd` features were removed | Reintroduce an alternate backend only with a conformance-backed adapter; `bd-d1wb`. |
 | render | default enables custom world-wgpu; direct GPUI is unconditional. On macOS the GUI closure feature-unifies render's WGPU 27 Metal edge with world-gfx's unconditional WGPU 27 Vulkan edge, enabling both backends. GUI-only grows the normal closure from 325 to 551 nodes. | Make world-gfx WGPU features target-correct, keep rich renderers isolated from normal defaults, repair current compile truth, then choose one primary renderer under `.8.11/.8.12`. |
 | Bevy | app's optional edge is cleanly gated, but the Bevy crate uses its full default feature set; Bevy-only reaches 531 normal package-version nodes and includes audio, GLTF, gamepad, web/Android, X11/Wayland, and broad GPU backends | Disable Bevy defaults and admit only features exercised by live renderer tests during `.8.11`. GUI+Bevy currently reaches 701 nodes and carries WGPU/Naga 26 and 27 together. |
 | platform | app scopes Wayland to Linux, but libc and windows-sys are unconditional | Relocate libc/windows-sys first; verify macOS, Linux, and Windows product graphs in `.8.2/.8.13`. |
@@ -1576,10 +1576,9 @@ No version migration in this ledger is authorized merely by being newer.
   eight-thread processes; the post-Wide four-thread application library
   passed 79/79.
 - **Backend scope:** `UniformGridIndex` is the only implemented spatial
-  backend. Optional `rstar` and `kiddo` declarations have no implementation or
-  call site, so this sub-update neither upgrades them nor falsely claims
-  R-tree/k-d-tree conformance. That declaration/product gap remains explicit
-  future work.
+  backend. The dependency-only `rstar` and `kiddo` declarations had no
+  implementation or call site and were later removed under `bd-d1wb`.
+  R-tree/k-d-tree work must begin with a real conformance-backed adapter.
 - **Workspace proof:** `cargo check --locked --workspace --all-targets`
   passed on pinned `nightly-2026-07-09`. The only diagnostic was the already
   recorded future-incompatibility notice for transitive

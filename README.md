@@ -121,7 +121,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
 - **`scriptbots-brain-ml`**: Feature selection and the retained `ml.placeholder` sensor-copy probe for Candle, Tract, and tch, plus the non-default code-first Frankentorch `FtBrain` family. The FtBrain source is implemented under `brain-ft`; its pinned DSR compile, determinism, and benchmark proof remains pending under `bd-2z0.3.12.3`.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
-- **`scriptbots-index`**: Production uniform-grid neighborhood index. The declared `rstar` and `kd` dependency features are compile-time scaffolding, not implemented index backends.
+- **`scriptbots-index`**: Production uniform-grid neighborhood index. Alternate backends are not advertised until they have real implementations and conformance coverage.
 - **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
 - **`scriptbots-render`**: GPUI UI layer with a window shell, HUD, canvas renderer for agents/food, selection highlights, and diagnostics overlay.
 - **`scriptbots-app`**: Binary shell. Wires tracing/logging, config/env, storage pipeline, installs brains, seeds agents, and launches the GPUI shell.
@@ -387,9 +387,7 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - Note: default features enable `ml`, `neuro`, and `fast-alloc`. To disable defaults, use `--no-default-features` and opt-in explicitly.
 - **`scriptbots-render`**:
   - `audio` → enable Kira-driven audio in the UI layer
-- **`scriptbots-index`**:
-  - `grid` is the implemented backend; `rstar` and `kd` currently enable dependencies only.
-  - Example: `cargo build -p scriptbots-index --features rstar`
+- **`scriptbots-index`**: the uniform-grid backend is unconditional; there are no backend-selection feature flags.
 - **`scriptbots-brain-ml`**:
   - `candle`, `tract`, and `tch` retain the dependency probes and `ml.placeholder`.
   - `brain-ft` exposes `FtBrainConfig`, `FtBrainFamily`, and `FT_BRAIN_KIND`.
@@ -423,7 +421,6 @@ cargo fmt --all
 cargo test --workspace
 
 # Build optional crates with features
-cargo build -p scriptbots-index --features rstar
 cargo build -p scriptbots-brain-ml --features candle # compile probe; inference is still a placeholder
 ```
 
@@ -532,7 +529,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 ### Data model & spatial indexing
 - **SoA layout**: agents use cache-friendly columns (`AgentColumns`) for fast scans during sense/actuation.
 - **Two identity layers**: slotmap-backed `AgentId` prevents stale references; monotonic `AgentUid` is the stable scientific identity used by digests, lineage, replay, and persistence.
-- **Spatial index**: uniform hash grid. Sense builds a read-only snapshot; the declared `rstar`/`kd` features do not yet provide alternate implementations.
+- **Spatial index**: uniform hash grid. Sense builds a read-only snapshot; alternate backends remain future implementation work and have no placeholder feature flags.
 
 ### Sensors & outputs
 - **Sensors**: multi-eye vision cones (angular), smell/sound/blood channels with attenuation, temperature discomfort, and clock/age cues.
