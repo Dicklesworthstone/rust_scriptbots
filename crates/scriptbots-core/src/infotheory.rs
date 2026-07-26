@@ -118,6 +118,195 @@ pub struct MiEstimate {
     pub saturated_fraction: f64,
 }
 
+/// Structured-log target for communication mutual-information windows.
+pub const COMMUNICATION_MI_LOG_TARGET: &str = "scriptbots::comms::mi";
+
+/// Fraction of samples in extreme bins that triggers a channel-saturation warning.
+pub const COMMUNICATION_MI_SATURATION_WARN_FRACTION: f64 = 0.05;
+
+/// Caller-owned identity for one aligned communication-analysis window.
+///
+/// The estimator cannot infer these fields from two slices. Keeping them beside the estimate
+/// prevents an offline caller from logging a context-free MI value that cannot be related back to
+/// a run interval or signal/response pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunicationMiWindow {
+    /// Inclusive first tick represented by the aligned samples.
+    pub tick_lo: u64,
+    /// Exclusive tick after the last represented sample.
+    pub tick_hi: u64,
+    /// Stable lowercase metric key identifying the aligned pair.
+    pub pair: String,
+}
+
+impl CommunicationMiWindow {
+    /// Construct a non-empty half-open window with a metric-safe pair identity.
+    pub fn new(
+        tick_lo: u64,
+        tick_hi: u64,
+        pair: impl Into<String>,
+    ) -> Result<Self, CommunicationMiWindowError> {
+        if tick_lo >= tick_hi {
+            return Err(CommunicationMiWindowError::InvalidTickWindow { tick_lo, tick_hi });
+        }
+        let pair = pair.into();
+        if pair.is_empty()
+            || !pair.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+        {
+            return Err(CommunicationMiWindowError::InvalidPair { pair });
+        }
+        Ok(Self {
+            tick_lo,
+            tick_hi,
+            pair,
+        })
+    }
+}
+
+/// Why a communication MI window could not be reported.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CommunicationMiWindowError {
+    /// A half-open window must contain at least one tick.
+    #[error("communication MI window [{tick_lo}, {tick_hi}) is empty or reversed")]
+    InvalidTickWindow {
+        /// Inclusive lower boundary supplied by the caller.
+        tick_lo: u64,
+        /// Exclusive upper boundary supplied by the caller.
+        tick_hi: u64,
+    },
+    /// Pair identities become log fields and metric keys, so ambiguous free text is refused.
+    #[error(
+        "communication MI pair {pair:?} must be non-empty lowercase ASCII using only [a-z0-9._-]"
+    )]
+    InvalidPair {
+        /// Rejected caller-supplied pair identity.
+        pair: String,
+    },
+    /// The underlying estimator refused the supplied samples or parameters.
+    #[error(transparent)]
+    Estimator(#[from] InfoTheoryError),
+}
+
+/// Testable sufficiency and saturation state emitted with a communication MI window.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CommunicationMiDiagnostics {
+    /// Aligned observations supplied to the estimator.
+    pub have: usize,
+    /// Miller-Madow adequacy floor for the selected bin count.
+    pub need: usize,
+    /// Whether `have >= need`.
+    pub sufficient: bool,
+    /// Fraction of observations whose pair touches the first or last bin.
+    pub saturated_fraction: f64,
+    /// Fixed warning threshold applied to [`Self::saturated_fraction`].
+    pub saturation_warn_fraction: f64,
+    /// Whether the saturation warning must be emitted.
+    pub saturation_warning: bool,
+}
+
+/// Context-bearing communication MI result used by offline study callers.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommunicationMiWindowReport {
+    /// Caller-owned interval and pair identity.
+    pub window: CommunicationMiWindow,
+    /// Full estimator result, including null and reproducibility provenance.
+    pub estimate: MiEstimate,
+}
+
+impl CommunicationMiWindowReport {
+    /// Derive the warning state from the estimator's single source of truth.
+    #[must_use]
+    pub const fn diagnostics(&self) -> CommunicationMiDiagnostics {
+        let need = self.estimate.bins * self.estimate.bins * 2;
+        CommunicationMiDiagnostics {
+            have: self.estimate.n,
+            need,
+            sufficient: self.estimate.sufficient,
+            saturated_fraction: self.estimate.saturated_fraction,
+            saturation_warn_fraction: COMMUNICATION_MI_SATURATION_WARN_FRACTION,
+            saturation_warning: self.estimate.saturated_fraction
+                > COMMUNICATION_MI_SATURATION_WARN_FRACTION,
+        }
+    }
+
+    /// Emit the required context-rich info row and any scientific warning rows.
+    ///
+    /// This is deliberately a method on the caller-facing report rather than inside
+    /// [`compute_mi`]: the estimator kernel remains a pure mathematical leaf, while a caller that
+    /// chooses to produce a communication report cannot accidentally omit window or pair context.
+    pub fn emit_diagnostics(&self) {
+        let diagnostics = self.diagnostics();
+        diag_info!(
+            target: "scriptbots::comms::mi",
+            tick_lo = self.window.tick_lo,
+            tick_hi = self.window.tick_hi,
+            pair = self.window.pair.as_str(),
+            estimator = self.estimate.estimator,
+            correction = self.estimate.correction,
+            surrogate_kind = self.estimate.surrogate_kind,
+            n = self.estimate.n,
+            required_n = diagnostics.need,
+            bins = self.estimate.bins,
+            mi_plugin = self.estimate.bits_plugin,
+            mi_corrected = self.estimate.bits_corrected,
+            mi_corrected_unclamped = self.estimate.bits_corrected_unclamped,
+            surrogate_runs = self.estimate.surrogate.r,
+            surrogate_mean = self.estimate.surrogate.mean,
+            surrogate_sd = self.estimate.surrogate.sd,
+            surrogate_q95 = self.estimate.surrogate.q95,
+            p_value = self.estimate.p_value,
+            ci_lo = self.estimate.ci_lo,
+            ci_hi = self.estimate.ci_hi,
+            sufficient = self.estimate.sufficient,
+            saturated_fraction = self.estimate.saturated_fraction,
+            surrogate_seed = self.estimate.surrogate_seed,
+            "communication mutual-information window estimated"
+        );
+        if !diagnostics.sufficient {
+            diag_warn!(
+                target: "scriptbots::comms::mi",
+                tick_lo = self.window.tick_lo,
+                tick_hi = self.window.tick_hi,
+                pair = self.window.pair.as_str(),
+                have = diagnostics.have,
+                need = diagnostics.need,
+                "communication mutual-information window has insufficient samples"
+            );
+        }
+        if diagnostics.saturation_warning {
+            diag_warn!(
+                target: "scriptbots::comms::mi",
+                tick_lo = self.window.tick_lo,
+                tick_hi = self.window.tick_hi,
+                pair = self.window.pair.as_str(),
+                saturated_fraction = diagnostics.saturated_fraction,
+                warn_fraction = diagnostics.saturation_warn_fraction,
+                "communication channel saturation exceeds the reporting threshold"
+            );
+        }
+    }
+}
+
+/// Compute and emit one context-bearing communication mutual-information report.
+///
+/// The surrogate remains an explicit positional argument. Selecting
+/// [`SurrogateKind::PairingPermutation`] here is therefore still a visible assertion that these
+/// aligned samples are i.i.d.; it is never hidden inside [`MiParams`].
+pub fn report_communication_mi_window(
+    window: CommunicationMiWindow,
+    emitter: &[f64],
+    receiver: &[f64],
+    params: &MiParams,
+    surrogate: SurrogateKind,
+) -> Result<CommunicationMiWindowReport, CommunicationMiWindowError> {
+    let estimate = compute_mi_with_surrogate(emitter, receiver, params, surrogate)?;
+    let report = CommunicationMiWindowReport { window, estimate };
+    report.emit_diagnostics();
+    Ok(report)
+}
+
 /// Full Transfer Entropy estimate report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TeEstimate {
@@ -1324,6 +1513,126 @@ mod tests {
             clean.saturated_fraction.abs() < f64::EPSILON,
             "no sample occupies an extreme bin, so saturation is zero, got {}",
             clean.saturated_fraction
+        );
+    }
+
+    /// A channel can be silent because it is genuinely constant or because it is pinned against
+    /// the top of its declared range. Both carry zero information; only the saturation diagnostic
+    /// distinguishes the broken measurement from an honestly quiet channel (bd-r4ja).
+    #[test]
+    fn bd_r4ja_constant_channels_are_zero_without_hiding_top_bin_saturation() {
+        let params = MiParams {
+            bins: 8,
+            surrogate_runs: 8,
+            bootstrap_runs: 10,
+            seed: 0xC0DE,
+        };
+
+        for (label, value, expected_saturation) in [
+            ("interior silent channel", 0.5_f64, 0.0_f64),
+            ("top-bin saturated channel", 1.0_f64, 1.0_f64),
+        ] {
+            let emitter = vec![value; 256];
+            let receiver = vec![value; 256];
+            let estimate = compute_mi(&emitter, &receiver, &params).expect(label);
+
+            assert_eq!(
+                estimate.bits_plugin.to_bits(),
+                0.0_f64.to_bits(),
+                "{label} has no variable symbol and therefore no plug-in information"
+            );
+            assert_eq!(
+                estimate.bits_corrected.to_bits(),
+                0.0_f64.to_bits(),
+                "{label} has no reportable mutual information"
+            );
+            assert_eq!(
+                estimate.bits_corrected_unclamped.to_bits(),
+                0.0_f64.to_bits(),
+                "{label} has no Miller-Madow bias term with one occupied joint cell"
+            );
+            assert_eq!(
+                estimate.saturated_fraction.to_bits(),
+                expected_saturation.to_bits(),
+                "{label} must remain distinguishable through its saturation diagnostic"
+            );
+            assert_eq!(
+                estimate.p_value.to_bits(),
+                1.0_f64.to_bits(),
+                "{label} cannot beat an identical zero-information null"
+            );
+            assert!(
+                [
+                    estimate.surrogate.mean,
+                    estimate.surrogate.sd,
+                    estimate.surrogate.q95,
+                    estimate.ci_lo,
+                    estimate.ci_hi,
+                ]
+                .into_iter()
+                .all(f64::is_finite),
+                "{label} must not leak NaN or infinity through a degenerate histogram"
+            );
+        }
+    }
+
+    /// The logging adapter must derive warnings from report data and retain explicit caller
+    /// context. This pins the distinction between "estimable but underpowered" and "saturated"
+    /// without coupling the mathematical estimator to a simulation or database (bd-r4ja).
+    #[test]
+    fn bd_r4ja_communication_window_reports_sufficiency_and_saturation() {
+        assert_eq!(COMMUNICATION_MI_LOG_TARGET, "scriptbots::comms::mi");
+        assert!(matches!(
+            CommunicationMiWindow::new(9, 9, "band0_sound_to_hearing"),
+            Err(CommunicationMiWindowError::InvalidTickWindow {
+                tick_lo: 9,
+                tick_hi: 9
+            })
+        ));
+        assert!(matches!(
+            CommunicationMiWindow::new(0, 10, "Band 0"),
+            Err(CommunicationMiWindowError::InvalidPair { .. })
+        ));
+
+        let params = MiParams {
+            bins: 8,
+            surrogate_runs: 8,
+            bootstrap_runs: 10,
+            seed: 0x51_6E_A1,
+        };
+        let underpowered = report_communication_mi_window(
+            CommunicationMiWindow::new(10, 20, "band0_sound_to_hearing").expect("valid window"),
+            &[0.5; 10],
+            &[0.5; 10],
+            &params,
+            SurrogateKind::CircularShift,
+        )
+        .expect("ten samples admit a circular null even though they are underpowered");
+        let diagnostics = underpowered.diagnostics();
+        assert_eq!(diagnostics.have, 10);
+        assert_eq!(diagnostics.need, 128);
+        assert!(!diagnostics.sufficient);
+        assert!(!diagnostics.saturation_warning);
+        assert_eq!(
+            underpowered.estimate.surrogate_kind, SURROGATE_IDENTITY,
+            "the report must retain the null that actually ran"
+        );
+
+        let saturated = report_communication_mi_window(
+            CommunicationMiWindow::new(20, 148, "band0_sound_to_hearing").expect("valid window"),
+            &[1.0; 128],
+            &[1.0; 128],
+            &params,
+            SurrogateKind::CircularShift,
+        )
+        .expect("saturated constant channel remains estimable");
+        let diagnostics = saturated.diagnostics();
+        assert!(diagnostics.sufficient);
+        assert!(diagnostics.saturation_warning);
+        assert_eq!(diagnostics.saturated_fraction.to_bits(), 1.0_f64.to_bits());
+        assert_eq!(
+            diagnostics.saturation_warn_fraction.to_bits(),
+            COMMUNICATION_MI_SATURATION_WARN_FRACTION.to_bits()
         );
     }
 
