@@ -21893,12 +21893,17 @@ impl WorldState {
             }
             for i in 0..runtime.eye_direction.len() {
                 let before = runtime.eye_direction[i];
+                // bd-d5w4: only a perturbed angle is renormalized. C++ treats eye direction as a
+                // closed interval and clamps out-of-range values outside the gate, so an exact
+                // `2pi` survives a rejected event; `wrap_unsigned_angle` would rewrite it to 0.
+                // The geometry is equivalent but the genome payload, material hash, gene log, and
+                // heredity attribution are not, so a no-op mutation must be exact inheritance.
                 let after =
                     if Self::mutation_event_accepted(mutation_rng, primary_rate, mutation_scale) {
                         let delta = mutation_rng.random_range(-mutation_scale..mutation_scale);
                         wrap_unsigned_angle(runtime.eye_direction[i] + delta)
                     } else {
-                        wrap_unsigned_angle(runtime.eye_direction[i])
+                        runtime.eye_direction[i]
                     };
                 runtime.eye_direction[i] = after;
                 if (after - before).abs() > 1e-4 {
@@ -30640,6 +30645,67 @@ mod tests {
             expected.checkpoint(),
             "a rejected event must consume its gate draw and no delta draw"
         );
+    }
+
+    #[test]
+    fn bd_d5w4_rejected_eye_direction_mutation_preserves_both_angular_endpoints() {
+        let world = v69t_world();
+        // Zero primary rate still runs the outer mutation-scale pass, which is exactly the
+        // situation in which the old unconditional wrap rewrote a valid 2pi direction to 0.
+        let mut parent = v69t_parent(0.0);
+        parent.eye_direction = [0.0, FULL_TURN, HALF_TURN, 0.25];
+        let mut crossover_rng = SmallRngStream::seed_from_u64(0x5EED_0007);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0x5EED_0008);
+
+        let child = world.build_child_runtime(
+            &parent,
+            None,
+            8,
+            OffspringRngIdentityV1::new(AgentUid(1), None, 0),
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+
+        assert_eq!(
+            child.eye_direction.map(f32::to_bits),
+            parent.eye_direction.map(f32::to_bits),
+            "a rejected event must inherit every eye direction bit-exactly, including both \
+             endpoints of the closed [0, 2pi] interval"
+        );
+        assert!(
+            !child
+                .mutation_log
+                .iter()
+                .any(|entry| entry.starts_with("eye_dir")),
+            "a no-op mutation must not report an eye-direction change; log was {:?}",
+            child.mutation_log
+        );
+    }
+
+    #[test]
+    fn bd_d5w4_accepted_eye_direction_mutation_still_normalizes_the_perturbed_angle() {
+        let world = v69t_world();
+        // rate*5 == 5.0 exceeds every draw from `random_range(0.0..1.0)`, so every gate accepts.
+        let mut parent = v69t_parent(1.0);
+        parent.eye_direction = [FULL_TURN; NUM_EYES];
+        let mut crossover_rng = SmallRngStream::seed_from_u64(0x5EED_0009);
+        let mut mutation_rng = SmallRngStream::seed_from_u64(0x5EED_000A);
+
+        let child = world.build_child_runtime(
+            &parent,
+            None,
+            8,
+            OffspringRngIdentityV1::new(AgentUid(1), None, 0),
+            &mut crossover_rng,
+            &mut mutation_rng,
+        );
+
+        for (eye, direction) in child.eye_direction.iter().enumerate() {
+            assert!(
+                (0.0..FULL_TURN).contains(direction),
+                "eye {eye}: a perturbed angle must be renormalized into [0, 2pi), got {direction}"
+            );
+        }
     }
 
     #[test]
