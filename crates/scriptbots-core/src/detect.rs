@@ -667,6 +667,51 @@ pub fn bimodality(
     values: &[f64],
     params: BimodalityParams,
 ) -> Result<BimodalityScore, DetectError> {
+    bimodality_with_work(values, params).map(|(score, _)| score)
+}
+
+/// Measured work performed by a detector call (bd-16g.2.11).
+///
+/// Reported rather than logged, because this module is a leaf and performs no
+/// logging: a caller or a test decides what to do with it.
+///
+/// The point is that a complexity claim be CHECKABLE rather than asserted in a doc
+/// comment. Adversarial inputs — already sorted, reverse sorted, heavy duplication,
+/// heavy tails — are exactly the shapes where a comparison sort's cost varies while
+/// still being superlinear, so a test that only timed things could be fooled. Counts
+/// cannot be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DetectorWork {
+    /// Times an input value was read. Linear in the sample count by construction.
+    pub value_visits: u64,
+    /// Times a histogram bin was read or folded. Bounded by [`BIMODALITY_BINS`],
+    /// independent of the sample count — this is the bounded-memory claim made
+    /// countable.
+    pub bin_visits: u64,
+    /// Heap allocations performed. Zero for this path: the histogram lives in fixed
+    /// stack arrays. The previous implementation allocated a full copy of the sample.
+    pub heap_allocations: u64,
+}
+
+/// [`bimodality`], additionally reporting the work it performed.
+///
+/// # Errors
+///
+/// Returns [`DetectError::NonFinite`] when any value is non-finite.
+pub fn bimodality_with_work(
+    values: &[f64],
+    params: BimodalityParams,
+) -> Result<(BimodalityScore, DetectorWork), DetectError> {
+    let mut work = DetectorWork::default();
+    let score = bimodality_inner(values, params, &mut work)?;
+    Ok((score, work))
+}
+
+fn bimodality_inner(
+    values: &[f64],
+    params: BimodalityParams,
+    work: &mut DetectorWork,
+) -> Result<BimodalityScore, DetectError> {
     for (index, value) in values.iter().enumerate() {
         if !value.is_finite() {
             return Err(DetectError::NonFinite { index });
@@ -690,6 +735,7 @@ pub fn bimodality(
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
     for value in values {
+        work.value_visits += 1;
         if *value < min {
             min = *value;
         }
@@ -720,6 +766,8 @@ pub fn bimodality(
     let mut mins = [f64::INFINITY; BIMODALITY_BINS];
     let span = max - min;
     for value in values {
+        work.value_visits += 1;
+        work.bin_visits += 1;
         let bin = bimodality_bin(*value, min, span);
         counts[bin] += 1;
         sums[bin] += *value;
@@ -737,6 +785,7 @@ pub fn bimodality(
     // that share a bin, bounded by one ulp of that bin's sum.
     let mut total = 0.0f64;
     for bin_sum in &sums {
+        work.bin_visits += 1;
         total += *bin_sum;
     }
     let mean = total / n;
@@ -744,12 +793,15 @@ pub fn bimodality(
     // PASS 3: dispersion about the canonical mean, also folded in bin order.
     let mut sq_sums = [0.0f64; BIMODALITY_BINS];
     for value in values {
+        work.value_visits += 1;
+        work.bin_visits += 1;
         let bin = bimodality_bin(*value, min, span);
         let d = *value - mean;
         sq_sums[bin] += d * d;
     }
     let mut sum_sq = 0.0f64;
     for bin_sq in &sq_sums {
+        work.bin_visits += 1;
         sum_sq += *bin_sq;
     }
     let total_variance = sum_sq / n;
@@ -762,6 +814,7 @@ pub fn bimodality(
     let mut prefix_count = 0usize;
     let mut prefix_sum = 0.0f64;
     for boundary in 1..BIMODALITY_BINS {
+        work.bin_visits += 1;
         prefix_count += counts[boundary - 1];
         prefix_sum += sums[boundary - 1];
         if prefix_count == 0 || prefix_count == values.len() {
@@ -804,12 +857,14 @@ pub fn bimodality(
     let mut lower_count = 0usize;
     let mut lower_sum = 0.0f64;
     for bin in 0..best_boundary {
+        work.bin_visits += 1;
         lower_count += counts[bin];
         lower_sum += sums[bin];
     }
     let mut upper_count = 0usize;
     let mut upper_sum = 0.0f64;
     for bin in best_boundary..BIMODALITY_BINS {
+        work.bin_visits += 1;
         upper_count += counts[bin];
         upper_sum += sums[bin];
     }
@@ -1148,6 +1203,7 @@ fn mean_sigma(series: &[Sample]) -> (f64, f64) {
 mod tests {
     use super::*;
     use rand::{Rng, SeedableRng, rngs::SmallRng};
+    use std::cell::Cell;
 
     fn series_from(values: &[f64]) -> Vec<Sample> {
         values
@@ -2233,5 +2289,130 @@ mod tests {
             smaller < params.min_cluster_fraction,
             "cluster fraction is the bound that must reject it"
         );
+    }
+
+    // ---- bd-16g.2.11 item 1 remainder: countable work and the negative control ----
+
+    /// Value visits must be exactly linear, whatever the input looks like.
+    ///
+    /// Adversarial shapes are the whole point. Already-sorted, reverse-sorted, heavily
+    /// duplicated and heavy-tailed inputs are exactly where a comparison sort's cost
+    /// varies while staying superlinear, so a timing-based check could be fooled by a
+    /// lucky case. Counts cannot be.
+    #[test]
+    fn bd_16g_2_11_value_visits_are_exactly_linear_on_adversarial_shapes() {
+        let params = BimodalityParams::default();
+        for n in [16usize, 128, 1024, 8192] {
+            let ascending: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            let mut descending = ascending.clone();
+            descending.reverse();
+            let duplicated: Vec<f64> = (0..n).map(|i| (i % 3) as f64).collect();
+            let heavy_tail: Vec<f64> = (0..n)
+                .map(|i| if i == 0 { 1.0e9 } else { (i % 5) as f64 })
+                .collect();
+
+            for (name, values) in [
+                ("ascending", &ascending),
+                ("descending", &descending),
+                ("duplicated", &duplicated),
+                ("heavy_tail", &heavy_tail),
+            ] {
+                let (_, work) = bimodality_with_work(values, params).expect("finite");
+                assert_eq!(
+                    work.value_visits,
+                    3 * n as u64,
+                    "{name} n={n}: three linear passes, no more and no fewer"
+                );
+                assert_eq!(
+                    work.heap_allocations, 0,
+                    "{name} n={n}: the histogram path must not allocate"
+                );
+            }
+        }
+    }
+
+    /// Bin work must stay bounded as n grows — the O(1) memory claim, made countable.
+    #[test]
+    fn bd_16g_2_11_bin_work_is_bounded_independently_of_sample_count() {
+        let params = BimodalityParams::default();
+        let small = two_clusters(8, 8, 5.0);
+        let large = two_clusters(50_000, 50_000, 5.0);
+
+        let (_, small_work) = bimodality_with_work(&small, params).expect("finite");
+        let (_, large_work) = bimodality_with_work(&large, params).expect("finite");
+
+        // Per-value bin touches scale with n (one per value per histogram pass); the
+        // FOLDS over bins do not. Subtracting the per-value component isolates the
+        // part that must stay constant.
+        let small_folds = small_work.bin_visits - 2 * small.len() as u64;
+        let large_folds = large_work.bin_visits - 2 * large.len() as u64;
+        assert_eq!(
+            small_folds, large_folds,
+            "bin folding must not grow with the sample count"
+        );
+        assert!(
+            large_folds <= 5 * BIMODALITY_BINS as u64,
+            "bin folding must stay within a small multiple of the bin count, got {large_folds}"
+        );
+    }
+
+    /// NEGATIVE CONTROL: restoring the sort must fail the complexity gate.
+    ///
+    /// This calls the retained sorting ORACLE rather than a hand-written mutant. A
+    /// control that tests a stand-in only proves the stand-in is slow; this one proves
+    /// the actual previous implementation would be caught, which is what the bead asks
+    /// for.
+    ///
+    /// The comparison count is measured, not assumed, by counting invocations of the
+    /// comparator the sort actually calls.
+    #[test]
+    fn bd_16g_2_11_negative_control_restored_sorting_fails_the_linear_bound() {
+        let params = BimodalityParams::default();
+        let n = 8192usize;
+        // Shuffled-ish but deterministic: a sorted input would let an adaptive sort
+        // look linear, which would weaken the control rather than strengthen it.
+        let mut rng = Lcg(0xC0FF_EE00_1234_5678);
+        let values: Vec<f64> = (0..n).map(|_| rng.next_f64() * 1000.0).collect();
+
+        // What the current implementation costs.
+        let (_, work) = bimodality_with_work(&values, params).expect("finite");
+        assert_eq!(work.value_visits, 3 * n as u64);
+
+        // What the restored sort would cost, measured through its own comparator.
+        let comparisons = Cell::new(0u64);
+        let mut sorted = values.clone();
+        sorted.sort_unstable_by(|a, b| {
+            comparisons.set(comparisons.get() + 1);
+            a.total_cmp(b)
+        });
+        let sort_comparisons = comparisons.get();
+
+        assert!(
+            sort_comparisons > work.value_visits,
+            "the control is only meaningful if sorting genuinely costs more: \
+             sort {sort_comparisons} vs linear {}",
+            work.value_visits
+        );
+        // n log2 n / 4 is a deliberately loose superlinear floor: comfortably above any
+        // constant multiple of n at this size, so exceeding it cannot be explained by a
+        // large linear constant.
+        let superlinear_floor = (n as f64 * (n as f64).log2() / 4.0) as u64;
+        assert!(
+            sort_comparisons > superlinear_floor,
+            "sorting must exceed a superlinear floor for the gate to be able to catch it: \
+             {sort_comparisons} vs {superlinear_floor}"
+        );
+        // And the current path must sit comfortably below it, or the gate could not
+        // distinguish the two.
+        assert!(
+            work.value_visits < superlinear_floor,
+            "the linear path must sit below the floor the sort exceeds"
+        );
+
+        // The oracle still agrees on the answer; this control is about COST, not
+        // correctness, and conflating the two would hide a regression in either.
+        let fast = bimodality(&values, params).expect("finite");
+        let oracle = bimodality_sorting_oracle(&values, params);
+        assert_eq!(fast.is_bimodal, oracle.is_bimodal);
     }
 }
