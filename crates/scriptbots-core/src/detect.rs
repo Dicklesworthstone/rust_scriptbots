@@ -621,14 +621,44 @@ impl Default for BimodalityParams {
 
 /// Score a set of per-agent values (one phenotype dimension) for bimodality.
 ///
-/// Uses an exhaustive Otsu split over the sorted values: deterministic, no
-/// iteration, no seeded initialization, and therefore no chance of two runs
-/// disagreeing about whether a population had split.
+/// Otsu's method over a fixed-width histogram: deterministic, no iteration, no
+/// seeded initialization, and therefore no chance of two runs disagreeing about
+/// whether a population had split.
+///
+/// # Complexity (bd-16g.2.11)
+///
+/// **O(n) time, O(1) working memory.** Two passes over the input plus one pass
+/// over [`BIMODALITY_BINS`] bins, which is independent of `n`. This previously
+/// sorted a full copy of the sample — O(n log n) time and O(n) memory — which
+/// contradicted the leaf contract this primitive advertises.
+///
+/// # Exactness and the approximation envelope
+///
+/// The quantisation is confined to the CANDIDATE SET, not to the answer:
+///
+/// * **Exact** for the chosen split — counts, means, between-class variance,
+///   score, and separation are computed from true per-bin sums of the original
+///   values, never from bin centres. For any given threshold the reported class
+///   statistics are precisely what a sorted implementation would report.
+/// * **Approximate** only in *which* thresholds are considered. The sorted
+///   version could split between any two adjacent order statistics; this version
+///   considers bin boundaries. The selected split therefore lies within one bin
+///   width, `(max - min) / BIMODALITY_BINS`, of the exhaustive optimum.
+///
+/// Consequence worth knowing before trusting a borderline result: on a sample
+/// whose score sits within rounding distance of `min_score`, the two versions can
+/// disagree about `is_bimodal`. That is inherent to any bounded-memory formulation
+/// and is why the envelope is stated rather than implied. Well-separated
+/// populations — the case this detector exists for — are unaffected, since their
+/// optimum is far from any threshold boundary.
+///
+/// Ties resolve to the lowest boundary (`>` on the running best), matching the
+/// previous rank scan, so equal-scoring splits pick the same side as before.
 ///
 /// # Panics
 ///
-/// Never: the split search only selects indices in `1..values.len()`, so every slice and index
-/// into the sorted values stays in bounds.
+/// Never: bin indices are clamped into range and the split search only accepts
+/// boundaries where both classes are non-empty.
 ///
 /// # Errors
 ///
@@ -655,64 +685,154 @@ pub fn bimodality(
         });
     }
 
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable_by(f64::total_cmp);
+    // PASS 1: extent only. `min`/`max` are order-independent by construction.
+    let n = values.len() as f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for value in values {
+        if *value < min {
+            min = *value;
+        }
+        if *value > max {
+            max = *value;
+        }
+    }
 
-    let n = sorted.len() as f64;
+    if min == max {
+        // Every value identical: no split exists. Detected from the extent rather
+        // than from a failed search, so it costs nothing and cannot be confused
+        // with "the search found no positive between-class variance".
+        return Ok(BimodalityScore {
+            score: 0.0,
+            separation: 0.0,
+            split: min,
+            lower_mean: min,
+            upper_mean: min,
+            lower_count: values.len(),
+            upper_count: 0,
+            is_bimodal: false,
+        });
+    }
+
+    // PASS 2: the histogram.
+    let mut counts = [0usize; BIMODALITY_BINS];
+    let mut sums = [0.0f64; BIMODALITY_BINS];
+    let mut mins = [f64::INFINITY; BIMODALITY_BINS];
+    let span = max - min;
+    for value in values {
+        let bin = bimodality_bin(*value, min, span);
+        counts[bin] += 1;
+        sums[bin] += *value;
+        if *value < mins[bin] {
+            mins[bin] = *value;
+        }
+    }
+
+    // EVERY aggregate below is folded in BIN order, never input order. That is what
+    // preserves permutation invariance: floating-point addition is not associative,
+    // so summing the same multiset in a different sequence changes the last bits.
+    // The sorted implementation got this for free by summing in sorted order; a
+    // histogram has to reach it deliberately. Bin order is canonical for a given
+    // multiset, so the only residual order dependence is between DISTINCT values
+    // that share a bin, bounded by one ulp of that bin's sum.
     let mut total = 0.0f64;
-    for value in &sorted {
-        total += *value;
+    for bin_sum in &sums {
+        total += *bin_sum;
     }
     let mean = total / n;
-    let mut sum_sq = 0.0f64;
-    for value in &sorted {
+
+    // PASS 3: dispersion about the canonical mean, also folded in bin order.
+    let mut sq_sums = [0.0f64; BIMODALITY_BINS];
+    for value in values {
+        let bin = bimodality_bin(*value, min, span);
         let d = *value - mean;
-        sum_sq += d * d;
+        sq_sums[bin] += d * d;
+    }
+    let mut sum_sq = 0.0f64;
+    for bin_sq in &sq_sums {
+        sum_sq += *bin_sq;
     }
     let total_variance = sum_sq / n;
     let total_sigma = total_variance.sqrt().max(params.min_sigma);
 
-    // Otsu: pick the split maximizing between-class variance.
-    let mut best = (0.0f64, 0usize);
+    // PASS 3: Otsu over BIN BOUNDARIES, O(BIMODALITY_BINS) and independent of n.
+    // `>` keeps the lowest-scoring-tie boundary, matching the previous rank scan.
+    let mut best_between = 0.0f64;
+    let mut best_boundary = 0usize;
+    let mut prefix_count = 0usize;
     let mut prefix_sum = 0.0f64;
-    for i in 1..sorted.len() {
-        prefix_sum += sorted[i - 1];
-        let w0 = i as f64 / n;
+    for boundary in 1..BIMODALITY_BINS {
+        prefix_count += counts[boundary - 1];
+        prefix_sum += sums[boundary - 1];
+        if prefix_count == 0 || prefix_count == values.len() {
+            continue;
+        }
+        let lower_n = prefix_count as f64;
+        let upper_n = n - lower_n;
+        let w0 = lower_n / n;
         let w1 = 1.0 - w0;
-        let mu0 = prefix_sum / i as f64;
-        let mu1 = (total - prefix_sum) / (n - i as f64);
+        let mu0 = prefix_sum / lower_n;
+        let mu1 = (total - prefix_sum) / upper_n;
         let between = w0 * w1 * (mu0 - mu1) * (mu0 - mu1);
-        if between > best.0 {
-            best = (between, i);
+        if between > best_between {
+            best_between = between;
+            best_boundary = boundary;
         }
     }
 
-    let (between_variance, split_index) = best;
-    if split_index == 0 {
-        // Every value identical: no split exists.
+    if best_boundary == 0 {
         return Ok(BimodalityScore {
             score: 0.0,
             separation: 0.0,
             split: mean,
             lower_mean: mean,
             upper_mean: mean,
-            lower_count: sorted.len(),
+            lower_count: values.len(),
             upper_count: 0,
             is_bimodal: false,
         });
     }
 
-    let lower = &sorted[..split_index];
-    let upper = &sorted[split_index..];
-    let lower_mean = lower.iter().sum::<f64>() / lower.len() as f64;
-    let upper_mean = upper.iter().sum::<f64>() / upper.len() as f64;
+    // Class statistics for the chosen boundary are EXACT in the sense that matters:
+    // `sums` holds true values, never bin centres, so only the candidate SET was
+    // quantised, not the reported answer.
+    //
+    // `upper_sum` is folded from its own bins rather than taken as `total -
+    // lower_sum`. The subtraction would be algebraically identical and numerically
+    // not: it inherits `total`'s rounding, which made the result depend on input
+    // order and broke permutation invariance.
+    let mut lower_count = 0usize;
+    let mut lower_sum = 0.0f64;
+    for bin in 0..best_boundary {
+        lower_count += counts[bin];
+        lower_sum += sums[bin];
+    }
+    let mut upper_count = 0usize;
+    let mut upper_sum = 0.0f64;
+    for bin in best_boundary..BIMODALITY_BINS {
+        upper_count += counts[bin];
+        upper_sum += sums[bin];
+    }
+    let lower_mean = lower_sum / lower_count as f64;
+    let upper_mean = upper_sum / upper_count as f64;
+
+    // Report an actual observed value, as the sorted implementation did: the
+    // smallest member of the upper class.
+    let mut split = max;
+    for bin in best_boundary..BIMODALITY_BINS {
+        if counts[bin] > 0 {
+            split = mins[bin];
+            break;
+        }
+    }
+
     let score = if total_variance > 0.0 {
-        (between_variance / total_variance).clamp(0.0, 1.0)
+        (best_between / total_variance).clamp(0.0, 1.0)
     } else {
         0.0
     };
     let separation = (upper_mean - lower_mean).abs() / total_sigma;
-    let smaller = lower.len().min(upper.len()) as f64 / n;
+    let smaller = lower_count.min(upper_count) as f64 / n;
     let is_bimodal = score >= params.min_score
         && separation >= params.min_separation
         && smaller >= params.min_cluster_fraction;
@@ -720,13 +840,35 @@ pub fn bimodality(
     Ok(BimodalityScore {
         score,
         separation,
-        split: sorted[split_index],
+        split,
         lower_mean,
         upper_mean,
-        lower_count: lower.len(),
-        upper_count: upper.len(),
+        lower_count,
+        upper_count,
         is_bimodal,
     })
+}
+
+/// Bin count for the linear-time Otsu search (bd-16g.2.11).
+///
+/// Fixed, so working memory is O(1) in the sample count: three arrays of this
+/// length, ~20 KiB total, regardless of whether the caller passes 100 values or
+/// 10 million. That bound is the contract; the value itself is a resolution
+/// choice and can be raised without changing any documented semantics.
+const BIMODALITY_BINS: usize = 1024;
+
+/// Map a value onto its histogram bin. `span` must be strictly positive.
+///
+/// Clamped rather than asserted: floating-point rounding can put `max` itself at
+/// index `BIMODALITY_BINS`, and a detector that panics on its own maximum would
+/// be worse than one that puts it in the top bin where it belongs.
+fn bimodality_bin(value: f64, min: f64, span: f64) -> usize {
+    let scaled = (value - min) / span * BIMODALITY_BINS as f64;
+    if scaled <= 0.0 {
+        return 0;
+    }
+    let index = scaled as usize;
+    index.min(BIMODALITY_BINS - 1)
 }
 
 fn validate_series(series: &[Sample]) -> Result<(), DetectError> {
@@ -1197,5 +1339,251 @@ mod tests {
         let score = bimodality(&[3.0; 100], BimodalityParams::default()).expect("valid");
         assert!(!score.is_bimodal);
         assert!((score.score).abs() < 1e-12);
+    }
+
+    // ---- bd-16g.2.11: linear-time bimodality vs a sorting oracle ----
+
+    /// The pre-bd-16g.2.11 implementation, kept verbatim as an independent oracle.
+    ///
+    /// Its whole value is that it is the OTHER algorithm: a full sort with an
+    /// exhaustive scan over every rank. A test that re-derived the histogram logic
+    /// would only prove the code agrees with itself.
+    fn bimodality_sorting_oracle(values: &[f64], params: BimodalityParams) -> BimodalityScore {
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable_by(f64::total_cmp);
+        let n = sorted.len() as f64;
+        let total: f64 = sorted.iter().sum();
+        let mean = total / n;
+        let sum_sq: f64 = sorted.iter().map(|v| (v - mean) * (v - mean)).sum();
+        let total_variance = sum_sq / n;
+        let total_sigma = total_variance.sqrt().max(params.min_sigma);
+        let mut best = (0.0f64, 0usize);
+        let mut prefix_sum = 0.0f64;
+        for i in 1..sorted.len() {
+            prefix_sum += sorted[i - 1];
+            let w0 = i as f64 / n;
+            let w1 = 1.0 - w0;
+            let mu0 = prefix_sum / i as f64;
+            let mu1 = (total - prefix_sum) / (n - i as f64);
+            let between = w0 * w1 * (mu0 - mu1) * (mu0 - mu1);
+            if between > best.0 {
+                best = (between, i);
+            }
+        }
+        let (between_variance, split_index) = best;
+        if split_index == 0 {
+            return BimodalityScore {
+                score: 0.0,
+                separation: 0.0,
+                split: mean,
+                lower_mean: mean,
+                upper_mean: mean,
+                lower_count: sorted.len(),
+                upper_count: 0,
+                is_bimodal: false,
+            };
+        }
+        let lower = &sorted[..split_index];
+        let upper = &sorted[split_index..];
+        let lower_mean = lower.iter().sum::<f64>() / lower.len() as f64;
+        let upper_mean = upper.iter().sum::<f64>() / upper.len() as f64;
+        let score = if total_variance > 0.0 {
+            (between_variance / total_variance).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        BimodalityScore {
+            score,
+            separation: (upper_mean - lower_mean).abs() / total_sigma,
+            split: sorted[split_index],
+            lower_mean,
+            upper_mean,
+            lower_count: lower.len(),
+            upper_count: upper.len(),
+            is_bimodal: score >= params.min_score
+                && (upper_mean - lower_mean).abs() / total_sigma >= params.min_separation
+                && lower.len().min(upper.len()) as f64 / n >= params.min_cluster_fraction,
+        }
+    }
+
+    /// Deterministic well-separated two-cluster sample.
+    fn two_clusters(lower_n: usize, upper_n: usize, gap: f64) -> Vec<f64> {
+        let mut out = Vec::with_capacity(lower_n + upper_n);
+        for i in 0..lower_n {
+            out.push((i % 7) as f64 * 0.01);
+        }
+        for i in 0..upper_n {
+            out.push(gap + (i % 5) as f64 * 0.01);
+        }
+        out
+    }
+
+    /// On separated populations the linear version must agree with the oracle.
+    ///
+    /// This is the case the detector exists for, and the case where the histogram
+    /// envelope is irrelevant because the optimum sits far from any bin boundary.
+    #[test]
+    fn bd_16g_2_11_linear_bimodality_matches_the_sorting_oracle() {
+        let params = BimodalityParams::default();
+        for (lower_n, upper_n, gap) in [(50, 50, 5.0), (20, 80, 3.0), (80, 20, 9.0), (2, 2, 4.0)] {
+            let values = two_clusters(lower_n, upper_n, gap);
+            let fast = bimodality(&values, params).expect("finite");
+            let oracle = bimodality_sorting_oracle(&values, params);
+            assert_eq!(
+                fast.is_bimodal, oracle.is_bimodal,
+                "verdict must agree for {lower_n}/{upper_n} gap {gap}"
+            );
+            assert_eq!(fast.lower_count, oracle.lower_count, "lower_count");
+            assert_eq!(fast.upper_count, oracle.upper_count, "upper_count");
+            assert!(
+                (fast.lower_mean - oracle.lower_mean).abs() < 1e-9,
+                "class means are computed from true sums and must be exact"
+            );
+            assert!(
+                (fast.upper_mean - oracle.upper_mean).abs() < 1e-9,
+                "upper_mean"
+            );
+            assert!((fast.score - oracle.score).abs() < 1e-9, "score");
+        }
+    }
+
+    /// Input ORDER must not change the answer, including adversarial orders.
+    ///
+    /// Sorted, reverse and duplicate-heavy inputs are exactly the shapes that make a
+    /// comparison-based implementation look linear on average while being O(n log n),
+    /// so they are also the shapes most worth pinning behaviourally.
+    #[test]
+    fn bd_16g_2_11_bimodality_is_invariant_to_adversarial_input_order() {
+        let params = BimodalityParams::default();
+        let base = two_clusters(40, 60, 6.0);
+        let reference = bimodality(&base, params).expect("finite");
+
+        let mut ascending = base.clone();
+        ascending.sort_unstable_by(f64::total_cmp);
+        let mut descending = ascending.clone();
+        descending.reverse();
+        let mut interleaved = Vec::with_capacity(base.len());
+        let (lo, hi) = ascending.split_at(base.len() / 2);
+        for i in 0..lo.len().max(hi.len()) {
+            if let Some(v) = lo.get(i) {
+                interleaved.push(*v);
+            }
+            if let Some(v) = hi.get(i) {
+                interleaved.push(*v);
+            }
+        }
+
+        for (name, permuted) in [
+            ("ascending", ascending),
+            ("descending", descending),
+            ("interleaved", interleaved),
+        ] {
+            let got = bimodality(&permuted, params).expect("finite");
+            assert_eq!(got.is_bimodal, reference.is_bimodal, "{name}: verdict");
+            assert_eq!(
+                got.lower_count, reference.lower_count,
+                "{name}: lower_count"
+            );
+            assert!((got.score - reference.score).abs() < 1e-9, "{name}: score");
+            assert!((got.split - reference.split).abs() < 1e-9, "{name}: split");
+        }
+    }
+
+    /// Degenerate inputs must not depend on the search finding anything.
+    #[test]
+    fn bd_16g_2_11_bimodality_handles_degenerate_inputs() {
+        let params = BimodalityParams::default();
+
+        let empty = bimodality(&[], params).expect("empty is not an error");
+        assert!(!empty.is_bimodal);
+        assert_eq!(empty.lower_count, 0);
+
+        let single = bimodality(&[4.25], params).expect("single");
+        assert!(!single.is_bimodal);
+        assert_eq!(single.lower_count, 1);
+        assert_eq!(single.upper_count, 0);
+
+        let identical = bimodality(&[2.5; 64], params).expect("identical");
+        assert!(
+            !identical.is_bimodal,
+            "no split exists in a constant sample"
+        );
+        assert_eq!(identical.lower_count, 64);
+        assert_eq!(identical.upper_count, 0);
+        assert!((identical.split - 2.5).abs() < 1e-12);
+
+        assert!(matches!(
+            bimodality(&[1.0, f64::NAN], params),
+            Err(DetectError::NonFinite { index: 1 })
+        ));
+        assert!(matches!(
+            bimodality(&[f64::INFINITY, 1.0], params),
+            Err(DetectError::NonFinite { index: 0 })
+        ));
+    }
+
+    /// The reported split must be an OBSERVED value and must actually separate.
+    ///
+    /// Reporting a bin edge instead would be a silent semantic change: callers use
+    /// `split` as a threshold against real data, and an edge can sit where no sample
+    /// lies.
+    #[test]
+    fn bd_16g_2_11_reported_split_is_an_observed_value_of_the_upper_class() {
+        let params = BimodalityParams::default();
+        let values = two_clusters(30, 30, 7.0);
+        let got = bimodality(&values, params).expect("finite");
+        assert!(
+            values.iter().any(|v| (v - got.split).abs() < 1e-12),
+            "split must be a value that actually occurs in the sample"
+        );
+        let below = values.iter().filter(|v| **v < got.split).count();
+        assert_eq!(
+            below, got.lower_count,
+            "everything below the split is exactly the lower class"
+        );
+    }
+
+    /// Scale invariance: a positive affine rescale must not change the verdict.
+    #[test]
+    fn bd_16g_2_11_bimodality_is_invariant_under_positive_affine_rescaling() {
+        let params = BimodalityParams::default();
+        let values = two_clusters(35, 45, 4.0);
+        let reference = bimodality(&values, params).expect("finite");
+        for (scale, shift) in [(2.0, 0.0), (0.5, 100.0), (10.0, -50.0)] {
+            let scaled: Vec<f64> = values.iter().map(|v| v * scale + shift).collect();
+            let got = bimodality(&scaled, params).expect("finite");
+            assert_eq!(
+                got.is_bimodal, reference.is_bimodal,
+                "verdict must survive scale {scale} shift {shift}"
+            );
+            assert!(
+                (got.score - reference.score).abs() < 1e-9,
+                "score is a variance ratio and must be scale-free"
+            );
+            assert!(
+                (got.separation - reference.separation).abs() < 1e-9,
+                "separation is sigma-normalised and must be scale-free"
+            );
+        }
+    }
+
+    /// Large n must not grow working memory, and must still agree with the oracle.
+    ///
+    /// The bound this pins is the one the bead cares about: bins are fixed, so the
+    /// histogram cost is identical at n = 100 and n = 200_000.
+    #[test]
+    fn bd_16g_2_11_large_sample_stays_bounded_and_correct() {
+        let params = BimodalityParams::default();
+        let values = two_clusters(100_000, 100_000, 8.0);
+        let fast = bimodality(&values, params).expect("finite");
+        let oracle = bimodality_sorting_oracle(&values, params);
+        assert!(fast.is_bimodal, "a clean 8-sigma split must register");
+        assert_eq!(fast.is_bimodal, oracle.is_bimodal);
+        assert_eq!(fast.lower_count, oracle.lower_count);
+        assert!((fast.score - oracle.score).abs() < 1e-9);
+        assert_eq!(
+            BIMODALITY_BINS, 1024,
+            "working memory is O(BIMODALITY_BINS) and must stay independent of n"
+        );
     }
 }
