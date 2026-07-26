@@ -20,6 +20,10 @@ pub enum InfoTheoryError {
     InsufficientSamples { have: usize, need: usize },
     #[error("bins count {0} is out of valid range (2..=32)")]
     InvalidBinCount(usize),
+    #[error(
+        "circular-shift surrogate needs at least {need} samples to form a non-degenerate shift, have {samples}"
+    )]
+    SurrogateInfeasible { samples: usize, need: usize },
     #[error("non-finite value encountered in input series")]
     NonFiniteInput,
 }
@@ -175,6 +179,21 @@ impl Default for MiParams {
     }
 }
 
+/// Smallest series length admitting a non-degenerate circular time-shift surrogate (bd-r4ja).
+///
+/// The shift is drawn from `k_min..=k_max` with `k_min = max(n/10, 1)` and `k_max = n - k_min`.
+/// That range is empty until `n > 2`, so below this a circular surrogate cannot be formed at all
+/// and the estimator must refuse rather than fall back to a different null.
+pub const MIN_CIRCULAR_SURROGATE_SAMPLES: usize = 3;
+
+/// Largest bin count the dense estimators will allocate for (bd-r4ja).
+///
+/// Transfer entropy builds a dense `bins^3` joint histogram, so an unvalidated bin count is an
+/// unbounded allocation driven by caller input: `bins = 1024` asks for a billion cells. The
+/// ceiling matches [`compute_mi`]'s existing `2..=32` contract, keeping the worst case at
+/// `32^3 = 32768` cells, and it must be enforced BEFORE the allocation, not after.
+pub const MAX_ESTIMATOR_BINS: usize = 32;
+
 /// Computes discretized bin index for `v` in `[0.0, 1.0]` over `bins`.
 #[must_use]
 pub fn discretize(v: f64, bins: usize) -> usize {
@@ -254,20 +273,19 @@ pub fn compute_mi(
         }
         shifted
     } else {
-        // Fallback for small N: i.i.d shuffle fallback
-        let mut shifted = emitter.to_vec();
-        for _ in 0..r_runs {
-            for i in (1..n).rev() {
-                let j = rng.random_range(0..=i);
-                shifted.swap(i, j);
-            }
-            let (_, surr_corr) = calc_mi_mm(&shifted, receiver, b);
-            surrogates.push(surr_corr);
-            if surr_corr >= corrected {
-                ge_count += 1;
-            }
-        }
-        shifted
+        // bd-r4ja: refuse rather than substitute an i.i.d. shuffle. The two nulls are not
+        // interchangeable. A circular shift preserves each series' autocorrelation and destroys
+        // only the cross-series alignment, so it tests "is this dependence more than the series'
+        // own structure explains". A shuffle destroys autocorrelation as well, making the null
+        // distribution narrower than the data warrants and the resulting p-value
+        // anti-conservative -- it manufactures significance for autocorrelated signals, which is
+        // exactly the population-dynamics case this module exists to measure. Silently swapping
+        // one for the other reports a p-value whose meaning depends on a sample-size branch the
+        // caller never sees.
+        return Err(InfoTheoryError::SurrogateInfeasible {
+            samples: n,
+            need: MIN_CIRCULAR_SURROGATE_SAMPLES,
+        });
     };
     let _ = shifted_emitter;
 
@@ -384,11 +402,20 @@ pub fn compute_te(
         });
     }
 
+    // bd-r4ja: validate the bin count BEFORE anything allocates. `calc_te_mm` builds a dense
+    // `bins^3` histogram, so an unchecked caller-supplied count is an unbounded allocation.
+    // `compute_mi` already enforced this range; transfer entropy did not, despite being the
+    // path that cubes it.
+    if params.bins < 2 || params.bins > MAX_ESTIMATOR_BINS {
+        return Err(InfoTheoryError::InvalidBinCount(params.bins));
+    }
+
     let raw_n = emitter.len();
-    if raw_n < 2 {
+    // A triplet needs two consecutive samples; the surrogate then needs a shiftable series.
+    if raw_n < MIN_CIRCULAR_SURROGATE_SAMPLES + 1 {
         return Err(InfoTheoryError::InsufficientSamples {
             have: raw_n,
-            need: params.bins * params.bins * params.bins * 5,
+            need: MIN_CIRCULAR_SURROGATE_SAMPLES + 1,
         });
     }
 
@@ -439,18 +466,13 @@ pub fn compute_te(
             }
         }
     } else {
-        shifted_e.copy_from_slice(&e_curr);
-        for _ in 0..r_runs {
-            for i in (1..n).rev() {
-                let j = rng.random_range(0..=i);
-                shifted_e.swap(i, j);
-            }
-            let surr_te = calc_te_mm(&r_next, &shifted_e, &r_curr, b);
-            surrogates.push(surr_te);
-            if surr_te >= te_bits {
-                ge_count += 1;
-            }
-        }
+        // bd-r4ja: same refusal as `compute_mi`. Transfer entropy is a statement about temporal
+        // structure, so replacing the circular-shift null with a shuffle here is worse still: it
+        // destroys the very autocorrelation the estimator conditions on.
+        return Err(InfoTheoryError::SurrogateInfeasible {
+            samples: n,
+            need: MIN_CIRCULAR_SURROGATE_SAMPLES,
+        });
     }
 
     let p_value = (1.0 + ge_count as f64) / (r_runs as f64 + 1.0);
@@ -588,6 +610,96 @@ mod tests {
         );
     }
 
+    /// Transfer entropy cubes the bin count into a dense histogram, so the count must be
+    /// rejected before anything allocates (bd-r4ja).
+    #[test]
+    fn bd_r4ja_te_rejects_an_oversized_bin_count_before_allocating() {
+        let series: Vec<f64> = (0..64).map(|i| f64::from(i % 7) / 7.0).collect();
+        let params = MiParams {
+            bins: 1024,
+            surrogate_runs: 2,
+            bootstrap_runs: 2,
+            seed: 7,
+        };
+
+        let error = compute_te(&series, &series, &params)
+            .expect_err("an oversized bin count must be refused, not allocated for");
+
+        assert!(
+            matches!(error, InfoTheoryError::InvalidBinCount(1024)),
+            "expected InvalidBinCount, got {error:?}"
+        );
+    }
+
+    /// A series too short to admit a non-degenerate circular shift must be refused, never
+    /// silently rerouted through an i.i.d. shuffle null (bd-r4ja).
+    #[test]
+    fn bd_r4ja_mi_refuses_when_no_circular_surrogate_exists() {
+        let params = MiParams {
+            bins: 4,
+            surrogate_runs: 4,
+            bootstrap_runs: 4,
+            seed: 11,
+        };
+
+        let error = compute_mi(&[0.1, 0.9], &[0.2, 0.8], &params)
+            .expect_err("two samples admit no circular shift, so there is no null to test against");
+
+        assert!(
+            matches!(
+                error,
+                InfoTheoryError::SurrogateInfeasible {
+                    samples: 2,
+                    need: MIN_CIRCULAR_SURROGATE_SAMPLES,
+                }
+            ),
+            "expected SurrogateInfeasible, got {error:?}"
+        );
+    }
+
+    /// The refusal boundary must be exact: three samples is the shortest series that does admit a
+    /// shift, and it must be accepted rather than swept up by an over-broad guard (bd-r4ja).
+    #[test]
+    fn bd_r4ja_mi_admits_the_shortest_series_that_has_a_circular_surrogate() {
+        let params = MiParams {
+            bins: 4,
+            surrogate_runs: 4,
+            bootstrap_runs: 4,
+            seed: 11,
+        };
+
+        let estimate = compute_mi(&[0.1, 0.5, 0.9], &[0.2, 0.6, 0.8], &params)
+            .expect("three samples admit a shift of 1 or 2 and must be accepted");
+
+        assert!(
+            !estimate.sufficient,
+            "three samples is far below the adequacy floor and must still be reported as \
+             insufficient evidence, even though the surrogate is formable"
+        );
+    }
+
+    /// Transfer entropy needs one more sample than MI: a triplet consumes a lag (bd-r4ja).
+    #[test]
+    fn bd_r4ja_te_refuses_a_series_too_short_for_a_shiftable_surrogate() {
+        let params = MiParams {
+            bins: 4,
+            surrogate_runs: 4,
+            bootstrap_runs: 4,
+            seed: 11,
+        };
+
+        let error = compute_te(&[0.1, 0.5, 0.9], &[0.2, 0.6, 0.8], &params)
+            .expect_err("three samples yield only two triplets, which admit no circular shift");
+
+        assert!(
+            matches!(
+                error,
+                InfoTheoryError::InsufficientSamples { have: 3, need: 4 }
+            ),
+            "expected InsufficientSamples{{have:3, need:4}}, got {error:?}"
+        );
+    }
+
     #[test]
     fn test_negative_bias_correction() {
         let n = 200;
@@ -603,16 +715,36 @@ mod tests {
             seed: 99,
         };
 
+        // bd-270k: count how often the estimator's `.max(0.0)` floor is the value being averaged.
+        // calc_mi_mm clamps a negative Miller-Madow result to zero, which is defensible for a
+        // single point estimate (mutual information cannot be negative) but is not neutral under
+        // averaging: every run the correction pushes below zero contributes 0 instead of its
+        // negative value, so the mean is pulled upward by exactly the mass that was truncated.
+        let mut clamped_runs = 0usize;
+
         for _ in 0..runs {
             let e: Vec<f64> = (0..n).map(|_| rng.random_range(0.0..1.0)).collect();
             let r: Vec<f64> = (0..n).map(|_| rng.random_range(0.0..1.0)).collect();
             let est = compute_mi(&e, &r, &params).unwrap();
             uncorrected_sum += est.bits_plugin;
             corrected_sum += est.bits_corrected;
+            if est.bits_corrected == 0.0 {
+                clamped_runs += 1;
+            }
         }
 
         let mean_uncorrected = uncorrected_sum / runs as f64;
         let mean_corrected = corrected_sum / runs as f64;
+
+        // Self-reporting, visible under `--nocapture` (bd-270k). Both means are facts about a
+        // fully seeded fixture, so the only way to observe them used to be tightening a bound
+        // until the assertion printed and then restoring the file byte-for-byte. That is a
+        // destructive way to read a number that the test already holds, and it leaves no record
+        // when the value moves for a legitimate reason -- such as the scientific RNG becoming
+        // project-owned Xoshiro256++ in aaac3fd99, which reseeded every fixture in this module.
+        println!("bd-270k mean_uncorrected={mean_uncorrected:.17}");
+        println!("bd-270k mean_corrected={mean_corrected:.17}");
+        println!("bd-270k clamped_runs={clamped_runs}/{runs}");
 
         assert!(
             mean_uncorrected > 0.05,
