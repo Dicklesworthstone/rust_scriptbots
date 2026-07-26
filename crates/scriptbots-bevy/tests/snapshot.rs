@@ -60,6 +60,36 @@ fn bevy_scene_cpu_surrogate_raster_matches_semantic_golden() {
         "snapshot fixture rendered only {agent_signal_pixels} agent-signal pixels"
     );
 
+    // A golden is only worth blessing if the frame it encodes is legible, and
+    // `capture::rgba8_is_visually_blank` is too weak to establish that: it only
+    // requires a summed per-channel spread of MIN_EVIDENCE_RGB_SPREAD = 8, which
+    // a frame with no readable terrain still clears by a factor of ten.
+    //
+    // This matters because the CPU surrogate paints flat `terrain_kind_base_color`
+    // albedo and nothing else. It models no emissive term, no bloom, no tonemap.
+    // Under BIOLUMINESCENT_DARK_FIELD_V1 -- whose own doc says "Agents and food
+    // carry scene luminance" -- every terrain albedo sits in RGB 5..37, so the
+    // surrogate renders the unlit substrate and calls it the scene. Measured on
+    // the frame this test produces, p5..p95 luminance spread fell from 126.42
+    // when the golden was blessed to 15.22, an 8.3x collapse, while the blank
+    // guard and the >= 1_000 agent-signal count above both still pass.
+    //
+    // Checking it here, before both the regenerate branch and the comparison,
+    // means BEVY_REGEN_GOLDEN cannot rubber-stamp an illegible frame and the
+    // failure names its own cause instead of surfacing as a bare channel delta.
+    // See bd-2z0.14.3.9.
+    let spread = luminance_spread(&produced_img);
+    assert!(
+        spread >= MIN_LEGIBLE_LUMINANCE_SPREAD,
+        "produced frame is not legible enough to bless or compare: p5..p95 luminance \
+         spread {spread:.2} < {MIN_LEGIBLE_LUMINANCE_SPREAD:.2} (the blessed golden carries \
+         126.42). The Bevy CPU surrogate composes raw terrain albedo only; it never \
+         calls the visual::splat_weights + visual::terrain_surface_srgb pair that \
+         scriptbots-render uses, so a dark-field palette leaves it with no lighting to \
+         render. Fix the surrogate's composition rather than re-blessing this golden \
+         (bd-2z0.14.3.9)"
+    );
+
     let regenerate = std::env::var("BEVY_REGEN_GOLDEN")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -112,6 +142,36 @@ fn bevy_scene_cpu_surrogate_raster_matches_semantic_golden() {
         hist_delta <= (width as u64 * height as u64) / 5,
         "luminance histogram drift too large: {hist_delta}"
     );
+}
+
+/// Minimum p5..p95 luminance spread a frame must carry to be a usable oracle.
+///
+/// Calibrated against both known frames rather than guessed: the blessed golden
+/// measures 126.42 and the current dark-field render measures 15.22, so 40.0
+/// sits with a 3x margin below the good frame and a 2.6x margin above the bad
+/// one. Percentiles rather than min/max keep a handful of pure-black agent
+/// pixels from standing in for real tonal range.
+const MIN_LEGIBLE_LUMINANCE_SPREAD: f32 = 40.0;
+
+/// Spread between the 5th and 95th luminance percentiles, in 0..255.
+fn luminance_spread(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> f32 {
+    let mut luminances: Vec<f32> = image
+        .pixels()
+        .map(|pixel| {
+            0.2126 * f32::from(pixel[0])
+                + 0.7152 * f32::from(pixel[1])
+                + 0.0722 * f32::from(pixel[2])
+        })
+        .collect();
+    if luminances.is_empty() {
+        return 0.0;
+    }
+    luminances.sort_by(f32::total_cmp);
+    let percentile = |q: f32| -> f32 {
+        let idx = ((luminances.len() - 1) as f32 * q).round() as usize;
+        luminances[idx]
+    };
+    percentile(0.95) - percentile(0.05)
 }
 
 fn luminance_histogram(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> [u64; 16] {
