@@ -2950,6 +2950,164 @@ mod hud_inspector_tests {
     }
 }
 
+/// bd-ikts.1: every computed visual authority must have a live consumer, or an
+/// explicit exemption naming the bead that will wire it.
+///
+/// bd-ikts diagnosed the root cause of the visual layer looking flat: 1,610
+/// lines of renderer-neutral appearance semantics in `scriptbots-core::visual`
+/// that no renderer called. That has since been largely wired by hand, bead by
+/// bead — and then the SAME failure recurred one layer up, where
+/// `EffectiveRenderSettings` is resolved against a real GPU probe, inserted as
+/// a Bevy resource, and read by nobody.
+///
+/// The defect is not any single unwired item. It is that nothing detects the
+/// difference between "wired" and "computed then ignored" — both compile, both
+/// pass tests, and the gap is invisible until somebody greps. This module is
+/// that detector.
+#[cfg(test)]
+mod visual_authority_consumer_guard {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// Authorities that are deliberately not consumed yet, each with the bead
+    /// that owns wiring or retiring it.
+    ///
+    /// An entry here is a TRACKED DECISION, not a silence. Adding one without a
+    /// bead id is the thing this guard exists to prevent.
+    const EXEMPT: &[(&str, &str)] = &[
+        ("bake_biome_atlas", "bd-ikts.2"),
+        ("bake_biome_texture", "bd-ikts.2"),
+        ("cell_phase", "bd-ikts.2"),
+        ("terrain_lushness", "bd-ikts.2"),
+    ];
+
+    fn workspace_root() -> PathBuf {
+        // crates/scriptbots-bevy -> crates -> workspace root
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root above crates/scriptbots-bevy")
+            .to_path_buf()
+    }
+
+    /// Text of this guard module is cut from every file before scanning.
+    ///
+    /// Without this the guard reads its own source and its `EXEMPT` string
+    /// literals count as consumers, so every exemption immediately looks stale.
+    /// That is not hypothetical — it is exactly how this test first failed.
+    /// An allowlist entry naming an authority is not a use of it.
+    const GUARD_MODULE_MARKER: &str = "mod visual_authority_consumer_guard";
+
+    /// Every `.rs` file under `crates/`, excluding `visual.rs` itself and this
+    /// guard module: a definition is not a consumer, and neither is a mention
+    /// inside the detector.
+    ///
+    /// Sweeping the WHOLE workspace matters. Measuring only the two GPU
+    /// frontends makes `resolve_day_night` and `terrain_normal_light_factor`
+    /// look unconsumed when they are in fact used by core and by the terminal
+    /// frontend; a narrower guard would invite deleting live code.
+    fn consumer_sources(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && !path.ends_with("scriptbots-core/src/visual.rs")
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                {
+                    let before_guard = text
+                        .split_once(GUARD_MODULE_MARKER)
+                        .map_or(text.as_str(), |(before, _)| before);
+                    out.push(before_guard.to_string());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&root.join("crates"), &mut out);
+        out
+    }
+
+    fn visual_authorities(root: &Path) -> Vec<String> {
+        let source = std::fs::read_to_string(root.join("crates/scriptbots-core/src/visual.rs"))
+            .expect("visual.rs readable");
+        source
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub fn "))
+            .filter_map(|rest| rest.split(['(', '<']).next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The guard. A new public authority in `visual.rs` fails this test until it
+    /// is either consumed somewhere in the workspace or exempted with a bead id.
+    #[test]
+    fn every_visual_authority_is_consumed_or_explicitly_exempt() {
+        let root = workspace_root();
+        let sources = consumer_sources(&root);
+        assert!(
+            sources.len() > 10,
+            "consumer sweep found only {} files; the walk is broken, not the codebase",
+            sources.len()
+        );
+        let exempt: BTreeMap<&str, &str> = EXEMPT.iter().copied().collect();
+
+        let mut unconsumed = Vec::new();
+        let mut exempt_but_actually_consumed = Vec::new();
+        for name in visual_authorities(&root) {
+            let consumed = sources.iter().any(|text| text.contains(&name));
+            match (consumed, exempt.get(name.as_str())) {
+                (false, None) => unconsumed.push(name),
+                (true, Some(bead)) => exempt_but_actually_consumed.push(format!("{name} ({bead})")),
+                _ => {}
+            }
+        }
+
+        assert!(
+            unconsumed.is_empty(),
+            "these visual authorities are computed but consumed by nobody: {unconsumed:?}. \
+             Either wire a consumer, or add an EXEMPT entry naming the bead that will. \
+             Leaving it unlisted is how bd-ikts happened."
+        );
+        assert!(
+            exempt_but_actually_consumed.is_empty(),
+            "these are exempt but now have real consumers, so the exemption is stale \
+             and should be removed along with its bead: {exempt_but_actually_consumed:?}"
+        );
+    }
+
+    /// An exemption without a bead id is an excuse. Reject it at the guard.
+    #[test]
+    fn every_exemption_names_a_bead() {
+        for (name, bead) in EXEMPT {
+            assert!(
+                bead.starts_with("bd-"),
+                "exemption for {name} must name a bead, got {bead:?}"
+            );
+        }
+    }
+
+    /// The guard must actually bite. A name that exists nowhere stands in for a
+    /// newly added, unwired authority.
+    #[test]
+    fn guard_detects_an_unconsumed_authority() {
+        let sources = consumer_sources(&workspace_root());
+        let invented = "totally_unwired_visual_authority_bd_ikts_1";
+        assert!(
+            !sources.iter().any(|text| text.contains(invented)),
+            "the detection this guard relies on is broken if an invented name appears to be consumed"
+        );
+    }
+}
+
 #[cfg(test)]
 mod hud_brain_overlay_tests {
     use super::*;
