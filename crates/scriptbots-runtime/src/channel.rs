@@ -261,40 +261,28 @@ impl ChannelHostPort {
     }
 
     fn enqueue(&self, message: IngressMessage, started: Instant) -> Result<(), HostAccessError> {
-        if started.elapsed() >= self.submit_deadline {
-            return Err(Self::protocol_violation(format!(
-                "channel host submission exceeded {:?}",
-                self.submit_deadline
-            )));
-        }
-        match self.sender.try_send(message) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(message)) => {
-                // `SyncSender::send_timeout` is unstable; park briefly between retries inside the
-                // configured deadline instead of blocking without bound.
-                const RETRY_PARK: Duration = Duration::from_millis(2);
-                let mut pending = message;
-                loop {
-                    match self.sender.try_send(pending) {
-                        Ok(()) => return Ok(()),
-                        Err(TrySendError::Full(returned)) => {
-                            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
-                            if remaining.is_zero() {
-                                return Err(Self::protocol_violation(format!(
-                                    "channel host did not drain ingress within {:?}",
-                                    self.submit_deadline
-                                )));
-                            }
-                            pending = returned;
-                            std::thread::park_timeout(RETRY_PARK.min(remaining));
-                        }
-                        Err(TrySendError::Disconnected(_)) => {
-                            return Err(HostAccessError::Disconnected);
-                        }
-                    }
+        // `SyncSender::send_timeout` is unstable; park briefly between retries inside the
+        // caller's original deadline instead of blocking without bound or resetting the budget.
+        const RETRY_PARK: Duration = Duration::from_millis(2);
+        let mut pending = message;
+        loop {
+            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(Self::protocol_violation(format!(
+                    "channel host did not drain ingress within {:?}",
+                    self.submit_deadline
+                )));
+            }
+            match self.sender.try_send(pending) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => {
+                    pending = returned;
+                    std::thread::park_timeout(RETRY_PARK.min(remaining));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(HostAccessError::Disconnected);
                 }
             }
-            Err(TrySendError::Disconnected(_)) => Err(HostAccessError::Disconnected),
         }
     }
 }

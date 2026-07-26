@@ -1676,7 +1676,10 @@ mod asupersync_runner {
                 if !self.cancellation_observed && self.should_cancel(cx) {
                     return Poll::Ready(DriverWake::Cancellation);
                 }
-                if self.receiver.is_closed() && self.controller_state == ControllerState::Connected
+                if self.receiver.is_closed()
+                    && !self.receiver.has_messages()
+                    && self.controller_state == ControllerState::Connected
+                    && self.shutdown_started_at.is_none()
                 {
                     return Poll::Ready(DriverWake::Disconnected);
                 }
@@ -2493,7 +2496,7 @@ mod tests {
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     #[test]
-    fn pending_authority_preserves_native_fifo_until_each_claim_resolves() {
+    fn pending_authority_preserves_buffered_fifo_after_controller_drop() {
         let first = envelope(1, HostCommand::Pause);
         let shutdown = envelope(2, HostCommand::Shutdown);
         let authority = Arc::new(ScriptedNativeAuthority {
@@ -2543,6 +2546,7 @@ mod tests {
         control
             .try_submit(shutdown.clone())
             .expect("later shutdown ingress");
+        drop(control);
 
         let outcome = runner
             .run_until_terminal()
