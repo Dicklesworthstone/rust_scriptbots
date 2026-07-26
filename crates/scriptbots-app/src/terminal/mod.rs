@@ -1470,7 +1470,7 @@ impl<'a> TerminalApp<'a> {
             .map(|entry| {
                 let mut spans = Vec::new();
                 spans.push(Span::styled(
-                    format!("#{:<4}", entry.label),
+                    format!("#{:<4}", agent_uid_label(entry.uid)),
                     self.palette.header_style(),
                 ));
                 spans.push(Span::raw(" "));
@@ -1503,7 +1503,7 @@ impl<'a> TerminalApp<'a> {
             .map(|entry| {
                 let mut spans = Vec::new();
                 spans.push(Span::styled(
-                    format!("#{:<4}", entry.label),
+                    format!("#{:<4}", agent_uid_label(entry.uid)),
                     self.palette.header_style(),
                 ));
                 spans.push(Span::raw(" "));
@@ -2221,7 +2221,7 @@ impl<'a> TerminalApp<'a> {
         if let Some((best_idx, _)) = nearest {
             self.focused_agent_cursor = best_idx;
             self.focus_lock = FocusLockMode::Manual;
-            let uid = self.snapshot.agents[best_idx].id;
+            let uid = agent_uid_label(self.snapshot.agents[best_idx].uid);
             self.push_toast(format!("Selected Agent #{uid}"));
             self.refresh_snapshot();
         }
@@ -2262,7 +2262,7 @@ impl<'a> TerminalApp<'a> {
             self.hover_tooltip = Some(MouseHoverTooltip {
                 cell_x: col,
                 cell_y: row,
-                agent_uid: agent.id,
+                agent_uid: agent.uid,
                 energy: agent.energy,
                 health: agent.health,
                 age: agent.age,
@@ -2391,7 +2391,7 @@ impl<'a> TerminalApp<'a> {
             .borders(Borders::ALL)
             .border_style(self.palette.accent_style())
             .title(Span::styled(
-                format!(" Agent #{} ", tooltip.agent_uid),
+                format!(" Agent #{} ", agent_uid_label(tooltip.agent_uid)),
                 self.palette.header_style(),
             ));
 
@@ -2789,13 +2789,13 @@ impl<'a> TerminalApp<'a> {
                         world
                             .agents()
                             .iter_handles()
-                            .find(|h| h.data().as_ffi() == e.label)
+                            .find(|h| h.data().as_ffi() == e.handle)
                     }),
                     FocusLockMode::Oldest => snap.oldest.first().and_then(|e| {
                         world
                             .agents()
                             .iter_handles()
-                            .find(|h| h.data().as_ffi() == e.label)
+                            .find(|h| h.data().as_ffi() == e.handle)
                     }),
                 };
                 if let Some(agent_uid) = agent_id_opt.and_then(|id| world.agent_uid(id)) {
@@ -3379,7 +3379,18 @@ impl DietClass {
 
 #[derive(Clone, Debug)]
 struct AgentViz {
+    /// The generational arena handle, encoded for cheap comparison. This is a
+    /// PHYSICAL slot: it is reused after an agent dies, so it identifies a
+    /// storage location and never an agent across time. Use it to look a live
+    /// agent back up; never show it to a person.
     id: u64,
+    /// The stable scientific `AgentUid` — the identity digests, lineage, replay,
+    /// and persistence all use, and therefore the only one worth displaying.
+    ///
+    /// `None` means the arena held a handle the identity map did not know, which
+    /// core documents as an invariant violation. Surfaced as `#?` rather than
+    /// substituted with a plausible number.
+    uid: Option<u64>,
     position: (f32, f32),
     heading: f32,
     diet: DietClass,
@@ -3394,7 +3405,11 @@ struct AgentViz {
 
 #[derive(Clone, Debug)]
 struct LeaderboardEntry {
-    label: u64,
+    /// Arena handle, kept only so focus-lock can resolve the row back to a live
+    /// agent. Never displayed — see [`AgentViz::id`].
+    handle: u64,
+    /// Stable `AgentUid`; this is what the row shows.
+    uid: Option<u64>,
     diet: DietClass,
     energy: f32,
     health: f32,
@@ -3714,6 +3729,7 @@ impl Snapshot {
 
             agents.push(AgentViz {
                 id: id.data().as_ffi(),
+                uid: world.agent_uid(*id).map(|uid| uid.get()),
                 position: (normalized_x, normalized_y),
                 heading,
                 diet,
@@ -3750,7 +3766,8 @@ impl Snapshot {
             .iter()
             .filter(|a| matches!(a.diet, DietClass::Carnivore))
             .map(|agent| LeaderboardEntry {
-                label: agent.id,
+                handle: agent.id,
+                uid: agent.uid,
                 diet: agent.diet,
                 energy: agent.energy,
                 health: agent.health,
@@ -3771,7 +3788,8 @@ impl Snapshot {
         let mut oldest: Vec<LeaderboardEntry> = agents
             .iter()
             .map(|agent| LeaderboardEntry {
-                label: agent.id,
+                handle: agent.id,
+                uid: agent.uid,
                 diet: agent.diet,
                 energy: agent.energy,
                 health: agent.health,
@@ -4188,7 +4206,11 @@ impl ToastEntry {
 pub struct MouseHoverTooltip {
     pub cell_x: u16,
     pub cell_y: u16,
-    pub agent_uid: u64,
+    /// The hovered agent's stable `AgentUid`, matching what the brain panel
+    /// reports. Before bd-qxrt this field was named `agent_uid` but carried the
+    /// reusable arena handle, so the tooltip and the brain panel showed two
+    /// different numbers for one agent.
+    pub agent_uid: Option<u64>,
     pub energy: f32,
     pub health: f32,
     pub age: u32,
@@ -5448,6 +5470,16 @@ impl CanvasCapability {
     }
 }
 
+/// Render a stable agent identity for display.
+///
+/// A missing uid is shown as `?`, not as a substituted number: core documents an
+/// arena handle without an identity as an invariant violation, and quietly
+/// printing `0` — or the slot handle — would present a wrong identity as a real
+/// one, which is the whole defect this helper exists to prevent (bd-qxrt).
+fn agent_uid_label(uid: Option<u64>) -> String {
+    uid.map_or_else(|| "?".to_string(), |uid| uid.to_string())
+}
+
 /// Lowercased environment variable, empty when unset or non-Unicode.
 fn env_lower(key: &str) -> String {
     std::env::var(key).unwrap_or_default().to_ascii_lowercase()
@@ -5886,6 +5918,7 @@ mod tests {
     fn canvas_test_agent(x: f32, y: f32) -> AgentViz {
         AgentViz {
             id: 1,
+            uid: Some(1),
             position: (x, y),
             heading: 0.0,
             diet: DietClass::Herbivore,
@@ -7169,6 +7202,62 @@ mod tests {
         assert_eq!(snapshot.tick, world.tick().0);
         assert_eq!(snapshot.agents.len(), world.agent_count());
         assert_eq!(snapshot.world_size.0, world.config().world_width);
+    }
+
+    /// bd-qxrt: every number the TUI shows a person must be the STABLE
+    /// `AgentUid`, never the reusable arena handle. Driven against a real world
+    /// so the two identity spaces are genuinely distinct, and asserting on the
+    /// arena's own answer rather than on a literal.
+    #[test]
+    fn displayed_agent_identity_is_the_stable_uid_not_the_arena_handle() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        for _ in 0..3 {
+            world
+                .try_spawn_agent(AgentData::default())
+                .expect("default agent is finite");
+        }
+
+        let snapshot = Snapshot::from_world(&world);
+        let handles: Vec<AgentId> = world.agents().iter_handles().collect();
+        assert_eq!(snapshot.agents.len(), handles.len());
+
+        for (viz, handle) in snapshot.agents.iter().zip(&handles) {
+            let expected = world.agent_uid(*handle).map(|uid| uid.get());
+            assert_eq!(viz.uid, expected, "AgentViz must carry the arena's own uid");
+            assert_eq!(
+                viz.id,
+                handle.data().as_ffi(),
+                "the arena handle stays available for lookups"
+            );
+        }
+
+        // The leaderboard is the surface that both DISPLAYS an identity and
+        // RESOLVES rows back to live agents, so it must keep the two separate.
+        for entry in snapshot.oldest.iter().chain(&snapshot.leaderboard) {
+            let resolved = handles
+                .iter()
+                .find(|handle| handle.data().as_ffi() == entry.handle)
+                .expect("every row must resolve to a live handle");
+            assert_eq!(
+                entry.uid,
+                world.agent_uid(*resolved).map(|uid| uid.get()),
+                "the displayed uid must belong to the agent the row resolves to"
+            );
+        }
+    }
+
+    /// A missing identity must be visible as `?`, never substituted with a
+    /// plausible number: printing `0` would present a wrong identity as a real
+    /// one, which is the defect rather than a fix for it.
+    #[test]
+    fn a_missing_agent_identity_renders_as_a_visible_placeholder() {
+        assert_eq!(agent_uid_label(Some(42)), "42");
+        assert_eq!(agent_uid_label(None), "?");
+        assert_ne!(
+            agent_uid_label(None),
+            "0",
+            "an absent uid must not be reported as agent zero"
+        );
     }
 
     #[test]
