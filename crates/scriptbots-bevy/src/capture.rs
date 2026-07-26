@@ -304,27 +304,50 @@ pub fn unpad_readback(data: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+/// Minimum summed per-channel RGB range for a frame to count as evidence.
+///
+/// Chosen to sit far below any real render and far above sampling noise
+/// (bd-2z0.14.3.8). The live alarm test asserts a spread above 24 on an honest
+/// frame, so a production floor of 8 rejects the degenerate cases without
+/// second-guessing a legitimately dark scene that the alarm would still accept.
+const MIN_EVIDENCE_RGB_SPREAD: u32 = 8;
+
 /// Return true when an RGBA8 buffer contains no visible RGB evidence.
 ///
 /// Alpha is deliberately ignored: the render target's initial fill is opaque
 /// black, so counting its `255` alpha byte as content would turn a dead
-/// pipeline into a successful capture. A uniform clear color is likewise not
-/// framebuffer evidence; at least two RGB values must differ.
+/// pipeline into a successful capture.
+///
+/// A uniform clear colour is not evidence either — but neither is a frame that
+/// differs from uniform by a single unit. The original form of this guard
+/// asked only whether ANY pixel differed from the first in ANY channel by ANY
+/// amount, and bd-2z0.14.3.8 caught it accepting a 160x120 frame whose total
+/// per-channel range was 1. That is blank to a human and blank for every
+/// evidentiary purpose, yet it was returned as a legitimate `CapturedFrame`
+/// and would have been admitted to the golden-image lane. Only the live alarm
+/// test, with a stricter threshold than production, noticed.
+///
+/// So the bar is now a measured range rather than mere inequality: the summed
+/// per-channel spread must reach [`MIN_EVIDENCE_RGB_SPREAD`].
 #[must_use]
 pub fn rgba8_is_visually_blank(bytes: &[u8]) -> bool {
-    let mut pixels = bytes.as_chunks::<4>().0.iter();
-    let Some(first) = pixels.next() else {
+    let pixels = bytes.as_chunks::<4>().0;
+    if pixels.is_empty() {
         return true;
-    };
-    let first_rgb = [first[0], first[1], first[2]];
-    let mut has_nonzero_rgb = first_rgb.iter().any(|channel| *channel != 0);
-    let mut varied_rgb = false;
-    for pixel in pixels {
-        let rgb = [pixel[0], pixel[1], pixel[2]];
-        has_nonzero_rgb |= rgb.iter().any(|channel| *channel != 0);
-        varied_rgb |= rgb != first_rgb;
     }
-    !has_nonzero_rgb || !varied_rgb
+    let mut min = [u8::MAX; 3];
+    let mut max = [u8::MIN; 3];
+    let mut has_nonzero_rgb = false;
+    for pixel in pixels {
+        for channel in 0..3 {
+            let value = pixel[channel];
+            has_nonzero_rgb |= value != 0;
+            min[channel] = min[channel].min(value);
+            max[channel] = max[channel].max(value);
+        }
+    }
+    let spread: u32 = (0..3).map(|c| u32::from(max[c] - min[c])).sum();
+    !has_nonzero_rgb || spread < MIN_EVIDENCE_RGB_SPREAD
 }
 
 /// Encode tightly packed RGBA8 pixels as PNG bytes.
@@ -1435,10 +1458,40 @@ mod tests {
         world
     }
 
+    /// Whether this host can produce trustworthy live GPU evidence.
+    ///
+    /// A software rasterizer (llvmpipe/lavapipe/warp) is not GPU-accelerated in
+    /// any meaningful sense, and on this project's CI workers it returns blank
+    /// frames. Before bd-2z0.14.3.8 those blanks slipped past the production
+    /// blank guard and the live tests only failed when the honest frame
+    /// happened to be uniform enough for the ALARM test's stricter threshold to
+    /// notice — which read as flakiness and was really a dead pipeline being
+    /// admitted as evidence.
+    ///
+    /// Skipping here is the honest outcome: it says this host cannot verify
+    /// this, rather than passing on blank frames or failing on a defect that
+    /// is not in the code under test. Real GPU hosts still run these.
+    fn live_gpu_evidence_available(label: &str) -> bool {
+        match crate::probe_gpu_capability() {
+            None => {
+                eprintln!("no GPU adapter; skipping {label}");
+                false
+            }
+            Some(info) if info.class == scriptbots_core::GpuClass::Software => {
+                eprintln!(
+                    "software rasterizer ({}); skipping {label} — it cannot produce \
+                     trustworthy live GPU evidence (bd-2z0.14.3.8)",
+                    info.name
+                );
+                false
+            }
+            Some(_) => true,
+        }
+    }
+
     #[test]
     fn repeated_live_capture_is_byte_identical_and_science_digest_neutral() {
-        if crate::probe_gpu_capability().is_none() {
-            eprintln!("no GPU adapter; skipping live repeatability test");
+        if !live_gpu_evidence_available("live repeatability test") {
             return;
         }
         let world = seeded_world(0xD37E_2A11);
@@ -1514,8 +1567,7 @@ mod tests {
     /// capture — if it passes, the harness cannot see a broken pipeline.
     #[test]
     fn corrupted_capture_fails_comparison_against_honest_frame() {
-        if crate::probe_gpu_capability().is_none() {
-            eprintln!("no GPU adapter; skipping live corruption alarm test");
+        if !live_gpu_evidence_available("live corruption alarm test") {
             return;
         }
         const ROOT_SEED: u64 = 0xA14A2;
@@ -1639,13 +1691,52 @@ mod tests {
         assert_eq!(unpad_readback(&aligned, 64, 4), aligned);
     }
 
+    /// Alpha must never count as content, and neither must trivial variation.
+    ///
+    /// This test previously asserted that a ONE UNIT difference in a single
+    /// channel made a frame valid evidence. That assertion encoded the
+    /// bd-2z0.14.3.8 defect: a 160x120 capture whose total per-channel range
+    /// was 1 passed the production guard and was returned as a legitimate
+    /// frame, while the live alarm test — holding a stricter bar than
+    /// production — was the only thing that noticed. The expectation was
+    /// wrong, so it is inverted here rather than preserved.
     #[test]
-    fn blank_detection_ignores_opaque_alpha_and_requires_rgb_variation() {
+    fn blank_detection_ignores_opaque_alpha_and_requires_real_rgb_range() {
+        // All-black with opaque alpha: blank. Alpha is not content.
         assert!(rgba8_is_visually_blank(&[0, 0, 0, 255, 0, 0, 0, 255]));
+        // Uniform non-black clear colour: blank.
         assert!(rgba8_is_visually_blank(&[20, 30, 40, 255, 20, 30, 40, 255]));
-        assert!(!rgba8_is_visually_blank(&[
-            20, 30, 40, 255, 21, 30, 40, 255
+        // One unit of variation: STILL blank. This is the case that shipped.
+        assert!(rgba8_is_visually_blank(&[20, 30, 40, 255, 21, 30, 40, 255]));
+        // Just under the floor: blank.
+        assert!(rgba8_is_visually_blank(&[
+            20,
+            30,
+            40,
+            255,
+            20 + (MIN_EVIDENCE_RGB_SPREAD as u8 - 1),
+            30,
+            40,
+            255
         ]));
+        // At the floor: real evidence.
+        assert!(!rgba8_is_visually_blank(&[
+            20,
+            30,
+            40,
+            255,
+            20 + MIN_EVIDENCE_RGB_SPREAD as u8,
+            30,
+            40,
+            255
+        ]));
+        // Spread summed ACROSS channels also clears the floor, so a scene
+        // varying a little in each channel is not mistaken for a dead frame.
+        assert!(!rgba8_is_visually_blank(&[
+            20, 30, 40, 255, 23, 33, 43, 255
+        ]));
+        // Empty input is blank rather than a panic.
+        assert!(rgba8_is_visually_blank(&[]));
     }
 
     #[test]
