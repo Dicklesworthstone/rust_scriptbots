@@ -449,7 +449,14 @@ struct TerminalApp<'a> {
     palette_query: String,
     palette_selected_index: usize,
     map_zoom_level: f32,
+    /// Centre of the visible world window, normalized. Follows the focused agent
+    /// when there is one, so zooming in shows what you selected rather than
+    /// whatever happens to be at the middle of the world.
     map_pan_offset: (f32, f32),
+    /// The map pane's last painted rect, so a mouse position can be turned into
+    /// a canvas fraction. Without it, screen->world has to guess the pane's size
+    /// and origin, which is how the old hover picked agents at random.
+    map_area: Option<Rect>,
     hover_tooltip: Option<MouseHoverTooltip>,
 }
 
@@ -530,7 +537,8 @@ impl<'a> TerminalApp<'a> {
             palette_query: String::new(),
             palette_selected_index: 0,
             map_zoom_level: 1.0,
-            map_pan_offset: (0.0, 0.0),
+            map_pan_offset: (0.5, 0.5),
+            map_area: None,
             hover_tooltip: None,
         };
         app.refresh_snapshot();
@@ -1423,6 +1431,14 @@ impl<'a> TerminalApp<'a> {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        self.map_area = Some(inner);
+        // Follow the selection: a zoomed canvas that stayed centred on the world
+        // while the user selected an agent elsewhere would show them a region
+        // with nothing in it and no way to tell why.
+        if let Some(position) = self.focused_agent_position() {
+            self.map_pan_offset = position;
+        }
+
         if inner.width >= 2 && inner.height >= 2 {
             let needed = inner.width as usize * inner.height as usize;
             if self.map_scratch.len() < needed {
@@ -1433,6 +1449,9 @@ impl<'a> TerminalApp<'a> {
             if self.map_stamp == 0 {
                 self.map_stamp = 1;
             }
+            // Resolved before the canvas borrow so the widget construction below
+            // holds exactly one mutable borrow of `self`.
+            let viewport = CanvasViewport::new(self.map_zoom_level, self.map_pan_offset);
             let use_canvas = self.map_canvas_enabled && self.canvas_capability.use_canvas();
             if use_canvas && self.map_canvas.is_none() {
                 self.map_canvas = Some(SubCellBuffer::new(
@@ -1457,6 +1476,7 @@ impl<'a> TerminalApp<'a> {
                     day_night: self.day_night,
                     capability: self.canvas_capability,
                     density: &mut self.map_density,
+                    viewport,
                 },
                 inner,
             );
@@ -2195,30 +2215,67 @@ impl<'a> TerminalApp<'a> {
         Ok(())
     }
 
+    /// The normalized world position of the agent the brain panel is focused on.
+    fn focused_agent_position(&self) -> Option<(f32, f32)> {
+        let focused = self.snapshot.focused_agent_uid?;
+        self.snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.uid == Some(focused))
+            .map(|agent| agent.position)
+    }
+
+    /// The world point under a terminal cell, or `None` when the cell is outside
+    /// the map pane.
+    ///
+    /// Goes through the same [`CanvasViewport`] the painter uses, so what the
+    /// user clicks is what the user sees. The previous implementation assumed a
+    /// fixed 80x36 terminal, ignored the pane's origin, and then compared a
+    /// world-unit coordinate against `AgentViz::position`, which is normalized —
+    /// two different spaces, so the "nearest" agent was essentially arbitrary.
+    fn world_at_cell(&self, col: u16, row: u16) -> Option<(f32, f32)> {
+        let area = self.map_area?;
+        if area.width == 0
+            || area.height == 0
+            || col < area.x
+            || row < area.y
+            || col >= area.x.saturating_add(area.width)
+            || row >= area.y.saturating_add(area.height)
+        {
+            return None;
+        }
+        let fx = (f32::from(col - area.x) + 0.5) / f32::from(area.width);
+        let fy = (f32::from(row - area.y) + 0.5) / f32::from(area.height);
+        Some(CanvasViewport::new(self.map_zoom_level, self.map_pan_offset).world_at(fx, fy))
+    }
+
+    /// Index of the agent nearest a normalized world point, within a pick radius
+    /// that shrinks with the viewport so zooming in tightens the selection
+    /// instead of grabbing whatever is loosely nearby.
+    fn agent_nearest(&self, world: (f32, f32)) -> Option<usize> {
+        let span = CanvasViewport::new(self.map_zoom_level, self.map_pan_offset).span;
+        let radius = CANVAS_PICK_RADIUS_FRACTION * span;
+        let max_d_sq = radius * radius;
+        let mut nearest: Option<(usize, f32)> = None;
+        for (idx, agent) in self.snapshot.agents.iter().enumerate() {
+            let dx = agent.position.0 - world.0;
+            let dy = agent.position.1 - world.1;
+            let dist_sq = dx.mul_add(dx, dy * dy);
+            if dist_sq <= max_d_sq && nearest.is_none_or(|(_, best)| dist_sq < best) {
+                nearest = Some((idx, dist_sq));
+            }
+        }
+        nearest.map(|(idx, _)| idx)
+    }
+
     pub fn handle_mouse_click(&mut self, col: u16, row: u16) {
         if self.palette_open {
             return;
         }
-        let (world_w, world_h) = self.snapshot.world_size;
-        if world_w == 0 || world_h == 0 {
+        let Some(world) = self.world_at_cell(col, row) else {
             return;
-        }
-        let wx = (col as f32 / 80.0) * world_w as f32;
-        let wy = (row as f32 / 36.0) * world_h as f32;
-
-        let mut nearest: Option<(usize, f32)> = None;
-        for (idx, agent) in self.snapshot.agents.iter().enumerate() {
-            let dx = agent.position.0 - wx;
-            let dy = agent.position.1 - wy;
-            let dist_sq = dx * dx + dy * dy;
-            if dist_sq < 2500.0 {
-                if nearest.map_or(true, |(_, min_d)| dist_sq < min_d) {
-                    nearest = Some((idx, dist_sq));
-                }
-            }
-        }
-
-        if let Some((best_idx, _)) = nearest {
+        };
+        if let Some(best_idx) = self.agent_nearest(world) {
             self.focused_agent_cursor = best_idx;
             self.focus_lock = FocusLockMode::Manual;
             let uid = agent_uid_label(self.snapshot.agents[best_idx].uid);
@@ -2228,35 +2285,26 @@ impl<'a> TerminalApp<'a> {
     }
 
     pub fn zoom_in(&mut self) {
-        self.map_zoom_level = (self.map_zoom_level * 1.2).min(4.0);
+        self.map_zoom_level = (self.map_zoom_level * 1.2).min(CANVAS_MAX_ZOOM);
         self.push_toast(format!("Zoom: {:.1}x", self.map_zoom_level));
     }
 
     pub fn zoom_out(&mut self) {
-        self.map_zoom_level = (self.map_zoom_level / 1.2).max(0.5);
+        // Floors at 1.0, the whole world. There is nothing outside the world to
+        // reveal, so a smaller value could only have been a number the toast
+        // reported and the map ignored.
+        self.map_zoom_level = (self.map_zoom_level / 1.2).max(1.0);
         self.push_toast(format!("Zoom: {:.1}x", self.map_zoom_level));
     }
 
     fn update_hover_tooltip(&mut self, col: u16, row: u16) {
-        let (world_w, world_h) = self.snapshot.world_size;
-        if world_w == 0 || world_h == 0 {
+        let Some(world) = self.world_at_cell(col, row) else {
             self.hover_tooltip = None;
             return;
-        }
-        let wx = (col as f32 / 80.0) * world_w as f32;
-        let wy = (row as f32 / 36.0) * world_h as f32;
-
-        let mut nearest: Option<&AgentViz> = None;
-        let mut min_d = 1600.0f32;
-        for agent in &self.snapshot.agents {
-            let dx = agent.position.0 - wx;
-            let dy = agent.position.1 - wy;
-            let d_sq = dx * dx + dy * dy;
-            if d_sq < min_d {
-                min_d = d_sq;
-                nearest = Some(agent);
-            }
-        }
+        };
+        let nearest = self
+            .agent_nearest(world)
+            .and_then(|idx| self.snapshot.agents.get(idx));
 
         if let Some(agent) = nearest {
             self.hover_tooltip = Some(MouseHoverTooltip {
@@ -5296,6 +5344,8 @@ struct MapWidget<'a> {
     capability: CanvasCapability,
     /// Grow-only per-sub-pixel agent counts, reused across frames.
     density: &'a mut Vec<u16>,
+    /// The world window being shown; the sole screen<->world transform.
+    viewport: CanvasViewport,
 }
 
 /// Terrain alpha, deliberately below [`subcell::ALPHA_SOLID`]: terrain must land
@@ -5336,6 +5386,90 @@ const CANVAS_BOOST_FLARE: f32 = 1.6;
 
 /// Spike length above which the canvas paints an attack cue.
 const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
+
+/// Click/hover pick radius, as a fraction of the visible window.
+///
+/// Scaled by the viewport span rather than fixed in world units, so the radius
+/// is a constant on-screen distance: at 8x zoom the same gesture selects a
+/// proportionally tighter region instead of still grabbing a whole neighbourhood.
+const CANVAS_PICK_RADIUS_FRACTION: f32 = 0.04;
+
+/// Tightest world window the canvas will show, as a fraction of the world.
+///
+/// Bounds `CanvasViewport::span` away from zero so the world->canvas transform
+/// can never divide by a degenerate span.
+const CANVAS_MIN_SPAN: f32 = 1.0 / CANVAS_MAX_ZOOM;
+
+/// Maximum magnification. Past this the sub-pixel grid is coarser than the
+/// world detail it is showing, so more zoom buys nothing.
+const CANVAS_MAX_ZOOM: f32 = 8.0;
+
+/// The square of world the canvas is currently showing, in normalized world
+/// coordinates.
+///
+/// This is the ONE place screen and world coordinates are related. Painting,
+/// hover, and click all go through it, so a zoomed canvas cannot show one thing
+/// and pick another — which is exactly what happened while zoom was a number
+/// nothing read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CanvasViewport {
+    /// Centre of the visible window, normalized.
+    centre: (f32, f32),
+    /// Side of the visible window as a fraction of the world; `1.0` is the
+    /// whole world.
+    span: f32,
+}
+
+impl CanvasViewport {
+    /// Build the window for a zoom level and desired centre.
+    ///
+    /// The centre is clamped so the window never runs off the world: there is
+    /// nothing outside it to show, and letting the window leave would paint a
+    /// band of blank cells that look like dead terrain.
+    fn new(zoom: f32, centre: (f32, f32)) -> Self {
+        let zoom = if zoom.is_finite() {
+            zoom.clamp(1.0, CANVAS_MAX_ZOOM)
+        } else {
+            1.0
+        };
+        let span = (1.0 / zoom).clamp(CANVAS_MIN_SPAN, 1.0);
+        let half = span / 2.0;
+        let clamp_axis = |v: f32| {
+            if v.is_finite() {
+                v.clamp(half, 1.0 - half)
+            } else {
+                0.5
+            }
+        };
+        Self {
+            centre: (clamp_axis(centre.0), clamp_axis(centre.1)),
+            span,
+        }
+    }
+
+    /// The normalized world point under a fractional canvas position, where
+    /// `(0.0, 0.0)` is the canvas's top-left and `(1.0, 1.0)` its bottom-right.
+    fn world_at(&self, fx: f32, fy: f32) -> (f32, f32) {
+        let half = self.span / 2.0;
+        (
+            (self.centre.0 - half + fx * self.span).clamp(0.0, 0.9999),
+            (self.centre.1 - half + fy * self.span).clamp(0.0, 0.9999),
+        )
+    }
+
+    /// The fractional canvas position of a normalized world point, or `None`
+    /// when that point is outside the window.
+    ///
+    /// Returning `None` rather than a clamped edge position is deliberate: an
+    /// off-screen agent must be skipped, not smeared onto the border where it
+    /// would read as a crowd against the frame.
+    fn canvas_at(&self, wx: f32, wy: f32) -> Option<(f32, f32)> {
+        let half = self.span / 2.0;
+        let fx = (wx - (self.centre.0 - half)) / self.span;
+        let fy = (wy - (self.centre.1 - half)) / self.span;
+        ((0.0..1.0).contains(&fx) && (0.0..1.0).contains(&fy)).then_some((fx, fy))
+    }
+}
 
 /// The eight sub-pixel offsets forming the selection ring around a focused
 /// agent's dot.
@@ -5559,9 +5693,12 @@ impl MapWidget<'_> {
         let day_scale = CANVAS_NIGHT_FLOOR + (1.0 - CANVAS_NIGHT_FLOOR) * daylight;
 
         for sy in 0..sub_h {
-            let v = (f32::from(sy) + 0.5) * inv_h;
+            let fy = (f32::from(sy) + 0.5) * inv_h;
             for sx in 0..sub_w {
-                let u = (f32::from(sx) + 0.5) * inv_w;
+                let fx = (f32::from(sx) + 0.5) * inv_w;
+                // Every world sample goes through the viewport, so zoom changes
+                // what is drawn rather than only what a toast claims.
+                let (u, v) = ctx.viewport.world_at(fx, fy);
                 let kind = ctx.terrain.sample(u, v);
                 let base = ctx.palette.terrain_canvas_rgb(kind);
 
@@ -5624,10 +5761,15 @@ impl MapWidget<'_> {
 
         let span_w = f32::from(sub_w);
         let span_h = f32::from(sub_h);
+        // `None` when the agent is outside the visible window. Every agent pass
+        // below skips those rather than clamping them to the border, where a
+        // crowd of off-screen agents would pile up against the frame and read as
+        // a real cluster.
         let agent_dot = |agent: &AgentViz| {
-            let sx = (agent.position.0 * span_w).floor().clamp(0.0, span_w - 1.0) as u16;
-            let sy = (agent.position.1 * span_h).floor().clamp(0.0, span_h - 1.0) as u16;
-            (sx, sy)
+            let (fx, fy) = ctx.viewport.canvas_at(agent.position.0, agent.position.1)?;
+            let sx = (fx * span_w).floor().clamp(0.0, span_w - 1.0) as u16;
+            let sy = (fy * span_h).floor().clamp(0.0, span_h - 1.0) as u16;
+            Some((sx, sy))
         };
 
         // Crowding pass. Without it, `set` is last-write-wins and forty agents
@@ -5641,7 +5783,9 @@ impl MapWidget<'_> {
         }
         density[..occupied].fill(0);
         for agent in &ctx.snapshot.agents {
-            let (sx, sy) = agent_dot(agent);
+            let Some((sx, sy)) = agent_dot(agent) else {
+                continue;
+            };
             let index = usize::from(sy) * usize::from(sub_w) + usize::from(sx);
             if let Some(slot) = density.get_mut(index) {
                 *slot = slot.saturating_add(1);
@@ -5657,7 +5801,9 @@ impl MapWidget<'_> {
         // wins the sub-pixel over any neighbour's whisker. One interleaved pass
         // would let paint order decide, which is how an agent goes missing.
         for agent in &ctx.snapshot.agents {
-            let (sx, sy) = agent_dot(agent);
+            let Some((sx, sy)) = agent_dot(agent) else {
+                continue;
+            };
             let (dx, dy) = HeadingSector::from_angle(agent.heading).whisker_offset();
             let (Ok(wx), Ok(wy)) = (
                 u16::try_from(i32::from(sx) + dx),
@@ -5680,7 +5826,9 @@ impl MapWidget<'_> {
         }
 
         for agent in &ctx.snapshot.agents {
-            let (sx, sy) = agent_dot(agent);
+            let Some((sx, sy)) = agent_dot(agent) else {
+                continue;
+            };
             let ink = ctx.palette.agent_canvas_rgb(agent.diet, agent.energy);
             // Crowding whitens rather than brightens. A multiplier saturates: a
             // bright diet color hits 1.0 at two agents and then reports the same
@@ -5912,6 +6060,25 @@ mod tests {
         day_night: (u32, f32),
         capability: CanvasCapability,
     ) -> Buffer {
+        render_canvas_frame_viewport(
+            snapshot,
+            terrain,
+            cells,
+            day_night,
+            capability,
+            CanvasViewport::new(1.0, (0.5, 0.5)),
+        )
+    }
+
+    /// [`render_canvas_frame_with`] against an explicit viewport.
+    fn render_canvas_frame_viewport(
+        snapshot: &Snapshot,
+        terrain: &TerrainView,
+        cells: (u16, u16),
+        day_night: (u32, f32),
+        capability: CanvasCapability,
+        viewport: CanvasViewport,
+    ) -> Buffer {
         let palette = Palette::test_backend_evidence();
         let mut scratch =
             vec![CellOccupancy::default(); usize::from(cells.0) * usize::from(cells.1)];
@@ -5929,6 +6096,7 @@ mod tests {
             day_night,
             capability,
             density: &mut density,
+            viewport,
         }
         .render(area, &mut buf);
         buf
@@ -6045,6 +6213,7 @@ mod tests {
             day_night: canvas_test_day_night(),
             capability: canvas_test_capability(),
             density: &mut Vec::new(),
+            viewport: CanvasViewport::new(1.0, (0.5, 0.5)),
         }
         .render(area, &mut buf);
 
@@ -7245,6 +7414,168 @@ mod tests {
         assert_eq!(snapshot.tick, world.tick().0);
         assert_eq!(snapshot.agents.len(), world.agent_count());
         assert_eq!(snapshot.world_size.0, world.config().world_width);
+    }
+
+    /// At 1x the window is the whole world, and the centre cannot drift off it
+    /// no matter what centre is requested — an unclamped window would paint a
+    /// band of empty cells that reads as dead terrain.
+    #[test]
+    fn the_viewport_is_the_whole_world_at_1x_and_never_leaves_it() {
+        let full = CanvasViewport::new(1.0, (0.9, 0.1));
+        assert!((full.span - 1.0).abs() < f32::EPSILON);
+        assert_eq!(
+            full.centre,
+            (0.5, 0.5),
+            "a full-world window has only one legal centre"
+        );
+        assert_eq!(full.world_at(0.0, 0.0), (0.0, 0.0));
+        let (bx, by) = full.world_at(0.999, 0.999);
+        assert!(
+            bx > 0.99 && by > 0.99,
+            "the far corner maps to the far world"
+        );
+
+        // Requesting a centre at the very edge slides the window back inside.
+        for zoom in [2.0_f32, 4.0, CANVAS_MAX_ZOOM] {
+            let edge = CanvasViewport::new(zoom, (0.0, 1.0));
+            let half = edge.span / 2.0;
+            assert!(
+                edge.centre.0 >= half - f32::EPSILON && edge.centre.1 <= 1.0 - half + f32::EPSILON,
+                "zoom {zoom} centre {:?} escaped the world",
+                edge.centre
+            );
+            let (x0, y0) = edge.world_at(0.0, 0.0);
+            let (x1, y1) = edge.world_at(0.999, 0.999);
+            assert!(
+                (0.0..=1.0).contains(&x0)
+                    && (0.0..=1.0).contains(&y0)
+                    && (0.0..=1.0).contains(&x1)
+                    && (0.0..=1.0).contains(&y1),
+                "zoom {zoom} window ran off the world"
+            );
+        }
+    }
+
+    /// `world_at` and `canvas_at` must be inverses, or what is painted and what
+    /// is clicked drift apart — the exact failure that made zoom cosmetic.
+    #[test]
+    fn viewport_round_trips_between_canvas_and_world() {
+        for zoom in [1.0_f32, 1.7, 4.0, CANVAS_MAX_ZOOM] {
+            let view = CanvasViewport::new(zoom, (0.42, 0.63));
+            for (fx, fy) in [(0.1_f32, 0.2_f32), (0.5, 0.5), (0.9, 0.75)] {
+                let (wx, wy) = view.world_at(fx, fy);
+                let (rx, ry) = view
+                    .canvas_at(wx, wy)
+                    .expect("a point taken from the window is inside the window");
+                assert!(
+                    (rx - fx).abs() < 1e-3 && (ry - fy).abs() < 1e-3,
+                    "zoom {zoom}: ({fx},{fy}) -> ({wx},{wy}) -> ({rx},{ry})"
+                );
+            }
+        }
+    }
+
+    /// Points outside the window must be reported as outside, not clamped onto
+    /// the border where a crowd of off-screen agents would pile against the
+    /// frame and read as a real cluster.
+    #[test]
+    fn viewport_reports_off_window_points_as_absent() {
+        let view = CanvasViewport::new(4.0, (0.5, 0.5));
+        assert!(view.canvas_at(0.5, 0.5).is_some(), "the centre is visible");
+        assert!(
+            view.canvas_at(0.01, 0.5).is_none(),
+            "far left is off-window"
+        );
+        assert!(
+            view.canvas_at(0.5, 0.99).is_none(),
+            "far bottom is off-window"
+        );
+    }
+
+    /// A non-finite zoom or centre must degrade to the full world rather than
+    /// producing a NaN span that would poison every sample for the frame.
+    #[test]
+    fn viewport_rejects_non_finite_inputs() {
+        for zoom in [f32::NAN, f32::INFINITY, -1.0] {
+            let view = CanvasViewport::new(zoom, (0.5, 0.5));
+            assert!(view.span.is_finite() && view.span > 0.0, "zoom {zoom}");
+            assert!(view.span <= 1.0, "zoom {zoom} span {}", view.span);
+        }
+        let view = CanvasViewport::new(4.0, (f32::NAN, f32::INFINITY));
+        assert!(view.centre.0.is_finite() && view.centre.1.is_finite());
+    }
+
+    /// The defect: zoom updated a counter and a toast while the paint path never
+    /// read it, so the map was identical at 1x and 8x. Driven through the real
+    /// render path, a zoomed frame must differ.
+    #[test]
+    fn zooming_actually_changes_what_the_canvas_paints() {
+        // A terrain with structure, so a smaller window genuinely sees less.
+        let terrain = TerrainView {
+            width: 8,
+            height: 8,
+            kinds: (0..64)
+                .map(|i| {
+                    if (i / 8 + i % 8) % 2 == 0 {
+                        TerrainKind::Rock
+                    } else {
+                        TerrainKind::DeepWater
+                    }
+                })
+                .collect(),
+            elevations: vec![0.5; 64],
+        };
+        let snapshot = Snapshot::default();
+        let frame_at = |zoom: f32| {
+            render_canvas_frame_viewport(
+                &snapshot,
+                &terrain,
+                (8, 8),
+                (0, 0.0),
+                canvas_test_capability(),
+                CanvasViewport::new(zoom, (0.5, 0.5)),
+            )
+        };
+        assert_ne!(
+            frame_at(1.0),
+            frame_at(CANVAS_MAX_ZOOM),
+            "zoom must change what the canvas paints"
+        );
+        assert_eq!(
+            frame_at(4.0),
+            frame_at(4.0),
+            "the same zoom is deterministic"
+        );
+    }
+
+    /// An agent outside the visible window must not be painted at all. Clamping
+    /// it to the edge would invent a border crowd that does not exist.
+    #[test]
+    fn agents_outside_the_window_are_not_painted() {
+        let terrain = canvas_test_terrain();
+        let mut snapshot = Snapshot::default();
+        // Zoomed 4x on the centre, this agent at the far corner is off-window.
+        snapshot.agents = vec![canvas_test_agent(0.02, 0.02)];
+        let zoomed = render_canvas_frame_viewport(
+            &snapshot,
+            &terrain,
+            (4, 4),
+            canvas_test_day_night(),
+            canvas_test_capability(),
+            CanvasViewport::new(4.0, (0.5, 0.5)),
+        );
+        let empty = render_canvas_frame_viewport(
+            &Snapshot::default(),
+            &terrain,
+            (4, 4),
+            canvas_test_day_night(),
+            canvas_test_capability(),
+            CanvasViewport::new(4.0, (0.5, 0.5)),
+        );
+        assert_eq!(
+            zoomed, empty,
+            "an off-window agent must leave the frame untouched"
+        );
     }
 
     /// The ring must follow the AGENT, not the slot. Two agents sit far apart;
