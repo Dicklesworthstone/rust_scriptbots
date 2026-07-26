@@ -318,6 +318,41 @@ static WITNESSES: &[Witness] = &[
         value: || Value::from(0.4),
         ticks: 8,
     },
+    // Third batch (bd-dorx). Terrain-coupled and reproduction knobs. carcass_* is deliberately
+    // absent: distribute_carcass_rewards early-returns unless a victim was `spiked`, and combat is
+    // unreachable in a short default run (bd-pdx5), so those knobs cannot move state here no matter
+    // what they are set to. Witnessing them needs a fixture that produces a real combat death --
+    // which is bd-pdx5's territory, not a value choice.
+    Witness {
+        path: "food_slope_weight",
+        value: || Value::from(2.0),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_elevation_weight",
+        value: || Value::from(2.0),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_moisture_weight",
+        value: || Value::from(2.0),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_capacity_fertility",
+        value: || Value::from(0.7),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_growth_fertility",
+        value: || Value::from(0.7),
+        ticks: 8,
+    },
+    Witness {
+        path: "food_decay_infertility",
+        value: || Value::from(0.7),
+        ticks: 8,
+    },
     Witness {
         path: "aging_tick_interval",
         value: || Value::from(1),
@@ -401,10 +436,10 @@ fn bd_dorx_every_witness_targets_a_scientific_knob() {
 /// lie of exactly the kind bd-dorx exists to stop. A floor makes the debt visible in the test
 /// output every run while making it impossible to quietly delete a witness.
 ///
-/// 21 is the OBSERVED count -- every one of these was seen to move material state on a real run.
+/// 27 is the OBSERVED count -- every one of these was seen to move material state on a real run.
 /// It is not an aspiration. An earlier value of 17 was aspirational and left this gate red,
 /// which is the failure it exists to prevent, so the number now tracks evidence only.
-const WITNESS_COVERAGE_FLOOR: usize = 21;
+const WITNESS_COVERAGE_FLOOR: usize = 27;
 
 /// Report scientific coverage, and hold the line against it regressing.
 ///
