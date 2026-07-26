@@ -24,11 +24,12 @@ use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AccessibilityPalette, AgentId, ControlCommand, ControlDisposition, GpuClass, GpuInfo,
-    IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderQuality, RenderSettings,
-    RenderTonemapMode, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
-    TerrainKind, TickSummary, TierFeatures, TraitModifiers, WorldState, WorldStepDriver,
-    apply_control_command, initial_tier_for, tier_features,
+    AccessibilityPalette, AgentId, BrainInspectionClientId, BrainInspectionLimits,
+    BrainInspectionRequest, BrainInspectionRevision, ControlCommand, ControlDisposition, GpuClass,
+    GpuInfo, IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderQuality, RenderSettings,
+    RenderTonemapMode, SelectedBrainTelemetryOutcome, SelectionMode, SelectionState,
+    SelectionUpdate, SimulationCommand, TerrainKind, TickSummary, TierFeatures, TraitModifiers,
+    WorldState, WorldStepDriver, apply_control_command, initial_tier_for, tier_features,
     visual::{
         self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
     },
@@ -397,12 +398,28 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             run_reported_worker("snapshot worker", &snapshot_failures, &worker_flag, || {
                 let mut last_snapshot: Option<WorldSnapshot> = None;
                 let mut next_revision = 1_u64;
+                // Client identity and revision for brain inspection are owned
+                // here, not in `from_world`, because the revision must be
+                // monotonic per client across snapshots (bd-2z0.14.1.15).
+                let brain_client_id = BrainInspectionClientId::new(BRAIN_OVERLAY_CLIENT_ID);
+                let mut next_brain_revision = 0_u64;
                 while worker_flag.load(Ordering::Acquire) {
                     let mut snapshot = {
                         let guard = world_for_worker.lock().map_err(|error| {
                             anyhow!("world mutex poisoned in Bevy snapshot worker: {error}")
                         })?;
-                        WorldSnapshot::from_world(&guard)
+                        let built = WorldSnapshot::from_world(&guard);
+                        // Captured under the same lock, so the activations and
+                        // the rest of the snapshot describe one world state.
+                        built.map(|mut snap| {
+                            snap.brain = BrainOverlay::capture(
+                                &guard,
+                                &snap.agents,
+                                brain_client_id,
+                                &mut next_brain_revision,
+                            );
+                            snap
+                        })
                     }
                     .ok_or_else(|| {
                         anyhow!(
@@ -1228,6 +1245,7 @@ struct HudElements {
     events: Entity,
     inspector: Entity,
     history: Entity,
+    brain: Entity,
 }
 
 #[derive(Component)]
@@ -1525,6 +1543,11 @@ pub(crate) struct WorldSnapshot {
     /// Decimated population/birth/death series for the HUD sparklines
     /// (bd-2z0.14.1.16). Bounded by [`HUD_SPARKLINE_SAMPLES`] at construction.
     history: HudHistory,
+    /// Bounded brain activations for the selected agent (bd-2z0.14.1.15).
+    ///
+    /// Populated by the snapshot worker, which owns the request revision;
+    /// `from_world` deliberately does not issue inspection requests.
+    brain: BrainOverlay,
     /// Newest-first recent world events for the HUD feed (bd-2z0.14.1.13).
     ///
     /// Bounded by [`HUD_EVENT_FEED_CAPACITY`] at construction, so a long run
@@ -1537,6 +1560,55 @@ pub(crate) struct WorldSnapshot {
 /// The bound is applied while deriving from world history, not after, so the
 /// vector is never transiently large.
 const HUD_EVENT_FEED_CAPACITY: usize = 6;
+
+/// Layers the brain overlay will render, and values shown per layer
+/// (bd-2z0.14.1.15). Core already bounds the payload it hands back; these are
+/// the presentation budgets on top of that.
+const BRAIN_OVERLAY_MAX_LAYERS: usize = 4;
+const BRAIN_OVERLAY_MAX_VALUES: usize = 12;
+
+/// Stable client identity for this frontend's inspection requests, so core can
+/// distinguish Bevy's requests from GPUI's and the TUI's.
+const BRAIN_OVERLAY_CLIENT_ID: u64 = 0x6265_7679; // "bevy"
+
+/// Why the brain overlay is showing what it is showing.
+///
+/// `NotRequested` is the important one: with nothing selected the overlay
+/// issues no inspection request at all, so no brain is inspected. Core's
+/// contract guarantees digest-neutrality only for the no-request case, and an
+/// overlay that polled every frame regardless of selection would quietly turn
+/// a read-only projection into a per-tick side effect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum BrainOverlayStatus {
+    /// No selection, therefore no request was issued.
+    #[default]
+    NotRequested,
+    /// Core returned a payload.
+    Ready,
+    /// Core typed-refused this target.
+    Unavailable,
+    /// The selected agent has no stable UID (already despawned).
+    NoStableIdentity,
+}
+
+/// One rendered activation layer, already clipped to the presentation budget.
+#[derive(Debug, Clone, PartialEq)]
+struct BrainOverlayLayer {
+    name: String,
+    shown: Vec<f32>,
+    total: usize,
+}
+
+/// Bounded projection of the selected agent's brain activations.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct BrainOverlay {
+    status: BrainOverlayStatus,
+    source_tick: u64,
+    layers: Vec<BrainOverlayLayer>,
+    /// Set when core clipped the payload, or when this projection clipped it
+    /// further. An inspector showing a truncated view must say so.
+    truncated: bool,
+}
 
 /// Sample budget for each HUD sparkline (bd-2z0.14.1.16).
 ///
@@ -1587,6 +1659,135 @@ impl HudHistory {
     fn is_empty(&self) -> bool {
         self.agents.is_empty()
     }
+}
+
+impl BrainOverlay {
+    /// Capture the primary selection's activations, or issue no request at all.
+    ///
+    /// Returns early with `NotRequested` when nothing is selected, BEFORE
+    /// touching `inspect_brains`. That ordering is the contract: no request
+    /// means no brain is inspected, which is what keeps the projection
+    /// digest-neutral.
+    fn capture(
+        world: &WorldState,
+        agents: &[AgentVisual],
+        client_id: BrainInspectionClientId,
+        next_revision: &mut u64,
+    ) -> Self {
+        let Some(selected) = agents
+            .iter()
+            .find(|a| matches!(a.selection, SelectionState::Selected))
+        else {
+            return Self::default();
+        };
+        let Some(uid) = world.agent_uid(selected.id) else {
+            return Self {
+                status: BrainOverlayStatus::NoStableIdentity,
+                ..Self::default()
+            };
+        };
+
+        let revision = next_revision.saturating_add(1);
+        *next_revision = revision;
+        let request = BrainInspectionRequest {
+            client_id,
+            revision: BrainInspectionRevision::new(revision),
+            targets: vec![uid],
+            limits: BrainInspectionLimits::default(),
+        };
+        let Ok(response) = world.inspect_brains(&request) else {
+            return Self {
+                status: BrainOverlayStatus::Unavailable,
+                ..Self::default()
+            };
+        };
+
+        let source_tick = response.source_tick.0;
+        match response.telemetry.into_iter().next() {
+            Some(SelectedBrainTelemetryOutcome::Ready { telemetry }) => {
+                let activations = &telemetry.inspection.activations;
+                let mut truncated = activations.truncated;
+                let mut layers = Vec::with_capacity(BRAIN_OVERLAY_MAX_LAYERS);
+                for layer in activations.layers.iter().take(BRAIN_OVERLAY_MAX_LAYERS) {
+                    let total = layer.values.len();
+                    if total > BRAIN_OVERLAY_MAX_VALUES {
+                        truncated = true;
+                    }
+                    layers.push(BrainOverlayLayer {
+                        name: layer.name.clone(),
+                        shown: layer
+                            .values
+                            .iter()
+                            .take(BRAIN_OVERLAY_MAX_VALUES)
+                            .copied()
+                            .collect(),
+                        total,
+                    });
+                }
+                if activations.layers.len() > BRAIN_OVERLAY_MAX_LAYERS {
+                    truncated = true;
+                }
+                Self {
+                    status: BrainOverlayStatus::Ready,
+                    source_tick,
+                    layers,
+                    truncated,
+                }
+            }
+            _ => Self {
+                status: BrainOverlayStatus::Unavailable,
+                source_tick,
+                ..Self::default()
+            },
+        }
+    }
+}
+
+/// Render the brain overlay as a multi-line HUD block (bd-2z0.14.1.15).
+fn format_brain_overlay(overlay: &BrainOverlay) -> String {
+    match overlay.status {
+        BrainOverlayStatus::NotRequested => "Brain: select an agent".to_string(),
+        BrainOverlayStatus::NoStableIdentity => {
+            "Brain: selection has no stable identity".to_string()
+        }
+        BrainOverlayStatus::Unavailable => {
+            format!("Brain: unavailable (tick {})", overlay.source_tick)
+        }
+        BrainOverlayStatus::Ready => {
+            let mut out = format!("Brain @ tick {}", overlay.source_tick);
+            if overlay.truncated {
+                out.push_str(" (clipped)");
+            }
+            for layer in &overlay.layers {
+                out.push_str(&format!(
+                    "\n  {} [{}/{}] {}",
+                    layer.name,
+                    layer.shown.len(),
+                    layer.total,
+                    format_sparkline_signed(&layer.shown)
+                ));
+            }
+            out
+        }
+    }
+}
+
+/// Draw activations, which are signed, on the same block ramp.
+///
+/// Scaled by peak absolute magnitude so a mostly-negative layer still shows
+/// shape rather than collapsing onto the floor.
+fn format_sparkline_signed(values: &[f32]) -> String {
+    let peak = values.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+    if peak <= f32::EPSILON {
+        return SPARK_GLYPHS[0].repeat(values.len());
+    }
+    values
+        .iter()
+        .map(|v| {
+            let level = ((v.abs() / peak) * 7.0).round().clamp(0.0, 7.0) as usize;
+            SPARK_GLYPHS[level.min(SPARK_GLYPHS.len() - 1)]
+        })
+        .collect()
 }
 
 /// Draw one series as a text sparkline, scaled by its own maximum.
@@ -1749,6 +1950,7 @@ impl WorldSnapshot {
             && self.agents == other.agents
             && self.events == other.events
             && self.history == other.history
+            && self.brain == other.brain
     }
 
     fn from_world(world: &WorldState) -> Option<Self> {
@@ -1909,6 +2111,9 @@ impl WorldSnapshot {
             agents,
             events: HudEvent::recent_from_history(world.history()),
             history: HudHistory::from_history(world.history()),
+            // Left empty here on purpose: issuing an inspection request needs a
+            // client-owned monotonic revision, which the snapshot worker holds.
+            brain: BrainOverlay::default(),
         })
     }
 }
@@ -2052,6 +2257,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mut events = Entity::PLACEHOLDER;
     let mut inspector = Entity::PLACEHOLDER;
     let mut history = Entity::PLACEHOLDER;
+    let mut brain = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
         tick = parent
@@ -2141,6 +2347,13 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         history = parent
             .spawn((
                 Text::new("History: collecting…"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        brain = parent
+            .spawn((
+                Text::new("Brain: select an agent"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -2315,6 +2528,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         events,
         inspector,
         history,
+        brain,
     });
 }
 
@@ -2434,6 +2648,7 @@ fn update_hud(
         event_feed,
         inspector_text,
         history_panel,
+        brain_panel,
     ) = {
         let snapshot = state.latest.as_ref().expect("snapshot available");
         let tick = snapshot.tick;
@@ -2456,6 +2671,7 @@ fn update_hud(
         // extraction rather than being held across the text writes below.
         let event_feed = format_event_feed(&snapshot.events);
         let history_panel = format_history_panel(&snapshot.history);
+        let brain_panel = format_brain_overlay(&snapshot.brain);
         let inspector_text = format_inspector(
             primary_agent
                 .map(|agent| InspectorDetail::from_agent(agent, selected_count.saturating_sub(1))),
@@ -2470,6 +2686,7 @@ fn update_hud(
             event_feed,
             inspector_text,
             history_panel,
+            brain_panel,
         )
     };
 
@@ -2589,6 +2806,9 @@ fn update_hud(
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.history) {
             **text = history_panel;
+        }
+        if let Ok(mut text) = texts.get_mut(hud_elements.brain) {
+            **text = brain_panel;
         }
     }
 }
@@ -2727,6 +2947,116 @@ mod hud_inspector_tests {
         for expected in ["smell", "sound", "hearing", "eye", "blood"] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hud_brain_overlay_tests {
+    use super::*;
+    use scriptbots_core::ScriptBotsConfig;
+
+    fn ready_overlay() -> BrainOverlay {
+        BrainOverlay {
+            status: BrainOverlayStatus::Ready,
+            source_tick: 42,
+            layers: vec![
+                BrainOverlayLayer {
+                    name: "input".to_string(),
+                    shown: vec![0.0, 0.5, 1.0],
+                    total: 3,
+                },
+                BrainOverlayLayer {
+                    name: "hidden".to_string(),
+                    shown: vec![-1.0, 0.0],
+                    total: 40,
+                },
+            ],
+            truncated: true,
+        }
+    }
+
+    /// THE contract for this bead: with nothing selected the overlay must
+    /// report NotRequested, which is the state reached by returning BEFORE
+    /// `inspect_brains` is ever called. No request means no brain inspected,
+    /// which is what keeps the projection digest-neutral.
+    #[test]
+    fn no_selection_means_no_request_was_issued() {
+        let overlay = BrainOverlay::default();
+        assert_eq!(overlay.status, BrainOverlayStatus::NotRequested);
+        assert!(overlay.layers.is_empty());
+        assert_eq!(format_brain_overlay(&overlay), "Brain: select an agent");
+    }
+
+    /// A capture attempt must not consume a revision when there is nothing to
+    /// ask about; otherwise an idle session would burn the revision space.
+    #[test]
+    fn revision_is_untouched_when_nothing_is_selected() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let mut revision = 7_u64;
+        let overlay = BrainOverlay::capture(
+            &world,
+            &[],
+            BrainInspectionClientId::new(BRAIN_OVERLAY_CLIENT_ID),
+            &mut revision,
+        );
+        assert_eq!(overlay.status, BrainOverlayStatus::NotRequested);
+        assert_eq!(revision, 7, "no request should consume no revision");
+    }
+
+    /// Clipping must be visible. A truncated view that does not say so lets a
+    /// reader conclude a brain has no deep structure when we simply refused to
+    /// copy it — core documents that same reasoning on `BrainActivations`.
+    #[test]
+    fn clipped_payload_is_announced() {
+        assert!(format_brain_overlay(&ready_overlay()).contains("clipped"));
+        let mut clean = ready_overlay();
+        clean.truncated = false;
+        assert!(!format_brain_overlay(&clean).contains("clipped"));
+    }
+
+    /// Each layer reports shown-vs-total so a reader can tell the panel is a
+    /// window onto a larger layer, not the whole thing.
+    #[test]
+    fn layers_report_shown_and_total_counts() {
+        let panel = format_brain_overlay(&ready_overlay());
+        assert!(panel.contains("input [3/3]"), "panel was {panel}");
+        assert!(panel.contains("hidden [2/40]"), "panel was {panel}");
+        assert!(panel.contains("tick 42"), "panel was {panel}");
+    }
+
+    /// Typed refusals and missing identities are surfaced rather than being
+    /// rendered as an empty brain.
+    #[test]
+    fn refusals_are_surfaced_not_blanked() {
+        let unavailable = BrainOverlay {
+            status: BrainOverlayStatus::Unavailable,
+            source_tick: 9,
+            ..BrainOverlay::default()
+        };
+        assert!(format_brain_overlay(&unavailable).contains("unavailable"));
+        let no_uid = BrainOverlay {
+            status: BrainOverlayStatus::NoStableIdentity,
+            ..BrainOverlay::default()
+        };
+        assert!(format_brain_overlay(&no_uid).contains("no stable identity"));
+    }
+
+    /// Activations are signed; scaling by peak absolute magnitude keeps a
+    /// mostly-negative layer legible instead of collapsing it onto the floor.
+    #[test]
+    fn signed_activations_scale_by_absolute_peak() {
+        let line = format_sparkline_signed(&[0.0, -1.0, 0.5]);
+        assert_eq!(line.chars().count(), 3);
+        assert!(
+            line.starts_with('▁'),
+            "zero should sit at the floor: {line}"
+        );
+        assert!(
+            line.contains('█'),
+            "peak magnitude should reach full height even when negative: {line}"
+        );
+        assert_eq!(format_sparkline_signed(&[0.0, 0.0]), "▁▁");
+        assert_eq!(format_sparkline_signed(&[]), "");
     }
 }
 
@@ -4313,6 +4643,7 @@ mod terrain_tests {
             agents: Vec::new(),
             events: Vec::new(),
             history: HudHistory::default(),
+            brain: BrainOverlay::default(),
         }
     }
 
@@ -4358,6 +4689,7 @@ mod terrain_tests {
             agents: Vec::new(),
             events: Vec::new(),
             history: HudHistory::default(),
+            brain: BrainOverlay::default(),
         }
     }
 
@@ -6387,6 +6719,7 @@ mod tests {
             events: spawn_label(&mut app),
             inspector: spawn_label(&mut app),
             history: spawn_label(&mut app),
+            brain: spawn_label(&mut app),
         };
         app.insert_resource(hud);
 
