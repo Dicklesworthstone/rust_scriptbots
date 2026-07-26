@@ -3499,6 +3499,10 @@ struct TerrainView {
     /// Per-tile normalized elevation, parallel to `kinds`. Only the sub-cell
     /// canvas reads it, to build the hillshade gradient; the flat map ignores it.
     elevations: Vec<f32>,
+    /// Per-tile moisture, parallel to `kinds`.
+    moisture: Vec<f32>,
+    /// Per-tile food-fertility bias, parallel to `kinds`.
+    fertility: Vec<f32>,
 }
 
 impl TerrainView {
@@ -3509,6 +3513,27 @@ impl TerrainView {
             height: terrain.height(),
             kinds: tiles.iter().map(|tile| tile.kind).collect(),
             elevations: tiles.iter().map(|tile| tile.elevation).collect(),
+            moisture: tiles.iter().map(|tile| tile.moisture).collect(),
+            fertility: tiles.iter().map(|tile| tile.fertility_bias).collect(),
+        }
+    }
+
+    /// Shared lushness for a normalized world point: how green this tile should
+    /// read within its biome, from [`visual::terrain_lushness`].
+    ///
+    /// Falls back to the neutral midpoint when the parallel arrays are short, so
+    /// a truncated view tints uniformly instead of striping the map.
+    fn lushness(&self, u: f32, v: f32) -> f32 {
+        if self.moisture.len() != self.kinds.len() || self.fertility.len() != self.kinds.len() {
+            return 0.5;
+        }
+        let Some((x, y)) = self.tile_coords(u, v) else {
+            return 0.5;
+        };
+        let idx = (y as usize).saturating_mul(self.width as usize) + x as usize;
+        match (self.moisture.get(idx), self.fertility.get(idx)) {
+            (Some(&moisture), Some(&fertility)) => visual::terrain_lushness(moisture, fertility),
+            _ => 0.5,
         }
     }
 
@@ -5035,27 +5060,47 @@ impl Palette {
     /// which is the field color; `terrain_fg` is the glyph ink and is far too
     /// bright to tile a whole map with.
     fn terrain_canvas_rgb(&self, kind: TerrainKind) -> [f32; 3] {
-        let idx = match kind {
+        color_channels(self.theme().terrain_bg[Self::terrain_index(kind)])
+    }
+
+    /// Index of a terrain kind into the theme's parallel color bands.
+    ///
+    /// One definition: three copies of this match previously had to be kept in
+    /// step by hand, and a theme band silently shifting under one of them would
+    /// have painted a biome in another biome's color.
+    const fn terrain_index(kind: TerrainKind) -> usize {
+        match kind {
             TerrainKind::DeepWater => 0,
             TerrainKind::ShallowWater => 1,
             TerrainKind::Sand => 2,
             TerrainKind::Grass => 3,
             TerrainKind::Bloom => 4,
             TerrainKind::Rock => 5,
-        };
-        color_channels(self.theme().terrain_bg[idx])
+        }
+    }
+
+    /// Terrain base for the canvas, tinted by how lush the tile is.
+    ///
+    /// Lushness lifts the field color toward the biome's own vivid ink, the same
+    /// base->ink move [`Self::food_canvas_rgb`] uses, so a wet fertile meadow and
+    /// a parched one differ without either leaving its biome's palette. Weighted
+    /// short of the full ink because that ink is glyph-bright and tiling a whole
+    /// map with it would drown the agents it is supposed to sit behind.
+    fn terrain_canvas_rgb_lush(&self, kind: TerrainKind, lushness: f32) -> [f32; 3] {
+        let base = self.terrain_canvas_rgb(kind);
+        let idx = Self::terrain_index(kind);
+        let ink = color_channels(self.theme().terrain_fg[idx]);
+        let t = lushness.clamp(0.0, 1.0) * CANVAS_LUSHNESS_WEIGHT;
+        [
+            (ink[0] - base[0]).mul_add(t, base[0]),
+            (ink[1] - base[1]).mul_add(t, base[1]),
+            (ink[2] - base[2]).mul_add(t, base[2]),
+        ]
     }
 
     /// Food ink, brightened toward the terrain's glyph color as the cell fills.
     fn food_canvas_rgb(&self, kind: TerrainKind, level: f32) -> [f32; 3] {
-        let idx = match kind {
-            TerrainKind::DeepWater => 0,
-            TerrainKind::ShallowWater => 1,
-            TerrainKind::Sand => 2,
-            TerrainKind::Grass => 3,
-            TerrainKind::Bloom => 4,
-            TerrainKind::Rock => 5,
-        };
+        let idx = Self::terrain_index(kind);
         let theme = self.theme();
         let base = color_channels(theme.terrain_bg[idx]);
         let ink = color_channels(theme.terrain_fg[idx]);
@@ -5090,14 +5135,7 @@ impl Palette {
         let rich_color = self
             .level
             .is_some_and(|level| level.has_16m || level.has_256);
-        let idx = match kind {
-            TerrainKind::DeepWater => 0,
-            TerrainKind::ShallowWater => 1,
-            TerrainKind::Sand => 2,
-            TerrainKind::Grass => 3,
-            TerrainKind::Bloom => 4,
-            TerrainKind::Rock => 5,
-        };
+        let idx = Self::terrain_index(kind);
         let theme = self.theme();
         let rich_fg = theme.terrain_fg[idx];
         let rich_bg = theme.terrain_bg[idx];
@@ -5386,6 +5424,12 @@ const CANVAS_BOOST_FLARE: f32 = 1.6;
 
 /// Spike length above which the canvas paints an attack cue.
 const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
+
+/// How far full lushness lifts a terrain tile toward its biome's vivid ink.
+///
+/// Well short of 1.0: that ink is glyph-bright, and tiling a whole map with it
+/// would drown the agent dots the terrain is supposed to sit behind.
+const CANVAS_LUSHNESS_WEIGHT: f32 = 0.35;
 
 /// Minimap edge as a fraction of the canvas.
 const CANVAS_MINIMAP_FRACTION: u16 = 4;
@@ -5784,7 +5828,9 @@ impl MapWidget<'_> {
                 // what is drawn rather than only what a toast claims.
                 let (u, v) = ctx.viewport.world_at(fx, fy);
                 let kind = ctx.terrain.sample(u, v);
-                let base = ctx.palette.terrain_canvas_rgb(kind);
+                let base = ctx
+                    .palette
+                    .terrain_canvas_rgb_lush(kind, ctx.terrain.lushness(u, v));
 
                 // Hillshade: the shared normal-light term keyed on terrain kind, so
                 // rock reads craggy and water flat from the same elevation slope.
@@ -6105,6 +6151,8 @@ mod tests {
             height: 1,
             kinds: vec![TerrainKind::Grass],
             elevations: vec![0.5],
+            moisture: vec![0.5],
+            fertility: vec![0.0],
         }
     }
 
@@ -6474,12 +6522,16 @@ mod tests {
             height: 1,
             kinds: vec![TerrainKind::Rock; 3],
             elevations: vec![0.5, 0.5, 0.5],
+            moisture: vec![0.5; 3],
+            fertility: vec![0.0; 3],
         };
         let sloped = TerrainView {
             width: 3,
             height: 1,
             kinds: vec![TerrainKind::Rock; 3],
             elevations: vec![0.0, 0.5, 1.0],
+            moisture: vec![0.5; 3],
+            fertility: vec![0.0; 3],
         };
         let snapshot = Snapshot::default();
         let sample = |terrain: &TerrainView| {
@@ -6505,6 +6557,8 @@ mod tests {
             height: 1,
             kinds: vec![TerrainKind::DeepWater],
             elevations: vec![0.5],
+            moisture: vec![0.5],
+            fertility: vec![0.0],
         };
         let frame_at = |tick: u64| {
             let mut snapshot = Snapshot::default();
@@ -7502,6 +7556,99 @@ mod tests {
         assert_eq!(snapshot.world_size.0, world.config().world_width);
     }
 
+    /// Moisture and fertility must reach the screen. Two tiles of the SAME biome
+    /// with different lushness have to render differently, or the tinting is
+    /// being computed and discarded — and a parched desert would look identical
+    /// to an oasis.
+    #[test]
+    fn lushness_tints_terrain_within_its_biome() {
+        let make = |moisture: f32, fertility: f32| TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::Grass],
+            elevations: vec![0.5],
+            moisture: vec![moisture],
+            fertility: vec![fertility],
+        };
+        let snapshot = Snapshot::default();
+        let background = |terrain: &TerrainView| {
+            let buf = render_canvas_frame(&snapshot, terrain, (4, 2), canvas_test_day_night());
+            cell_bg(&buf, 1, 1)
+        };
+        let parched = background(&make(0.0, 0.0));
+        let lush = background(&make(1.0, 1.0));
+        assert_ne!(
+            parched, lush,
+            "moisture and fertility must change how a tile reads"
+        );
+        assert!(
+            luminance(lush) > luminance(parched),
+            "a lush tile must read brighter: parched {parched:?}, lush {lush:?}"
+        );
+    }
+
+    /// A short or mismatched moisture array must tint uniformly rather than
+    /// striping the map, so a truncated view degrades quietly instead of drawing
+    /// bands that look like real terrain features.
+    #[test]
+    fn a_truncated_terrain_view_tints_uniformly() {
+        let ragged = TerrainView {
+            width: 2,
+            height: 1,
+            kinds: vec![TerrainKind::Grass, TerrainKind::Grass],
+            elevations: vec![0.5, 0.5],
+            moisture: vec![1.0], // short on purpose
+            fertility: vec![0.0, 0.0],
+        };
+        assert!(
+            (ragged.lushness(0.25, 0.5) - ragged.lushness(0.75, 0.5)).abs() < f32::EPSILON,
+            "a mismatched view must not stripe"
+        );
+    }
+
+    /// Acceptance item: an agent's dot must land on the sub-pixel its world
+    /// position names, within one sub-pixel. This is what makes the 2x4 density
+    /// mean something — a canvas that resolves eight dots per cell but places
+    /// them a cell off has bought resolution and spent it on being wrong.
+    #[test]
+    fn agent_dots_land_on_the_sub_pixel_their_world_position_names() {
+        let terrain = canvas_test_terrain();
+        // 8x4 cells = a 16x16 braille sub-grid at 1x.
+        let (cells_x, cells_y) = (8_u16, 4_u16);
+        let (sub_w, sub_h) = (cells_x * 2, cells_y * 4);
+        for (wx, wy) in [
+            (0.0_f32, 0.0_f32),
+            (0.25, 0.75),
+            (0.5, 0.5),
+            (0.99, 0.99),
+            (0.33, 0.66),
+        ] {
+            let mut snapshot = Snapshot::default();
+            snapshot.agents = vec![canvas_test_agent(wx, wy)];
+            let buf = render_canvas_frame(
+                &snapshot,
+                &terrain,
+                (cells_x, cells_y),
+                canvas_test_day_night(),
+            );
+
+            let expected_sx = (wx * f32::from(sub_w)).floor() as u16;
+            let expected_sy = (wy * f32::from(sub_h)).floor() as u16;
+            let cell = (expected_sx / 2, expected_sy / 4);
+            let code = buf_symbol(&buf, cell)
+                .chars()
+                .next()
+                .map(u32::from)
+                .expect("one glyph");
+            assert!(
+                code & braille_bit(expected_sx, expected_sy) != 0,
+                "world ({wx},{wy}) must light sub-pixel ({expected_sx},{expected_sy}) \
+                 in cell {cell:?}; glyph was {:?}",
+                buf_symbol(&buf, cell)
+            );
+        }
+    }
+
     /// The minimap only earns its screen space while zoomed: at 1x it would be a
     /// second copy of the canvas with a rectangle tracing its own border.
     #[test]
@@ -7703,6 +7850,8 @@ mod tests {
                 })
                 .collect(),
             elevations: vec![0.5; 64],
+            moisture: vec![0.5; 64],
+            fertility: vec![0.0; 64],
         };
         let snapshot = Snapshot::default();
         let frame_at = |zoom: f32| {
