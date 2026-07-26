@@ -1913,21 +1913,22 @@ mod tests {
             bias: 0.0,
         };
         let mut nodes = vec![inert; BRAIN_SIZE];
-        nodes[INPUT_SIZE].weights[0] = f32::MAX;
-        nodes[INPUT_SIZE].targets[0] = INPUT_SIZE;
+        nodes[INPUT_SIZE].damping = 1.1;
         let genome = family
             .genome(&nodes, BrainProvenance::default())
             .expect("finite hostile genome");
         let mut dynamic = vec![NodeState::default(); BRAIN_SIZE];
         dynamic[INPUT_SIZE].output = f32::MAX;
+        dynamic[INPUT_SIZE].target = -f32::MAX;
         let state = family
             .state(&genome, &dynamic)
             .expect("finite hostile state");
         let mut evaluator = family.evaluator(&genome, &state).expect("evaluator");
         let before = evaluator.checkpoint_state().expect("checkpoint before");
 
+        let res = evaluator.evaluate(&[0.0; INPUT_SIZE]);
         assert!(matches!(
-            evaluator.evaluate(&[0.0; INPUT_SIZE]),
+            res,
             Err(BrainProtocolError::InvalidPayload {
                 kind: BrainEnvelopeKind::EvaluatorState,
                 ..
