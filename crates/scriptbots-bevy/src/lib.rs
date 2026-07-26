@@ -27,8 +27,8 @@ use scriptbots_core::{
     AccessibilityPalette, AgentId, ControlCommand, ControlDisposition, GpuClass, GpuInfo,
     IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderQuality, RenderSettings,
     RenderTonemapMode, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
-    TerrainKind, TierFeatures, TraitModifiers, WorldState, WorldStepDriver, apply_control_command,
-    initial_tier_for, tier_features,
+    TerrainKind, TickSummary, TierFeatures, TraitModifiers, WorldState, WorldStepDriver,
+    apply_control_command, initial_tier_for, tier_features,
     visual::{
         self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
     },
@@ -1225,6 +1225,7 @@ struct HudElements {
     world: Entity,
     tonemap: Entity,
     palette: Entity,
+    events: Entity,
 }
 
 #[derive(Component)]
@@ -1519,6 +1520,93 @@ pub(crate) struct WorldSnapshot {
     terrain_color: TerrainColorMap,
     terrain_height: TerrainHeightSnapshot,
     agents: Vec<AgentVisual>,
+    /// Newest-first recent world events for the HUD feed (bd-2z0.14.1.13).
+    ///
+    /// Bounded by [`HUD_EVENT_FEED_CAPACITY`] at construction, so a long run
+    /// or a births/deaths storm cannot grow the snapshot without limit.
+    events: Vec<HudEvent>,
+}
+
+/// How many recent events the HUD feed retains and renders.
+///
+/// The bound is applied while deriving from world history, not after, so the
+/// vector is never transiently large.
+const HUD_EVENT_FEED_CAPACITY: usize = 6;
+
+/// One entry in the HUD event feed.
+///
+/// Counts are per completed tick, taken straight from [`TickSummary`], rather
+/// than one entry per individual birth or death: a busy tick would otherwise
+/// flood the feed and push everything else out within a single frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HudEvent {
+    tick: u64,
+    kind: HudEventKind,
+    count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HudEventKind {
+    Birth,
+    Death,
+    SpikeHit,
+}
+
+impl HudEventKind {
+    /// Glyph shown beside the entry. Kept to widely available symbols so a
+    /// missing font renders a box rather than nothing at all.
+    const fn glyph(self) -> &'static str {
+        match self {
+            Self::Birth => "✚",
+            Self::Death => "✖",
+            Self::SpikeHit => "⚔",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Birth => "born",
+            Self::Death => "died",
+            Self::SpikeHit => "spiked",
+        }
+    }
+}
+
+impl HudEvent {
+    /// Derive the newest-first feed from retained tick summaries.
+    ///
+    /// `history` is oldest-first, so it is walked in reverse. Within one tick
+    /// the order is births, deaths, then spike hits, so a tick that produced
+    /// several kinds always reads the same way.
+    fn recent_from_history<'a>(
+        history: impl DoubleEndedIterator<Item = &'a TickSummary>,
+    ) -> Vec<Self> {
+        let mut events = Vec::with_capacity(HUD_EVENT_FEED_CAPACITY);
+        for summary in history.rev() {
+            let tick = summary.tick.0;
+            let candidates = [
+                (
+                    HudEventKind::Birth,
+                    u32::try_from(summary.births).unwrap_or(u32::MAX),
+                ),
+                (
+                    HudEventKind::Death,
+                    u32::try_from(summary.deaths).unwrap_or(u32::MAX),
+                ),
+                (HudEventKind::SpikeHit, summary.spike_hits),
+            ];
+            for (kind, count) in candidates {
+                if count == 0 {
+                    continue;
+                }
+                events.push(Self { tick, kind, count });
+                if events.len() == HUD_EVENT_FEED_CAPACITY {
+                    return events;
+                }
+            }
+        }
+        events
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -1557,6 +1645,7 @@ impl WorldSnapshot {
             && self.terrain_color == other.terrain_color
             && self.terrain_height == other.terrain_height
             && self.agents == other.agents
+            && self.events == other.events
     }
 
     fn from_world(world: &WorldState) -> Option<Self> {
@@ -1708,6 +1797,7 @@ impl WorldSnapshot {
             },
             terrain_height,
             agents,
+            events: HudEvent::recent_from_history(world.history()),
         })
     }
 }
@@ -1848,6 +1938,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mut world = Entity::PLACEHOLDER;
     let mut tonemap = Entity::PLACEHOLDER;
     let mut palette = Entity::PLACEHOLDER;
+    let mut events = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
         tick = parent
@@ -1916,6 +2007,13 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         palette = parent
             .spawn((
                 Text::new("Palette: Natural • press C to cycle"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        events = parent
+            .spawn((
+                Text::new("Events: --"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -2087,6 +2185,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         world,
         tonemap,
         palette,
+        events,
     });
 }
 
@@ -2196,7 +2295,15 @@ fn update_hud(
         return;
     };
 
-    let (tick, agent_count, world_size, agent_radius, selected_count, primary_selection) = {
+    let (
+        tick,
+        agent_count,
+        world_size,
+        agent_radius,
+        selected_count,
+        primary_selection,
+        event_feed,
+    ) = {
         let snapshot = state.latest.as_ref().expect("snapshot available");
         let tick = snapshot.tick;
         let agent_count = snapshot.agents.len();
@@ -2212,6 +2319,9 @@ fn update_hud(
                 }
             }
         }
+        // Formatted here so the snapshot borrow ends with the rest of the
+        // extraction rather than being held across the text writes below.
+        let event_feed = format_event_feed(&snapshot.events);
         (
             tick,
             agent_count,
@@ -2219,6 +2329,7 @@ fn update_hud(
             agent_radius,
             selected_count,
             primary,
+            event_feed,
         )
     };
 
@@ -2330,7 +2441,121 @@ fn update_hud(
         if let Ok(mut text) = texts.get_mut(hud_elements.palette) {
             **text = format!("{} • press C to cycle", accessibility.palette().label());
         }
+        if let Ok(mut text) = texts.get_mut(hud_elements.events) {
+            **text = event_feed;
+        }
     }
+}
+
+#[cfg(test)]
+mod hud_event_feed_tests {
+    use super::*;
+
+    fn summary(tick: u64, births: usize, deaths: usize, spike_hits: u32) -> TickSummary {
+        TickSummary {
+            tick: scriptbots_core::Tick(tick),
+            agent_count: 10,
+            births,
+            deaths,
+            total_energy: 0.0,
+            average_energy: 0.0,
+            average_health: 0.0,
+            max_age: 0,
+            spike_hits,
+        }
+    }
+
+    /// History is oldest-first; the feed must read newest-first so the most
+    /// recent thing that happened is the first thing shown.
+    #[test]
+    fn feed_is_newest_first() {
+        let history = vec![
+            summary(1, 1, 0, 0),
+            summary(2, 0, 1, 0),
+            summary(3, 0, 0, 2),
+        ];
+        let events = HudEvent::recent_from_history(history.iter());
+        let ticks: Vec<u64> = events.iter().map(|e| e.tick).collect();
+        assert_eq!(ticks, vec![3, 2, 1], "newest tick must come first");
+        assert_eq!(events[0].kind, HudEventKind::SpikeHit);
+        assert_eq!(events[0].count, 2);
+    }
+
+    /// A tick with no births, deaths or spike hits contributes nothing, so
+    /// quiet ticks cannot push real events out of a bounded feed.
+    #[test]
+    fn quiet_ticks_produce_no_entries() {
+        let history = vec![summary(1, 0, 0, 0), summary(2, 0, 0, 0)];
+        assert!(HudEvent::recent_from_history(history.iter()).is_empty());
+    }
+
+    /// Within one tick the order is births, deaths, then spike hits, so a busy
+    /// tick always reads the same way.
+    #[test]
+    fn one_tick_orders_births_deaths_then_spikes() {
+        let history = vec![summary(7, 3, 2, 1)];
+        let events = HudEvent::recent_from_history(history.iter());
+        let kinds: Vec<HudEventKind> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                HudEventKind::Birth,
+                HudEventKind::Death,
+                HudEventKind::SpikeHit
+            ]
+        );
+        assert!(events.iter().all(|e| e.tick == 7));
+    }
+
+    /// The bound is applied while deriving, not after: a births/deaths storm
+    /// over a long history must not build a large vector and then trim it.
+    #[test]
+    fn feed_is_bounded_under_a_storm() {
+        let history: Vec<TickSummary> = (0..500).map(|t| summary(t, 9, 9, 9)).collect();
+        let events = HudEvent::recent_from_history(history.iter());
+        assert_eq!(events.len(), HUD_EVENT_FEED_CAPACITY);
+        assert_eq!(
+            events[0].tick, 499,
+            "the newest tick must survive the bound"
+        );
+    }
+
+    /// An empty feed says so rather than rendering a bare label.
+    #[test]
+    fn empty_feed_renders_a_placeholder() {
+        assert_eq!(format_event_feed(&[]), "Events: none yet");
+    }
+
+    /// Every entry reaches the rendered line with its glyph, count and tick.
+    #[test]
+    fn formatted_line_carries_glyph_count_and_tick() {
+        let events = HudEvent::recent_from_history([summary(12, 2, 1, 0)].iter());
+        let line = format_event_feed(&events);
+        assert!(line.starts_with("Events:"), "line was {line}");
+        assert!(line.contains("✚ 2×born@12"), "line was {line}");
+        assert!(line.contains("✖ 1×died@12"), "line was {line}");
+    }
+}
+
+/// Render the newest-first event feed as one HUD line (bd-2z0.14.1.13).
+///
+/// Entries are already bounded by [`HUD_EVENT_FEED_CAPACITY`] at derivation,
+/// so this only formats; it never truncates a list it was handed.
+fn format_event_feed(events: &[HudEvent]) -> String {
+    if events.is_empty() {
+        return "Events: none yet".to_string();
+    }
+    let mut line = String::from("Events:");
+    for event in events {
+        line.push_str(&format!(
+            " {} {}×{}@{}",
+            event.kind.glyph(),
+            event.count,
+            event.kind.label(),
+            event.tick
+        ));
+    }
+    line
 }
 
 fn handle_selection_input(
@@ -3607,6 +3832,7 @@ mod terrain_tests {
             terrain_color: color,
             terrain_height: height,
             agents: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -3650,6 +3876,7 @@ mod terrain_tests {
             },
             terrain_height: height,
             agents: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -5676,6 +5903,7 @@ mod tests {
             world: spawn_label(&mut app),
             tonemap: spawn_label(&mut app),
             palette: spawn_label(&mut app),
+            events: spawn_label(&mut app),
         };
         app.insert_resource(hud);
 
