@@ -617,6 +617,104 @@ impl Default for ConservationTolerances {
 }
 
 impl ConservationVerdict {
+    /// Total per-tick breaches across every seed, including those past the report cap.
+    ///
+    /// The cap exists so a log does not print 50,000 lines; it must not make the COUNT
+    /// wrong, or a run that breached 50,000 times reads as if it breached 100.
+    #[must_use]
+    pub fn total_breaches(&self) -> u64 {
+        self.seeds
+            .iter()
+            .map(|seed| seed.breaches.len() as u64 + seed.truncated_breaches)
+            .sum()
+    }
+
+    /// The flow category on the largest-magnitude breach anywhere in the run.
+    ///
+    /// "Worst" is by residual magnitude rather than by first occurrence, matching what
+    /// [`ConservationBreach::worst_category`] means per breach. Ties resolve to the
+    /// earlier tick so the answer is deterministic; a verdict line that changes between
+    /// identical runs is worse than no verdict line.
+    #[must_use]
+    pub fn worst_category(&self) -> Option<ResourceFlowKind> {
+        self.seeds
+            .iter()
+            .flat_map(|seed| seed.breaches.iter())
+            .filter(|breach| breach.worst_category.is_some())
+            .max_by(|left, right| {
+                left.residual
+                    .abs()
+                    .total_cmp(&right.residual.abs())
+                    .then(right.tick.0.cmp(&left.tick.0))
+            })
+            .and_then(|breach| breach.worst_category)
+    }
+
+    /// The single machine-parseable verdict line (bd-16g.11.2).
+    ///
+    /// This is the line a leaderboard or release checklist greps for, which is exactly
+    /// why its shape is pinned by a test: a format that drifts silently breaks every
+    /// consumer that was grepping it, and those consumers fail by finding nothing rather
+    /// than by erroring. Stable `key=value` pairs, no spaces inside values.
+    #[must_use]
+    pub fn summary_line(&self, artifact: Option<&str>) -> String {
+        let worst = self
+            .worst_category()
+            .map_or_else(|| "none".to_owned(), |kind| format!("{kind:?}"));
+        format!(
+            "economy_gate verdict={} seeds={} breaches={} worst={} tolerance_overridden={} artifact={}",
+            if self.pass { "pass" } else { "fail" },
+            self.seeds.len(),
+            self.total_breaches(),
+            worst,
+            self.tolerance_overridden,
+            artifact.unwrap_or("none"),
+        )
+    }
+
+    /// Emit the gate's lifecycle log on target `scriptbots::economy::gate`.
+    ///
+    /// Someone reading only CI logs must be able to say "metabolism is over-posted
+    /// starting at tick 412" without cloning the repo, so failures carry the first
+    /// breaches with their stock, residual, tolerance and suspect category. The breach
+    /// detail is capped at ten: an error block nobody reads is the same as no error block.
+    pub fn log_summary(&self, artifact: Option<&str>) {
+        for seed in &self.seeds {
+            tracing::info!(
+                target: "scriptbots::economy::gate",
+                seed = seed.seed,
+                ticks = seed.ticks,
+                breaches = seed.breaches.len() + seed.truncated_breaches as usize,
+                max_abs_residual = ?seed.max_abs_residual,
+                cumulative_residual = ?seed.cumulative_residual,
+                "conservation seed complete"
+            );
+        }
+        if !self.pass {
+            for breach in self
+                .seeds
+                .iter()
+                .flat_map(|seed| seed.breaches.iter())
+                .take(10)
+            {
+                tracing::error!(
+                    target: "scriptbots::economy::gate",
+                    tick = breach.tick.0,
+                    stock = ?breach.stock,
+                    residual = breach.residual,
+                    tolerance = breach.tolerance,
+                    worst_category = ?breach.worst_category,
+                    "conservation breach"
+                );
+            }
+        }
+        tracing::info!(
+            target: "scriptbots::economy::gate",
+            "{}",
+            self.summary_line(artifact)
+        );
+    }
+
     /// Attach the digest of the configuration this verdict describes.
     ///
     /// Deliberately a builder rather than a parameter on [`evaluate_conservation`]:
@@ -1681,5 +1779,78 @@ mod tests {
             tagged_json, first,
             "attaching a digest must change the artifact, or it is not being recorded"
         );
+    }
+
+    /// The grep-target verdict line has a PINNED shape (bd-16g.11.2).
+    ///
+    /// This line is what a leaderboard or release checklist greps for, and a grep
+    /// consumer fails by finding NOTHING rather than by erroring. A silent format drift
+    /// would therefore read as "no runs" instead of "parser broken", so the format is
+    /// asserted rather than merely produced.
+    #[test]
+    fn bd_16g_11_2_the_machine_parseable_verdict_line_shape_is_pinned() {
+        let clean = evaluate_conservation(&[]);
+        let line = clean.summary_line(None);
+        assert_eq!(
+            line,
+            "economy_gate verdict=pass seeds=0 breaches=0 worst=none tolerance_overridden=false artifact=none",
+            "the grep target must not drift silently"
+        );
+
+        for field in [
+            "economy_gate ",
+            "verdict=",
+            "seeds=",
+            "breaches=",
+            "worst=",
+            "tolerance_overridden=",
+            "artifact=",
+        ] {
+            assert!(line.contains(field), "verdict line must carry {field}");
+        }
+        assert!(
+            !line.trim_start_matches("economy_gate ").contains("  "),
+            "no double spaces: key=value pairs must stay splittable on whitespace"
+        );
+
+        let tagged = clean.summary_line(Some("artifacts/economy/verdict.json"));
+        assert!(
+            tagged.contains("artifact=artifacts/economy/verdict.json"),
+            "a red CI run must be diagnosable from the log line alone, which means the \
+             artifact path has to be in it"
+        );
+    }
+
+    /// `total_breaches` must count TRUNCATED breaches, not just reported ones.
+    ///
+    /// The report cap exists so a log does not print 50,000 lines. If the count inherited
+    /// that cap, a run that breached 50,000 times would report 100 and read as nearly
+    /// healthy -- the cap would have turned a reporting limit into a false measurement.
+    #[test]
+    fn bd_16g_11_2_breach_count_includes_truncated_breaches() {
+        let seed = SeedVerdict {
+            seed: 7,
+            ticks: 64,
+            max_abs_residual: [0.0; STOCK_COUNT],
+            argmax_tick: [None; STOCK_COUNT],
+            cumulative_residual: [0.0; STOCK_COUNT],
+            gross_flow: [0.0; STOCK_COUNT],
+            breaches: Vec::new(),
+            truncated_breaches: 4_900,
+        };
+        let verdict = ConservationVerdict {
+            seeds: vec![seed],
+            pass: false,
+            failures: vec!["synthetic".to_owned()],
+            tolerance_overridden: false,
+            tolerances: ConservationTolerances::default(),
+            config_digest: None,
+        };
+        assert_eq!(
+            verdict.total_breaches(),
+            4_900,
+            "a truncated breach is still a breach"
+        );
+        assert!(verdict.summary_line(None).contains("breaches=4900"));
     }
 }
