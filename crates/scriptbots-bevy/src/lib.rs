@@ -1226,6 +1226,7 @@ struct HudElements {
     tonemap: Entity,
     palette: Entity,
     events: Entity,
+    inspector: Entity,
 }
 
 #[derive(Component)]
@@ -1617,7 +1618,14 @@ struct AgentVisual {
     color: [f32; 3],
     selection: SelectionState,
     health: f32,
+    /// Current energy reserve, for the inspector overlay (bd-2z0.14.1.14).
+    ///
+    /// Sourced from `AgentRuntime::energy`, the same value GPUI's inspector
+    /// reports as `detail.energy`, so the two frontends cannot disagree.
+    energy: f32,
     age: u32,
+    /// Lineage depth, matching GPUI's `detail.generation` (bd-2z0.14.1.14).
+    generation: u32,
     reference_age_ticks: u64,
     spike_length: f32,
     boost: f32,
@@ -1678,11 +1686,16 @@ impl WorldSnapshot {
         let headings = columns.headings();
         let spikes = columns.spike_lengths();
         let boosts = columns.boosts();
+        let generations = columns.generations();
         let runtime = world.runtime();
 
         let mut agents = Vec::with_capacity(arena.len());
         for (idx, agent_id) in arena.iter_handles().enumerate() {
             let runtime_entry = runtime.get(agent_id);
+            // Read separately rather than growing the already 15-wide tuple
+            // below; `Option<&AgentRuntime>` is `Copy`, so this does not
+            // disturb that destructuring.
+            let energy = runtime_entry.map_or(0.0, |rt| rt.energy);
             let (
                 selection,
                 wheel_left,
@@ -1768,7 +1781,9 @@ impl WorldSnapshot {
                 eye_fov,
                 selection,
                 health: healths[idx],
+                energy,
                 age: ages[idx],
+                generation: generations[idx].0,
                 reference_age_ticks: u64::from(config.aging_health_decay_start.max(1)),
                 indicator,
                 reproduction_intent,
@@ -1939,6 +1954,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mut tonemap = Entity::PLACEHOLDER;
     let mut palette = Entity::PLACEHOLDER;
     let mut events = Entity::PLACEHOLDER;
+    let mut inspector = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
         tick = parent
@@ -2014,6 +2030,13 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         events = parent
             .spawn((
                 Text::new("Events: --"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        inspector = parent
+            .spawn((
+                Text::new("Inspector: no selection"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -2186,6 +2209,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         tonemap,
         palette,
         events,
+        inspector,
     });
 }
 
@@ -2303,6 +2327,7 @@ fn update_hud(
         selected_count,
         primary_selection,
         event_feed,
+        inspector_text,
     ) = {
         let snapshot = state.latest.as_ref().expect("snapshot available");
         let tick = snapshot.tick;
@@ -2311,17 +2336,23 @@ fn update_hud(
         let agent_radius = snapshot.agent_radius;
         let mut selected_count = 0usize;
         let mut primary: Option<(AgentId, u32, f32)> = None;
+        let mut primary_agent: Option<&AgentVisual> = None;
         for agent in &snapshot.agents {
             if matches!(agent.selection, SelectionState::Selected) {
                 selected_count += 1;
                 if primary.is_none() {
                     primary = Some((agent.id, agent.age, agent.health));
+                    primary_agent = Some(agent);
                 }
             }
         }
         // Formatted here so the snapshot borrow ends with the rest of the
         // extraction rather than being held across the text writes below.
         let event_feed = format_event_feed(&snapshot.events);
+        let inspector_text = format_inspector(
+            primary_agent
+                .map(|agent| InspectorDetail::from_agent(agent, selected_count.saturating_sub(1))),
+        );
         (
             tick,
             agent_count,
@@ -2330,6 +2361,7 @@ fn update_hud(
             selected_count,
             primary,
             event_feed,
+            inspector_text,
         )
     };
 
@@ -2444,6 +2476,146 @@ fn update_hud(
         if let Ok(mut text) = texts.get_mut(hud_elements.events) {
             **text = event_feed;
         }
+        if let Ok(mut text) = texts.get_mut(hud_elements.inspector) {
+            **text = inspector_text;
+        }
+    }
+}
+
+#[cfg(test)]
+mod hud_inspector_tests {
+    use super::*;
+
+    fn sample_agent_visual_for_inspector() -> AgentVisual {
+        AgentVisual {
+            id: AgentId::null(),
+            position: Vec2::new(10.0, 20.0),
+            heading: 0.0,
+            color: [0.2, 0.4, 0.7],
+            selection: SelectionState::Selected,
+            health: 1.4,
+            energy: 0.62,
+            age: 120,
+            generation: 7,
+            reference_age_ticks: 1,
+            spike_length: 4.0,
+            boost: 1.0,
+            wheel_left: 0.25,
+            wheel_right: -0.5,
+            herbivore_tendency: 0.8,
+            temperature_preference: 0.3,
+            food_delta: 0.4,
+            sound_level: 0.2,
+            sound_output: 0.1,
+            sound_multiplier: 1.0,
+            trait_modifiers: TraitModifiers::default(),
+            eye_dirs: [0.0; NUM_EYES],
+            eye_fov: [1.0; NUM_EYES],
+            indicator: IndicatorState::default(),
+            reproduction_intent: 0.25,
+            spiked: false,
+        }
+    }
+
+    /// Built directly rather than borrowing the sibling test module's
+    /// `sample_agent_visual` helper, which is private to that module.
+    /// Energy and health are deliberately distinct values so a transposition
+    /// in the format string cannot pass.
+    fn detail() -> InspectorDetail {
+        InspectorDetail {
+            id: AgentId::null(),
+            energy: 0.62,
+            health: 1.40,
+            age: 120,
+            generation: 7,
+            herbivore_tendency: 0.80,
+            temperature_preference: 0.30,
+            spike_length: 4.00,
+            boost: 1.00,
+            reproduction_intent: 0.25,
+            spiked: false,
+            trait_modifiers: TraitModifiers::default(),
+            also_selected: 0,
+        }
+    }
+
+    /// The whole point of the bead: the overlay must carry more than the
+    /// id/age/health the old one-line readout showed. Energy and generation
+    /// in particular were absent from the snapshot entirely before this.
+    #[test]
+    fn inspector_reports_vitals_the_one_line_readout_omitted() {
+        let line = format_inspector(Some(detail()));
+        for expected in ["Energy", "0.62", "Gen 7", "Health", "1.40", "Age", "120"] {
+            assert!(line.contains(expected), "missing {expected} in: {line}");
+        }
+    }
+
+    /// `from_agent` is a plain field copy, which is exactly where a
+    /// transposition hides. Pin the mapping against a real `AgentVisual`.
+    #[test]
+    fn from_agent_maps_each_field_to_its_own_slot() {
+        let mut agent = sample_agent_visual_for_inspector();
+        agent.energy = 0.11;
+        agent.health = 0.22;
+        agent.age = 33;
+        agent.generation = 44;
+        let d = InspectorDetail::from_agent(&agent, 2);
+        assert!((d.energy - 0.11).abs() < f32::EPSILON, "energy mismapped");
+        assert!((d.health - 0.22).abs() < f32::EPSILON, "health mismapped");
+        assert_eq!(d.age, 33, "age mismapped");
+        assert_eq!(d.generation, 44, "generation mismapped");
+        assert_eq!(d.also_selected, 2);
+    }
+
+    /// Diet wording is derived from the same herbivore tendency the renderer
+    /// colours by, so the label and the colour cannot disagree.
+    #[test]
+    fn diet_label_follows_herbivore_tendency() {
+        let mut d = detail();
+        d.herbivore_tendency = 0.9;
+        assert_eq!(d.diet(), "herbivore");
+        d.herbivore_tendency = 0.5;
+        assert_eq!(d.diet(), "omnivore");
+        d.herbivore_tendency = 0.1;
+        assert_eq!(d.diet(), "carnivore");
+    }
+
+    /// A spike that landed a hit must be visibly distinct from one merely
+    /// extended, since that is the difference between threat and posture.
+    #[test]
+    fn spike_hit_is_called_out() {
+        let mut d = detail();
+        d.spiked = true;
+        assert!(format_inspector(Some(d)).contains("HIT"));
+        d.spiked = false;
+        assert!(!format_inspector(Some(d)).contains("HIT"));
+    }
+
+    /// Multi-select reports the remainder, and a lone selection says nothing
+    /// about extras.
+    #[test]
+    fn multi_selection_reports_the_remainder() {
+        let mut d = detail();
+        d.also_selected = 3;
+        assert!(format_inspector(Some(d)).contains("+3 more selected"));
+        d.also_selected = 0;
+        assert!(!format_inspector(Some(d)).contains("more selected"));
+    }
+
+    /// With nothing selected the panel keeps a stable presence rather than
+    /// disappearing — the same mounting lesson as bd-rzy3.
+    #[test]
+    fn empty_selection_renders_a_stable_placeholder() {
+        assert_eq!(format_inspector(None), "Inspector: no selection");
+    }
+
+    /// Trait modifiers are surfaced, matching GPUI's inspector vocabulary.
+    #[test]
+    fn trait_modifiers_are_surfaced() {
+        let line = format_inspector(Some(detail()));
+        for expected in ["smell", "sound", "hearing", "eye", "blood"] {
+            assert!(line.contains(expected), "missing {expected} in: {line}");
+        }
     }
 }
 
@@ -2535,6 +2707,105 @@ mod hud_event_feed_tests {
         assert!(line.contains("✚ 2×born@12"), "line was {line}");
         assert!(line.contains("✖ 1×died@12"), "line was {line}");
     }
+}
+
+/// The primary selection's vitals, projected for the inspector overlay.
+///
+/// Field vocabulary deliberately mirrors GPUI's inspector detail (`energy`,
+/// `health`, `age`, `generation`, `spike_length`, trait modifiers) so the two
+/// frontends describe the same agent the same way rather than inventing a
+/// second vocabulary (bd-2z0.14.1.14).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct InspectorDetail {
+    id: AgentId,
+    energy: f32,
+    health: f32,
+    age: u32,
+    generation: u32,
+    herbivore_tendency: f32,
+    temperature_preference: f32,
+    spike_length: f32,
+    boost: f32,
+    reproduction_intent: f32,
+    spiked: bool,
+    trait_modifiers: TraitModifiers,
+    also_selected: usize,
+}
+
+impl InspectorDetail {
+    fn from_agent(agent: &AgentVisual, also_selected: usize) -> Self {
+        Self {
+            id: agent.id,
+            energy: agent.energy,
+            health: agent.health,
+            age: agent.age,
+            generation: agent.generation,
+            herbivore_tendency: agent.herbivore_tendency,
+            temperature_preference: agent.temperature_preference,
+            spike_length: agent.spike_length,
+            boost: agent.boost,
+            reproduction_intent: agent.reproduction_intent,
+            spiked: agent.spiked,
+            trait_modifiers: agent.trait_modifiers,
+            also_selected,
+        }
+    }
+
+    /// Diet label from the same herbivore/carnivore tendency the renderer
+    /// colours by, so the word and the colour cannot disagree.
+    const fn diet(&self) -> &'static str {
+        if self.herbivore_tendency >= 0.66 {
+            "herbivore"
+        } else if self.herbivore_tendency <= 0.33 {
+            "carnivore"
+        } else {
+            "omnivore"
+        }
+    }
+}
+
+/// Render the inspector overlay as a multi-line block (bd-2z0.14.1.14).
+///
+/// Returns the placeholder when nothing is selected, so the panel keeps a
+/// stable presence in the HUD instead of appearing and vanishing.
+fn format_inspector(detail: Option<InspectorDetail>) -> String {
+    let Some(d) = detail else {
+        return "Inspector: no selection".to_string();
+    };
+    let extra = if d.also_selected > 0 {
+        format!(" (+{} more selected)", d.also_selected)
+    } else {
+        String::new()
+    };
+    let spike = if d.spiked {
+        format!("{:.2} HIT", d.spike_length)
+    } else {
+        format!("{:.2}", d.spike_length)
+    };
+    let t = &d.trait_modifiers;
+    format!(
+        "Inspector: {:?}{}\n  Energy {:>5.2} • Health {:>5.2} • Age {:>5} • Gen {}\n  \
+         Diet {} ({:.2}) • Temp pref {:.2} • Repro {:.2}\n  \
+         Spike {} • Boost {:.2}\n  \
+         Traits smell {:.2} sound {:.2} hearing {:.2} eye {:.2} blood {:.2}",
+        d.id,
+        extra,
+        d.energy,
+        d.health,
+        d.age,
+        d.generation,
+        d.diet(),
+        d.herbivore_tendency,
+        d.temperature_preference,
+        d.reproduction_intent,
+        spike,
+        d.boost,
+        t.smell,
+        t.sound,
+        t.hearing,
+        t.eye,
+        t.blood
+    )
 }
 
 /// Render the newest-first event feed as one HUD line (bd-2z0.14.1.13).
@@ -3749,7 +4020,9 @@ mod terrain_tests {
             color: [0.2, 0.4, 0.7],
             selection: SelectionState::Selected,
             health: 1.4,
+            energy: 0.62,
             age: 120,
+            generation: 7,
             reference_age_ticks: TEST_REFERENCE_AGE_TICKS,
             spike_length: 4.0,
             boost: 1.0,
@@ -5904,6 +6177,7 @@ mod tests {
             tonemap: spawn_label(&mut app),
             palette: spawn_label(&mut app),
             events: spawn_label(&mut app),
+            inspector: spawn_label(&mut app),
         };
         app.insert_resource(hud);
 
