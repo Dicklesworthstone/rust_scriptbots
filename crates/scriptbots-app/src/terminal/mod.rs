@@ -407,6 +407,8 @@ struct TerminalApp<'a> {
     /// Sub-cell tier probed once at startup; the canvas never re-reads the
     /// environment while painting.
     canvas_capability: CanvasCapability,
+    /// Grow-only per-sub-pixel agent counts backing the canvas crowding pass.
+    map_density: Vec<u16>,
     analytics: Option<TerminalAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: AnalyticsStatus,
@@ -503,6 +505,7 @@ impl<'a> TerminalApp<'a> {
             // better picture, and a terminal without color falls back anyway.
             map_canvas_enabled: true,
             canvas_capability,
+            map_density: Vec::new(),
             analytics: None,
             analytics_revision: None,
             analytics_status: AnalyticsStatus::default(),
@@ -1453,6 +1456,7 @@ impl<'a> TerminalApp<'a> {
                     canvas,
                     day_night: self.day_night,
                     capability: self.canvas_capability,
+                    density: &mut self.map_density,
                 },
                 inner,
             );
@@ -5262,6 +5266,8 @@ struct MapWidget<'a> {
     day_night: (u32, f32),
     /// The probed sub-cell tier; supplies the quantization depth.
     capability: CanvasCapability,
+    /// Grow-only per-sub-pixel agent counts, reused across frames.
+    density: &'a mut Vec<u16>,
 }
 
 /// Terrain alpha, deliberately below [`subcell::ALPHA_SOLID`]: terrain must land
@@ -5302,6 +5308,35 @@ const CANVAS_BOOST_FLARE: f32 = 1.6;
 
 /// Spike length above which the canvas paints an attack cue.
 const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
+
+/// How far a fully crowded sub-pixel blends toward white.
+///
+/// Short of 1.0 on purpose: a maximally crowded dot must still carry a hint of
+/// its diet color, or a carnivore pile and a herbivore pile look the same.
+const CANVAS_CLUSTER_WHITEN: f32 = 0.7;
+
+/// Normalized crowding for a sub-pixel holding `count` agents.
+///
+/// `1 - 1/count`: exactly `0.0` for a lone agent (so the common case is never
+/// tinted at all), `0.5` at two, and saturating toward `1.0`. Saturating rather
+/// than linear because a 5k-agent world would otherwise drive every occupied dot
+/// to the same maximum and lose the distinction it was added to create.
+fn cluster_heat(count: u16) -> f32 {
+    if count <= 1 {
+        return 0.0;
+    }
+    1.0 - 1.0 / f32::from(count)
+}
+
+/// Blend `rgb` toward white by `amount` in `[0, 1]`.
+fn whiten(rgb: [f32; 3], amount: f32) -> [f32; 3] {
+    let t = amount.clamp(0.0, 1.0);
+    [
+        (1.0 - rgb[0]).mul_add(t, rgb[0]),
+        (1.0 - rgb[1]).mul_add(t, rgb[1]),
+        (1.0 - rgb[2]).mul_add(t, rgb[2]),
+    ]
+}
 
 /// What a terminal reports it can do with color, decoupled from the detection
 /// crate's own `ColorLevel` (whose private fields make it unconstructible in a
@@ -5437,6 +5472,7 @@ impl MapWidget<'_> {
     /// placed — at eight times the cell grid's density.
     fn render_canvas(
         canvas: &mut SubCellBuffer,
+        density: &mut Vec<u16>,
         area: Rect,
         buf: &mut Buffer,
         ctx: &MapWidget<'_>,
@@ -5539,6 +5575,28 @@ impl MapWidget<'_> {
             (sx, sy)
         };
 
+        // Crowding pass. Without it, `set` is last-write-wins and forty agents
+        // stacked on one sub-pixel are indistinguishable from one — the same
+        // "unreadable soup" the sub-cell canvas exists to fix, one level down.
+        // The buffer is grow-only and reused across frames like every other
+        // canvas allocation.
+        let occupied = usize::from(sub_w) * usize::from(sub_h);
+        if density.len() < occupied {
+            density.resize(occupied, 0);
+        }
+        density[..occupied].fill(0);
+        for agent in &ctx.snapshot.agents {
+            let (sx, sy) = agent_dot(agent);
+            let index = usize::from(sy) * usize::from(sub_w) + usize::from(sx);
+            if let Some(slot) = density.get_mut(index) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        let crowding_at = |sx: u16, sy: u16| -> f32 {
+            let index = usize::from(sy) * usize::from(sub_w) + usize::from(sx);
+            cluster_heat(density.get(index).copied().unwrap_or(0))
+        };
+
         // Whiskers first, bodies second. Both write the Agents layer, and `set`
         // replaces within a layer, so the second pass guarantees a body dot always
         // wins the sub-pixel over any neighbour's whisker. One interleaved pass
@@ -5569,6 +5627,11 @@ impl MapWidget<'_> {
         for agent in &ctx.snapshot.agents {
             let (sx, sy) = agent_dot(agent);
             let ink = ctx.palette.agent_canvas_rgb(agent.diet, agent.energy);
+            // Crowding whitens rather than brightens. A multiplier saturates: a
+            // bright diet color hits 1.0 at two agents and then reports the same
+            // dot for two as for fifty. Blending toward white keeps climbing,
+            // and reads as heat.
+            let ink = whiten(ink, crowding_at(sx, sy) * CANVAS_CLUSTER_WHITEN);
             // Boost is the one agent state with no other channel on this canvas:
             // a dot is a dot regardless of speed, so flare it instead.
             let flare = if agent.boosted {
@@ -5641,7 +5704,12 @@ impl Widget for MapWidget<'_> {
         }
 
         if let Some(canvas) = self.canvas.take() {
-            Self::render_canvas(canvas, area, buf, &self);
+            // Move the crowding buffer out so the paint pass can write it while
+            // holding `&self`, then hand the same allocation back — the grow-only
+            // contract is the whole reason it lives on the app instead of here.
+            let mut density = std::mem::take(self.density);
+            Self::render_canvas(canvas, &mut density, area, buf, &self);
+            *self.density = density;
             return;
         }
 
@@ -5773,6 +5841,7 @@ mod tests {
         let mut scratch =
             vec![CellOccupancy::default(); usize::from(cells.0) * usize::from(cells.1)];
         let mut canvas = SubCellBuffer::new(cells.0, cells.1, capability.mode);
+        let mut density = Vec::new();
         let area = Rect::new(0, 0, cells.0, cells.1);
         let mut buf = Buffer::empty(area);
         MapWidget {
@@ -5784,6 +5853,7 @@ mod tests {
             canvas: Some(&mut canvas),
             day_night,
             capability,
+            density: &mut density,
         }
         .render(area, &mut buf);
         buf
@@ -5898,6 +5968,7 @@ mod tests {
             canvas: None,
             day_night: canvas_test_day_night(),
             capability: canvas_test_capability(),
+            density: &mut Vec::new(),
         }
         .render(area, &mut buf);
 
@@ -6127,6 +6198,77 @@ mod tests {
             frame_at(quarter),
             frame_at(quarter),
             "the same tick must produce a byte-identical frame"
+        );
+    }
+
+    /// Crowding must be zero for the common case and must keep climbing without
+    /// ever reaching the top, so no two pile sizes ever report the same heat.
+    #[test]
+    fn cluster_heat_is_zero_alone_and_strictly_monotonic_thereafter() {
+        assert_eq!(cluster_heat(0), 0.0, "an empty sub-pixel is not crowded");
+        assert_eq!(cluster_heat(1), 0.0, "a lone agent must not be tinted");
+        let mut previous = 0.0_f32;
+        for count in 2..=64_u16 {
+            let heat = cluster_heat(count);
+            assert!(
+                heat > previous,
+                "heat must strictly increase at {count}: {heat} vs {previous}"
+            );
+            assert!(heat < 1.0, "heat must never saturate at {count}: {heat}");
+            previous = heat;
+        }
+        assert!(
+            (cluster_heat(2) - 0.5).abs() < f32::EPSILON,
+            "two agents sit exactly halfway"
+        );
+    }
+
+    /// The defect this closes: `SubCellBuffer::set` is last-write-wins, so before
+    /// the crowding pass a stack of agents on one sub-pixel produced a byte for
+    /// byte identical cell to a single agent there. An observer could not tell a
+    /// swarm from a straggler.
+    #[test]
+    fn a_crowded_sub_pixel_reads_differently_from_a_lone_agent() {
+        let terrain = canvas_test_terrain();
+        let render_pile = |count: usize| {
+            let mut snapshot = Snapshot::default();
+            snapshot.agents = (0..count).map(|_| canvas_test_agent(0.0, 0.0)).collect();
+            let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
+            cell_fg(&buf, 0, 0)
+        };
+        let lone = render_pile(1);
+        let pair = render_pile(2);
+        let swarm = render_pile(16);
+        assert_ne!(lone, pair, "two agents must not render as one");
+        assert_ne!(pair, swarm, "a swarm must not render as a pair");
+        assert!(
+            luminance(swarm) > luminance(pair) && luminance(pair) > luminance(lone),
+            "crowding must read as heat: lone {lone:?}, pair {pair:?}, swarm {swarm:?}"
+        );
+    }
+
+    /// Whitening, not brightening: a maximally crowded dot must still be tinted
+    /// by its diet so a carnivore pile and a herbivore pile stay distinguishable.
+    #[test]
+    fn a_crowded_dot_keeps_a_trace_of_its_diet_color() {
+        let terrain = canvas_test_terrain();
+        let pile_of = |diet: DietClass| {
+            let mut snapshot = Snapshot::default();
+            snapshot.agents = (0..64)
+                .map(|_| {
+                    let mut agent = canvas_test_agent(0.0, 0.0);
+                    agent.diet = diet;
+                    agent
+                })
+                .collect();
+            let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
+            cell_fg(&buf, 0, 0)
+        };
+        let herbivores = pile_of(DietClass::Herbivore);
+        let carnivores = pile_of(DietClass::Carnivore);
+        assert_ne!(
+            herbivores, carnivores,
+            "a fully crowded pile must not wash out to the same white regardless of diet"
         );
     }
 
