@@ -5019,6 +5019,12 @@ impl Palette {
         ]
     }
 
+    /// Ink for the canvas selection ring: the theme's accent, so the highlight
+    /// matches the accent the rest of the TUI already uses for focus.
+    fn accent_canvas_rgb(&self) -> [f32; 3] {
+        color_channels(self.theme().accent)
+    }
+
     /// Agent ink by diet, scaled by energy so dying agents read as dimmer dots.
     fn agent_canvas_rgb(&self, diet: DietClass, energy: f32) -> [f32; 3] {
         let idx = match diet {
@@ -5331,6 +5337,22 @@ const CANVAS_BOOST_FLARE: f32 = 1.6;
 /// Spike length above which the canvas paints an attack cue.
 const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
 
+/// The eight sub-pixel offsets forming the selection ring around a focused
+/// agent's dot.
+///
+/// The centre is deliberately absent: the ring must not paint over the agent it
+/// is pointing at, or selecting an agent would hide the very thing selected.
+const CANVAS_SELECTION_RING: [(i32, i32); 8] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+
 /// How far a fully crowded sub-pixel blends toward white.
 ///
 /// Short of 1.0 on purpose: a maximally crowded dot must still carry a hint of
@@ -5516,6 +5538,7 @@ impl MapWidget<'_> {
         // Repaint from world state every frame. Higher layers must be cleared
         // first: `set` only replaces when the incoming layer is at least the
         // stored one, so last frame's agent dots would otherwise survive.
+        canvas.clear_layer(Layer::Selection);
         canvas.clear_layer(Layer::Cues);
         canvas.clear_layer(Layer::Agents);
         canvas.clear_layer(Layer::Food);
@@ -5682,6 +5705,26 @@ impl MapWidget<'_> {
                     1.0,
                 ],
             );
+
+            // The focused agent gets a ring on the Selection layer, above
+            // everything. Matched on the STABLE uid: the arena handle is a
+            // reusable slot, so ringing by handle would follow the slot rather
+            // than the agent and could highlight a stranger after a death
+            // (bd-qxrt). `None == None` must not match either — an agent whose
+            // identity is missing is not "the focused one".
+            if let (Some(uid), Some(focused)) = (agent.uid, ctx.snapshot.focused_agent_uid)
+                && uid == focused
+            {
+                let ink = ctx.palette.accent_canvas_rgb();
+                for (dx, dy) in CANVAS_SELECTION_RING {
+                    if let (Ok(rx), Ok(ry)) = (
+                        u16::try_from(i32::from(sx) + dx),
+                        u16::try_from(i32::from(sy) + dy),
+                    ) {
+                        canvas.set(Layer::Selection, rx, ry, [ink[0], ink[1], ink[2], 1.0]);
+                    }
+                }
+            }
 
             // An extended spike is an attack in progress. It goes on the Cues
             // layer, above every body, because a strike that another agent's dot
@@ -7202,6 +7245,63 @@ mod tests {
         assert_eq!(snapshot.tick, world.tick().0);
         assert_eq!(snapshot.agents.len(), world.agent_count());
         assert_eq!(snapshot.world_size.0, world.config().world_width);
+    }
+
+    /// The ring must follow the AGENT, not the slot. Two agents sit far apart;
+    /// focus names one by stable uid, and only that one may be ringed. Matching
+    /// on the arena handle instead would follow a reusable slot and could ring a
+    /// stranger after a death (bd-qxrt).
+    #[test]
+    fn the_selection_ring_marks_the_focused_agent_and_only_that_agent() {
+        let terrain = canvas_test_terrain();
+        // 4x4 cells = an 8x16 sub-grid. Two agents, well separated.
+        let mut focused = canvas_test_agent(0.5, 0.5);
+        focused.uid = Some(7);
+        let mut other = canvas_test_agent(0.05, 0.05);
+        other.uid = Some(9);
+        let mut snapshot = Snapshot::default();
+        snapshot.agents = vec![focused, other];
+
+        let unfocused_frame =
+            render_canvas_frame(&snapshot, &terrain, (4, 4), canvas_test_day_night());
+        snapshot.focused_agent_uid = Some(7);
+        let focused_frame =
+            render_canvas_frame(&snapshot, &terrain, (4, 4), canvas_test_day_night());
+
+        // The focused agent sits on sub-pixel (4, 8); the ring lights (3..=5, 7..=9)
+        // minus the centre. Sub-pixel (3, 7) belongs to terminal cell (1, 1).
+        let ring_cell = (3_u16 / 2, 7_u16 / 4);
+        let before = buf_symbol(&unfocused_frame, ring_cell);
+        let after = buf_symbol(&focused_frame, ring_cell);
+        assert_ne!(
+            before, after,
+            "focusing an agent must light the ring around it"
+        );
+
+        // The other agent is at sub-pixel (0, 0); nothing near it may change.
+        assert_eq!(
+            buf_symbol(&unfocused_frame, (0, 0)),
+            buf_symbol(&focused_frame, (0, 0)),
+            "an unfocused agent must not acquire a ring"
+        );
+    }
+
+    /// The ring surrounds the dot; it must never paint over it, or selecting an
+    /// agent would hide the thing selected.
+    #[test]
+    fn the_selection_ring_leaves_the_agents_own_sub_pixel_alone() {
+        assert_eq!(CANVAS_SELECTION_RING.len(), 8);
+        assert!(
+            !CANVAS_SELECTION_RING.contains(&(0, 0)),
+            "the ring must exclude the centre"
+        );
+        let distinct: std::collections::BTreeSet<(i32, i32)> =
+            CANVAS_SELECTION_RING.iter().copied().collect();
+        assert_eq!(distinct.len(), 8, "ring offsets must not repeat");
+    }
+
+    fn buf_symbol(buf: &Buffer, cell: (u16, u16)) -> String {
+        buf[(cell.0, cell.1)].symbol().to_string()
     }
 
     /// bd-qxrt: every number the TUI shows a person must be the STABLE
