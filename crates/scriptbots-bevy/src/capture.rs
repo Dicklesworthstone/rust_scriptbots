@@ -206,6 +206,10 @@ pub struct CompareThresholds {
     pub max_differing_ratio: f32,
     /// Maximum allowed mean absolute channel deviation over all pixels.
     pub max_mean_abs_diff: f32,
+    /// Minimum allowed mean SSIM over all luma windows.
+    pub min_ssim_mean: f32,
+    /// Minimum allowed SSIM for the single worst luma window.
+    pub min_ssim_window: f32,
 }
 
 impl Default for CompareThresholds {
@@ -214,6 +218,21 @@ impl Default for CompareThresholds {
             differing_channel: 8,
             max_differing_ratio: 0.005,
             max_mean_abs_diff: 0.5,
+            // Structural gates are ADDITIVE: they can only fail a comparison the
+            // per-channel gate would have passed, never rescue one it failed. A
+            // perceptual score that could override a channel breach would be a
+            // gate that talks itself out of a real regression, which is the
+            // failure mode this whole harness exists to avoid.
+            //
+            // These defaults are deliberately loose because they are uncalibrated:
+            // no GPU lane was available to measure real adapter jitter (bd-e6ff,
+            // bd-oite). 0.98 mean rejects global structural change; 0.5 on a single
+            // window rejects severe localized damage — a dead mesh, a material that
+            // stopped shading, a bloom pass gone missing in one region — while
+            // sitting far above anything raster jitter produces. Tighten once a
+            // real-GPU lane can measure the true noise floor.
+            min_ssim_mean: 0.98,
+            min_ssim_window: 0.5,
         }
     }
 }
@@ -231,8 +250,102 @@ pub struct DiffStats {
     pub max_channel_diff: u8,
     /// Mean absolute channel deviation over all channels of all pixels.
     pub mean_abs_diff: f64,
+    /// Mean SSIM over all 8x8 luma windows, in `[-1, 1]` (1.0 = identical).
+    ///
+    /// Structural, not per-channel: it answers "does this look like the same
+    /// image" where [`mean_abs_diff`](Self::mean_abs_diff) answers "how far
+    /// apart are the numbers" (bd-2z0.14.3.10 item 3).
+    pub ssim_mean: f64,
+    /// SSIM of the WORST 8x8 luma window.
+    ///
+    /// The mean is dominated by the many untouched windows, so localized damage
+    /// — one dead mesh, a broken shader on one material, a bloom pass that
+    /// stopped contributing in one region — barely moves it. The worst window
+    /// is what actually notices, which is why the gate uses both.
+    pub ssim_min: f64,
     /// Whether the comparison passed the thresholds.
     pub pass: bool,
+}
+
+/// Side length of the SSIM window, in pixels.
+const SSIM_WINDOW: usize = 8;
+
+/// Rec. 709 luma of an RGBA8 pixel, matching the luminance basis the rest of
+/// the harness uses.
+fn luma8(pixel: &[u8; 4]) -> f64 {
+    0.2126 * f64::from(pixel[0]) + 0.7152 * f64::from(pixel[1]) + 0.0722 * f64::from(pixel[2])
+}
+
+/// Mean and worst-window SSIM between two same-shape RGBA8 frames.
+///
+/// Standard single-scale SSIM over non-overlapping `SSIM_WINDOW` blocks of the
+/// luma channel, with the usual C1/C2 stabilizers so flat identical regions
+/// score exactly 1.0 instead of dividing by zero. Non-overlapping blocks (not a
+/// sliding Gaussian) keep this O(pixels) and fully deterministic, which matters
+/// because it runs inside a golden gate.
+///
+/// Edge blocks are skipped when the frame is not a multiple of the window; a
+/// partial block has too few samples for a meaningful variance and would add
+/// noise to the very statistic being gated on.
+fn ssim_luma(golden: &[u8], candidate: &[u8], width: u32, height: u32) -> (f64, f64) {
+    // 8-bit dynamic range, the standard SSIM constants.
+    const C1: f64 = (0.01 * 255.0) * (0.01 * 255.0);
+    const C2: f64 = (0.03 * 255.0) * (0.03 * 255.0);
+
+    let width = width as usize;
+    let height = height as usize;
+    let g = golden.as_chunks::<4>().0;
+    let c = candidate.as_chunks::<4>().0;
+
+    let mut sum = 0.0_f64;
+    let mut windows = 0_u64;
+    let mut worst = f64::INFINITY;
+
+    let blocks_y = height / SSIM_WINDOW;
+    let blocks_x = width / SSIM_WINDOW;
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let (mut gs, mut cs) = (0.0_f64, 0.0_f64);
+            let (mut gss, mut css, mut gcs) = (0.0_f64, 0.0_f64, 0.0_f64);
+            for row in 0..SSIM_WINDOW {
+                let base = (by * SSIM_WINDOW + row) * width + bx * SSIM_WINDOW;
+                for col in 0..SSIM_WINDOW {
+                    let gl = luma8(&g[base + col]);
+                    let cl = luma8(&c[base + col]);
+                    gs += gl;
+                    cs += cl;
+                    gss += gl * gl;
+                    css += cl * cl;
+                    gcs += gl * cl;
+                }
+            }
+            let n = (SSIM_WINDOW * SSIM_WINDOW) as f64;
+            let g_mean = gs / n;
+            let c_mean = cs / n;
+            // Population variance/covariance: the window IS the population.
+            let g_var = (gss / n) - g_mean * g_mean;
+            let c_var = (css / n) - c_mean * c_mean;
+            let cov = (gcs / n) - g_mean * c_mean;
+
+            let numerator = (2.0 * g_mean * c_mean + C1) * (2.0 * cov + C2);
+            let denominator = (g_mean * g_mean + c_mean * c_mean + C1) * (g_var + c_var + C2);
+            let score = if denominator == 0.0 {
+                1.0
+            } else {
+                numerator / denominator
+            };
+            sum += score;
+            worst = worst.min(score);
+            windows += 1;
+        }
+    }
+
+    if windows == 0 {
+        // Frame smaller than one window: no structural claim is possible, so
+        // report the neutral value and let the per-channel gate decide alone.
+        return (1.0, 1.0);
+    }
+    (sum / windows as f64, worst)
 }
 
 /// Compare two tightly packed RGBA8 buffers of the same dimensions.
@@ -287,14 +400,23 @@ pub fn compare_frames(
     let total_pixels = u64::from(width) * u64::from(height);
     let differing_ratio = differing_pixels as f64 / total_pixels as f64;
     let mean_abs_diff = abs_sum as f64 / (total_pixels * 4) as f64;
+    // Structural agreement, which the per-channel statistics above cannot see.
+    // A localized regression can hold differing_ratio under its threshold and
+    // mean_abs_diff near zero purely by being small, while looking obviously
+    // wrong (bd-2z0.14.3.10 item 3).
+    let (ssim_mean, ssim_min) = ssim_luma(golden, candidate, width, height);
     let pass = differing_ratio <= f64::from(thresholds.max_differing_ratio)
-        && mean_abs_diff <= f64::from(thresholds.max_mean_abs_diff);
+        && mean_abs_diff <= f64::from(thresholds.max_mean_abs_diff)
+        && ssim_mean >= f64::from(thresholds.min_ssim_mean)
+        && ssim_min >= f64::from(thresholds.min_ssim_window);
     Ok(DiffStats {
         differing_pixels,
         total_pixels,
         differing_ratio,
         max_channel_diff,
         mean_abs_diff,
+        ssim_mean,
+        ssim_min,
         pass,
     })
 }
@@ -1782,6 +1904,10 @@ mod tests {
             differing_channel: 0,
             max_differing_ratio: 0.0,
             max_mean_abs_diff: 255.0,
+            // Disabled: this test isolates per-channel counting, and the frame
+            // is smaller than one SSIM window anyway.
+            min_ssim_mean: -1.0,
+            min_ssim_window: -1.0,
         };
         // 4 pixels, each differing in RED only.
         let golden = [10u8, 20, 30, 255].repeat(4);
@@ -1806,6 +1932,9 @@ mod tests {
             differing_channel: 0,
             max_differing_ratio: 1.0,
             max_mean_abs_diff: 255.0,
+            // Disabled for the same reason as the sibling test above.
+            min_ssim_mean: -1.0,
+            min_ssim_window: -1.0,
         };
         let golden = [10u8, 20, 30, 40].repeat(2);
         let mut candidate = golden.clone();
@@ -1919,6 +2048,151 @@ mod tests {
         }
         assert_eq!(json["schema"], PROVENANCE_SCHEMA);
         assert_eq!(json["world_digest"], "blake3:deadbeef");
+    }
+
+    /// Build a frame from a per-pixel closure, for structural comparison tests.
+    fn frame_from(width: u32, height: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                out.extend_from_slice(&f(x, y));
+            }
+        }
+        out
+    }
+
+    /// Identical frames must score a perfect 1.0 on both structural statistics,
+    /// including across flat regions where variance is zero.
+    #[test]
+    fn ssim_of_identical_frames_is_one_even_on_flat_regions() {
+        let flat = frame_from(64, 64, |_, _| [40, 40, 40, 255]);
+        let (mean, min) = ssim_luma(&flat, &flat, 64, 64);
+        assert!(
+            (mean - 1.0).abs() < 1e-9 && (min - 1.0).abs() < 1e-9,
+            "identical flat frames must be 1.0/1.0, got {mean}/{min}"
+        );
+
+        let textured = frame_from(64, 64, |x, y| {
+            let v = ((x * 7 + y * 13) % 256) as u8;
+            [v, v / 2, 255 - v, 255]
+        });
+        let (mean, min) = ssim_luma(&textured, &textured, 64, 64);
+        assert!(
+            (mean - 1.0).abs() < 1e-9 && (min - 1.0).abs() < 1e-9,
+            "identical textured frames must be 1.0/1.0, got {mean}/{min}"
+        );
+    }
+
+    /// The defect item 3 names: a small, severe, LOCALIZED regression passes
+    /// every per-channel threshold purely by being small.
+    ///
+    /// One 8x8 block of a 256x256 frame is 64 of 65,536 pixels — a differing
+    /// ratio of 0.00098, well under the 0.005 allowance — and inverting it
+    /// moves the mean absolute deviation by a fraction of a unit. Per-channel
+    /// statistics therefore report "pass" on a frame with a visibly destroyed
+    /// region, which is exactly what a dead mesh or an unshaded material looks
+    /// like. The worst-window structural score is what refuses it.
+    #[test]
+    fn a_localized_structural_regression_passes_per_channel_and_fails_perceptually() {
+        let golden = frame_from(256, 256, |x, y| {
+            let v = ((x * 3 + y * 5) % 200 + 28) as u8;
+            [v, v, v, 255]
+        });
+        let candidate = frame_from(256, 256, |x, y| {
+            let v = ((x * 3 + y * 5) % 200 + 28) as u8;
+            if x < 8 && y < 8 {
+                [255 - v, 255 - v, 255 - v, 255]
+            } else {
+                [v, v, v, 255]
+            }
+        });
+
+        let thresholds = CompareThresholds::default();
+        let stats = compare_frames(&golden, &candidate, 256, 256, &thresholds).expect("compare");
+
+        // The per-channel half of the gate is genuinely satisfied.
+        assert!(
+            stats.differing_ratio <= f64::from(thresholds.max_differing_ratio),
+            "premise: differing ratio {} must sit under the allowance",
+            stats.differing_ratio
+        );
+        assert!(
+            stats.mean_abs_diff <= f64::from(thresholds.max_mean_abs_diff),
+            "premise: mean abs diff {} must sit under the allowance",
+            stats.mean_abs_diff
+        );
+
+        // ...and the structural half still refuses it.
+        assert!(
+            stats.ssim_min < f64::from(thresholds.min_ssim_window),
+            "worst window {} must breach the structural floor",
+            stats.ssim_min
+        );
+        assert!(
+            !stats.pass,
+            "a destroyed 8x8 region must not pass merely because it is small"
+        );
+    }
+
+    /// The mean alone is not enough, which is why the worst window is gated too.
+    ///
+    /// Averaged over 1,024 windows, a single destroyed one moves the mean by
+    /// under a thousandth — it would sail past any mean threshold loose enough
+    /// to tolerate real adapter jitter.
+    #[test]
+    fn mean_ssim_alone_would_miss_localized_damage() {
+        let golden = frame_from(256, 256, |x, y| {
+            let v = ((x * 3 + y * 5) % 200 + 28) as u8;
+            [v, v, v, 255]
+        });
+        let candidate = frame_from(256, 256, |x, y| {
+            let v = ((x * 3 + y * 5) % 200 + 28) as u8;
+            if x < 8 && y < 8 {
+                [255 - v, 255 - v, 255 - v, 255]
+            } else {
+                [v, v, v, 255]
+            }
+        });
+        let (mean, min) = ssim_luma(&golden, &candidate, 256, 256);
+        assert!(
+            mean > 0.98,
+            "premise: the mean stays above a realistic threshold ({mean})"
+        );
+        assert!(
+            min < mean,
+            "the worst window must be strictly more sensitive than the mean ({min} vs {mean})"
+        );
+    }
+
+    /// The structural gate must never rescue a comparison the per-channel gate
+    /// failed. It is additive by construction; this pins that it stays so.
+    #[test]
+    fn structural_agreement_cannot_rescue_a_per_channel_failure() {
+        // A large, uniform brightness lift: structurally near-identical (every
+        // window keeps its shape) but a gross per-channel deviation.
+        let golden = frame_from(64, 64, |x, y| {
+            let v = ((x * 3 + y * 5) % 200 + 28) as u8;
+            [v, v, v, 255]
+        });
+        let candidate = frame_from(64, 64, |x, y| {
+            let v = ((x * 3 + y * 5) % 200 + 28) as u8;
+            [
+                v.saturating_add(60),
+                v.saturating_add(60),
+                v.saturating_add(60),
+                255,
+            ]
+        });
+        let stats = compare_frames(&golden, &candidate, 64, 64, &CompareThresholds::default())
+            .expect("compare");
+        assert!(
+            stats.mean_abs_diff > f64::from(CompareThresholds::default().max_mean_abs_diff),
+            "premise: this must be a per-channel failure"
+        );
+        assert!(
+            !stats.pass,
+            "high structural similarity must not override a channel breach"
+        );
     }
 
     /// Provenance JSON written before build identity existed must still decode.
