@@ -26,11 +26,11 @@ use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
     AccessibilityPalette, AgentId, BrainInspectionClientId, BrainInspectionLimits,
     BrainInspectionRequest, BrainInspectionRevision, ControlCommand, ControlDisposition, GpuClass,
-    GpuInfo, IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderQuality, RenderSettings,
-    RenderTonemapMode, SelectedBrainTelemetryOutcome, SelectionMode, SelectionState,
-    SelectionUpdate, SimulationCommand, TerrainKind, TickSummary, TierFeatures, TraitModifiers,
-    WorldState, WorldStepDriver, apply_control_command, initial_tier_for, tier_features,
-    toroidal_delta,
+    GpuInfo, IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderGovernor, RenderQuality,
+    RenderSettings, RenderTonemapMode, SelectedBrainTelemetryOutcome, SelectionMode,
+    SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TickSummary, TierFeatures,
+    TraitModifiers, WorldState, WorldStepDriver, apply_control_command, initial_tier_for,
+    tier_features, toroidal_delta,
     visual::{
         self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
     },
@@ -255,6 +255,14 @@ pub struct EffectiveRenderSettings {
     pub features: TierFeatures,
     /// Adapter probe (None when probing found no adapter).
     pub gpu: Option<GpuInfo>,
+    /// The tier the operator actually asked for, retained after Auto-resolution.
+    ///
+    /// `tier` alone cannot answer "may this adapt?": once `Auto` resolves to a
+    /// concrete rung it is indistinguishable from an explicitly requested one.
+    /// The adaptive governor is only permitted to run when this is
+    /// [`RenderQuality::Auto`], which is the bead's "explicit quality disables
+    /// adaptation" clause (bd-2z0.14.3.3).
+    pub requested: RenderQuality,
 }
 
 /// Probe the default high-performance GPU adapter and classify it.
@@ -350,7 +358,132 @@ pub(crate) fn resolve_effective_render_settings_for_gpu(
         tier,
         features,
         gpu,
+        requested,
     }
+}
+
+/// Frame budget the adaptive governor holds the renderer to: 60 fps.
+const ADAPTIVE_FRAME_BUDGET_MS: f32 = 16.6;
+
+/// Live adaptive quality governor for the production Bevy renderer (bd-2z0.14.3.3).
+///
+/// The [`RenderGovernor`] itself is a pure, already-tested closed loop in
+/// `scriptbots-core`; before this it had no production consumer at all, so the
+/// tier was startup-only and no measured frame time could ever change it. This
+/// resource is the frontend half: it owns the governor when — and only when —
+/// adaptation is permitted.
+///
+/// `None` means "never adapt", and it is deliberately not recoverable. Two
+/// distinct situations produce it: the operator requested an explicit tier, or
+/// the operator took manual control at runtime via the quality-tier button. In
+/// both cases a later automatic transition would be the renderer overriding a
+/// human, so the governor is dropped rather than paused.
+#[derive(Resource, Debug, Default)]
+pub struct AdaptiveQualityGovernor {
+    governor: Option<RenderGovernor>,
+}
+
+impl AdaptiveQualityGovernor {
+    /// Build the governor for a resolved launch, or an inert one when the
+    /// operator pinned a tier.
+    ///
+    /// The ceiling is the Auto-resolved tier: adaptation may fall back from what
+    /// the adapter was judged capable of, and may climb back to it, but never
+    /// above it. That keeps the capability mapping authoritative.
+    #[must_use]
+    pub fn for_launch(effective: &EffectiveRenderSettings) -> Self {
+        if effective.requested != RenderQuality::Auto {
+            info!(
+                requested = ?effective.requested,
+                "explicit render quality requested; adaptive governor disabled"
+            );
+            return Self { governor: None };
+        }
+        info!(
+            initial = ?effective.tier,
+            ceiling = ?effective.tier,
+            budget_ms = ADAPTIVE_FRAME_BUDGET_MS,
+            "adaptive render governor engaged"
+        );
+        Self {
+            governor: Some(RenderGovernor::new(
+                effective.tier,
+                effective.tier,
+                ADAPTIVE_FRAME_BUDGET_MS,
+            )),
+        }
+    }
+
+    /// Whether automatic tier transitions can still happen.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.governor.is_some()
+    }
+
+    /// Permanently hand the tier back to the operator.
+    pub fn relinquish_to_operator(&mut self) {
+        if self.governor.take().is_some() {
+            info!("operator set the quality tier manually; adaptive governor disengaged");
+        }
+    }
+}
+
+/// Feed measured frame times to the governor and apply any tier it decides on.
+///
+/// This is the closed loop the bead calls for: observe, decide, and reconfigure
+/// through [`EffectiveRenderSettings`] so every existing tier consumer picks the
+/// change up. `EffectiveRenderSettings` is only written when the tier actually
+/// moves — a blind write every frame would mark the resource changed forever and
+/// make `Res::is_changed` useless to downstream systems like
+/// `apply_tier_to_sun_light`.
+fn drive_adaptive_quality(
+    time: Res<Time>,
+    mut adaptive: ResMut<AdaptiveQualityGovernor>,
+    mut effective: ResMut<EffectiveRenderSettings>,
+) {
+    let Some(governor) = adaptive.governor.as_mut() else {
+        return;
+    };
+
+    // Sampled before `observe`, deliberately. `observe` clears the window as
+    // soon as it evaluates one, so reading p95 afterwards reports the empty
+    // successor window (0.0) rather than the evidence that drove the decision.
+    // This is the window one sample short of the one just judged, which is the
+    // closest honest statistic the governor exposes.
+    let window_p95_ms = governor.window_p95();
+
+    governor.observe(time.delta_secs() * 1_000.0);
+
+    let decided = governor.current_tier();
+    if decided == effective.tier {
+        return;
+    }
+
+    // Reported from the frame-time regime rather than by comparing tiers:
+    // `RenderQuality` is deliberately unordered (no `PartialOrd`), and the
+    // governor steps down only after windows over budget and up only after
+    // windows under 60% of it, so p95 names the cause directly.
+    let cause = if window_p95_ms > ADAPTIVE_FRAME_BUDGET_MS {
+        "frame budget exceeded"
+    } else {
+        "sustained headroom"
+    };
+
+    let previous = effective.tier;
+    effective.tier = decided;
+    effective.features = tier_features(decided);
+    info!(
+        previous = ?previous,
+        tier = ?decided,
+        cause,
+        window_p95_ms,
+        budget_ms = ADAPTIVE_FRAME_BUDGET_MS,
+        adapter = effective.gpu.as_ref().map_or("<none>", |info| info.name.as_str()),
+        shadows = effective.features.shadows,
+        ssao = effective.features.ssao,
+        bloom = effective.features.bloom,
+        "adaptive render governor changed the quality tier"
+    );
 }
 
 pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
@@ -484,6 +617,11 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     })
     .insert_resource(submitter_resource)
     .insert_resource(controls_resource)
+    // Built from the resolved settings, so it engages only for Auto launches
+    // (bd-2z0.14.3.3).
+    .insert_resource(AdaptiveQualityGovernor::for_launch(
+        &effective_render_settings,
+    ))
     .insert_non_send_resource(SnapshotInbox { receiver: rx })
     .insert_non_send_resource(BevyLifecycleFailureInbox {
         receiver: failure_rx,
@@ -523,7 +661,16 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             // Nested so the outer tuple stays within Bevy's 20-system arity
             // limit; the inner .chain() preserves strict ordering, so the
             // button still runs before the system that applies its effect.
-            (handle_quality_tier_button, apply_tier_to_sun_light).chain(),
+            //
+            // The governor sits between them on purpose: the button may
+            // disengage it this frame, and whichever of the two sets the tier
+            // must land before `apply_tier_to_sun_light` reads `is_changed`.
+            (
+                handle_quality_tier_button,
+                drive_adaptive_quality,
+                apply_tier_to_sun_light,
+            )
+                .chain(),
             handle_auto_exposure_toggle,
             handle_exposure_adjust_buttons,
             handle_palette_shortcuts,
@@ -4278,10 +4425,15 @@ const fn next_quality_tier(tier: RenderQuality) -> RenderQuality {
 
 fn handle_quality_tier_button(
     mut effective: ResMut<EffectiveRenderSettings>,
+    mut adaptive: ResMut<AdaptiveQualityGovernor>,
     mut query: Query<&Interaction, (Changed<Interaction>, With<QualityTierButton>)>,
 ) {
     for interaction in &mut query {
         if *interaction == Interaction::Pressed {
+            // Taking the tier by hand is an explicit choice, so the governor
+            // stands down permanently. Without this the next completed window
+            // would silently overwrite what the operator just picked.
+            adaptive.relinquish_to_operator();
             let next = next_quality_tier(effective.tier);
             effective.tier = next;
             effective.features = tier_features(next);
@@ -6729,6 +6881,117 @@ mod tests {
                     | RenderQuality::High
             ),
             "auto resolves onto the ladder, never Ultra"
+        );
+    }
+
+    /// A fixed adapter so governor tests never depend on the host's real GPU.
+    fn discrete_gpu_fixture() -> GpuInfo {
+        GpuInfo {
+            name: "ScriptBots Test Adapter".to_string(),
+            backend: "Metal".to_string(),
+            class: GpuClass::Discrete,
+            vram_bytes: None,
+            max_texture_2d: Some(16_384),
+            timestamp_queries: true,
+        }
+    }
+
+    /// The resolved tier cannot answer "was this asked for, or inferred?".
+    /// Auto resolves to a concrete rung and then looks exactly like an explicit
+    /// request, which is why the governor needs `requested` retained (bd-2z0.14.3.3).
+    #[test]
+    fn resolved_settings_record_the_requested_tier_not_just_the_effective_one() {
+        let explicit = resolve_effective_render_settings_for_gpu(
+            &RenderSettings {
+                quality: Some(RenderQuality::Low),
+                ..RenderSettings::default()
+            },
+            Some(discrete_gpu_fixture()),
+        );
+        assert_eq!(explicit.requested, RenderQuality::Low);
+        assert_eq!(explicit.tier, RenderQuality::Low);
+
+        let auto = resolve_effective_render_settings_for_gpu(
+            &RenderSettings::default(),
+            Some(discrete_gpu_fixture()),
+        );
+        assert_eq!(
+            auto.requested,
+            RenderQuality::Auto,
+            "Auto must survive resolution; the effective tier alone loses it"
+        );
+        assert_ne!(
+            auto.tier,
+            RenderQuality::Auto,
+            "Auto must still resolve to a concrete rung"
+        );
+    }
+
+    #[test]
+    fn adaptive_governor_engages_only_for_auto_quality() {
+        let auto = resolve_effective_render_settings_for_gpu(
+            &RenderSettings::default(),
+            Some(discrete_gpu_fixture()),
+        );
+        assert!(
+            AdaptiveQualityGovernor::for_launch(&auto).is_active(),
+            "an Auto launch must adapt to measured frame times"
+        );
+
+        for pinned in [
+            RenderQuality::Potato,
+            RenderQuality::Low,
+            RenderQuality::Medium,
+            RenderQuality::High,
+            RenderQuality::Ultra,
+        ] {
+            let explicit = resolve_effective_render_settings_for_gpu(
+                &RenderSettings {
+                    quality: Some(pinned),
+                    ..RenderSettings::default()
+                },
+                Some(discrete_gpu_fixture()),
+            );
+            assert!(
+                !AdaptiveQualityGovernor::for_launch(&explicit).is_active(),
+                "explicit {pinned:?} must never be overridden by the governor"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_tier_override_permanently_disengages_the_governor() {
+        let auto = resolve_effective_render_settings_for_gpu(
+            &RenderSettings::default(),
+            Some(discrete_gpu_fixture()),
+        );
+        let mut governor = AdaptiveQualityGovernor::for_launch(&auto);
+        assert!(governor.is_active());
+
+        governor.relinquish_to_operator();
+        assert!(
+            !governor.is_active(),
+            "the operator's manual pick must not be silently overwritten later"
+        );
+
+        // Idempotent: releasing twice is not an error and does not re-engage.
+        governor.relinquish_to_operator();
+        assert!(!governor.is_active());
+    }
+
+    /// Guards the seam this bead exists to close: before it, the governor had
+    /// no production consumer, so the tier was startup-only no matter how badly
+    /// frames ran. If the wiring is deleted, this fails.
+    #[test]
+    fn production_update_schedule_drives_the_adaptive_governor() {
+        let production = include_str!("lib.rs");
+        assert!(
+            production.contains("drive_adaptive_quality,"),
+            "drive_adaptive_quality must stay registered in the Update schedule"
+        );
+        assert!(
+            production.contains("AdaptiveQualityGovernor::for_launch("),
+            "run_renderer must construct the governor resource"
         );
     }
 
