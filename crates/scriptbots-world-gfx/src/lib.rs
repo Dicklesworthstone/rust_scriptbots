@@ -969,12 +969,46 @@ impl ReadbackRing {
         })
     }
 
+    /// Resolve the copy layout's non-zero dimensions, or say which contract broke.
+    ///
+    /// `copy_texture_to_buffer` requires a non-zero row pitch and row count.
+    /// These were previously `NonZeroU32::new(..).unwrap()`, so a ring whose
+    /// layout had been accepted with a zero row pitch or a zero height
+    /// PANICKED inside the readback path — the one place this bead says must
+    /// return a typed error instead. `validate_readback_layout` should already
+    /// have refused such a ring, which is exactly why the failure was invisible:
+    /// an invariant enforced in one place and asserted by panic in another
+    /// reports a bug as a crash with no attribution.
+    ///
+    /// Split out as a pure function so `copy` and its tests share one decision
+    /// and the check can be exercised without a GPU adapter.
+    fn copy_layout_dimensions(
+        bytes_per_row: u32,
+        extent: (u32, u32),
+    ) -> Result<(std::num::NonZeroU32, std::num::NonZeroU32), ReadbackError> {
+        let (width, height) = extent;
+        let rows = std::num::NonZeroU32::new(height)
+            .ok_or(ReadbackError::ZeroDimensions { width, height })?;
+        let pitch = std::num::NonZeroU32::new(bytes_per_row).ok_or_else(|| {
+            ReadbackError::Resize(format!(
+                "readback row pitch is zero for a {width}x{height} extent; the layout was \
+                 admitted without a copyable row size"
+            ))
+        })?;
+        Ok((pitch, rows))
+    }
+
     fn copy(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         color: &wgpu::Texture,
     ) -> Result<(), ReadbackError> {
+        // Validated BEFORE any slot state is disturbed, so a rejected copy
+        // leaves the ring exactly as it was rather than half-reset (bd-2z0.7.11).
+        let (bytes_per_row, rows_per_image) =
+            Self::copy_layout_dimensions(self.bytes_per_row, self.extent)?;
+
         let slot = &mut self.slots[self.curr];
         slot.ready = false;
         if slot.mapped.load(Ordering::Relaxed) {
@@ -990,10 +1024,8 @@ impl ReadbackRing {
                 buffer: &slot.buf,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(
-                        std::num::NonZeroU32::new(self.bytes_per_row).unwrap().get(),
-                    ),
-                    rows_per_image: Some(std::num::NonZeroU32::new(self.extent.1).unwrap().get()),
+                    bytes_per_row: Some(bytes_per_row.get()),
+                    rows_per_image: Some(rows_per_image.get()),
                 },
             },
             wgpu::Extent3d {
@@ -1104,6 +1136,72 @@ mod tests {
         AccessibilityPalette, TerrainKind,
         visual::{self, SplatInput, TerrainSurfaceInput},
     };
+
+    /// A zero row count must be reported, not asserted by panic.
+    ///
+    /// This path previously read `NonZeroU32::new(self.extent.1).unwrap()`
+    /// inside the readback copy. A ring that reached it with a zero height
+    /// aborted the process from within the GPU capture path — the exact place
+    /// this bead requires a typed, attributable error.
+    #[test]
+    fn a_zero_readback_height_is_typed_rather_than_panicking() {
+        let error = super::ReadbackRing::copy_layout_dimensions(256, (640, 0))
+            .expect_err("a zero height cannot produce a copyable layout");
+        match error {
+            ReadbackError::ZeroDimensions { width, height } => {
+                assert_eq!(
+                    (width, height),
+                    (640, 0),
+                    "the refusal must name the extent"
+                );
+            }
+            other => panic!("expected ZeroDimensions, got {other:?}"),
+        }
+    }
+
+    /// A zero row pitch is a layout contract failure, and the message has to say
+    /// so — `Resize` is documented as covering unsupported readback layouts.
+    #[test]
+    fn a_zero_readback_row_pitch_is_typed_rather_than_panicking() {
+        let error = super::ReadbackRing::copy_layout_dimensions(0, (640, 360))
+            .expect_err("a zero row pitch cannot produce a copyable layout");
+        match error {
+            ReadbackError::Resize(message) => {
+                assert!(
+                    message.contains("640x360"),
+                    "the refusal must name the extent it was asked to copy: {message}"
+                );
+                assert!(
+                    message.contains("row pitch"),
+                    "the refusal must name what was wrong: {message}"
+                );
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+    }
+
+    /// Height is checked before pitch, so a ring that is wrong in both ways
+    /// reports the zero extent — the more fundamental fact — rather than a
+    /// derived row-pitch symptom.
+    #[test]
+    fn a_doubly_invalid_layout_reports_the_zero_extent_first() {
+        let error = super::ReadbackRing::copy_layout_dimensions(0, (0, 0))
+            .expect_err("nothing about this layout is copyable");
+        assert!(
+            matches!(error, ReadbackError::ZeroDimensions { .. }),
+            "the zero extent is the cause; the zero pitch is downstream of it: {error:?}"
+        );
+    }
+
+    /// An ordinary layout still resolves, so the guard rejects only the
+    /// genuinely impossible.
+    #[test]
+    fn a_valid_readback_layout_resolves_to_its_dimensions() {
+        let (pitch, rows) = super::ReadbackRing::copy_layout_dimensions(2_560, (640, 360))
+            .expect("an aligned 640x360 layout is copyable");
+        assert_eq!(pitch.get(), 2_560);
+        assert_eq!(rows.get(), 360);
+    }
 
     /// Every shipped WGSL source must parse and pass naga semantic validation.
     ///
