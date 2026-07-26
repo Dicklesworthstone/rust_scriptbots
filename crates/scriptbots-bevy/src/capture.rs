@@ -342,6 +342,40 @@ pub fn pixel_evidence_verdict(gpu: Option<&scriptbots_core::GpuInfo>) -> PixelEv
     }
 }
 
+/// Explain a blank capture in terms of what the lane could ever have proven
+/// (bd-2z0.14.3.3 item 4).
+///
+/// The blank guard used to report only its symptom — "produced a blank or
+/// uniform RGB frame" — which reads identically in two situations that call for
+/// opposite responses:
+///
+/// * a software rasterizer, where a uniform frame is the KNOWN behaviour of a
+///   lane that was never able to certify pixels. Nothing is broken; the run
+///   asked the wrong lane for evidence.
+/// * a discrete or integrated GPU, where a uniform frame means the pipeline
+///   genuinely failed. Something IS broken, and reading it as a lane limitation
+///   would file a real rendering bug as an environment quirk.
+///
+/// Collapsing those into one message is how a harness trains its readers to
+/// ignore it. The verdict is sourced from [`pixel_evidence_verdict`] rather than
+/// re-deciding here, so there is exactly one place that knows which adapters can
+/// certify pixels.
+fn blank_frame_error(gpu: Option<&scriptbots_core::GpuInfo>) -> anyhow::Error {
+    match pixel_evidence_verdict(gpu) {
+        PixelEvidenceVerdict::SmokeOnly(reason) => anyhow!(
+            "offscreen capture produced a blank or uniform RGB frame, and this lane \
+             could not have certified pixels in the first place: {reason}"
+        ),
+        PixelEvidenceVerdict::Admissible => anyhow!(
+            "offscreen capture produced a blank or uniform RGB frame on {}, an adapter \
+             that IS admissible for pixel evidence — so this is a real pipeline failure \
+             (camera, lighting, extraction or readback), not a lane limitation, and it \
+             must not be dismissed as one",
+            gpu.map_or("an unknown adapter", |info| info.name.as_str())
+        ),
+    }
+}
+
 /// Side length of the SSIM window, in pixels.
 const SSIM_WINDOW: usize = 8;
 
@@ -1080,9 +1114,7 @@ impl<'a> OffscreenCapture<'a> {
             ));
         }
         if rgba8_is_visually_blank(&rgba8) {
-            return Err(anyhow!(
-                "offscreen capture produced a blank or uniform RGB frame"
-            ));
+            return Err(blank_frame_error(self.effective.gpu.as_ref()));
         }
         Ok(CapturedFrame {
             width,
@@ -2173,6 +2205,52 @@ mod tests {
             reason.contains("no GPU adapter"),
             "an absent adapter must not be reported as a software rasterizer: {reason}"
         );
+    }
+
+    /// A blank frame from a software rasterizer must be explained as a lane
+    /// limitation, naming the adapter, and must stay actionable.
+    #[test]
+    fn a_blank_frame_on_a_software_lane_is_explained_as_a_lane_limitation() {
+        let error = blank_frame_error(Some(&gpu_info(
+            "llvmpipe (LLVM 21.1.8, 256 bits)",
+            scriptbots_core::GpuClass::Software,
+        )))
+        .to_string();
+        assert!(
+            error.contains("could not have certified pixels"),
+            "the message must say the lane was never able to prove this: {error}"
+        );
+        assert!(
+            error.contains("llvmpipe"),
+            "the message must name the adapter it is talking about: {error}"
+        );
+    }
+
+    /// The same blank frame on capable hardware is the OPPOSITE finding, and the
+    /// message must not let a reader file it as an environment quirk.
+    ///
+    /// This is the distinction the old single message destroyed: identical text
+    /// for "this lane never could" and "your pipeline just broke".
+    #[test]
+    fn a_blank_frame_on_capable_hardware_is_reported_as_a_real_pipeline_failure() {
+        for class in [
+            scriptbots_core::GpuClass::Discrete,
+            scriptbots_core::GpuClass::Integrated,
+        ] {
+            let error = blank_frame_error(Some(&gpu_info("Apple M4", class))).to_string();
+            assert!(
+                error.contains("real pipeline failure"),
+                "{class:?} must be reported as a genuine failure: {error}"
+            );
+            assert!(
+                error.contains("Apple M4"),
+                "the message must name the adapter: {error}"
+            );
+            assert!(
+                !error.contains("could not have certified pixels"),
+                "capable hardware must never be excused as a lane limitation: {error}"
+            );
+        }
     }
 
     /// Real hardware stays admissible, so this decision narrows nothing that
