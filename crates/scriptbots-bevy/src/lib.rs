@@ -519,6 +519,10 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             handle_playback_shortcuts,
             handle_playback_buttons,
             handle_tonemap_mode_buttons,
+            // Nested so the outer tuple stays within Bevy's 20-system arity
+            // limit; the inner .chain() preserves strict ordering, so the
+            // button still runs before the system that applies its effect.
+            (handle_quality_tier_button, apply_tier_to_sun_light).chain(),
             handle_auto_exposure_toggle,
             handle_exposure_adjust_buttons,
             handle_palette_shortcuts,
@@ -1247,6 +1251,17 @@ struct HudElements {
     history: Entity,
     brain: Entity,
 }
+
+/// The sun light whose shadow state follows the resolved quality tier.
+///
+/// Marked so [`apply_tier_to_sun_light`] can re-apply on a runtime tier change
+/// rather than the tier only mattering at startup (bd-2z0.14.1.17).
+#[derive(Component)]
+struct TierDrivenSunLight;
+
+/// Cycles the render quality tier at runtime.
+#[derive(Component)]
+struct QualityTierButton;
 
 #[derive(Component)]
 struct FollowButton {
@@ -2133,7 +2148,11 @@ fn assign_presentation_revision(
     Ok(true)
 }
 
-fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
+fn setup_scene(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    effective: Res<EffectiveRenderSettings>,
+) {
     let camera_transform = Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y);
     commands.spawn((
         Camera3d::default(),
@@ -2153,16 +2172,20 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 
     let light_transform =
         Transform::from_xyz(-1200.0, 1800.0, 900.0).looking_at(Vec3::ZERO, Vec3::Y);
+    // bd-2z0.14.1.17: the FIRST live consumer of the resolved quality tier.
+    // Before this the tier was probed against a real GPU, logged, inserted as a
+    // resource, and read by nobody — Potato and Ultra rendered identically.
     commands.spawn((
         DirectionalLight {
             illuminance: 9000.0,
-            shadows_enabled: true,
+            shadows_enabled: effective.features.shadows,
             ..default()
         },
         light_transform,
         GlobalTransform::default(),
         Visibility::default(),
         InheritedVisibility::default(),
+        TierDrivenSunLight,
     ));
 
     let body_mesh = meshes.add(Mesh::from(Capsule3d::new(0.5, 1.6)));
@@ -2475,6 +2498,22 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                 .with_children(|btn| {
                     btn.spawn((
                         Text::new("Auto Exposure"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    QualityTierButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Quality"),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
@@ -3184,6 +3223,83 @@ mod visual_authority_consumer_guard {
         assert!(
             !sources.iter().any(|text| text.contains(invented)),
             "the detection this guard relies on is broken if an invented name appears to be consumed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quality_tier_consumer_tests {
+    use super::*;
+
+    /// The defect this bead names, as an assertion: the resolved tier must be
+    /// READ by a live system, not merely resolved, logged and inserted.
+    ///
+    /// Before bd-2z0.14.1.17 there was no `Res<EffectiveRenderSettings>`
+    /// anywhere in the workspace, so Potato and Ultra rendered identically and
+    /// nothing detected it.
+    #[test]
+    fn the_resolved_tier_has_a_live_reader() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod quality_tier_consumer_tests")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            production.contains("Res<EffectiveRenderSettings>")
+                || production.contains("ResMut<EffectiveRenderSettings>"),
+            "the quality tier must be read by a live system; if this fails the \
+             tier has gone inert again and Potato renders like Ultra"
+        );
+        assert!(
+            production.contains("shadows_enabled: effective.features.shadows"),
+            "the sun light must take its shadow state from the tier, not a literal"
+        );
+    }
+
+    /// Cycling must always move, and must never land on Auto.
+    ///
+    /// Auto is a REQUEST meaning resolve-against-the-adapter, not a tier.
+    /// Cycling into it would mean re-probing the GPU from an input handler.
+    #[test]
+    fn tier_cycle_covers_every_concrete_tier_and_never_yields_auto() {
+        let mut seen = Vec::new();
+        let mut tier = RenderQuality::Potato;
+        for _ in 0..5 {
+            seen.push(tier);
+            assert_ne!(
+                next_quality_tier(tier),
+                RenderQuality::Auto,
+                "cycling must never produce Auto"
+            );
+            tier = next_quality_tier(tier);
+        }
+        assert_eq!(tier, RenderQuality::Potato, "the cycle must wrap");
+        for expected in [
+            RenderQuality::Potato,
+            RenderQuality::Low,
+            RenderQuality::Medium,
+            RenderQuality::High,
+            RenderQuality::Ultra,
+        ] {
+            assert!(seen.contains(&expected), "cycle skipped {expected:?}");
+        }
+        // Auto is an accepted INPUT, and resolves somewhere concrete.
+        assert_eq!(
+            next_quality_tier(RenderQuality::Auto),
+            RenderQuality::Potato
+        );
+    }
+
+    /// The tier must actually change what the frame looks like, or the toggle
+    /// is a label. Potato and Ultra must disagree about shadows.
+    #[test]
+    fn tier_change_visibly_changes_shadow_state() {
+        assert!(
+            !tier_features(RenderQuality::Potato).shadows,
+            "Potato must disable shadows, else the wiring proves nothing"
+        );
+        assert!(
+            tier_features(RenderQuality::Ultra).shadows,
+            "Ultra must enable shadows"
         );
     }
 }
@@ -3966,6 +4082,58 @@ fn handle_clear_selection_button(
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
         }
+    }
+}
+
+/// Advance the quality tier through the concrete tiers, skipping Auto.
+///
+/// Auto is a REQUEST, not a tier: it means "resolve against the probed
+/// adapter". Cycling into it at runtime would mean re-probing the GPU from an
+/// input handler, so the cycle stays over concrete tiers only (bd-2z0.14.1.17).
+const fn next_quality_tier(tier: RenderQuality) -> RenderQuality {
+    match tier {
+        RenderQuality::Potato => RenderQuality::Low,
+        RenderQuality::Low => RenderQuality::Medium,
+        RenderQuality::Medium => RenderQuality::High,
+        RenderQuality::High => RenderQuality::Ultra,
+        // Ultra wraps, and Auto resolves to the low end so a click always moves.
+        RenderQuality::Ultra | RenderQuality::Auto => RenderQuality::Potato,
+    }
+}
+
+fn handle_quality_tier_button(
+    mut effective: ResMut<EffectiveRenderSettings>,
+    mut query: Query<&Interaction, (Changed<Interaction>, With<QualityTierButton>)>,
+) {
+    for interaction in &mut query {
+        if *interaction == Interaction::Pressed {
+            let next = next_quality_tier(effective.tier);
+            effective.tier = next;
+            effective.features = tier_features(next);
+            info!(
+                tier = ?next,
+                shadows = effective.features.shadows,
+                ssao = effective.features.ssao,
+                bloom = effective.features.bloom,
+                "Bevy quality tier changed at runtime"
+            );
+        }
+    }
+}
+
+/// Re-apply the tier to the sun light whenever the tier changes.
+///
+/// This is what makes the toggle more than a label: without it the tier would
+/// still be startup-only, which is the defect this bead names.
+fn apply_tier_to_sun_light(
+    effective: Res<EffectiveRenderSettings>,
+    mut lights: Query<&mut DirectionalLight, With<TierDrivenSunLight>>,
+) {
+    if !effective.is_changed() {
+        return;
+    }
+    for mut light in &mut lights {
+        light.shadows_enabled = effective.features.shadows;
     }
 }
 
