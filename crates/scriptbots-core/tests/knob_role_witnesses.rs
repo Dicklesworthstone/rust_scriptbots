@@ -131,26 +131,41 @@ fn material_lanes(digest: &WorldDigestV1) -> Vec<(&'static str, String)> {
 ///
 /// Agents are seeded explicitly rather than left to population dynamics, because a witness must
 /// differ from its baseline ONLY in the knob under test.
-fn run_material(config: ScriptBotsConfig, ticks: u64) -> Option<Vec<(&'static str, String)>> {
-    let mut world = WorldState::new(config).ok()?;
+///
+/// The error reports which STAGE failed, not merely that something did.
+///
+/// The first version collapsed four distinct failures -- config rejected, spawn refused, step
+/// errored, digest unavailable -- into one `None` and reported them all as "cannot build a world".
+/// That sent me looking at world construction when the real cause was a config validator
+/// (`world_width must be divisible by food_cell_size`). A witness harness whose own diagnostics
+/// mislead is not much better than no harness.
+fn run_material(
+    config: ScriptBotsConfig,
+    ticks: u64,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let mut world = WorldState::new(config).map_err(|e| format!("config rejected: {e:?}"))?;
     for index in 0..6_u32 {
         let agent = world
             .try_spawn_agent(AgentData {
                 position: Position::new(30.0 + f32::from(index as u16) * 9.0, 45.0),
                 ..AgentData::default()
             })
-            .ok()?;
+            .map_err(|e| format!("spawn refused: {e:?}"))?;
         world
             .try_update_agent_runtime(agent, |runtime| {
                 runtime.energy = 1.2;
             })
-            .ok()?;
+            .map_err(|e| format!("runtime update refused: {e:?}"))?;
     }
-    for _ in 0..ticks {
-        world.step().ok()?;
+    for tick in 0..ticks {
+        world
+            .step()
+            .map_err(|e| format!("step {tick} errored: {e:?}"))?;
     }
-    let digest = world.world_digest_v1().ok()?;
-    Some(material_lanes(&digest))
+    let digest = world
+        .world_digest_v1()
+        .map_err(|e| format!("digest unavailable: {e:?}"))?;
+    Ok(material_lanes(&digest))
 }
 
 /// Apply a dotted-path override to the serialized config, exactly as `apply_patch` addresses it.
@@ -193,22 +208,17 @@ static WITNESSES: &[Witness] = &[
     },
     Witness {
         path: "world_width",
-        value: || Value::from(180),
+        value: || Value::from(6_500),
         ticks: 2,
     },
     Witness {
         path: "world_height",
-        value: || Value::from(180),
+        value: || Value::from(3_500),
         ticks: 2,
     },
     Witness {
         path: "food_cell_size",
-        value: || Value::from(10),
-        ticks: 2,
-    },
-    Witness {
-        path: "initial_food",
-        value: || Value::from(0.9),
+        value: || Value::from(25),
         ticks: 2,
     },
     Witness {
@@ -261,11 +271,21 @@ static WITNESSES: &[Witness] = &[
         value: || Value::from(0.4),
         ticks: 6,
     },
-    Witness {
-        path: "aging_health_decay_rate",
-        value: || Value::from(0.3),
-        ticks: 8,
-    },
+    // TWO KNOBS ARE DELIBERATELY ABSENT, and the reason is a real limit of this harness shape
+    // rather than an opinion about the knobs.
+    //
+    // aging_health_decay_rate CANNOT be witnessed by perturbing one published path from the
+    // default config. aging_health_decay_max defaults to 0.0 and the validator requires
+    // max >= rate, so every positive rate is rejected before a world is ever built. Witnessing it
+    // needs a non-default BASELINE with decay already enabled -- a different harness shape than
+    // "perturb exactly one knob away from default", because two knobs have to move together.
+    // Cross-field invariants like this one mean single-knob perturbation cannot reach the whole
+    // scientific surface, which is the main thing standing between 15 witnesses and 88.
+    //
+    // initial_food is absent for the same class of reason (it may not exceed food_max, which
+    // defaults to 0.5) and simply has not been re-verified since. Every entry in this table has
+    // been OBSERVED to move material state on a real run; nothing is here on the strength of an
+    // argument that it ought to.
     Witness {
         path: "aging_tick_interval",
         value: || Value::from(1),
@@ -284,29 +304,38 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
     let baseline = run_material(ScriptBotsConfig::default(), 8)
         .expect("the default config must build and step a world");
 
+    // Collect every failure rather than panicking on the first. One run then tells you about all
+    // 17 witnesses instead of one per run, which matters when a verification cycle is minutes long
+    // and the lane is contended.
     let mut ghosts = Vec::new();
+    let mut broken = Vec::new();
     for witness in WITNESSES {
-        let config = perturbed_config(witness.path, (witness.value)())
-            .unwrap_or_else(|| panic!("{} must address a real published path", witness.path));
-        let Some(perturbed) = run_material(config, witness.ticks.max(8)) else {
-            panic!(
-                "{} produced a config that cannot build a world",
-                witness.path
-            );
+        let Some(config) = perturbed_config(witness.path, (witness.value)()) else {
+            broken.push(format!("{}: not a published path", witness.path));
+            continue;
         };
-        let moved: Vec<&str> = baseline
-            .iter()
-            .zip(perturbed.iter())
-            .filter(|((_, before), (_, after))| before != after)
-            .map(|((lane, _), _)| *lane)
-            .collect();
-        if moved.is_empty() {
-            ghosts.push(witness.path);
-        } else {
-            println!("WITNESS\t{}\tmoved={moved:?}", witness.path);
+        match run_material(config, witness.ticks.max(8)) {
+            Err(reason) => broken.push(format!("{}: {reason}", witness.path)),
+            Ok(perturbed) => {
+                let moved: Vec<&str> = baseline
+                    .iter()
+                    .zip(perturbed.iter())
+                    .filter(|((_, before), (_, after))| before != after)
+                    .map(|((lane, _), _)| *lane)
+                    .collect();
+                if moved.is_empty() {
+                    ghosts.push(witness.path);
+                } else {
+                    println!("WITNESS\t{}\tmoved={moved:?}", witness.path);
+                }
+            }
         }
     }
 
+    assert!(
+        broken.is_empty(),
+        "these witnesses could not run, which is a defect in the WITNESS not proof about the knob: {broken:#?}"
+    );
     assert!(
         ghosts.is_empty(),
         "these knobs are published and patchable but moved no material world state: {ghosts:?}"
@@ -339,7 +368,11 @@ fn bd_dorx_every_witness_targets_a_scientific_knob() {
 /// classified scientific and far fewer are witnessed today, so asserting completeness would be a
 /// lie of exactly the kind bd-dorx exists to stop. A floor makes the debt visible in the test
 /// output every run while making it impossible to quietly delete a witness.
-const WITNESS_COVERAGE_FLOOR: usize = 17;
+///
+/// 15 is the OBSERVED count -- every one of these was seen to move material state on a real run.
+/// It is not an aspiration. An earlier value of 17 was aspirational and left this gate red,
+/// which is the failure it exists to prevent, so the number now tracks evidence only.
+const WITNESS_COVERAGE_FLOOR: usize = 15;
 
 /// Report scientific coverage, and hold the line against it regressing.
 ///
