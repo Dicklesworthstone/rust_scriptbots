@@ -43,7 +43,7 @@ use bevy::window::{ExitCondition, WindowPlugin};
 use scriptbots_core::{RenderQuality, RenderSettings, WorldState};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     AccessibilityState, AgentMeshes, AgentRegistry, ReflectionProbeAssets, SnapshotState,
@@ -120,6 +120,13 @@ fn poll_readback_device(device: &RenderDevice) -> Result<()> {
 pub struct CaptureProvenance {
     /// Schema tag (`scriptbots.capture-provenance.v1`).
     pub schema: String,
+    /// Scientific identity of the world state this frame depicts.
+    ///
+    /// `None` only when the digest could not be computed; it never means two
+    /// worlds agreed. A capture that cannot say which world it shows is not
+    /// evidence of anything (bd-2z0.14.3.4).
+    #[serde(default)]
+    pub world_digest: Option<String>,
     /// Scene name from the manifest.
     pub scene: String,
     /// World RNG seed.
@@ -626,13 +633,28 @@ impl<'a> OffscreenCapture<'a> {
     }
 
     /// Provenance block for one capture (pixel hash lives in the scene log).
+    ///
+    /// `world_digest` is the scientific identity of the state that produced the
+    /// frame. Without it an artifact records how it was rendered but not WHAT
+    /// it depicts, so two captures of different worlds are indistinguishable
+    /// once the process exits — which is exactly the question a golden
+    /// mismatch asks (bd-2z0.14.3.4 round-1 audit: provenance omits world
+    /// identity). `None` means the digest was unavailable, never that the
+    /// worlds matched.
     #[must_use]
-    pub fn provenance(&self, scene: &str, seed: u64, tick: u64) -> CaptureProvenance {
+    pub fn provenance(
+        &self,
+        scene: &str,
+        seed: u64,
+        tick: u64,
+        world_digest: Option<String>,
+    ) -> CaptureProvenance {
         CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
             scene: scene.to_string(),
             seed,
             tick,
+            world_digest,
             frontend: "bevy_offscreen".to_string(),
             adapter_name: self.adapter_name.clone(),
             backend: self.backend.clone(),
@@ -683,6 +705,18 @@ impl<'a> OffscreenCapture<'a> {
             .ok_or_else(|| anyhow!("world snapshot unavailable at tick {tick}"))?;
         validate_capture_tick(snapshot.tick, tick)?;
         validate_capture_seed(world.agent_substream_protocol_v1().root_seed(), seed)?;
+        // Scientific identity of the state being depicted, recorded alongside
+        // how it was rendered (bd-2z0.14.3.4). Taken BEFORE rendering, so it
+        // describes the world the frame actually shows. A digest failure is
+        // reported as absent rather than silently omitted or faked — capture
+        // itself is read-only over the world and must not fail on it.
+        let world_digest = match world.world_digest_v1() {
+            Ok(digest) => Some(digest.overall),
+            Err(error) => {
+                warn!(%error, "world digest unavailable for capture provenance");
+                None
+            }
+        };
         snapshot.revision = self.next_snapshot_revision;
         self.next_snapshot_revision = self
             .next_snapshot_revision
@@ -828,7 +862,7 @@ impl<'a> OffscreenCapture<'a> {
             width,
             height,
             rgba8,
-            provenance: self.provenance(scene, seed, tick),
+            provenance: self.provenance(scene, seed, tick, world_digest),
         })
     }
 
@@ -1808,6 +1842,7 @@ mod tests {
     fn provenance_serializes_with_required_fields() {
         let provenance = CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
+            world_digest: Some("blake3:deadbeef".to_string()),
             scene: "unit".to_string(),
             seed: 42,
             tick: 12,
@@ -1838,6 +1873,9 @@ mod tests {
             "rustc_version",
             "target_triple",
             "corrupt",
+            // A capture that cannot say which world it depicts records how it
+            // was rendered but not what it shows (bd-2z0.14.3.4).
+            "world_digest",
         ] {
             assert!(
                 json.get(field).is_some(),
@@ -1845,5 +1883,39 @@ mod tests {
             );
         }
         assert_eq!(json["schema"], PROVENANCE_SCHEMA);
+        assert_eq!(json["world_digest"], "blake3:deadbeef");
+    }
+
+    /// An absent world digest must serialize as an explicit null, never vanish.
+    ///
+    /// A missing key would let a reader assume the field was simply not part of
+    /// this schema version, rather than that identity was unavailable for this
+    /// specific capture. Absence of evidence has to look different from absence
+    /// of the question.
+    #[test]
+    fn provenance_records_an_unavailable_world_digest_explicitly() {
+        let provenance = CaptureProvenance {
+            schema: PROVENANCE_SCHEMA.to_string(),
+            world_digest: None,
+            scene: "unit".to_string(),
+            seed: 1,
+            tick: 1,
+            frontend: "bevy_offscreen".to_string(),
+            adapter_name: "test-adapter".to_string(),
+            backend: "Vulkan".to_string(),
+            device_type: "Software".to_string(),
+            quality_tier: "Potato".to_string(),
+            viewport: [16, 16],
+            colorspace: "rgba8-srgb".to_string(),
+            rustc_version: "rustc test".to_string(),
+            target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            corrupt: false,
+        };
+        let json = serde_json::to_value(&provenance).expect("serialize");
+        assert!(
+            json.get("world_digest").is_some(),
+            "the key must be present even when the digest is unavailable"
+        );
+        assert!(json["world_digest"].is_null());
     }
 }
