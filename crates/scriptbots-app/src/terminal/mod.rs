@@ -5387,6 +5387,19 @@ const CANVAS_BOOST_FLARE: f32 = 1.6;
 /// Spike length above which the canvas paints an attack cue.
 const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
 
+/// Minimap edge as a fraction of the canvas.
+const CANVAS_MINIMAP_FRACTION: u16 = 4;
+
+/// Smallest useful minimap edge in sub-pixels. Below this the thumbnail cannot
+/// show a viewport rectangle distinct from its own border, so it is omitted
+/// rather than drawn as a meaningless smudge.
+const CANVAS_MINIMAP_MIN_EDGE: u16 = 8;
+
+/// Thumbnail alpha, deliberately below [`subcell::ALPHA_SOLID`] so the world
+/// thumbnail lands in cell backgrounds and leaves the lit dots for the viewport
+/// rectangle — the one thing the minimap exists to communicate.
+const CANVAS_MINIMAP_ALPHA: f32 = 0.4;
+
 /// Click/hover pick radius, as a fraction of the visible window.
 ///
 /// Scaled by the viewport span rather than fixed in world units, so the radius
@@ -5658,6 +5671,77 @@ impl MapWidget<'_> {
     /// This is the resolution win: the buffer is 2x4 sub-pixels per terminal
     /// cell in braille mode, so terrain and food are sampled — and agents are
     /// placed — at eight times the cell grid's density.
+    /// Corner thumbnail of the whole world with the visible window outlined.
+    ///
+    /// Only drawn while zoomed. At 1x the canvas already IS the whole world, so
+    /// a thumbnail would be a second copy of what the user is looking at and the
+    /// rectangle would trace its own border — decoration that costs screen and
+    /// says nothing.
+    fn paint_minimap(canvas: &mut SubCellBuffer, ctx: &MapWidget<'_>) {
+        let view = ctx.viewport;
+        if view.span >= 1.0 {
+            return;
+        }
+        let (sub_w, sub_h) = (canvas.sub_width(), canvas.sub_height());
+        let box_w = sub_w / CANVAS_MINIMAP_FRACTION;
+        let box_h = sub_h / CANVAS_MINIMAP_FRACTION;
+        if box_w < CANVAS_MINIMAP_MIN_EDGE
+            || box_h < CANVAS_MINIMAP_MIN_EDGE
+            || box_w >= sub_w
+            || box_h >= sub_h
+        {
+            return;
+        }
+        // Top-right: the world canvas is densest toward its centre, and the HUD
+        // panels already own the bottom.
+        let origin_x = sub_w - box_w;
+
+        // Thumbnail of the entire world, dim, in the cell backgrounds.
+        for by in 0..box_h {
+            let v = (f32::from(by) + 0.5) / f32::from(box_h);
+            for bx in 0..box_w {
+                let u = (f32::from(bx) + 0.5) / f32::from(box_w);
+                let base = ctx.palette.terrain_canvas_rgb(ctx.terrain.sample(u, v));
+                canvas.set(
+                    Layer::Selection,
+                    origin_x + bx,
+                    by,
+                    [base[0], base[1], base[2], CANVAS_MINIMAP_ALPHA],
+                );
+            }
+        }
+
+        // The visible window, as lit dots. This is the payload: at 8x zoom the
+        // canvas alone gives no clue which eighth of the world it is showing.
+        let half = view.span / 2.0;
+        let to_box = |value: f32, edge: u16| -> u16 {
+            let scaled = (value * f32::from(edge)).floor();
+            let clamped = scaled.clamp(0.0, f32::from(edge - 1));
+            clamped as u16
+        };
+        let x0 = to_box(view.centre.0 - half, box_w);
+        let x1 = to_box(view.centre.0 + half, box_w);
+        let y0 = to_box(view.centre.1 - half, box_h);
+        let y1 = to_box(view.centre.1 + half, box_h);
+        let ink = ctx.palette.accent_canvas_rgb();
+        let mut mark = |bx: u16, by: u16| {
+            canvas.set(
+                Layer::Selection,
+                origin_x + bx,
+                by,
+                [ink[0], ink[1], ink[2], 1.0],
+            );
+        };
+        for bx in x0..=x1 {
+            mark(bx, y0);
+            mark(bx, y1);
+        }
+        for by in y0..=y1 {
+            mark(x0, by);
+            mark(x1, by);
+        }
+    }
+
     fn render_canvas(
         canvas: &mut SubCellBuffer,
         density: &mut Vec<u16>,
@@ -5887,6 +5971,8 @@ impl MapWidget<'_> {
                 }
             }
         }
+
+        Self::paint_minimap(canvas, ctx);
 
         // Quantize through the engine's own quantizer so a 16- or 256-color
         // terminal is handed a color it can actually reproduce instead of a
@@ -7414,6 +7500,99 @@ mod tests {
         assert_eq!(snapshot.tick, world.tick().0);
         assert_eq!(snapshot.agents.len(), world.agent_count());
         assert_eq!(snapshot.world_size.0, world.config().world_width);
+    }
+
+    /// The minimap only earns its screen space while zoomed: at 1x it would be a
+    /// second copy of the canvas with a rectangle tracing its own border.
+    #[test]
+    fn the_minimap_appears_only_when_zoomed() {
+        let terrain = canvas_test_terrain();
+        let snapshot = Snapshot::default();
+        let frame_at = |zoom: f32| {
+            render_canvas_frame_viewport(
+                &snapshot,
+                &terrain,
+                (32, 16),
+                (0, 0.0),
+                canvas_test_capability(),
+                CanvasViewport::new(zoom, (0.5, 0.5)),
+            )
+        };
+        // A 32x16 cell canvas is a 64x64 sub-grid; a quarter edge is 16, so the
+        // thumbnail occupies sub-pixels x 48..64, y 0..16 — cells x 24..32, y 0..4.
+        // The world here is empty, so any lit dot in that region is the viewport
+        // rectangle and nothing else.
+        let lit_in_minimap = |buf: &Buffer| {
+            let mut lit = 0;
+            for y in 0..4_u16 {
+                for x in 24..32_u16 {
+                    if buf_symbol(buf, (x, y)) != "\u{2800}" {
+                        lit += 1;
+                    }
+                }
+            }
+            lit
+        };
+
+        assert_eq!(
+            lit_in_minimap(&frame_at(1.0)),
+            0,
+            "an unzoomed canvas must not draw a minimap"
+        );
+        assert!(
+            lit_in_minimap(&frame_at(CANVAS_MAX_ZOOM)) > 0,
+            "a zoomed canvas must outline its viewport in the corner thumbnail"
+        );
+    }
+
+    /// The rectangle must track the window, not sit in a fixed spot: a marker
+    /// that never moves tells the user nothing about where they are.
+    #[test]
+    fn the_minimap_rectangle_moves_with_the_viewport() {
+        let terrain = canvas_test_terrain();
+        let snapshot = Snapshot::default();
+        let frame_centred_on = |centre: (f32, f32)| {
+            render_canvas_frame_viewport(
+                &snapshot,
+                &terrain,
+                (32, 16),
+                (0, 0.0),
+                canvas_test_capability(),
+                CanvasViewport::new(CANVAS_MAX_ZOOM, centre),
+            )
+        };
+        assert_ne!(
+            frame_centred_on((0.15, 0.15)),
+            frame_centred_on((0.85, 0.85)),
+            "panning the window must move the minimap rectangle"
+        );
+    }
+
+    /// A canvas too small to host a thumbnail must simply not draw one, rather
+    /// than smearing a few sub-pixels that cannot show a distinct viewport
+    /// rectangle.
+    #[test]
+    fn the_minimap_is_omitted_when_the_canvas_is_too_small() {
+        let terrain = canvas_test_terrain();
+        let snapshot = Snapshot::default();
+        let tiny = |zoom: f32| {
+            render_canvas_frame_viewport(
+                &snapshot,
+                &terrain,
+                (4, 2),
+                (0, 0.0),
+                canvas_test_capability(),
+                CanvasViewport::new(zoom, (0.5, 0.5)),
+            )
+        };
+        // A 4x2 cell canvas is an 8x8 sub-grid; a quarter of that is 2x2, below
+        // CANVAS_MINIMAP_MIN_EDGE. With a single-tile terrain the world looks the
+        // same at every zoom, so any difference here would be minimap smear.
+        assert_eq!(
+            tiny(1.0),
+            tiny(CANVAS_MAX_ZOOM),
+            "a canvas too small for a minimap must not draw one"
+        );
     }
 
     /// At 1x the window is the whole world, and the centre cannot drift off it
