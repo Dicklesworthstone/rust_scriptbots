@@ -22,6 +22,7 @@ use bevy::ui::{BorderColor, BorderRadius};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
+use bevy_post_process::bloom::Bloom;
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
     AccessibilityPalette, AgentId, BrainInspectionClientId, BrainInspectionLimits,
@@ -669,6 +670,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 handle_quality_tier_button,
                 drive_adaptive_quality,
                 apply_tier_to_sun_light,
+                apply_tier_to_bloom,
             )
                 .chain(),
             handle_auto_exposure_toggle,
@@ -2291,21 +2293,29 @@ fn setup_scene(
     effective: Res<EffectiveRenderSettings>,
 ) {
     let camera_transform = Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y);
-    commands.spawn((
-        Camera3d::default(),
-        Camera {
-            clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
-            ..default()
-        },
-        camera_transform,
-        GlobalTransform::default(),
-        Visibility::default(),
-        InheritedVisibility::default(),
-        Tonemapping::AcesFitted,
-        ColorGrading::default(),
-        Hdr,
-        PrimaryCamera,
-    ));
+    let camera = commands
+        .spawn((
+            Camera3d::default(),
+            Camera {
+                clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
+                ..default()
+            },
+            camera_transform,
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            Tonemapping::AcesFitted,
+            ColorGrading::default(),
+            Hdr,
+            PrimaryCamera,
+        ))
+        .id();
+    // Inserted separately rather than in the tuple because it is CONDITIONAL:
+    // the component's presence is the on/off switch, so an unconditional insert
+    // would make every tier bloom (bd-2z0.14.3.3).
+    if effective.features.bloom {
+        commands.entity(camera).insert(Bloom::NATURAL);
+    }
 
     let light_transform =
         Transform::from_xyz(-1200.0, 1800.0, 900.0).looking_at(Vec3::ZERO, Vec3::Y);
@@ -3573,6 +3583,34 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    /// `features.bloom` must have a real consumer, not just a log line.
+    ///
+    /// Before bd-2z0.14.3.3 this crate never attached a `Bloom` component to any
+    /// camera. The field was logged at startup and on every tier change, so the
+    /// governor could announce Potato -> Ultra while the post stack stayed
+    /// identical — a tier that reports moving without moving anything. Shadows
+    /// were the only feature with a live consumer.
+    #[test]
+    fn the_bloom_tier_feature_has_a_live_consumer() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod quality_tier_consumer_tests")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            production.contains("effective.features.bloom"),
+            "the bloom tier feature must be read by production code, not only logged"
+        );
+        assert!(
+            production.contains("insert(Bloom::NATURAL)"),
+            "reading the flag is not enough; a Bloom component must actually be attached"
+        );
+        assert!(
+            production.contains("remove::<Bloom>()"),
+            "a tier step DOWN must be able to take bloom away again, or the effect \
+             is one-way and the tier still does not describe the frame"
+        );
+    }
+
     /// Cycling must always move, and must never land on Auto.
     ///
     /// Auto is a REQUEST meaning resolve-against-the-adapter, not a tier.
@@ -4461,6 +4499,45 @@ fn apply_tier_to_sun_light(
     }
     for mut light in &mut lights {
         light.shadows_enabled = effective.features.shadows;
+    }
+}
+
+/// Re-apply the tier's bloom decision to the primary camera whenever the tier
+/// changes.
+///
+/// `features.bloom` was pure decoration before this: it was logged at startup
+/// and again on every tier change, and NOTHING consumed it — no `Bloom`
+/// component was ever attached to any camera in this crate. So the governor
+/// (and the manual tier button) could report moving between Potato and Ultra
+/// while the post stack stayed exactly the same. That is the bd-ikts complaint
+/// "the post stack is implemented but invisible", one layer up: here it was not
+/// merely invisible, it was absent.
+///
+/// Presence of the component IS the switch, so this inserts and removes rather
+/// than mutating a field. `Bloom` requires `Hdr`, which the primary camera
+/// already carries, and `BloomPlugin` ships inside `PostProcessPlugin` via
+/// `DefaultPlugins`, so the inserted component is genuinely rendered rather
+/// than silently inert.
+fn apply_tier_to_bloom(
+    mut commands: Commands,
+    effective: Res<EffectiveRenderSettings>,
+    cameras: Query<(Entity, Option<&Bloom>), With<PrimaryCamera>>,
+) {
+    if !effective.is_changed() {
+        return;
+    }
+    for (entity, current) in &cameras {
+        match (effective.features.bloom, current.is_some()) {
+            (true, false) => {
+                commands.entity(entity).insert(Bloom::NATURAL);
+            }
+            (false, true) => {
+                commands.entity(entity).remove::<Bloom>();
+            }
+            // Already in the requested state; touching it would churn the
+            // render world for no reason.
+            _ => {}
+        }
     }
 }
 
