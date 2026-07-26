@@ -42519,6 +42519,94 @@ mod tests {
         );
     }
 
+    /// Hard ceiling for the bd-pdx5 probe. Chosen well above anything a healthy 6-agent
+    /// fixture should reach in 16 ticks, and far below a size that makes a tick expensive,
+    /// so a runaway trips this in milliseconds instead of exhausting a CI timeout.
+    const PDX5_POPULATION_CEILING: usize = 128;
+
+    #[test]
+    // bd-pdx5: #[ignore] is deliberate and is NOT a way of hiding a red test. The defect under
+    // investigation is non-termination, and the one thing a probe for non-termination must never
+    // do is join the default `cargo test -p scriptbots-core` path before it is known to return.
+    // The per-tick ceiling below bounds the runaway case, but nothing inside a test can bound a
+    // single `step()` that does not come back. Run it explicitly:
+    //   cargo test -p scriptbots-core --lib -- --ignored sustained_combat_keeps_the_world_bounded
+    // Remove this attribute the moment the probe is observed to terminate; leaving it here once
+    // that is known would itself be the "muted alarm" failure bd-16g.11.2 exists to prevent.
+    #[ignore = "bd-pdx5: probes a suspected non-termination; must not gate the default test path until it is known to return"]
+    fn sustained_combat_keeps_the_world_bounded() {
+        // bd-pdx5. Combat has been UNREACHABLE by construction in this fixture for its whole
+        // life: `stage_combat` hard-gates on `spike_lengths[idx] > 0.5`, agents start at 0, and
+        // actuation only walks that toward the commanded target at `spike_growth_rate`
+        // (0.005/tick), so 64 ticks tops out near 0.32. The first fixture to clear that floor did
+        // not produce a red conservation gate -- it produced a run that never terminated
+        // (SIGKILL at 1800s; see the revert in a299e3c71a8e).
+        //
+        // This is the isolated, BOUNDED probe for that. It deliberately carries no ledger and no
+        // injected fault, so it separates "can the world survive sustained combat" from anything
+        // the economy machinery does. One tick of real combat is already known-good --
+        // `resource_ledger_attributes_ecology_combat_and_interventions` asserts a non-zero Combat
+        // attribution after a single step -- so what is under test here is ACCUMULATION across
+        // ticks, not a single-step infinite loop.
+        //
+        // Population is asserted every tick rather than once at the end. A runaway therefore
+        // fails fast, with the per-tick trace attached, instead of hanging for thirty minutes and
+        // telling nobody anything. If this test ever goes red, read the trace before assuming a
+        // fix: a monotone climb means growth, a flat trace means the cost is per-tick and the
+        // carcass/neighbour scan is the place to look.
+        let mut world = mutation_suite_world(0x9D_5000);
+        let handles: Vec<AgentId> = world.agents().iter_handles().collect();
+        assert!(handles.len() >= 2, "fixture must seed at least two agents");
+        let attacker = handles[0];
+        let victim = handles[1];
+
+        // Remove the aiming threshold so the hit does not depend on incidental drift, and let a
+        // brain command the spike: `stage_brains` runs before `stage_combat` and overwrites
+        // `runtime.outputs` unconditionally for every agent (an unbound one receives
+        // `default_outputs(sensors)`), so a value staged here between ticks would be gone before
+        // combat ever reads it.
+        world.config.spike_min_length = 0.0;
+        world.config.spike_alignment_cosine = 0.0;
+        let aggressor = world
+            .brain_registry_mut()
+            .expect("pdx5 registry mutation")
+            .register("test.pdx5-aggressor", |_rng| {
+                Ok(Box::new(LedgerAggressorBrain))
+            });
+        assert!(
+            world
+                .bind_agent_brain(attacker, aggressor)
+                .expect("pdx5 aggressor brain"),
+            "attacker must accept the aggressor brain"
+        );
+        let attacker_idx = world.agents.index_of(attacker).expect("attacker index");
+        let victim_idx = world.agents.index_of(victim).expect("victim index");
+        {
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[attacker_idx] = Position::new(40.0, 60.0);
+            columns.positions_mut()[victim_idx] = Position::new(45.0, 60.0);
+            columns.headings_mut()[attacker_idx] = 0.0;
+            // Above both the 0.5 eligibility floor and spike_min_length.
+            columns.spike_lengths_mut()[attacker_idx] = 5.0;
+            columns.health_mut()[victim_idx] = 2.0;
+        }
+        if let Some(runtime) = world.runtime.get_mut(attacker) {
+            runtime.herbivore_tendency = 0.0;
+            runtime.energy = 1.5;
+        }
+
+        let mut population = Vec::new();
+        for tick in 0..16 {
+            world.step().expect("pdx5 step");
+            let live = world.agents().len();
+            population.push(live);
+            assert!(
+                live <= PDX5_POPULATION_CEILING,
+                "population ran away under sustained combat at tick {tick}: {population:?}"
+            );
+        }
+    }
+
     // bd-dz37: drives the feature-gated fault machinery, so it is gated to match. Run with
     // --features economy-faults.
     #[cfg(feature = "economy-faults")]
