@@ -416,3 +416,70 @@ fn bd_dorx_scientific_witness_coverage_does_not_regress() {
         "a witness targeted a path the registry does not call scientific"
     );
 }
+
+/// Paths `KNOB_RANGES` declares that the control plane does not publish on a default config.
+///
+/// This set is PINNED rather than merely reported, so it cannot grow quietly. Two distinct things
+/// live in it and they must not be conflated:
+///
+/// * The nine `render.*` entries are LEGITIMATE. `render.post`, `render.day_night` and
+///   `render.auto_exposure` are `Option` fields that serialize to `null` when unset, and the
+///   flattener stops at any non-object node, so each is one leaf on a default world and expands
+///   only once populated. The deeper paths are real and reachable — just not discoverable from a
+///   default config. That is the discovery/mutation asymmetry recorded on bd-dorx.
+/// * `mutation.primary` and `mutation.secondary` are STALE, and are a live defect. No
+///   `ScriptBotsConfig` field produces either path: the config carries
+///   `reproduction_mutation_scale`, `reproduction_meta_mutation_chance` and
+///   `reproduction_meta_mutation_scale`. The `mutation_primary` / `mutation_secondary` identifiers
+///   in `lib.rs` belong to an agent PROJECTION struct, and the only other `mutation.primary.*`
+///   references in the tree are analytics metric names — a different namespace entirely. They
+///   declare ranges for paths no config can ever emit.
+///
+/// Unknown paths are simply not range-checked (`validate` does `if let Some(range) = ...find(...)`),
+/// so the stale pair is inert rather than harmful — which is precisely why it survived. Removing
+/// them needs an edit to `crates/scriptbots-core/src/lib.rs` (~4749), which was leased by another
+/// agent when this gate was written.
+const KNOB_RANGES_NOT_PUBLISHED_BY_DEFAULT: &[&str] = &[
+    "mutation.primary",
+    "mutation.secondary",
+    "render.auto_exposure.speed_brighten",
+    "render.auto_exposure.speed_darken",
+    "render.day_night.cycle_ticks",
+    "render.day_night.night_ambient",
+    "render.day_night.start_phase",
+    "render.post.bloom.intensity",
+    "render.post.bloom.threshold",
+    "render.post.vignette.intensity",
+    "render.post.vignette.smoothness",
+];
+
+/// `KNOB_RANGES` must not drift from the surface the control plane actually publishes.
+///
+/// Asserting EQUALITY with the pinned set, not merely containment, is the point. Containment would
+/// let a new stale entry slip in, and it would also let the two known-stale entries be removed
+/// without anyone updating this list — so the gate would keep passing while its own documentation
+/// rotted. Equality means both directions are load-bearing: adding a stale range fails, and fixing
+/// one fails until the fix is recorded here.
+///
+/// This is the same defect class `no_spec_is_stale` catches for `KNOB_ROLES`. That gate covers the
+/// new registry only; `KNOB_RANGES` predates it and was never checked.
+#[test]
+fn bd_dorx_knob_ranges_declare_no_unexpected_unpublished_path() {
+    let published = default_knob_paths();
+    let mut unpublished: Vec<&str> = scriptbots_core::KNOB_RANGES
+        .iter()
+        .map(|range| range.path)
+        .filter(|path| !published.iter().any(|known| known == path))
+        .collect();
+    unpublished.sort_unstable();
+
+    let mut expected: Vec<&str> = KNOB_RANGES_NOT_PUBLISHED_BY_DEFAULT.to_vec();
+    expected.sort_unstable();
+
+    assert_eq!(
+        unpublished, expected,
+        "KNOB_RANGES drifted from the published surface. A path here that is NOT under \
+         render.auto_exposure/render.day_night/render.post is a stale range declaring a knob no \
+         config can emit. If you fixed one, delete it from KNOB_RANGES_NOT_PUBLISHED_BY_DEFAULT too"
+    );
+}
