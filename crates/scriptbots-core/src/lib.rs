@@ -71,6 +71,7 @@ pub mod gallery;
 pub mod genome_diff;
 pub mod infotheory;
 pub mod interventions;
+pub mod knob_roles;
 pub mod map_elites;
 pub mod narrative_text;
 pub mod permalink;
