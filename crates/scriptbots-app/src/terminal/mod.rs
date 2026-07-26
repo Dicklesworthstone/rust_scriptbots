@@ -404,6 +404,9 @@ struct TerminalApp<'a> {
     map_canvas: Option<SubCellBuffer>,
     /// Whether the map draws through the sub-cell canvas. Toggled with `B`.
     map_canvas_enabled: bool,
+    /// Sub-cell tier probed once at startup; the canvas never re-reads the
+    /// environment while painting.
+    canvas_capability: CanvasCapability,
     analytics: Option<TerminalAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: AnalyticsStatus,
@@ -451,6 +454,14 @@ struct TerminalApp<'a> {
 impl<'a> TerminalApp<'a> {
     fn new(renderer: &TerminalRenderer, ctx: RendererContext<'a>) -> Self {
         let palette = Palette::detect();
+        let canvas_capability = palette.canvas_capability();
+        info!(
+            tier = canvas_capability.label(),
+            mode = ?canvas_capability.mode,
+            depth = ?canvas_capability.depth,
+            canvas = canvas_capability.use_canvas(),
+            "terminal sub-cell canvas capability probed"
+        );
         let (terrain, day_night) = {
             let world = ctx
                 .world
@@ -491,6 +502,7 @@ impl<'a> TerminalApp<'a> {
             // On by default wherever it can be shown: the sub-cell canvas is the
             // better picture, and a terminal without color falls back anyway.
             map_canvas_enabled: true,
+            canvas_capability,
             analytics: None,
             analytics_revision: None,
             analytics_status: AnalyticsStatus::default(),
@@ -1418,12 +1430,12 @@ impl<'a> TerminalApp<'a> {
             if self.map_stamp == 0 {
                 self.map_stamp = 1;
             }
-            let use_canvas = self.map_canvas_enabled && self.palette.supports_sub_cell();
+            let use_canvas = self.map_canvas_enabled && self.canvas_capability.use_canvas();
             if use_canvas && self.map_canvas.is_none() {
                 self.map_canvas = Some(SubCellBuffer::new(
                     inner.width,
                     inner.height,
-                    SubCellMode::Braille,
+                    self.canvas_capability.mode,
                 ));
             }
             let canvas = if use_canvas {
@@ -1440,6 +1452,7 @@ impl<'a> TerminalApp<'a> {
                     stamp: self.map_stamp,
                     canvas,
                     day_night: self.day_night,
+                    capability: self.canvas_capability,
                 },
                 inner,
             );
@@ -2547,19 +2560,31 @@ impl<'a> TerminalApp<'a> {
                 }
             }
             (KeyCode::Char('B'), _) => {
-                if self.palette.supports_sub_cell() {
+                let capability = self.canvas_capability;
+                if capability.use_canvas() {
                     self.map_canvas_enabled = !self.map_canvas_enabled;
                     let state = if self.map_canvas_enabled {
-                        "Braille sub-cell map ON (2x4 density)"
+                        format!(
+                            "Sub-cell map ON ({} · {}x{} per cell)",
+                            capability.label(),
+                            capability.mode.dots_x(),
+                            capability.mode.dots_y()
+                        )
                     } else {
-                        "Braille sub-cell map OFF (flat glyph map)"
+                        "Sub-cell map OFF (flat glyph map)".to_string()
                     };
                     self.push_event(self.snapshot.tick, EventKind::Info, state);
+                } else if capability.depth.is_none() {
+                    self.push_event(
+                        self.snapshot.tick,
+                        EventKind::Info,
+                        "Sub-cell map needs color; the flat glyph map keeps terrain readable without it",
+                    );
                 } else {
                     self.push_event(
                         self.snapshot.tick,
                         EventKind::Info,
-                        "Sub-cell map needs a 256-color or truecolor terminal",
+                        "Sub-cell map needs a UTF-8 locale and a terminal with block glyphs",
                     );
                 }
             }
@@ -4772,16 +4797,9 @@ impl Palette {
             } else {
                 // Auto-detect: prefer ON when stdout is a real terminal, UTF-8 locale, and not a
                 // known minimal TERM. This is heuristic but works well in practice.
-                let term = std::env::var("TERM")
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
+                let term = env_lower("TERM");
                 let looks_modern_term = !matches!(term.as_str(), "" | "dumb" | "linux" | "vt100");
-                let locale = std::env::var("LC_ALL")
-                    .ok()
-                    .or_else(|| std::env::var("LC_CTYPE").ok())
-                    .or_else(|| std::env::var("LANG").ok())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
+                let locale = locale_lower();
                 let utf8_locale = locale.contains("utf-8") || locale.contains("utf8");
                 let is_ci = std::env::var("CI").is_ok();
                 looks_modern_term && utf8_locale && !is_ci
@@ -4929,9 +4947,14 @@ impl Palette {
     /// averages several sub-pixel colors into one fg and one bg per cell, which
     /// only reads correctly with a real color channel — under 16 colors the
     /// averaging collapses and the flat glyph map stays the better picture.
-    fn supports_sub_cell(&self) -> bool {
-        self.level
-            .is_some_and(|level| level.has_16m || level.has_256)
+    /// Probe this terminal for the richest sub-cell tier it can actually show.
+    fn canvas_capability(&self) -> CanvasCapability {
+        CanvasCapability::detect(
+            ColorSupport::from_level(self.level),
+            &env_lower("TERM"),
+            &locale_lower(),
+            std::env::var_os("NO_COLOR").is_some(),
+        )
     }
 
     /// Terrain base color for the canvas. Uses the theme's background band,
@@ -5237,6 +5260,8 @@ struct MapWidget<'a> {
     canvas: Option<&'a mut SubCellBuffer>,
     /// Resolved `(cycle_ticks, start_phase)` for the shared daylight curve.
     day_night: (u32, f32),
+    /// The probed sub-cell tier; supplies the quantization depth.
+    capability: CanvasCapability,
 }
 
 /// Terrain alpha, deliberately below [`subcell::ALPHA_SOLID`]: terrain must land
@@ -5277,6 +5302,132 @@ const CANVAS_BOOST_FLARE: f32 = 1.6;
 
 /// Spike length above which the canvas paints an attack cue.
 const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
+
+/// What a terminal reports it can do with color, decoupled from the detection
+/// crate's own `ColorLevel` (whose private fields make it unconstructible in a
+/// test, and therefore unusable as a probe input).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ColorSupport {
+    basic: bool,
+    ansi256: bool,
+    truecolor: bool,
+}
+
+impl ColorSupport {
+    fn from_level(level: Option<ColorLevel>) -> Self {
+        level.map_or_else(Self::default, |level| Self {
+            basic: level.has_basic,
+            ansi256: level.has_256,
+            truecolor: level.has_16m,
+        })
+    }
+}
+
+/// What sub-cell tier this terminal can actually display.
+///
+/// Probed once at startup from the environment and then carried, so no paint
+/// path re-reads `TERM` or re-runs color detection per frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanvasCapability {
+    /// The richest glyph vocabulary the terminal can render.
+    mode: SubCellMode,
+    /// The color depth to quantize into, or `None` when the terminal reports no
+    /// color at all or the user set `NO_COLOR`.
+    depth: Option<ColorDepth>,
+}
+
+impl CanvasCapability {
+    /// Resolve the tier from raw environment facts.
+    ///
+    /// Taking the environment as arguments rather than reading it makes the whole
+    /// policy testable: a probe that reads `std::env` directly can only be tested
+    /// by mutating process-global state, which is exactly the kind of test that
+    /// passes alone and fails in a parallel run.
+    ///
+    /// `term` and `locale` are expected lowercased.
+    fn detect(color: ColorSupport, term: &str, locale: &str, no_color: bool) -> Self {
+        let depth = if no_color {
+            None
+        } else if color.truecolor {
+            Some(ColorDepth::TrueColor)
+        } else if color.ansi256 {
+            Some(ColorDepth::Ansi256)
+        } else if color.basic {
+            Some(ColorDepth::Ansi16)
+        } else {
+            None
+        };
+
+        // Every sub-cell vocabulary above ASCII is multi-byte UTF-8, so a
+        // non-UTF-8 locale rules all of them out no matter how capable TERM is.
+        let utf8 = locale.contains("utf-8") || locale.contains("utf8");
+        let mode = if !utf8 || matches!(term, "" | "dumb" | "vt100") {
+            SubCellMode::Ascii
+        } else if term == "linux" {
+            // The Linux console's built-in font carries the block-drawing range
+            // but not U+2800..U+28FF, so braille renders as tofu there.
+            SubCellMode::Quadrant
+        } else {
+            SubCellMode::Braille
+        };
+
+        Self { mode, depth }
+    }
+
+    /// Whether this tier resolves more than one world sample per terminal cell.
+    const fn has_sub_cell_density(self) -> bool {
+        !matches!(self.mode, SubCellMode::Ascii)
+    }
+
+    /// Whether the world map should paint through the canvas at all.
+    ///
+    /// Density without color is a REGRESSION, not a degradation: the flat map's
+    /// per-terrain glyphs still distinguish water from rock with no color at all,
+    /// whereas an uncolored braille field is eight identical dots. So `NO_COLOR`
+    /// and colorless terminals are honored by staying on the flat map, which
+    /// loses nothing, rather than by painting a canvas that cannot say anything.
+    const fn use_canvas(self) -> bool {
+        self.has_sub_cell_density() && self.depth.is_some()
+    }
+
+    /// Stable label for the startup log and the HUD.
+    const fn label(self) -> &'static str {
+        match (self.mode, self.depth) {
+            (SubCellMode::Braille, Some(ColorDepth::TrueColor)) => "braille/truecolor",
+            (SubCellMode::Braille, Some(ColorDepth::Ansi256)) => "braille/256",
+            (SubCellMode::Braille, Some(ColorDepth::Ansi16)) => "braille/16",
+            (SubCellMode::Braille, None) => "braille/no-color",
+            (SubCellMode::Quadrant, Some(ColorDepth::TrueColor)) => "quadrant/truecolor",
+            (SubCellMode::Quadrant, Some(ColorDepth::Ansi256)) => "quadrant/256",
+            (SubCellMode::Quadrant, Some(ColorDepth::Ansi16)) => "quadrant/16",
+            (SubCellMode::Quadrant, None) => "quadrant/no-color",
+            (SubCellMode::HalfBlock, Some(ColorDepth::TrueColor)) => "half-block/truecolor",
+            (SubCellMode::HalfBlock, Some(ColorDepth::Ansi256)) => "half-block/256",
+            (SubCellMode::HalfBlock, Some(ColorDepth::Ansi16)) => "half-block/16",
+            (SubCellMode::HalfBlock, None) => "half-block/no-color",
+            (SubCellMode::Ascii, Some(ColorDepth::TrueColor)) => "ascii/truecolor",
+            (SubCellMode::Ascii, Some(ColorDepth::Ansi256)) => "ascii/256",
+            (SubCellMode::Ascii, Some(ColorDepth::Ansi16)) => "ascii/16",
+            (SubCellMode::Ascii, None) => "ascii/no-color",
+        }
+    }
+}
+
+/// Lowercased environment variable, empty when unset or non-Unicode.
+fn env_lower(key: &str) -> String {
+    std::env::var(key).unwrap_or_default().to_ascii_lowercase()
+}
+
+/// Lowercased effective locale, following the standard `LC_ALL` > `LC_CTYPE` >
+/// `LANG` precedence.
+fn locale_lower() -> String {
+    std::env::var("LC_ALL")
+        .ok()
+        .or_else(|| std::env::var("LC_CTYPE").ok())
+        .or_else(|| std::env::var("LANG").ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
 
 impl MapWidget<'_> {
     /// Paint the world into the sub-cell buffer and blit the composed frame.
@@ -5451,14 +5602,12 @@ impl MapWidget<'_> {
             }
         }
 
-        // Quantize through the engine's own quantizer so a 256-color terminal is
-        // handed a color it can actually reproduce instead of a truecolor triple
-        // the backend will approximate on its own terms.
-        let depth = if ctx.palette.level.is_some_and(|level| level.has_16m) {
-            ColorDepth::TrueColor
-        } else {
-            ColorDepth::Ansi256
-        };
+        // Quantize through the engine's own quantizer so a 16- or 256-color
+        // terminal is handed a color it can actually reproduce instead of a
+        // truecolor triple the backend will approximate on its own terms.
+        // `use_canvas` already refused a depthless terminal, so the fallback here
+        // is unreachable defensive code rather than a silent policy.
+        let depth = ctx.capability.depth.unwrap_or(ColorDepth::Ansi16);
         let to_color = |channels: [f32; 3]| {
             let q = quantize(channels, depth);
             Color::Rgb(q[0], q[1], q[2])
@@ -5588,6 +5737,14 @@ mod tests {
         visual::resolve_day_night(None, None)
     }
 
+    /// Truecolor braille, the tier a modern terminal probes into.
+    const fn canvas_test_capability() -> CanvasCapability {
+        CanvasCapability {
+            mode: SubCellMode::Braille,
+            depth: Some(ColorDepth::TrueColor),
+        }
+    }
+
     /// Render one canvas frame and hand back the composed buffer.
     fn render_canvas_frame(
         snapshot: &Snapshot,
@@ -5595,10 +5752,27 @@ mod tests {
         cells: (u16, u16),
         day_night: (u32, f32),
     ) -> Buffer {
+        render_canvas_frame_with(
+            snapshot,
+            terrain,
+            cells,
+            day_night,
+            canvas_test_capability(),
+        )
+    }
+
+    /// [`render_canvas_frame`] against an explicit capability tier.
+    fn render_canvas_frame_with(
+        snapshot: &Snapshot,
+        terrain: &TerrainView,
+        cells: (u16, u16),
+        day_night: (u32, f32),
+        capability: CanvasCapability,
+    ) -> Buffer {
         let palette = Palette::test_backend_evidence();
         let mut scratch =
             vec![CellOccupancy::default(); usize::from(cells.0) * usize::from(cells.1)];
-        let mut canvas = SubCellBuffer::new(cells.0, cells.1, SubCellMode::Braille);
+        let mut canvas = SubCellBuffer::new(cells.0, cells.1, capability.mode);
         let area = Rect::new(0, 0, cells.0, cells.1);
         let mut buf = Buffer::empty(area);
         MapWidget {
@@ -5609,6 +5783,7 @@ mod tests {
             stamp: 1,
             canvas: Some(&mut canvas),
             day_night,
+            capability,
         }
         .render(area, &mut buf);
         buf
@@ -5722,6 +5897,7 @@ mod tests {
             stamp: 1,
             canvas: None,
             day_night: canvas_test_day_night(),
+            capability: canvas_test_capability(),
         }
         .render(area, &mut buf);
 
@@ -5951,6 +6127,247 @@ mod tests {
             frame_at(quarter),
             frame_at(quarter),
             "the same tick must produce a byte-identical frame"
+        );
+    }
+
+    const TRUECOLOR: ColorSupport = ColorSupport {
+        basic: true,
+        ansi256: true,
+        truecolor: true,
+    };
+    const ANSI256: ColorSupport = ColorSupport {
+        basic: true,
+        ansi256: true,
+        truecolor: false,
+    };
+    const ANSI16: ColorSupport = ColorSupport {
+        basic: true,
+        ansi256: false,
+        truecolor: false,
+    };
+    const NO_SUPPORT: ColorSupport = ColorSupport {
+        basic: false,
+        ansi256: false,
+        truecolor: false,
+    };
+
+    /// The whole degradation ladder in one table. Before this, only
+    /// braille+truecolor and braille+256 were reachable: a 16-color terminal was
+    /// refused the canvas outright, `NO_COLOR` was never consulted, and the glyph
+    /// mode was a hardcoded `Braille` regardless of what the terminal could draw.
+    #[test]
+    fn capability_probe_walks_the_full_degradation_ladder() {
+        let utf8 = "en_us.utf-8";
+        let cases: [(
+            &str,
+            ColorSupport,
+            &str,
+            &str,
+            bool,
+            SubCellMode,
+            Option<ColorDepth>,
+        ); 9] = [
+            (
+                "modern truecolor",
+                TRUECOLOR,
+                "xterm-256color",
+                utf8,
+                false,
+                SubCellMode::Braille,
+                Some(ColorDepth::TrueColor),
+            ),
+            (
+                "256-color only",
+                ANSI256,
+                "xterm-256color",
+                utf8,
+                false,
+                SubCellMode::Braille,
+                Some(ColorDepth::Ansi256),
+            ),
+            (
+                "16-color only",
+                ANSI16,
+                "xterm",
+                utf8,
+                false,
+                SubCellMode::Braille,
+                Some(ColorDepth::Ansi16),
+            ),
+            (
+                "no color reported",
+                NO_SUPPORT,
+                "xterm",
+                utf8,
+                false,
+                SubCellMode::Braille,
+                None,
+            ),
+            (
+                "NO_COLOR overrides a capable terminal",
+                TRUECOLOR,
+                "xterm-256color",
+                utf8,
+                true,
+                SubCellMode::Braille,
+                None,
+            ),
+            (
+                "linux console has blocks but no braille",
+                ANSI256,
+                "linux",
+                utf8,
+                false,
+                SubCellMode::Quadrant,
+                Some(ColorDepth::Ansi256),
+            ),
+            (
+                "non-utf8 locale rules out every multi-byte glyph",
+                TRUECOLOR,
+                "xterm-256color",
+                "en_us.iso-8859-1",
+                false,
+                SubCellMode::Ascii,
+                Some(ColorDepth::TrueColor),
+            ),
+            (
+                "dumb terminal",
+                ANSI16,
+                "dumb",
+                utf8,
+                false,
+                SubCellMode::Ascii,
+                Some(ColorDepth::Ansi16),
+            ),
+            (
+                "unset TERM",
+                NO_SUPPORT,
+                "",
+                "",
+                false,
+                SubCellMode::Ascii,
+                None,
+            ),
+        ];
+
+        for (name, color, term, locale, no_color, mode, depth) in cases {
+            let capability = CanvasCapability::detect(color, term, locale, no_color);
+            assert_eq!(capability.mode, mode, "{name}: glyph mode");
+            assert_eq!(capability.depth, depth, "{name}: color depth");
+        }
+    }
+
+    /// Two independent reasons to stay on the flat map, and they must both hold:
+    /// no sub-cell density is useless, and no color is worse than useless — an
+    /// uncolored braille field cannot distinguish water from rock, while the flat
+    /// map's per-terrain glyphs still can.
+    #[test]
+    fn the_canvas_is_refused_without_both_density_and_color() {
+        let utf8 = "en_us.utf-8";
+        assert!(
+            CanvasCapability::detect(TRUECOLOR, "xterm-256color", utf8, false).use_canvas(),
+            "a capable terminal must get the canvas"
+        );
+        assert!(
+            CanvasCapability::detect(ANSI16, "xterm", utf8, false).use_canvas(),
+            "16 colors is a degradation, not a disqualification"
+        );
+        assert!(
+            !CanvasCapability::detect(TRUECOLOR, "xterm-256color", utf8, true).use_canvas(),
+            "NO_COLOR must fall back to the flat map"
+        );
+        assert!(
+            !CanvasCapability::detect(TRUECOLOR, "dumb", utf8, false).use_canvas(),
+            "no sub-cell density means no canvas"
+        );
+        assert!(
+            !CanvasCapability::detect(NO_SUPPORT, "xterm-256color", utf8, false).use_canvas(),
+            "a colorless terminal must keep the flat map's terrain glyphs"
+        );
+    }
+
+    /// Each glyph tier must actually reach the screen. A mode that resolves in the
+    /// probe but never changes what is painted is the same defect as a dead
+    /// engine, one layer up.
+    #[test]
+    fn every_probed_glyph_mode_paints_its_own_vocabulary() {
+        let terrain = canvas_test_terrain();
+        let mut snapshot = Snapshot::default();
+        snapshot.agents = vec![canvas_test_agent(0.0, 0.0)];
+
+        let glyph_for = |mode: SubCellMode| {
+            let buf = render_canvas_frame_with(
+                &snapshot,
+                &terrain,
+                (4, 2),
+                canvas_test_day_night(),
+                CanvasCapability {
+                    mode,
+                    depth: Some(ColorDepth::TrueColor),
+                },
+            );
+            buf[(0, 0)].symbol().to_string()
+        };
+
+        let braille = glyph_for(SubCellMode::Braille);
+        assert!(
+            braille
+                .chars()
+                .all(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "braille tier must emit braille, got {braille:?}"
+        );
+        assert_eq!(
+            glyph_for(SubCellMode::HalfBlock),
+            "\u{2580}",
+            "half-block tier must emit the upper half block"
+        );
+        let quadrant = glyph_for(SubCellMode::Quadrant);
+        assert!(
+            quadrant
+                .chars()
+                .all(|c| ('\u{2580}'..='\u{259F}').contains(&c)),
+            "quadrant tier must emit a block-drawing glyph, got {quadrant:?}"
+        );
+    }
+
+    /// The probed depth must reach the quantizer. A 16-color terminal handed a
+    /// truecolor triple gets whatever the backend decides; handed a quantized one
+    /// it gets a color from the palette it actually has.
+    #[test]
+    fn the_probed_color_depth_reaches_the_quantizer() {
+        let terrain = canvas_test_terrain();
+        let snapshot = Snapshot::default();
+        let background_for = |depth: ColorDepth| {
+            let buf = render_canvas_frame_with(
+                &snapshot,
+                &terrain,
+                (4, 2),
+                canvas_test_day_night(),
+                CanvasCapability {
+                    mode: SubCellMode::Braille,
+                    depth: Some(depth),
+                },
+            );
+            cell_bg(&buf, 1, 1)
+        };
+        let truecolor = background_for(ColorDepth::TrueColor);
+        let ansi16 = background_for(ColorDepth::Ansi16);
+        assert_ne!(
+            truecolor, ansi16,
+            "a 16-color tier must snap the terrain color onto the ANSI palette"
+        );
+        let expected = quantize(
+            [
+                f32::from(truecolor.0) / 255.0,
+                f32::from(truecolor.1) / 255.0,
+                f32::from(truecolor.2) / 255.0,
+            ],
+            ColorDepth::Ansi16,
+        );
+        assert_eq!(
+            ansi16,
+            (expected[0], expected[1], expected[2]),
+            "the 16-color background must be exactly the engine's quantization of the truecolor one"
         );
     }
 
