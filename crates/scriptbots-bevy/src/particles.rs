@@ -137,9 +137,32 @@ pub struct ParticlePool {
     free: Vec<u32>,
     live_count: usize,
     born_counter: u64,
+    /// Birth sequence stamped on each slot at spawn.
+    ///
+    /// DIAGNOSTIC ONLY. Eviction order comes from the intrusive list below, not
+    /// from comparing these — which is what makes `born_counter` wrap a
+    /// non-issue rather than a lurking correctness bug (bd-2z0.14.1.19).
+    born_seq: Vec<u64>,
+    /// Intrusive doubly-linked FIFO over the LIVE AMBIENT slots, oldest first.
+    ///
+    /// This is what makes true-oldest eviction O(1). The previous code scanned
+    /// `0..capacity` and took the first ambient slot it found, which is the
+    /// LOWEST slot index, not the oldest particle — after any kill/reuse the
+    /// two disagree, and a freshly spawned particle in a recycled low slot was
+    /// evicted ahead of genuinely old ones.
+    ambient_prev: Vec<u32>,
+    ambient_next: Vec<u32>,
+    ambient_head: u32,
+    ambient_tail: u32,
     /// Overflow behavior when the pool is full.
     pub overflow: OverflowPolicy,
 }
+
+/// Sentinel for "no slot" in the intrusive ambient list.
+///
+/// Safe as a sentinel because `with_capacity` caps addressable slots at
+/// `u32::MAX`, so the largest real index is `u32::MAX - 1`.
+const NO_SLOT: u32 = u32::MAX;
 
 impl ParticlePool {
     /// Allocate a pool for `capacity` particles (single allocation).
@@ -152,8 +175,77 @@ impl ParticlePool {
             free: (0..slots_u32).rev().collect(),
             live_count: 0,
             born_counter: 0,
+            born_seq: vec![0; capacity],
+            ambient_prev: vec![NO_SLOT; capacity],
+            ambient_next: vec![NO_SLOT; capacity],
+            ambient_head: NO_SLOT,
+            ambient_tail: NO_SLOT,
             overflow: OverflowPolicy::default(),
         }
+    }
+
+    /// Append a live ambient slot to the tail of the FIFO. O(1).
+    fn ambient_push_back(&mut self, slot: u32) {
+        let s = slot as usize;
+        self.ambient_prev[s] = self.ambient_tail;
+        self.ambient_next[s] = NO_SLOT;
+        if self.ambient_tail == NO_SLOT {
+            self.ambient_head = slot;
+        } else {
+            self.ambient_next[self.ambient_tail as usize] = slot;
+        }
+        self.ambient_tail = slot;
+    }
+
+    /// Remove a slot from the ambient FIFO wherever it sits. O(1).
+    ///
+    /// Only called for slots known to be in the list — a live ambient particle —
+    /// so the neighbour links are always coherent.
+    fn ambient_unlink(&mut self, slot: u32) {
+        let s = slot as usize;
+        let prev = self.ambient_prev[s];
+        let next = self.ambient_next[s];
+        if prev == NO_SLOT {
+            self.ambient_head = next;
+        } else {
+            self.ambient_next[prev as usize] = next;
+        }
+        if next == NO_SLOT {
+            self.ambient_tail = prev;
+        } else {
+            self.ambient_prev[next as usize] = prev;
+        }
+        self.ambient_prev[s] = NO_SLOT;
+        self.ambient_next[s] = NO_SLOT;
+    }
+
+    /// Birth sequence stamped on a live slot, for diagnostics and tests.
+    #[must_use]
+    pub fn born_seq_of(&self, handle: ParticleHandle) -> Option<u64> {
+        let slot = handle.slot as usize;
+        if slot >= self.slots.len()
+            || self.generations[slot] != handle.generation
+            || self.slots[slot].is_none()
+        {
+            return None;
+        }
+        Some(self.born_seq[slot])
+    }
+
+    /// Slot holding the oldest live ambient particle, if any. O(1).
+    #[must_use]
+    pub fn oldest_ambient_slot(&self) -> Option<u32> {
+        (self.ambient_head != NO_SLOT).then_some(self.ambient_head)
+    }
+
+    /// Priority of whatever occupies a slot, for the injected-negative test
+    /// that reconstructs the rejected lowest-slot scan.
+    #[cfg(test)]
+    fn slot_priority_for_test(&self, slot: u32) -> Option<ParticlePriority> {
+        self.slots
+            .get(slot as usize)?
+            .as_ref()
+            .map(|particle| particle.priority)
     }
 
     /// Maximum number of live particles.
@@ -178,9 +270,17 @@ impl ParticlePool {
             None => self.evict_for(particle.priority)?,
         };
         let generation = self.generations[slot as usize];
+        let is_ambient = particle.priority == ParticlePriority::Ambient;
         self.slots[slot as usize] = Some(particle);
         self.live_count += 1;
-        self.born_counter += 1;
+        // Wrapping is documented rather than guarded: `born_seq` is diagnostic,
+        // and eviction order is the list's position, so a wrap cannot reorder
+        // anything. At one spawn per nanosecond a u64 still takes ~584 years.
+        self.born_counter = self.born_counter.wrapping_add(1);
+        self.born_seq[slot as usize] = self.born_counter;
+        if is_ambient {
+            self.ambient_push_back(slot);
+        }
         Some(ParticleHandle { slot, generation })
     }
 
@@ -192,13 +292,12 @@ impl ParticlePool {
                     // Don't churn: ambient spawns into a full pool simply lose.
                     return None;
                 }
-                // Find the oldest ambient slot (deterministic slot scan).
-                let slot_count = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
-                let victim = (0..slot_count).find(|&slot| {
-                    self.slots[slot as usize]
-                        .as_ref()
-                        .is_some_and(|p| p.priority == ParticlePriority::Ambient)
-                })?;
+                // The head of the ambient FIFO IS the oldest live ambient
+                // particle, in O(1) and with no scan. Previously this searched
+                // `0..capacity` and took the first ambient it found, which is
+                // the lowest SLOT — after any kill and reuse that is frequently
+                // the newest particle, so the policy evicted the wrong one.
+                let victim = self.oldest_ambient_slot()?;
                 self.kill_slot(victim);
                 // kill_slot returned the victim to the free list; reclaim it
                 // for the incoming particle so it is not double-allocated.
@@ -210,7 +309,13 @@ impl ParticlePool {
     }
 
     fn kill_slot(&mut self, slot: u32) {
-        if self.slots[slot as usize].take().is_some() {
+        if let Some(particle) = self.slots[slot as usize].take() {
+            // Unlink BEFORE the slot can be recycled, or the FIFO would keep a
+            // pointer to a slot that has since been refilled by a different
+            // particle — the list must contain exactly the live ambients.
+            if particle.priority == ParticlePriority::Ambient {
+                self.ambient_unlink(slot);
+            }
             self.generations[slot as usize] = self.generations[slot as usize].wrapping_add(1);
             self.free.push(slot);
             self.live_count -= 1;
@@ -1167,6 +1272,241 @@ mod tests {
             priority,
             follow: None,
         }
+    }
+
+    /// THE DEFECT, as a regression guard: eviction must take the oldest
+    /// ambient, not the lowest slot index.
+    ///
+    /// The two agree only until something is killed. After a kill the freed
+    /// slot is reused by the NEWEST particle, so a scan from slot 0 evicts the
+    /// youngest ambient while genuinely old ones survive — the opposite of the
+    /// policy's name. This arrangement makes lowest-slot and true-oldest
+    /// disagree, so the old implementation fails it and the new one passes.
+    #[test]
+    fn eviction_takes_the_oldest_ambient_not_the_lowest_slot() {
+        let mut pool = ParticlePool::with_capacity(3);
+        let a = pool.spawn(particle(ParticlePriority::Ambient)).expect("a");
+        let b = pool.spawn(particle(ParticlePriority::Ambient)).expect("b");
+        let c = pool.spawn(particle(ParticlePriority::Ambient)).expect("c");
+        assert_eq!(
+            (a.slot, b.slot, c.slot),
+            (0, 1, 2),
+            "free list hands out 0,1,2"
+        );
+
+        pool.kill(a);
+        let d = pool.spawn(particle(ParticlePriority::Ambient)).expect("d");
+        assert_eq!(
+            d.slot, 0,
+            "the freed low slot is recycled by the NEWEST particle"
+        );
+
+        assert_eq!(
+            pool.oldest_ambient_slot(),
+            Some(b.slot),
+            "b is the oldest surviving ambient; slot 0 now holds the newest"
+        );
+
+        let critical = pool
+            .spawn(particle(ParticlePriority::Critical))
+            .expect("a critical spawn must evict an ambient from a full pool");
+        assert_eq!(
+            critical.slot, b.slot,
+            "the victim must be the oldest ambient (slot {}), not the lowest slot (0)",
+            b.slot
+        );
+        assert!(
+            pool.born_seq_of(b).is_none(),
+            "the evicted particle is dead"
+        );
+        assert!(
+            pool.born_seq_of(d).is_some(),
+            "the newest ambient must survive; evicting it is the bug"
+        );
+        assert!(pool.born_seq_of(c).is_some(), "untouched ambient survives");
+    }
+
+    /// The injected negative: the strategy the old code used must actually
+    /// disagree with the correct one on this arrangement.
+    ///
+    /// A regression guard is worth nothing if the wrong implementation would
+    /// also satisfy it. This reproduces the discarded "first ambient slot from
+    /// zero" scan and asserts it picks a DIFFERENT victim than the pool does —
+    /// so `eviction_takes_the_oldest_ambient_not_the_lowest_slot` is proven to
+    /// fail against the old behaviour rather than merely asserted to.
+    #[test]
+    fn a_lowest_slot_scan_would_pick_a_different_victim_than_true_oldest() {
+        let mut pool = ParticlePool::with_capacity(3);
+        let a = pool.spawn(particle(ParticlePriority::Ambient)).expect("a");
+        let b = pool.spawn(particle(ParticlePriority::Ambient)).expect("b");
+        pool.spawn(particle(ParticlePriority::Ambient)).expect("c");
+        pool.kill(a);
+        let d = pool.spawn(particle(ParticlePriority::Ambient)).expect("d");
+
+        // The rejected strategy, restated here and nowhere in production.
+        let lowest_ambient_slot = (0..pool.capacity() as u32)
+            .find(|&slot| pool.slot_priority_for_test(slot) == Some(ParticlePriority::Ambient));
+        let true_oldest = pool.oldest_ambient_slot();
+
+        assert_eq!(
+            lowest_ambient_slot,
+            Some(d.slot),
+            "the scan finds the recycled low slot"
+        );
+        assert_eq!(true_oldest, Some(b.slot), "the oldest ambient is b");
+        assert_ne!(
+            lowest_ambient_slot, true_oldest,
+            "if these agreed, the regression guard would pass against the bug it exists to catch"
+        );
+    }
+
+    /// Randomized spawn/kill/reuse traces must agree with a simple reference
+    /// model of "ambient slots in birth order", which is the specification the
+    /// intrusive list is an optimization of.
+    #[test]
+    fn ambient_eviction_matches_a_reference_model_under_random_traces() {
+        const CAPACITY: usize = 16;
+        // Deterministic LCG: no rand dependency, and a failure is reproducible
+        // from the seed printed in the assertion.
+        let mut state: u64 = 0x1419_5EED_2026_07_26;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+
+        let mut pool = ParticlePool::with_capacity(CAPACITY);
+        // Reference model: ambient slots, oldest first.
+        let mut expected: Vec<u32> = Vec::new();
+        let mut live: Vec<ParticleHandle> = Vec::new();
+
+        for op in 0..4_000u32 {
+            match next() % 3 {
+                0 => {
+                    // Spawn ambient. Rejected when full (no churn), which the
+                    // model mirrors by leaving itself unchanged.
+                    if let Some(handle) = pool.spawn(particle(ParticlePriority::Ambient)) {
+                        expected.push(handle.slot);
+                        live.push(handle);
+                    }
+                }
+                1 => {
+                    // Kill an arbitrary live particle.
+                    if !live.is_empty() {
+                        let victim = live.swap_remove((next() as usize) % live.len());
+                        // Only mirror the kill when the handle was actually
+                        // live. A stale handle names a slot that a DIFFERENT
+                        // particle now occupies, and dropping that slot from
+                        // the model would desynchronise it from a pool that
+                        // correctly ignored the stale kill.
+                        let was_live = pool.born_seq_of(victim).is_some();
+                        pool.kill(victim);
+                        if was_live {
+                            expected.retain(|slot| *slot != victim.slot);
+                        }
+                    }
+                }
+                _ => {
+                    // Critical spawn: evicts the oldest ambient when full.
+                    let before = expected.first().copied();
+                    if let Some(handle) = pool.spawn(particle(ParticlePriority::Critical)) {
+                        if pool.live_count() == CAPACITY && before == Some(handle.slot) {
+                            // It reused the evicted slot; the model drops it.
+                            expected.retain(|slot| *slot != handle.slot);
+                        }
+                        live.retain(|h| h.slot != handle.slot);
+                        live.push(handle);
+                    }
+                }
+            }
+            assert_eq!(
+                pool.oldest_ambient_slot(),
+                expected.first().copied(),
+                "op {op}: pool and reference model disagree on the oldest ambient"
+            );
+        }
+    }
+
+    /// With no ambient to sacrifice the policy refuses rather than evicting
+    /// something it promised never to touch.
+    #[test]
+    fn a_full_pool_without_ambients_refuses_the_spawn() {
+        let mut pool = ParticlePool::with_capacity(2);
+        pool.spawn(particle(ParticlePriority::Critical))
+            .expect("c0");
+        pool.spawn(particle(ParticlePriority::Standard))
+            .expect("s1");
+        assert_eq!(pool.oldest_ambient_slot(), None);
+        assert!(
+            pool.spawn(particle(ParticlePriority::Critical)).is_none(),
+            "critical and standard particles must never be evicted by policy"
+        );
+        assert_eq!(
+            pool.live_count(),
+            2,
+            "a refused spawn must not disturb the pool"
+        );
+    }
+
+    /// An ambient arriving at a full pool loses rather than churning another
+    /// ambient out — otherwise the pool thrashes at steady state.
+    #[test]
+    fn an_ambient_spawn_into_a_full_pool_is_rejected_without_churn() {
+        let mut pool = ParticlePool::with_capacity(2);
+        let first = pool.spawn(particle(ParticlePriority::Ambient)).expect("a0");
+        pool.spawn(particle(ParticlePriority::Ambient)).expect("a1");
+        assert!(pool.spawn(particle(ParticlePriority::Ambient)).is_none());
+        assert_eq!(
+            pool.oldest_ambient_slot(),
+            Some(first.slot),
+            "the rejected spawn must not have evicted anything"
+        );
+        assert_eq!(pool.live_count(), 2);
+    }
+
+    /// Degenerate capacities must answer rather than panic or index out of range.
+    #[test]
+    fn degenerate_capacities_are_handled() {
+        let mut empty = ParticlePool::with_capacity(0);
+        assert_eq!(empty.oldest_ambient_slot(), None);
+        assert!(empty.spawn(particle(ParticlePriority::Critical)).is_none());
+        assert!(empty.spawn(particle(ParticlePriority::Ambient)).is_none());
+
+        let mut one = ParticlePool::with_capacity(1);
+        let only = one
+            .spawn(particle(ParticlePriority::Ambient))
+            .expect("fits");
+        assert_eq!(one.oldest_ambient_slot(), Some(only.slot));
+        let critical = one
+            .spawn(particle(ParticlePriority::Critical))
+            .expect("evicts the single ambient");
+        assert_eq!(critical.slot, only.slot);
+        assert_eq!(one.oldest_ambient_slot(), None, "the list is now empty");
+        assert_eq!(one.live_count(), 1);
+    }
+
+    /// A stale handle must be inert. Acting on one would unlink a slot that a
+    /// different particle now occupies and silently corrupt the FIFO.
+    #[test]
+    fn stale_handles_do_not_corrupt_the_ambient_order() {
+        let mut pool = ParticlePool::with_capacity(2);
+        let doomed = pool.spawn(particle(ParticlePriority::Ambient)).expect("a0");
+        pool.kill(doomed);
+        let reused = pool.spawn(particle(ParticlePriority::Ambient)).expect("a1");
+        assert_eq!(reused.slot, doomed.slot, "the slot is recycled");
+
+        pool.kill(doomed); // stale: same slot, older generation
+        assert!(
+            pool.born_seq_of(reused).is_some(),
+            "a stale handle must not kill the particle that replaced it"
+        );
+        assert_eq!(
+            pool.oldest_ambient_slot(),
+            Some(reused.slot),
+            "the ambient list must still contain the live particle"
+        );
+        assert_eq!(pool.live_count(), 1);
     }
 
     #[test]
