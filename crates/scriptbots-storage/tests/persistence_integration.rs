@@ -1,7 +1,7 @@
 use fsqlite::compat::{OpenFlags, RowExt, open_with_flags};
 use scriptbots_core::{
-    AgentData, PersistenceBatch, ReplayEvent, ReplayEventKind, ScriptBotsConfig, Tick, TickSummary,
-    WorldState,
+    AgentData, PersistenceBatch, ReplayEvent, ReplayEventKind, ReplayInteractionKind,
+    ScriptBotsConfig, Tick, TickSummary, WorldState,
 };
 use scriptbots_storage::{StoragePipeline, StorageReader};
 use std::{
@@ -277,24 +277,10 @@ fn temp_run_path(label: &str) -> std::path::PathBuf {
     ))
 }
 
-/// An emitted pairwise edge must survive the write path with both participants and both
-/// positions intact, and must be reachable as an interaction without parsing JSON.
-///
-/// This is the persistence half of `bd-2z0.5.9`. It is written against a hand-constructed
-/// event rather than a simulated run ON PURPOSE, and the distinction matters:
-///
-///   * `ReplayEventKind` has no pairwise variant yet, so `counterpart` is `None` at every
-///     emission site in core. A run-driven test would assert `0 == 0` and pass while proving
-///     nothing -- the same shape as the always-empty stream that `replay_event_tick_cap = 0`
-///     produces, and the shape this session has repeatedly found masquerading as coverage.
-///   * Constructing the event here tests the PROJECTION, which is the part storage owns. It
-///     cannot pass vacuously: if `replay_row_from_event` drops a field, or the writer omits a
-///     column, or the writer's pairwise filter is wrong, an assertion below fails.
-///
-/// When core gains a pairwise kind, this test keeps its meaning unchanged and the emission
-/// side becomes a separate, genuinely run-driven assertion.
+/// Typed combat and food-share facts must retain their source tick, stable participants,
+/// positions, kind, and magnitude through the durable projection.
 #[test]
-fn a_pairwise_replay_event_persists_as_a_queryable_interaction_edge() {
+fn typed_pairwise_events_persist_as_queryable_interaction_edges() {
     let path = temp_run_path("interaction_edge");
     let path_str = path.to_str().expect("utf8 path");
 
@@ -311,22 +297,30 @@ fn a_pairwise_replay_event_persists_as_a_queryable_interaction_edge() {
             .submit(&batch_with_replay_events(
                 4,
                 vec![
-                    // The pairwise edge under test.
                     ReplayEvent {
                         agent_uid: Some(actor),
                         position: Some(actor_position),
                         counterpart: Some(target),
                         counterpart_position: Some(target_position),
-                        kind: ReplayEventKind::Action {
-                            left_wheel: 0.5,
-                            right_wheel: 0.25,
-                            boost: true,
-                            spike_target: Some(target),
-                            sound_level: 0.125,
-                            give_intent: 0.75,
+                        kind: ReplayEventKind::Interaction {
+                            tick: Tick(2),
+                            ordinal: 0,
+                            kind: ReplayInteractionKind::Combat,
+                            magnitude: 0.375,
                         },
                     },
-                    // A single-agent event at the same tick. It must not become an edge.
+                    ReplayEvent {
+                        agent_uid: Some(target),
+                        position: Some(target_position),
+                        counterpart: Some(actor),
+                        counterpart_position: Some(actor_position),
+                        kind: ReplayEventKind::Interaction {
+                            tick: Tick(4),
+                            ordinal: 0,
+                            kind: ReplayInteractionKind::FoodShare,
+                            magnitude: 0.125,
+                        },
+                    },
                     ReplayEvent {
                         agent_uid: Some(actor),
                         position: Some(actor_position),
@@ -345,51 +339,72 @@ fn a_pairwise_replay_event_persists_as_a_queryable_interaction_edge() {
 
     let storage = StorageReader::open(path_str).expect("open storage after shutdown");
 
-    // Premise: both events were actually written. Without this the exclusion assertion below
+    // Premise: all events were actually written. Without this the exclusion assertion below
     // would be satisfied by a run that persisted nothing at all.
     let replayed = storage.load_replay_events().expect("replay events");
     assert_eq!(
         replayed.len(),
-        2,
-        "both hand-built events must reach the database before the edge projection can be judged"
+        3,
+        "both interactions and the single-agent control must reach the database"
     );
-
-    let edge_event = replayed
+    let edge_events = replayed
         .iter()
-        .find(|persisted| persisted.event.counterpart.is_some())
-        .expect("the pairwise event must round-trip with its counterpart still set");
-    assert_eq!(edge_event.event.agent_uid, Some(actor));
-    assert_eq!(edge_event.event.counterpart, Some(target));
+        .filter(|persisted| persisted.event.counterpart.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(edge_events.len(), 2);
+    assert_eq!(edge_events[0].tick, 2);
+    assert_eq!(edge_events[0].event.agent_uid, Some(actor));
+    assert_eq!(edge_events[0].event.counterpart, Some(target));
     assert_eq!(
-        edge_event.event.position,
+        edge_events[0].event.position,
         Some(actor_position),
         "the emission-time actor position must survive the write path"
     );
     assert_eq!(
-        edge_event.event.counterpart_position,
+        edge_events[0].event.counterpart_position,
         Some(target_position),
         "the emission-time counterpart position must survive the write path"
     );
+    assert!(matches!(
+        edge_events[0].event.kind,
+        ReplayEventKind::Interaction {
+            tick: Tick(2),
+            ordinal: 0,
+            kind: ReplayInteractionKind::Combat,
+            magnitude,
+        } if magnitude.to_bits() == 0.375_f32.to_bits()
+    ));
+    assert!(matches!(
+        edge_events[1].event.kind,
+        ReplayEventKind::Interaction {
+            tick: Tick(4),
+            ordinal: 0,
+            kind: ReplayInteractionKind::FoodShare,
+            magnitude,
+        } if magnitude.to_bits() == 0.125_f32.to_bits()
+    ));
 
     let interactions = storage.recent_interactions(16).expect("interaction edges");
     assert_eq!(
         interactions.len(),
-        1,
-        "exactly the pairwise event is an interaction; the single-agent event is not: \
+        2,
+        "exactly the pairwise events are interactions; the single-agent event is not: \
          {interactions:?}"
     );
-    let edge = &interactions[0];
-    assert_eq!(edge.tick, 4);
-    assert_eq!(edge.actor, actor);
-    assert_eq!(edge.target, target);
-    assert_eq!(edge.kind, "action");
-    assert_eq!(edge.actor_position, Some(actor_position));
-    assert_eq!(edge.target_position, Some(target_position));
-    assert_eq!(
-        edge.value, None,
-        "no ReplayEventKind carries a magnitude yet; a non-null value here would mean storage \
-         invented a measurement"
-    );
+    let combat = &interactions[0];
+    assert_eq!(combat.tick, 2);
+    assert_eq!(combat.actor, actor);
+    assert_eq!(combat.target, target);
+    assert_eq!(combat.kind, "combat");
+    assert_eq!(combat.actor_position, Some(actor_position));
+    assert_eq!(combat.target_position, Some(target_position));
+    assert_eq!(combat.value, Some(0.375));
+    let food_share = &interactions[1];
+    assert_eq!(food_share.tick, 4);
+    assert_eq!(food_share.actor, target);
+    assert_eq!(food_share.target, actor);
+    assert_eq!(food_share.kind, "food_share");
+    assert_eq!(food_share.value, Some(0.125));
 
     storage.close().expect("close storage reader");
 
@@ -399,17 +414,21 @@ fn a_pairwise_replay_event_persists_as_a_queryable_interaction_edge() {
         .expect("independent read-only reader opens");
     let rows = reader
         .query(
-            "SELECT actor_agent_uid, target_agent_uid, kind FROM interactions
+            "SELECT tick, actor_agent_uid, target_agent_uid, kind, value FROM interactions
              ORDER BY tick ASC, seq ASC",
         )
         .expect("interactions table is queryable");
-    assert_eq!(rows.len(), 1, "exactly the one edge must be recorded");
-    let actor_uid: i64 = rows[0].get_typed(0).expect("actor_agent_uid is INTEGER");
-    let target_uid: i64 = rows[0].get_typed(1).expect("target_agent_uid is INTEGER");
-    let kind: String = rows[0].get_typed(2).expect("kind is TEXT");
+    assert_eq!(rows.len(), 2, "exactly the two edges must be recorded");
+    let source_tick: i64 = rows[0].get_typed(0).expect("tick is INTEGER");
+    let actor_uid: i64 = rows[0].get_typed(1).expect("actor_agent_uid is INTEGER");
+    let target_uid: i64 = rows[0].get_typed(2).expect("target_agent_uid is INTEGER");
+    let kind: String = rows[0].get_typed(3).expect("kind is TEXT");
+    let value: f64 = rows[0].get_typed(4).expect("value is REAL");
+    assert_eq!(source_tick, 2);
     assert_eq!(actor_uid, 7);
     assert_eq!(target_uid, 11);
-    assert_eq!(kind, "action");
+    assert_eq!(kind, "combat");
+    assert_eq!(value, 0.375);
 
     // The accounting identity bd-2z0.5.9 asks for: an interaction row exists for exactly the
     // replay events that name two participants -- no edge without an event, no pairwise event

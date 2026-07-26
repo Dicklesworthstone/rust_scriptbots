@@ -35,16 +35,85 @@
 //! persistence_interval` events are retained between drains.
 
 use crate::{
-    ReplayEvent, ReplayEventKind, WorldState,
+    PendingReplayInteraction, ReplayEvent, ReplayEventKind, Tick, WorldState,
     channels::{OutputChannel, OutputsExt},
 };
 
 impl WorldState {
+    fn begin_replay_tick(&mut self, tick: Tick) {
+        if self.replay_tick != tick.0 {
+            self.replay_tick = tick.0;
+            self.replay_interactions_this_tick = 0;
+        }
+    }
+
+    /// Number of pairwise interaction slots still available for this simulation tick.
+    pub(crate) fn replay_interaction_slots(&mut self, tick: Tick) -> usize {
+        self.begin_replay_tick(tick);
+        self.config
+            .interaction_event_tick_cap
+            .saturating_sub(self.replay_interactions_this_tick)
+    }
+
+    /// Append an already bounded, canonical sequence of pairwise interaction facts.
+    pub(crate) fn record_replay_interaction_events(
+        &mut self,
+        tick: Tick,
+        events: Vec<PendingReplayInteraction>,
+        dropped: usize,
+    ) {
+        self.begin_replay_tick(tick);
+        let remaining = self
+            .config
+            .interaction_event_tick_cap
+            .saturating_sub(self.replay_interactions_this_tick);
+        for event in events.into_iter().take(remaining) {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "usize is at most u64 on every supported ScriptBots target"
+            )]
+            let ordinal = self.replay_interactions_this_tick as u64;
+            self.replay_events.push(ReplayEvent {
+                agent_uid: Some(event.actor),
+                position: Some(event.actor_position),
+                counterpart: Some(event.target),
+                counterpart_position: Some(event.target_position),
+                kind: ReplayEventKind::Interaction {
+                    tick,
+                    ordinal,
+                    kind: event.kind,
+                    magnitude: event.magnitude,
+                },
+            });
+            self.replay_interactions_this_tick += 1;
+        }
+        let dropped = u64::try_from(dropped).unwrap_or(u64::MAX);
+        self.replay_interactions_dropped_total = self
+            .replay_interactions_dropped_total
+            .saturating_add(dropped);
+        if dropped > 0 {
+            diag_debug!(
+                tick = tick.0,
+                emitted = self.replay_interactions_this_tick,
+                dropped,
+                cap = self.config.interaction_event_tick_cap,
+                "pairwise interaction replay sample reached its per-tick cap"
+            );
+        }
+    }
+
+    /// Total pairwise facts omitted by the deterministic per-tick interaction cap.
+    #[must_use]
+    pub const fn replay_interaction_events_dropped(&self) -> u64 {
+        self.replay_interactions_dropped_total
+    }
+
     /// Record per-agent actuation decisions into the tick's replay stream.
     ///
     /// The spike target is not an actuation output — combat resolves spike victims after
     /// this stage — so `spike_target` records `None` rather than fabricating a target.
-    pub(crate) fn record_replay_action_events(&mut self) {
+    pub(crate) fn record_replay_action_events(&mut self, tick: Tick) {
+        self.begin_replay_tick(tick);
         let cap = self.config.replay_event_tick_cap;
         if cap == 0 {
             return;
@@ -101,7 +170,8 @@ impl WorldState {
 
     /// Compute and append the digest event; invoked once per projection by
     /// `prepare_persistence`, where it consumes any pending driver request.
-    pub(crate) fn append_requested_replay_world_digest(&mut self) {
+    pub(crate) fn append_requested_replay_world_digest(&mut self, tick: Tick) {
+        self.begin_replay_tick(tick);
         if !self.replay_world_digest_pending {
             return;
         }
@@ -139,8 +209,9 @@ impl WorldState {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AgentData, AgentUid, PersistenceAdmissionError, PersistenceBatch, Position, ReplayEvent,
-        ReplayEventKind, ScriptBotsConfig, WorldPersistence, WorldState,
+        AgentData, AgentId, AgentUid, PersistenceAdmissionError, PersistenceBatch, Position,
+        ReplayEvent, ReplayEventKind, ReplayInteractionKind, ScriptBotsConfig, WorldPersistence,
+        WorldState, channels::OutputChannel,
     };
     use std::sync::{Arc, Mutex};
 
@@ -411,6 +482,152 @@ mod tests {
         assert!(
             uids.windows(2).all(|pair| pair[0] < pair[1]),
             "actions must be recorded in ascending stable uid order, got {uids:?}"
+        );
+    }
+
+    fn pairwise_world(cap: usize) -> (WorldState, AgentId, AgentId, AgentUid, AgentUid) {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_max: 1.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            food_transfer_rate: 0.125,
+            food_sharing_distance: 20.0,
+            spike_radius: 20.0,
+            spike_damage: 0.5,
+            spike_energy_cost: 0.0,
+            spike_min_length: 0.1,
+            spike_alignment_cosine: 0.9,
+            spike_speed_damage_bonus: 0.0,
+            spike_length_damage_bonus: 0.0,
+            interaction_event_tick_cap: cap,
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("pairwise fixture world");
+        let actor = world
+            .try_spawn_agent(AgentData::default())
+            .expect("interaction actor");
+        let target = world
+            .try_spawn_agent(AgentData::default())
+            .expect("interaction target");
+        let actor_index = world.agents.index_of(actor).expect("actor index");
+        let target_index = world.agents.index_of(target).expect("target index");
+        {
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[actor_index] = Position::new(10.0, 10.0);
+            columns.positions_mut()[target_index] = Position::new(12.0, 10.0);
+            columns.headings_mut()[actor_index] = 0.0;
+            columns.spike_lengths_mut()[actor_index] = 1.0;
+            columns.health_mut()[target_index] = 2.0;
+        }
+        {
+            let runtime = world.runtime.get_mut(actor).expect("actor runtime");
+            runtime.energy = 1.0;
+            runtime.give_intent = 1.0;
+            runtime.herbivore_tendency = 0.1;
+            runtime.outputs[OutputChannel::SpikeTarget.index()] = 1.0;
+        }
+        {
+            let runtime = world.runtime.get_mut(target).expect("target runtime");
+            runtime.energy = 1.0;
+            runtime.give_intent = 0.0;
+            runtime.herbivore_tendency = 0.2;
+        }
+        let actor_uid = world.agent_uid(actor).expect("actor uid");
+        let target_uid = world.agent_uid(target).expect("target uid");
+        (world, actor, target, actor_uid, target_uid)
+    }
+
+    fn exercise_pairwise_stages(cap: usize) -> (WorldState, AgentUid, AgentUid) {
+        let (mut world, _actor, _target, actor_uid, target_uid) = pairwise_world(cap);
+        world.stage_food();
+        world.stage_combat();
+        (world, actor_uid, target_uid)
+    }
+
+    #[test]
+    fn food_share_and_combat_emit_exact_typed_pairwise_facts() {
+        let (world, actor, target) = exercise_pairwise_stages(8);
+        let interactions = world
+            .replay_events
+            .iter()
+            .filter(|event| matches!(event.kind, ReplayEventKind::Interaction { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(interactions.len(), 2);
+
+        let share = interactions[0];
+        assert_eq!(share.agent_uid, Some(actor));
+        assert_eq!(share.counterpart, Some(target));
+        assert_eq!(share.position, Some(Position::new(10.0, 10.0)));
+        assert_eq!(share.counterpart_position, Some(Position::new(12.0, 10.0)));
+        assert!(matches!(
+            share.kind,
+            ReplayEventKind::Interaction {
+                tick: Tick(1),
+                ordinal: 0,
+                kind: ReplayInteractionKind::FoodShare,
+                magnitude,
+            } if magnitude.to_bits() == 0.125_f32.to_bits()
+        ));
+
+        let combat = interactions[1];
+        assert_eq!(combat.agent_uid, Some(actor));
+        assert_eq!(combat.counterpart, Some(target));
+        assert!(matches!(
+            combat.kind,
+            ReplayEventKind::Interaction {
+                tick: Tick(1),
+                ordinal: 1,
+                kind: ReplayInteractionKind::Combat,
+                magnitude,
+            } if magnitude.to_bits() == 0.5_f32.to_bits()
+        ));
+        assert_eq!(
+            world.combat_spike_hits, 1,
+            "one emitted combat edge must match the in-sim hit counter"
+        );
+    }
+
+    #[test]
+    fn interaction_cap_is_per_tick_bounded_and_science_neutral() {
+        let mut observations = Vec::new();
+        for cap in [0usize, 1, 2] {
+            let (world, _, _) = exercise_pairwise_stages(cap);
+            let kinds = world
+                .replay_events
+                .iter()
+                .filter_map(|event| match event.kind {
+                    ReplayEventKind::Interaction { kind, .. } => Some(kind),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let digest = world.world_digest_v1().expect("science digest").overall;
+            observations.push((kinds, digest, world.replay_interaction_events_dropped()));
+        }
+
+        assert!(observations[0].0.is_empty());
+        assert_eq!(observations[1].0, vec![ReplayInteractionKind::FoodShare]);
+        assert_eq!(
+            observations[2].0,
+            vec![
+                ReplayInteractionKind::FoodShare,
+                ReplayInteractionKind::Combat
+            ]
+        );
+        assert_eq!(observations[0].1, observations[1].1);
+        assert_eq!(observations[1].1, observations[2].1);
+        assert_eq!(observations[0].2, 2);
+        assert_eq!(observations[1].2, 1);
+        assert_eq!(observations[2].2, 0);
+        assert_eq!(
+            ScriptBotsConfig::default().interaction_event_tick_cap,
+            crate::DEFAULT_INTERACTION_EVENT_TICK_CAP
         );
     }
 }

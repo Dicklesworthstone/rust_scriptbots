@@ -7536,6 +7536,15 @@ pub enum ReplayRngScope {
     },
 }
 
+/// Categories of directed, pairwise simulation interactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayInteractionKind {
+    /// A directed spike hit from attacker to victim.
+    Combat,
+    /// A directed energy transfer from giver to recipient.
+    FoodShare,
+}
+
 /// Detailed event recordings emitted for deterministic replays.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReplayEventKind {
@@ -7577,6 +7586,22 @@ pub enum ReplayEventKind {
         /// Canonical overall digest at the boundary.
         overall: String,
     },
+    /// A directed pairwise simulation interaction.
+    ///
+    /// Unlike the enclosing persistence batch, `tick` is the boundary where the interaction
+    /// actually occurred. A batch may retain several ticks before it is admitted. `ordinal` is
+    /// assigned by core in canonical emission order and therefore remains stable when a
+    /// consumer filters the shared replay stream.
+    Interaction {
+        /// Simulation boundary where the interaction occurred.
+        tick: Tick,
+        /// Zero-based ordinal among pairwise interactions emitted for this tick.
+        ordinal: u64,
+        /// Typed interaction category.
+        kind: ReplayInteractionKind,
+        /// Damage dealt or energy transferred.
+        magnitude: f32,
+    },
 }
 
 /// Default per-tick replay-event budget.
@@ -7586,6 +7611,14 @@ pub enum ReplayEventKind {
 /// than growing without limit. Runs with larger populations should raise it to at or above
 /// their peak agent count; the dropped count is how they find out they need to.
 pub const DEFAULT_REPLAY_EVENT_TICK_CAP: usize = 512;
+
+/// Default maximum number of pairwise interaction events retained per tick.
+///
+/// Pairwise edges can be substantially denser than the per-agent action stream. This separate
+/// cap prevents action recording from consuming the entire interaction budget before the food
+/// and combat stages run. A zero value selects the aggregates-only fallback; a value at or above
+/// the tick's interaction count records full fidelity.
+pub const DEFAULT_INTERACTION_EVENT_TICK_CAP: usize = 512;
 
 /// Lightweight wrapper pairing an agent context with a replay event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -7610,6 +7643,16 @@ pub struct ReplayEvent {
     pub counterpart_position: Option<Position>,
     /// Event payload.
     pub kind: ReplayEventKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingReplayInteraction {
+    actor: AgentUid,
+    actor_position: Position,
+    target: AgentUid,
+    target_position: Position,
+    kind: ReplayInteractionKind,
+    magnitude: f32,
 }
 
 /// Aggregate payload forwarded to persistence sinks.
@@ -11522,6 +11565,14 @@ pub struct ScriptBotsConfig {
     /// buffer instead would silently record only the first tick of every window.
     #[serde(default)]
     pub replay_event_tick_cap: usize,
+    /// Maximum pairwise interaction events retained per tick.
+    ///
+    /// The deterministic sample keeps events in canonical stage order (food sharing, then
+    /// combat) and stable actor/target order within each stage. `0` retains aggregate counters
+    /// only. Set this at or above the observed per-tick interaction count for full fidelity.
+    /// The selected value is part of the serialized run configuration and provenance.
+    #[serde(default)]
+    pub interaction_event_tick_cap: usize,
     /// Sampling cadence for analytics families.
     pub analytics_stride: AnalyticsStride,
     /// `NeuroFlow` runtime configuration.
@@ -11636,6 +11687,7 @@ impl Default for ScriptBotsConfig {
             economy_debug_per_tick: false,
             persistence_interval: 0,
             replay_event_tick_cap: DEFAULT_REPLAY_EVENT_TICK_CAP,
+            interaction_event_tick_cap: DEFAULT_INTERACTION_EVENT_TICK_CAP,
             analytics_stride: AnalyticsStride::default(),
             neuroflow: NeuroflowSettings {
                 enabled: true,
@@ -15870,8 +15922,9 @@ pub struct WorldState {
     pending_death_records: Vec<DeathRecord>,
     pending_lifecycle_birth_metrics: Vec<BirthRecord>,
     pending_lifecycle_death_metrics: Vec<DeathRecord>,
-    #[allow(dead_code)]
     replay_tick: u64,
+    replay_interactions_this_tick: usize,
+    replay_interactions_dropped_total: u64,
     replay_events: Vec<ReplayEvent>,
     /// Transient driver request to bind the canonical world digest into the next projected
     /// batch's replay stream; consumed by `prepare_persistence`. Never serialized: it is a
@@ -16676,6 +16729,8 @@ impl WorldState {
             pending_lifecycle_birth_metrics: Vec::new(),
             pending_lifecycle_death_metrics: Vec::new(),
             replay_tick: 0,
+            replay_interactions_this_tick: 0,
+            replay_interactions_dropped_total: 0,
             replay_events: Vec::new(),
             replay_world_digest_pending: false,
             persistence_binding: Arc::new(PersistenceSessionToken::default()),
@@ -19460,6 +19515,10 @@ impl WorldState {
     )]
     fn stage_food(&mut self) -> FoodResourceActivity {
         let mut activity = FoodResourceActivity::default();
+        let replay_tick = self.tick.next();
+        let interaction_slots = self.replay_interaction_slots(replay_tick);
+        let mut interaction_events = Vec::with_capacity(interaction_slots.min(64));
+        let mut interaction_events_dropped = 0usize;
         let cell_size = validated_world_unit_f32(self.config.food_cell_size);
         #[cfg(any(test, feature = "economy-faults"))]
         let ledger_fault = self.current_ledger_fault();
@@ -19675,6 +19734,23 @@ impl WorldState {
                         (recipient_runtime.energy + actual_transfer).min(2.0);
                     recipient_runtime.food_delta += actual_transfer;
                 }
+                if interaction_events.len() >= interaction_slots {
+                    interaction_events_dropped = interaction_events_dropped.saturating_add(1);
+                } else if let (Some(giver), Some(recipient)) = (
+                    self.identities.get(giver_id).map(|identity| identity.uid),
+                    self.identities
+                        .get(*recipient_id)
+                        .map(|identity| identity.uid),
+                ) {
+                    interaction_events.push(PendingReplayInteraction {
+                        actor: giver,
+                        actor_position: positions[giver_idx],
+                        target: recipient,
+                        target_position: positions[recipient_idx],
+                        kind: ReplayInteractionKind::FoodShare,
+                        magnitude: actual_transfer,
+                    });
+                }
                 indicator_pulses.push((giver_id, 10.0, [1.0, 1.0, 1.0]));
                 indicator_pulses.push((*recipient_id, 10.0, [1.0, 1.0, 1.0]));
             }
@@ -19682,6 +19758,11 @@ impl WorldState {
         for (id, intensity, color) in indicator_pulses {
             self.pulse_indicator(id, intensity, color);
         }
+        self.record_replay_interaction_events(
+            replay_tick,
+            interaction_events,
+            interaction_events_dropped,
+        );
         activity
     }
     fn prepare_registered_brain(
@@ -20486,6 +20567,8 @@ impl WorldState {
         reason = "combat geometry and damage preserve established f32 operation order across scalar and SIMD paths"
     )]
     fn stage_combat(&mut self) {
+        let replay_tick = self.tick.next();
+        let interaction_slots = self.replay_interaction_slots(replay_tick);
         let spike_radius = self.config.spike_radius;
         if spike_radius <= 0.0 {
             return;
@@ -20754,6 +20837,40 @@ impl WorldState {
             result
         });
 
+        let mut interaction_events = Vec::with_capacity(interaction_slots.min(64));
+        let mut interaction_events_dropped = 0usize;
+        for (attacker_idx, result) in results.iter().enumerate() {
+            let attacker_id = handles[attacker_idx];
+            let Some(attacker) = self
+                .identities
+                .get(attacker_id)
+                .map(|identity| identity.uid)
+            else {
+                continue;
+            };
+            for hit in &result.hits {
+                if interaction_events.len() >= interaction_slots {
+                    interaction_events_dropped = interaction_events_dropped.saturating_add(1);
+                    continue;
+                }
+                let Some(target_id) = handles.get(hit.target_idx).copied() else {
+                    continue;
+                };
+                let Some(target) = self.identities.get(target_id).map(|identity| identity.uid)
+                else {
+                    continue;
+                };
+                interaction_events.push(PendingReplayInteraction {
+                    actor: attacker,
+                    actor_position: positions[attacker_idx],
+                    target,
+                    target_position: positions[hit.target_idx],
+                    kind: ReplayInteractionKind::Combat,
+                    magnitude: hit.damage,
+                });
+            }
+        }
+
         let mut buckets = vec![DamageBucket::default(); handles.len()];
         let columns = self.agents.columns_mut();
         let healths = columns.health_mut();
@@ -20848,6 +20965,11 @@ impl WorldState {
             .sum::<u32>();
         self.combat_spike_attempts = self.combat_spike_attempts.saturating_add(attempts);
         self.combat_spike_hits = self.combat_spike_hits.saturating_add(hits);
+        self.record_replay_interaction_events(
+            replay_tick,
+            interaction_events,
+            interaction_events_dropped,
+        );
     }
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
@@ -22522,7 +22644,7 @@ impl WorldState {
         // A driver-requested world digest rides this boundary's batch so the digest covers
         // the completed post-tick state and the verifying driver sees the same shape. This
         // must stay ahead of the replay-event take below or the digest misses its own tick.
-        self.append_requested_replay_world_digest();
+        self.append_requested_replay_world_digest(next_tick);
 
         let ready = BoundaryReady {
             tick: next_tick,
@@ -22740,7 +22862,7 @@ impl WorldState {
         let brain_evaluation = observed_stage!(WorldStepStage::Brains, { self.stage_brains() });
         observed_stage!(WorldStepStage::Actuation, {
             self.stage_actuation();
-            self.record_replay_action_events();
+            self.record_replay_action_events(next_tick);
         });
         observed_stage!(WorldStepStage::TemperatureDiscomfort, {
             let before = self.capture_resource_amounts();
@@ -23501,10 +23623,11 @@ impl WorldState {
         scientific_config.narrative_interval = 0;
         scientific_config.narrative_capacity = 0;
         scientific_config.persistence_interval = 0;
-        // Recording replay events is a read-only projection of state the tick already
-        // computed. Letting the cap into the digest would mean a run that records cannot
-        // match the production run it exists to verify, which defeats the anchor.
+        // Recording replay and interaction events is a read-only projection of state the tick
+        // already computed. Letting either cap into the digest would mean a run that records
+        // cannot match the production run it exists to verify, which defeats the anchor.
         scientific_config.replay_event_tick_cap = 0;
+        scientific_config.interaction_event_tick_cap = 0;
         scientific_config.analytics_stride = AnalyticsStride {
             macro_metrics: 0,
             behavior_metrics: 0,
@@ -23736,6 +23859,8 @@ impl WorldState {
             &self.pending_lifecycle_death_metrics,
         )?;
         encoder.u64(self.replay_tick);
+        encoder.usize(self.replay_interactions_this_tick);
+        encoder.u64(self.replay_interactions_dropped_total);
         encoder.postcard("pending replay events", &self.replay_events)?;
 
         let mut runtime_tails = self

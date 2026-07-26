@@ -42,7 +42,7 @@ use scriptbots_core::{
     AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding,
     DeathCause, DeathRecord, Generation, PersistenceAdmissionError, PersistenceAdmissionState,
     PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase, ReplayEvent,
-    ReplayEventKind, ReplayRngScope, Tick, WorldPersistence,
+    ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
     rng_domains::{AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain},
     world_counters_digest_v1,
@@ -64,7 +64,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_TICK_BUFFER: usize = 32;
 const DEFAULT_AGENT_BUFFER: usize = 1024;
@@ -84,6 +84,12 @@ const MAX_STORAGE_QUERY_PAGE: usize = 4_096;
 const MAX_HOST_JOURNAL_ARCHIVE_BYTES: usize = 256 << 20;
 const OUTBOX_PAYLOAD_VERSION: u32 = 4;
 const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
+/// Sequence namespace reserved for core-owned pairwise interaction ordinals.
+///
+/// Legacy replay events use their position within the enclosing persistence batch. Interaction
+/// events retain a per-source-tick ordinal instead, so placing them in this disjoint namespace
+/// prevents a collision while preserving a stable identity across persistence windows.
+pub const INTERACTION_REPLAY_SEQ_BASE: u64 = 1 << 62;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -3814,6 +3820,12 @@ struct ReplayEventRow {
     counterpart: Option<i64>,
     #[serde(default)]
     counterpart_position: Option<(f64, f64)>,
+    /// Typed interaction magnitude projected by core.
+    ///
+    /// Defaulting is required for outbox payloads admitted by a binary that predates pairwise
+    /// event emission.
+    #[serde(default)]
+    interaction_value: Option<f64>,
 }
 
 /// Aggregate event count grouped by replay event type.
@@ -3954,9 +3966,8 @@ pub struct PersistedInteraction {
     pub target: AgentUid,
     /// Magnitude of the interaction -- damage dealt, energy transferred.
     ///
-    /// `None` for every edge today: no `ReplayEventKind` variant carries a magnitude yet, and
-    /// deriving one from the payload here would make storage the author of a measurement it
-    /// did not take.
+    /// Typed core interaction events always carry this value. `None` remains possible when
+    /// reading a legacy or manually constructed pairwise replay row that did not record one.
     pub value: Option<f64>,
     /// Where the actor was when it acted, if the emitter recorded it.
     pub actor_position: Option<Position>,
@@ -4084,6 +4095,11 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
     // Scientific rows only. `narrative_events` is deliberately absent: see
     // [`estimate_narrative_size`] for why derived commentary is budgeted separately
     // (`bd-erff`).
+    let interaction_rows = payload
+        .replay_events
+        .iter()
+        .filter(|event| event.agent_uid.is_some() && event.counterpart.is_some())
+        .count();
     let events = [
         payload.metrics.len(),
         payload.events.len(),
@@ -4091,6 +4107,7 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
         payload.births.len(),
         payload.deaths.len(),
         payload.replay_events.len(),
+        interaction_rows,
     ]
     .into_iter()
     .fold(0usize, usize::saturating_add);
@@ -4108,6 +4125,7 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
     // constant is unchanged -- but the check is the point. bd-erff was an estimator that had
     // drifted from what the writer actually wrote, and a record can only grow silently once.
     const REPLAY_BYTES: usize = 512;
+    const INTERACTION_BYTES: usize = 256;
     const SUMMARY_BYTES: usize = 256;
 
     // A JSON string byte can expand to six ASCII bytes (`\u00xx`). The prepared
@@ -4128,6 +4146,7 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
         (payload.births.len(), BIRTH_BYTES),
         (payload.deaths.len(), DEATH_BYTES),
         (payload.replay_events.len(), REPLAY_BYTES),
+        (interaction_rows, INTERACTION_BYTES),
     ] {
         bytes = bytes.saturating_add(count.saturating_mul(row_bytes));
     }
@@ -4866,6 +4885,11 @@ impl StorageBuffer {
             + self.births.len()
             + self.deaths.len()
             + self.replay_events.len()
+            + self
+                .replay_events
+                .iter()
+                .filter(|event| event.agent_uid.is_some() && event.counterpart.is_some())
+                .count()
             + self.run_events.len()
     }
 
@@ -5131,6 +5155,50 @@ impl StorageBuffer {
                     context,
                     reason: format!(
                         "expected {expected_rows} canonical event row(s) totaling {expected}, found {rows} row(s) totaling {total}"
+                    ),
+                });
+            }
+        }
+        let mut replay_keys = BTreeSet::new();
+        for row in &self.replay_events {
+            let row_tick = checked_u64("replay_events.tick", row.tick)?;
+            if row_tick > enclosing_tick {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.tick",
+                    reason: format!(
+                        "replay event tick {row_tick} exceeds enclosing batch tick {enclosing_tick}"
+                    ),
+                });
+            }
+            checked_u64("replay_events.seq", row.seq)?;
+            if !replay_keys.insert((row.tick, row.seq)) {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.seq",
+                    reason: format!(
+                        "duplicate replay event key at tick {}, seq {}",
+                        row.tick, row.seq
+                    ),
+                });
+            }
+            if let Some(value) = row.interaction_value
+                && (!value.is_finite() || value <= 0.0)
+            {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.interaction.magnitude",
+                    reason: format!(
+                        "interaction magnitude at tick {}, seq {} must be finite and positive",
+                        row.tick, row.seq
+                    ),
+                });
+            }
+            if matches!(row.event_type.as_str(), "combat" | "food_share")
+                && row.interaction_value.is_none()
+            {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.interaction.magnitude",
+                    reason: format!(
+                        "{} interaction at tick {}, seq {} has no magnitude",
+                        row.event_type, row.tick, row.seq
                     ),
                 });
             }
@@ -7069,12 +7137,10 @@ impl StorageReader {
     /// writer anywhere in the workspace until `Storage::insert_interactions`. Anything that
     /// queried it before now got an empty answer from a table that looked deliberately built.
     ///
-    /// Returns an empty page when the run recorded no pairwise events. That is the CURRENT
-    /// state of every run: `ReplayEventKind` has no pairwise variant yet, so `counterpart` is
-    /// `None` at every emission site in core. This reader is the persistence half of
-    /// `bd-2z0.5.9` and is wired ahead of the emission half deliberately -- an event kind
-    /// arriving later flows through without another schema change. Do not read an empty result
-    /// as evidence that a run had no interactions.
+    /// Returns an empty page when the run recorded no pairwise events. A zero
+    /// `interaction_event_tick_cap`, or a run in which no hit/share completed, produces that
+    /// honest result. Typed core interaction events otherwise flow through without another
+    /// schema change.
     pub fn recent_interactions(
         &self,
         limit: usize,
@@ -12653,18 +12719,19 @@ impl Storage {
     /// under recovery replay for the same reason the replay row is, and the edge joins back to
     /// the event it came from without a surrogate key.
     ///
-    /// `value` is NULL today. It is the column for a magnitude -- combat damage, transfer
-    /// amount -- and no `ReplayEventKind` variant carries one yet, so writing anything else
-    /// would be inventing a measurement. `payload_json` carries the event payload verbatim, so
-    /// a kind that gains a magnitude becomes queryable before this function changes.
+    /// `value` comes only from the typed core interaction payload -- combat damage or transfer
+    /// amount. Legacy or manually constructed pairwise events remain nullable rather than
+    /// asking storage to invent a measurement. `payload_json` carries the event payload
+    /// verbatim.
     fn insert_interactions(
         tx: &Transaction<'_>,
         run_id: RunId,
         rows: &[ReplayEventRow],
-    ) -> Result<(), FrankenError> {
+    ) -> Result<usize, FrankenError> {
         let sql = "insert or replace into interactions (
                 run_id, tick, seq, actor_agent_uid, target_agent_uid, kind, value, payload_json
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+        let mut inserted = 0usize;
         for row in rows {
             let (Some(actor), Some(target)) = (row.agent_uid, row.counterpart) else {
                 continue;
@@ -12678,12 +12745,13 @@ impl Storage {
                     actor.into(),
                     target.into(),
                     row.event_type.as_str().into(),
-                    SqliteValue::Null,
+                    row.interaction_value.map_or(SqliteValue::Null, Into::into),
                     row.payload.as_str().into(),
                 ],
             )?;
+            inserted += 1;
         }
-        Ok(())
+        Ok(inserted)
     }
 
     fn flush_attempt(
@@ -12701,6 +12769,7 @@ impl Storage {
                 source,
                 commit_state: FailureCommitState::RolledBack,
             })?;
+        let mut interaction_rows = 0usize;
         let transaction_result = (|| -> Result<(), FrankenError> {
             #[cfg(test)]
             fail_at_host_journal_transaction_fault(
@@ -12746,7 +12815,7 @@ impl Storage {
             Self::insert_replay_events(&tx, run_id, &buffer.replay_events)?;
             // Same transaction and same source slice as the replay rows above, so an edge can
             // never be committed without the event it was derived from, nor the reverse.
-            Self::insert_interactions(&tx, run_id, &buffer.replay_events)?;
+            interaction_rows = Self::insert_interactions(&tx, run_id, &buffer.replay_events)?;
             Self::insert_run_events(&tx, run_id, &buffer.run_events)?;
             #[cfg(test)]
             fail_at_host_journal_transaction_fault(
@@ -12859,6 +12928,10 @@ impl Storage {
             };
         }
 
+        debug!(
+            run_id = run_id.get(),
+            interaction_rows, "persisted pairwise interaction rows"
+        );
         Ok(())
     }
 
@@ -15809,7 +15882,15 @@ fn replay_row_from_event(
         context,
         reason: format!("non-finite replay value at tick {tick}, seq {seq}"),
     };
-    let (scope, event_type, payload_value): (String, String, Value) = match &event.kind {
+    let fallback_seq = checked_i64("replay_events.seq", seq)?;
+    let (scope, event_type, payload_value, row_tick, row_seq, interaction_value): (
+        String,
+        String,
+        Value,
+        i64,
+        i64,
+        Option<f64>,
+    ) = match &event.kind {
         ReplayEventKind::BrainOutputs { outputs } => {
             if outputs.iter().any(|value| !value.is_finite()) {
                 return Err(invalid_non_finite("replay_events.brain_outputs"));
@@ -15823,6 +15904,9 @@ fn replay_row_from_event(
                 .to_string(),
                 "brain_outputs".to_string(),
                 json!({ "outputs": outputs }),
+                tick,
+                fallback_seq,
+                None,
             )
         }
         ReplayEventKind::Action {
@@ -15858,6 +15942,9 @@ fn replay_row_from_event(
                     "sound_level": sound_level,
                     "give_intent": give_intent,
                 }),
+                tick,
+                fallback_seq,
+                None,
             )
         }
         ReplayEventKind::RngSample {
@@ -15888,6 +15975,9 @@ fn replay_row_from_event(
                     "range_max": range_max,
                     "value": value,
                 }),
+                tick,
+                fallback_seq,
+                None,
             )
         }
         ReplayEventKind::WorldDigest { overall } => {
@@ -15907,6 +15997,71 @@ fn replay_row_from_event(
                 "world:digest".to_string(),
                 "world_digest".to_string(),
                 json!({ "overall": overall }),
+                tick,
+                fallback_seq,
+                None,
+            )
+        }
+        ReplayEventKind::Interaction {
+            tick: interaction_tick,
+            ordinal,
+            kind,
+            magnitude,
+        } => {
+            if !magnitude.is_finite() || *magnitude <= 0.0 {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.interaction.magnitude",
+                    reason: format!(
+                        "interaction magnitude at tick {}, ordinal {ordinal} must be finite and positive",
+                        interaction_tick.0
+                    ),
+                });
+            }
+            let (Some(actor), Some(target)) = (event.agent_uid, event.counterpart) else {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.interaction.participants",
+                    reason: format!(
+                        "interaction at tick {}, ordinal {ordinal} requires actor and target",
+                        interaction_tick.0
+                    ),
+                });
+            };
+            if actor == target {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.interaction.participants",
+                    reason: format!(
+                        "interaction at tick {}, ordinal {ordinal} cannot target its actor",
+                        interaction_tick.0
+                    ),
+                });
+            }
+            let source_tick = encode_u64("replay_events.interaction.tick", interaction_tick.0)?;
+            if source_tick > tick {
+                return Err(StorageError::InvalidData {
+                    context: "replay_events.interaction.tick",
+                    reason: format!(
+                        "interaction tick {source_tick} exceeds enclosing batch tick {tick}"
+                    ),
+                });
+            }
+            let namespaced_seq = INTERACTION_REPLAY_SEQ_BASE
+                .checked_add(*ordinal)
+                .ok_or_else(|| StorageError::InvalidData {
+                    context: "replay_events.interaction.ordinal",
+                    reason: format!("interaction ordinal {ordinal} exceeds the sequence namespace"),
+                })?;
+            let stored_seq = encode_u64("replay_events.interaction.ordinal", namespaced_seq)?;
+            let event_type = match kind {
+                ReplayInteractionKind::Combat => "combat",
+                ReplayInteractionKind::FoodShare => "food_share",
+            };
+            (
+                "agent:interaction".to_string(),
+                event_type.to_string(),
+                json!({ "magnitude": magnitude }),
+                source_tick,
+                stored_seq,
+                Some(f64::from(*magnitude)),
             )
         }
     };
@@ -15927,8 +16082,8 @@ fn replay_row_from_event(
     };
 
     Ok(ReplayEventRow {
-        tick,
-        seq: checked_i64("replay_events.seq", seq)?,
+        tick: row_tick,
+        seq: row_seq,
         agent_uid: optional_agent_uid("replay_events.agent_uid", event.agent_uid)?,
         scope,
         event_type,
@@ -15939,6 +16094,7 @@ fn replay_row_from_event(
             event.counterpart_position,
             "replay_events.counterpart_position",
         )?,
+        interaction_value,
     })
 }
 
@@ -16050,6 +16206,11 @@ struct WorldDigestPayload {
     overall: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct InteractionPayload {
+    magnitude: f32,
+}
+
 /// Column list shared by every `replay_events` reader.
 ///
 /// Written once because the columns and the positional [`decode`] indices in
@@ -16107,6 +16268,7 @@ fn replay_event_row_from_query_row(row: &Row) -> Result<ReplayEventRow, StorageE
             tick,
             seq,
         )?,
+        interaction_value: None,
     })
 }
 
@@ -16138,6 +16300,7 @@ fn paired_position(
 
 fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageError> {
     let agent_uid = decode_agent_uid(row.agent_uid, row.tick, row.seq)?;
+    let counterpart = decode_agent_uid(row.counterpart, row.tick, row.seq)?;
     let kind = match row.event_type.as_str() {
         "brain_outputs" => {
             if row.scope.starts_with("agent:") && agent_uid.is_none() {
@@ -16207,6 +16370,49 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
                 overall: payload.overall,
             }
         }
+        "combat" | "food_share" => {
+            let (Some(actor), Some(target)) = (agent_uid, counterpart) else {
+                return Err(StorageError::ReplayParse {
+                    tick: row.tick,
+                    seq: row.seq,
+                    reason: "interaction event requires actor and target".to_string(),
+                });
+            };
+            if actor == target {
+                return Err(StorageError::ReplayParse {
+                    tick: row.tick,
+                    seq: row.seq,
+                    reason: "interaction event cannot target its actor".to_string(),
+                });
+            }
+            let payload: InteractionPayload = parse_payload(row)?;
+            if !payload.magnitude.is_finite() || payload.magnitude <= 0.0 {
+                return Err(StorageError::ReplayParse {
+                    tick: row.tick,
+                    seq: row.seq,
+                    reason: "interaction magnitude must be finite and positive".to_string(),
+                });
+            }
+            let sequence = checked_u64("replay_events.interaction.seq", row.seq)?;
+            let ordinal = sequence
+                .checked_sub(INTERACTION_REPLAY_SEQ_BASE)
+                .ok_or_else(|| StorageError::ReplayParse {
+                    tick: row.tick,
+                    seq: row.seq,
+                    reason: "interaction sequence is outside the reserved namespace".to_string(),
+                })?;
+            let interaction_kind = match row.event_type.as_str() {
+                "combat" => ReplayInteractionKind::Combat,
+                "food_share" => ReplayInteractionKind::FoodShare,
+                _ => unreachable!("guarded by the outer match"),
+            };
+            ReplayEventKind::Interaction {
+                tick: Tick(checked_u64("replay_events.interaction.tick", row.tick)?),
+                ordinal,
+                kind: interaction_kind,
+                magnitude: payload.magnitude,
+            }
+        }
         other => {
             return Err(StorageError::ReplayParse {
                 tick: row.tick,
@@ -16222,7 +16428,7 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
     Ok(ReplayEvent {
         agent_uid,
         position: row.position.map(position_from_columns),
-        counterpart: decode_agent_uid(row.counterpart, row.tick, row.seq)?,
+        counterpart,
         counterpart_position: row.counterpart_position.map(position_from_columns),
         kind,
     })
@@ -18491,6 +18697,7 @@ mod tests {
         assert_eq!(row.position, None);
         assert_eq!(row.counterpart, None);
         assert_eq!(row.counterpart_position, None);
+        assert_eq!(row.interaction_value, None);
 
         let modern = ReplayEventRow {
             tick: 7,
@@ -18502,6 +18709,7 @@ mod tests {
             position: Some((1.5, -2.5)),
             counterpart: Some(13),
             counterpart_position: Some((3.0, 4.0)),
+            interaction_value: Some(0.25),
         };
         let encoded = serde_json::to_string(&modern).expect("row serializes");
         let decoded: ReplayEventRow =
@@ -18509,6 +18717,7 @@ mod tests {
         assert_eq!(decoded.position, Some((1.5, -2.5)));
         assert_eq!(decoded.counterpart, Some(13));
         assert_eq!(decoded.counterpart_position, Some((3.0, 4.0)));
+        assert_eq!(decoded.interaction_value, Some(0.25));
     }
 
     /// Column names of one table, in declaration order.

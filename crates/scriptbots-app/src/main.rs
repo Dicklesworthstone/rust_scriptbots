@@ -25,15 +25,16 @@ use scriptbots_brain::{
 use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 use scriptbots_core::{
     LEGACY_RENDER_ENV_NAMES, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
-    PersistenceSessionError, RenderQuality, RenderTonemapMode, ReplayEventKind, ScriptBotsConfig,
-    TickSummary, WorldDigestV1, WorldPersistence, WorldState, map_legacy_render_env,
-    parse_render_quality,
+    PersistenceSessionError, RenderQuality, RenderTonemapMode, ReplayEventKind,
+    ReplayInteractionKind, ScriptBotsConfig, TickSummary, WorldDigestV1, WorldPersistence,
+    WorldState, map_legacy_render_env, parse_render_quality,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    PersistedReplayEvent, PersistenceGuarantee, ShutdownReceipt, StoragePipeline, StorageReader,
+    INTERACTION_REPLAY_SEQ_BASE, PersistedReplayEvent, PersistenceGuarantee, ShutdownReceipt,
+    StoragePipeline, StorageReader,
 };
 use serde_json::{self, Value as JsonValue};
 use std::process::{Command, Stdio};
@@ -3439,12 +3440,17 @@ fn run_headless_simulation(
     let mut summaries = Vec::with_capacity(records.len());
     for record in records {
         summaries.push(record.summary);
-        for (seq, event) in record.events.into_iter().enumerate() {
-            events.push(PersistedReplayEvent {
-                tick: record.tick,
-                seq: seq as u64,
-                event,
-            });
+        for (fallback_seq, event) in record.events.into_iter().enumerate() {
+            let (tick, seq) = match &event.kind {
+                ReplayEventKind::Interaction { tick, ordinal, .. } => (
+                    tick.0,
+                    INTERACTION_REPLAY_SEQ_BASE
+                        .checked_add(*ordinal)
+                        .ok_or_else(|| anyhow::anyhow!("interaction replay ordinal overflow"))?,
+                ),
+                _ => (record.tick, fallback_seq as u64),
+            };
+            events.push(PersistedReplayEvent { tick, seq, event });
         }
     }
 
@@ -3930,6 +3936,14 @@ fn count_event_kinds(events: &[PersistedReplayEvent]) -> HashMap<&'static str, u
             ReplayEventKind::Action { .. } => "action",
             ReplayEventKind::RngSample { .. } => "rng_sample",
             ReplayEventKind::WorldDigest { .. } => "world_digest",
+            ReplayEventKind::Interaction {
+                kind: ReplayInteractionKind::Combat,
+                ..
+            } => "combat",
+            ReplayEventKind::Interaction {
+                kind: ReplayInteractionKind::FoodShare,
+                ..
+            } => "food_share",
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -4024,6 +4038,15 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
                 event.agent_uid
             )
         }
+        ReplayEventKind::Interaction {
+            tick,
+            ordinal,
+            kind,
+            magnitude,
+        } => format!(
+            "Interaction(tick={}, ordinal={ordinal}, kind={kind:?}, actor={:?}, target={:?}, magnitude={magnitude:.6})",
+            tick.0, event.agent_uid, event.counterpart
+        ),
     }
 }
 
@@ -4032,7 +4055,14 @@ fn print_event_counts(
     counts: &HashMap<String, u64>,
     reference: Option<&HashMap<String, u64>>,
 ) {
-    let keys = ["brain_outputs", "action", "rng_sample", "world_digest"];
+    let keys = [
+        "brain_outputs",
+        "action",
+        "rng_sample",
+        "world_digest",
+        "combat",
+        "food_share",
+    ];
     println!("  {}", label.cyan().bold());
     for key in keys {
         let value = counts.get(key).copied().unwrap_or(0);

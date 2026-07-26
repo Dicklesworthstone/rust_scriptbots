@@ -6,8 +6,8 @@
 //! memory is gone by the time anyone gets a say.
 
 use scriptbots_core::{
-    MetricSample, PersistenceBatch, PersistenceEvent, PersistenceEventKind, ReplayEvent,
-    ReplayEventKind, Tick, TickSummary,
+    AgentUid, MetricSample, PersistenceBatch, PersistenceEvent, PersistenceEventKind, Position,
+    ReplayEvent, ReplayEventKind, ReplayInteractionKind, Tick, TickSummary,
 };
 use scriptbots_storage::{
     PayloadBudget, StorageError, StoragePipeline, StorageReader, estimate_batch_size,
@@ -246,6 +246,67 @@ fn the_size_estimate_is_deterministic_monotonic_and_allocates_nothing() {
     );
     assert_eq!(small_events, 10);
     assert_eq!(large_events, 1_000);
+}
+
+#[test]
+fn derived_interaction_rows_are_charged_to_the_scientific_budget() {
+    let mut ordinary = batch(1, 0);
+    ordinary.replay_events.push(ReplayEvent {
+        agent_uid: Some(AgentUid(7)),
+        position: Some(Position::new(1.0, 2.0)),
+        counterpart: None,
+        counterpart_position: None,
+        kind: ReplayEventKind::BrainOutputs {
+            outputs: Vec::new(),
+        },
+    });
+
+    let mut pairwise = batch(1, 0);
+    pairwise.replay_events.push(ReplayEvent {
+        agent_uid: Some(AgentUid(7)),
+        position: Some(Position::new(1.0, 2.0)),
+        counterpart: Some(AgentUid(11)),
+        counterpart_position: Some(Position::new(3.0, 4.0)),
+        kind: ReplayEventKind::Interaction {
+            tick: Tick(1),
+            ordinal: 0,
+            kind: ReplayInteractionKind::Combat,
+            magnitude: 0.25,
+        },
+    });
+
+    let (ordinary_bytes, ordinary_events) = estimate_batch_size(&ordinary);
+    let (pairwise_bytes, pairwise_events) = estimate_batch_size(&pairwise);
+    assert_eq!(ordinary_events, 1);
+    assert_eq!(
+        pairwise_events, 2,
+        "one typed interaction creates both a replay row and a derived interaction row"
+    );
+    assert!(
+        pairwise_bytes > ordinary_bytes,
+        "the derived SQL row must consume a conservative byte allowance"
+    );
+
+    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("pipeline");
+    pipeline.set_payload_budget(PayloadBudget {
+        max_batch_bytes: ordinary_bytes,
+        max_batch_events: ordinary_events,
+        max_inflight_bytes: usize::MAX,
+    });
+    pipeline
+        .submit(&ordinary)
+        .expect("the one-row baseline fits its exact budget");
+    assert!(matches!(
+        pipeline.submit(&pairwise),
+        Err(StorageError::PayloadTooLarge { .. })
+    ));
+    pipeline.shutdown().expect("shutdown");
 }
 
 #[test]
