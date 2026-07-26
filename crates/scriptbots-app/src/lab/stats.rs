@@ -1,7 +1,7 @@
 //! Analysis layer: effect sizes with CIs over matched-seed run summaries (bd-16g.1.4).
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap};
 use thiserror::Error;
 
 /// Individual run summary row produced by run exports.
@@ -48,6 +48,18 @@ pub enum StatsError {
     ZeroVariance,
     #[error("Non-finite metric value encountered")]
     NonFiniteValue,
+    /// The caller supplied a non-finite significance level or one outside `(0, 1)`.
+    #[error("Significance level must be finite and strictly between zero and one")]
+    InvalidSignificanceLevel,
+    /// A raw p-value was non-finite or outside `[0, 1]`.
+    #[error("P-value at index {index} must be finite and between zero and one")]
+    InvalidPValue {
+        /// Zero-based position of the rejected value in the caller's input.
+        index: usize,
+    },
+    /// The input family cannot be ranked without losing integer precision.
+    #[error("Too many simultaneous comparisons to rank")]
+    TooManyComparisons,
 }
 
 /// Detailed paired effect size and confidence interval for matched-seed runs.
@@ -73,6 +85,30 @@ pub struct Effect {
     pub ci_95: (f64, f64),
     pub correction: Option<Correction>,
     pub underpowered: bool,
+}
+
+/// One hypothesis after a multiple-comparison adjustment.
+///
+/// Records stay in the caller's original order. `rank` is one-based and describes the
+/// hypothesis's position after sorting by raw p-value, with the original index breaking
+/// ties deterministically. Holm-Bonferroni controls family-wise error; Benjamini-Hochberg
+/// controls the false-discovery rate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdjustedComparison {
+    /// Zero-based position in the caller's raw p-value slice.
+    pub original_index: usize,
+    /// One-based position after sorting by raw p-value and original index.
+    pub rank: usize,
+    /// Unmodified caller-supplied p-value.
+    pub raw_p_value: f64,
+    /// Multiplicity-adjusted p-value for the selected correction.
+    pub adjusted_p_value: f64,
+    /// Rank-specific critical value against which the raw p-value is compared.
+    pub adjusted_alpha: f64,
+    /// Whether the selected procedure rejects this hypothesis.
+    pub rejected: bool,
+    /// Multiple-comparison procedure that produced this record.
+    pub correction: Correction,
 }
 
 /// Two-sided paired permutation p-value for the mean difference (bd-h189).
@@ -331,19 +367,141 @@ pub fn bootstrap_ci(values: &[f64], iters: usize, seed: u64) -> (f64, f64) {
     (means[lower_idx], means[upper_idx.min(iters - 1)])
 }
 
-/// Adjusts multiple comparison effects using Holm-Bonferroni correction.
-pub fn adjust_multiple_comparisons(effects: &mut [Effect], method: Correction) {
-    if method == Correction::None || effects.is_empty() {
-        return;
+/// Adjusts a family of raw p-values and returns value-level correction evidence.
+///
+/// Holm-Bonferroni uses a true step-down decision: after the first failed rank, no later
+/// hypothesis is rejected even if its own raw p-value is below that rank's alpha. Its
+/// adjusted p-values are the prefix maximum of `(m - rank + 1) * p`.
+///
+/// Benjamini-Hochberg uses the complementary step-up decision and the reverse cumulative
+/// minimum of `m / rank * p`. `Correction::None` is an explicit pass-through that still
+/// returns the raw decision and rank provenance.
+///
+/// The returned records do not mutate effect estimates or confidence intervals. A reporting
+/// caller must persist these results explicitly; merely labelling an `Effect` as corrected
+/// without carrying the adjusted values would recreate bd-7vdu.
+///
+/// # Errors
+///
+/// Returns [`StatsError::NoSamples`] for an empty family, rejects a non-finite or out-of-range
+/// significance level or p-value, and refuses a family whose size cannot be represented exactly
+/// by the ranking implementation.
+pub fn adjust_multiple_comparisons(
+    p_values: &[f64],
+    alpha: f64,
+    method: Correction,
+) -> Result<Vec<AdjustedComparison>, StatsError> {
+    if p_values.is_empty() {
+        return Err(StatsError::NoSamples);
     }
-    for effect in effects {
-        effect.correction = Some(method);
+    if !alpha.is_finite() || alpha <= 0.0 || alpha >= 1.0 {
+        return Err(StatsError::InvalidSignificanceLevel);
     }
+
+    let family_size = u32::try_from(p_values.len()).map_err(|_| StatsError::TooManyComparisons)?;
+    let family_size_f64 = f64::from(family_size);
+    let mut ranked = Vec::with_capacity(p_values.len());
+    for (original_index, &p_value) in p_values.iter().enumerate() {
+        if !p_value.is_finite() || !(0.0..=1.0).contains(&p_value) {
+            return Err(StatsError::InvalidPValue {
+                index: original_index,
+            });
+        }
+        ranked.push((original_index, p_value));
+    }
+    ranked.sort_by(|(left_index, left_p), (right_index, right_p)| {
+        let value_ordering = if left_p < right_p {
+            Ordering::Less
+        } else if left_p > right_p {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        };
+        value_ordering.then_with(|| left_index.cmp(right_index))
+    });
+
+    let mut adjusted_p_values = vec![0.0; ranked.len()];
+    let mut adjusted_alphas = vec![alpha; ranked.len()];
+    let mut rejected = vec![false; ranked.len()];
+
+    match method {
+        Correction::None => {
+            for (position, (_, p_value)) in ranked.iter().enumerate() {
+                adjusted_p_values[position] = *p_value;
+                rejected[position] = *p_value <= alpha;
+            }
+        }
+        Correction::HolmBonferroni => {
+            let mut running_adjusted = 0.0_f64;
+            let mut still_rejecting = true;
+            for (position, (_, p_value)) in ranked.iter().enumerate() {
+                let rank =
+                    u32::try_from(position + 1).map_err(|_| StatsError::TooManyComparisons)?;
+                let remaining = family_size - rank + 1;
+                let remaining_f64 = f64::from(remaining);
+                let adjusted_alpha = alpha / remaining_f64;
+
+                running_adjusted = running_adjusted.max((remaining_f64 * *p_value).min(1.0));
+                adjusted_p_values[position] = running_adjusted;
+                adjusted_alphas[position] = adjusted_alpha;
+
+                rejected[position] = still_rejecting && *p_value <= adjusted_alpha;
+                still_rejecting = rejected[position];
+            }
+        }
+        Correction::BenjaminiHochberg => {
+            let mut running_adjusted = 1.0_f64;
+            for position in (0..ranked.len()).rev() {
+                let rank =
+                    u32::try_from(position + 1).map_err(|_| StatsError::TooManyComparisons)?;
+                let rank_f64 = f64::from(rank);
+                let candidate = (family_size_f64 * ranked[position].1 / rank_f64).min(1.0);
+                running_adjusted = running_adjusted.min(candidate);
+                adjusted_p_values[position] = running_adjusted;
+                adjusted_alphas[position] = alpha * rank_f64 / family_size_f64;
+            }
+
+            let last_rejected = ranked
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(position, (_, p_value))| *p_value <= adjusted_alphas[*position])
+                .map(|(position, _)| position);
+            if let Some(last_rejected) = last_rejected {
+                rejected[..=last_rejected].fill(true);
+            }
+        }
+    }
+
+    let mut comparisons = ranked
+        .iter()
+        .enumerate()
+        .map(
+            |(position, (original_index, raw_p_value))| AdjustedComparison {
+                original_index: *original_index,
+                rank: position + 1,
+                raw_p_value: *raw_p_value,
+                adjusted_p_value: adjusted_p_values[position],
+                adjusted_alpha: adjusted_alphas[position],
+                rejected: rejected[position],
+                correction: method,
+            },
+        )
+        .collect::<Vec<_>>();
+    comparisons.sort_by_key(|comparison| comparison.original_index);
+    Ok(comparisons)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected}, got {actual}"
+        );
+    }
 
     #[test]
     fn test_paired_diff_matched_seeds() {
@@ -740,5 +898,196 @@ mod tests {
             "more observations of the same cohort pattern must narrow the interval: \
              small={narrow_width}, large={large_width}"
         );
+    }
+
+    #[test]
+    fn holm_bonferroni_reports_ranked_values_in_original_order() {
+        let comparisons = adjust_multiple_comparisons(
+            &[0.04, 0.001, 0.03, 0.20],
+            0.05,
+            Correction::HolmBonferroni,
+        )
+        .unwrap();
+
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|comparison| comparison.original_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|comparison| comparison.rank)
+                .collect::<Vec<_>>(),
+            [3, 1, 2, 4]
+        );
+        for (comparison, expected) in comparisons.iter().zip([0.09, 0.004, 0.09, 0.20]) {
+            assert_close(comparison.adjusted_p_value, expected);
+        }
+        for (comparison, expected) in comparisons.iter().zip([0.025, 0.0125, 0.05 / 3.0, 0.05]) {
+            assert_close(comparison.adjusted_alpha, expected);
+        }
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|comparison| comparison.rejected)
+                .collect::<Vec<_>>(),
+            [false, true, false, false]
+        );
+        assert!(
+            comparisons
+                .iter()
+                .all(|comparison| comparison.correction == Correction::HolmBonferroni)
+        );
+    }
+
+    #[test]
+    fn holm_bonferroni_stops_after_the_first_failed_rank() {
+        let comparisons = adjust_multiple_comparisons(
+            &[0.01, 0.02, 0.021, 0.022],
+            0.05,
+            Correction::HolmBonferroni,
+        )
+        .unwrap();
+
+        for (comparison, expected) in comparisons.iter().zip([0.04, 0.06, 0.06, 0.06]) {
+            assert_close(comparison.adjusted_p_value, expected);
+        }
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|comparison| comparison.rejected)
+                .collect::<Vec<_>>(),
+            [true, false, false, false],
+            "ranks three and four pass their individual alpha thresholds but must remain \
+             unrejected after rank two fails"
+        );
+    }
+
+    #[test]
+    fn holm_bonferroni_uses_inclusive_thresholds_and_stable_ties() {
+        let boundary = adjust_multiple_comparisons(
+            &[0.05, 0.025, 1.0 / 60.0, 0.0125],
+            0.05,
+            Correction::HolmBonferroni,
+        )
+        .unwrap();
+        assert!(boundary.iter().all(|comparison| comparison.rejected));
+        for comparison in &boundary {
+            assert_close(comparison.adjusted_p_value, 0.05);
+            assert_close(comparison.raw_p_value, comparison.adjusted_alpha);
+        }
+
+        let ties =
+            adjust_multiple_comparisons(&[0.04, 0.01, 0.01], 0.05, Correction::HolmBonferroni)
+                .unwrap();
+        assert_eq!(
+            ties.iter()
+                .map(|comparison| comparison.rank)
+                .collect::<Vec<_>>(),
+            [3, 1, 2],
+            "equal p-values must be ranked by original index"
+        );
+        for (comparison, expected) in ties.iter().zip([0.04, 0.03, 0.03]) {
+            assert_close(comparison.adjusted_p_value, expected);
+        }
+
+        let signed_zero_ties =
+            adjust_multiple_comparisons(&[0.0, -0.0], 0.05, Correction::HolmBonferroni).unwrap();
+        assert_eq!(
+            signed_zero_ties
+                .iter()
+                .map(|comparison| comparison.rank)
+                .collect::<Vec<_>>(),
+            [1, 2],
+            "numerically equal signed zeros must use the original-index tie break"
+        );
+    }
+
+    #[test]
+    fn benjamini_hochberg_is_a_value_level_step_up_adjustment() {
+        let comparisons = adjust_multiple_comparisons(
+            &[0.001, 0.03, 0.04, 0.20],
+            0.05,
+            Correction::BenjaminiHochberg,
+        )
+        .unwrap();
+
+        for (comparison, expected) in comparisons
+            .iter()
+            .zip([0.004, 0.16 / 3.0, 0.16 / 3.0, 0.20])
+        {
+            assert_close(comparison.adjusted_p_value, expected);
+        }
+        for (comparison, expected) in comparisons.iter().zip([0.0125, 0.025, 0.0375, 0.05]) {
+            assert_close(comparison.adjusted_alpha, expected);
+        }
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|comparison| comparison.rejected)
+                .collect::<Vec<_>>(),
+            [true, false, false, false]
+        );
+
+        let step_up =
+            adjust_multiple_comparisons(&[0.03, 0.04], 0.05, Correction::BenjaminiHochberg)
+                .unwrap();
+        assert!(
+            step_up.iter().all(|comparison| comparison.rejected),
+            "the largest passing rank rejects the whole prefix even when rank one misses its \
+             individual critical value"
+        );
+        for comparison in step_up {
+            assert_close(comparison.adjusted_p_value, 0.04);
+        }
+    }
+
+    #[test]
+    fn unadjusted_comparisons_pass_values_through() {
+        let comparisons =
+            adjust_multiple_comparisons(&[0.20, 0.01], 0.05, Correction::None).unwrap();
+
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|comparison| comparison.rank)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        for (comparison, expected) in comparisons.iter().zip([0.20, 0.01]) {
+            assert_close(comparison.raw_p_value, expected);
+            assert_close(comparison.adjusted_p_value, expected);
+            assert_close(comparison.adjusted_alpha, 0.05);
+        }
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|comparison| comparison.rejected)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn multiple_comparison_inputs_are_validated() {
+        assert_eq!(
+            adjust_multiple_comparisons(&[], 0.05, Correction::HolmBonferroni),
+            Err(StatsError::NoSamples)
+        );
+        for alpha in [0.0, -0.0, 1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                adjust_multiple_comparisons(&[0.01], alpha, Correction::HolmBonferroni),
+                Err(StatsError::InvalidSignificanceLevel)
+            );
+        }
+        for p_value in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                adjust_multiple_comparisons(&[0.01, p_value], 0.05, Correction::HolmBonferroni,),
+                Err(StatsError::InvalidPValue { index: 1 })
+            );
+        }
     }
 }
