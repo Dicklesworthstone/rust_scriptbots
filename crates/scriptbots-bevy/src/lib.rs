@@ -3097,6 +3097,187 @@ mod visual_authority_consumer_guard {
             .join("\n")
     }
 
+    /// Files that own a canonical authority, and therefore may define it.
+    ///
+    /// Each entry is (source path, importable module path). The module path is
+    /// what a failure message tells the reader to call, so it must be the real
+    /// import route and not just a filename.
+    const AUTHORITY_OWNERS: &[(&str, &str)] = &[
+        ("crates/scriptbots-core/src/lib.rs", "scriptbots_core"),
+        (
+            "crates/scriptbots-core/src/visual.rs",
+            "scriptbots_core::visual",
+        ),
+    ];
+
+    /// Crates that consume authorities and must never re-define one.
+    const CONSUMER_CRATE_DIRS: &[&str] = &[
+        "crates/scriptbots-bevy/src",
+        "crates/scriptbots-render/src",
+        "crates/scriptbots-app/src",
+        "crates/scriptbots-world-gfx/src",
+    ];
+
+    /// Every `pub fn` name owned by core, paired with the module that owns it.
+    ///
+    /// bd-ikts.5: the consumer guard above catches an authority with NO
+    /// consumer. This catches the opposite failure — an authority with too
+    /// MANY implementations. bd-ikts.4 found `toroidal_delta` defined three
+    /// times, the copies missing core's non-finite and non-positive-extent
+    /// guards and disagreeing with it at exactly half a world, and nothing in
+    /// the build noticed.
+    fn core_authority_owners(root: &Path) -> BTreeMap<String, &'static str> {
+        let mut owners = BTreeMap::new();
+        for (path, module) in AUTHORITY_OWNERS {
+            let Ok(source) = std::fs::read_to_string(root.join(path)) else {
+                continue;
+            };
+            for line in source.lines() {
+                if let Some(rest) = line.strip_prefix("pub fn ")
+                    && let Some(name) = rest.split(['(', '<']).next()
+                {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        owners.insert(name.to_string(), *module);
+                    }
+                }
+            }
+        }
+        owners
+    }
+
+    /// Function definitions in the consumer crates, as (name, file, is_test).
+    ///
+    /// Comments are stripped so prose naming a function is not read as
+    /// defining it, and this guard module is cut so its own text cannot
+    /// trigger it — both mistakes were made and caught earlier today.
+    fn consumer_fn_definitions(root: &Path) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for dir in CONSUMER_CRATE_DIRS {
+            collect_fn_definitions(&root.join(dir), root, &mut found);
+        }
+        found
+    }
+
+    fn collect_fn_definitions(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_fn_definitions(&path, root, out);
+                continue;
+            }
+            if !path.extension().is_some_and(|e| e == "rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Cut this guard module so its own literals cannot trip it.
+            let text = text
+                .split_once(GUARD_MODULE_MARKER)
+                .map_or(text.as_str(), |(before, _)| before);
+            let display = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                let after = trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("fn "))
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "));
+                if let Some(rest) = after
+                    && let Some(name) = rest.split(['(', '<']).next()
+                {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        out.push((name.to_string(), display.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A consumer crate must never re-implement a core authority.
+    ///
+    /// The message names the CANONICAL OWNER rather than merely reporting a
+    /// duplicate, because "X is duplicated" sends the reader hunting while
+    /// "X is owned by scriptbots_core, call it" tells them what to do. That is
+    /// the difference between a guard that gets obeyed and one that gets
+    /// suppressed.
+    #[test]
+    fn no_consumer_crate_reimplements_a_core_authority() {
+        let root = workspace_root();
+        let owners = core_authority_owners(&root);
+        assert!(
+            owners.len() > 10,
+            "only {} core authorities found; the extraction is broken, not the codebase",
+            owners.len()
+        );
+
+        let definitions = consumer_fn_definitions(&root);
+        assert!(
+            definitions.len() > 50,
+            "only {} consumer fn definitions found; the sweep is broken",
+            definitions.len()
+        );
+
+        let mut offences = Vec::new();
+        for (name, file) in &definitions {
+            if let Some(module) = owners.get(name.as_str()) {
+                offences.push(format!(
+                    "{file} defines `{name}`, which is owned by `{module}` — \
+                     call `{module}::{name}` instead of re-implementing it"
+                ));
+            }
+        }
+        assert!(
+            offences.is_empty(),
+            "a core authority was re-implemented in a consumer crate:\n  {}\n\
+             bd-ikts.4 found toroidal_delta defined three times, the copies \
+             silently disagreeing with core at exactly half a world. If a \
+             same-named private helper is genuinely unrelated, rename it.",
+            offences.join("\n  ")
+        );
+    }
+
+    /// The duplication guard must actually bite.
+    ///
+    /// A synthetic definition of a real authority, in a path the sweep covers,
+    /// must be recognised as an offence. Without this the test above is
+    /// indistinguishable from one whose extraction silently returns nothing.
+    #[test]
+    fn duplication_guard_detects_a_synthetic_reimplementation() {
+        let root = workspace_root();
+        let owners = core_authority_owners(&root);
+        let authority = owners
+            .keys()
+            .next()
+            .cloned()
+            .expect("core exposes at least one authority");
+        let synthetic = vec![(
+            authority.clone(),
+            "crates/scriptbots-bevy/src/fake.rs".to_string(),
+        )];
+        let offences: Vec<_> = synthetic
+            .iter()
+            .filter(|(name, _)| owners.contains_key(name.as_str()))
+            .collect();
+        assert_eq!(
+            offences.len(),
+            1,
+            "a synthetic re-implementation of `{authority}` must be flagged; \
+             if it is not, the owner table or the matching is broken"
+        );
+    }
+
     fn visual_authorities(root: &Path) -> Vec<String> {
         let source = std::fs::read_to_string(root.join("crates/scriptbots-core/src/visual.rs"))
             .expect("visual.rs readable");
