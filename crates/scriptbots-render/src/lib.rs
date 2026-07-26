@@ -13810,6 +13810,147 @@ fn terrain_accents_are_legible(cell_px: f32) -> bool {
     cell_px >= TERRAIN_ACCENT_MIN_CELL_PX
 }
 
+/// GPUI's default Metal instance buffer, in bytes.
+///
+/// Read from the dependency rather than guessed: `InstanceBufferPool::default()`
+/// in `gpui_macos/src/metal_renderer.rs` sets `buffer_size: 2 * 1024 * 1024`. A
+/// frame whose primitives do not fit bails with `scene too large`, and the
+/// renderer then retries the WHOLE scene against a doubled pool (`reset(size *
+/// 2)`), capped at 256 MiB.
+///
+/// We cannot size this pool ourselves. `InstanceBufferPool` is `pub(crate)` in
+/// `gpui_macos` and the app never constructs one, so the ONLY lever this crate
+/// has over instance-buffer pressure is emitting fewer primitives (bd-2z0.7.12).
+const GPUI_DEFAULT_INSTANCE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
+/// Primitive counts for one frame, as the Metal renderer would see them.
+///
+/// Deterministic and host-independent: it is arithmetic over counts and the
+/// real `#[repr(C)]` layouts, so the budget can be asserted in an ordinary unit
+/// test with no Metal adapter. That matters because this bead's live-Metal lane
+/// needs a clean tree and an exact-class host, and a budget nobody can check
+/// until then is a budget that silently rots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SceneCost {
+    quads: usize,
+    shadows: usize,
+    underlines: usize,
+}
+
+impl SceneCost {
+    /// Instance bytes these primitives occupy.
+    ///
+    /// Uses `size_of` on the actual GPUI types, so a layout change upstream is
+    /// reflected here instead of drifting away from a hardcoded number.
+    ///
+    /// This deliberately does NOT model path rasterization. Paths are tessellated
+    /// into vertices whose count depends on geometry, so a path term would be a
+    /// guess wearing a number's clothes. Every value here is therefore a LOWER
+    /// BOUND on the real frame cost — which is the safe direction: a budget that
+    /// under-counts can only fail to warn, never warn falsely.
+    fn instance_bytes(self) -> usize {
+        self.quads * std::mem::size_of::<gpui::Quad>()
+            + self.shadows * std::mem::size_of::<gpui::Shadow>()
+            + self.underlines * std::mem::size_of::<gpui::Underline>()
+    }
+
+    /// Whether this frame fits GPUI's default pool without forcing a retry.
+    fn fits_default_instance_buffer(self) -> bool {
+        self.instance_bytes() <= GPUI_DEFAULT_INSTANCE_BUFFER_BYTES
+    }
+}
+
+#[cfg(test)]
+mod scene_cost_census_tests {
+    use super::*;
+
+    /// The census VioletHawk measured on the live macOS window: a flat ~14.9k
+    /// quads and ~4.2-5.2k paths regardless of population (16/100/200), which is
+    /// why the cost is terrain and HUD tessellation rather than agents.
+    const MEASURED_QUADS: usize = 14_900;
+    const MEASURED_SHADOWS: usize = 6;
+
+    /// The observed frame must NOT fit the default pool.
+    ///
+    /// This is the reproduction, reduced to arithmetic: it explains the three
+    /// `scene too large` lines in the retained evidence
+    /// (temp_agent_space/bd-2z0.1.5-macos-matrix/m8_gui.log) without a Metal
+    /// host. If someone ever makes this pass by shrinking the scene, the budget
+    /// test below is what holds the win in place.
+    #[test]
+    fn the_measured_frame_overflows_the_default_instance_buffer() {
+        let observed = SceneCost {
+            quads: MEASURED_QUADS,
+            shadows: MEASURED_SHADOWS,
+            underlines: 0,
+        };
+        assert!(
+            !observed.fits_default_instance_buffer(),
+            "the measured frame ({MEASURED_QUADS} quads) must exceed the {GPUI_DEFAULT_INSTANCE_BUFFER_BYTES}-byte \
+             default pool, or this bead's premise is wrong; it costs {} bytes",
+            observed.instance_bytes()
+        );
+    }
+
+    /// Quads ALONE overflow it, so no amount of path work can fix this by itself.
+    ///
+    /// Worth pinning separately: the bead's remaining plan is largely about path
+    /// emission (terrain accents, chart tessellation), and this records that the
+    /// quad count has to come down too. Optimising only paths would leave the
+    /// default pool still overflowing and the work looking done.
+    #[test]
+    fn quads_alone_exceed_the_default_pool() {
+        let quads_only = SceneCost {
+            quads: MEASURED_QUADS,
+            ..SceneCost::default()
+        };
+        assert!(
+            !quads_only.fits_default_instance_buffer(),
+            "{MEASURED_QUADS} quads cost {} bytes and must not fit the default pool",
+            quads_only.instance_bytes()
+        );
+    }
+
+    /// The largest quad count that still fits, so the target is a number rather
+    /// than "fewer".
+    #[test]
+    fn the_quad_budget_is_a_concrete_number() {
+        let per_quad = std::mem::size_of::<gpui::Quad>();
+        let budget = GPUI_DEFAULT_INSTANCE_BUFFER_BYTES / per_quad;
+
+        assert!(
+            SceneCost {
+                quads: budget,
+                ..SceneCost::default()
+            }
+            .fits_default_instance_buffer(),
+            "{budget} quads at {per_quad} bytes each must fit"
+        );
+        assert!(
+            !SceneCost {
+                quads: budget + 1,
+                ..SceneCost::default()
+            }
+            .fits_default_instance_buffer(),
+            "{} quads must not fit; the budget edge is off by one",
+            budget + 1
+        );
+        assert!(
+            budget < MEASURED_QUADS,
+            "the budget ({budget}) must be below what the live window emitted \
+             ({MEASURED_QUADS}), otherwise the observed overflow is unexplained"
+        );
+    }
+
+    /// An empty scene costs nothing and fits, so the predicate is not vacuously
+    /// false for every input.
+    #[test]
+    fn an_empty_scene_fits() {
+        assert_eq!(SceneCost::default().instance_bytes(), 0);
+        assert!(SceneCost::default().fits_default_instance_buffer());
+    }
+}
+
 #[cfg(test)]
 mod terrain_accent_budget_tests {
     use super::*;
@@ -17694,6 +17835,127 @@ mod command_characterization_tests {
         }
     }
 
+    /// bd-fjs5: 'a' must submit a REAL crossover of two selected parents.
+    ///
+    /// This is the 27th and last HUD shortcut from the bd-jw6f coverage map, and
+    /// the only one that needed harness work rather than an assertion.
+    ///
+    /// WHY THE OBVIOUS TEST IS WORTHLESS HERE. `spawn_crossover_agent` falls back
+    /// to `ControlCommand::SpawnAgent { herbivore_tendency: 0.5 }` whenever fewer
+    /// than two agents are selected. So pressing 'a' with nothing selected submits
+    /// a command, increases population, and looks entirely healthy — against a
+    /// crossover control that is completely broken. Asserting "something was
+    /// submitted" is precisely the failure mode bd-jw6f exists to eliminate.
+    ///
+    /// The discriminating assertion is therefore the VARIANT: `SpawnCrossover`
+    /// carrying two distinct parent UIDs, and explicitly NOT the `SpawnAgent`
+    /// fallback. That is a claim the degenerate path cannot satisfy.
+    ///
+    /// Reaching it needs `drain_into_world`, because selection is intent-based
+    /// (bd-37m): ctrl-a only submits an intent, so without a drain the world still
+    /// has zero selected agents when 'a' is pressed and crossover takes the
+    /// fallback every time.
+    #[test]
+    fn crossover_shortcut_submits_a_real_crossover_of_two_selected_parents() {
+        let mut fixture = ShortcutFixture::install_with_agents(2);
+
+        // Step once before doing anything else. `try_inject_crossover_agent_with`
+        // returns Ok(None) when either parent still has a pending origin record,
+        // so freshly seeded agents CANNOT be crossed until their origin commits.
+        // Without this the whole test passes its intent assertions and then dies
+        // at the population check, which reads exactly like a broken control —
+        // this is a contract of the heredity bookkeeping, not a defect.
+        {
+            let mut world = fixture.world.lock().expect("shortcut world lock");
+            let _ = world.step();
+        }
+        assert_eq!(
+            fixture.world.lock().expect("world lock").agent_count(),
+            2,
+            "both seeded parents must survive the commit step, or the crossover below \
+             has nothing to cross and would fail for an unrelated reason"
+        );
+
+        // Precondition, asserted rather than assumed: selection starts empty, so
+        // a pass below cannot come from agents that were already selected.
+        assert_eq!(
+            fixture.selected_agents(),
+            0,
+            "fixture must start with nothing selected, or the crossover assertion proves nothing"
+        );
+
+        fixture.press("ctrl-a");
+        assert_eq!(
+            fixture.selected_agents(),
+            0,
+            "selection is intent-based (bd-37m): the renderer must NOT write selection \
+             directly, so the world must still show nothing selected before the drain"
+        );
+
+        fixture.drain_into_world();
+        assert_eq!(
+            fixture.selected_agents(),
+            2,
+            "after draining the select-all intent the world must mark both agents selected; \
+             without this the crossover control below silently takes its no-parents fallback"
+        );
+
+        let before = fixture.submitted().len();
+        fixture.press("a");
+        let new_commands = fixture.submitted().split_off(before);
+
+        let crossover = new_commands
+            .iter()
+            .find_map(|command| match command {
+                ControlCommand::SpawnCrossover { parent_a, parent_b } => {
+                    Some((*parent_a, *parent_b))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "pressing 'a' with two agents selected must submit \
+                     ControlCommand::SpawnCrossover, got {new_commands:?}. A bare SpawnAgent here \
+                     is the no-parents fallback, which means crossover never saw the selection"
+                )
+            });
+
+        let (parent_a, parent_b) = crossover;
+        assert_ne!(
+            parent_a, parent_b,
+            "crossover must name two DISTINCT parents; crossing an agent with itself is a clone \
+             wearing a crossover's name and would corrupt any heredity measurement downstream"
+        );
+
+        // The fallback and the real path are both "a submitted command", so pin
+        // that the fallback did not ALSO fire.
+        assert!(
+            !new_commands
+                .iter()
+                .any(|command| matches!(command, ControlCommand::SpawnAgent { .. })),
+            "pressing 'a' with parents selected must not submit the no-parents SpawnAgent \
+             fallback, got {new_commands:?}"
+        );
+
+        // Close the chain to the world, exactly as the spawn shortcuts do: an
+        // intent the world would reject is not a working control.
+        let before_agents = fixture.world.lock().expect("world lock").agent_count();
+        let dispositions = fixture.drain_into_world();
+        let after_agents = fixture.world.lock().expect("world lock").agent_count();
+
+        assert!(
+            dispositions
+                .iter()
+                .any(|disposition| matches!(disposition, ControlDisposition::WorldApplied)),
+            "the crossover intent must be applied by the world, got {dispositions:?}"
+        );
+        assert_eq!(
+            after_agents,
+            before_agents + 1,
+            "crossover must add exactly one child (before={before_agents}, after={after_agents})"
+        );
+    }
+
     fn gui_simulation_driver_with_step(
         world: &Arc<Mutex<WorldState>>,
         simulation_step: WorldStepDriver,
@@ -18220,6 +18482,10 @@ mod command_characterization_tests {
         canvas: gpui::WindowHandle<SimulationView>,
         world: Arc<Mutex<WorldState>>,
         submitted: Arc<Mutex<Vec<ControlCommand>>>,
+        /// The undrained queue, i.e. exactly what a real driver would pick up.
+        /// Held so `drain_into_world` can close the loop for controls whose
+        /// effect is only observable after intents are applied (bd-fjs5).
+        pending: Arc<Mutex<Vec<ControlCommand>>>,
     }
 
     impl ShortcutFixture {
@@ -18285,7 +18551,42 @@ mod command_characterization_tests {
                 canvas: windows.canvas,
                 world,
                 submitted,
+                pending,
             }
+        }
+
+        /// Apply every queued intent to the world, then repaint — the step a real
+        /// driver performs and that this fixture deliberately omitted.
+        ///
+        /// Needed because selection is intent-based by design (bd-37m): the
+        /// renderer submits an intent and never writes selection itself, so a
+        /// control whose behaviour DEPENDS on current selection cannot be
+        /// exercised at all until something applies that intent. Draining takes
+        /// from `pending` only, so `submitted()` keeps the full evidence trail.
+        ///
+        /// Returns the dispositions in order, so a caller can assert the world
+        /// actually accepted the intents rather than trusting that a drain which
+        /// applied nothing was a drain that worked.
+        fn drain_into_world(&mut self) -> Vec<ControlDisposition> {
+            let commands = {
+                let mut queue = self.pending.lock().expect("shortcut command queue");
+                std::mem::take(&mut *queue)
+            };
+            let dispositions = {
+                let mut world = self.world.lock().expect("shortcut world lock");
+                commands
+                    .into_iter()
+                    .map(|command| {
+                        let label = format!("{command:?}");
+                        apply_control_command(&mut world, command).unwrap_or_else(|error| {
+                            panic!("drained intent {label} rejected: {error}")
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            force_production_repaint(&mut self.app, self.hud);
+            force_production_repaint(&mut self.app, self.canvas);
+            dispositions
         }
 
         /// Step the world and repaint until the playback timeline holds
