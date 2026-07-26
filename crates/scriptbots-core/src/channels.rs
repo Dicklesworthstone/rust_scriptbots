@@ -329,6 +329,71 @@ mod tests {
         assert!(seen.iter().all(|hit| *hit), "a sensor index is unnamed");
     }
 
+    /// `labelled()` is the shared decode every view is supposed to consume
+    /// instead of indexing the sensor vector by hand (bd-16g.4). If it ever
+    /// paired a value with the wrong channel, every UI built on it would
+    /// mislabel in perfect agreement — the drift would be invisible precisely
+    /// because everything drifted together.
+    ///
+    /// Uses a vector whose value ENCODES its own index, so a transposition of
+    /// any two slots is caught. A uniform or zeroed vector would pass while
+    /// scrambled.
+    #[test]
+    fn labelled_pairs_every_value_with_the_channel_that_owns_its_index() {
+        let mut sensors = [0.0_f32; INPUT_SIZE];
+        for (index, slot) in sensors.iter_mut().enumerate() {
+            // Distinct, exactly representable, and never 0.0 so a slot that was
+            // silently skipped is distinguishable from one that holds zero.
+            *slot = (index as f32) + 0.5;
+        }
+
+        let labelled = sensors.labelled();
+        assert_eq!(labelled.len(), INPUT_SIZE, "decode must be total");
+
+        for (position, &(channel, value)) in labelled.iter().enumerate() {
+            assert_eq!(
+                channel.index, position,
+                "slot {position} was labelled with the channel that owns index {}",
+                channel.index
+            );
+            assert_eq!(
+                value, sensors[position],
+                "slot {position} ({}) carries the value of a different slot",
+                channel.name
+            );
+            // And the by-channel accessor must agree with the bulk decode, or a
+            // view reading one way sees something different from a view reading
+            // the other.
+            assert_eq!(
+                sensors.sensor(channel),
+                value,
+                "sensor({}) disagrees with labelled() at index {position}",
+                channel.name
+            );
+        }
+    }
+
+    /// A transposition must actually fail the check above. Without this, the
+    /// test could be asserting a tautology and nobody would know.
+    #[test]
+    fn the_decode_check_would_catch_a_transposed_pair() {
+        let mut sensors = [0.0_f32; INPUT_SIZE];
+        for (index, slot) in sensors.iter_mut().enumerate() {
+            *slot = (index as f32) + 0.5;
+        }
+        let labelled = sensors.labelled();
+
+        // Simulate the defect: read slot 1's value while claiming slot 0's channel.
+        let claimed = labelled[0].0;
+        let wrong_value = labelled[1].1;
+        assert_ne!(
+            sensors.sensor(claimed),
+            wrong_value,
+            "if these compared equal the encoding could not distinguish slots and \
+             labelled_pairs_every_value_with_the_channel_that_owns_its_index would be vacuous"
+        );
+    }
+
     #[test]
     fn channel_names_are_unique() {
         // Names reach analytics, logs, and the UI; two channels sharing one name
