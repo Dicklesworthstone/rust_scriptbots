@@ -39,12 +39,12 @@ use journal::{
     encode_host_command_postcard_hex, encode_journal_u64, prepare_host_journal_archive,
 };
 use scriptbots_core::{
-    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding,
-    DeathCause, DeathRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
-    INTERACTION_EVENTS_PERSISTED_KIND, INTERACTION_EVENTS_SAMPLED_OUT_KIND,
-    INTERACTION_EVENTS_TRUNCATED_KIND, PersistenceAdmissionError, PersistenceAdmissionState,
-    PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase, ReplayEvent,
-    ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
+    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, DeathCause,
+    DeathRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND, INTERACTION_EVENTS_PERSISTED_KIND,
+    INTERACTION_EVENTS_SAMPLED_OUT_KIND, INTERACTION_EVENTS_TRUNCATED_KIND,
+    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
+    Position, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayInteractionKind,
+    ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
     narrative::{
         EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord,
@@ -82,6 +82,7 @@ const DEFAULT_LIFECYCLE_BUFFER: usize = 512;
 const DEFAULT_REPLAY_BUFFER: usize = 1024;
 const DEFAULT_COMMAND_CAPACITY: usize = 8;
 const DEFAULT_STARTUP_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMMAND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_ADMISSION_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(120);
@@ -3466,9 +3467,147 @@ pub enum FailureCommitState {
 /// Controller-side wait phase that exhausted its configured deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageWaitPhase {
+    Preparation,
     AdmissionGate,
     CommandEnqueue,
     Acknowledgement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparationStage {
+    Start,
+    Measure,
+    NarrativeMeasure,
+    Permit,
+    Materialize,
+    ReplaySerialization,
+    Validate,
+    Analytics,
+    Complete,
+}
+
+impl PreparationStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Measure => "measure",
+            Self::NarrativeMeasure => "narrative_measure",
+            Self::Permit => "permit",
+            Self::Materialize => "materialize",
+            Self::ReplaySerialization => "replay_serialization",
+            Self::Validate => "validate",
+            Self::Analytics => "analytics",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PreparationProgress {
+    scientific_bytes: usize,
+    scientific_records: usize,
+    narrative_bytes: usize,
+    narrative_records: usize,
+}
+
+trait PreparationObserver {
+    fn checkpoint(
+        &mut self,
+        stage: PreparationStage,
+        progress: PreparationProgress,
+    ) -> Result<(), StorageError>;
+}
+
+struct UnboundedPreparation;
+
+impl PreparationObserver for UnboundedPreparation {
+    fn checkpoint(
+        &mut self,
+        _stage: PreparationStage,
+        _progress: PreparationProgress,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+struct PreparationDeadline<'a, Clock>
+where
+    Clock: FnMut(PreparationStage) -> Instant,
+{
+    clock: &'a mut Clock,
+    started: Instant,
+    configured: Duration,
+    path: Arc<str>,
+    tick: u64,
+}
+
+impl<'a, Clock> PreparationDeadline<'a, Clock>
+where
+    Clock: FnMut(PreparationStage) -> Instant,
+{
+    fn new(clock: &'a mut Clock, configured: Duration, path: Arc<str>, tick: u64) -> Self {
+        let started = clock(PreparationStage::Start);
+        debug!(
+            schema = "scriptbots.persistence-preparation.v1",
+            phase = "start",
+            stage = PreparationStage::Start.as_str(),
+            deadline = ?configured,
+            path = %path,
+            tick,
+            identity_state = "unassigned",
+            disposition = "preparing",
+            "persistence preparation deadline started"
+        );
+        Self {
+            clock,
+            started,
+            configured,
+            path,
+            tick,
+        }
+    }
+}
+
+impl<Clock> PreparationObserver for PreparationDeadline<'_, Clock>
+where
+    Clock: FnMut(PreparationStage) -> Instant,
+{
+    fn checkpoint(
+        &mut self,
+        stage: PreparationStage,
+        progress: PreparationProgress,
+    ) -> Result<(), StorageError> {
+        let now = (self.clock)(stage);
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed < self.configured {
+            return Ok(());
+        }
+        warn!(
+            schema = "scriptbots.persistence-preparation.v1",
+            phase = "refusal",
+            stage = stage.as_str(),
+            deadline = ?self.configured,
+            elapsed = ?elapsed,
+            scientific_bytes = progress.scientific_bytes,
+            scientific_records = progress.scientific_records,
+            narrative_bytes = progress.narrative_bytes,
+            narrative_records = progress.narrative_records,
+            path = %self.path,
+            tick = self.tick,
+            identity_state = "unassigned",
+            disposition = "not_admitted",
+            receipt = "none",
+            "persistence preparation deadline exhausted"
+        );
+        Err(StorageError::Worker(StorageWorkerError::Timeout {
+            operation: StorageOperation::Admit,
+            phase: StorageWaitPhase::Preparation,
+            path: self.path.to_string(),
+            tick: Some(self.tick),
+            waited: self.configured,
+            commit_state: FailureCommitState::NotAdmitted,
+        }))
+    }
 }
 
 /// Structured error crossing the storage worker boundary.
@@ -4218,26 +4357,76 @@ struct PendingAnalytics {
     readings: Arc<[MetricReading]>,
 }
 
+fn clone_preparation_string<Observer>(
+    source: &str,
+    observer: &mut Observer,
+    stage: PreparationStage,
+    progress: PreparationProgress,
+) -> Result<String, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    const CHECKPOINT_BYTES: usize = 4_096;
+
+    observer.checkpoint(stage, progress)?;
+    let mut cloned = String::with_capacity(source.len());
+    observer.checkpoint(stage, progress)?;
+    let mut next_checkpoint = CHECKPOINT_BYTES;
+    for (offset, character) in source.char_indices() {
+        if offset >= next_checkpoint {
+            observer.checkpoint(stage, progress)?;
+            next_checkpoint = next_checkpoint.saturating_add(CHECKPOINT_BYTES);
+        }
+        cloned.push(character);
+    }
+    observer.checkpoint(stage, progress)?;
+    Ok(cloned)
+}
+
 impl PendingAnalytics {
     fn from_batch(batch: &PersistenceBatch) -> Result<Self, StorageError> {
+        let mut observer = UnboundedPreparation;
+        Self::from_batch_observed(batch, &mut observer, PreparationProgress::default())
+    }
+
+    fn from_batch_observed<Observer>(
+        batch: &PersistenceBatch,
+        observer: &mut Observer,
+        progress: PreparationProgress,
+    ) -> Result<Self, StorageError>
+    where
+        Observer: PreparationObserver,
+    {
+        observer.checkpoint(PreparationStage::Analytics, progress)?;
         let tick = batch.summary.tick.0;
         let tick_column = encode_u64("metrics.tick", tick)?;
         let mut values = BTreeMap::new();
         for metric in &batch.metrics {
-            values.insert(metric.name.to_string(), metric.value);
+            let name = clone_preparation_string(
+                metric.name.as_ref(),
+                observer,
+                PreparationStage::Analytics,
+                progress,
+            )?;
+            values.insert(name, metric.value);
+            observer.checkpoint(PreparationStage::Analytics, progress)?;
         }
-        let readings = values
-            .into_iter()
-            .map(|(name, value)| MetricReading {
+        let mut readings = Vec::with_capacity(values.len());
+        for (name, value) in values {
+            observer.checkpoint(PreparationStage::Analytics, progress)?;
+            readings.push(MetricReading {
                 tick: tick_column,
                 name,
                 value,
-            })
-            .collect::<Vec<_>>();
+            });
+        }
+        observer.checkpoint(PreparationStage::Analytics, progress)?;
+        let readings = Arc::from(readings);
+        observer.checkpoint(PreparationStage::Analytics, progress)?;
         Ok(Self {
             tick,
             agent_count: batch.summary.agent_count,
-            readings: Arc::from(readings),
+            readings,
         })
     }
 }
@@ -4250,11 +4439,27 @@ struct PreparedPersistenceBatch {
 }
 
 impl PreparedPersistenceBatch {
+    #[cfg(test)]
     fn from_batch(batch: &PersistenceBatch) -> Result<Self, StorageError> {
+        let mut observer = UnboundedPreparation;
+        Self::from_batch_observed(batch, &mut observer, PreparationProgress::default())
+    }
+
+    fn from_batch_observed<Observer>(
+        batch: &PersistenceBatch,
+        observer: &mut Observer,
+        progress: PreparationProgress,
+    ) -> Result<Self, StorageError>
+    where
+        Observer: PreparationObserver,
+    {
+        let storage = Storage::prepare_batch_observed(batch, observer, progress)?;
+        let analytics = PendingAnalytics::from_batch_observed(batch, observer, progress)?;
+        observer.checkpoint(PreparationStage::Complete, progress)?;
         Ok(Self {
             tick: batch.summary.tick.0,
-            storage: Storage::prepare_batch(batch)?,
-            analytics: PendingAnalytics::from_batch(batch)?,
+            storage,
+            analytics,
         })
     }
 }
@@ -4625,6 +4830,39 @@ impl InFlightPermit {
             }
         }
     }
+
+    fn try_acquire_observed<Observer>(
+        counter: &Arc<AtomicUsize>,
+        bytes: usize,
+        maximum: usize,
+        observer: &mut Observer,
+        progress: PreparationProgress,
+    ) -> Result<Result<Self, usize>, StorageError>
+    where
+        Observer: PreparationObserver,
+    {
+        let mut current = counter.load(Ordering::SeqCst);
+        loop {
+            observer.checkpoint(PreparationStage::Permit, progress)?;
+            let Some(would_be) = current.checked_add(bytes) else {
+                return Ok(Err(usize::MAX));
+            };
+            if would_be > maximum {
+                return Ok(Err(would_be));
+            }
+            match counter.compare_exchange(current, would_be, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    let permit = Self {
+                        counter: Arc::clone(counter),
+                        bytes,
+                    };
+                    observer.checkpoint(PreparationStage::Permit, progress)?;
+                    return Ok(Ok(permit));
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 impl Drop for InFlightPermit {
@@ -4684,14 +4922,33 @@ impl Default for PayloadBudget {
 /// oversized refusal instead of wrapping below a cap.
 #[must_use]
 pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
+    let mut observer = UnboundedPreparation;
+    let mut progress = PreparationProgress::default();
+    estimate_batch_size_observed(payload, &mut observer, &mut progress)
+        .expect("the unbounded preparation observer cannot refuse an estimate")
+}
+
+fn estimate_batch_size_observed<Observer>(
+    payload: &PersistenceBatch,
+    observer: &mut Observer,
+    progress: &mut PreparationProgress,
+) -> Result<(usize, usize), StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(PreparationStage::Measure, *progress)?;
     // Scientific rows only. `narrative_events` is deliberately absent: see
     // [`estimate_narrative_size`] for why derived commentary is budgeted separately
     // (`bd-erff`).
-    let interaction_rows = payload
-        .replay_events
-        .iter()
-        .filter(|event| event.agent_uid.is_some() && event.counterpart.is_some())
-        .count();
+    let mut interaction_rows = 0usize;
+    for (index, event) in payload.replay_events.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::Measure, *progress)?;
+        }
+        interaction_rows = interaction_rows.saturating_add(usize::from(
+            event.agent_uid.is_some() && event.counterpart.is_some(),
+        ));
+    }
     let events = [
         payload.metrics.len(),
         payload.events.len(),
@@ -4742,19 +4999,32 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
     ] {
         bytes = bytes.saturating_add(count.saturating_mul(row_bytes));
     }
+    progress.scientific_bytes = bytes;
+    progress.scientific_records = events;
 
-    for metric in &payload.metrics {
+    for (index, metric) in payload.metrics.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::Measure, *progress)?;
+        }
         bytes = bytes.saturating_add(metric.name.len().saturating_mul(METRIC_NAME_MULTIPLIER));
+        progress.scientific_bytes = bytes;
     }
-    for event in &payload.events {
+    for (index, event) in payload.events.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::Measure, *progress)?;
+        }
         if let PersistenceEventKind::Custom(name) = &event.kind {
             bytes = bytes.saturating_add(
                 name.len()
                     .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
             );
+            progress.scientific_bytes = bytes;
         }
     }
-    for agent in &payload.agents {
+    for (index, agent) in payload.agents.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::Measure, *progress)?;
+        }
         let binding_bytes = if agent.runtime.brain.registry_key().is_some() {
             // `registry:` plus the longest decimal u64, without formatting it.
             "registry:".len().saturating_add(20)
@@ -4763,29 +5033,43 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
         };
         bytes =
             bytes.saturating_add(binding_bytes.saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER));
+        progress.scientific_bytes = bytes;
     }
-    for birth in &payload.births {
+    for (index, birth) in payload.births.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::Measure, *progress)?;
+        }
         if let Some(kind) = &birth.brain_kind {
             bytes = bytes.saturating_add(
                 kind.len()
                     .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
             );
+            progress.scientific_bytes = bytes;
         }
     }
-    for death in &payload.deaths {
+    for (index, death) in payload.deaths.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::Measure, *progress)?;
+        }
         if let Some(kind) = &death.brain_kind {
             bytes = bytes.saturating_add(
                 kind.len()
                     .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
             );
+            progress.scientific_bytes = bytes;
         }
     }
-    for event in &payload.replay_events {
+    for (index, event) in payload.replay_events.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::Measure, *progress)?;
+        }
         if let ReplayEventKind::BrainOutputs { outputs } = &event.kind {
             bytes = bytes.saturating_add(outputs.len().saturating_mul(REPLAY_OUTPUT_BYTES));
+            progress.scientific_bytes = bytes;
         }
     }
-    (bytes, events)
+    observer.checkpoint(PreparationStage::Measure, *progress)?;
+    Ok((bytes, events))
 }
 
 /// Estimated bytes and record count for a batch's derived narrative commentary.
@@ -4802,6 +5086,21 @@ pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
 /// comparable and equally conservative; only the pool they are charged against differs.
 #[must_use]
 pub fn estimate_narrative_size(payload: &PersistenceBatch) -> (usize, usize) {
+    let mut observer = UnboundedPreparation;
+    let mut progress = PreparationProgress::default();
+    estimate_narrative_size_observed(payload, &mut observer, &mut progress)
+        .expect("the unbounded preparation observer cannot refuse an estimate")
+}
+
+fn estimate_narrative_size_observed<Observer>(
+    payload: &PersistenceBatch,
+    observer: &mut Observer,
+    progress: &mut PreparationProgress,
+) -> Result<(usize, usize), StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(PreparationStage::NarrativeMeasure, *progress)?;
     /// Matches the fixed per-record allocation `estimate_batch_size` uses for other rows.
     const NARRATIVE_EVENT_BYTES: usize = 256;
     /// Matches `estimate_batch_size`'s owned-plus-escaped string multiplier.
@@ -4809,15 +5108,22 @@ pub fn estimate_narrative_size(payload: &PersistenceBatch) -> (usize, usize) {
 
     let events = payload.narrative_events.len();
     let mut bytes = events.saturating_mul(NARRATIVE_EVENT_BYTES);
-    for event in &payload.narrative_events {
+    progress.narrative_bytes = bytes;
+    progress.narrative_records = events;
+    for (index, event) in payload.narrative_events.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::NarrativeMeasure, *progress)?;
+        }
         bytes = bytes.saturating_add(
             event
                 .human_text
                 .len()
                 .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
         );
+        progress.narrative_bytes = bytes;
     }
-    (bytes, events)
+    observer.checkpoint(PreparationStage::NarrativeMeasure, *progress)?;
+    Ok((bytes, events))
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -5509,6 +5815,24 @@ impl StorageBuffer {
     }
 
     fn validate_contents(&self, enclosing_tick: u64) -> Result<(), StorageError> {
+        let mut observer = UnboundedPreparation;
+        self.validate_contents_observed(
+            enclosing_tick,
+            &mut observer,
+            PreparationProgress::default(),
+        )
+    }
+
+    fn validate_contents_observed<Observer>(
+        &self,
+        enclosing_tick: u64,
+        observer: &mut Observer,
+        progress: PreparationProgress,
+    ) -> Result<(), StorageError>
+    where
+        Observer: PreparationObserver,
+    {
+        observer.checkpoint(PreparationStage::Validate, progress)?;
         let invalid = |context: &'static str, value: f64| StorageError::InvalidData {
             context,
             reason: format!("non-finite value {value}"),
@@ -5545,6 +5869,7 @@ impl StorageBuffer {
             }
         }
         for row in &self.metrics {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
             if !row.value.is_finite() {
                 return Err(invalid("metrics.value", row.value));
             }
@@ -5554,6 +5879,7 @@ impl StorageBuffer {
         let mut death_event_rows = 0usize;
         let mut death_event_total = 0usize;
         for row in &self.events {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
             let row_tick = checked_u64("events.tick", row.tick)?;
             if row_tick != enclosing_tick {
                 return Err(StorageError::InvalidData {
@@ -5587,6 +5913,7 @@ impl StorageBuffer {
             }
         }
         for row in &self.agents {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
             for (context, value) in [
                 ("agents.position_x", row.position_x),
                 ("agents.position_y", row.position_y),
@@ -5625,6 +5952,7 @@ impl StorageBuffer {
         let mut birth_spawn_ordinals = BTreeSet::new();
         let mut birth_ordinals = BTreeSet::new();
         for row in &self.births {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
             let row_tick = checked_u64("births.tick", row.tick)?;
             validate_lifecycle_record_tick("births.tick", row_tick, enclosing_tick)?;
             let agent_uid = checked_u64("births.agent_uid", row.agent_uid)?;
@@ -5682,6 +6010,7 @@ impl StorageBuffer {
         }
         let mut death_uids = BTreeSet::new();
         for row in &self.deaths {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
             let row_tick = checked_u64("deaths.tick", row.tick)?;
             validate_lifecycle_record_tick("deaths.tick", row_tick, enclosing_tick)?;
             checked_u64("deaths.agent_uid", row.agent_uid)?;
@@ -5706,11 +6035,12 @@ impl StorageBuffer {
                 }
             }
         }
-        let born_records = self
-            .births
-            .iter()
-            .filter(|row| row.origin == BirthOrigin::Born)
-            .count();
+        let mut born_records = 0usize;
+        for row in &self.births {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
+            born_records =
+                born_records.saturating_add(usize::from(row.origin == BirthOrigin::Born));
+        }
         if summary_births != born_records {
             return Err(StorageError::InvalidData {
                 context: "ticks.births",
@@ -5758,6 +6088,7 @@ impl StorageBuffer {
         let mut narrative_rows = 0_u64;
         let mut minimum_narrative_tick = None;
         for row in &self.replay_events {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
             let row_tick = checked_u64("replay_events.tick", row.tick)?;
             if row_tick > enclosing_tick {
                 return Err(StorageError::InvalidData {
@@ -5917,7 +6248,11 @@ impl StorageBuffer {
             }
             .into());
         }
-        for event in validated_run_event_map(&self.run_events)?.into_values() {
+        observer.checkpoint(PreparationStage::Validate, progress)?;
+        for event in
+            validated_run_event_map_observed(&self.run_events, observer, progress)?.into_values()
+        {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
             if event.tick.0 > enclosing_tick {
                 return Err(invalid_run_event(
                     RunEventField::Tick,
@@ -5928,6 +6263,7 @@ impl StorageBuffer {
                 ));
             }
         }
+        observer.checkpoint(PreparationStage::Validate, progress)?;
         Ok(())
     }
 
@@ -6369,6 +6705,25 @@ fn run_event_row_from_query_row(row: &Row) -> Result<RunEventRow, StorageError> 
 }
 
 fn persisted_run_event_from_row(row: &RunEventRow) -> Result<PersistedRunEvent, StorageError> {
+    let mut observer = UnboundedPreparation;
+    persisted_run_event_from_row_observed(
+        row,
+        &mut observer,
+        PreparationStage::Validate,
+        PreparationProgress::default(),
+    )
+}
+
+fn persisted_run_event_from_row_observed<Observer>(
+    row: &RunEventRow,
+    observer: &mut Observer,
+    stage: PreparationStage,
+    progress: PreparationProgress,
+) -> Result<PersistedRunEvent, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(stage, progress)?;
     let schema_version = supported_run_event_schema(row.schema_version)?;
 
     let tick = u64::try_from(row.tick)
@@ -6428,6 +6783,7 @@ fn persisted_run_event_from_row(row: &RunEventRow) -> Result<PersistedRunEvent, 
         .map(SubjectRef::from_db_string)
         .transpose()
         .map_err(|reason| invalid_run_event(RunEventField::Subject, reason))?;
+    observer.checkpoint(stage, progress)?;
 
     let record = EventRecord {
         schema_version,
@@ -6436,17 +6792,20 @@ fn persisted_run_event_from_row(row: &RunEventRow) -> Result<PersistedRunEvent, 
         severity,
         magnitude: row.magnitude,
         window: (window_start, window_end),
-        metric: row.metric.clone(),
+        metric: clone_preparation_string(&row.metric, observer, stage, progress)?,
         before: row.before_value,
         after: row.after_value,
         score: row.score,
         subject,
-        human_text: row.human_text.clone(),
+        human_text: clone_preparation_string(&row.human_text, observer, stage, progress)?,
     };
-    Ok(PersistedRunEvent {
-        identity: RunEventIdentity::from_record(&record),
-        record,
-    })
+    let identity = RunEventIdentity {
+        tick: record.tick,
+        kind: record.kind,
+        metric: clone_preparation_string(&record.metric, observer, stage, progress)?,
+    };
+    observer.checkpoint(stage, progress)?;
+    Ok(PersistedRunEvent { identity, record })
 }
 
 fn run_event_identity_collision(
@@ -6461,21 +6820,118 @@ fn run_event_identity_collision(
     }
 }
 
+fn preparation_strings_equal<Observer>(
+    left: &str,
+    right: &str,
+    observer: &mut Observer,
+    stage: PreparationStage,
+    progress: PreparationProgress,
+) -> Result<bool, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    const CHECKPOINT_BYTES: usize = 4_096;
+
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (index, (left_byte, right_byte)) in left.bytes().zip(right.bytes()).enumerate() {
+        if index.is_multiple_of(CHECKPOINT_BYTES) {
+            observer.checkpoint(stage, progress)?;
+        }
+        if left_byte != right_byte {
+            return Ok(false);
+        }
+    }
+    observer.checkpoint(stage, progress)?;
+    Ok(true)
+}
+
+fn run_event_records_equal_observed<Observer>(
+    left: &EventRecord,
+    right: &EventRecord,
+    observer: &mut Observer,
+    stage: PreparationStage,
+    progress: PreparationProgress,
+) -> Result<bool, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    let fixed_fields_equal = left.schema_version == right.schema_version
+        && left.tick == right.tick
+        && left.kind == right.kind
+        && left.severity == right.severity
+        && left.magnitude == right.magnitude
+        && left.window == right.window
+        && left.before == right.before
+        && left.after == right.after
+        && left.score == right.score
+        && left.subject == right.subject;
+    if !fixed_fields_equal
+        || !preparation_strings_equal(&left.metric, &right.metric, observer, stage, progress)?
+    {
+        return Ok(false);
+    }
+    preparation_strings_equal(
+        &left.human_text,
+        &right.human_text,
+        observer,
+        stage,
+        progress,
+    )
+}
+
 fn validated_run_event_map(
     rows: &[RunEventRow],
 ) -> Result<BTreeMap<RunEventIdentity, EventRecord>, StorageError> {
+    let mut observer = UnboundedPreparation;
+    validated_run_event_map_observed(rows, &mut observer, PreparationProgress::default())
+}
+
+fn validated_run_event_map_observed<Observer>(
+    rows: &[RunEventRow],
+    observer: &mut Observer,
+    progress: PreparationProgress,
+) -> Result<BTreeMap<RunEventIdentity, EventRecord>, StorageError>
+where
+    Observer: PreparationObserver,
+{
     let mut events = BTreeMap::new();
     for row in rows {
-        let persisted = persisted_run_event_from_row(row)?;
+        observer.checkpoint(PreparationStage::Validate, progress)?;
+        let persisted = persisted_run_event_from_row_observed(
+            row,
+            observer,
+            PreparationStage::Validate,
+            progress,
+        )?;
+        observer.checkpoint(PreparationStage::Validate, progress)?;
         if let Some(existing) = events.get(&persisted.identity) {
-            return Err(run_event_identity_collision(
-                persisted.identity,
+            observer.checkpoint(PreparationStage::Validate, progress)?;
+            let duplicate = run_event_records_equal_observed(
                 existing,
                 &persisted.record,
-            ));
+                observer,
+                PreparationStage::Validate,
+                progress,
+            )?;
+            observer.checkpoint(PreparationStage::Validate, progress)?;
+            let error = if duplicate {
+                RunEventDecodeError::DuplicateIdentity {
+                    identity: persisted.identity,
+                }
+            } else {
+                RunEventDecodeError::ConflictingIdentity {
+                    identity: persisted.identity,
+                }
+            };
+            return Err(error.into());
         }
+        observer.checkpoint(PreparationStage::Validate, progress)?;
         events.insert(persisted.identity, persisted.record);
+        observer.checkpoint(PreparationStage::Validate, progress)?;
     }
+    observer.checkpoint(PreparationStage::Validate, progress)?;
     Ok(events)
 }
 
@@ -15096,10 +15552,34 @@ impl Storage {
     }
 
     fn prepare_batch(payload: &PersistenceBatch) -> Result<StorageBuffer, StorageError> {
+        let mut observer = UnboundedPreparation;
+        Self::prepare_batch_observed(payload, &mut observer, PreparationProgress::default())
+    }
+
+    fn prepare_batch_observed<Observer>(
+        payload: &PersistenceBatch,
+        observer: &mut Observer,
+        progress: PreparationProgress,
+    ) -> Result<StorageBuffer, StorageError>
+    where
+        Observer: PreparationObserver,
+    {
+        observer.checkpoint(PreparationStage::Materialize, progress)?;
         let summary = &payload.summary;
         let tick = encode_u64("ticks.tick", summary.tick.0)?;
-        let mut prepared = StorageBuffer::default();
+        let mut prepared = StorageBuffer {
+            ticks: Vec::with_capacity(1),
+            metrics: Vec::with_capacity(payload.metrics.len()),
+            events: Vec::with_capacity(payload.events.len()),
+            agents: Vec::with_capacity(payload.agents.len()),
+            births: Vec::with_capacity(payload.births.len()),
+            deaths: Vec::with_capacity(payload.deaths.len()),
+            replay_events: Vec::with_capacity(payload.replay_events.len()),
+            run_events: Vec::with_capacity(payload.narrative_events.len()),
+        };
+        observer.checkpoint(PreparationStage::Materialize, progress)?;
 
+        observer.checkpoint(PreparationStage::Materialize, progress)?;
         prepared.ticks.push(TickRow {
             tick,
             epoch: encode_u64("ticks.epoch", payload.epoch)?,
@@ -15113,48 +15593,73 @@ impl Storage {
         });
 
         for metric in &payload.metrics {
+            observer.checkpoint(PreparationStage::Materialize, progress)?;
             prepared.metrics.push(MetricRow {
                 tick,
-                name: metric.name.to_string(),
+                name: clone_preparation_string(
+                    metric.name.as_ref(),
+                    observer,
+                    PreparationStage::Materialize,
+                    progress,
+                )?,
                 value: metric.value,
             });
         }
 
         for event in &payload.events {
+            observer.checkpoint(PreparationStage::Materialize, progress)?;
             prepared.events.push(EventRow {
                 tick,
                 kind: match &event.kind {
                     PersistenceEventKind::Births => "births".to_string(),
                     PersistenceEventKind::Deaths => "deaths".to_string(),
-                    PersistenceEventKind::Custom(name) => name.to_string(),
+                    PersistenceEventKind::Custom(name) => clone_preparation_string(
+                        name,
+                        observer,
+                        PreparationStage::Materialize,
+                        progress,
+                    )?,
                 },
                 count: checked_i64("events.count", event.count)?,
             });
         }
 
         for agent in &payload.agents {
-            prepared.agents.push(agent_row_from_snapshot(tick, agent)?);
+            observer.checkpoint(PreparationStage::Materialize, progress)?;
+            prepared.agents.push(agent_row_from_snapshot_observed(
+                tick, agent, observer, progress,
+            )?);
         }
 
         for birth in &payload.births {
-            prepared.births.push(birth_row_from_record(birth)?);
+            observer.checkpoint(PreparationStage::Materialize, progress)?;
+            prepared
+                .births
+                .push(birth_row_from_record_observed(birth, observer, progress)?);
         }
 
         for death in &payload.deaths {
-            prepared.deaths.push(death_row_from_record(death)?);
+            observer.checkpoint(PreparationStage::Materialize, progress)?;
+            prepared
+                .deaths
+                .push(death_row_from_record_observed(death, observer, progress)?);
         }
 
         for (seq, event) in payload.replay_events.iter().enumerate() {
-            prepared
-                .replay_events
-                .push(replay_row_from_event(event, tick, seq)?);
+            observer.checkpoint(PreparationStage::Materialize, progress)?;
+            prepared.replay_events.push(replay_row_from_event_observed(
+                event, tick, seq, observer, progress,
+            )?);
         }
 
         for event in &payload.narrative_events {
-            prepared.run_events.push(run_event_row_from_record(event)?);
+            observer.checkpoint(PreparationStage::Materialize, progress)?;
+            prepared.run_events.push(run_event_row_from_record_observed(
+                event, observer, progress,
+            )?);
         }
 
-        prepared.validate_contents(summary.tick.0)?;
+        prepared.validate_contents_observed(summary.tick.0, observer, progress)?;
         Ok(prepared)
     }
 
@@ -16536,6 +17041,8 @@ struct StorageThresholds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageDeadlines {
     pub startup_ack: Duration,
+    /// Maximum controller time spent measuring and materializing a borrowed payload.
+    pub preparation: Duration,
     pub command_enqueue: Duration,
     pub admission_ack: Duration,
     pub flush_ack: Duration,
@@ -16546,6 +17053,7 @@ impl Default for StorageDeadlines {
     fn default() -> Self {
         Self {
             startup_ack: DEFAULT_STARTUP_ACK_TIMEOUT,
+            preparation: DEFAULT_PREPARATION_TIMEOUT,
             command_enqueue: DEFAULT_COMMAND_ENQUEUE_TIMEOUT,
             admission_ack: DEFAULT_ADMISSION_ACK_TIMEOUT,
             flush_ack: DEFAULT_FLUSH_ACK_TIMEOUT,
@@ -16558,6 +17066,7 @@ impl StorageDeadlines {
     fn validate(self) -> Result<(), StorageError> {
         for (name, timeout) in [
             ("startup_ack", self.startup_ack),
+            ("preparation", self.preparation),
             ("command_enqueue", self.command_enqueue),
             ("admission_ack", self.admission_ack),
             ("flush_ack", self.flush_ack),
@@ -16658,12 +17167,45 @@ impl StorageSink {
         self.run_id
     }
 
+    fn publish_preparation_error(&self, error: &StorageError, tick: u64) {
+        let worker_error = match error {
+            StorageError::Worker(worker_error) => worker_error.clone(),
+            other => StorageWorkerError::Internal {
+                operation: StorageOperation::Admit,
+                path: self.path.to_string(),
+                tick: Some(tick),
+                commit_state: FailureCommitState::NotAdmitted,
+                detail: other.to_string(),
+            },
+        };
+        self.analytics.publish_worker_error(&worker_error, false);
+    }
+
     /// Admit a persistence batch and wait until its exact payload is in the worker outbox.
     pub fn submit_with_receipt(
         &self,
         payload: &PersistenceBatch,
     ) -> Result<AdmissionReceipt, StorageError> {
+        let mut clock = |_| Instant::now();
+        self.submit_with_receipt_using_clock(payload, &mut clock)
+    }
+
+    fn submit_with_receipt_using_clock<Clock>(
+        &self,
+        payload: &PersistenceBatch,
+        clock: &mut Clock,
+    ) -> Result<AdmissionReceipt, StorageError>
+    where
+        Clock: FnMut(PreparationStage) -> Instant,
+    {
         let tick = payload.summary.tick.0;
+        let mut progress = PreparationProgress::default();
+        let mut preparation = PreparationDeadline::new(
+            clock,
+            self.deadlines.preparation,
+            Arc::clone(&self.path),
+            tick,
+        );
 
         // MEASURE BEFORE ALLOCATING. `from_batch` below materializes the entire
         // batch; if the batch is pathological, the memory is already gone by the
@@ -16674,8 +17216,23 @@ impl StorageSink {
         // This is a NotAdmitted outcome in the strictest sense: the caller still
         // holds the exact payload it tried to submit, so the exact-retry semantics
         // the storage contract depends on are untouched.
-        let (bytes, events) = estimate_batch_size(payload);
+        let (bytes, events) =
+            estimate_batch_size_observed(payload, &mut preparation, &mut progress)
+                .inspect_err(|error| self.publish_preparation_error(error, tick))?;
         if bytes > self.budget.max_batch_bytes || events > self.budget.max_batch_events {
+            warn!(
+                schema = "scriptbots.persistence-preparation.v1",
+                phase = "refusal",
+                stage = PreparationStage::Measure.as_str(),
+                scientific_bytes = bytes,
+                scientific_records = events,
+                path = %self.path,
+                tick,
+                identity_state = "unassigned",
+                disposition = "not_admitted",
+                reason = "payload_too_large",
+                "persistence payload refused before materialization"
+            );
             return Err(StorageError::PayloadTooLarge {
                 tick,
                 bytes,
@@ -16684,32 +17241,46 @@ impl StorageSink {
                 max_events: self.budget.max_batch_events,
             });
         }
+        let _ = estimate_narrative_size_observed(payload, &mut preparation, &mut progress)
+            .inspect_err(|error| self.publish_preparation_error(error, tick))?;
 
         // Total in-flight back-pressure. A stream of individually-legal batches
         // can still exhaust memory if the writer falls behind, so the buffered
         // total is bounded too. The CAS both checks and reserves without the
         // fetch-add-then-undo window or integer wraparound.
-        let permit = InFlightPermit::try_acquire(
+        let permit = InFlightPermit::try_acquire_observed(
             &self.inflight_bytes,
             bytes,
             self.budget.max_inflight_bytes,
+            &mut preparation,
+            progress,
         )
+        .inspect_err(|error| self.publish_preparation_error(error, tick))?
         .map_err(|would_be| StorageError::InFlightBytesExhausted {
             tick,
             would_be,
             max_inflight: self.budget.max_inflight_bytes,
         })?;
 
-        let prepared = PreparedPersistenceBatch::from_batch(payload).inspect_err(|error| {
-            let worker_error = StorageWorkerError::Internal {
-                operation: StorageOperation::Admit,
-                path: self.path.to_string(),
-                tick: Some(tick),
-                commit_state: FailureCommitState::NotAdmitted,
-                detail: error.to_string(),
-            };
-            self.analytics.publish_worker_error(&worker_error, false);
-        })?;
+        let prepared =
+            PreparedPersistenceBatch::from_batch_observed(payload, &mut preparation, progress)
+                .inspect_err(|error| self.publish_preparation_error(error, tick))?;
+        debug!(
+            schema = "scriptbots.persistence-preparation.v1",
+            phase = "prepared",
+            stage = PreparationStage::Complete.as_str(),
+            deadline = ?self.deadlines.preparation,
+            scientific_bytes = progress.scientific_bytes,
+            scientific_records = progress.scientific_records,
+            narrative_bytes = progress.narrative_bytes,
+            narrative_records = progress.narrative_records,
+            path = %self.path,
+            tick,
+            identity_state = "unassigned",
+            disposition = "prepared",
+            "persistence payload preparation completed"
+        );
+        drop(preparation);
         let enqueue_deadline = Instant::now() + self.deadlines.command_enqueue;
         let admission = lock_admission_gate_until(
             &self.admission,
@@ -16775,7 +17346,7 @@ impl StorageSink {
                 return Err(StorageError::Worker(worker_error));
             }
         }
-        reply_rx
+        let receipt = reply_rx
             .recv_deadline(Instant::now() + self.deadlines.admission_ack)
             .map_err(|error| {
                 let (worker_error, stopped) = match error {
@@ -16805,7 +17376,25 @@ impl StorageSink {
                 self.analytics.publish_worker_error(&worker_error, stopped);
                 StorageError::Worker(worker_error)
             })?
-            .map_err(StorageError::Worker)
+            .map_err(StorageError::Worker)?;
+        info!(
+            schema = "scriptbots.persistence-preparation.v1",
+            phase = "receipt",
+            stage = "outbox_admission",
+            deadline = ?self.deadlines.preparation,
+            scientific_bytes = progress.scientific_bytes,
+            scientific_records = progress.scientific_records,
+            narrative_bytes = progress.narrative_bytes,
+            narrative_records = progress.narrative_records,
+            path = %self.path,
+            tick,
+            identity_state = "assigned",
+            disposition = "admitted",
+            receipt = ?receipt.guarantee,
+            batch_id = receipt.batch_id.get(),
+            "prepared persistence payload admitted to the durable outbox"
+        );
+        Ok(receipt)
     }
 
     /// Admit a persistence batch while discarding the returned batch identifier.
@@ -18722,14 +19311,33 @@ fn shutdown_worker_storage(
     })
 }
 
-fn brain_binding_to_string(binding: &BrainBinding) -> String {
-    binding.describe().into_owned()
+#[cfg(test)]
+fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> Result<AgentRow, StorageError> {
+    let mut observer = UnboundedPreparation;
+    agent_row_from_snapshot_observed(tick, agent, &mut observer, PreparationProgress::default())
 }
 
-fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> Result<AgentRow, StorageError> {
+fn agent_row_from_snapshot_observed<Observer>(
+    tick: i64,
+    agent: &AgentState,
+    observer: &mut Observer,
+    progress: PreparationProgress,
+) -> Result<AgentRow, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(PreparationStage::Materialize, progress)?;
     let uid = encode_u64("agents.agent_uid", agent.identity.uid.get())?;
     let data = &agent.data;
     let runtime = &agent.runtime;
+    let brain_binding = if let Some(key) = runtime.brain.registry_key() {
+        format!("registry:{key}")
+    } else if let Some(kind) = runtime.brain.kind() {
+        clone_preparation_string(kind, observer, PreparationStage::Materialize, progress)?
+    } else {
+        "unbound".to_owned()
+    };
+    observer.checkpoint(PreparationStage::Materialize, progress)?;
     Ok(AgentRow {
         tick,
         agent_uid: uid,
@@ -18758,7 +19366,7 @@ fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> Result<AgentRow, St
         trait_eye: f64::from(runtime.trait_modifiers.eye),
         trait_blood: f64::from(runtime.trait_modifiers.blood),
         give_intent: f64::from(runtime.give_intent),
-        brain_binding: brain_binding_to_string(&runtime.brain),
+        brain_binding,
         brain_key: runtime
             .brain
             .registry_key()
@@ -18815,7 +19423,15 @@ fn scope_label(scope: ReplayRngScope) -> String {
 /// The table's CHECK constraints are the contract, so the conversion refuses what the schema
 /// would reject rather than deferring to a constraint violation that would roll back the
 /// whole batch — including the scientific rows sharing the transaction.
-fn run_event_row_from_record(record: &EventRecord) -> Result<RunEventRow, StorageError> {
+fn run_event_row_from_record_observed<Observer>(
+    record: &EventRecord,
+    observer: &mut Observer,
+    progress: PreparationProgress,
+) -> Result<RunEventRow, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(PreparationStage::Materialize, progress)?;
     let as_i64 = |field: RunEventField, value: u64| -> Result<i64, StorageError> {
         i64::try_from(value).map_err(|error| {
             invalid_run_event(
@@ -18831,26 +19447,111 @@ fn run_event_row_from_record(record: &EventRecord) -> Result<RunEventRow, Storag
         magnitude: record.magnitude,
         window_start: as_i64(RunEventField::WindowStart, record.window.0)?,
         window_end: as_i64(RunEventField::WindowEnd, record.window.1)?,
-        metric: record.metric.clone(),
+        metric: clone_preparation_string(
+            &record.metric,
+            observer,
+            PreparationStage::Materialize,
+            progress,
+        )?,
         before_value: record.before,
         after_value: record.after,
         score: record.score,
         subject_ref: record
             .subject
             .map(scriptbots_core::narrative::SubjectRef::to_db_string),
-        human_text: record.human_text.clone(),
+        human_text: clone_preparation_string(
+            &record.human_text,
+            observer,
+            PreparationStage::Materialize,
+            progress,
+        )?,
         schema_version: i64::from(record.schema_version),
     };
-    let decoded = persisted_run_event_from_row(&row)?;
-    debug_assert_eq!(&decoded.record, record);
+    let _decoded = persisted_run_event_from_row_observed(
+        &row,
+        observer,
+        PreparationStage::Materialize,
+        progress,
+    )?;
+    #[cfg(debug_assertions)]
+    {
+        let round_trips = run_event_records_equal_observed(
+            &_decoded.record,
+            record,
+            observer,
+            PreparationStage::Materialize,
+            progress,
+        )?;
+        debug_assert!(round_trips);
+    }
     Ok(row)
 }
 
+#[cfg(test)]
 fn replay_row_from_event(
     event: &ReplayEvent,
     tick: i64,
     seq: usize,
 ) -> Result<ReplayEventRow, StorageError> {
+    let mut observer = UnboundedPreparation;
+    replay_row_from_event_observed(
+        event,
+        tick,
+        seq,
+        &mut observer,
+        PreparationProgress::default(),
+    )
+}
+
+fn serialize_brain_outputs_observed<Observer>(
+    outputs: &[f32],
+    tick: i64,
+    seq: usize,
+    observer: &mut Observer,
+    progress: PreparationProgress,
+) -> Result<String, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    let capacity = outputs.len().saturating_mul(32).saturating_add(16);
+    let mut payload = String::with_capacity(capacity);
+    payload.push_str("{\"outputs\":[");
+    observer.checkpoint(PreparationStage::ReplaySerialization, progress)?;
+    for (index, value) in outputs.iter().enumerate() {
+        if index.is_multiple_of(256) {
+            observer.checkpoint(PreparationStage::ReplaySerialization, progress)?;
+        }
+        if !value.is_finite() {
+            return Err(StorageError::InvalidData {
+                context: "replay_events.brain_outputs",
+                reason: format!("non-finite replay value at tick {tick}, seq {seq}"),
+            });
+        }
+        if index > 0 {
+            payload.push(',');
+        }
+        let encoded = serde_json::to_string(value).map_err(|error| StorageError::InvalidData {
+            context: "replay_events.brain_outputs",
+            reason: error.to_string(),
+        })?;
+        payload.push_str(&encoded);
+    }
+    payload.push_str("]}");
+    observer.checkpoint(PreparationStage::ReplaySerialization, progress)?;
+    Ok(payload)
+}
+
+fn replay_row_from_event_observed<Observer>(
+    event: &ReplayEvent,
+    tick: i64,
+    seq: usize,
+    observer: &mut Observer,
+    progress: PreparationProgress,
+) -> Result<ReplayEventRow, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(PreparationStage::Materialize, progress)?;
     let invalid_non_finite = |context: &'static str| StorageError::InvalidData {
         context,
         reason: format!("non-finite replay value at tick {tick}, seq {seq}"),
@@ -18864,32 +19565,27 @@ fn replay_row_from_event(
             ),
         });
     }
-    let (scope, event_type, payload_value, row_tick, row_seq, interaction_value): (
+    let (scope, event_type, payload, row_tick, row_seq, interaction_value): (
         String,
         String,
-        Value,
+        String,
         i64,
         i64,
         Option<f64>,
     ) = match &event.kind {
-        ReplayEventKind::BrainOutputs { outputs } => {
-            if outputs.iter().any(|value| !value.is_finite()) {
-                return Err(invalid_non_finite("replay_events.brain_outputs"));
+        ReplayEventKind::BrainOutputs { outputs } => (
+            if event.agent_uid.is_some() {
+                "agent:brain"
+            } else {
+                "world:brain"
             }
-            (
-                if event.agent_uid.is_some() {
-                    "agent:brain"
-                } else {
-                    "world:brain"
-                }
-                .to_string(),
-                "brain_outputs".to_string(),
-                json!({ "outputs": outputs }),
-                tick,
-                fallback_seq,
-                None,
-            )
-        }
+            .to_string(),
+            "brain_outputs".to_string(),
+            serialize_brain_outputs_observed(outputs, tick, seq, observer, progress)?,
+            tick,
+            fallback_seq,
+            None,
+        ),
         ReplayEventKind::Action {
             left_wheel,
             right_wheel,
@@ -18922,7 +19618,8 @@ fn replay_row_from_event(
                     "spike_target": spike_target,
                     "sound_level": sound_level,
                     "give_intent": give_intent,
-                }),
+                })
+                .to_string(),
                 tick,
                 fallback_seq,
                 None,
@@ -18955,7 +19652,8 @@ fn replay_row_from_event(
                     "range_min": range_min,
                     "range_max": range_max,
                     "value": value,
-                }),
+                })
+                .to_string(),
                 tick,
                 fallback_seq,
                 None,
@@ -18977,7 +19675,7 @@ fn replay_row_from_event(
             (
                 "world:digest".to_string(),
                 "world_digest".to_string(),
-                json!({ "overall": overall }),
+                json!({ "overall": overall }).to_string(),
                 tick,
                 fallback_seq,
                 None,
@@ -19015,7 +19713,7 @@ fn replay_row_from_event(
             (
                 NARRATIVE_INPUT_SCOPE.to_owned(),
                 NARRATIVE_INPUT_EVENT_TYPE.to_owned(),
-                serde_json::to_value(NarrativeInputPayloadV1::from_record(*record)).map_err(
+                serde_json::to_string(&NarrativeInputPayloadV1::from_record(*record)).map_err(
                     |error| NarrativeInputStreamError::InvalidRecord {
                         tick: record.input.tick.0,
                         reason: error.to_string(),
@@ -19085,7 +19783,7 @@ fn replay_row_from_event(
             (
                 "agent:interaction".to_string(),
                 event_type.to_string(),
-                json!({ "magnitude": magnitude }),
+                json!({ "magnitude": magnitude }).to_string(),
                 source_tick,
                 stored_seq,
                 Some(f64::from(*magnitude)),
@@ -19114,7 +19812,7 @@ fn replay_row_from_event(
         agent_uid: optional_agent_uid("replay_events.agent_uid", event.agent_uid)?,
         scope,
         event_type,
-        payload: payload_value.to_string(),
+        payload,
         position: finite_position(event.position, "replay_events.position")?,
         counterpart: optional_agent_uid("replay_events.counterpart", event.counterpart)?,
         counterpart_position: finite_position(
@@ -19678,7 +20376,21 @@ fn position_from_columns((x, y): (f64, f64)) -> Position {
     Position::new(x as f32, y as f32)
 }
 
+#[cfg(test)]
 fn birth_row_from_record(record: &BirthRecord) -> Result<BirthRow, StorageError> {
+    let mut observer = UnboundedPreparation;
+    birth_row_from_record_observed(record, &mut observer, PreparationProgress::default())
+}
+
+fn birth_row_from_record_observed<Observer>(
+    record: &BirthRecord,
+    observer: &mut Observer,
+    progress: PreparationProgress,
+) -> Result<BirthRow, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(PreparationStage::Materialize, progress)?;
     validate_birth_origin_ordinal(record.origin, record.birth_ordinal)?;
     let birth_ordinal = record
         .birth_ordinal
@@ -19691,7 +20403,13 @@ fn birth_row_from_record(record: &BirthRecord) -> Result<BirthRow, StorageError>
         birth_ordinal,
         parent_a: optional_agent_uid("births.parent_a", record.parent_a)?,
         parent_b: optional_agent_uid("births.parent_b", record.parent_b)?,
-        brain_kind: record.brain_kind.clone(),
+        brain_kind: record
+            .brain_kind
+            .as_deref()
+            .map(|kind| {
+                clone_preparation_string(kind, observer, PreparationStage::Materialize, progress)
+            })
+            .transpose()?,
         brain_key: record
             .brain_key
             .map(|key| encode_u64("births.brain_key", key))
@@ -19729,14 +20447,34 @@ fn decode_death_cause(value: &str) -> Result<DeathCause, StorageError> {
     }
 }
 
+#[cfg(test)]
 fn death_row_from_record(record: &DeathRecord) -> Result<DeathRow, StorageError> {
+    let mut observer = UnboundedPreparation;
+    death_row_from_record_observed(record, &mut observer, PreparationProgress::default())
+}
+
+fn death_row_from_record_observed<Observer>(
+    record: &DeathRecord,
+    observer: &mut Observer,
+    progress: PreparationProgress,
+) -> Result<DeathRow, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(PreparationStage::Materialize, progress)?;
     Ok(DeathRow {
         tick: encode_u64("deaths.tick", record.tick.0)?,
         agent_uid: encode_u64("deaths.agent_uid", record.agent_uid.get())?,
         age: i64::from(record.age),
         generation: i64::from(record.generation.0),
         herbivore_tendency: f64::from(record.herbivore_tendency),
-        brain_kind: record.brain_kind.clone(),
+        brain_kind: record
+            .brain_kind
+            .as_deref()
+            .map(|kind| {
+                clone_preparation_string(kind, observer, PreparationStage::Materialize, progress)
+            })
+            .transpose()?,
         brain_key: record
             .brain_key
             .map(|key| encode_u64("deaths.brain_key", key))
@@ -19758,9 +20496,9 @@ fn death_row_from_record(record: &DeathRecord) -> Result<DeathRow, StorageError>
 mod tests {
     use super::*;
     use scriptbots_core::{
-        AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
-        PersistenceEventKind, Position, ScriptBotsConfig, Tick, TickSummary, Velocity, WorldState,
-        rng_domains::AgentRngCountersV1,
+        AgentData, AgentRuntime, AgentState, BrainBinding, MetricSample, PersistenceBatch,
+        PersistenceEvent, PersistenceEventKind, Position, ScriptBotsConfig, Tick, TickSummary,
+        Velocity, WorldState, rng_domains::AgentRngCountersV1,
     };
     use scriptbots_runtime::{
         CommandAuthorityLookupFailure, CommandEnvelope, CommandId, CommandStatus, HostAccessError,
@@ -20458,6 +21196,48 @@ mod tests {
             assert_complete_journal_prefix(&retried, 1, 1);
             assert_eq!(retried.tick_count, 1);
         }
+    }
+
+    #[test]
+    fn deterministic_chaos_admission_commit_fault_recovers_without_double_apply() {
+        // The fixed session id is the deterministic seed for this first LabRuntime case.  The
+        // existing test-only fault seam injects exactly once at the durable outbox admission
+        // commit boundary, then the same command is retried after a cold reopen.
+        const SEED: u64 = 0xC0A5_5015;
+        let path = temp_db_path("deterministic-chaos-admission-commit");
+        let path = path.to_string_lossy().into_owned();
+        let session_id = HostSessionId::new(SEED);
+        let (pipeline, mut core, mut frontend) = fault_test_host(&path, session_id);
+        arm_host_journal_fault(&path, HostJournalFaultPoint::AdmissionBeforeCommit);
+
+        let mut next_nanos = 0;
+        let command =
+            submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
+        assert_journal_fault_status(
+            &pipeline,
+            &command,
+            HostJournalFaultPoint::AdmissionBeforeCommit,
+            FailureCommitState::RolledBack,
+        );
+        drop_fault_host(pipeline, core, frontend);
+
+        let rolled_back = journal_database_snapshot(&path);
+        assert_empty_journal_snapshot(&rolled_back);
+
+        let (recovered_pipeline, mut recovered_core, mut recovered_frontend) =
+            recovered_fault_test_host(&path, session_id);
+        let retry = submit_fault_command(
+            &mut recovered_frontend,
+            &mut recovered_core,
+            HostCommand::Step,
+            &mut next_nanos,
+        );
+        assert_eq!(retry.journal(), &JournalState::Durable);
+        drop_fault_host(recovered_pipeline, recovered_core, recovered_frontend);
+
+        let recovered = journal_database_snapshot(&path);
+        assert_complete_journal_prefix(&recovered, 1, 1);
+        assert_eq!(recovered.tick_count, 1);
     }
 
     #[test]
@@ -21536,11 +22316,330 @@ mod tests {
     fn short_deadlines() -> StorageDeadlines {
         StorageDeadlines {
             startup_ack: Duration::from_secs(2),
+            preparation: Duration::from_millis(250),
             command_enqueue: Duration::from_millis(100),
             admission_ack: Duration::from_millis(250),
             flush_ack: Duration::from_millis(250),
             shutdown_ack: Duration::from_millis(250),
         }
+    }
+
+    #[test]
+    fn preparation_deadline_boundary_uses_before_exact_after_clock() {
+        let configured = Duration::from_nanos(10);
+        for (elapsed, should_expire) in [(9, false), (10, true), (11, true)] {
+            let started = Instant::now();
+            let mut stages = Vec::new();
+            let result = {
+                let mut clock = |stage| {
+                    stages.push(stage);
+                    if stage == PreparationStage::Start {
+                        started
+                    } else {
+                        started + Duration::from_nanos(elapsed)
+                    }
+                };
+                let mut deadline = PreparationDeadline::new(
+                    &mut clock,
+                    configured,
+                    Arc::from(":boundary-test:"),
+                    17,
+                );
+                deadline.checkpoint(PreparationStage::Measure, PreparationProgress::default())
+            };
+            assert_eq!(stages, [PreparationStage::Start, PreparationStage::Measure]);
+            if should_expire {
+                assert!(matches!(
+                    result,
+                    Err(StorageError::Worker(StorageWorkerError::Timeout {
+                        operation: StorageOperation::Admit,
+                        phase: StorageWaitPhase::Preparation,
+                        tick: Some(17),
+                        waited,
+                        commit_state: FailureCommitState::NotAdmitted,
+                        ..
+                    })) if waited == configured
+                ));
+            } else {
+                result.expect("a checkpoint one nanosecond before the deadline must pass");
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_deadline_covers_every_pre_enqueue_stage_without_side_effects() {
+        let target_stages = [
+            PreparationStage::Measure,
+            PreparationStage::NarrativeMeasure,
+            PreparationStage::Permit,
+            PreparationStage::Materialize,
+            PreparationStage::Validate,
+            PreparationStage::Analytics,
+            PreparationStage::Complete,
+        ];
+        for target in target_stages {
+            let (tx, rx) = xchan::bounded(1);
+            let sink = StorageSink {
+                run_id: RunId::new(1),
+                tx,
+                analytics: AnalyticsSnapshotProvider::empty(),
+                admission: Arc::new(Mutex::new(AdmissionState { open: true })),
+                path: Arc::from(format!(":preparation-stage-{}:", target.as_str())),
+                deadlines: StorageDeadlines {
+                    preparation: Duration::from_nanos(10),
+                    ..StorageDeadlines::default()
+                },
+                budget: PayloadBudget::default(),
+                inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            };
+            let payload = sample_batch(89, 8.9);
+            let expected_estimate = estimate_batch_size(&payload);
+            let started = Instant::now();
+            let mut witnessed_target = false;
+            let mut clock = |stage| {
+                if stage == target {
+                    witnessed_target = true;
+                    started + Duration::from_nanos(10)
+                } else {
+                    started
+                }
+            };
+
+            let error = sink
+                .submit_with_receipt_using_clock(&payload, &mut clock)
+                .expect_err("the selected preparation stage must hit the exact deadline");
+            assert!(
+                matches!(
+                    error,
+                    StorageError::Worker(StorageWorkerError::Timeout {
+                        operation: StorageOperation::Admit,
+                        phase: StorageWaitPhase::Preparation,
+                        tick: Some(89),
+                        waited,
+                        commit_state: FailureCommitState::NotAdmitted,
+                        ..
+                    }) if waited == Duration::from_nanos(10)
+                ),
+                "stage {target:?} did not return the typed preparation refusal"
+            );
+            assert!(
+                witnessed_target,
+                "stage {target:?} was not reached under the preparation deadline"
+            );
+            assert_eq!(
+                sink.inflight_bytes.load(Ordering::SeqCst),
+                0,
+                "stage {target:?} leaked an in-flight permit"
+            );
+            assert!(
+                matches!(rx.try_recv(), Err(xchan::TryRecvError::Empty)),
+                "stage {target:?} enqueued a worker command"
+            );
+            assert_eq!(
+                sink.analytics.snapshot().watermarks,
+                PersistenceWatermarks::default(),
+                "stage {target:?} minted an identity or advanced a watermark"
+            );
+            assert_eq!(
+                estimate_batch_size(&payload),
+                expected_estimate,
+                "stage {target:?} changed the retained retry payload"
+            );
+            assert_eq!(payload.summary.tick.0, 89);
+        }
+    }
+
+    #[test]
+    fn preparation_deadline_interrupts_nested_replay_serialization_without_permit_leak() {
+        let (tx, rx) = xchan::bounded(1);
+        let sink = StorageSink {
+            run_id: RunId::new(1),
+            tx,
+            analytics: AnalyticsSnapshotProvider::empty(),
+            admission: Arc::new(Mutex::new(AdmissionState { open: true })),
+            path: Arc::from(":nested-replay-deadline:"),
+            deadlines: StorageDeadlines {
+                preparation: Duration::from_nanos(10),
+                ..StorageDeadlines::default()
+            },
+            budget: PayloadBudget::default(),
+            inflight_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut payload = sample_batch(90, 9.0);
+        payload.replay_events.push(ReplayEvent {
+            agent_uid: Some(AgentUid(1)),
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::BrainOutputs {
+                outputs: vec![0.25; 4_096],
+            },
+        });
+        let started = Instant::now();
+        let mut replay_checkpoints = 0usize;
+        let mut clock = |stage| {
+            if stage == PreparationStage::ReplaySerialization {
+                replay_checkpoints = replay_checkpoints.saturating_add(1);
+            }
+            if replay_checkpoints >= 3 {
+                started + Duration::from_nanos(10)
+            } else {
+                started
+            }
+        };
+
+        let error = sink
+            .submit_with_receipt_using_clock(&payload, &mut clock)
+            .expect_err("the third nested replay checkpoint must hit the exact deadline");
+        assert!(matches!(
+            error,
+            StorageError::Worker(StorageWorkerError::Timeout {
+                operation: StorageOperation::Admit,
+                phase: StorageWaitPhase::Preparation,
+                tick: Some(90),
+                waited,
+                commit_state: FailureCommitState::NotAdmitted,
+                ..
+            }) if waited == Duration::from_nanos(10)
+        ));
+        assert_eq!(replay_checkpoints, 3);
+        assert_eq!(
+            sink.inflight_bytes.load(Ordering::SeqCst),
+            0,
+            "a deadline after permit acquisition must release the permit"
+        );
+        assert!(matches!(rx.try_recv(), Err(xchan::TryRecvError::Empty)));
+        assert_eq!(
+            sink.analytics.snapshot().watermarks,
+            PersistenceWatermarks::default(),
+            "pre-enqueue refusal must not publish an identity or watermark"
+        );
+        assert!(matches!(
+            &payload.replay_events[0].kind,
+            ReplayEventKind::BrainOutputs { outputs } if outputs.len() == 4_096
+        ));
+    }
+
+    #[test]
+    fn preparation_deadline_file_pipeline_e2e_preserves_exact_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-preparation-deadline-e2e");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            &path_string,
+            64,
+            4_096,
+            1_024,
+            1_024,
+        )?;
+        let mut deadline_sink = pipeline.sink();
+        deadline_sink.deadlines.preparation = Duration::from_nanos(10);
+        let payload = sample_batch(91, 9.1);
+        let (scientific_bytes, scientific_records) = estimate_batch_size(&payload);
+        let started = Instant::now();
+        let mut clock = |stage| {
+            if stage == PreparationStage::Materialize {
+                started + Duration::from_nanos(10)
+            } else {
+                started
+            }
+        };
+
+        let refusal = deadline_sink
+            .submit_with_receipt_using_clock(&payload, &mut clock)
+            .expect_err("materialization at the exact deadline must be refused");
+        assert!(matches!(
+            refusal,
+            StorageError::Worker(StorageWorkerError::Timeout {
+                operation: StorageOperation::Admit,
+                phase: StorageWaitPhase::Preparation,
+                tick: Some(91),
+                waited,
+                commit_state: FailureCommitState::NotAdmitted,
+                ..
+            }) if waited == Duration::from_nanos(10)
+        ));
+        assert_eq!(pipeline.inflight_bytes(), 0);
+        let reader = StorageReader::open(&path_string)?;
+        assert_eq!(
+            reader.persistence_watermarks()?,
+            PersistenceWatermarks::default()
+        );
+        assert_eq!(reader.run_ledger_summary()?.tick_count, 0);
+        reader.close()?;
+        println!(
+            "{}",
+            json!({
+                "schema": "scriptbots.persistence-preparation.evidence.v1",
+                "phase": "refusal",
+                "stage": "materialize",
+                "deadline": "10ns",
+                "scientific_bytes": scientific_bytes,
+                "scientific_records": scientific_records,
+                "payload_key": format!("tick-91-bytes-{scientific_bytes}"),
+                "identity_state": "unassigned",
+                "disposition": "not_admitted",
+                "receipt": Value::Null,
+                "batch_id": Value::Null,
+                "tick": 91,
+                "durable_tick_count": 0
+            })
+        );
+
+        let healthy_started = Instant::now();
+        let mut healthy_clock = |stage| {
+            if stage == PreparationStage::Start {
+                healthy_started
+            } else {
+                healthy_started + Duration::from_nanos(9)
+            }
+        };
+        let receipt =
+            deadline_sink.submit_with_receipt_using_clock(&payload, &mut healthy_clock)?;
+        let duplicate =
+            deadline_sink.submit_with_receipt_using_clock(&payload, &mut healthy_clock)?;
+        assert_eq!(receipt.guarantee, PersistenceGuarantee::Durable);
+        assert_eq!(duplicate.guarantee, receipt.guarantee);
+        assert_eq!(
+            duplicate.batch_id, receipt.batch_id,
+            "the exact retry must reuse its durable identity"
+        );
+        let flush = pipeline.flush_and_wait()?;
+        assert_eq!(flush.watermarks.durable, Some(receipt.batch_id));
+        pipeline.shutdown()?;
+
+        let reader = StorageReader::open(&path_string)?;
+        let ledger = reader.run_ledger_summary()?;
+        assert_eq!(ledger.tick_count, 1);
+        assert_eq!(ledger.latest_tick.map(|tick| tick.tick), Some(91));
+        let final_watermarks = reader.persistence_watermarks()?;
+        assert_eq!(final_watermarks.admitted, Some(receipt.batch_id));
+        assert_eq!(final_watermarks.applied, Some(receipt.batch_id));
+        assert_eq!(final_watermarks.durable, Some(receipt.batch_id));
+        reader.close()?;
+        let receipt_label = match receipt.guarantee {
+            PersistenceGuarantee::CommittedVolatile => "committed_volatile",
+            PersistenceGuarantee::Durable => "durable",
+        };
+        println!(
+            "{}",
+            json!({
+                "schema": "scriptbots.persistence-preparation.evidence.v1",
+                "phase": "retry",
+                "stage": "outbox_admission",
+                "deadline": "10ns",
+                "scientific_bytes": scientific_bytes,
+                "scientific_records": scientific_records,
+                "payload_key": format!("tick-91-bytes-{scientific_bytes}"),
+                "identity_state": "assigned",
+                "disposition": "admitted",
+                "receipt": receipt_label,
+                "batch_id": receipt.batch_id.get(),
+                "tick": 91,
+                "durable_tick_count": ledger.tick_count
+            })
+        );
+        Ok(())
     }
 
     #[test]
@@ -21561,6 +22660,30 @@ mod tests {
         };
         assert!(matches!(
             error,
+            StorageError::InvalidData {
+                context: "storage.deadlines",
+                ..
+            }
+        ));
+        let preparation_error =
+            match StoragePipeline::unattributed_memory_with_thresholds_and_deadlines(
+                64,
+                4096,
+                1024,
+                1024,
+                StorageDeadlines {
+                    preparation: Duration::ZERO,
+                    ..StorageDeadlines::default()
+                },
+            ) {
+                Ok(mut pipeline) => {
+                    pipeline.shutdown()?;
+                    return Err("zero preparation deadline unexpectedly created a pipeline".into());
+                }
+                Err(error) => error,
+            };
+        assert!(matches!(
+            preparation_error,
             StorageError::InvalidData {
                 context: "storage.deadlines",
                 ..
@@ -28734,5 +29857,9 @@ mod tests {
 
         let _ = fs::remove_file(path);
         Ok(())
+    }
+
+    mod lab_runtime_chaos {
+        include!("lab_runtime_chaos.rs");
     }
 }
