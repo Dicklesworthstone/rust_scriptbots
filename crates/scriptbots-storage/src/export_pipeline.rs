@@ -37,6 +37,49 @@ pub struct MetricExportWriter<W: Write> {
     header_written: bool,
 }
 
+/// Streaming writer for the canonical event table, sharing the metric table's
+/// provenance envelope and schema-versioning rules.
+pub struct EventExportWriter<W: Write> {
+    writer: W,
+    format: ExportFormat,
+}
+
+impl<W: Write> EventExportWriter<W> {
+    pub fn new(writer: W, format: ExportFormat) -> Self {
+        Self { writer, format }
+    }
+
+    pub fn write_provenance(&mut self, prov: &ExportProvenance) -> std::io::Result<()> {
+        let json = serde_json::to_string(prov).unwrap_or_default();
+        match self.format {
+            ExportFormat::JsonLines => writeln!(self.writer, "{{\"provenance\":{json}}}"),
+            ExportFormat::Csv => writeln!(self.writer, "# PROVENANCE: {json}"),
+        }
+    }
+
+    pub fn write_event_row(
+        &mut self,
+        event_id: &str,
+        tick: u64,
+        kind: &str,
+        payload: &str,
+    ) -> std::io::Result<()> {
+        match self.format {
+            ExportFormat::JsonLines => writeln!(
+                self.writer,
+                "{{\"event_id\":{},\"tick\":{tick},\"kind\":{},\"payload\":{}}}",
+                serde_json::to_string(event_id).unwrap_or_default(),
+                serde_json::to_string(kind).unwrap_or_default(),
+                serde_json::to_string(payload).unwrap_or_default()
+            ),
+            ExportFormat::Csv => {
+                writeln!(self.writer, "event_id,tick,kind,payload")?;
+                writeln!(self.writer, "{event_id},{tick},{kind},{payload}")
+            }
+        }
+    }
+}
+
 impl<W: Write> MetricExportWriter<W> {
     pub fn new(writer: W, format: ExportFormat) -> Self {
         Self {
@@ -181,5 +224,42 @@ mod tests {
         assert_eq!(row["tick"], 9);
         assert_eq!(row["metric"], "population");
         assert_eq!(row["value"], 12.5);
+    }
+
+    #[test]
+    fn jsonl_event_export_reuses_provenance_contract() {
+        let mut buf = Vec::new();
+        let mut writer = EventExportWriter::new(&mut buf, ExportFormat::JsonLines);
+        let prov = ExportProvenance {
+            run_id: "run-events".into(),
+            seed: 11,
+            config_digest: "blake3:config-events".into(),
+            source_revision: "git:def456".into(),
+            source_tree_digest: "blake3:tree-events".into(),
+            authority_decisions: vec!["durable_watermark:4".into()],
+            conservation_tolerances: None,
+            schema_version: 1,
+            exported_at_utc: "2026-07-27T00:00:00Z".into(),
+        };
+        writer.write_provenance(&prov).unwrap();
+        writer
+            .write_event_row("evt-1", 4, "combat", "unicode: π")
+            .unwrap();
+
+        let mut lines = String::from_utf8(buf).unwrap().lines();
+        let envelope: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(envelope["provenance"]["run_id"], "run-events");
+        assert_eq!(
+            envelope["provenance"]["config_digest"],
+            "blake3:config-events"
+        );
+        assert_eq!(
+            envelope["provenance"]["source_tree_digest"],
+            "blake3:tree-events"
+        );
+        let row: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(row["event_id"], "evt-1");
+        assert_eq!(row["kind"], "combat");
+        assert_eq!(row["payload"], "unicode: π");
     }
 }
