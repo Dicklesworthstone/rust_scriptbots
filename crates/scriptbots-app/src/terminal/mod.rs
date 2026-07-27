@@ -412,7 +412,10 @@ impl TerminalRenderer {
     }
 }
 
-#[derive(Clone, Copy)]
+// `PartialEq`/`Debug` so tests can assert focus DID NOT change — the negative
+// control that catches Ctrl+T leaking into the plain-t focus action
+// (bd-2z0.14.2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusLockMode {
     Manual,
     TopPredator,
@@ -2680,8 +2683,26 @@ impl<'a> TerminalApp<'a> {
                 self.palette_selected_index = 0;
                 return Ok(false);
             }
-            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+            // Ctrl+T cycles the chrome theme. This arm MUST come before the
+            // plain-`t` focus arm below, which matches `_` on modifiers and would
+            // otherwise swallow Ctrl+T into "Focus: Top predators" — the exact
+            // disagreement the command palette already advertised, since it has
+            // listed keybind_hint "Ctrl+T" for a handler that did not exist
+            // (bd-2z0.14.2.2).
+            (KeyCode::Char('t') | KeyCode::Char('T'), KeyModifiers::CONTROL) => {
+                let theme_label = self.palette.cycle_theme();
+                info!(theme = %theme_label, "terminal chrome theme cycled");
+                self.push_toast(format!("Theme: {theme_label}"));
+                return Ok(false);
+            }
+            // Plain `p` cycles the accessibility palette, which is an ORTHOGONAL
+            // axis to the chrome theme: theme styles chrome, palette drives
+            // semantic data colour. `c` stays bound so existing muscle memory
+            // keeps working; both reach the same single implementation the
+            // command palette uses, so the three entry points cannot diverge.
+            (KeyCode::Char('p'), KeyModifiers::NONE) | (KeyCode::Char('c'), KeyModifiers::NONE) => {
                 let mode_label = self.palette.cycle_mode();
+                info!(palette = %mode_label, "terminal accessibility palette cycled");
                 self.push_toast(format!("Palette: {mode_label}"));
                 return Ok(false);
             }
@@ -2921,7 +2942,12 @@ impl<'a> TerminalApp<'a> {
                     },
                 );
             }
-            (KeyCode::Char('t') | KeyCode::Char('T'), _) => {
+            // Restricted to NONE/SHIFT rather than `_`. With `_` this arm claimed
+            // every modifier combination including CONTROL, so Ctrl+T could never
+            // reach a theme handler no matter where one was added — the binding
+            // was unreachable by construction, not merely missing
+            // (bd-2z0.14.2.2).
+            (KeyCode::Char('t') | KeyCode::Char('T'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 self.focus_lock = FocusLockMode::TopPredator;
                 self.refresh_snapshot();
                 self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Top predators");
@@ -4552,7 +4578,9 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
         },
         CommandPaletteItem {
             label: "Cycle Accessibility Palette",
-            keybind_hint: "c",
+            // Both are live. `p` is the documented binding and matches GPUI; `c`
+            // is retained so the previous binding keeps working (bd-2z0.14.2.2).
+            keybind_hint: "p / c",
             category: "View",
             action: CommandPaletteAction::CyclePalette,
         },
@@ -7470,6 +7498,195 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE))
             .expect("comma steps back");
         assert_eq!(app.selected_eye, None, "',' must step back to all cones");
+    }
+
+    /// Run `probe` against a TerminalApp built for driving keystrokes at.
+    ///
+    /// Scoped rather than returned: `TerminalApp` borrows the `ControlRuntime`,
+    /// so a helper that returned both would be returning a value referencing its
+    /// own local. The closure keeps the runtime alive for exactly as long as the
+    /// app needs it.
+    fn with_shortcut_app(probe: impl FnOnce(&mut TerminalApp)) {
+        let world = command_characterization_world();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+        probe(&mut app);
+    }
+
+    /// Ctrl+T must cycle the chrome theme, and must NOT be eaten by plain-`t`.
+    ///
+    /// Driven through `handle_key` rather than by calling `cycle_theme`, because
+    /// the defect this bead reopened for was precisely that the METHOD existed
+    /// and worked while no key reached it: the command palette advertised
+    /// "Ctrl+T" while the plain-`t` arm matched `_` on modifiers and claimed the
+    /// combination first. A method-only test passes against that bug.
+    #[test]
+    fn ctrl_t_cycles_the_theme_without_triggering_the_plain_t_focus_action() {
+        with_shortcut_app(|app| {
+            let before = app.palette.theme_id;
+            let focus_before = app.focus_lock;
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .expect("ctrl-t is handled");
+
+            assert_ne!(
+                app.palette.theme_id, before,
+                "Ctrl+T must advance the chrome theme"
+            );
+            assert_eq!(
+                app.palette.theme_id,
+                before.next(),
+                "Ctrl+T must advance by exactly one step of the documented cycle"
+            );
+            // The negative control, and the actual bug: focus must be untouched.
+            assert_eq!(
+                app.focus_lock, focus_before,
+                "Ctrl+T must not also fire the plain-t focus action; the two bindings \
+                 are separate and a shared arm is how they collided"
+            );
+        });
+    }
+
+    /// Plain `t` must still focus predators and must NOT cycle the theme.
+    ///
+    /// The other half of modifier separation: tightening the focus arm to
+    /// NONE/SHIFT could have made plain `t` stop working entirely, and nothing
+    /// else in the suite drives it.
+    #[test]
+    fn plain_t_still_focuses_predators_and_leaves_the_theme_alone() {
+        with_shortcut_app(|app| {
+            let theme_before = app.palette.theme_id;
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+                .expect("plain t is handled");
+
+            assert!(
+                matches!(app.focus_lock, FocusLockMode::TopPredator),
+                "plain t must still lock focus to top predators"
+            );
+            assert_eq!(
+                app.palette.theme_id, theme_before,
+                "plain t must not cycle the chrome theme"
+            );
+        });
+    }
+
+    /// Plain `p` cycles the accessibility palette and must not open the command
+    /// palette — a different control on a neighbouring binding (Ctrl+P).
+    #[test]
+    fn plain_p_cycles_the_accessibility_palette_without_opening_a_control() {
+        with_shortcut_app(|app| {
+            let mode_before = app.palette.mode;
+            let theme_before = app.palette.theme_id;
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+                .expect("plain p is handled");
+
+            assert_ne!(
+                app.palette.mode, mode_before,
+                "plain p must advance the accessibility palette"
+            );
+            assert!(
+                !app.palette_open,
+                "plain p must not open the command palette; that is Ctrl+P"
+            );
+            // The two axes are orthogonal by design: chrome theme and semantic
+            // data palette must not move together.
+            assert_eq!(
+                app.palette.theme_id, theme_before,
+                "cycling the accessibility palette must not change the chrome theme"
+            );
+        });
+    }
+
+    /// Ctrl+P still opens the command palette, and does not cycle anything.
+    #[test]
+    fn ctrl_p_opens_the_command_palette_and_cycles_nothing() {
+        with_shortcut_app(|app| {
+            let mode_before = app.palette.mode;
+            let theme_before = app.palette.theme_id;
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+                .expect("ctrl-p is handled");
+
+            assert!(app.palette_open, "Ctrl+P must open the command palette");
+            assert_eq!(
+                app.palette.mode, mode_before,
+                "Ctrl+P must not cycle the accessibility palette"
+            );
+            assert_eq!(
+                app.palette.theme_id, theme_before,
+                "Ctrl+P must not cycle the chrome theme"
+            );
+        });
+    }
+
+    /// Ctrl+T walks the full cycle and wraps, driven from the keyboard.
+    #[test]
+    fn ctrl_t_walks_the_whole_theme_cycle_and_wraps() {
+        with_shortcut_app(|app| {
+            let start = app.palette.theme_id;
+            let mut seen = vec![start];
+            loop {
+                app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                    .expect("ctrl-t is handled");
+                let now = app.palette.theme_id;
+                if now == start {
+                    break;
+                }
+                assert!(
+                    !seen.contains(&now),
+                    "Ctrl+T re-entered {now:?} before wrapping; some themes are \
+                     unreachable from the keyboard"
+                );
+                seen.push(now);
+                assert!(seen.len() <= 64, "Ctrl+T never wrapped back to {start:?}");
+            }
+            assert!(
+                seen.len() > 1,
+                "the keyboard cycle must visit more than one theme"
+            );
+        });
+    }
+
+    /// The advertised keybinding hints must name bindings that exist.
+    ///
+    /// This is the defect that made the reopen necessary: the command palette
+    /// listed "Ctrl+T" for a handler nobody had written, so the help was a
+    /// promise the product did not keep.
+    #[test]
+    fn the_command_palette_hints_match_the_real_bindings() {
+        let items = all_command_palette_items();
+        let theme = items
+            .iter()
+            .find(|i| matches!(i.action, CommandPaletteAction::CycleTheme))
+            .expect("a theme-cycle entry must exist");
+        assert_eq!(
+            theme.keybind_hint, "Ctrl+T",
+            "the theme hint must name the binding that now exists"
+        );
+
+        let palette = items
+            .iter()
+            .find(|i| matches!(i.action, CommandPaletteAction::CyclePalette))
+            .expect("a palette-cycle entry must exist");
+        assert!(
+            palette.keybind_hint.contains('p'),
+            "the accessibility palette hint must name `p`, the documented binding; \
+             got {:?}",
+            palette.keybind_hint
+        );
     }
 
     /// THE TRAP THIS BEAD WARNS ABOUT. Eye channels are NOT a regular `eye * 4`
