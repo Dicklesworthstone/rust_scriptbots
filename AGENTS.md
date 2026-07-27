@@ -118,6 +118,19 @@ If you want to change something or add a feature, **revise existing code files i
 
 New files are reserved for **genuinely new functionality** that makes zero sense to include in any existing file. The bar for creating new files is **incredibly high**.
 
+### Signals Must Name What They Observed
+
+A **signal** is anything a later reader trusts without re-deriving it: a log line, a return value, a test name, a report, a schema, a doc comment. **Before asserting an outcome, compute the observation that would falsify it:**
+
+- **A guard** — a case that FAILS it. A guard you deleted also passes correct data.
+- **A coverage report over a matrix** — that its cells DIFFER. A collapsed matrix reads as a thorough one.
+- **A declared capability** (table, config knob, public API) — a consumer. Grep for a writer AND a reader.
+- **A bound, count, or width** — derive it from the declaration it describes. **NEVER** copy it from prose; a bead sentence goes stale, a type does not.
+
+**If you cannot compute it, do not drop the qualifier.** Name the evidence you actually have — "admitted", not "persisted" — and file the gap. An unqualified past-tense claim is read as observed.
+
+Context: `bd-0oro` catalogues 18 instances of this in this codebase, with no shared author. The two existing mechanical defences are disjoint and cover under half; this form is the one no scanner can reach, because the discriminating value was never computed.
+
 ---
 
 ## Backwards Compatibility
