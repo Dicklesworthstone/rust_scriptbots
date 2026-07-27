@@ -14376,6 +14376,108 @@ pub mod narrative {
         pub human_text: String,
     }
 
+    /// Metric name the narrative vocabulary treats as the population series.
+    pub const METRIC_POPULATION: &str = "population";
+    /// Metric name the narrative vocabulary treats as the mean-energy series.
+    pub const METRIC_ENERGY: &str = "agents.energy";
+    /// Metric name the narrative vocabulary treats as the combat series.
+    pub const METRIC_COMBAT: &str = "spike_hits";
+
+    /// Map a detector's evidence onto the persisted narrative vocabulary.
+    ///
+    /// # Why this returns `Option` instead of a catch-all
+    /// [`EventKind`] is a METRIC-AWARE vocabulary: a downward step means
+    /// `PopulationCrash` on one series and `EnergyCollapse` on another. A detection whose
+    /// (kind, metric, direction) triple has no vocabulary entry is genuinely unnameable
+    /// here, and inventing a bucket for it would put rows in the run database that claim
+    /// to mean something they do not. Callers that need the un-mappable ones can still
+    /// read the [`DetectionEvidence`](crate::detect::DetectionEvidence) directly.
+    ///
+    /// Lineage kinds map to `None` deliberately. `EventKind::Extinction` means the
+    /// POPULATION reached zero; a species dying out is a different claim on a different
+    /// subject, and collapsing the two would make "extinction" rows ambiguous forever.
+    /// Species-level event emission is bd-16g.3.3's scope.
+    #[must_use]
+    pub fn event_kind_for(evidence: &crate::detect::DetectionEvidence) -> Option<EventKind> {
+        use crate::detect::{DetectionKind, EvidenceClass};
+
+        match (evidence.kind, &evidence.class) {
+            (DetectionKind::ChangePoint, EvidenceClass::Shift(dir)) => {
+                match (evidence.metric.as_str(), dir) {
+                    (METRIC_POPULATION, Direction::Down) => Some(EventKind::PopulationCrash),
+                    (METRIC_POPULATION, Direction::Up) => Some(EventKind::PopulationBoom),
+                    (METRIC_ENERGY, Direction::Down) => Some(EventKind::EnergyCollapse),
+                    (METRIC_ENERGY, Direction::Up) => Some(EventKind::EnergyRecovery),
+                    // A lull in combat is not a story; only the surge is. This matches
+                    // the live engine, which emits CombatSurge for both and lets the
+                    // dedupe drop the lull.
+                    (METRIC_COMBAT, _) => Some(EventKind::CombatSurge),
+                    _ => None,
+                }
+            }
+            (DetectionKind::ThresholdCrossing, EvidenceClass::Crossing(Direction::Down))
+                if evidence.metric == METRIC_POPULATION && evidence.means().1 <= 0.5 =>
+            {
+                Some(EventKind::Extinction)
+            }
+            (DetectionKind::Regime, EvidenceClass::Regime(regime))
+                if matches!(regime, Regime::Collapse | Regime::Growth) =>
+            {
+                Some(EventKind::RegimeChange)
+            }
+            (DetectionKind::Bimodality, EvidenceClass::Bimodal(true)) => {
+                Some(EventKind::SpeciationHint)
+            }
+            _ => None,
+        }
+    }
+
+    /// Render evidence into a persistable row, or `None` if it has no vocabulary entry.
+    ///
+    /// The prose comes from [`DetectionEvidence::narrate`](crate::detect::DetectionEvidence::narrate)
+    /// so that what a reader sees in the timeline is byte-identical to what lands in the
+    /// run database. Two templates for the same event is how a run-to-run diff starts
+    /// reporting changes that never happened.
+    ///
+    /// Non-finite scores are clamped: JSON has no encoding for infinity, and a row that
+    /// cannot round-trip through the storage layer is worse than a saturated one.
+    #[must_use]
+    pub fn event_record_from_evidence(
+        evidence: &crate::detect::DetectionEvidence,
+    ) -> Option<EventRecord> {
+        let kind = event_kind_for(evidence)?;
+        let (before, after) = evidence.means();
+        Some(EventRecord {
+            schema_version: EVENT_RECORD_SCHEMA_VERSION,
+            tick: Tick(evidence.start_tick),
+            kind,
+            severity: severity_for(kind),
+            magnitude: (after - before).abs(),
+            window: (evidence.start_tick, evidence.end_tick),
+            metric: evidence.metric.clone(),
+            before,
+            after,
+            score: if evidence.score.is_finite() {
+                evidence.score
+            } else {
+                f64::MAX
+            },
+            subject: None,
+            human_text: evidence.narrate(),
+        })
+    }
+
+    /// Severity the live engine already assigns each kind, kept in one place.
+    const fn severity_for(kind: EventKind) -> f32 {
+        match kind {
+            EventKind::Extinction => 1.0,
+            EventKind::PopulationCrash | EventKind::ResourceCollapse => 0.8,
+            EventKind::EnergyCollapse | EventKind::PopulationBoom => 0.6,
+            EventKind::RegimeChange | EventKind::SpeciationHint => 0.4,
+            _ => 0.5,
+        }
+    }
+
     /// What counts as *worth telling a human about*.
     ///
     /// A detection can be statistically impeccable and narratively worthless.
@@ -15020,6 +15122,277 @@ pub mod narrative {
                 crate::narrative_text::fixed(before, 2),
                 crate::narrative_text::fixed(after, 2),
             ),
+        }
+    }
+
+    #[cfg(test)]
+    mod evidence_bridge_tests {
+        use super::{
+            EVENT_RECORD_SCHEMA_VERSION, EventKind, METRIC_COMBAT, METRIC_ENERGY,
+            METRIC_POPULATION, event_kind_for, event_record_from_evidence,
+        };
+        use crate::detect::{
+            DetectionEvidence, DetectionKind, Direction, EvidenceClass, EvidenceSide, Regime,
+        };
+
+        fn ev(
+            kind: DetectionKind,
+            metric: &str,
+            class: EvidenceClass,
+            before: f64,
+            after: f64,
+        ) -> DetectionEvidence {
+            DetectionEvidence {
+                metric: metric.to_owned(),
+                kind,
+                start_tick: 100,
+                end_tick: 200,
+                samples: 64,
+                score: 12.5,
+                class,
+                before: Some(EvidenceSide {
+                    samples: 32,
+                    mean: before,
+                }),
+                after: Some(EvidenceSide {
+                    samples: 32,
+                    mean: after,
+                }),
+                params: vec![("h", 9.0)],
+                finite: true,
+            }
+        }
+
+        /// The vocabulary is metric-aware: the same shape means different things.
+        #[test]
+        fn bd_ji3a_the_same_shift_maps_by_metric_not_by_shape() {
+            let down = |m| {
+                ev(
+                    DetectionKind::ChangePoint,
+                    m,
+                    EvidenceClass::Shift(Direction::Down),
+                    1000.0,
+                    300.0,
+                )
+            };
+            assert_eq!(
+                event_kind_for(&down(METRIC_POPULATION)),
+                Some(EventKind::PopulationCrash)
+            );
+            assert_eq!(
+                event_kind_for(&down(METRIC_ENERGY)),
+                Some(EventKind::EnergyCollapse),
+                "an identical downward step is a different event on a different series"
+            );
+            assert_eq!(
+                event_kind_for(&down(METRIC_COMBAT)),
+                Some(EventKind::CombatSurge),
+                "combat reuses the surge kind for both directions, matching the live engine"
+            );
+
+            let up = |m| {
+                ev(
+                    DetectionKind::ChangePoint,
+                    m,
+                    EvidenceClass::Shift(Direction::Up),
+                    300.0,
+                    1000.0,
+                )
+            };
+            assert_eq!(
+                event_kind_for(&up(METRIC_POPULATION)),
+                Some(EventKind::PopulationBoom)
+            );
+            assert_eq!(
+                event_kind_for(&up(METRIC_ENERGY)),
+                Some(EventKind::EnergyRecovery)
+            );
+        }
+
+        /// Evidence with no vocabulary entry must be refused, not bucketed.
+        #[test]
+        fn bd_ji3a_unnameable_evidence_is_refused_not_bucketed() {
+            // A metric the narrative vocabulary has never heard of.
+            assert_eq!(
+                event_kind_for(&ev(
+                    DetectionKind::ChangePoint,
+                    "food.total",
+                    EvidenceClass::Shift(Direction::Down),
+                    10.0,
+                    1.0,
+                )),
+                None,
+                "an unknown series must not be forced into a population/energy bucket"
+            );
+
+            // A regime that is neither collapse nor growth is not news.
+            assert_eq!(
+                event_kind_for(&ev(
+                    DetectionKind::Regime,
+                    METRIC_POPULATION,
+                    EvidenceClass::Regime(Regime::Equilibrium),
+                    1.0,
+                    1.0,
+                )),
+                None
+            );
+
+            // Bimodality that found ONE cluster is not a speciation hint.
+            assert_eq!(
+                event_kind_for(&ev(
+                    DetectionKind::Bimodality,
+                    METRIC_ENERGY,
+                    EvidenceClass::Bimodal(false),
+                    1.0,
+                    1.0,
+                )),
+                None
+            );
+            assert_eq!(
+                event_kind_for(&ev(
+                    DetectionKind::Bimodality,
+                    METRIC_ENERGY,
+                    EvidenceClass::Bimodal(true),
+                    300.0,
+                    1000.0,
+                )),
+                Some(EventKind::SpeciationHint)
+            );
+        }
+
+        /// A species dying out is NOT EventKind::Extinction.
+        #[test]
+        fn bd_ji3a_species_level_lineage_events_do_not_borrow_population_extinction() {
+            for kind in [
+                DetectionKind::Speciation,
+                DetectionKind::Extinction,
+                DetectionKind::Radiation,
+            ] {
+                let evidence = ev(kind, "Beta-2", EvidenceClass::Lineage(true), 9.0, 0.0);
+                assert_eq!(
+                    event_kind_for(&evidence),
+                    None,
+                    "{kind:?} must not map onto a population-level vocabulary entry"
+                );
+                assert!(event_record_from_evidence(&evidence).is_none());
+            }
+        }
+
+        /// Population extinction is a crossing to zero, not merely a fall.
+        #[test]
+        fn bd_ji3a_extinction_requires_actually_reaching_zero() {
+            let to_zero = ev(
+                DetectionKind::ThresholdCrossing,
+                METRIC_POPULATION,
+                EvidenceClass::Crossing(Direction::Down),
+                12.0,
+                0.0,
+            );
+            assert_eq!(event_kind_for(&to_zero), Some(EventKind::Extinction));
+
+            let merely_low = ev(
+                DetectionKind::ThresholdCrossing,
+                METRIC_POPULATION,
+                EvidenceClass::Crossing(Direction::Down),
+                1200.0,
+                40.0,
+            );
+            assert_eq!(
+                event_kind_for(&merely_low),
+                None,
+                "a steep fall that did not reach zero is not an extinction"
+            );
+        }
+
+        /// The persisted prose must be the SAME prose the timeline shows.
+        #[test]
+        fn bd_ji3a_persisted_text_is_the_narrated_text() {
+            let evidence = ev(
+                DetectionKind::ChangePoint,
+                METRIC_POPULATION,
+                EvidenceClass::Shift(Direction::Down),
+                1000.0,
+                300.0,
+            );
+            let record = event_record_from_evidence(&evidence).expect("mappable");
+            assert_eq!(
+                record.human_text,
+                evidence.narrate(),
+                "two templates for one event is how a run-to-run diff reports changes \
+                 that never happened"
+            );
+            assert_eq!(record.tick.0, evidence.start_tick);
+            assert_eq!(record.window, (evidence.start_tick, evidence.end_tick));
+            assert_eq!(record.metric, METRIC_POPULATION);
+            assert_eq!(record.before, 1000.0);
+            assert_eq!(record.after, 300.0);
+            assert_eq!(record.schema_version, EVENT_RECORD_SCHEMA_VERSION);
+        }
+
+        /// A row that cannot round-trip is worse than a saturated one.
+        #[test]
+        fn bd_ji3a_non_finite_scores_are_clamped_so_the_row_survives_json() {
+            let mut evidence = ev(
+                DetectionKind::ChangePoint,
+                METRIC_POPULATION,
+                EvidenceClass::Shift(Direction::Down),
+                1000.0,
+                300.0,
+            );
+            evidence.score = f64::INFINITY;
+            let record = event_record_from_evidence(&evidence).expect("mappable");
+            assert!(
+                record.score.is_finite(),
+                "JSON has no encoding for infinity; an unserializable row is a lost row"
+            );
+            assert_eq!(record.score, f64::MAX);
+        }
+
+        /// The whole point of templated prose: it survives serialization unchanged.
+        #[test]
+        fn bd_ji3a_records_round_trip_byte_identically() {
+            let cases = [
+                ev(
+                    DetectionKind::ChangePoint,
+                    METRIC_POPULATION,
+                    EvidenceClass::Shift(Direction::Down),
+                    1000.0,
+                    300.0,
+                ),
+                ev(
+                    DetectionKind::ChangePoint,
+                    METRIC_ENERGY,
+                    EvidenceClass::Shift(Direction::Up),
+                    0.4,
+                    0.9,
+                ),
+                ev(
+                    DetectionKind::Bimodality,
+                    METRIC_ENERGY,
+                    EvidenceClass::Bimodal(true),
+                    300.0,
+                    1000.0,
+                ),
+                ev(
+                    DetectionKind::Regime,
+                    METRIC_POPULATION,
+                    EvidenceClass::Regime(Regime::Collapse),
+                    1.0,
+                    -1.0,
+                ),
+            ];
+            for evidence in &cases {
+                let record = event_record_from_evidence(evidence).expect("mappable");
+                let json = serde_json::to_string(&record).expect("serializes");
+                let back: super::EventRecord = serde_json::from_str(&json).expect("deserializes");
+                assert_eq!(
+                    serde_json::to_string(&back).expect("re-serializes"),
+                    json,
+                    "a lossy round trip destroys the run-to-run diff silently"
+                );
+                assert_eq!(back.human_text, record.human_text);
+                assert_eq!(back.metric, record.metric);
+            }
         }
     }
 }

@@ -1381,6 +1381,16 @@ impl DetectionEvidence {
         }
     }
 
+    /// Before/after representative means, defaulting to zero when a side is absent.
+    ///
+    /// Zero is the documented default for an absent side, NOT a measured value. A caller
+    /// that needs to tell "the mean was zero" from "there was no side" must read
+    /// [`Self::before`] / [`Self::after`] directly.
+    #[must_use]
+    pub fn means(&self) -> (f64, f64) {
+        self.sides()
+    }
+
     /// Before/after means, defaulting to zero when a side is absent.
     fn sides(&self) -> (f64, f64) {
         (
