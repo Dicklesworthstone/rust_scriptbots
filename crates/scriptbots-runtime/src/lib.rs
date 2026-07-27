@@ -2210,6 +2210,20 @@ impl CommandLifecycleEvidence {
     pub const fn requires_runtime_journal(&self) -> bool {
         self.envelope.command.requires_journal() && !self.transitions.is_empty()
     }
+
+    /// Whether this command's terminal transition APPLIED it.
+    ///
+    /// Every terminal lifecycle is journaled, including rejections and failures,
+    /// so a consumer reconstructing world state from the journal must filter on
+    /// this. Counting a failed `Emigrate` as a departure would reconstruct a
+    /// population that never existed — and would do so from a record that is
+    /// itself perfectly correct, which is the worst kind of wrong answer.
+    #[must_use]
+    pub fn was_applied(&self) -> bool {
+        self.terminal().is_some_and(|transition| {
+            matches!(&transition.application, ApplicationState::Applied(_))
+        })
+    }
 }
 
 #[derive(Deserialize)]

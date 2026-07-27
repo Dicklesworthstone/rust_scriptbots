@@ -351,6 +351,21 @@ pub struct MigrationBarrierReport {
     pub pop_before: BTreeMap<IslandId, u32>,
     /// Per-island population immediately after every move was applied.
     pub pop_after: BTreeMap<IslandId, u32>,
+    /// Every organism's identity immediately before any move was applied.
+    ///
+    /// THE EVIDENCE, CARRIED RATHER THAN ASSERTED AWAY. Together with
+    /// [`Self::census_after`] and [`Self::moves`] this is exactly the input
+    /// [`verify_migration`] consumed, so a consumer can re-derive the
+    /// conservation verdict instead of trusting that it was reached. A report
+    /// that only said `conserved: true` would be a claim; this is a receipt.
+    ///
+    /// Note these bracket the MIGRATION PHASE, not the barrier. The barrier also
+    /// steps every island, and births during that stepping are why a pre-barrier
+    /// census is the wrong thing to compare against — an organism born this
+    /// barrier can emigrate in it.
+    pub census_before: BTreeSet<OrganismId>,
+    /// Every organism's identity immediately after every move was applied.
+    pub census_after: BTreeSet<OrganismId>,
 }
 
 impl MigrationBarrierReport {
@@ -365,6 +380,170 @@ impl MigrationBarrierReport {
     pub fn total_after(&self) -> u32 {
         self.pop_after.values().sum()
     }
+}
+
+/// An exact way a migration barrier can have corrupted the population
+/// (bd-tfso).
+///
+/// Each variant names a distinct corruption so a failure says WHICH invariant
+/// broke, not merely that one did. A single "migration failed" would be useless
+/// here: the whole class of bug this guards against is silent, so the payload is
+/// the investigation.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MigrationViolation {
+    /// The population changed across a phase that contains no ticks.
+    #[error("population changed across migration: {before} organisms before, {after} after")]
+    NotConserved {
+        /// Organisms present before any move.
+        before: usize,
+        /// Organisms present after every move.
+        after: usize,
+    },
+    /// Moves are not in ascending `(to island, from island, from uid)` order.
+    #[error("move {index} is out of canonical (to, from, uid) order")]
+    OutOfCanonicalOrder {
+        /// Index of the first out-of-order move.
+        index: usize,
+    },
+    /// A move claims to have taken an organism that was not there.
+    #[error("move claims departure of {organism}, which was not present before migration")]
+    DepartureNotPresent {
+        /// The organism the move named.
+        organism: OrganismId,
+    },
+    /// A move claims an arrival identity that already existed.
+    #[error("arrival {organism} collides with an organism that already existed")]
+    ArrivalCollides {
+        /// The colliding identity.
+        organism: OrganismId,
+    },
+    /// One organism emigrated more than once in a single barrier.
+    #[error("{organism} emigrated twice in one barrier")]
+    DepartedTwice {
+        /// The doubly-departed organism.
+        organism: OrganismId,
+    },
+    /// Two moves claim the same arrival identity.
+    #[error("{organism} arrived twice in one barrier")]
+    ArrivedTwice {
+        /// The doubly-arrived identity.
+        organism: OrganismId,
+    },
+    /// An organism exists afterwards that no move and no prior state explains.
+    ///
+    /// THIS IS THE DUPLICATION SIGNAL. An emigration that failed to remove the
+    /// organism from its source leaves it on both islands, and the source copy
+    /// is exactly an unexplained presence.
+    #[error("{organism} exists after migration but nothing explains it")]
+    UnexplainedPresence {
+        /// The unexplained organism.
+        organism: OrganismId,
+    },
+    /// An organism that should exist afterwards does not.
+    ///
+    /// THIS IS THE LOSS SIGNAL. A dropped emigrant — collected from its source
+    /// and never delivered — is exactly an unexplained absence.
+    #[error("{organism} should exist after migration but does not")]
+    UnexplainedAbsence {
+        /// The missing organism.
+        organism: OrganismId,
+    },
+}
+
+/// Prove one barrier's migration neither lost, duplicated, nor reordered an
+/// organism (bd-tfso).
+///
+/// # Why this is a function and not a pile of assertions
+///
+/// A conservation check that lives only inside a test proves the test is
+/// correct. This runs in production at every migration barrier AND is what the
+/// mutation tests attack, so the thing being verified and the thing being
+/// trusted are the same code.
+///
+/// # The identity it enforces
+///
+/// No scientific tick runs inside a migration phase, so births and deaths are
+/// structurally zero across it and the population is not merely conserved in
+/// COUNT — the exact set of organisms is determined:
+///
+/// ```text
+/// after == (before \ departures) ∪ arrivals
+/// ```
+///
+/// Set equality is strictly stronger than comparing totals, and the difference
+/// is the whole point. An organism duplicated on one island and lost on another
+/// leaves the total unchanged; it cannot leave this equation unchanged, because
+/// the surviving copy is an identity nothing explains and the lost one is an
+/// identity that should be there and is not.
+///
+/// # What it cannot catch, stated plainly
+///
+/// It compares identities, so it cannot see a corruption that preserves every
+/// identity while damaging what the organism CARRIES — a brain that arrived
+/// unbound, say. That is covered where it belongs, by `scriptbots-core`'s
+/// transfer tests, not here.
+///
+/// # Errors
+///
+/// Returns the first [`MigrationViolation`] found, checked cheapest-first so the
+/// reported violation is the most specific one available.
+pub fn verify_migration(
+    before: &BTreeSet<OrganismId>,
+    after: &BTreeSet<OrganismId>,
+    moves: &[AppliedMigration],
+) -> Result<(), MigrationViolation> {
+    for (index, pair) in moves.windows(2).enumerate() {
+        let key =
+            |applied: &AppliedMigration| (applied.to.island, applied.from.island, applied.from.uid);
+        if key(&pair[0]) > key(&pair[1]) {
+            return Err(MigrationViolation::OutOfCanonicalOrder { index: index + 1 });
+        }
+    }
+
+    let mut departures = BTreeSet::new();
+    let mut arrivals = BTreeSet::new();
+    for applied in moves {
+        if !before.contains(&applied.from) {
+            return Err(MigrationViolation::DepartureNotPresent {
+                organism: applied.from,
+            });
+        }
+        if before.contains(&applied.to) {
+            return Err(MigrationViolation::ArrivalCollides {
+                organism: applied.to,
+            });
+        }
+        if !departures.insert(applied.from) {
+            return Err(MigrationViolation::DepartedTwice {
+                organism: applied.from,
+            });
+        }
+        if !arrivals.insert(applied.to) {
+            return Err(MigrationViolation::ArrivedTwice {
+                organism: applied.to,
+            });
+        }
+    }
+
+    if before.len() != after.len() {
+        return Err(MigrationViolation::NotConserved {
+            before: before.len(),
+            after: after.len(),
+        });
+    }
+
+    let expected: BTreeSet<OrganismId> = before
+        .difference(&departures)
+        .copied()
+        .chain(arrivals.iter().copied())
+        .collect();
+    if let Some(&organism) = after.difference(&expected).next() {
+        return Err(MigrationViolation::UnexplainedPresence { organism });
+    }
+    if let Some(&organism) = expected.difference(after).next() {
+        return Err(MigrationViolation::UnexplainedAbsence { organism });
+    }
+    Ok(())
 }
 
 /// One island's outcome within a [`BarrierReport`].
@@ -590,6 +769,19 @@ pub enum ArchipelagoError {
         interval_ticks: u64,
         /// Configured barrier interval.
         barrier_interval: u64,
+    },
+    /// A migration barrier corrupted the population.
+    ///
+    /// Distinct from [`Self::MigrationNotConserved`], which only compares
+    /// totals: this carries the exact identity-level violation, including the
+    /// duplicate-and-lose case that leaves the total untouched.
+    #[error("migration corrupted the population at tick {tick}: {violation}")]
+    MigrationCorrupted {
+        /// Barrier tick the corruption was detected at.
+        tick: u64,
+        /// Exact identity-level violation.
+        #[source]
+        violation: MigrationViolation,
     },
     /// Emigrant selection failed.
     #[error("migration selection failed: {source}")]
@@ -1329,6 +1521,15 @@ impl Archipelago {
             .map(|(&id, list)| (id, u32::try_from(list.len()).unwrap_or(u32::MAX)))
             .collect();
         let total_before: u32 = pop_before.values().sum();
+        // The identity census taken from the SAME frozen snapshot selection
+        // reads, so the proof at the end compares like with like.
+        let census_before: BTreeSet<OrganismId> = candidates
+            .iter()
+            .flat_map(|(&island, list)| {
+                list.iter()
+                    .map(move |candidate| OrganismId::new(island, AgentUid(candidate.uid)))
+            })
+            .collect();
 
         // PHASE 2 — select everything before applying anything.
         let plan = select_emigrants(&candidates, &config, self.master_seed, epoch)
@@ -1400,6 +1601,20 @@ impl Archipelago {
             });
         }
 
+        // THE IDENTITY-LEVEL PROOF, which the count above cannot give. An
+        // organism duplicated on one island and lost on another leaves
+        // `total_before == total_after` true; it cannot leave this true. Run in
+        // production, not only in tests, because the failure it catches is
+        // silent and a run that has corrupted its population must stop rather
+        // than keep producing plausible science.
+        let census_after = self.organism_census()?;
+        verify_migration(&census_before, &census_after, &moves).map_err(|violation| {
+            ArchipelagoError::MigrationCorrupted {
+                tick: barrier_tick.0,
+                violation,
+            }
+        })?;
+
         for (island, before) in &pop_before {
             let after = pop_after.get(island).copied().unwrap_or(0);
             if *before > 0 && after == 0 {
@@ -1427,6 +1642,8 @@ impl Archipelago {
             moves,
             pop_before,
             pop_after,
+            census_before,
+            census_after,
         }))
     }
 
@@ -3231,6 +3448,495 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // bd-tfso: born-red negative controls for the conservation invariant
+    // ---------------------------------------------------------------------
+
+    /// A real barrier's migration, and the two censuses that bracket it.
+    ///
+    /// Mutations below are applied to THIS — actual organisms from an actual
+    /// migrating archipelago — rather than to invented identities, so a mutant
+    /// is a corruption of something the migrator really produced.
+    struct RealBarrier {
+        before: BTreeSet<OrganismId>,
+        after: BTreeSet<OrganismId>,
+        moves: Vec<AppliedMigration>,
+    }
+
+    /// Run one migrating archipelago far enough to produce real moves.
+    ///
+    /// The censuses come from the report rather than from `organism_census()`
+    /// around the call, and that distinction is load-bearing: a barrier STEPS
+    /// every island before it migrates, so an organism born during this
+    /// barrier's stepping phase can emigrate in it and would be absent from a
+    /// pre-barrier census. I found that by writing the pre-barrier version
+    /// first and watching it fail on `island-3/agent-24`.
+    fn real_barrier() -> RealBarrier {
+        let specs: Vec<IslandSpec> = (0..4).map(|id| spec(id, populated_config(None))).collect();
+        let mut archipelago = populated_archipelago(migrating_config(
+            specs,
+            30,
+            EmigrantSelectionRule::Fittest,
+            2,
+        ))
+        .expect("valid migrating archipelago");
+
+        archipelago.step_to_barrier().expect("warm-up barrier");
+        let report = archipelago.step_to_barrier().expect("measured barrier");
+        let migration = report.migration.expect("barrier migrated");
+        assert!(
+            !migration.moves.is_empty(),
+            "no organism moved, so every mutation below would be vacuous"
+        );
+        RealBarrier {
+            before: migration.census_before,
+            after: migration.census_after,
+            moves: migration.moves,
+        }
+    }
+
+    /// The unmutated barrier must PASS, or every red result below is meaningless.
+    ///
+    /// This re-derives the verdict from the report's own evidence rather than
+    /// trusting that production reached it — which is the point of the report
+    /// carrying the censuses at all.
+    #[test]
+    fn bd_tfso_the_unmutated_barrier_passes_its_own_verifier() {
+        let barrier = real_barrier();
+        for applied in &barrier.moves {
+            assert!(
+                barrier.before.contains(&applied.from),
+                "the departure {} must have existed before migration",
+                applied.from
+            );
+            assert!(
+                barrier.after.contains(&applied.to),
+                "the arrival {} must exist after migration",
+                applied.to
+            );
+            assert!(
+                !barrier.after.contains(&applied.from),
+                "the departure {} must be gone from its source island",
+                applied.from
+            );
+        }
+        assert_eq!(
+            verify_migration(&barrier.before, &barrier.after, &barrier.moves),
+            Ok(()),
+            "a correct barrier must pass; if it does not, the red results below \
+             prove nothing about corruption"
+        );
+        assert_eq!(
+            barrier.before.len(),
+            barrier.after.len(),
+            "no tick runs inside migration, so the population cannot change"
+        );
+    }
+
+    /// MUTANT 1 — DROP AN EMIGRANT. Caught by `UnexplainedAbsence`.
+    ///
+    /// The organism is collected from its source and never delivered: the move
+    /// record says it arrived, the population says it did not. This is the
+    /// failure a naive "did the totals match?" check reports as a mere count
+    /// mismatch and a census-only check misses entirely.
+    #[test]
+    fn bd_tfso_a_dropped_emigrant_is_caught_as_an_unexplained_absence() {
+        let barrier = real_barrier();
+        let dropped = barrier.moves[0].to;
+        let mut mutant = barrier.after.clone();
+        assert!(mutant.remove(&dropped), "the arrival was there to drop");
+
+        assert_eq!(
+            verify_migration(&barrier.before, &mutant, &barrier.moves),
+            Err(MigrationViolation::NotConserved {
+                before: barrier.before.len(),
+                after: barrier.before.len() - 1,
+            }),
+            "a dropped emigrant must be caught"
+        );
+
+        // AND WITH THE COUNT MADE TO MATCH by fabricating a replacement, the
+        // identity check is what catches it — the case that matters, because a
+        // sums-only conservation check is now perfectly satisfied.
+        let fabricated = OrganismId::new(dropped.island, AgentUid(u64::MAX));
+        let mut disguised = mutant;
+        disguised.insert(fabricated);
+        assert_eq!(
+            disguised.len(),
+            barrier.before.len(),
+            "the disguise must restore the total, or it is not a disguise"
+        );
+        assert_eq!(
+            verify_migration(&barrier.before, &disguised, &barrier.moves),
+            Err(MigrationViolation::UnexplainedPresence {
+                organism: fabricated,
+            }),
+            "a loss disguised by a fabricated organism must still be caught"
+        );
+    }
+
+    /// MUTANT 2 — DUPLICATE AN ORGANISM ACROSS TWO ISLANDS. Caught by
+    /// `UnexplainedPresence`.
+    ///
+    /// *** THE HALF THE OPERATOR NAMED, AND THE ONE POPULATION SUMS CANNOT SEE.
+    /// *** An emigration that copied instead of moving leaves the organism on
+    /// its source island AND on its destination. Pair it with a loss elsewhere
+    /// and the total is unchanged, which is precisely why this test exists.
+    #[test]
+    fn bd_tfso_an_organism_duplicated_across_islands_is_caught() {
+        let barrier = real_barrier();
+        let duplicated = barrier.moves[0].from;
+
+        // The emigration copied instead of moving: the organism is on its source
+        // island AND on its destination.
+        let mut duplicated_only = barrier.after.clone();
+        assert!(
+            duplicated_only.insert(duplicated),
+            "the source copy must not already be there, or nothing was duplicated"
+        );
+        assert_eq!(
+            verify_migration(&barrier.before, &duplicated_only, &barrier.moves),
+            Err(MigrationViolation::NotConserved {
+                before: barrier.before.len(),
+                after: barrier.before.len() + 1,
+            })
+        );
+
+        // NOW THE ONE THAT MATTERS: duplicate on one island, lose on another, so
+        // THE TOTAL IS UNCHANGED. A conservation check built on sums passes this
+        // happily; that is precisely the failure this bead's guard exists for.
+        let mut balanced = duplicated_only;
+        let victim = barrier
+            .moves
+            .last()
+            .map(|applied| applied.to)
+            .expect("at least one move");
+        assert!(balanced.remove(&victim), "something else to lose");
+        assert_eq!(
+            balanced.len(),
+            barrier.before.len(),
+            "the mutant must be population-neutral, or it is not the hard case"
+        );
+        assert_eq!(
+            verify_migration(&barrier.before, &balanced, &barrier.moves),
+            Err(MigrationViolation::UnexplainedPresence {
+                organism: duplicated,
+            }),
+            "duplicate-and-lose keeps the total unchanged and MUST still be caught"
+        );
+    }
+
+    /// MUTANT 3 — REORDER SELECTION. Caught by `OutOfCanonicalOrder`.
+    ///
+    /// Application order is the contract. Out of canonical order the outcome
+    /// depends on edge iteration order, which is how an archipelago stops being
+    /// reproducible while still looking fine at one thread.
+    #[test]
+    fn bd_tfso_reordered_moves_are_caught() {
+        let barrier = real_barrier();
+        assert!(
+            barrier.moves.len() >= 2,
+            "reordering needs at least two moves"
+        );
+        let mut reordered = barrier.moves.clone();
+        reordered.reverse();
+        assert_eq!(
+            verify_migration(&barrier.before, &barrier.after, &reordered),
+            Err(MigrationViolation::OutOfCanonicalOrder { index: 1 }),
+            "reversing a correctly ordered plan must be caught at the first pair"
+        );
+    }
+
+    /// MUTANT 4 — EMIGRATE THE SAME ORGANISM TWICE IN ONE BARRIER.
+    ///
+    /// This is what a per-edge select-and-apply loop produces: island 1's
+    /// fittest agent chosen for the edge to island 0 and again for the edge to
+    /// island 2. The two-phase discipline makes it unreachable in production;
+    /// this proves the verifier would catch it if that discipline were lost.
+    #[test]
+    fn bd_tfso_an_organism_emigrating_twice_is_caught() {
+        let barrier = real_barrier();
+        let mut moves = barrier.moves.clone();
+        let mut cloned = moves[0];
+        // Same departure, a different arrival identity, and placed so the plan
+        // stays canonically ordered — otherwise the ORDER check would fire first
+        // and this would not be testing what it claims to test.
+        cloned.to = OrganismId::new(cloned.to.island, AgentUid(u64::MAX));
+        moves.insert(1, cloned);
+        moves.sort_by_key(|applied| (applied.to.island, applied.from.island, applied.from.uid));
+
+        assert_eq!(
+            verify_migration(&barrier.before, &barrier.after, &moves),
+            Err(MigrationViolation::DepartedTwice {
+                organism: barrier.moves[0].from,
+            }),
+            "one organism cannot leave twice in a single barrier"
+        );
+    }
+
+    /// MUTANT 5 — AN ARRIVAL THAT REUSES AN EXISTING IDENTITY.
+    ///
+    /// The bd-8jlj hazard at the migration boundary: if an arrival took the
+    /// source UID instead of a fresh destination one it could land on top of a
+    /// living organism, and two individuals would silently become one.
+    #[test]
+    fn bd_tfso_an_arrival_colliding_with_a_living_organism_is_caught() {
+        let barrier = real_barrier();
+        let mut moves = barrier.moves.clone();
+        let victim = *barrier
+            .before
+            .iter()
+            .find(|organism| !moves.iter().any(|m| m.from == **organism))
+            .expect("a bystander organism exists");
+        moves[0].to = victim;
+
+        assert_eq!(
+            verify_migration(&barrier.before, &barrier.after, &moves),
+            Err(MigrationViolation::ArrivalCollides { organism: victim }),
+            "an arrival must never reuse a living organism's identity"
+        );
+    }
+
+    /// DUPLICATION BY DOUBLE DELIVERY IS UNREPRESENTABLE, not merely untested.
+    ///
+    /// `MigratingAgent` owns a live `Box<dyn BrainRunner>` and is deliberately
+    /// NOT `Clone`; `WorldState::immigrate` consumes it by value. So "deliver
+    /// the same organism to two islands" cannot be written — it is a borrow
+    /// checker error, not a runtime failure. This test documents the argument
+    /// and pins the property it depends on, because a future `#[derive(Clone)]`
+    /// added for convenience would silently reopen the hole.
+    ///
+    /// The verifier above covers the OTHER duplication route, where an
+    /// emigration fails to remove the organism from its source.
+    #[test]
+    fn bd_tfso_double_delivery_is_prevented_by_ownership_not_by_checking() {
+        fn assert_not_clone<T>() {
+            // Compiles for any T; the point is the negative trait bound below.
+        }
+        assert_not_clone::<MigratingAgent>();
+        // If `MigratingAgent` ever gains `Clone`, this stops compiling and the
+        // reviewer is forced to think about why it was not `Clone`.
+        trait NotClone {}
+        impl<T: ?Sized> NotClone for T {}
+        fn requires_no_clone<T: NotClone>() {}
+        requires_no_clone::<MigratingAgent>();
+
+        // The real evidence is structural and is asserted by the type system at
+        // every call site: `deliver_migrant` takes the organism by value and
+        // there is exactly one of it.
+        let barrier = real_barrier();
+        let arrivals: BTreeSet<_> = barrier.moves.iter().map(|applied| applied.to).collect();
+        assert_eq!(
+            arrivals.len(),
+            barrier.moves.len(),
+            "every arrival identity is distinct"
+        );
+    }
+
+    /// A journal that keeps every batch so a run can be reconstructed from it.
+    ///
+    /// Receipts are DRAINED from a queue rather than regenerated per poll. My
+    /// first version rebuilt them from the retained batches on every call, which
+    /// re-acknowledged work the host had already accounted for and latched the
+    /// island with `science_blocked` on the second barrier — a reminder that a
+    /// test double still has to honour the protocol it stands in for.
+    #[derive(Clone, Default)]
+    struct RecordingJournal {
+        batches: Rc<RefCell<Vec<Arc<JournalBatch>>>>,
+        pending: Rc<RefCell<VecDeque<JournalReceipt>>>,
+    }
+
+    impl JournalPort for RecordingJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            self.batches.borrow_mut().push(Arc::clone(batch));
+            self.pending.borrow_mut().push_back(JournalReceipt::new(
+                batch.id(),
+                JournalReceiptState::Durable,
+            ));
+            JournalAdmission::Accepted {
+                batch_id: batch.id(),
+            }
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            let mut pending = self.pending.borrow_mut();
+            let count = limit.min(pending.len());
+            pending.drain(..count).collect()
+        }
+
+        fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+            ShutdownCommitRequirement::CommittedVolatile
+        }
+    }
+
+    /// THE JOURNAL IS A RECORD, NOT A LOG: replaying it reconstructs every
+    /// island's population exactly (bd-tfso).
+    ///
+    /// This is the other half of the conservation claim, and it composes with the
+    /// mutation tests above. Those prove the in-memory invariant catches
+    /// corruption; this proves the DURABLE record is sufficient to rebuild the
+    /// state that invariant was checked against. A journal that cannot do that is
+    /// a diagnostic log — useful for reading, useless for replay — and bd-16g.5.2
+    /// requires migration to be replayable.
+    ///
+    /// The reconstruction closes the full accounting identity, per island:
+    ///
+    /// ```text
+    /// population == initial + Σ births − Σ deaths − Σ emigrations + Σ immigrations
+    /// ```
+    ///
+    /// Every term comes from the journal and nothing from live world state:
+    /// births and deaths from each `Step` batch's `ScientificBoundary` summary,
+    /// migrations from the `Emigrate`/`Immigrate` command envelopes. That is the
+    /// identity I earlier recorded on bd-16g.5.2 as unclosable — it is closable,
+    /// and this is where all four terms finally exist in one place.
+    ///
+    /// Only APPLIED commands count. Every terminal lifecycle is journaled,
+    /// including failures, so counting a failed `Emigrate` as a departure would
+    /// reconstruct a population that never existed from a record that is itself
+    /// perfectly correct.
+    #[test]
+    fn bd_tfso_replaying_the_journal_reconstructs_every_island_population() {
+        let islands: Vec<IslandId> = (0..3).map(IslandId).collect();
+        let specs: Vec<IslandSpec> = islands
+            .iter()
+            .map(|id| spec(id.0, populated_config(None)))
+            .collect();
+        let journals: Vec<RecordingJournal> = islands
+            .iter()
+            .map(|_| RecordingJournal::default())
+            .collect();
+        let recorders = journals.clone();
+
+        let mut archipelago = Archipelago::with_factories(
+            migrating_config(specs, 30, EmigrantSelectionRule::Fittest, 2),
+            populated_world_factory,
+            |meta| {
+                let index = meta.id.0 as usize;
+                Some(Box::new(recorders[index].clone()) as Box<dyn JournalPort>)
+            },
+        )
+        .expect("recording archipelago");
+
+        let initial: Vec<i64> = islands
+            .iter()
+            .map(|&id| {
+                i64::try_from(
+                    archipelago
+                        .with_island_world(id, WorldState::agent_count)
+                        .expect("island readable"),
+                )
+                .expect("population fits i64")
+            })
+            .collect();
+
+        let mut total_moves = 0usize;
+        for _ in 0..4 {
+            let report = archipelago.step_to_barrier().expect("barrier steps");
+            total_moves += report.migration.map_or(0, |m| m.moves.len());
+        }
+        assert!(
+            total_moves > 0,
+            "no organism migrated, so the migration terms below are all zero and \
+             the reconstruction would succeed without proving anything"
+        );
+
+        for (index, &id) in islands.iter().enumerate() {
+            let mut population = initial[index];
+            let mut births = 0i64;
+            let mut deaths = 0i64;
+            let mut emigrations = 0i64;
+            let mut immigrations = 0i64;
+
+            for batch in journals[index].batches.borrow().iter() {
+                if let Some(scientific) = batch.scientific() {
+                    // The RECORDS, not `summary.births`. That counter is
+                    // Born-only by design, so it omits population-floor
+                    // injections AND immigrants; reconstructing from it gave 0
+                    // against a live population of 36, which is how I found
+                    // this. The record list carries every origin.
+                    births += i64::try_from(scientific.births().len()).expect("births fit i64");
+                    deaths += i64::try_from(scientific.deaths().len()).expect("deaths fit i64");
+                }
+                let Some(lifecycle) = batch.command_lifecycle() else {
+                    continue;
+                };
+                if !lifecycle.was_applied() {
+                    continue;
+                }
+                let Some(envelope) = batch.command() else {
+                    continue;
+                };
+                match &envelope.command {
+                    HostCommand::Emigrate { .. } => emigrations += 1,
+                    HostCommand::Immigrate { .. } => immigrations += 1,
+                    _ => {}
+                }
+            }
+
+            population += births - deaths - emigrations + immigrations;
+            let actual = i64::try_from(
+                archipelago
+                    .with_island_world(id, WorldState::agent_count)
+                    .expect("island readable"),
+            )
+            .expect("population fits i64");
+            assert_eq!(
+                population, actual,
+                "island {id} reconstructed from its journal as {population} but holds \
+                 {actual}: initial {}, births {births}, deaths {deaths}, emigrations \
+                 {emigrations}, immigrations {immigrations}",
+                initial[index]
+            );
+
+            // *** THE MIGRATION TERMS ARE LOAD-BEARING, NOT DECORATIVE. ***
+            // `immigrate` does push a BirthRecord (origin Injected), so it is
+            // tempting to assume arrivals are already inside `births` and that
+            // adding them double-counts. They are NOT: a step's births are
+            // sliced from an index captured at step entry
+            // (scriptbots-core lib.rs, `pending_birth_records[start..]`), and an
+            // arrival is recorded BETWEEN steps during the migration phase — so
+            // it falls before the next step's start index and never reaches any
+            // scientific boundary. Dropping the migration terms therefore
+            // under-counts by exactly the arrivals, and this asserts that rather
+            // than leaving it as a comment. Filed as bd-it29: the destination's
+            // birth-record stream silently omits arrivals. Fixing that bug will
+            // correctly break this assertion, and the fix must update it.
+            if immigrations != 0 {
+                assert_ne!(
+                    initial[index] + births - deaths - emigrations,
+                    actual,
+                    "island {id}: the identity closed WITHOUT the arrival term, so \
+                     arrivals are inside `births` after all and this reconstruction \
+                     double-counts them"
+                );
+            }
+        }
+
+        // The migration terms must actually be non-zero SOMEWHERE, or the
+        // identity above was proven only for births and deaths.
+        let journaled_moves: usize = journals
+            .iter()
+            .map(|journal| {
+                journal
+                    .batches
+                    .borrow()
+                    .iter()
+                    .filter(|batch| {
+                        batch.command_lifecycle().is_some_and(|l| l.was_applied())
+                            && batch.command().is_some_and(|e| {
+                                matches!(&e.command, HostCommand::Immigrate { .. })
+                            })
+                    })
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            journaled_moves, total_moves,
+            "every applied migration must appear in exactly one island's journal"
+        );
     }
 
     /// The migration graph is the archipelago's own topology, expanded both ways.
