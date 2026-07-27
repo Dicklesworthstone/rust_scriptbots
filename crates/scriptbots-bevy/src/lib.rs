@@ -9203,6 +9203,16 @@ mod acknowledgement_guard {
             "a CommandStatusDto receipt",
             "return the receipt instead of echoing the request back as the result",
         ),
+        // Added after this guard MISSED a live instance. The GPUI render layer
+        // has its own submitter returning a bool, and `submit_config_update`
+        // dropped it with `let _ =` while every rule here scored zero. A guard
+        // is only as wide as its registry, which is why bd-hhsl also asks
+        // whether the registry can be derived rather than listed.
+        (
+            "self.submit_control_command(",
+            "a bool meaning ENQUEUED, not applied",
+            "return or gate on it so the caller learns the edit never reached the simulation",
+        ),
     ];
 
     /// Literals that fabricate a receipt out of nothing.
@@ -9220,6 +9230,12 @@ mod acknowledgement_guard {
             "return the CommandStatusDto the control call already produces",
         ),
     ];
+
+    /// Calls that submit a command from inside a control method.
+    const SUBMITTING_CALLS: &[&str] = &["self.enqueue(", "self.submit_control_command("];
+
+    /// The receipt type a submitting method must hand back.
+    const RECEIPT_TYPE: &str = "CommandStatusDto";
 
     /// One detected offence, carrying enough to act on without hunting.
     #[derive(Debug)]
@@ -9297,13 +9313,22 @@ mod acknowledgement_guard {
     fn discarded_submissions(sources: &[(String, String)]) -> Vec<Offence> {
         let mut out = Vec::new();
         for (file, text) in sources {
+            let mut previous = String::new();
             for (index, raw) in text.lines().enumerate() {
                 let line = raw.trim();
-                if line.starts_with("//") {
+                if line.starts_with("//") || line.is_empty() {
                     continue;
                 }
+                // rustfmt wraps a long bound call onto its own line, so a line
+                // can both start the call and end the statement while still
+                // being assigned to something. The binding is on the previous
+                // line, which ends with `=`. Measured, not guessed: without
+                // this, the rule reported a false offence on the very fix that
+                // 0a63c630c4 landed.
+                let bound_by_wrap = previous.ends_with('=');
                 for (fragment, meaning, fix) in COMMAND_SUBMITTERS {
-                    let opens_and_closes = line.starts_with(fragment) && line.ends_with(';');
+                    let opens_and_closes =
+                        line.starts_with(fragment) && line.ends_with(';') && !bound_by_wrap;
                     let explicitly_dropped = line.contains(&format!("let _ = {fragment}"));
                     if opens_and_closes || explicitly_dropped {
                         out.push(Offence {
@@ -9315,6 +9340,7 @@ mod acknowledgement_guard {
                         });
                     }
                 }
+                previous = line.to_owned();
             }
         }
         out
@@ -9346,6 +9372,115 @@ mod acknowledgement_guard {
             }
         }
         out
+    }
+
+    /// `fn name` at the start of a declaration, ignoring calls and types.
+    fn declared_function_name(raw: &str) -> Option<String> {
+        let line = raw.trim_start();
+        let rest = line
+            .strip_prefix("pub async fn ")
+            .or_else(|| line.strip_prefix("pub(crate) async fn "))
+            .or_else(|| line.strip_prefix("async fn "))
+            .or_else(|| line.strip_prefix("pub fn "))
+            .or_else(|| line.strip_prefix("pub(crate) fn "))
+            .or_else(|| line.strip_prefix("pub(super) fn "))
+            .or_else(|| line.strip_prefix("fn "))?;
+        let name = rest.split(['(', '<']).next()?.trim();
+        (!name.is_empty()).then(|| name.to_owned())
+    }
+
+    /// Methods that submit a command but hand back something else.
+    ///
+    /// THE THIRD SHAPE, and the one that got past the first two rules. When
+    /// `apply_patch` projected unapplied config it discarded no answer and
+    /// invented no literal: it built a `ConfigSnapshot` from the REQUESTED
+    /// config and returned that. The value looked richly correct — real config
+    /// data, correctly shaped — but it was assembled from the request rather
+    /// than from anything the host said, and stamped with the tick at which
+    /// those values were not yet in effect. That is the most dangerous of the
+    /// three, because a fabricated literal looks thin while a fabricated
+    /// structure looks like evidence.
+    ///
+    /// PROVEN AGAINST HISTORY BEFORE BEING WRITTEN: this rule reports exactly
+    /// one offence at `0a63c630c4^` — apply_patch, at its real line — and zero
+    /// afterwards.
+    ///
+    /// Multi-line signatures are accumulated up to the opening brace; reading
+    /// only the first header line produced two false positives in the
+    /// prototype, because the return type had not been seen yet.
+    ///
+    /// SCOPED TO FILES THAT KNOW THE RECEIPT TYPE, deliberately. `CommandStatusDto`
+    /// is owned by scriptbots-app; the GPUI render layer has its own submitter
+    /// returning a bool and never mentions the type. Applying this rule there
+    /// produced three false offences in the first run, demanding a type that
+    /// crate cannot name. Render's weaker contract is covered by the discard
+    /// rule instead, which is what actually caught its live defect.
+    fn submitters_returning_a_projection(sources: &[(String, String)]) -> Vec<Offence> {
+        let mut out = Vec::new();
+        for (file, text) in sources {
+            if !text.contains(RECEIPT_TYPE) {
+                continue;
+            }
+            let mut current: Option<(String, usize)> = None;
+            let mut signature = String::new();
+            let mut collecting = false;
+            for (index, raw) in text.lines().enumerate() {
+                let line = raw.trim();
+                if line.starts_with("//") {
+                    continue;
+                }
+                if let Some(name) = declared_function_name(raw) {
+                    current = Some((name, index + 1));
+                    signature = line.to_owned();
+                    collecting = !line.contains('{');
+                    continue;
+                }
+                if collecting {
+                    signature.push(' ');
+                    signature.push_str(line);
+                    collecting = !line.contains('{');
+                    continue;
+                }
+                let Some((name, declared_at)) = current.as_ref() else {
+                    continue;
+                };
+                if SUBMITTING_CALLS.iter().any(|call| line.contains(call))
+                    && !signature.contains(RECEIPT_TYPE)
+                {
+                    out.push(Offence {
+                        file: file.clone(),
+                        line_no: index + 1,
+                        line: line.to_owned(),
+                        problem: format!(
+                            "`{name}` (declared at line {declared_at}) submits a command but does \
+                             not return {RECEIPT_TYPE}, so whatever it returns was assembled from \
+                             the request rather than from the host's answer"
+                        ),
+                        fix: format!(
+                            "return the {RECEIPT_TYPE} that submit_control_command produces, and \
+                             let callers read applied state back through a read endpoint"
+                        ),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// A method that submits a command must return the receipt, not a projection.
+    #[test]
+    fn no_submitting_method_returns_a_projection() {
+        let offences = submitters_returning_a_projection(&scanned_sources());
+        assert!(
+            offences.is_empty(),
+            "a control method answers with a value built from the request instead of the \
+             host's receipt (bd-hhsl):{}",
+            offences
+                .iter()
+                .map(Offence::to_string)
+                .collect::<Vec<_>>()
+                .join("")
+        );
     }
 
     /// No surface may throw away the answer to a command it submitted.
@@ -9465,6 +9600,95 @@ mod acknowledgement_guard {
         assert!(
             discarded_submissions(&corrected).is_empty(),
             "the guard fires on the corrected form, so it would forbid its own fix"
+        );
+    }
+
+    /// The projection rule must fire on the config defect that got past the
+    /// other two.
+    ///
+    /// This case exists because the first two rules BOTH scored zero on
+    /// `crates/scriptbots-app/src/control.rs` at `0a63c630c4^` while the
+    /// projection defect was live there. A guard that missed a real instance is
+    /// worth a permanent test of the miss, not just a patch.
+    ///
+    /// The lines are transcribed from that revision.
+    #[test]
+    fn the_projection_rule_fires_on_the_defect_the_other_rules_missed() {
+        let offending = vec![(
+            "crates/scriptbots-app/src/control.rs".to_owned(),
+            [
+                // The real file declares the receipt type, which is what brings
+                // it into this rule's scope. Without this line the fixture is
+                // skipped as a crate that cannot name the type — a difference
+                // between the sample and the real file that this canary caught
+                // on its first run.
+                "    pub fn pause(&self) -> Result<CommandStatusDto, ControlError> {",
+                "        self.submit_control_command(ControlCommand::Pause)",
+                "    }",
+                "    pub fn apply_patch(&self, patch: Value) -> Result<ConfigSnapshot, ControlError> {",
+                "        let snapshot = ConfigSnapshot::from_config(new_config.clone(), current_tick)?;",
+                "        drop(world);",
+                "        self.enqueue(ControlCommand::UpdateConfig(Box::new(new_config)))?;",
+                "        Ok(snapshot)",
+                "    }",
+            ]
+            .join("\n"),
+        )];
+
+        // The other two rules are blind to it — that is the point.
+        assert!(
+            discarded_submissions(&offending).is_empty(),
+            "the discard rule was never the one that could catch this"
+        );
+        assert!(
+            fabricated_receipts(&offending).is_empty(),
+            "the literal rule was never the one that could catch this"
+        );
+
+        let offences = submitters_returning_a_projection(&offending);
+        assert_eq!(
+            offences.len(),
+            1,
+            "the projection rule stopped detecting the defect it was written for: {offences:#?}"
+        );
+        assert!(
+            offences[0].problem.contains("apply_patch"),
+            "the message must name the offending method: {}",
+            offences[0].problem
+        );
+
+        // Quiet on the corrected form, or it forbids its own fix.
+        let corrected = vec![(
+            "corrected.rs".to_owned(),
+            [
+                "    pub fn apply_patch(&self, patch: Value) -> Result<CommandStatusDto, ControlError> {",
+                "        let status = self.submit_control_command(ControlCommand::UpdateConfig(c))?;",
+                "        Ok(status)",
+                "    }",
+            ]
+            .join("\n"),
+        )];
+        assert!(
+            submitters_returning_a_projection(&corrected).is_empty(),
+            "the projection rule fires on the corrected form"
+        );
+
+        // A crate that cannot name the receipt type is out of scope rather than
+        // permanently guilty. This is the render layer's shape, and demanding
+        // CommandStatusDto there produced three false offences before the rule
+        // was scoped.
+        let foreign = vec![(
+            "crates/scriptbots-render/src/lib.rs".to_owned(),
+            [
+                "    fn submit_simulation_command(&self, command: SimulationCommand) -> bool {",
+                "        self.submit_control_command(ControlCommand::UpdateSimulation(command))",
+                "    }",
+            ]
+            .join("\n"),
+        )];
+        assert!(
+            submitters_returning_a_projection(&foreign).is_empty(),
+            "the projection rule demands a type this crate cannot name"
         );
     }
 }

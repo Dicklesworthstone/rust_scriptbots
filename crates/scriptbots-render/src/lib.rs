@@ -2935,18 +2935,30 @@ impl SimulationView {
         driver.snapshot()
     }
 
-    fn submit_config_update<F>(&self, update: F)
+    /// Submit a config edit, reporting whether it was actually enqueued.
+    ///
+    /// The result used to be dropped with `let _ =`, so a caller had no way to
+    /// know the edit never reached the simulation — the eighth instance of the
+    /// class bd-2z0.7.14 and bd-2z0.4.9 removed from the other surfaces, hiding
+    /// in the GPUI layer that bd-37m already flags (bd-hhsl). The underlying
+    /// submit warns on refusal, but a warning in the log does not tell the code
+    /// what happened.
+    ///
+    /// Returns false when the world lock is poisoned as well as when the queue
+    /// refuses: in both cases the edit did not reach the simulation, which is
+    /// the only distinction a caller acts on.
+    fn submit_config_update<F>(&self, update: F) -> bool
     where
         F: FnOnce(&mut ScriptBotsConfig),
     {
-        if let Ok(world) = self.world.lock() {
-            let mut new_config = world.config().clone();
-            drop(world);
-            update(&mut new_config);
-            let _ = self.submit_control_command(ControlCommand::UpdateConfig(Box::new(new_config)));
-        } else {
+        let Ok(world) = self.world.lock() else {
             warn!("failed to acquire world lock for config update");
-        }
+            return false;
+        };
+        let mut new_config = world.config().clone();
+        drop(world);
+        update(&mut new_config);
+        self.submit_control_command(ControlCommand::UpdateConfig(Box::new(new_config)))
     }
 
     fn apply_preset(&mut self, preset: PresetKind, _cx: &mut Context<Self>) {
