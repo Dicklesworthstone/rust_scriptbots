@@ -6673,7 +6673,18 @@ impl StorageBuffer {
                 });
             }
             checked_u64("replay_events.seq", row.seq)?;
-            if !replay_keys.insert((row.tick, row.seq)) {
+            // Keyed by (island, tick, seq). Each island numbers its own replay stream from
+            // seq 0, so a fused barrier legitimately carries (tick 1, seq 0) once per island;
+            // run-scoped keys rejected the second island outright. The V15 primary key is
+            // (run_id, island_id, tick, seq), so this aligns the in-batch check with the
+            // uniqueness the schema already enforces rather than inventing a looser one.
+            //
+            // FOUND BY THE FIRST REAL ARCHIPELAGO (bd-16g.5.5.6), not by review: the earlier
+            // island-aware validator pass generalised the summaries, the birth/death counters
+            // and the event totals and left this set run-scoped. Nothing caught it until a
+            // harness actually ran four islands through a barrier, which is the argument for
+            // the harness existing.
+            if !replay_keys.insert((row.island_id, row.tick, row.seq)) {
                 if row.event_type == NARRATIVE_INPUT_EVENT_TYPE {
                     return Err(NarrativeInputStreamError::DuplicateTick {
                         tick: checked_u64("replay_events.narrative_input.tick", row.tick)?,
@@ -6683,8 +6694,8 @@ impl StorageBuffer {
                 return Err(StorageError::InvalidData {
                     context: "replay_events.seq",
                     reason: format!(
-                        "duplicate replay event key at tick {}, seq {}",
-                        row.tick, row.seq
+                        "duplicate replay event key at tick {}, seq {} on island {}",
+                        row.tick, row.seq, row.island_id
                     ),
                 });
             }
@@ -21279,10 +21290,13 @@ mod tests {
         LocalHostPort, ManualInstant, NullFrontend, NullFrontendSubmissionError, PlaybackSnapshot,
     };
     use std::{
+        cell::RefCell,
+        collections::VecDeque,
         fs,
         io::{Read, Write},
         path::{Path, PathBuf},
         process::{Child, Command, ExitStatus, Stdio},
+        rc::Rc,
         sync::TryLockError,
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
@@ -28025,6 +28039,231 @@ mod tests {
                 );
             }
         }
+
+        storage.close()?;
+        Ok(())
+    }
+
+    /// HARNESS ONLY. Captures one island's `PersistenceBatch` as the archipelago produces it.
+    ///
+    /// bd-16g.5.5.6. This is a TEST DOUBLE and deliberately lives in `#[cfg(test)]` so it cannot
+    /// acquire a production caller. It is NOT a reusable adapter and must not be promoted into
+    /// one: the real archipelago-to-storage wiring is bd-16g.5.5.2, which is blocked because the
+    /// app has no production archipelago to wire, and it should be designed against a real run
+    /// mode rather than lifted out of a harness.
+    ///
+    /// RECEIPTS ARE DRAINED FROM A QUEUE, NOT REGENERATED PER POLL. Copied deliberately from
+    /// `RecordingJournal` in `scriptbots-runtime`'s archipelago tests, which records the lesson:
+    /// rebuilding receipts from retained batches on every poll re-acknowledges work the host has
+    /// already accounted for and latches the island with `science_blocked` on the second
+    /// barrier. A test double still has to honour the protocol it stands in for.
+    #[derive(Clone)]
+    struct HarnessIslandJournal {
+        island: IslandId,
+        captured: Rc<RefCell<Vec<(IslandId, PersistenceBatch)>>>,
+        pending: Rc<RefCell<VecDeque<scriptbots_runtime::JournalReceipt>>>,
+    }
+
+    impl scriptbots_runtime::JournalPort for HarnessIslandJournal {
+        fn try_admit(
+            &mut self,
+            batch: &Arc<scriptbots_runtime::JournalBatch>,
+        ) -> scriptbots_runtime::JournalAdmission {
+            if let Some(payload) = batch.persistence() {
+                self.captured
+                    .borrow_mut()
+                    .push((self.island, (**payload).clone()));
+            }
+            self.pending
+                .borrow_mut()
+                .push_back(scriptbots_runtime::JournalReceipt::new(
+                    batch.id(),
+                    scriptbots_runtime::JournalReceiptState::Durable,
+                ));
+            scriptbots_runtime::JournalAdmission::Accepted {
+                batch_id: batch.id(),
+            }
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<scriptbots_runtime::JournalReceipt> {
+            let mut pending = self.pending.borrow_mut();
+            let count = limit.min(pending.len());
+            pending.drain(..count).collect()
+        }
+
+        fn shutdown_commit_requirement(&self) -> scriptbots_runtime::ShutdownCommitRequirement {
+            scriptbots_runtime::ShutdownCommitRequirement::CommittedVolatile
+        }
+    }
+
+    /// A REAL ARCHIPELAGO STILL CANNOT BE RECORDED, and this pins the reason (bd-16g.5.5.6).
+    ///
+    /// I set out to make "an archipelago has been recorded" true. It is not, and this test is
+    /// the honest form of that result rather than a green one obtained by lowering the bar.
+    ///
+    /// The barrier reaches storage and is refused by the NARRATIVE-INPUT REPLAY STREAM, which
+    /// asserts ONE record per tick PER RUN (`NarrativeInputStreamError::DuplicateTick`).
+    /// `WorldState` records a narrative input every tick unconditionally -- `narrative_interval`
+    /// does not suppress it -- so four islands closing tick 1 contribute four, and the fused
+    /// barrier is rejected.
+    ///
+    /// WHY I DID NOT FIX IT HERE. Two routes were available and both are wrong for this bead:
+    /// island-scoping the duplicate check changes the semantics of bd-16g.2.9.2's narrative
+    /// replay contract, which is another bead's decision about whether an archipelago has one
+    /// narrative stream per run or one per island; and stripping narrative rows out of the
+    /// fused buffer would silently discard durable replay records, which is exactly the
+    /// under-record shape bd-0oro catalogues as instance 12. Either would have turned this test
+    /// green while making the system worse.
+    ///
+    /// WHAT THE ATTEMPT DID EARN. It found a real defect that review had missed: the in-batch
+    /// `replay_keys` uniqueness set was still run-scoped after the island-aware validator pass,
+    /// so four islands each numbering their replay stream from seq 0 collided. That is fixed in
+    /// the same commit, and nothing but a real archipelago would have surfaced it.
+    ///
+    /// Written as a characterization of the CURRENT boundary: it goes RED when the narrative
+    /// stream question is settled, which forces it to be rewritten into the recorded-archipelago
+    /// assertion it was meant to be rather than left behind asserting a limitation that no
+    /// longer exists.
+    #[test]
+    fn a_real_archipelago_barrier_is_refused_by_the_run_scoped_narrative_input_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_runtime::{Archipelago, ArchipelagoConfig, IslandSpec, Topology};
+
+        const ISLANDS: u32 = 4;
+        const BARRIERS: u32 = 2;
+
+        let path = temp_db_path("storage-archipelago-recorded");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let captured: Rc<RefCell<Vec<(IslandId, PersistenceBatch)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+
+        let base = ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(0x0151_a4d0),
+            closed: true,
+            history_capacity: 8,
+            // Every tick emits a persistence batch, so a barrier always has something to record.
+            persistence_interval: 1,
+            // narrative_interval = 0 does NOT suppress the narrative-input replay record --
+            // WorldState records it unconditionally. Left at 0 anyway so the fixture is not
+            // asking for narrative work it does not need; the refusal below comes from the
+            // record being emitted regardless.
+            narrative_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+
+        let specs: Vec<IslandSpec> = (0..ISLANDS)
+            .map(|id| IslandSpec {
+                id: IslandId(id),
+                label: format!("island-{id}"),
+                config: base.clone(),
+            })
+            .collect();
+
+        let capture_handle = Rc::clone(&captured);
+        let mut archipelago = Archipelago::with_factories(
+            ArchipelagoConfig {
+                islands: specs,
+                topology: Topology::Ring,
+                barrier_interval: std::num::NonZeroU64::new(1).expect("nonzero"),
+                master_seed: 0x00c0_ffee,
+                host_options: HostCoreOptions::default(),
+                migration: None,
+            },
+            |meta| {
+                let mut world = WorldState::new(meta.effective_config.clone())?;
+                world
+                    .try_spawn_agent(AgentData::default())
+                    .expect("deterministic founding agent is finite");
+                Ok(world)
+            },
+            |meta| {
+                Some(Box::new(HarnessIslandJournal {
+                    island: meta.id,
+                    captured: Rc::clone(&capture_handle),
+                    pending: Rc::new(RefCell::new(VecDeque::new())),
+                })
+                    as Box<dyn scriptbots_runtime::JournalPort>)
+            },
+        )?;
+
+        let mut complete_barriers = 0_u32;
+        let mut refusal: Option<StorageError> = None;
+        for _ in 0..BARRIERS {
+            archipelago.step_to_barrier()?;
+
+            // One barrier's worth of per-island batches, grouped by the tick they closed.
+            let drained: Vec<(IslandId, PersistenceBatch)> =
+                captured.borrow_mut().drain(..).collect();
+            let mut by_tick: BTreeMap<u64, Vec<(IslandId, PersistenceBatch)>> = BTreeMap::new();
+            for (island, batch) in drained {
+                by_tick
+                    .entry(batch.summary.tick.0)
+                    .or_default()
+                    .push((island, batch));
+            }
+
+            for (_tick, island_batches) in by_tick {
+                // Only complete barriers are offered; a tick not every island closed is exactly
+                // what ArchipelagoBarrierSink exists to refuse.
+                if u32::try_from(island_batches.len())? != ISLANDS {
+                    continue;
+                }
+                complete_barriers += 1;
+                let mut sink = ArchipelagoBarrierSink::new((0..ISLANDS).map(IslandId))?;
+                for (island, batch) in island_batches {
+                    sink.admit(island, batch)?;
+                }
+                if let Err(error) = storage.persist_barrier_from(&sink) {
+                    refusal = Some(error);
+                }
+            }
+        }
+
+        // The archipelago really did produce complete barriers: the refusal below is about what
+        // storage does with one, not about the harness never assembling one.
+        assert!(
+            complete_barriers > 0,
+            "the archipelago produced no complete barrier, so this test would be asserting a \
+             refusal that was never actually attempted"
+        );
+
+        let refusal = refusal.expect(
+            "a fused archipelago barrier was ACCEPTED; the narrative-input stream is no longer \
+             run-scoped, so this characterization is stale and must be rewritten into the \
+             recorded-archipelago assertion it was always meant to be",
+        );
+        assert!(
+            matches!(
+                refusal,
+                StorageError::NarrativeInputStream(NarrativeInputStreamError::DuplicateTick { .. })
+            ),
+            "the refusal must be the run-scoped narrative-input contract, which is the one \
+             remaining blocker between a real archipelago and a recorded one, got: {refusal}"
+        );
+
+        // NOTHING WAS RECORDED, asserted rather than assumed. A partially-applied barrier would
+        // be worse than none: it would put a tick that only some islands closed into the
+        // durable record, which is the state the archipelago contract says storage must never
+        // observe.
+        storage.flush()?;
+        let recorded: i64 = storage
+            .connection()?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            recorded, 0,
+            "a refused barrier left {recorded} tick summaries behind; the refusal must be \
+             atomic or it has durably recorded a partial archipelago"
+        );
 
         storage.close()?;
         Ok(())
