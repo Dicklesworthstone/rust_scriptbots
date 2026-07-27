@@ -156,7 +156,9 @@ impl Default for VolatileJournal {
 }
 
 impl VolatileJournal {
-    fn with_capacity(capacity: usize) -> Self {
+    /// `pub(crate)` so sibling modules' tests can build a bounded journal directly.
+    /// `channel.rs`'s archive-bound test (bd-2z0.5.12) needs an explicit capacity.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             highest_accepted: None,
             archive: VolatileJournalArchive {
