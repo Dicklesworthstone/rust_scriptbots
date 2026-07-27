@@ -5,7 +5,7 @@
 //! tie-breaking (no `partial_cmp().unwrap()`, no HashMap iteration).
 
 use rand::Rng;
-use scriptbots_core::SmallRngStream;
+use scriptbots_core::{SmallRngStream, rng_domains::derive_migration_seed};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -187,11 +187,23 @@ pub fn compare_candidates(
 /// Selects emigrants across `islands` according to two-phase deterministic rules.
 ///
 /// Returns a list of `EmigrantRecord` moves and the updated population counts.
+/// # Migration RNG domain
+///
+/// The migration stream is ITS OWN domain, derived from `(master_seed, barrier_index)`
+/// through [`derive_migration_seed`]. bd-16g.5.3 requires exactly this and explains why:
+/// if emigrant choice were drawn from an island's generator, the selection on the
+/// island-4-to-island-5 edge would depend on how many agents happened to reproduce on
+/// island 0 that epoch -- coupling the islands through the one path nobody inspects.
+///
+/// It previously seeded with `seed.wrapping_add(tick)`. That is derivation by ADDITION,
+/// which bd-16g.5.3 forbids by name: generators seeded with adjacent integers can emit
+/// correlated early output, so consecutive barriers could select correlated emigrants
+/// while every determinism gate stayed green. The KDF diffuses instead.
 pub fn select_emigrants(
     islands_candidates: &BTreeMap<IslandId, Vec<CandidateAgent>>,
     config: &MigrationConfig,
-    seed: u64,
-    tick: u64,
+    master_seed: u64,
+    barrier_index: u64,
 ) -> Result<BarrierReport, MigrationError> {
     if islands_candidates.is_empty() {
         return Err(MigrationError::EmptyArchipelago);
@@ -209,7 +221,7 @@ pub fn select_emigrants(
 
     // Rank candidates per island
     let mut ranked_candidates: BTreeMap<IslandId, Vec<(CandidateAgent, f64)>> = BTreeMap::new();
-    let mut rng = SmallRngStream::seed_from_u64(seed.wrapping_add(tick));
+    let mut rng = SmallRngStream::seed_from_u64(derive_migration_seed(master_seed, barrier_index));
 
     for (&island_id, candidates) in islands_candidates {
         let mut sorted = candidates.clone();
@@ -301,7 +313,8 @@ pub fn select_emigrants(
     }
 
     Ok(BarrierReport {
-        tick,
+        // The report's `tick` field carries the barrier index it was produced for.
+        tick: barrier_index,
         selection_rule: config.selection_rule,
         moves,
         pop_before,
@@ -421,5 +434,142 @@ mod tests {
         let total_after: u32 = report.pop_after.values().sum();
         assert_eq!(total_before, total_after);
         assert!(report.conserved);
+    }
+
+    /// The migration stream must NOT be `master_seed + barrier_index`.
+    ///
+    /// bd-16g.5.3 forbids seed derivation by addition by name: generators seeded with
+    /// adjacent integers can emit correlated early output, so consecutive barriers could
+    /// pick correlated emigrants while every determinism gate stayed green. This pins the
+    /// KDF against the construction it replaced, which is the only way the regression
+    /// stays visible -- reverting to addition breaks nothing else.
+    #[test]
+    fn bd_16g_5_2_migration_seed_is_derived_not_added() {
+        let master = 0x5EED_0000_5EED_0000_u64;
+        for barrier in 0..8u64 {
+            assert_ne!(
+                derive_migration_seed(master, barrier),
+                master.wrapping_add(barrier),
+                "barrier {barrier} fell back to additive derivation"
+            );
+        }
+        // Adjacent barriers must land far apart, not one apart.
+        let a = derive_migration_seed(master, 4);
+        let b = derive_migration_seed(master, 5);
+        assert_ne!(a, b);
+        assert!(
+            a.abs_diff(b) > 1,
+            "adjacent barrier seeds must diffuse, got {a} and {b}"
+        );
+    }
+
+    /// Emigrant choice must depend on the barrier index, and only through the KDF.
+    #[test]
+    fn bd_16g_5_2_random_selection_changes_across_barriers() {
+        let mut candidates = BTreeMap::new();
+        candidates.insert(
+            0u32,
+            (1..=12u64)
+                .map(|uid| CandidateAgent {
+                    uid,
+                    energy: 1.0,
+                    health: 1.0,
+                    age: 10,
+                    speed: 1.0,
+                })
+                .collect::<Vec<_>>(),
+        );
+        candidates.insert(
+            1u32,
+            (100..=111u64)
+                .map(|uid| CandidateAgent {
+                    uid,
+                    energy: 1.0,
+                    health: 1.0,
+                    age: 10,
+                    speed: 1.0,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let config = MigrationConfig {
+            selection_rule: EmigrantSelectionRule::Random,
+            emigrants_per_edge: 3,
+            ..MigrationConfig::default()
+        };
+        let master = 0xA11C_E000_A11C_E000_u64;
+
+        let first = select_emigrants(&candidates, &config, master, 0).expect("barrier 0");
+        let second = select_emigrants(&candidates, &config, master, 1).expect("barrier 1");
+
+        // Every candidate is identical on every axis, so ONLY the random rank can order
+        // them -- if the barrier index did not reach the stream these would match.
+        let uids =
+            |report: &BarrierReport| report.moves.iter().map(|m| m.agent_uid).collect::<Vec<_>>();
+        assert_ne!(
+            uids(&first),
+            uids(&second),
+            "barrier index must reach the migration stream"
+        );
+
+        // And it must be reproducible: same inputs, same answer.
+        let repeat = select_emigrants(&candidates, &config, master, 0).expect("barrier 0 again");
+        assert_eq!(
+            uids(&first),
+            uids(&repeat),
+            "the same barrier must select the same emigrants"
+        );
+    }
+
+    /// Migration selection must not change when an island's population history differs.
+    ///
+    /// This is the coupling bd-16g.5.3 exists to prevent, stated for the migrator: the
+    /// choice on the 0->1 edge must not depend on what happened on island 2.
+    #[test]
+    fn bd_16g_5_2_selection_on_one_edge_ignores_unrelated_islands() {
+        let agents = |base: u64| {
+            (0..6u64)
+                .map(|i| CandidateAgent {
+                    uid: base + i,
+                    energy: 1.0 + i as f32,
+                    health: 1.0,
+                    age: 10,
+                    speed: 1.0,
+                })
+                .collect::<Vec<_>>()
+        };
+        let config = MigrationConfig {
+            selection_rule: EmigrantSelectionRule::Fittest,
+            emigrants_per_edge: 2,
+            topology: MigrationTopology::Ring,
+            ..MigrationConfig::default()
+        };
+        let master = 0xFEED_FEED_FEED_FEED_u64;
+
+        let mut two = BTreeMap::new();
+        two.insert(0u32, agents(1));
+        two.insert(1u32, agents(100));
+        let small = select_emigrants(&two, &config, master, 3).expect("two islands");
+
+        let mut three = two.clone();
+        three.insert(2u32, agents(200));
+        let large = select_emigrants(&three, &config, master, 3).expect("three islands");
+
+        let edge_moves = |report: &BarrierReport| {
+            report
+                .moves
+                .iter()
+                .filter(|m| m.from_island == 0 && m.to_island == 1)
+                .map(|m| m.agent_uid)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !edge_moves(&small).is_empty(),
+            "the 0->1 edge must move agents"
+        );
+        assert_eq!(
+            edge_moves(&small),
+            edge_moves(&large),
+            "who leaves island 0 for island 1 must not depend on island 2 existing"
+        );
     }
 }
