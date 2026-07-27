@@ -2097,4 +2097,53 @@ mod tests {
             })
         ));
     }
+
+    /// PERMUTING THE CONFIG ORDER MUST NOT MOVE AN ISLAND'S SCIENCE.
+    ///
+    /// bd-16g.5.3 names this as the second half of its independence proof, and says
+    /// explicitly that the first half misses it: `test_island_independence_across_
+    /// archipelago_sizes` varies the island COUNT while island 0 stays first in the
+    /// config, so a seeding rule that keyed off POSITION rather than IslandId would pass
+    /// it. This test moves island 0 to the back and asserts nothing about it changed.
+    ///
+    /// The failure it exists to catch is quiet: position-keyed seeding still yields a
+    /// perfectly deterministic archipelago, so every determinism gate stays green while
+    /// island identity silently means "whatever slot it was declared in".
+    #[test]
+    fn island_science_is_independent_of_declaration_order() {
+        let master_seed = 0x0BAD_1D3A_0BAD_1D3A;
+        let subject = IslandId(0);
+
+        let digest_for = |specs: Vec<IslandSpec>| {
+            let mut config = archipelago_config(specs, 100);
+            config.master_seed = master_seed;
+            let mut archipelago = populated_archipelago(config).expect("valid archipelago");
+            let seed = archipelago
+                .islands()
+                .find(|meta| meta.id == subject)
+                .expect("subject island")
+                .effective_config
+                .rng_seed;
+            archipelago.step_to_barrier().expect("barrier");
+            let digest = archipelago.island_digest(subject).expect("subject digest");
+            (seed, digest)
+        };
+
+        let forward: Vec<IslandSpec> = (0..4).map(|id| spec(id, populated_config(None))).collect();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        let (forward_seed, forward_digest) = digest_for(forward);
+        let (reversed_seed, reversed_digest) = digest_for(reversed);
+
+        assert_eq!(
+            forward_seed, reversed_seed,
+            "the per-island seed must key off IslandId, never the config slot"
+        );
+        assert_eq!(
+            forward_digest, reversed_digest,
+            "island {subject:?} produced different science purely because it was declared \
+             last instead of first"
+        );
+    }
 }
