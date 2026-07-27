@@ -594,6 +594,80 @@ fn trace_digest(trace: &ChaosTraceV1) -> String {
     blake3::hash(&canonical).to_hex().to_string()
 }
 
+/// The persistence-protocol content of a trace, without the two `asupersync`
+/// runtime identifiers that are not reproducible (bd-vluo).
+///
+/// # Why two fields are omitted, with the evidence
+///
+/// `trace_fingerprint` and `schedule_hash` are NOT stable across runs of the
+/// same seed — not merely across compiler releases or machines, but between two
+/// invocations of the same test. Diffing two traces emitted by one process
+/// showed those two fields as the ONLY difference; every field describing the
+/// persistence protocol was byte-identical:
+///
+/// ```text
+///   schedule_hash:      2993681334943190722  vs 12293449132265657841
+///   trace_fingerprint: 13242232221399463641  vs 11047006961373022139
+///   schedule, virtual_time_nanos, lab_steps, batch_id, watermarks,
+///   exact_retry_batch_ids, application_count, outbox_*: all identical
+/// ```
+///
+/// The first run in a FRESH PROCESS also differs from the first run in another
+/// fresh process, so this is not a counter accumulating within one process. Both
+/// values derive from `asupersync`'s canonical trace fingerprint, which hashes
+/// packed task and region ARENA HANDLES (`pack_arena(task.0)`), so runtime
+/// handle identity is reaching the digest. That is `asupersync` 0.3.9 internal
+/// state, not anything this crate's corpus determines.
+///
+/// # Why exclude rather than assert
+///
+/// Including them made the test claim something false: it is named for corpus
+/// stability and could not establish it, because its own inputs varied. A green
+/// run would have been luck. Excluding them lets the test assert the invariant it
+/// actually owns — that a fixed corpus drives a reproducible persistence outcome
+/// — over content that genuinely is reproducible.
+///
+/// This projection is used ONLY by the stability test. [`trace_digest`] is
+/// unchanged, so the DPOR exploration and negative-control tests keep hashing the
+/// full trace and keep their ability to tell two interleavings apart. Narrowing
+/// the digest everywhere would have been the easy edit and would have blunted the
+/// mutation control, which is the opposite of what a stability fix should do.
+#[derive(Serialize)]
+struct StableTraceContentV1<'a> {
+    schema: &'a str,
+    seed: u64,
+    mode: &'a str,
+    checkpoint: &'a str,
+    fault: &'a str,
+    schedule: &'a [String],
+    virtual_time_nanos: u64,
+    lab_steps: u64,
+    exploration_runs: usize,
+    exploration_classes: usize,
+    domain: &'a TraceDomainState,
+    first_divergence: Option<&'a str>,
+}
+
+/// Digest of the reproducible content of a trace (bd-vluo).
+fn stable_trace_digest(trace: &ChaosTraceV1) -> String {
+    let stable = StableTraceContentV1 {
+        schema: trace.schema,
+        seed: trace.seed,
+        mode: trace.mode,
+        checkpoint: &trace.checkpoint,
+        fault: &trace.fault,
+        schedule: &trace.schedule,
+        virtual_time_nanos: trace.virtual_time_nanos,
+        lab_steps: trace.lab_steps,
+        exploration_runs: trace.exploration_runs,
+        exploration_classes: trace.exploration_classes,
+        domain: &trace.domain,
+        first_divergence: trace.first_divergence.as_deref(),
+    };
+    let canonical = serde_json::to_vec(&stable).expect("serialize stable LabRuntime trace content");
+    blake3::hash(&canonical).to_hex().to_string()
+}
+
 fn emit_trace(trace: &ChaosTraceV1, artifact_label: &str) {
     let digest = trace_digest(trace);
     let artifact = ChaosTraceArtifact {
@@ -908,7 +982,11 @@ fn lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions() {
             "tests::lab_runtime_chaos::lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions",
         );
         assert_eq!(first_domain_divergence(&expected), None);
-        let expected_digest = trace_digest(&expected);
+        // bd-vluo: the PERSISTENCE-PROTOCOL content, not the full trace. Two of
+        // the trace's fields are asupersync runtime identifiers that differ on
+        // every run of the same seed, so hashing them made this test unable to
+        // establish the stability it is named for. See `stable_trace_digest`.
+        let expected_digest = stable_trace_digest(&expected);
         emit_trace(&expected, "stable-corpus");
 
         for repetition in 1..STABILITY_REPETITIONS {
@@ -918,7 +996,7 @@ fn lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions() {
                 observation,
                 "tests::lab_runtime_chaos::lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions",
             );
-            let actual_digest = trace_digest(&actual);
+            let actual_digest = stable_trace_digest(&actual);
             if actual_digest != expected_digest {
                 let mut divergent = actual;
                 divergent.first_divergence = Some(format!("stable_digest_repetition_{repetition}"));
