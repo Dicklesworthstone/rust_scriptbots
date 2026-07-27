@@ -542,7 +542,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
     let submit_ok = command_submit(ControlCommand::UpdateConfig(Box::new(
         updated_config.clone(),
     )));
-    assert!(submit_ok, "control queue rejected config update");
+    assert!(submit_ok.is_some(), "control queue rejected config update");
 
     let renderer = TerminalRenderer::default();
     {

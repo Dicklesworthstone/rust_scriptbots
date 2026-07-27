@@ -39,9 +39,10 @@ use crate::command::{
     CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
 };
 use crate::control::{
-    AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, DietClassDto,
-    EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
-    SelectionStateDto, SharedLatestSummary, SimulationStatusDto, SpeedRequest,
+    AgentScoreEntry, CommandReporter, CommandStatusDto, ConfigSnapshot, ControlError,
+    ControlHandle, DietClassDto, EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate,
+    Scoreboard, SelectionModeDto, SelectionStateDto, SharedLatestSummary, SimulationStatusDto,
+    SpeedRequest,
 };
 use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
 // keep image out of servers unless needed
@@ -373,6 +374,13 @@ pub enum ControlRuntimeStatus {
 /// issued before the server tasks reach their await would be lost and the
 /// join below would hang forever.
 pub struct ControlRuntime {
+    /// Lets whatever applies drained commands report their outcome.
+    ///
+    /// Carried here rather than threaded through the launch tuple because the
+    /// applier lives in the renderer or the terminal frontend, several calls
+    /// away from where the bus is built, and widening four signatures to reach
+    /// it would touch files other panes are actively editing (bd-tgfz).
+    command_reporter: CommandReporter,
     shutdown: watch::Sender<bool>,
     thread: Option<JoinHandle<Result<()>>>,
     status: watch::Receiver<ControlRuntimeStatus>,
@@ -410,6 +418,10 @@ impl ControlRuntime {
         let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Starting);
         let status_for_thread = status_tx.clone();
         let handle = ControlHandle::new(world.clone(), command_tx.clone(), latest_summary);
+        // Derived before the handle moves into the axum state: the reporter
+        // shares the ledger, so an outcome recorded through it is the same
+        // receipt a REST client polls.
+        let command_reporter = handle.command_reporter();
 
         let thread = thread::Builder::new()
             .name("scriptbots-control".into())
@@ -442,6 +454,7 @@ impl ControlRuntime {
         match startup_rx.recv_timeout(startup_timeout) {
             Ok(ControlStartupSignal::Ready) => Ok((
                 Self {
+                    command_reporter,
                     shutdown,
                     thread: Some(thread),
                     status: status_rx,
@@ -480,6 +493,12 @@ impl ControlRuntime {
     #[must_use]
     pub fn subscribe_status(&self) -> watch::Receiver<ControlRuntimeStatus> {
         self.status.clone()
+    }
+
+    /// A reporter the applier uses to record what became of a drained command.
+    #[must_use]
+    pub fn command_reporter(&self) -> CommandReporter {
+        Arc::clone(&self.command_reporter)
     }
 
     /// Return the latest runtime lifecycle state without blocking.
@@ -597,6 +616,10 @@ impl ControlRuntime {
         let command_submit = make_command_submit(command_tx);
         let (status_guard, status) = watch::channel(ControlRuntimeStatus::Running);
         let runtime = Self {
+            // The dummy runtime has no ledger, so its reporter is a sink. It is
+            // explicitly a no-op rather than a panic: tests that never apply a
+            // command should not have to care that they hold one.
+            command_reporter: Arc::new(|_, _| {}),
             shutdown: watch::channel(false).0,
             thread: None,
             status,

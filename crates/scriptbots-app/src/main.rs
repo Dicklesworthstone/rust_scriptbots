@@ -3012,11 +3012,36 @@ impl Renderer for GuiRenderer {
         prepare_linux_gui_backend();
         let control_health: scriptbots_render::GuiHealthProbe =
             Arc::new(ctx.control_runtime.health_probe());
+        // The renderer does not depend on scriptbots-app, so the bus envelope
+        // is adapted here rather than leaking the type across the boundary: the
+        // id travels as a plain String and the renderer's outcome is mapped
+        // back onto the ledger's (bd-tgfz).
+        let drain = Arc::clone(&ctx.command_drain);
+        let gui_drain: scriptbots_render::GuiCommandDrain = Arc::new(move || {
+            (drain)()
+                .into_iter()
+                .map(|bus| (bus.id, bus.command))
+                .collect()
+        });
+        let reporter = ctx.control_runtime.command_reporter();
+        let gui_reporter: scriptbots_render::GuiCommandReporter =
+            Arc::new(move |command_id, outcome| {
+                let outcome = match outcome {
+                    scriptbots_render::GuiCommandOutcome::Applied => {
+                        scriptbots_app::CommandOutcome::Applied
+                    }
+                    scriptbots_render::GuiCommandOutcome::Rejected => {
+                        scriptbots_app::CommandOutcome::Rejected
+                    }
+                };
+                reporter(command_id, outcome);
+            });
         run_demo(
             Arc::clone(&ctx.world),
             Arc::clone(&ctx.simulation_step),
             ctx.analytics.clone(),
-            Arc::clone(&ctx.command_drain),
+            gui_drain,
+            gui_reporter,
             Arc::clone(&ctx.command_submit),
             control_health,
         )

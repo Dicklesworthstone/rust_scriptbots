@@ -2124,7 +2124,8 @@ struct SimulationDriveSnapshot {
 struct GuiSimulationDriver {
     world: Arc<Mutex<WorldState>>,
     simulation_step: WorldStepDriver,
-    command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+    command_drain: GuiCommandDrain,
+    command_reporter: GuiCommandReporter,
     pending_playback: VecDeque<SimulationCommand>,
     paused: bool,
     speed_multiplier: f32,
@@ -2137,12 +2138,14 @@ impl GuiSimulationDriver {
     fn new(
         world: Arc<Mutex<WorldState>>,
         simulation_step: WorldStepDriver,
-        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+        command_drain: GuiCommandDrain,
+        command_reporter: GuiCommandReporter,
     ) -> Self {
         Self {
             world,
             simulation_step,
             command_drain,
+            command_reporter,
             pending_playback: VecDeque::new(),
             paused: false,
             speed_multiplier: 1.0,
@@ -2262,11 +2265,23 @@ impl GuiSimulationDriver {
             if let Some(error) = world.latched_step_error() {
                 step_error = Some(error.to_string());
             } else {
-                for command in (self.command_drain.as_ref())() {
+                for (receipt, command) in (self.command_drain.as_ref())() {
+                    // Reported from HERE, the only place that knows whether the
+                    // world took the command. Playback counts as applied: the
+                    // command was accepted and routed, it just lands on the
+                    // driver rather than on world state (bd-tgfz).
                     match apply_control_command(&mut world, command) {
-                        Ok(ControlDisposition::WorldApplied) => {}
-                        Ok(ControlDisposition::Playback(command)) => playback.push(command),
-                        Err(error) => warn!(%error, "GPUI rejected a drained control command"),
+                        Ok(ControlDisposition::WorldApplied) => {
+                            (self.command_reporter)(&receipt, GuiCommandOutcome::Applied);
+                        }
+                        Ok(ControlDisposition::Playback(command)) => {
+                            (self.command_reporter)(&receipt, GuiCommandOutcome::Applied);
+                            playback.push(command);
+                        }
+                        Err(error) => {
+                            (self.command_reporter)(&receipt, GuiCommandOutcome::Rejected);
+                            warn!(%error, %receipt, "GPUI rejected a drained control command");
+                        }
                     }
                 }
             }
@@ -2538,7 +2553,8 @@ impl GuiSession {
         world: Arc<Mutex<WorldState>>,
         simulation_step: WorldStepDriver,
         analytics: AnalyticsSnapshotProvider,
-        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+        command_drain: GuiCommandDrain,
+        command_reporter: GuiCommandReporter,
         command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     ) -> Self {
         let mut inspector_state = InspectorState::default();
@@ -2554,6 +2570,7 @@ impl GuiSession {
                 world,
                 simulation_step,
                 command_drain,
+                command_reporter,
             ))),
             analytics,
             command_submit,
@@ -2642,11 +2659,32 @@ fn open_gui_session_windows(
 }
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
+/// Drained commands, each paired with the identity it was admitted under.
+///
+/// The renderer does not depend on scriptbots-app, so it names the identity as
+/// a plain `String` rather than importing the bus type. What matters is that an
+/// id arrives WITH the command: without it the GPUI applier cannot report what
+/// became of anything it applies (bd-tgfz).
+pub type GuiCommandDrain = Arc<dyn Fn() -> Vec<(String, ControlCommand)> + Send + Sync + 'static>;
+
+/// What the GPUI applier observed when it applied a drained command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuiCommandOutcome {
+    /// The world accepted the command.
+    Applied,
+    /// The world refused it at application time.
+    Rejected,
+}
+
+/// Records an applied command's outcome against the id it travelled with.
+pub type GuiCommandReporter = Arc<dyn Fn(&str, GuiCommandOutcome) + Send + Sync + 'static>;
+
 pub fn run_demo(
     world: Arc<Mutex<WorldState>>,
     simulation_step: WorldStepDriver,
     analytics: AnalyticsSnapshotProvider,
-    command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+    command_drain: GuiCommandDrain,
+    command_reporter: GuiCommandReporter,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     health_probe: GuiHealthProbe,
 ) -> Result<(), GuiRunError> {
@@ -2668,6 +2706,7 @@ pub fn run_demo(
         simulation_step,
         analytics,
         command_drain,
+        command_reporter,
         command_submit,
     ));
     let session_for_app = Arc::clone(&session);
@@ -17782,7 +17821,8 @@ mod command_characterization_tests {
 
     fn simulation_view(
         world: Arc<Mutex<WorldState>>,
-        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+        command_drain: GuiCommandDrain,
+        command_reporter: GuiCommandReporter,
     ) -> SimulationView {
         let simulation_driver = gui_simulation_driver(&world, command_drain);
         simulation_view_with_driver(simulation_driver)
@@ -17790,7 +17830,8 @@ mod command_characterization_tests {
 
     fn gui_simulation_driver(
         world: &Arc<Mutex<WorldState>>,
-        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+        command_drain: GuiCommandDrain,
+        command_reporter: GuiCommandReporter,
     ) -> Arc<Mutex<GuiSimulationDriver>> {
         let simulation_step = disabled_persistence_step_driver(world);
         gui_simulation_driver_with_step(world, simulation_step, command_drain)
@@ -18012,7 +18053,8 @@ mod command_characterization_tests {
     fn gui_simulation_driver_with_step(
         world: &Arc<Mutex<WorldState>>,
         simulation_step: WorldStepDriver,
-        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
+        command_drain: GuiCommandDrain,
+        command_reporter: GuiCommandReporter,
     ) -> Arc<Mutex<GuiSimulationDriver>> {
         Arc::new(Mutex::new(GuiSimulationDriver::new(
             Arc::clone(world),
@@ -18021,9 +18063,7 @@ mod command_characterization_tests {
         )))
     }
 
-    fn one_shot_command_drain(
-        commands: Vec<ControlCommand>,
-    ) -> Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static> {
+    fn one_shot_command_drain(commands: Vec<ControlCommand>) -> GuiCommandDrain {
         let commands = Mutex::new(Some(commands));
         Arc::new(move || {
             commands
