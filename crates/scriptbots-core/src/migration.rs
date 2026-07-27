@@ -332,6 +332,15 @@ impl WorldState {
     ///
     /// # Errors
     ///
+    /// Returns a [`RejectedImmigrant`], **which hands the organism back**. Every
+    /// rejection is decided before this world takes ownership, so a refused
+    /// arrival is never a lost agent — the caller can return it to its source or
+    /// fail the whole barrier, and either way the population is conserved. An
+    /// `immigrate` that consumed the migrant and returned a bare error would
+    /// make its own failure path the very defect this module exists to prevent.
+    ///
+    /// The wrapped [`MigrationTransferError`] is one of:
+    ///
     /// - [`MigrationTransferError::UnknownBrainFamily`] if this world's brain
     ///   registry does not offer the migrant's family under the same key and
     ///   kind.
@@ -339,20 +348,84 @@ impl WorldState {
     ///   holds no live executor.
     /// - [`MigrationTransferError::ScientificState`] if the payload fails
     ///   validation or an unresolved persistence boundary forbids the mutation.
-    pub fn immigrate(
-        &mut self,
-        migrant: MigratingAgent,
-    ) -> Result<AgentUid, MigrationTransferError> {
-        self.ensure_scientific_mutation_allowed("agents.immigrate")?;
+    #[allow(
+        clippy::result_large_err,
+        reason = "the Err variant is large BECAUSE it carries the whole organism, which is \
+                  the entire point: a refused arrival that did not hand the agent back would \
+                  make this function's own failure path a silent population loss. Boxing it \
+                  would shrink the Result by moving the same bytes to the heap on the cold \
+                  path while making every caller unwrap through an indirection to reach the \
+                  thing it must not drop."
+    )]
+    pub fn immigrate(&mut self, migrant: MigratingAgent) -> Result<AgentUid, RejectedImmigrant> {
+        let position = match self.planned_arrival(&migrant) {
+            Ok(position) => position,
+            Err(error) => return Err(RejectedImmigrant { migrant, error }),
+        };
 
         let MigratingAgent {
             mut data,
             mut runtime,
             origin_uid,
-            normalized_position,
+            normalized_position: _,
         } = migrant;
 
-        match inspect_brain(&runtime.brain) {
+        data.position.x = position[0];
+        data.position.y = position[1];
+        // Parentage is source-local; see the method docs and bd-8jlj.
+        runtime.lineage = [None, None];
+        // Per-tick transient state from another world's last tick must not
+        // reach this world's first tick: a stale spike flag would let the
+        // destination attribute a death to combat that happened elsewhere.
+        runtime.combat = CombatEventFlags::default();
+        runtime.selection = SelectionState::None;
+
+        let record_tick = self.tick;
+        // Reserving the identity BEFORE inserting means the minted UID is known
+        // without a post-insert lookup that could fail. There is no honest
+        // failure left at this point: the organism is about to be in this world,
+        // so an error here could not hand it back.
+        //
+        // The reservation installs DEFAULT `AgentRngCountersV1`, and that
+        // default IS the re-derivation bd-16g.5.3 requires: every keyed
+        // substream is a function of (this world's root seed, this new UID,
+        // ordinal), so the arrival's draws owe nothing to the source.
+        let reservation = self.reserve_agent_insertion(BirthOrigin::Injected);
+        let uid = reservation.identity.uid;
+        self.insert_reserved_agent(
+            data,
+            runtime,
+            record_tick,
+            BirthOrigin::Injected,
+            reservation,
+        );
+
+        diag_info!(
+            origin_uid = origin_uid.get(),
+            local_uid = uid.get(),
+            tick = record_tick.0,
+            position_x = data.position.x,
+            position_y = data.position.y,
+            "agent immigrated into world under a fresh local identity"
+        );
+
+        Ok(uid)
+    }
+
+    /// Decide every possible rejection while the caller still owns the migrant,
+    /// and return the destination coordinates the arrival will land on.
+    ///
+    /// THE WHOLE POINT IS THE ORDERING. [`Self::immigrate`] takes the organism by
+    /// value, so any check performed after that point could only report a failure
+    /// it had already made unrecoverable. Every gate therefore lives here, on a
+    /// borrow, and `immigrate` performs no fallible step once it has ownership.
+    fn planned_arrival(
+        &self,
+        migrant: &MigratingAgent,
+    ) -> Result<[f32; 2], MigrationTransferError> {
+        self.ensure_scientific_mutation_allowed("agents.immigrate")?;
+
+        match inspect_brain(&migrant.runtime.brain) {
             // Nothing to resolve: an unbound organism carries no family, and a
             // runner constructed outside the registry travels with the agent.
             BrainTransferCheck::Unbound
@@ -361,7 +434,7 @@ impl WorldState {
             } => {}
             BrainTransferCheck::Dead { kind } => {
                 return Err(MigrationTransferError::BrainNotTransferable {
-                    uid: origin_uid.get(),
+                    uid: migrant.origin_uid.get(),
                     kind: kind.to_owned(),
                 });
             }
@@ -385,41 +458,62 @@ impl WorldState {
 
         let width = validated_world_unit_f32(self.config.world_width);
         let height = validated_world_unit_f32(self.config.world_height);
-        data.position.x = expand_fraction(normalized_position[0], width);
-        data.position.y = expand_fraction(normalized_position[1], height);
-        data.validate_at("migration.arrival.agent")?;
+        let position = [
+            expand_fraction(migrant.normalized_position[0], width),
+            expand_fraction(migrant.normalized_position[1], height),
+        ];
 
-        // Parentage is source-local; see the method docs and bd-8jlj.
-        runtime.lineage = [None, None];
-        // Per-tick transient state from another world's last tick must not
-        // reach this world's first tick: a stale spike flag would let the
-        // destination attribute a death to combat that happened elsewhere.
-        runtime.combat = CombatEventFlags::default();
-        runtime.selection = SelectionState::None;
-        runtime.validate_at("migration.arrival.agent.runtime")?;
+        // Validate the candidate the world would actually hold, not the one that
+        // arrived: the remap is what decides the coordinates, so validating
+        // before it would check numbers this world never stores.
+        let mut candidate = migrant.data;
+        candidate.position.x = position[0];
+        candidate.position.y = position[1];
+        candidate.validate_at("migration.arrival.agent")?;
+        migrant
+            .runtime
+            .validate_at("migration.arrival.agent.runtime")?;
 
-        let record_tick = self.tick;
-        // `insert_agent` mints the identity from this world's allocator and
-        // installs DEFAULT `AgentRngCountersV1` — that default is precisely the
-        // re-derivation bd-16g.5.3 requires, since every keyed substream is a
-        // function of (this world's root seed, this new UID, ordinal).
-        let id = self.insert_agent(data, runtime, record_tick, BirthOrigin::Injected);
-        let uid = self
-            .agent_uid(id)
-            .ok_or_else(|| ScientificStateError::MissingAgentIdentity {
-                path: "migration.arrival.identity".to_owned(),
-            })?;
+        Ok(position)
+    }
+}
 
-        diag_info!(
-            origin_uid = origin_uid.get(),
-            local_uid = uid.get(),
-            tick = record_tick.0,
-            position_x = data.position.x,
-            position_y = data.position.y,
-            "agent immigrated into world under a fresh local identity"
-        );
+/// An organism this world refused to admit, handed back with the reason.
+///
+/// CONSERVATION IS THE REASON THIS TYPE EXISTS. A refused arrival must not be a
+/// destroyed one. If [`WorldState::immigrate`] returned a bare error it would
+/// have consumed the migrant to produce it, so its own failure path would delete
+/// an agent from the run with nothing but a log line to show for it — the exact
+/// silent population loss the migration invariants are written to prevent.
+///
+/// Take the organism back with [`Self::into_migrant`] and either return it to its
+/// source world or fail the whole barrier. Dropping this value drops the
+/// organism, which is legal but is a decision, not an accident.
+#[derive(Debug, Error)]
+#[error("world refused an immigrating agent: {error}")]
+pub struct RejectedImmigrant {
+    migrant: MigratingAgent,
+    #[source]
+    error: MigrationTransferError,
+}
 
-        Ok(uid)
+impl RejectedImmigrant {
+    /// Why the arrival was refused.
+    #[must_use]
+    pub const fn error(&self) -> &MigrationTransferError {
+        &self.error
+    }
+
+    /// Reclaim the organism so it can be returned to its source or re-routed.
+    #[must_use]
+    pub fn into_migrant(self) -> MigratingAgent {
+        self.migrant
+    }
+
+    /// Reclaim both the organism and the reason together.
+    #[must_use]
+    pub fn into_parts(self) -> (MigratingAgent, MigrationTransferError) {
+        (self.migrant, self.error)
     }
 }
 
@@ -817,21 +911,41 @@ mod tests {
 
         let target = uids(&source)[0];
         let migrant = source.emigrate(target).expect("emigration succeeds");
-        let error = destination
+        let rejected = destination
             .immigrate(migrant)
             .expect_err("an unknown family must be refused");
         assert!(
             matches!(
-                error,
+                rejected.error(),
                 MigrationTransferError::UnknownBrainFamily { registry_key, .. }
-                    if registry_key == key
+                    if *registry_key == key
             ),
-            "unexpected error: {error:?}"
+            "unexpected error: {:?}",
+            rejected.error()
         );
         assert_eq!(
             destination.agent_count(),
             0,
             "a refused arrival must not be admitted"
+        );
+
+        // AND THE ORGANISM COMES BACK. This is the half that makes the refusal
+        // safe: a rejection that consumed the migrant would delete an agent from
+        // the run, and every population count on both worlds would still balance
+        // against its own history. The source can take it back.
+        let returned = rejected.into_migrant();
+        assert_eq!(returned.origin_uid(), target);
+        let restored = source
+            .immigrate(returned)
+            .expect("source re-admits its own");
+        assert_eq!(
+            source.agent_count(),
+            1,
+            "the refused organism must be recoverable, not destroyed"
+        );
+        assert_ne!(
+            restored, target,
+            "even coming home it takes a fresh uid, because it left the allocator"
         );
     }
 

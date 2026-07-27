@@ -88,7 +88,7 @@ pub use archipelago::{
     IslandMeta, IslandSpec, MAX_ISLANDS, StepTopology, Topology,
 };
 pub use host_core::{
-    HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, VolatileJournal,
+    HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, MigrationArrival, VolatileJournal,
 };
 pub use native::{FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError};
 
@@ -1620,6 +1620,47 @@ pub enum HostCommand {
         /// Second stable parent identity.
         parent_b: AgentUid,
     },
+    /// Remove one agent from this world so it can be carried to another
+    /// (bd-emcv).
+    ///
+    /// # Why the organism is not in this command
+    ///
+    /// A migrating agent owns a live `Box<dyn BrainRunner>`, and this enum is
+    /// `Clone + PartialEq + Serialize + Deserialize` because the host retries
+    /// submissions by cloning the envelope and the journal digests it. A trait
+    /// object satisfies none of those, so the payload CANNOT ride inside the
+    /// command — that is a type-level fact, not a style choice.
+    ///
+    /// The split is therefore deliberate: this command names the organism, and
+    /// the organism itself travels beside it. On application the host parks the
+    /// departed agent in a private outbound slot, which the mover collects with
+    /// [`HostCore::take_outbound_migrant`]. The command is what reaches the
+    /// journal, and because it names the source UID the departure is replayable
+    /// from the record alone.
+    Emigrate {
+        /// Stable local identity of the agent to remove.
+        agent_uid: AgentUid,
+    },
+    /// Admit an organism previously handed to
+    /// [`HostCore::stage_immigrant`] (bd-emcv).
+    ///
+    /// Carries the arrival's PROVENANCE — where it came from — rather than the
+    /// organism, for the reason given on [`HostCommand::Emigrate`]. The pair
+    /// `(origin_island, origin_uid)` is the only globally unique name the
+    /// arriving organism has, because the destination-local UID does not exist
+    /// until the world's allocator mints one during application.
+    ///
+    /// The command deliberately does NOT carry that new local UID. It could not:
+    /// the value is unknown at admission. It does not need to either — the
+    /// allocator is deterministic, so replaying this command against the same
+    /// world state mints the same UID. Recording a UID here would be recording a
+    /// guess.
+    Immigrate {
+        /// Island the organism departed from.
+        origin_island: IslandId,
+        /// The organism's UID on the world it departed.
+        origin_uid: AgentUid,
+    },
     /// Begin orderly host shutdown.
     Shutdown,
 }
@@ -1677,6 +1718,8 @@ impl HostCommand {
             | Self::AdjustAgentMutationRates { .. }
             | Self::SpawnAgent { .. }
             | Self::SpawnCrossover { .. }
+            | Self::Emigrate { .. }
+            | Self::Immigrate { .. }
             | Self::Shutdown => true,
         }
     }
@@ -6783,7 +6826,9 @@ mod tests {
                     HostCommand::UpdateSelection(_) => {}
                     HostCommand::AdjustAgentMutationRates { .. }
                     | HostCommand::SpawnAgent { .. }
-                    | HostCommand::SpawnCrossover { .. } => {
+                    | HostCommand::SpawnCrossover { .. }
+                    | HostCommand::Emigrate { .. }
+                    | HostCommand::Immigrate { .. } => {
                         self.revisions.scientific =
                             self.revisions.scientific.checked_next().ok_or_else(|| {
                                 protocol_violation("scientific revision exhausted")

@@ -20,11 +20,12 @@ use super::{
 };
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    ACTIVATION_CAPTURE_BUDGET, BrainInspectionClientId, BrainInspectionError,
+    ACTIVATION_CAPTURE_BUDGET, AgentUid, BrainInspectionClientId, BrainInspectionError,
     BrainInspectionRequest, BrainInspectionRevision, CharacterizationError, CompletedStepFault,
-    ControlCommand, ControlDisposition, DynamicAgentSnapshot, DynamicWorldSnapshot,
+    ControlCommand, ControlDisposition, DynamicAgentSnapshot, DynamicWorldSnapshot, MigratingAgent,
     NullPersistence, PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError,
     ScriptBotsConfig, Tick, TickSummary, WorldDigestV1, WorldState, apply_control_command,
+    rng_domains::IslandId,
 };
 use std::{
     cell::RefCell,
@@ -1845,6 +1846,32 @@ pub struct HostCore {
     shutdown_receipt: Option<(JournalBatchId, ShutdownCommitRequirement)>,
     failed_journal_batches: HashSet<JournalBatchId>,
     latched_fault: Option<HostFault>,
+    /// An organism this host has removed from its world and not yet handed to a
+    /// mover (bd-emcv). While it sits here it belongs to NO world, so the host
+    /// refuses a second emigration until it is collected.
+    outbound_migrant: Option<MigratingAgent>,
+    /// An organism handed to this host and awaiting its `Immigrate` command.
+    staged_immigrant: Option<MigratingAgent>,
+    /// Provenance and local identity of the most recent completed arrival.
+    last_arrival: Option<MigrationArrival>,
+}
+
+/// Both identities of one completed arrival (bd-emcv).
+///
+/// The mover needs the destination-local UID to record where the organism went,
+/// and that UID does not exist until the world's allocator mints it during
+/// application — so it cannot be in the `Immigrate` command and has to be read
+/// back from the host afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationArrival {
+    /// Island the organism departed from.
+    pub origin_island: IslandId,
+    /// The organism's UID on the world it departed.
+    pub origin_uid: AgentUid,
+    /// The UID this world's allocator minted for it.
+    pub local_uid: AgentUid,
+    /// Completed scientific tick the arrival was applied at.
+    pub tick: Tick,
 }
 
 impl HostCore {
@@ -2036,6 +2063,9 @@ impl HostCore {
             shutdown_receipt: None,
             failed_journal_batches: HashSet::new(),
             latched_fault: None,
+            outbound_migrant: None,
+            staged_immigrant: None,
+            last_arrival: None,
         })
     }
 
@@ -2208,6 +2238,73 @@ impl HostCore {
     /// Canonical full scientific digest without exposing the mutable world.
     pub fn scientific_digest_v1(&self) -> Result<WorldDigestV1, CharacterizationError> {
         self.world.world_digest_v1()
+    }
+
+    /// Collect the organism a completed [`HostCommand::Emigrate`] removed from
+    /// this world (bd-emcv).
+    ///
+    /// THIS IS THE OUT-OF-BAND HALF OF THE MIGRATION SEAM. The command carries
+    /// only the UID, because `HostCommand` is `Clone + Serialize` and a live
+    /// `Box<dyn BrainRunner>` is neither; the organism therefore travels through
+    /// this slot instead of through the envelope. The journal still records the
+    /// move, because the command that names it is what gets journaled.
+    ///
+    /// Returns `None` when nothing is waiting. **The caller that takes the value
+    /// owns the only copy of a living organism** — dropping it deletes an agent
+    /// from the run with no death record, which is why the host refuses a second
+    /// emigration while this slot is occupied rather than overwriting it.
+    pub fn take_outbound_migrant(&mut self) -> Option<MigratingAgent> {
+        self.outbound_migrant.take()
+    }
+
+    /// Whether an emigrated organism is waiting to be collected.
+    #[must_use]
+    pub const fn has_outbound_migrant(&self) -> bool {
+        self.outbound_migrant.is_some()
+    }
+
+    /// Hand an organism to this host so a later [`HostCommand::Immigrate`] can
+    /// admit it (bd-emcv).
+    ///
+    /// Staging is not admission: nothing enters the world and no journal record
+    /// is written until the command applies. That ordering is what keeps the
+    /// arrival on the command pipeline, where every other world mutation lives.
+    ///
+    /// # Errors
+    ///
+    /// Returns the organism straight back if a different one is already staged.
+    /// Silently replacing it would destroy a living agent, so the refusal hands
+    /// ownership to the caller rather than making the host the place an organism
+    /// can vanish.
+    pub fn stage_immigrant(&mut self, migrant: MigratingAgent) -> Result<(), MigratingAgent> {
+        if self.staged_immigrant.is_some() {
+            return Err(migrant);
+        }
+        self.staged_immigrant = Some(migrant);
+        Ok(())
+    }
+
+    /// Whether an organism is staged and awaiting its `Immigrate` command.
+    #[must_use]
+    pub const fn has_staged_immigrant(&self) -> bool {
+        self.staged_immigrant.is_some()
+    }
+
+    /// Take back a staged organism that will not be admitted after all.
+    ///
+    /// Exists so a mover that fails a barrier between staging and commanding can
+    /// return the organism to its source instead of leaking it.
+    pub fn unstage_immigrant(&mut self) -> Option<MigratingAgent> {
+        self.staged_immigrant.take()
+    }
+
+    /// Both identities of the most recent completed arrival, if any.
+    ///
+    /// The destination-local UID is minted during application, so it cannot be
+    /// in the command and has to be read back here.
+    #[must_use]
+    pub const fn last_arrival(&self) -> Option<MigrationArrival> {
+        self.last_arrival
     }
 
     /// Read the owned world through a closure, without handing out a borrow.
@@ -2921,6 +3018,8 @@ impl HostCore {
                     | HostCommand::AdjustAgentMutationRates { .. }
                     | HostCommand::SpawnAgent { .. }
                     | HostCommand::SpawnCrossover { .. }
+                    | HostCommand::Emigrate { .. }
+                    | HostCommand::Immigrate { .. }
             )
         {
             let blocked = self.complete_failed(
@@ -2999,6 +3098,19 @@ impl HostCore {
                 next_control,
                 true,
             ),
+            HostCommand::Emigrate { agent_uid } => {
+                self.apply_emigrate_command(admission, &retry_envelope, agent_uid, next_control)
+            }
+            HostCommand::Immigrate {
+                origin_island,
+                origin_uid,
+            } => self.apply_immigrate_command(
+                admission,
+                &retry_envelope,
+                origin_island,
+                origin_uid,
+                next_control,
+            ),
             HostCommand::Step => self.apply_step_command(admission, &retry_envelope, next_control),
             HostCommand::Shutdown => {
                 self.apply_shutdown_command(admission, &retry_envelope, next_control)
@@ -3067,6 +3179,139 @@ impl HostCore {
         if let Some(next_scientific) = next_scientific {
             self.revisions.scientific = next_scientific;
         }
+        let applied = self.applied_boundary();
+        self.complete_applied_with(envelope.command_id, admission, applied)?;
+        let blocked = self.offer_journal(envelope, applied, None, None)?;
+        Ok(ApplyResult::completed(blocked))
+    }
+
+    /// Remove one agent from the world and park it for the mover (bd-emcv).
+    ///
+    /// Journals exactly like [`HostCommand::SpawnAgent`] does: an
+    /// [`AppliedCommand`] boundary with an advanced scientific revision and no
+    /// [`ScientificBoundary`]. That is not a shortcut — a `ScientificBoundary` is
+    /// tick-shaped (events, summary, births, deaths, combat, resource tick) and a
+    /// migration is not a tick, so most of those fields would have to be
+    /// fabricated. The record that matters is the ENVELOPE, which names the
+    /// departing UID, and the journal digests and retains it.
+    ///
+    /// A departure is deliberately NOT a death: no `DeathRecord` is written,
+    /// because the organism is alive and about to be somewhere else.
+    fn apply_emigrate_command(
+        &mut self,
+        admission: AdmissionSequence,
+        envelope: &CommandEnvelope,
+        agent_uid: AgentUid,
+        next_control: ControlRevision,
+    ) -> Result<ApplyResult, HostAccessError> {
+        // Refuse rather than overwrite. The occupant of this slot is a living
+        // organism that exists in no world; replacing it would delete an agent
+        // from the run and every population count would still balance.
+        if self.outbound_migrant.is_some() {
+            let blocked = self.complete_failed(
+                envelope.command_id,
+                admission,
+                "migration_outbound_occupied",
+                "a previously emigrated agent has not been collected".to_owned(),
+            )?;
+            return Ok(ApplyResult::completed(blocked));
+        }
+        let next_scientific = self
+            .revisions
+            .scientific
+            .checked_next()
+            .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+        let migrant = match self.world.emigrate(agent_uid) {
+            Ok(migrant) => migrant,
+            Err(error) => {
+                let blocked = self.complete_failed(
+                    envelope.command_id,
+                    admission,
+                    "migration_emigrate",
+                    error.to_string(),
+                )?;
+                return Ok(ApplyResult::completed(blocked));
+            }
+        };
+        self.outbound_migrant = Some(migrant);
+        self.revisions.control = next_control;
+        self.revisions.scientific = next_scientific;
+        let applied = self.applied_boundary();
+        self.complete_applied_with(envelope.command_id, admission, applied)?;
+        let blocked = self.offer_journal(envelope, applied, None, None)?;
+        Ok(ApplyResult::completed(blocked))
+    }
+
+    /// Admit the staged organism under a freshly minted local identity
+    /// (bd-emcv).
+    ///
+    /// The command names `(origin_island, origin_uid)` and the staged organism
+    /// carries its own origin UID; this checks that they agree before admitting
+    /// anything. Without that check a mis-sequenced pair would journal a record
+    /// describing one organism while a different one actually arrived, and the
+    /// journal is the ONLY witness that a move happened at all — a wrong record
+    /// there is worse than no record, because it reads as evidence.
+    ///
+    /// A refused arrival is re-staged, not dropped: [`WorldState::immigrate`]
+    /// hands the organism back precisely so this path cannot lose it.
+    fn apply_immigrate_command(
+        &mut self,
+        admission: AdmissionSequence,
+        envelope: &CommandEnvelope,
+        origin_island: IslandId,
+        origin_uid: AgentUid,
+        next_control: ControlRevision,
+    ) -> Result<ApplyResult, HostAccessError> {
+        let Some(migrant) = self.staged_immigrant.take() else {
+            let blocked = self.complete_failed(
+                envelope.command_id,
+                admission,
+                "migration_nothing_staged",
+                "no organism is staged for this immigrate command".to_owned(),
+            )?;
+            return Ok(ApplyResult::completed(blocked));
+        };
+        if migrant.origin_uid() != origin_uid {
+            let staged = migrant.origin_uid().get();
+            self.staged_immigrant = Some(migrant);
+            let blocked = self.complete_failed(
+                envelope.command_id,
+                admission,
+                "migration_staged_mismatch",
+                format!(
+                    "immigrate command names origin uid {} but the staged organism is {staged}",
+                    origin_uid.get()
+                ),
+            )?;
+            return Ok(ApplyResult::completed(blocked));
+        }
+        let next_scientific = self
+            .revisions
+            .scientific
+            .checked_next()
+            .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+        let local_uid = match self.world.immigrate(migrant) {
+            Ok(local_uid) => local_uid,
+            Err(rejected) => {
+                let (migrant, error) = rejected.into_parts();
+                self.staged_immigrant = Some(migrant);
+                let blocked = self.complete_failed(
+                    envelope.command_id,
+                    admission,
+                    "migration_immigrate",
+                    error.to_string(),
+                )?;
+                return Ok(ApplyResult::completed(blocked));
+            }
+        };
+        self.revisions.control = next_control;
+        self.revisions.scientific = next_scientific;
+        self.last_arrival = Some(MigrationArrival {
+            origin_island,
+            origin_uid,
+            local_uid,
+            tick: self.world.tick(),
+        });
         let applied = self.applied_boundary();
         self.complete_applied_with(envelope.command_id, admission, applied)?;
         let blocked = self.offer_journal(envelope, applied, None, None)?;
@@ -3837,10 +4082,10 @@ mod tests {
     };
     use scriptbots_core::{
         ActivationLayer, AgentData, AgentUid, BrainActivations, BrainInspection,
-        BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner, Generation, HydrologyField,
-        HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer, INPUT_SIZE, MapArtifact,
-        MapArtifactMetadata, MapGeneratorKind, OUTPUT_SIZE, Position, ScriptBotsConfig,
-        SelectionMode, SelectionState, SelectionUpdate, TerrainLayer, Velocity,
+        BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner, BrainSpawnError, Generation,
+        HydrologyField, HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer, INPUT_SIZE,
+        MapArtifact, MapArtifactMetadata, MapGeneratorKind, OUTPUT_SIZE, Position,
+        ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainLayer, Velocity,
         bound_brain_inspection,
     };
     use std::{hint::black_box, sync::Mutex, time::Instant};
@@ -4504,6 +4749,446 @@ mod tests {
             core.scientific_digest_v1()
                 .expect("post-projection matrix digest"),
             digest_before
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // bd-emcv: the journaled migration seam
+    // ---------------------------------------------------------------------
+
+    const MIGRATION_BRAIN_KIND: &str = "runtime.migration";
+    const MIGRATION_BRAIN_DIGEST: u64 = 0x4d49_4752_4154_4501;
+
+    #[derive(Debug, Clone)]
+    struct MigrationBrain;
+
+    impl BrainRunner for MigrationBrain {
+        fn kind(&self) -> &'static str {
+            MIGRATION_BRAIN_KIND
+        }
+
+        fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+            [0.0; OUTPUT_SIZE]
+        }
+
+        fn state_digest(&self) -> Option<u64> {
+            Some(MIGRATION_BRAIN_DIGEST)
+        }
+
+        fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// A migration-seam host with `agents` bound agents, optionally without the
+    /// brain family registered — which is how the destination is made to refuse.
+    fn migration_host(
+        session: u64,
+        agents: usize,
+        register_family: bool,
+    ) -> (HostCore, LocalHostPort) {
+        let mut world = world(0);
+        if register_family {
+            let family = world
+                .brain_registry_mut()
+                .expect("registry mutable before the first tick")
+                .register_with_state_digest(MIGRATION_BRAIN_KIND, MIGRATION_BRAIN_DIGEST, |_rng| {
+                    Ok(Box::new(MigrationBrain))
+                });
+            for _ in 0..agents {
+                let id = world
+                    .try_spawn_agent(AgentData::default())
+                    .expect("seed migration agent");
+                assert!(
+                    world.bind_agent_brain(id, family).expect("bind"),
+                    "the migration family must bind"
+                );
+            }
+        } else {
+            for _ in 0..agents {
+                world
+                    .try_spawn_agent(AgentData::default())
+                    .expect("seed migration agent");
+            }
+        }
+        world.step().expect("finalize seeded agent origins");
+        let core = HostCore::new(HostSessionId::new(session), world, options(true))
+            .expect("migration host construction");
+        let port = core.local_port();
+        (core, port)
+    }
+
+    /// The typed failure code of a completed command, or a readable description
+    /// of whatever state it is actually in.
+    ///
+    /// Returning a string rather than matching-and-panicking keeps the assertion
+    /// in the test (where the expected value is visible) and keeps a bare
+    /// `panic!` out of the file.
+    fn failure_code(status: &CommandStatus) -> String {
+        match status.application() {
+            ApplicationState::Failed(failure) => failure.code.clone(),
+            other => format!("<expected a typed failure, got {other:?}>"),
+        }
+    }
+
+    fn first_uid(core: &HostCore) -> AgentUid {
+        let id = core
+            .world
+            .agents()
+            .iter_handles()
+            .next()
+            .expect("migration host has a live agent");
+        core.world
+            .agent_uid(id)
+            .expect("live agent has an identity")
+    }
+
+    /// One organism crosses two hosts through the command pipeline, and BOTH
+    /// halves are journaled (bd-emcv).
+    ///
+    /// THE CONSTRAINT THIS DESIGN EXISTS FOR: `HostCommand` is `Clone`,
+    /// `PartialEq`, `Serialize` and `Deserialize` — the host clones envelopes to
+    /// retry and the journal digests them — while a migrating organism owns a
+    /// live `Box<dyn BrainRunner>`, which is none of those. So the organism
+    /// cannot be in the command. It travels through the host's outbound/staged
+    /// slots instead, and the command that NAMES it is what reaches the journal.
+    ///
+    /// The alternative was a `with_world_mut` seam, which would have produced a
+    /// working migration that no journal ever saw. Population counts would still
+    /// balance and the archipelago conservation guard would stay green while the
+    /// run silently stopped being replayable.
+    ///
+    /// What crosses (phenotype, brain, re-derived RNG counters) is proven by
+    /// `scriptbots-core`'s migration tests. This proves the SEAM: lifecycle,
+    /// revisions, journal commitment, and that the pair population is conserved.
+    #[test]
+    fn bd_emcv_a_journaled_command_pair_moves_one_organism_between_hosts() {
+        let (mut source, mut source_port) = migration_host(0x5011, 2, true);
+        let (mut destination, mut destination_port) = migration_host(0x5012, 1, true);
+
+        let departing = first_uid(&source);
+        let source_before = source.world.agent_count();
+        let destination_before = destination.world.agent_count();
+        let source_tick = source.world_tick();
+        let source_revisions = source.latest_snapshot().revisions;
+
+        // --- DEPARTURE -----------------------------------------------------
+        submit(
+            &mut source_port,
+            1,
+            HostCommand::Emigrate {
+                agent_uid: departing,
+            },
+        );
+        source
+            .drive(ManualInstant::from_nanos(1))
+            .expect("emigrate boundary");
+
+        let applied_departure = applied(&status(&mut source_port, 1));
+        assert_eq!(
+            applied_departure.tick, source_tick,
+            "a migration is not a tick and must not advance one"
+        );
+        assert_eq!(
+            applied_departure.revisions.scientific,
+            ScientificRevision::new(source_revisions.scientific.get() + 1),
+            "removing an agent is a scientific mutation and must advance that revision"
+        );
+        assert_eq!(source.world.agent_count(), source_before - 1);
+        assert!(
+            source.has_outbound_migrant(),
+            "the organism must be parked for the mover, not dropped"
+        );
+
+        source
+            .drive(ManualInstant::from_nanos(2))
+            .expect("departure journal receipts");
+        assert_eq!(
+            status(&mut source_port, 1).journal(),
+            &JournalState::CommittedVolatile,
+            "the departure must be committed to the journal, not merely applied"
+        );
+
+        // --- HAND-OFF ------------------------------------------------------
+        let migrant = source
+            .take_outbound_migrant()
+            .expect("the departed organism is collectable");
+        assert_eq!(migrant.origin_uid(), departing);
+        assert!(!source.has_outbound_migrant(), "the slot must now be empty");
+        assert_eq!(
+            source.world.agent_count() + destination.world.agent_count(),
+            source_before + destination_before - 1,
+            "in transit the organism belongs to no world; that gap is why the mover \
+             owns the obligation to deliver it"
+        );
+
+        destination
+            .stage_immigrant(migrant)
+            .expect("nothing is staged yet");
+        assert!(destination.has_staged_immigrant());
+        assert_eq!(
+            destination.world.agent_count(),
+            destination_before,
+            "staging is not admission: nothing enters the world until the command applies"
+        );
+
+        // --- ARRIVAL -------------------------------------------------------
+        let destination_tick = destination.world_tick();
+        let destination_revisions = destination.latest_snapshot().revisions;
+        submit(
+            &mut destination_port,
+            1,
+            HostCommand::Immigrate {
+                origin_island: IslandId(3),
+                origin_uid: departing,
+            },
+        );
+        destination
+            .drive(ManualInstant::from_nanos(1))
+            .expect("immigrate boundary");
+
+        let applied_arrival = applied(&status(&mut destination_port, 1));
+        assert_eq!(applied_arrival.tick, destination_tick);
+        assert_eq!(
+            applied_arrival.revisions.scientific,
+            ScientificRevision::new(destination_revisions.scientific.get() + 1)
+        );
+        assert_eq!(destination.world.agent_count(), destination_before + 1);
+        assert!(!destination.has_staged_immigrant());
+
+        let arrival = destination.last_arrival().expect("arrival recorded");
+        assert_eq!(arrival.origin_island, IslandId(3));
+        assert_eq!(arrival.origin_uid, departing);
+        assert_eq!(arrival.tick, destination_tick);
+        assert_ne!(
+            arrival.local_uid, departing,
+            "the arrival takes a FRESH uid from this world's allocator; reusing the \
+             source uid would name a different organism that already lives here"
+        );
+
+        destination
+            .drive(ManualInstant::from_nanos(2))
+            .expect("arrival journal receipts");
+        assert_eq!(
+            status(&mut destination_port, 1).journal(),
+            &JournalState::CommittedVolatile,
+            "the arrival must be committed to the journal, not merely applied"
+        );
+
+        assert_eq!(
+            source.world.agent_count() + destination.world.agent_count(),
+            source_before + destination_before,
+            "the pair population must be restored by the arrival"
+        );
+    }
+
+    /// A second departure is refused while an organism is still uncollected.
+    ///
+    /// The slot holds a living agent that exists in NO world. Overwriting it
+    /// would delete that agent from the run, and every population count on both
+    /// worlds would still balance against its own history — the silent loss this
+    /// whole seam is shaped to prevent.
+    #[test]
+    fn bd_emcv_a_second_departure_is_refused_while_one_is_uncollected() {
+        let (mut core, mut port) = migration_host(0x5013, 3, true);
+        let first = first_uid(&core);
+        let before = core.world.agent_count();
+
+        submit(&mut port, 1, HostCommand::Emigrate { agent_uid: first });
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("first emigrate");
+        applied(&status(&mut port, 1));
+
+        let second = first_uid(&core);
+        assert_ne!(second, first, "a different agent is now first");
+        submit(&mut port, 2, HostCommand::Emigrate { agent_uid: second });
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("second emigrate boundary");
+
+        assert_eq!(
+            failure_code(&status(&mut port, 2)),
+            "migration_outbound_occupied"
+        );
+        assert_eq!(
+            core.world.agent_count(),
+            before - 1,
+            "exactly one organism may be in flight, so exactly one has left"
+        );
+        assert_eq!(
+            core.take_outbound_migrant()
+                .expect("the first organism is still collectable")
+                .origin_uid(),
+            first,
+            "the refusal must protect the ORIGINAL occupant, not swap it"
+        );
+    }
+
+    /// An `Immigrate` with nothing staged fails and admits nothing.
+    #[test]
+    fn bd_emcv_immigrate_without_a_staged_organism_admits_nothing() {
+        let (mut core, mut port) = migration_host(0x5014, 1, true);
+        let before = core.world.agent_count();
+
+        submit(
+            &mut port,
+            1,
+            HostCommand::Immigrate {
+                origin_island: IslandId(0),
+                origin_uid: AgentUid(1),
+            },
+        );
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("immigrate boundary");
+
+        assert_eq!(
+            failure_code(&status(&mut port, 1)),
+            "migration_nothing_staged"
+        );
+        assert_eq!(core.world.agent_count(), before);
+        assert_eq!(
+            core.last_arrival(),
+            None,
+            "nothing arrived, so nothing to record"
+        );
+    }
+
+    /// A command naming a different organism than the staged one is refused, and
+    /// the organism is put back.
+    ///
+    /// Without this check a mis-sequenced pair would journal a record describing
+    /// one organism while a different one actually arrived. The journal is the
+    /// ONLY witness that a move happened, so a wrong record there is worse than
+    /// no record — it reads as evidence.
+    #[test]
+    fn bd_emcv_a_command_naming_the_wrong_organism_is_refused_and_the_staged_one_survives() {
+        let (mut source, mut source_port) = migration_host(0x5015, 2, true);
+        let (mut destination, mut destination_port) = migration_host(0x5016, 1, true);
+
+        let departing = first_uid(&source);
+        submit(
+            &mut source_port,
+            1,
+            HostCommand::Emigrate {
+                agent_uid: departing,
+            },
+        );
+        source
+            .drive(ManualInstant::from_nanos(1))
+            .expect("emigrate");
+        let migrant = source.take_outbound_migrant().expect("collected");
+        destination.stage_immigrant(migrant).expect("staged");
+        let before = destination.world.agent_count();
+
+        submit(
+            &mut destination_port,
+            1,
+            HostCommand::Immigrate {
+                origin_island: IslandId(0),
+                origin_uid: AgentUid(departing.get() + 1000),
+            },
+        );
+        destination
+            .drive(ManualInstant::from_nanos(1))
+            .expect("mismatched immigrate boundary");
+
+        assert_eq!(
+            failure_code(&status(&mut destination_port, 1)),
+            "migration_staged_mismatch"
+        );
+        assert_eq!(destination.world.agent_count(), before);
+        assert!(
+            destination.has_staged_immigrant(),
+            "a refused command must put the organism back, not consume it"
+        );
+
+        // And the correct command still works, so the refusal cost nothing.
+        submit(
+            &mut destination_port,
+            2,
+            HostCommand::Immigrate {
+                origin_island: IslandId(0),
+                origin_uid: departing,
+            },
+        );
+        destination
+            .drive(ManualInstant::from_nanos(2))
+            .expect("corrected immigrate boundary");
+        applied(&status(&mut destination_port, 2));
+        assert_eq!(destination.world.agent_count(), before + 1);
+    }
+
+    /// A destination that cannot host the organism's brain family refuses the
+    /// arrival AND HANDS THE ORGANISM BACK.
+    ///
+    /// This is the conservation-critical failure path. `WorldState::immigrate`
+    /// returns a `RejectedImmigrant` carrying the organism precisely so this
+    /// branch can re-stage it; an `immigrate` that consumed the migrant to
+    /// produce an error would make its own failure path a silent population loss.
+    #[test]
+    fn bd_emcv_a_refused_arrival_is_re_staged_rather_than_destroyed() {
+        let (mut source, mut source_port) = migration_host(0x5017, 2, true);
+        // No brain family registered here, so the bound migrant cannot be hosted.
+        let (mut destination, mut destination_port) = migration_host(0x5018, 1, false);
+
+        let departing = first_uid(&source);
+        submit(
+            &mut source_port,
+            1,
+            HostCommand::Emigrate {
+                agent_uid: departing,
+            },
+        );
+        source
+            .drive(ManualInstant::from_nanos(1))
+            .expect("emigrate");
+        let migrant = source.take_outbound_migrant().expect("collected");
+        assert_eq!(migrant.brain_kind(), Some(MIGRATION_BRAIN_KIND));
+        destination.stage_immigrant(migrant).expect("staged");
+        let destination_before = destination.world.agent_count();
+        let source_after_departure = source.world.agent_count();
+
+        submit(
+            &mut destination_port,
+            1,
+            HostCommand::Immigrate {
+                origin_island: IslandId(0),
+                origin_uid: departing,
+            },
+        );
+        destination
+            .drive(ManualInstant::from_nanos(1))
+            .expect("refused immigrate boundary");
+
+        assert_eq!(
+            failure_code(&status(&mut destination_port, 1)),
+            "migration_immigrate"
+        );
+        assert_eq!(destination.world.agent_count(), destination_before);
+
+        // THE ORGANISM IS STILL ALIVE and can go home, which is the whole point.
+        let returned = destination
+            .unstage_immigrant()
+            .expect("a refused arrival must remain recoverable");
+        assert_eq!(returned.origin_uid(), departing);
+        source
+            .stage_immigrant(returned)
+            .expect("the source can take it back");
+        submit(
+            &mut source_port,
+            2,
+            HostCommand::Immigrate {
+                origin_island: IslandId(0),
+                origin_uid: departing,
+            },
+        );
+        source
+            .drive(ManualInstant::from_nanos(2))
+            .expect("return immigrate boundary");
+        applied(&status(&mut source_port, 2));
+        assert_eq!(
+            source.world.agent_count(),
+            source_after_departure + 1,
+            "the organism that no world would take must not simply disappear"
         );
     }
 
