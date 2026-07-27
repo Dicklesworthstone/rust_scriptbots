@@ -146,7 +146,7 @@ impl WorldRenderer {
             let (color, color_view) = create_color(&device, format, size)?;
             let view = ViewUniforms::new(&device, &queue, size);
             let mut terrain = TerrainPipeline::new(&device, format, &view);
-            terrain.init_atlas(&device, &queue);
+            terrain.init_atlas(&device, &queue)?;
             let agents = AgentPipeline::new(&device, format, &view);
             Ok((readback, color, color_view, view, terrain, agents))
         });
@@ -541,17 +541,46 @@ fn validate_snapshot(snapshot: &WorldSnapshot<'_>) -> Result<(), ReadbackError> 
 mod capture_smoke_test {
     use super::*;
 
+    /// Acquire an adapter, or report that this host cannot supply live GPU
+    /// evidence and let the caller skip.
+    ///
+    /// These tests used to `.expect("adapter")`, so on a host with no usable
+    /// backend they went RED rather than skipping — observed directly on rch
+    /// worker hz1, which reports `active_backends: Backends(0x0)` while hz2
+    /// offers llvmpipe. A test that fails because the machine has no GPU is
+    /// indistinguishable, in CI output, from a test that fails because the
+    /// renderer broke, and the first kind teaches everyone to ignore the
+    /// second. `scriptbots-bevy` already skips this way via
+    /// `live_gpu_evidence_available`; world-gfx had no equivalent.
+    ///
+    /// Skipping is honest here precisely BECAUSE these are live-GPU claims: a
+    /// host without an adapter has not proven the claim false, it has failed to
+    /// test it, and the difference belongs in the log rather than in the result.
+    fn live_adapter(label: &str) -> Option<wgpu::Adapter> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })) {
+            Ok(adapter) => Some(adapter),
+            Err(error) => {
+                eprintln!(
+                    "skipping {label}: this host exposes no usable wgpu adapter ({error:?}); \
+                     live GPU evidence is unavailable, not disproven"
+                );
+                None
+            }
+        }
+    }
+
     // This executes the real offscreen wgpu pipeline and blocking GPU readback.
     // It is not a GPUI window, Bevy render graph, or on-screen presentation test.
     #[test]
     fn wgpu_offscreen_gpu_framebuffer_readback_is_populated() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .expect("adapter");
+        let Some(adapter) = live_adapter("wgpu offscreen readback smoke") else {
+            return;
+        };
         let size = (640, 360);
         let mut renderer =
             pollster::block_on(WorldRenderer::new(&adapter, size)).expect("renderer");
@@ -632,13 +661,9 @@ mod capture_smoke_test {
     /// evidence needs the DSR lanes this machine does not have.
     #[test]
     fn independent_renderers_produce_byte_identical_frames() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .expect("adapter");
+        let Some(adapter) = live_adapter("independent-renderer determinism") else {
+            return;
+        };
         let size = (320, 180);
         let dims = (64u32, 32u32);
         let tiles = vec![3u32; (dims.0 * dims.1) as usize];
@@ -1017,6 +1042,39 @@ fn validate_readback_layout(
     })
 }
 
+/// Resolve a texture-to-buffer copy layout's non-zero dimensions, or say which
+/// contract broke (bd-2z0.7.11, bd-aqy8).
+///
+/// `copy_texture_to_buffer` requires a non-zero row pitch and row count. Both
+/// call sites previously wrote `NonZeroU32::new(..).unwrap()`, so a zero
+/// PANICKED from inside GPU work — the readback path, which this bead family
+/// requires to be fallible, and `init_atlas`, which runs during initialisation.
+/// In both cases an upstream validator was supposed to make zero impossible,
+/// and that is exactly why the failure was invisible: an invariant enforced in
+/// one place and asserted by panic in another reports a bug as a crash with no
+/// attribution.
+///
+/// Module-scoped on purpose. `ReadbackRing` and `TerrainPipeline` both need it,
+/// and giving each its own copy would recreate the duplicated-invariant problem
+/// this bead family keeps having to undo — one validator, two callers. It is
+/// also pure, so it is exercised without a GPU adapter, which matters because
+/// this crate has none on the remote lane.
+fn copy_layout_dimensions(
+    bytes_per_row: u32,
+    extent: (u32, u32),
+) -> Result<(std::num::NonZeroU32, std::num::NonZeroU32), ReadbackError> {
+    let (width, height) = extent;
+    let rows =
+        std::num::NonZeroU32::new(height).ok_or(ReadbackError::ZeroDimensions { width, height })?;
+    let pitch = std::num::NonZeroU32::new(bytes_per_row).ok_or_else(|| {
+        ReadbackError::Resize(format!(
+            "copy row pitch is zero for a {width}x{height} extent; the layout was \
+             admitted without a copyable row size"
+        ))
+    })?;
+    Ok((pitch, rows))
+}
+
 impl ReadbackRing {
     fn new(
         device: &wgpu::Device,
@@ -1055,35 +1113,6 @@ impl ReadbackRing {
         })
     }
 
-    /// Resolve the copy layout's non-zero dimensions, or say which contract broke.
-    ///
-    /// `copy_texture_to_buffer` requires a non-zero row pitch and row count.
-    /// These were previously `NonZeroU32::new(..).unwrap()`, so a ring whose
-    /// layout had been accepted with a zero row pitch or a zero height
-    /// PANICKED inside the readback path — the one place this bead says must
-    /// return a typed error instead. `validate_readback_layout` should already
-    /// have refused such a ring, which is exactly why the failure was invisible:
-    /// an invariant enforced in one place and asserted by panic in another
-    /// reports a bug as a crash with no attribution.
-    ///
-    /// Split out as a pure function so `copy` and its tests share one decision
-    /// and the check can be exercised without a GPU adapter.
-    fn copy_layout_dimensions(
-        bytes_per_row: u32,
-        extent: (u32, u32),
-    ) -> Result<(std::num::NonZeroU32, std::num::NonZeroU32), ReadbackError> {
-        let (width, height) = extent;
-        let rows = std::num::NonZeroU32::new(height)
-            .ok_or(ReadbackError::ZeroDimensions { width, height })?;
-        let pitch = std::num::NonZeroU32::new(bytes_per_row).ok_or_else(|| {
-            ReadbackError::Resize(format!(
-                "readback row pitch is zero for a {width}x{height} extent; the layout was \
-                 admitted without a copyable row size"
-            ))
-        })?;
-        Ok((pitch, rows))
-    }
-
     fn copy(
         &mut self,
         device: &wgpu::Device,
@@ -1093,7 +1122,7 @@ impl ReadbackRing {
         // Validated BEFORE any slot state is disturbed, so a rejected copy
         // leaves the ring exactly as it was rather than half-reset (bd-2z0.7.11).
         let (bytes_per_row, rows_per_image) =
-            Self::copy_layout_dimensions(self.bytes_per_row, self.extent)?;
+            copy_layout_dimensions(self.bytes_per_row, self.extent)?;
 
         let slot = &mut self.slots[self.curr];
         slot.ready = false;
@@ -1223,6 +1252,43 @@ mod tests {
         visual::{self, SplatInput, TerrainSurfaceInput},
     };
 
+    /// The atlas upload layout goes through the SAME validator as readback.
+    ///
+    /// `atlas_w`/`atlas_h` are derived (`grid_cols * tile_w`,
+    /// `grid_rows * tile_h`), so a misconfigured tile size yields a zero that
+    /// used to panic during GPU initialisation. This pins the shape of the
+    /// atlas call — pitch is `atlas_w * 4` for RGBA8 — against the one shared
+    /// decision, so the two callers cannot drift apart into separate rules.
+    #[test]
+    fn a_degenerate_atlas_extent_is_typed_rather_than_panicking() {
+        // A zero tile size collapses the whole atlas.
+        // Written as a literal zero rather than `0 * 4`: clippy::erasing_op
+        // rejects the multiplication, and the point is the resulting pitch.
+        let error = super::copy_layout_dimensions(0, (0, 64))
+            .expect_err("a zero-width atlas cannot be uploaded");
+        assert!(
+            matches!(error, ReadbackError::ZeroDimensions { .. })
+                || matches!(error, ReadbackError::Resize(_)),
+            "a degenerate atlas must be typed, got {error:?}"
+        );
+
+        // Zero rows: the grid had no rows to bake.
+        let rows_error = super::copy_layout_dimensions(256 * 4, (256, 0))
+            .expect_err("a zero-height atlas cannot be uploaded");
+        match rows_error {
+            ReadbackError::ZeroDimensions { width, height } => {
+                assert_eq!((width, height), (256, 0));
+            }
+            other => panic!("expected ZeroDimensions, got {other:?}"),
+        }
+
+        // The ordinary 3x2 atlas shape still resolves.
+        let (pitch, atlas_rows) = super::copy_layout_dimensions(384 * 4, (384, 256))
+            .expect("a real atlas extent must upload");
+        assert_eq!(pitch.get(), 384 * 4, "RGBA8 pitch is four bytes per texel");
+        assert_eq!(atlas_rows.get(), 256);
+    }
+
     /// A zero row count must be reported, not asserted by panic.
     ///
     /// This path previously read `NonZeroU32::new(self.extent.1).unwrap()`
@@ -1231,7 +1297,7 @@ mod tests {
     /// this bead requires a typed, attributable error.
     #[test]
     fn a_zero_readback_height_is_typed_rather_than_panicking() {
-        let error = super::ReadbackRing::copy_layout_dimensions(256, (640, 0))
+        let error = super::copy_layout_dimensions(256, (640, 0))
             .expect_err("a zero height cannot produce a copyable layout");
         match error {
             ReadbackError::ZeroDimensions { width, height } => {
@@ -1249,7 +1315,7 @@ mod tests {
     /// so — `Resize` is documented as covering unsupported readback layouts.
     #[test]
     fn a_zero_readback_row_pitch_is_typed_rather_than_panicking() {
-        let error = super::ReadbackRing::copy_layout_dimensions(0, (640, 360))
+        let error = super::copy_layout_dimensions(0, (640, 360))
             .expect_err("a zero row pitch cannot produce a copyable layout");
         match error {
             ReadbackError::Resize(message) => {
@@ -1271,7 +1337,7 @@ mod tests {
     /// derived row-pitch symptom.
     #[test]
     fn a_doubly_invalid_layout_reports_the_zero_extent_first() {
-        let error = super::ReadbackRing::copy_layout_dimensions(0, (0, 0))
+        let error = super::copy_layout_dimensions(0, (0, 0))
             .expect_err("nothing about this layout is copyable");
         assert!(
             matches!(error, ReadbackError::ZeroDimensions { .. }),
@@ -1283,7 +1349,7 @@ mod tests {
     /// genuinely impossible.
     #[test]
     fn a_valid_readback_layout_resolves_to_its_dimensions() {
-        let (pitch, rows) = super::ReadbackRing::copy_layout_dimensions(2_560, (640, 360))
+        let (pitch, rows) = super::copy_layout_dimensions(2_560, (640, 360))
             .expect("an aligned 640x360 layout is copyable");
         assert_eq!(pitch.get(), 2_560);
         assert_eq!(rows.get(), 360);
@@ -1326,37 +1392,99 @@ mod tests {
     /// be discovered by comparing frames.
     ///
     /// bd-2z0.7.11 asks that the shipped backends agree on what they produce, or
-    /// that the difference be declared. Terrain, agent body and the nose are now
-    /// routed through `scriptbots_core::visual`. These are not, and each is a
-    /// colour this shader still authors locally. The list is asserted so it
-    /// cannot silently grow, and so removing an entry is a deliberate act that
-    /// shows up in a diff.
+    /// that the difference be declared. Terrain, agent body, the nose and — as of
+    /// bd-rl1h — the diet stripe, wheels and selection rim are routed through
+    /// `scriptbots_core::visual`. What remains is declared here, so it cannot
+    /// silently grow, and so removing an entry is a deliberate act in a diff.
     #[test]
     fn backend_local_agent_chroma_is_declared_not_discovered() {
-        const STILL_BACKEND_LOCAL: [&str; 4] = [
-            "stripe: mixed from local carn/herb colours",
-            "wheels: local speed brightening",
-            "mouth: local hot-event interpolation",
-            "selection rim: local white",
+        // Down from four (bd-rl1h). Each remaining entry names the exact reason
+        // it could not simply follow the nose precedent, because "not done yet"
+        // and "blocked on an input the instance does not carry" need different
+        // work and should not look the same to whoever reads this next.
+        const STILL_BACKEND_LOCAL: [&str; 1] = [
+            "mouth: local hot-event interpolation — core's mouth_activity needs \
+             sound_multiplier, which AgentInstance does not upload",
         ];
         let source = super::agent_shader_source();
 
-        // The declaration is only honest if these really are still local.
+        // The declaration is only honest if this really is still local.
         assert!(
-            source.contains("var stripe = mix(carn_color, herb_color, herbivore);"),
-            "stripe is declared backend-local; if it has been routed through core, \
+            source.contains("let mouth_color = vec3<f32>("),
+            "the mouth is declared backend-local; if it has been routed through core, \
              remove it from STILL_BACKEND_LOCAL rather than leaving a stale claim"
-        );
-        assert!(
-            source.contains("let rim_color = vec3<f32>(1.0, 1.0, 1.0)"),
-            "the selection rim is declared backend-local; update the declaration if \
-             that changed"
         );
         assert_eq!(
             STILL_BACKEND_LOCAL.len(),
-            4,
+            1,
             "shrinking this list is the goal; growing it means a new divergence was \
              introduced without routing it through core"
+        );
+
+        // The three routed this pass must NOT drift back to local authorship.
+        // Asserting their absence is what makes the shrunken list trustworthy:
+        // without it, someone could reintroduce a literal and the count would
+        // still read as progress.
+        for (label, literal) in [
+            (
+                "stripe",
+                "var stripe = mix(carn_color, herb_color, herbivore);",
+            ),
+            ("selection rim", "let rim_color = vec3<f32>(1.0, 1.0, 1.0)"),
+            (
+                "wheels",
+                "let wheel_base_color = vec3<f32>(0.14, 0.16, 0.21);",
+            ),
+        ] {
+            assert!(
+                !source.contains(literal),
+                "{label} was routed through core in bd-rl1h, but its hand-authored \
+                 literal is back in the shader; the backends disagree again"
+            );
+        }
+    }
+
+    /// The routed ornaments must carry CORE's values, not lookalikes.
+    ///
+    /// The stripe endpoints are the reason this matters most. The shader authored
+    /// green/red while core's palette is cyan/magenta — not a drifted value but a
+    /// different scheme, and `visual.rs` restrains genome colour specifically so
+    /// the cyan-to-magenta semantic cannot be erased. Asserting on the generated
+    /// source proves the generation is wired, rather than that two constants
+    /// happen to agree today.
+    #[test]
+    fn the_agent_shader_consumes_the_core_ornament_palette() {
+        let source = super::agent_shader_source();
+        let agents = visual::BIOLUMINESCENT_DARK_FIELD_V1.agents;
+
+        for (label, value) in [
+            ("herbivore", agents.herbivore_srgb),
+            ("carnivore", agents.carnivore_srgb),
+            ("wheel", agents.wheel_srgb),
+            ("selection rim", agents.selection_rim_srgb),
+        ] {
+            let rendered = format!("vec3<f32>({:?}, {:?}, {:?})", value[0], value[1], value[2]);
+            assert!(
+                source.contains(&rendered),
+                "the generated shader must carry core's {label} colour verbatim; \
+                 expected {rendered}"
+            );
+        }
+
+        assert!(
+            source.contains("mix(CORE_AGENT_CARNIVORE_SRGB, CORE_AGENT_HERBIVORE_SRGB, herbivore)"),
+            "the stripe must be derived from the core endpoints, in core's argument \
+             order — swapping them inverts the diet ramp while still looking routed"
+        );
+        assert!(
+            source.contains("CORE_AGENT_WHEEL_SRGB * (0.65 + wheel_left * 0.55)"),
+            "the wheels must use core's single-colour speed brightening, not a mix \
+             between two authored endpoints"
+        );
+        assert!(
+            source.contains("CORE_AGENT_SELECTION_RIM_SRGB * (selection_glow + glow)"),
+            "the selection rim must take its chroma from core and keep glow as a \
+             local intensity"
         );
     }
 
@@ -2131,7 +2259,29 @@ impl TerrainPipeline {
             vbuf_capacity_bytes,
         }
     }
-    fn init_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// Bake and upload the terrain atlas.
+    ///
+    /// # Errors
+    /// Returns [`ReadbackError::ZeroDimensions`] or [`ReadbackError::Resize`]
+    /// when the derived atlas extent cannot describe a texture upload.
+    ///
+    /// `atlas_w`/`atlas_h` are DERIVED (`grid_cols * tile_w`,
+    /// `grid_rows * tile_h`), not constants, so a misconfigured tile size
+    /// produces a zero. This used to reach `NonZeroU32::new(..).unwrap()` and
+    /// abort the process during GPU INITIALISATION, before the renderer even
+    /// existed to report anything (bd-aqy8). Validated up front, so the failure
+    /// is typed and attributable and no GPU resource is created for an extent
+    /// that cannot be uploaded.
+    fn init_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), ReadbackError> {
+        // Checked BEFORE allocating the texture: the same fail-before-mutate
+        // ordering the resize and readback paths already use.
+        let (atlas_pitch, atlas_rows) =
+            copy_layout_dimensions(self.atlas_w * 4, (self.atlas_w, self.atlas_h))?;
+
         // Generate a simple 3x2 atlas (DeepWater, ShallowWater, Sand, Grass, Bloom, Rock)
         self.atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("terrain.atlas.real"),
@@ -2183,8 +2333,8 @@ impl TerrainPipeline {
             &pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(std::num::NonZeroU32::new(self.atlas_w * 4).unwrap().get()),
-                rows_per_image: Some(std::num::NonZeroU32::new(self.atlas_h).unwrap().get()),
+                bytes_per_row: Some(atlas_pitch.get()),
+                rows_per_image: Some(atlas_rows.get()),
             },
             wgpu::Extent3d {
                 width: self.atlas_w,
@@ -2192,7 +2342,7 @@ impl TerrainPipeline {
                 depth_or_array_layers: 1,
             },
         );
-        // refresh bind group to point to the new view
+        // refresh bind group to point to the new view (returns Ok below)
         self.bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("terrain.bg.rebind"),
             layout: &self.bg_layout,
@@ -2207,6 +2357,7 @@ impl TerrainPipeline {
                 },
             ],
         });
+        Ok(())
     }
 
     fn ensure_vbuf_capacity(&mut self, device: &wgpu::Device, needed_bytes: u64) {
@@ -2449,20 +2600,51 @@ fn agent_instance_gpu(agent: &AgentInstance) -> AgentInstanceGpu {
 /// cannot drift: a palette edit in core reaches the GPU without anybody
 /// remembering that this shader exists. Only the small prelude is formatted;
 /// the shader body stays a raw literal, so no brace in it needs escaping.
+/// Extends to the diet stripe, wheels and selection rim (bd-rl1h). Those three
+/// were not merely drifted values — the shader was painting a DIFFERENT COLOUR
+/// SCHEME. It authored `herb_color = (0.24, 0.78, 0.36)` green and
+/// `carn_color = (0.88, 0.26, 0.21)` red, while core's palette is
+/// `herbivore_srgb = [0.18, 0.86, 1.00]` cyan and
+/// `carnivore_srgb = [1.00, 0.60, 0.92]` magenta. `visual.rs` calls that the
+/// "cyan-to-magenta semantic" and deliberately restrains genome colour so it
+/// cannot be erased; world-gfx was erasing it wholesale. The selection rim was
+/// pure white against core's `[0.72, 0.94, 1.00]`.
 fn agent_shader_source() -> String {
-    let halo = scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1
-        .food
-        .halo_srgb;
-    let core = scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1
-        .food
-        .core_srgb;
+    let palette = &scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1;
+    let halo = palette.food.halo_srgb;
+    let core = palette.food.core_srgb;
+    let herbivore = palette.agents.herbivore_srgb;
+    let carnivore = palette.agents.carnivore_srgb;
+    let wheel = palette.agents.wheel_srgb;
+    let rim = palette.agents.selection_rim_srgb;
     format!(
         "// GENERATED from scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1 (bd-2z0.7.11).\n\
          // Do not hand-edit these values; change the palette in core instead.\n\
          const CORE_FOOD_HALO_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
          const CORE_FOOD_CORE_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_AGENT_HERBIVORE_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_AGENT_CARNIVORE_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_AGENT_WHEEL_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_AGENT_SELECTION_RIM_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
          {AGENTS_WGSL}",
-        halo[0], halo[1], halo[2], core[0], core[1], core[2],
+        halo[0],
+        halo[1],
+        halo[2],
+        core[0],
+        core[1],
+        core[2],
+        herbivore[0],
+        herbivore[1],
+        herbivore[2],
+        carnivore[0],
+        carnivore[1],
+        carnivore[2],
+        wheel[0],
+        wheel[1],
+        wheel[2],
+        rim[0],
+        rim[1],
+        rim[2],
     )
 }
 
@@ -2743,12 +2925,15 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
 
   // Wheels
   let wheel_half_length = body_half_length * 0.96;
-  let wheel_base_color = vec3<f32>(0.14, 0.16, 0.21);
-  let wheel_high_color = vec3<f32>(0.38, 0.42, 0.48);
+  // Core authority: visual::agent_visual_params brightens the single canonical
+  // wheel colour by speed, WHEEL_BASE_RGB * (0.65 + clamp01(speed) * 0.55),
+  // rather than interpolating between two authored endpoints. `wheel_left` and
+  // `wheel_right` are already clamped where they are unpacked, so this is core's
+  // expression verbatim (bd-rl1h).
   let left_dist = capsule_distance(vec2<f32>(local.x + wheel_offset, local.y), wheel_half_length, wheel_radius);
   let right_dist = capsule_distance(vec2<f32>(local.x - wheel_offset, local.y), wheel_half_length, wheel_radius);
-  let left_color = mix(wheel_base_color, wheel_high_color, wheel_left);
-  let right_color = mix(wheel_base_color, wheel_high_color, wheel_right);
+  let left_color = CORE_AGENT_WHEEL_SRGB * (0.65 + wheel_left * 0.55);
+  let right_color = CORE_AGENT_WHEEL_SRGB * (0.65 + wheel_right * 0.55);
   layer(&accum_rgb, &accum_alpha, left_color, smooth_mask(left_dist));
   layer(&accum_rgb, &accum_alpha, right_color, smooth_mask(right_dist));
 
@@ -2757,9 +2942,13 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   layer(&accum_rgb, &accum_alpha, body_color, body_mask);
 
   // Diet stripe
-  let herb_color = vec3<f32>(0.24, 0.78, 0.36);
-  let carn_color = vec3<f32>(0.88, 0.26, 0.21);
-  var stripe = mix(carn_color, herb_color, herbivore);
+  // Core authority: visual::diet_stripe_color is
+  // mix_vec3(CARNIVORE_RGB, HERBIVORE_RGB, clamp01(herbivore_tendency)), and
+  // `herbivore` is already clamped where it is unpacked. WGSL mix is
+  // a + (b - a) * t, identical to core's mix_vec3, so this is the same value
+  // rather than a lookalike. The hand-authored green/red endpoints were not a
+  // drifted palette but a different scheme entirely (bd-rl1h).
+  var stripe = mix(CORE_AGENT_CARNIVORE_SRGB, CORE_AGENT_HERBIVORE_SRGB, herbivore);
   let blood_tint = clamp(0.7 + trait_blood * 0.2, 0.8, 1.35);
   stripe = clamp(stripe * blood_tint, vec3<f32>(0.0), vec3<f32>(1.2));
   let stripe_dist = capsule_distance(local, body_half_length * 0.82, body_radius * 0.45);
@@ -2872,7 +3061,12 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let rim_width = max(fwidth(body_dist), 0.001) * 1.5;
   // Same reversed-edge fix as smooth_mask: 1 - smoothstep(-w, 0, x), never smoothstep(0, -w, x).
   let rim = 1.0 - smoothstep(-rim_width, 0.0, body_dist + body_radius * 0.15);
-  let rim_color = vec3<f32>(1.0, 1.0, 1.0) * (selection_glow + glow);
+  // Core authority: visual::agent_visual_params sets selection_rim_color from
+  // the palette's agents.selection_rim_srgb. The local literal was pure white,
+  // which is not that colour — the rim read as untinted here and cyan-tinted in
+  // every core-authoritative backend (bd-rl1h). The glow scaling stays local:
+  // it is an intensity, not a chroma, and core does not author it.
+  let rim_color = CORE_AGENT_SELECTION_RIM_SRGB * (selection_glow + glow);
   layer(&accum_rgb, &accum_alpha, rim_color, rim);
 
   // Boost tint overlay
