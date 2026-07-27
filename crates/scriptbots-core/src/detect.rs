@@ -707,6 +707,15 @@ pub fn bimodality_with_work(
     Ok((score, work))
 }
 
+// bd-16g.2.11: the three passes and the boundary search are one algorithm and are
+// reviewed as a unit — splitting them would mean threading the histogram arrays and
+// the work counters through helper signatures, which obscures the linear-pass
+// structure this function exists to make obvious. Mirrors the existing lint policy
+// used for the digest encoder in lib.rs.
+#[allow(
+    clippy::too_many_lines,
+    reason = "single algorithm, reviewed as a unit"
+)]
 fn bimodality_inner(
     values: &[f64],
     params: BimodalityParams,
@@ -744,6 +753,14 @@ fn bimodality_inner(
         }
     }
 
+    // Exact equality is the correct test here, not a tolerance: `min == max` holds
+    // precisely when every sample is bitwise identical, which is the condition being
+    // detected. An epsilon would wrongly collapse a genuinely narrow-but-real split,
+    // and this primitive is scale-free — "narrow" is not meaningful to it.
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact extent equality is the intended test"
+    )]
     if min == max {
         // Every value identical: no split exists. Detected from the extent rather
         // than from a failed search, so it costs nothing and cannot be confused
