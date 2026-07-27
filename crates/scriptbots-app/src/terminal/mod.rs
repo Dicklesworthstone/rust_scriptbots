@@ -5193,6 +5193,82 @@ pub fn is_reduced_motion_requested() -> bool {
     std::env::var("SCRIPTBOTS_REDUCED_MOTION").is_ok() || std::env::var("NO_COLOR").is_ok()
 }
 
+/// Why motion was reduced, or that it was not.
+///
+/// Carries the CAUSE rather than a bare bool because the causes are not
+/// interchangeable: a capability reduction is a statement about what the terminal
+/// can do, an environment request is a statement about what the operator wants,
+/// and only one of those may be overridden (bd-2z0.14.2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionPolicy {
+    /// Every source permits motion.
+    Full,
+    /// The operator asked for reduced motion via `SCRIPTBOTS_REDUCED_MOTION`.
+    ReducedByEnvironment,
+    /// `NO_COLOR` is set, or the probed terminal reports no colour at all.
+    ReducedByCapability,
+    /// The requested quality tier does not budget for animation.
+    ReducedByQualityTier,
+    /// The persisted run config asked for it, and nothing stronger applied.
+    ReducedByConfig,
+}
+
+impl MotionPolicy {
+    /// Whether non-essential motion must be suppressed.
+    #[must_use]
+    pub const fn is_reduced(self) -> bool {
+        !matches!(self, Self::Full)
+    }
+}
+
+/// Resolve the one motion policy from every source that gets a say.
+///
+/// THE PRECEDENCE RULE, stated once here because the acceptance criterion asks
+/// for exactly one and a rule that lives in several places is not a rule:
+/// REDUCTION IS ONE-WAY. Any source that asks for less motion wins, and an
+/// explicit request FOR motion cannot overturn a safety or capability reduction.
+/// So `Some(false)` in the run config means "I do not need it reduced", never
+/// "reduce nothing" — it is a preference, and it only decides the outcome when no
+/// stronger source has already spoken.
+///
+/// Getting this backwards is invisible in the obvious direction. If config
+/// naively won, a saved `reduced_motion: false` would re-enable animation on a
+/// terminal that reports no colour, or on a Potato tier chosen precisely because
+/// the machine cannot afford it — and nothing on screen would say why it got
+/// slower or started flickering. The failure only shows up on someone else's
+/// hardware.
+///
+/// Order within the reduced causes is reporting only: they all suppress motion,
+/// and the variant exists so a log or a panel can say which one decided.
+#[must_use]
+pub fn resolve_motion_policy(
+    config_reduced_motion: Option<bool>,
+    env_requests_reduced: bool,
+    terminal_has_colour: bool,
+    quality: Option<scriptbots_core::RenderQuality>,
+) -> MotionPolicy {
+    // Capability first: what the terminal can actually do is not negotiable.
+    if !terminal_has_colour {
+        return MotionPolicy::ReducedByCapability;
+    }
+    // Then the operator's explicit environment request, which is a safety
+    // preference (motion sensitivity) rather than a taste one.
+    if env_requests_reduced {
+        return MotionPolicy::ReducedByEnvironment;
+    }
+    // Then the tier: Potato is chosen because the machine cannot afford more.
+    if matches!(quality, Some(scriptbots_core::RenderQuality::Potato)) {
+        return MotionPolicy::ReducedByQualityTier;
+    }
+    // Only now does the persisted preference decide, and only in the reducing
+    // direction — `Some(false)` and `None` both land on Full precisely because
+    // nothing above asked for less.
+    if config_reduced_motion == Some(true) {
+        return MotionPolicy::ReducedByConfig;
+    }
+    MotionPolicy::Full
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CuratedThemeId {
     /// bd-9pqz art direction, derived from `visual::BIOLUMINESCENT_DARK_FIELD_V1`.
@@ -9241,6 +9317,94 @@ mod tests {
     /// projection, and a panel that advanced the simulation would corrupt the
     /// run an experimenter is observing.
     #[test]
+    /// AN EXPLICIT MOTION REQUEST MUST NOT OVERTURN A SAFETY OR CAPABILITY
+    /// REDUCTION.
+    ///
+    /// This is the acceptance criterion stated as a property, and it is the one
+    /// that fails silently in the dangerous direction. If the persisted config
+    /// naively won, a saved `reduced_motion: false` would re-enable animation on a
+    /// terminal reporting no colour, or on a Potato tier chosen because the
+    /// machine cannot afford more — and nothing on screen would explain why it got
+    /// slower or started flickering. The bug only appears on someone else's
+    /// hardware (bd-2z0.14.2.4).
+    ///
+    /// Drives every combination of the three reducing sources against an explicit
+    /// `Some(false)`, rather than one example, because a precedence rule is only
+    /// as good as its worst ordering.
+    #[test]
+    fn an_explicit_motion_request_cannot_override_a_reduction() {
+        for env in [false, true] {
+            for colour in [false, true] {
+                for quality in [
+                    None,
+                    Some(scriptbots_core::RenderQuality::Potato),
+                    Some(scriptbots_core::RenderQuality::High),
+                ] {
+                    let any_reduction = env
+                        || !colour
+                        || matches!(quality, Some(scriptbots_core::RenderQuality::Potato));
+                    if !any_reduction {
+                        continue;
+                    }
+                    // The operator explicitly asked FOR motion.
+                    let policy = resolve_motion_policy(Some(false), env, colour, quality);
+                    assert!(
+                        policy.is_reduced(),
+                        "env={env} colour={colour} quality={quality:?}: an explicit \
+                         reduced_motion=false overturned a reduction and produced \
+                         {policy:?}. Reduction must be one-way"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Capability outranks every preference, and the cause is reported.
+    #[test]
+    fn a_terminal_without_colour_is_reduced_whatever_anyone_asked_for() {
+        for config in [None, Some(false), Some(true)] {
+            let policy = resolve_motion_policy(
+                config,
+                false,
+                false,
+                Some(scriptbots_core::RenderQuality::High),
+            );
+            assert_eq!(
+                policy,
+                MotionPolicy::ReducedByCapability,
+                "config={config:?}: a terminal reporting no colour must reduce by \
+                 CAPABILITY, and must say so — the cause is what lets a log explain \
+                 the decision"
+            );
+        }
+    }
+
+    /// The config may still REDUCE, which is the half that must keep working.
+    ///
+    /// The negative control for the rule above: if the precedence were implemented
+    /// as "ignore the config", every assertion in this module would still pass
+    /// while the persisted preference silently did nothing.
+    #[test]
+    fn the_config_can_still_ask_for_reduction_when_nothing_stronger_applies() {
+        assert_eq!(
+            resolve_motion_policy(Some(true), false, true, None),
+            MotionPolicy::ReducedByConfig,
+            "with no stronger source, a persisted reduced_motion=true must decide"
+        );
+        assert_eq!(
+            resolve_motion_policy(Some(false), false, true, None),
+            MotionPolicy::Full,
+            "with no reducing source at all, an explicit request for motion must be \
+             honoured — otherwise the setting is decorative"
+        );
+        assert_eq!(
+            resolve_motion_policy(None, false, true, None),
+            MotionPolicy::Full,
+            "an unset preference must not itself reduce; None is 'no opinion', not \
+             'reduce'"
+        );
+    }
+
     /// The probe panel must say the reading is a counterfactual, in both views.
     ///
     /// bd-r7cz is a conflict between bd-16g.4's criterion ("every displayed
