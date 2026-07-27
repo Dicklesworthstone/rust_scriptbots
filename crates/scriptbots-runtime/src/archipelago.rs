@@ -119,7 +119,15 @@ pub const MAX_ISLANDS: usize = 64;
 const ARCHIPELAGO_COMMAND_NAMESPACE: u64 = u64::MAX - 1;
 
 /// Versioned tag for per-island RNG seed derivation (provisional, bd-16g.5.3).
-const ISLAND_RNG_SEED_TAG: &str = "scriptbots.archipelago.island-rng-seed.v1";
+/// v2 (bd-cxcf): [`IslandId`] widened from `u16` to the canonical `u32`, so
+/// `derive_island_value` now folds FOUR bytes of island id instead of two and every
+/// island seed changes.
+///
+/// Per the bd-2z0.5.6 digest policy the change goes INTO the derivation and the version
+/// tag moves with it, rather than being smuggled in silently: runs seeded under v1 are
+/// NOT COMPARABLE to runs seeded under v2, which is a different statement from their
+/// digests disagreeing. The tag is the only thing that lets a reader tell those apart.
+const ISLAND_RNG_SEED_TAG: &str = "scriptbots.archipelago.island-rng-seed.v2";
 
 /// Versioned tag for per-island host session identity derivation.
 const ISLAND_SESSION_TAG: &str = "scriptbots.archipelago.island-session.v1";
@@ -161,15 +169,12 @@ fn derive_island_value(tag: &str, master_seed: u64, island: IslandId) -> u64 {
 }
 
 /// Stable identity of one island inside an archipelago.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct IslandId(pub u16);
-
-impl std::fmt::Display for IslandId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "island-{}", self.0)
-    }
-}
+///
+/// Re-exported from core (bd-cxcf) so the archipelago, the migrator and the RNG
+/// derivation all speak one type. This was a local `u16` newtype; widening it to the
+/// canonical `u32` changes how many bytes the seed derivation hashes, which is why
+/// [`ISLAND_RNG_SEED_TAG`] moved to v2.
+pub use scriptbots_core::rng_domains::IslandId;
 
 /// One island's declared scenario: identity, human label, and complete config.
 ///
@@ -1376,7 +1381,7 @@ mod tests {
         }
     }
 
-    fn spec(id: u16, config: ScriptBotsConfig) -> IslandSpec {
+    fn spec(id: u32, config: ScriptBotsConfig) -> IslandSpec {
         IslandSpec {
             id: IslandId(id),
             label: format!("test-island-{id}"),
@@ -1419,7 +1424,7 @@ mod tests {
         ));
 
         let excessive = (0..=MAX_ISLANDS)
-            .map(|id| spec(u16::try_from(id).expect("small id"), test_config(None)))
+            .map(|id| spec(u32::try_from(id).expect("small id"), test_config(None)))
             .collect();
         assert!(matches!(
             Archipelago::new(archipelago_config(excessive, 1)),
@@ -1624,7 +1629,8 @@ mod tests {
         let island_specs: Vec<IslandSpec> = (0..8)
             .map(|id| {
                 let mut config = populated_config(None);
-                config.food_growth_rate = 0.01f32.mul_add(f32::from(id), 0.01);
+                config.food_growth_rate =
+                    0.01f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.01);
                 spec(id, config)
             })
             .collect();
@@ -1651,7 +1657,8 @@ mod tests {
         let island_specs: Vec<IslandSpec> = (0..4)
             .map(|id| {
                 let mut config = populated_config(None);
-                config.food_growth_rate = 0.01f32.mul_add(f32::from(id), 0.01);
+                config.food_growth_rate =
+                    0.01f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.01);
                 spec(id, config)
             })
             .collect();
@@ -1682,7 +1689,8 @@ mod tests {
         let island_specs: Vec<IslandSpec> = (0..4)
             .map(|id| {
                 let mut config = populated_config(None);
-                config.food_growth_rate = 0.02f32.mul_add(f32::from(id), 0.01);
+                config.food_growth_rate =
+                    0.02f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.01);
                 spec(id, config)
             })
             .collect();
@@ -1702,7 +1710,7 @@ mod tests {
         for (index, island_report) in report.islands.iter().enumerate() {
             assert_eq!(
                 island_report.island,
-                IslandId(u16::try_from(index).expect("small index"))
+                IslandId(u32::try_from(index).expect("small index"))
             );
             assert_eq!(island_report.world_tick, Tick(75));
             assert_eq!(island_report.ticks_stepped, 25);
@@ -1965,7 +1973,7 @@ mod tests {
         // Island 0 stepped to the barrier tick internally before island 1
         // faulted, but no exposed view may show that: every committed snapshot
         // stays at the prior boundary and digests refuse while latched.
-        for id in [0_u16, 1] {
+        for id in [0_u32, 1] {
             let snapshot = archipelago
                 .island_snapshot(IslandId(id))
                 .expect("committed snapshot exists");
@@ -2022,7 +2030,8 @@ mod tests {
         let island_specs: Vec<IslandSpec> = (0..4)
             .map(|id| {
                 let mut config = populated_config(None);
-                config.food_growth_rate = 0.02f32.mul_add(f32::from(id), 0.01);
+                config.food_growth_rate =
+                    0.02f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.01);
                 spec(id, config)
             })
             .collect();
@@ -2037,7 +2046,7 @@ mod tests {
         assert!(archipelago.latched().is_none());
 
         let mut digests = Vec::new();
-        for id in 0..4_u16 {
+        for id in 0..4_u32 {
             let snapshot = archipelago
                 .island_snapshot(IslandId(id))
                 .expect("committed snapshot");

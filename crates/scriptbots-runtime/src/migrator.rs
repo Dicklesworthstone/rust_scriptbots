@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Unique identifier for an island within an archipelago.
-pub type IslandId = u32;
+pub use scriptbots_core::rng_domains::IslandId;
 
 /// Emigrant selection strategy for migration barriers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,15 +329,22 @@ mod tests {
     #[test]
     fn test_ring_topology_build_edges() {
         let topo = MigrationTopology::Ring;
-        let edges = topo.build_edges(&[0, 1, 2]);
-        assert_eq!(edges, vec![(0, 1), (1, 2), (2, 0)]);
+        let edges = topo.build_edges(&[IslandId(0), IslandId(1), IslandId(2)]);
+        assert_eq!(
+            edges,
+            vec![
+                (IslandId(0), IslandId(1)),
+                (IslandId(1), IslandId(2)),
+                (IslandId(2), IslandId(0)),
+            ]
+        );
     }
 
     #[test]
     fn test_fittest_selection_with_uid_tiebreak() {
         let mut candidates = BTreeMap::new();
         candidates.insert(
-            0,
+            IslandId(0),
             vec![
                 CandidateAgent {
                     uid: 10,
@@ -363,7 +369,7 @@ mod tests {
                 },
             ],
         );
-        candidates.insert(1, vec![]);
+        candidates.insert(IslandId(1), vec![]);
 
         let config = MigrationConfig {
             interval_ticks: 100,
@@ -385,7 +391,7 @@ mod tests {
     fn test_two_phase_no_duplicate_emigration() {
         let mut candidates = BTreeMap::new();
         candidates.insert(
-            0,
+            IslandId(0),
             vec![CandidateAgent {
                 uid: 1,
                 energy: 1.0,
@@ -394,8 +400,8 @@ mod tests {
                 speed: 0.1,
             }],
         );
-        candidates.insert(1, vec![]);
-        candidates.insert(2, vec![]);
+        candidates.insert(IslandId(1), vec![]);
+        candidates.insert(IslandId(2), vec![]);
 
         let config = MigrationConfig {
             interval_ticks: 100,
@@ -425,7 +431,7 @@ mod tests {
                     speed: (i as f32) * 0.05,
                 })
                 .collect();
-            candidates.insert(id, agents);
+            candidates.insert(IslandId(id), agents);
         }
 
         let config = MigrationConfig::default();
@@ -468,7 +474,7 @@ mod tests {
     fn bd_16g_5_2_random_selection_changes_across_barriers() {
         let mut candidates = BTreeMap::new();
         candidates.insert(
-            0u32,
+            IslandId(0),
             (1..=12u64)
                 .map(|uid| CandidateAgent {
                     uid,
@@ -480,7 +486,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         candidates.insert(
-            1u32,
+            IslandId(1),
             (100..=111u64)
                 .map(|uid| CandidateAgent {
                     uid,
@@ -546,19 +552,19 @@ mod tests {
         let master = 0xFEED_FEED_FEED_FEED_u64;
 
         let mut two = BTreeMap::new();
-        two.insert(0u32, agents(1));
-        two.insert(1u32, agents(100));
+        two.insert(IslandId(0), agents(1));
+        two.insert(IslandId(1), agents(100));
         let small = select_emigrants(&two, &config, master, 3).expect("two islands");
 
         let mut three = two.clone();
-        three.insert(2u32, agents(200));
+        three.insert(IslandId(2), agents(200));
         let large = select_emigrants(&three, &config, master, 3).expect("three islands");
 
         let edge_moves = |report: &BarrierReport| {
             report
                 .moves
                 .iter()
-                .filter(|m| m.from_island == 0 && m.to_island == 1)
+                .filter(|m| m.from_island == IslandId(0) && m.to_island == IslandId(1))
                 .map(|m| m.agent_uid)
                 .collect::<Vec<_>>()
         };

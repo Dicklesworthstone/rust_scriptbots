@@ -191,9 +191,26 @@ pub const ISLAND_RNG_DERIVATION_V1: &str = "scriptbots.island-rng-domains.v1";
 /// Derivation identity for the migration stream (bd-16g.5.3).
 pub const MIGRATION_RNG_DERIVATION_V1: &str = "scriptbots.island-migration-rng.v1";
 
-/// Stable index of one island within an archipelago (bd-16g.5.3).
+/// Stable index of one island within an archipelago.
+///
+/// THE CANONICAL ISLAND IDENTITY (bd-cxcf). Three incompatible definitions used to exist
+/// -- a bare `u32` alias in the migrator, a `u16` newtype in the archipelago, and this --
+/// so the migrator and the archipelago could not exchange an island id despite living in
+/// one crate. That is why `select_emigrants` never had a caller and no agent had ever
+/// moved between islands.
+///
+/// It lives in core because both runtime modules depend on core, and it is a newtype
+/// rather than an alias so an island index can never be passed where a count or a raw
+/// `u32` is expected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct IslandId(pub u32);
+
+impl std::fmt::Display for IslandId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "island-{}", self.0)
+    }
+}
 
 /// Seed for one island's stream in one domain (bd-16g.5.3).
 ///

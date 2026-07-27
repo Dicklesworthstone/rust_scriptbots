@@ -1132,7 +1132,7 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         }
         let specs: Vec<IslandSpec> = (0..island_count)
             .map(|id| IslandSpec {
-                id: IslandId(id as u16),
+                id: IslandId(u32::try_from(id).expect("island index fits u32")),
                 label: format!("island-{id}"),
                 config: base_config.clone(),
             })
@@ -1157,7 +1157,7 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         let mut cell_digests = Vec::new();
         for i in 0..island_count {
             let digest = arch
-                .island_digest(IslandId(i as u16))
+                .island_digest(IslandId(u32::try_from(i).expect("island index fits u32")))
                 .context("island digest")?
                 .overall;
             cell_digests.push(digest);
