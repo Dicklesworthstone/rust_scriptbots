@@ -1,5 +1,7 @@
 //! Analysis layer: effect sizes with CIs over matched-seed run summaries (bd-16g.1.4).
 
+use rand::Rng;
+use scriptbots_core::SmallRngStream;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
@@ -789,20 +791,15 @@ pub fn bootstrap_ci(values: &[f64], iters: usize, seed: u64) -> Result<(f64, f64
     let mut ordered = values.to_vec();
     ordered.sort_by(f64::total_cmp);
     let mut means = Vec::with_capacity(iters);
-    let mut current_seed = seed;
+    let mut rng = SmallRngStream::seed_from_u64(seed);
 
     for _ in 0..iters {
         let sample_sum = compensated_sum((0..ordered.len()).map(|_| {
-            // LCG deterministic pseudorandom index selection.
-            current_seed = current_seed
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            let divisor =
-                u64::try_from(ordered.len()).expect("slice length always fits the target u64");
-            let bounded_index = current_seed % divisor;
-            let index =
-                usize::try_from(bounded_index).expect("modulo slice length always fits usize");
-            ordered[index]
+            // Use the project's portable scientific stream. A previous bespoke LCG
+            // selected with `% len`; for power-of-two sample sizes its short low-bit
+            // cycle could make every replicate the same multiset and collapse a
+            // genuinely data-derived interval.
+            ordered[rng.random_range(0..ordered.len())]
         }));
         means.push(sample_sum / ordered.len() as f64);
     }

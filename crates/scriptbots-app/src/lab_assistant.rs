@@ -1157,12 +1157,12 @@ mod tests {
                 &validated.spec.falsifier,
             )
             .expect("analysis retains exact run provenance");
-            NotebookRenderer::render_markdown(
-                &validated.spec.hypothesis,
-                &claims,
-                &run_refs(summaries),
-            )
-            .expect("verified analysis renders")
+            let goal = format!(
+                "{}\n\n- Validated Spec ID: {}",
+                validated.spec.hypothesis, validated.spec_id
+            );
+            NotebookRenderer::render_markdown(&goal, &claims, &run_refs(summaries))
+                .expect("verified analysis renders")
         };
         let mut reordered = first_lab.run_summaries.clone();
         reordered.reverse();
