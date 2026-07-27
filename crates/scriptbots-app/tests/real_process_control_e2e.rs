@@ -364,3 +364,107 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
 
     Ok(())
 }
+
+/// DETERMINISTIC REPRODUCTION OF bd-w1oi, not a fix.
+///
+/// bd-w1oi records that `--mode server` stops simulating with
+/// "persistence did not acknowledge completed simulation tick 420 (Indeterminate):
+/// storage Admit timed out during Acknowledgement at :memory: after 120s". It was
+/// observed ONCE, incidentally, while the E2E above was failing for an unrelated
+/// reason. That left the bead's cheapest open question unanswered: is the tick
+/// number STABLE (a capacity boundary) or does it vary (a race)? A stable number
+/// points at a bound to find; a varying one points at a timing bug. This answers
+/// that by driving the shipped binary and reporting the tick it actually dies on.
+///
+/// It is a REPRODUCTION ONLY. The fix belongs to whoever owns the storage/runtime
+/// path — those files are mid-cutover and I have not touched them. What this
+/// contributes is that the next person does not have to reproduce it first.
+///
+/// #[ignore]d because it costs ~5 minutes of wall clock by construction: the
+/// failure is a 120s acknowledgement deadline elapsing after several minutes of
+/// simulation. That is a SLOW test, which is a different reason from the
+/// unverified-test ignore this file used to carry — this one has been observed
+/// doing exactly what it claims.
+#[test]
+#[serial]
+#[ignore = "bd-w1oi reproduction: ~5 minutes by construction (a 120s storage deadline \
+            after minutes of simulation). Run explicitly: cargo test -p scriptbots-app \
+            --test real_process_control_e2e -- --ignored bd_w1oi --nocapture"]
+fn bd_w1oi_server_mode_stops_simulating_on_a_storage_acknowledgement_timeout() -> Result<()> {
+    let run_dir = tempdir()?;
+    let mut child = Command::new(binary())
+        .args(["--mode", "server", "--storage", "memory"])
+        .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
+        .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_CONTROL_MCP", "disabled")
+        .env("RUST_LOG", "warn,scriptbots_app=info")
+        .current_dir(run_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn the shipped binary")?;
+
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("child stderr was not captured"))?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(std::result::Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Generous but bounded: the observed failure was ~5 minutes in, and a run that
+    // does NOT fail is itself a result worth reporting rather than hanging on.
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut failure: Option<String> = None;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                if line.contains("Simulation step failed in server mode") {
+                    failure = Some(line);
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let Some(failure) = failure else {
+        // NOT a pass. If the defect did not reproduce, the bead needs that recorded
+        // just as much — it would mean the tick number is not stable and the cause
+        // is timing-dependent.
+        panic!(
+            "bd-w1oi did NOT reproduce within 600s. That is a RESULT, not a success: \
+             it means the failure is not deterministic on this host, and the bead's \
+             'is tick 420 stable' question is answered NO. Record it there."
+        );
+    };
+
+    // Report the tick it actually died on, so a second run's number can be compared
+    // against 420 without re-reading logs.
+    let tick = failure
+        .split("tick ")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unparsed".to_string());
+    println!(
+        "{{\"schema\":\"scriptbots.bd-w1oi-repro.v1\",\"reproduced\":true,\"failure_tick\":\"{tick}\",\
+         \"first_observed_tick\":\"420\",\"stable\":{},\"detail\":{:?}}}",
+        tick == "420",
+        failure.trim()
+    );
+    Ok(())
+}
