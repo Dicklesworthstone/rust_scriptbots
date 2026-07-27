@@ -587,47 +587,50 @@ impl ControlHandle {
     /// Build a tail of recent narrative events from the world's tick history.
     /// Events include births, deaths, and combat spike hits.
     pub fn events_tail(&self, limit: usize) -> Result<Vec<EventEntry>, ControlError> {
-        let world = self.lock_world()?;
+        // Answered before the lock is taken. This used to sit AFTER it, so a
+        // limit=0 request contended on the world mutex to return an empty vec.
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // The limit arrives unclamped from the query string; cap it so a hostile
-        // request cannot reserve unbounded memory (history yields ≤3 events/tick).
-        let limit = limit.min(world.history().count().saturating_mul(3).max(1));
-        let mut events = Vec::with_capacity(limit);
-        for summary in world.history().rev() {
-            if summary.births > 0 {
-                events.push(EventEntry::new(
-                    summary.tick.0,
-                    EventKind::Birth,
-                    saturating_u32(summary.births),
-                ));
-                if events.len() >= limit {
-                    break;
+        self.with_world(|world| {
+            // The limit arrives unclamped from the query string; cap it so a hostile
+            // request cannot reserve unbounded memory (history yields ≤3 events/tick).
+            let limit = limit.min(world.history().count().saturating_mul(3).max(1));
+            let mut events = Vec::with_capacity(limit);
+            for summary in world.history().rev() {
+                if summary.births > 0 {
+                    events.push(EventEntry::new(
+                        summary.tick.0,
+                        EventKind::Birth,
+                        saturating_u32(summary.births),
+                    ));
+                    if events.len() >= limit {
+                        break;
+                    }
+                }
+                if summary.deaths > 0 {
+                    events.push(EventEntry::new(
+                        summary.tick.0,
+                        EventKind::Death,
+                        saturating_u32(summary.deaths),
+                    ));
+                    if events.len() >= limit {
+                        break;
+                    }
+                }
+                if summary.spike_hits > 0 {
+                    events.push(EventEntry::new(
+                        summary.tick.0,
+                        EventKind::Combat,
+                        summary.spike_hits,
+                    ));
+                    if events.len() >= limit {
+                        break;
+                    }
                 }
             }
-            if summary.deaths > 0 {
-                events.push(EventEntry::new(
-                    summary.tick.0,
-                    EventKind::Death,
-                    saturating_u32(summary.deaths),
-                ));
-                if events.len() >= limit {
-                    break;
-                }
-            }
-            if summary.spike_hits > 0 {
-                events.push(EventEntry::new(
-                    summary.tick.0,
-                    EventKind::Combat,
-                    summary.spike_hits,
-                ));
-                if events.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(events)
+            events
+        })
     }
 
     /// Render a coarse ASCII map of terrain, food, and agents — the server-side
