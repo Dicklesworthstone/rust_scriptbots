@@ -440,14 +440,32 @@ impl ControlHandle {
         }
     }
 
+    /// The ONE place a control read reaches world state.
+    ///
+    /// bd-88yj retires `SharedWorld` from `ControlHandle` in favour of a
+    /// HostClient port. Fourteen production call sites each took the lock
+    /// directly, so "reads go through the port" would have meant fourteen
+    /// simultaneous edits with nothing working until the last one landed. This
+    /// is the seam that makes the port a one-place change instead: every read
+    /// now borrows the world through here, so swapping the body for a snapshot
+    /// poll does not touch a single caller.
+    ///
+    /// It is a read seam on purpose. Nothing here hands out `&mut WorldState` -
+    /// mutation belongs to the applier behind the command bus, which is the
+    /// distinction bd-tgfz established and which cannot hold while any control
+    /// surface can still reach in and write.
+    fn with_world<R>(&self, read: impl FnOnce(&WorldState) -> R) -> Result<R, ControlError> {
+        let world = self.lock_world()?;
+        Ok(read(&world))
+    }
+
     fn lock_world(&self) -> Result<MutexGuard<'_, WorldState>, ControlError> {
         self.shared_world.lock().map_err(|err| err.into())
     }
 
     /// Retrieve the current configuration snapshot.
     pub fn snapshot(&self) -> Result<ConfigSnapshot, ControlError> {
-        let world = self.lock_world()?;
-        ConfigSnapshot::from_world(world.config(), world.tick())
+        self.with_world(|world| ConfigSnapshot::from_world(world.config(), world.tick()))?
     }
 
     /// Retrieve the latest tick summary from the running world.
@@ -483,8 +501,7 @@ impl ControlHandle {
         &self,
         query: AgentDebugQuery,
     ) -> Result<Vec<AgentDebugInfo>, ControlError> {
-        let world = self.lock_world()?;
-        Ok(world.agent_debug_view(query))
+        self.with_world(|world| world.agent_debug_view(query))
     }
 
     /// Submit a selection update and return its admission receipt.
@@ -526,8 +543,7 @@ impl ControlHandle {
 
     /// Retrieve the current status summary of the running simulation.
     pub fn status(&self) -> Result<SimulationStatusDto, ControlError> {
-        let world = self.lock_world()?;
-        Ok(SimulationStatusDto {
+        self.with_world(|world| SimulationStatusDto {
             tick: world.tick().0,
             agent_count: world.agent_count(),
             is_closed: world.is_closed(),
@@ -537,28 +553,24 @@ impl ControlHandle {
 
     /// Retrieve a snapshot of the current hydrology state, if available.
     pub fn hydrology_snapshot(&self) -> Result<Option<HydrologySnapshot>, ControlError> {
-        let world = self.lock_world()?;
-        Ok(world.hydrology().map(HydrologySnapshot::from_state))
+        self.with_world(|world| world.hydrology().map(HydrologySnapshot::from_state))
     }
 
     /// Flatten the configuration into individual knob descriptors for discovery.
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
-        let rev = {
-            let world = self.lock_world()?;
-            world.config_revision()
-        };
+        let rev = self.with_world(WorldState::config_revision)?;
         if let Some((cached_rev, cached)) = lock_cache(&self.knobs_cache).as_ref()
             && *cached_rev == rev
         {
             return Ok(cached.clone());
         }
-        let (rev2, config_value) = {
-            let world = self.lock_world()?;
-            let rev2 = world.config_revision();
-            let value =
-                serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
-            (rev2, value)
-        };
+        let (rev2, config_value) = self.with_world(|world| {
+            (
+                world.config_revision(),
+                serde_json::to_value(world.config()),
+            )
+        })?;
+        let config_value = config_value.map_err(ControlError::serialization)?;
         let mut entries = Vec::with_capacity(256);
         let mut prefix = String::new();
         flatten_value(&mut prefix, &config_value, &mut entries);
@@ -568,8 +580,7 @@ impl ControlHandle {
 
     /// Retrieve the configuration audit log accumulated since startup.
     pub fn audit(&self) -> Result<Vec<ConfigAuditEntry>, ControlError> {
-        let world = self.lock_world()?;
-        Ok(world.config_audit().to_vec())
+        self.with_world(|world| world.config_audit().to_vec())
     }
 
     /// Build a tail of recent narrative events from the world's tick history.
@@ -891,10 +902,7 @@ impl ControlHandle {
         cmd: ControlCommand,
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
-        let (tick, rev) = {
-            let world = self.lock_world()?;
-            (world.tick().0, world.config_revision())
-        };
+        let (tick, rev) = self.with_world(|world| (world.tick().0, world.config_revision()))?;
         let mut cache = lock_cache(&self.status_cache);
         if let Some(key) = idempotency_key
             && let Some(existing) = cache.get(key)
