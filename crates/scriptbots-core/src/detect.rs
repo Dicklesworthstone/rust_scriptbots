@@ -990,6 +990,28 @@ pub enum DetectionKind {
     Regime,
     /// A bimodality assessment over a value set.
     Bimodality,
+    /// A lineage split: a species appeared (bd-16g.3).
+    Speciation,
+    /// A lineage ended: a species vanished (bd-16g.3).
+    Extinction,
+    /// A lineage expanded sharply (bd-16g.3).
+    Radiation,
+}
+
+impl DetectionKind {
+    /// True for kinds this module's own primitives emit.
+    ///
+    /// The lineage kinds are produced by `crate::species`, which depends on this module
+    /// and not the reverse -- `detect` is a leaf and must not learn about species, agents
+    /// or the world. So the completeness gate here covers only what this module emits, and
+    /// the lineage kinds are gated where they are built.
+    #[must_use]
+    pub const fn is_series_primitive(self) -> bool {
+        matches!(
+            self,
+            Self::ChangePoint | Self::ThresholdCrossing | Self::Regime | Self::Bimodality
+        )
+    }
 }
 
 /// The detector's own verdict, kept typed rather than flattened to a string.
@@ -1006,6 +1028,13 @@ pub enum EvidenceClass {
     Regime(Regime),
     /// Whether the sample split into two clusters.
     Bimodal(bool),
+    /// A lineage event, carrying whether a detector hint corroborated it (bd-16g.3).
+    ///
+    /// The flag is deliberately part of the CLASSIFICATION rather than a loose field:
+    /// "a species appeared" and "a species appeared and the detector saw it coming" are
+    /// different claims, and a consumer that cannot tell them apart will present an
+    /// unhinted split with the same confidence as a corroborated one.
+    Lineage(bool),
 }
 
 /// One side of a before/after or cluster comparison.
@@ -1027,7 +1056,12 @@ pub struct EvidenceSide {
 pub struct DetectionEvidence {
     /// Metric identity, supplied by the caller: this module deliberately does not
     /// know metric names, and inventing one here would be a lie about provenance.
-    pub metric: &'static str,
+    ///
+    /// OWNED rather than `&'static str`. Series metrics are compile-time literals, but
+    /// lineage evidence (bd-16g.3) identifies itself by a species name generated at
+    /// runtime. Keeping this borrowed forced a caller to `Box::leak` a name per event —
+    /// a slow memory leak in any long run, which is a worse defect than this allocation.
+    pub metric: String,
     /// Which primitive produced this.
     pub kind: DetectionKind,
     /// First tick of the evidence window.
@@ -1083,7 +1117,7 @@ impl ChangePoint {
         params: CusumParams,
     ) -> DetectionEvidence {
         DetectionEvidence {
-            metric,
+            metric: metric.into(),
             kind: DetectionKind::ChangePoint,
             start_tick: self.tick,
             end_tick: self.tick,
@@ -1112,9 +1146,9 @@ impl ChangePoint {
 impl Crossing {
     /// Evidence for this threshold crossing.
     #[must_use]
-    pub fn evidence(&self, metric: &'static str, samples: usize) -> DetectionEvidence {
+    pub fn evidence(&self, metric: impl Into<String>, samples: usize) -> DetectionEvidence {
         DetectionEvidence {
-            metric,
+            metric: metric.into(),
             kind: DetectionKind::ThresholdCrossing,
             start_tick: self.tick,
             end_tick: self.tick,
@@ -1142,9 +1176,9 @@ impl Crossing {
 impl RegimeWindow {
     /// Evidence for this regime window.
     #[must_use]
-    pub fn evidence(&self, metric: &'static str, samples: usize) -> DetectionEvidence {
+    pub fn evidence(&self, metric: impl Into<String>, samples: usize) -> DetectionEvidence {
         DetectionEvidence {
-            metric,
+            metric: metric.into(),
             kind: DetectionKind::Regime,
             start_tick: self.start_tick,
             end_tick: self.end_tick,
@@ -1173,13 +1207,13 @@ impl BimodalityScore {
     #[must_use]
     pub fn evidence(
         &self,
-        metric: &'static str,
+        metric: impl Into<String>,
         start_tick: u64,
         end_tick: u64,
         params: BimodalityParams,
     ) -> DetectionEvidence {
         DetectionEvidence {
-            metric,
+            metric: metric.into(),
             kind: DetectionKind::Bimodality,
             start_tick,
             end_tick,
@@ -1304,6 +1338,40 @@ impl DetectionEvidence {
                     )
                 }
             }
+            (DetectionKind::Speciation, EvidenceClass::Lineage(corroborated)) => {
+                let (_, after) = self.sides();
+                format!(
+                    // "{name} split off ..." would read as if {name} were the PARENT.
+                    // It is the new lineage, so it has to be the thing that appeared.
+                    "t={} {} appeared as a new lineage of {}{}",
+                    self.start_tick,
+                    self.metric,
+                    count(after),
+                    if corroborated {
+                        ""
+                    } else {
+                        " (no preceding detector hint)"
+                    }
+                )
+            }
+            (DetectionKind::Extinction, EvidenceClass::Lineage(_)) => {
+                let (before, _) = self.sides();
+                format!(
+                    "t={} {} died out, last seen at {}",
+                    self.start_tick,
+                    self.metric,
+                    count(before)
+                )
+            }
+            (DetectionKind::Radiation, EvidenceClass::Lineage(_)) => {
+                let (before, after) = self.sides();
+                format!(
+                    "t={} {} radiated, {}",
+                    self.start_tick,
+                    self.metric,
+                    count_transition(before, after)
+                )
+            }
             // A kind/class pair that does not correspond is a construction bug, not a
             // narration case. Saying so is better than inventing prose for it.
             (kind, class) => format!(
@@ -1343,7 +1411,7 @@ pub fn narrate_timeline(evidence: &[DetectionEvidence]) -> Vec<String> {
         a.start_tick
             .cmp(&b.start_tick)
             .then(a.end_tick.cmp(&b.end_tick))
-            .then(a.metric.cmp(b.metric))
+            .then(a.metric.cmp(&b.metric))
             .then((a.kind as u8).cmp(&(b.kind as u8)))
     });
     ordered.iter().map(|item| item.narrate()).collect()
@@ -2145,7 +2213,13 @@ mod tests {
             let needs_sides = match evidence.kind {
                 DetectionKind::ChangePoint
                 | DetectionKind::ThresholdCrossing
-                | DetectionKind::Bimodality => true,
+                | DetectionKind::Bimodality
+                // Lineage kinds (bd-16g.3) carry member counts as their two sides.
+                // Extinction's `after` is a real zero, not a missing side: "it ended at
+                // zero" and "we did not measure the end" must not collapse together.
+                | DetectionKind::Speciation
+                | DetectionKind::Extinction
+                | DetectionKind::Radiation => true,
                 DetectionKind::Regime => false,
             };
             if needs_sides {
@@ -2164,7 +2238,26 @@ mod tests {
             DetectionKind::Regime,
             DetectionKind::Bimodality,
         ] {
+            assert!(
+                kind.is_series_primitive(),
+                "{kind:?} must be a series primitive"
+            );
             assert!(seen.contains(&kind), "{kind:?} emitted no evidence");
+        }
+
+        // The lineage kinds are deliberately NOT required here: they are emitted by
+        // crate::species, which depends on this leaf rather than the reverse. Asserting
+        // them in this gate would force `detect` to learn about species and break the
+        // property the module header commits to. They are gated where they are built.
+        for kind in [
+            DetectionKind::Speciation,
+            DetectionKind::Extinction,
+            DetectionKind::Radiation,
+        ] {
+            assert!(
+                !kind.is_series_primitive(),
+                "{kind:?} is a lineage kind and must not be gated as a series primitive"
+            );
         }
     }
 

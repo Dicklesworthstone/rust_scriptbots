@@ -18,6 +18,7 @@
     clippy::module_name_repetitions
 )]
 
+use crate::detect::{DetectionEvidence, DetectionKind, EvidenceClass, EvidenceSide};
 use crate::{AgentUid, Tick};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -917,6 +918,58 @@ pub fn diff_species_tables(before: &SpeciesTable, after: &SpeciesTable) -> Vec<P
     events
 }
 
+impl PhylogenyEvent {
+    /// Render this event into the shared [`DetectionEvidence`] envelope (bd-16g.3).
+    ///
+    /// Lineage events join the SAME envelope the series detectors use, so a consumer --
+    /// the narrated timeline, the lab assistant, a highlight reel -- reads one shape
+    /// instead of two. That is the whole argument for the envelope: five consumers each
+    /// inventing their own join is how five different answers to one question appear.
+    ///
+    /// `corroborated` records whether a detector hint preceded this event. It is part of
+    /// the CLASSIFICATION, not a loose field, because "a species appeared" and "a species
+    /// appeared and the detector saw it coming" are different claims and must not present
+    /// with equal confidence.
+    #[must_use]
+    pub fn evidence(&self, corroborated: bool) -> DetectionEvidence {
+        let kind = match self.kind {
+            PhylogenyEventKind::Speciation => DetectionKind::Speciation,
+            PhylogenyEventKind::Extinction => DetectionKind::Extinction,
+            PhylogenyEventKind::Radiation => DetectionKind::Radiation,
+        };
+        DetectionEvidence {
+            // The species NAME is the metric identity: it is the stable, human-facing
+            // handle a reader already uses to talk about a lineage across a run.
+            metric: self.name.clone(),
+            kind,
+            start_tick: self.tick.0,
+            end_tick: self.tick.0,
+            samples: self.members_after.max(self.members_before),
+            // Growth multiple, and 0.0 for an extinction: there is no ratio to report when
+            // the denominator is the thing that ended.
+            score: if self.members_before == 0 {
+                0.0
+            } else {
+                self.members_after as f64 / self.members_before as f64
+            },
+            class: EvidenceClass::Lineage(corroborated),
+            before: Some(EvidenceSide {
+                samples: self.members_before,
+                mean: self.members_before as f64,
+            }),
+            after: Some(EvidenceSide {
+                samples: self.members_after,
+                mean: self.members_after as f64,
+            }),
+            params: vec![
+                ("radiation_growth_factor", RADIATION_GROWTH_FACTOR),
+                ("radiation_min_members", RADIATION_MIN_MEMBERS as f64),
+            ],
+            finite: true,
+        }
+    }
+}
+
 /// A bimodality hint from the detector kernel, reduced to what this gate needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeciationHint {
@@ -1679,5 +1732,133 @@ mod tests {
             "the second split is unhinted, not co-credited"
         );
         assert!(out.accounts_for_all_hints(hints.len()));
+    }
+
+    /// GROUND TRUTH: hand-labelled lineage scenarios, each with a known answer.
+    ///
+    /// The same shape as bd-16g.2's detector matrix: a case per phenomenon, plus the
+    /// negative control. The negative is the one that matters -- a stable population must
+    /// emit NOTHING, because a lineage timeline that reports churn every sample is one
+    /// nobody reads.
+    #[test]
+    fn bd_16g_3_ground_truth_matrix_for_lineage_events() {
+        // 1. Clean split: a new id appears alongside the incumbent.
+        let split = diff_species_tables(
+            &table(0, vec![sp(1, "Alpha-1", 20, 0)]),
+            &table(10, vec![sp(1, "Alpha-1", 12, 0), sp(2, "Beta-2", 8, 10)]),
+        );
+        assert_eq!(split.len(), 1, "one new lineage, one event: {split:?}");
+        assert_eq!(split[0].kind, PhylogenyEventKind::Speciation);
+        assert_eq!(split[0].species, SpeciesId(2));
+
+        // 2. Clean extinction.
+        let gone = diff_species_tables(
+            &table(0, vec![sp(1, "Alpha-1", 5, 0), sp(2, "Beta-2", 3, 0)]),
+            &table(10, vec![sp(1, "Alpha-1", 5, 0)]),
+        );
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].kind, PhylogenyEventKind::Extinction);
+        assert_eq!(
+            gone[0].members_before, 3,
+            "the last known size must be carried"
+        );
+
+        // 3. Clean radiation.
+        let boom = diff_species_tables(
+            &table(0, vec![sp(1, "Alpha-1", 6, 0)]),
+            &table(10, vec![sp(1, "Alpha-1", 30, 0)]),
+        );
+        assert_eq!(boom.len(), 1);
+        assert_eq!(boom[0].kind, PhylogenyEventKind::Radiation);
+
+        // 4. NEGATIVE CONTROL: a stable population emits nothing at all.
+        let stable = diff_species_tables(
+            &table(0, vec![sp(1, "Alpha-1", 20, 0), sp(2, "Beta-2", 14, 0)]),
+            &table(10, vec![sp(1, "Alpha-1", 21, 0), sp(2, "Beta-2", 13, 0)]),
+        );
+        assert!(
+            stable.is_empty(),
+            "ordinary drift is not an event; a timeline that churns is one nobody reads: {stable:?}"
+        );
+
+        // 5. NEGATIVE: shrinking is not a radiation, however sharply.
+        let crash = diff_species_tables(
+            &table(0, vec![sp(1, "Alpha-1", 40, 0)]),
+            &table(10, vec![sp(1, "Alpha-1", 4, 0)]),
+        );
+        assert!(
+            crash.is_empty(),
+            "a collapse is not a radiation, and the species still exists: {crash:?}"
+        );
+    }
+
+    /// Lineage events must render into the shared evidence envelope.
+    #[test]
+    fn bd_16g_3_lineage_events_emit_shared_detection_evidence() {
+        let events = diff_species_tables(
+            &table(0, vec![sp(1, "Alpha-1", 20, 0)]),
+            &table(10, vec![sp(1, "Alpha-1", 12, 0), sp(2, "Beta-2", 8, 10)]),
+        );
+        let speciation = &events[0];
+
+        let corroborated = speciation.evidence(true);
+        assert_eq!(corroborated.kind, DetectionKind::Speciation);
+        assert_eq!(
+            corroborated.metric, "Beta-2",
+            "the species name is the identity"
+        );
+        assert_eq!(corroborated.start_tick, 10);
+        assert!(corroborated.finite);
+        assert!(matches!(corroborated.class, EvidenceClass::Lineage(true)));
+
+        // The corroboration flag must actually change the narrative, or it is decoration.
+        let alone = speciation.evidence(false);
+        assert!(matches!(alone.class, EvidenceClass::Lineage(false)));
+        assert_ne!(
+            corroborated.narrate(),
+            alone.narrate(),
+            "an uncorroborated split must not read identically to a corroborated one"
+        );
+        assert!(
+            alone.narrate().contains("no preceding detector hint"),
+            "the missing hint must be visible to a reader: {}",
+            alone.narrate()
+        );
+        // And the narration must still obey bd-16g.2's rule: cite evidence, not thresholds.
+        for token in [
+            "radiation_growth_factor",
+            "min_members",
+            "threshold",
+            "exceeded",
+        ] {
+            assert!(
+                !corroborated.narrate().contains(token),
+                "lineage narration leaked a configured bound: {}",
+                corroborated.narrate()
+            );
+        }
+    }
+
+    /// Extinction narrates its last known size, not a ratio.
+    #[test]
+    fn bd_16g_3_extinction_evidence_reports_the_last_known_size() {
+        let events = diff_species_tables(
+            &table(0, vec![sp(1, "Alpha-1", 5, 0), sp(2, "Beta-2", 9, 0)]),
+            &table(10, vec![sp(1, "Alpha-1", 5, 0)]),
+        );
+        let evidence = events[0].evidence(false);
+        assert_eq!(evidence.kind, DetectionKind::Extinction);
+        assert_eq!(evidence.before.expect("before side").samples, 9);
+        assert_eq!(evidence.after.expect("after side").samples, 0);
+        assert_eq!(
+            evidence.score, 0.0,
+            "there is no growth ratio to report when the denominator is what ended"
+        );
+        let text = evidence.narrate();
+        assert!(text.contains("died out"), "{text}");
+        assert!(
+            text.contains('9'),
+            "the last known size must appear: {text}"
+        );
     }
 }
