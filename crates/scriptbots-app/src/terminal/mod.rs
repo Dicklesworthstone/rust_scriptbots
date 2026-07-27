@@ -1449,18 +1449,20 @@ impl<'a> TerminalApp<'a> {
             .map(|entry| (entry.avg_energy.max(0.0) * 100.0) as u64)
             .collect();
 
-        if !pop_data.is_empty() {
-            let spark = Sparkline::default()
-                .style(self.palette.population_spark_style())
-                .data(&pop_data);
-            frame.render_widget(spark, trend_layout[0]);
-        }
-        if !energy_data.is_empty() {
-            let spark = Sparkline::default()
-                .style(self.palette.energy_spark_style())
-                .data(&energy_data);
-            frame.render_widget(spark, trend_layout[1]);
-        }
+        self.draw_trend(
+            frame,
+            trend_layout[0],
+            TREND_POPULATION,
+            self.palette.population_spark_style(),
+            &pop_data,
+        );
+        self.draw_trend(
+            frame,
+            trend_layout[1],
+            TREND_ENERGY,
+            self.palette.energy_spark_style(),
+            &energy_data,
+        );
         let births_data: Vec<u64> = snapshot
             .history
             .iter()
@@ -1478,18 +1480,20 @@ impl<'a> TerminalApp<'a> {
         // green/red. Beyond consistency this is the accessibility fix: green
         // versus red is indistinguishable under the deuteranopia and protanopia
         // palettes this app ships, and the raw constants bypassed them (bd-f4x0).
-        if !births_data.is_empty() {
-            let spark = Sparkline::default()
-                .style(self.palette.event_style(EventKind::Birth))
-                .data(&births_data);
-            frame.render_widget(spark, trend_layout[2]);
-        }
-        if !deaths_data.is_empty() {
-            let spark = Sparkline::default()
-                .style(self.palette.event_style(EventKind::Death))
-                .data(&deaths_data);
-            frame.render_widget(spark, trend_layout[3]);
-        }
+        self.draw_trend(
+            frame,
+            trend_layout[2],
+            TREND_BIRTHS,
+            self.palette.event_style(EventKind::Birth),
+            &births_data,
+        );
+        self.draw_trend(
+            frame,
+            trend_layout[3],
+            TREND_DEATHS,
+            self.palette.event_style(EventKind::Death),
+            &deaths_data,
+        );
 
         let mut trend_lines = Vec::new();
         if let Some(recent) = snapshot.history.first() {
@@ -2015,6 +2019,56 @@ impl<'a> TerminalApp<'a> {
             .title(self.palette.title("Brains"))
             .borders(Borders::ALL);
         frame.render_widget(List::new(items).block(block), area);
+    }
+
+    /// Split one trend row into its label column and the sparkline that follows.
+    ///
+    /// Degrades rather than panicking on a narrow pane: if the row cannot spare
+    /// the label width the label area comes back empty and the sparkline keeps
+    /// the whole row, which is the pre-existing behaviour rather than a crash.
+    /// Draw one labelled trend sparkline.
+    ///
+    /// One helper rather than four near-identical blocks, so a fifth trend cannot
+    /// be added with the label quietly left off — which is how the four ended up
+    /// unlabelled in the first place.
+    fn draw_trend(
+        &self,
+        frame: &mut Frame<'_>,
+        row: Rect,
+        label: &str,
+        style: Style,
+        data: &[u64],
+    ) {
+        if data.is_empty() {
+            return;
+        }
+        let (label_area, spark_area) = Self::trend_row(row);
+        if label_area.width > 0 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("{label:<width$}", width = TREND_LABEL_WIDTH as usize),
+                    self.palette.muted_style(),
+                )),
+                label_area,
+            );
+        }
+        frame.render_widget(Sparkline::default().style(style).data(data), spark_area);
+    }
+
+    fn trend_row(row: Rect) -> (Rect, Rect) {
+        if row.width <= TREND_LABEL_WIDTH {
+            return (Rect { width: 0, ..row }, row);
+        }
+        let label = Rect {
+            width: TREND_LABEL_WIDTH,
+            ..row
+        };
+        let spark = Rect {
+            x: row.x + TREND_LABEL_WIDTH,
+            width: row.width - TREND_LABEL_WIDTH,
+            ..row
+        };
+        (label, spark)
     }
 
     fn draw_mortality(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
@@ -3977,6 +4031,29 @@ enum EventKind {
     Population,
     Info,
 }
+
+/// Row labels for the four stacked trend sparklines, and the width reserved for
+/// them.
+///
+/// These exist because the four sparklines were distinguished by COLOUR ALONE
+/// (bd-xg82). Measuring the palette proved that indefensible rather than merely
+/// imperfect: `population_spark` and the Birth event colour are the SAME VALUE in
+/// every accessibility palette — a measured separation of exactly 1.000:1 — so
+/// the population and births rows rendered identically for every viewer, not
+/// only hue-blind ones. Four unlabelled full-width bars, two of them the same
+/// colour, stacked adjacently.
+///
+/// The fix is a channel that does not depend on hue at all. Labels also make the
+/// panel readable for someone who simply has not memorised which row is which,
+/// which is most people.
+const TREND_LABEL_WIDTH: u16 = 4;
+const TREND_POPULATION: &str = "pop";
+const TREND_ENERGY: &str = "nrg";
+const TREND_BIRTHS: &str = "brt";
+const TREND_DEATHS: &str = "dth";
+
+/// Every trend label, for tests that must see them as a set.
+const TREND_LABELS: [&str; 4] = [TREND_POPULATION, TREND_ENERGY, TREND_BIRTHS, TREND_DEATHS];
 
 /// Why an agent died, as the mortality panel breaks it down.
 ///
@@ -7872,6 +7949,107 @@ mod tests {
     /// legend to read the mortality panel. Asserting the exact ramp entry is what
     /// keeps that true — a future edit that merely picks "some palette colour"
     /// would still be retunable and still be wrong.
+    /// The four trend rows must be told apart WITHOUT colour.
+    ///
+    /// This is the measured justification, not a precaution. Across every
+    /// accessibility palette, the population row and the births row use the SAME
+    /// COLOUR — `population_spark` and the Birth event entry are one value, a
+    /// separation of exactly 1.000:1. Four unlabelled full-width sparklines
+    /// stacked adjacently, two of them identical, is unreadable for every viewer
+    /// rather than only hue-blind ones (bd-xg82).
+    ///
+    /// So the labels are the load-bearing channel and they are asserted as such:
+    /// present, distinct, and narrow enough to fit the reserved column. Fixing
+    /// this by shifting one of the hues would have left the panel colour-only and
+    /// still unreadable in monochrome.
+    #[test]
+    fn every_trend_row_is_labelled_distinctly_without_relying_on_colour() {
+        let mut seen: Vec<&str> = Vec::new();
+        for label in TREND_LABELS {
+            assert!(!label.is_empty(), "every trend row needs a label");
+            assert!(
+                !seen.contains(&label),
+                "trend label {label:?} is reused; duplicate labels defeat the \
+                 non-colour channel exactly as duplicate colours did"
+            );
+            assert!(
+                label.len() < TREND_LABEL_WIDTH as usize,
+                "trend label {label:?} does not fit the {TREND_LABEL_WIDTH}-column \
+                 reserve with a separating space, so it would abut the bars"
+            );
+            seen.push(label);
+        }
+        assert_eq!(seen.len(), 4, "all four trend rows must be labelled");
+    }
+
+    /// Records the defect that made the labels necessary, so it cannot quietly
+    /// stop being true and leave the labels looking like decoration.
+    ///
+    /// If a future palette edit gives population and births distinct colours this
+    /// fails, and the right response is to update this test — NOT to remove the
+    /// labels. Colour separation alone would still leave the panel unreadable in
+    /// monochrome, which is the whole point of bd-xg82.
+    #[test]
+    fn population_and_births_share_a_colour_in_every_palette() {
+        for mode in [
+            TerminalPaletteMode::Natural,
+            TerminalPaletteMode::Deuteranopia,
+            TerminalPaletteMode::Protanopia,
+            TerminalPaletteMode::Tritanopia,
+            TerminalPaletteMode::HighContrast,
+        ] {
+            let mut palette = Palette::test_backend_evidence();
+            palette.mode = mode;
+            let pop = palette
+                .population_spark_style()
+                .fg
+                .expect("the population spark must carry a colour");
+            let births = palette
+                .event_style(EventKind::Birth)
+                .fg
+                .expect("the births spark must carry a colour");
+            assert_eq!(
+                contrast_ratio(pop, births),
+                1.0,
+                "{mode:?}: population and births are documented as sharing a colour \
+                 ({pop:?} vs {births:?}); if that changed, update this test and KEEP \
+                 the row labels — colour alone is still not a channel in monochrome"
+            );
+        }
+    }
+
+    /// A pane too narrow for the label column must not panic or overlap.
+    #[test]
+    fn a_narrow_trend_row_degrades_instead_of_panicking() {
+        let wide = Rect {
+            x: 3,
+            y: 1,
+            width: 40,
+            height: 1,
+        };
+        let (label, spark) = TerminalApp::trend_row(wide);
+        assert_eq!(label.width, TREND_LABEL_WIDTH);
+        assert_eq!(spark.x, wide.x + TREND_LABEL_WIDTH);
+        assert_eq!(
+            label.width + spark.width,
+            wide.width,
+            "the split must consume the row exactly, with no overlap or gap"
+        );
+
+        for width in 0..=TREND_LABEL_WIDTH {
+            let narrow = Rect { width, ..wide };
+            let (label, spark) = TerminalApp::trend_row(narrow);
+            assert_eq!(
+                label.width, 0,
+                "at width {width} there is no room for a label"
+            );
+            assert_eq!(
+                spark.width, width,
+                "at width {width} the sparkline must keep the whole row"
+            );
+        }
+    }
+
     #[test]
     fn mortality_bars_take_the_palette_ramp_that_names_each_cause() {
         for mode in [
@@ -9205,7 +9383,14 @@ mod tests {
                 evidence.forced_width_cells,
                 evidence.empty_symbol_cells,
             ),
-            (2361, 1526, 0, 0, 0),
+            // Reviewed 2026-07-27 (bd-xg82): the four trend sparklines gained
+            // non-colour row labels, so two rows in this fixture grew a
+            // TREND_LABEL_WIDTH (4) column label carrying 3 visible characters.
+            // The deltas are exactly that and nothing else: +6 non-blank
+            // (2 rows x 3 glyphs) and +8 styled (2 rows x 4 styled columns).
+            // Only population and energy have data at this fixture's tick, which
+            // is why it is two rows rather than four.
+            (2367, 1534, 0, 0, 0),
             "fixed-seed Ratatui TestBackend cell counts changed; inspect the rendered buffer before intentionally updating this reviewed evidence: {evidence:?}"
         );
         // Reviewed 2026-07-17 (bd-2z0.10.1): the header title now carries the scenario id
@@ -9220,8 +9405,12 @@ mod tests {
         // change (2361/1526/0/0/0 before and after), so nothing moved on screen —
         // only the colours the digest also hashes. A layout regression would have
         // shifted those counts first.
+        // Reviewed 2026-07-27 (bd-xg82): trend row labels, as detailed on the cell
+        // counts above. Those counts moved by exactly the label arithmetic, which
+        // is the evidence that the digest change is the labels and not a layout
+        // regression riding along with them.
         assert_eq!(
-            evidence.full_cell_fnv1a64, "c518b8f39fabf19c",
+            evidence.full_cell_fnv1a64, "4ab177bfc13b0371",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
         assert_eq!(
