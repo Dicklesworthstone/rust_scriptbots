@@ -19,6 +19,7 @@ pub type SharedWorld = Arc<Mutex<WorldState>>;
 pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
 pub mod experiment_runner;
+pub mod host_thread;
 pub mod lab_assistant;
 pub mod montage;
 pub mod tournament;
