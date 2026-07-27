@@ -15,7 +15,17 @@ pub enum ExportFormat {
 pub struct ExportProvenance {
     pub run_id: String,
     pub seed: u64,
-    pub config_hash: String,
+    /// Digest of the normalized run configuration (the conservation verdict's
+    /// `config_digest` is the canonical source for this value).
+    pub config_digest: String,
+    /// Exact source revision/tree that produced the run or rendered artifact.
+    pub source_revision: String,
+    pub source_tree_digest: String,
+    /// Decisions that affect interpretation of the exported rows (for example,
+    /// authority/recovery outcomes or conservation verdict status).
+    pub authority_decisions: Vec<String>,
+    /// Serialized tolerance policy when a conservation verdict was part of the run.
+    pub conservation_tolerances: Option<serde_json::Value>,
     pub schema_version: u32,
     pub exported_at_utc: String,
 }
@@ -41,8 +51,15 @@ impl<W: Write> MetricExportWriter<W> {
             ExportFormat::Csv => {
                 writeln!(
                     self.writer,
-                    "# PROVENANCE: run_id={},seed={},config_hash={},schema_version={}",
-                    prov.run_id, prov.seed, prov.config_hash, prov.schema_version
+                    "# PROVENANCE: run_id={},seed={},config_digest={},source_revision={},source_tree_digest={},schema_version={},authority_decisions={},conservation_tolerances={}",
+                    prov.run_id,
+                    prov.seed,
+                    prov.config_digest,
+                    prov.source_revision,
+                    prov.source_tree_digest,
+                    prov.schema_version,
+                    serde_json::to_string(&prov.authority_decisions).unwrap_or_default(),
+                    serde_json::to_string(&prov.conservation_tolerances).unwrap_or_default()
                 )
             }
             ExportFormat::JsonLines => {
@@ -106,7 +123,14 @@ mod tests {
         let prov = ExportProvenance {
             run_id: "run-42".into(),
             seed: 2026,
-            config_hash: "abc123hash".into(),
+            config_digest: "blake3:abc123hash".into(),
+            source_revision: "git:deadbeef".into(),
+            source_tree_digest: "blake3:tree".into(),
+            authority_decisions: vec!["conservation:pass".into(), "durable_watermark:42".into()],
+            conservation_tolerances: Some(serde_json::json!({
+                "per_tick_relative": 1.0e-6,
+                "cumulative_relative": 1.0e-5,
+            })),
             schema_version: 1,
             exported_at_utc: "2026-07-22T15:00:00Z".into(),
         };
@@ -117,6 +141,8 @@ mod tests {
 
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("# PROVENANCE: run_id=run-42"));
+        assert!(output.contains("source_tree_digest=blake3:tree"));
+        assert!(output.contains("conservation:pass"));
         assert!(output.contains("tick,metric_name,value"));
         assert!(output.contains("100,population,42"));
     }
