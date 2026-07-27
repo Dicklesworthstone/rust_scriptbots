@@ -1654,7 +1654,14 @@ impl<'a> TerminalApp<'a> {
             .rev()
             .map(|entry| {
                 let style = self.palette.event_style(entry.kind);
-                let text = format!("[t{:>6}] {}", entry.tick, entry.message);
+                // The marker leads, so the kind is scannable down the left edge
+                // and survives with no colour at all (bd-xg82).
+                let text = format!(
+                    "{} [t{:>6}] {}",
+                    entry.kind.marker(),
+                    entry.tick,
+                    entry.message
+                );
                 ListItem::new(Span::styled(text, style))
             })
             .collect();
@@ -4030,6 +4037,30 @@ enum EventKind {
     Death,
     Population,
     Info,
+}
+
+impl EventKind {
+    /// A one-character marker so the event log reads without colour.
+    ///
+    /// The log rendered every kind as identically-formatted text and carried the
+    /// kind in the FOREGROUND COLOUR ALONE, so in monochrome — or for a reader
+    /// who cannot separate these hues — a birth and a death were the same line
+    /// (bd-xg82). Letters rather than symbols, matching the C/H/S/A/U convention
+    /// the mortality panel already uses, and ASCII so the narrow and ascii
+    /// capability tiers render them unchanged.
+    const fn marker(self) -> char {
+        match self {
+            Self::Birth => 'B',
+            Self::Death => 'D',
+            Self::Population => 'P',
+            Self::Info => 'i',
+        }
+    }
+
+    /// Every kind, for tests that must see them as a set.
+    const fn all() -> [Self; 4] {
+        [Self::Birth, Self::Death, Self::Population, Self::Info]
+    }
 }
 
 /// Row labels for the four stacked trend sparklines, and the width reserved for
@@ -7949,6 +7980,82 @@ mod tests {
     /// legend to read the mortality panel. Asserting the exact ramp entry is what
     /// keeps that true — a future edit that merely picks "some palette colour"
     /// would still be retunable and still be wrong.
+    /// Every event kind must be distinguishable with no colour at all.
+    ///
+    /// The log rendered all four kinds as identically-formatted text and carried
+    /// the kind in the foreground colour alone, so a birth and a death were the
+    /// same line in monochrome (bd-xg82).
+    #[test]
+    fn every_event_kind_has_a_distinct_ascii_marker() {
+        let mut seen: Vec<char> = Vec::new();
+        for kind in EventKind::all() {
+            let marker = kind.marker();
+            assert!(
+                marker.is_ascii_graphic(),
+                "{kind:?} marker {marker:?} must be printable ASCII so the narrow \
+                 and ascii capability tiers render it unchanged"
+            );
+            assert!(
+                !seen.contains(&marker),
+                "{kind:?} reuses marker {marker:?}; duplicate markers defeat the \
+                 non-colour channel exactly as a shared colour would"
+            );
+            seen.push(marker);
+        }
+        assert_eq!(seen.len(), 4, "all four event kinds must be marked");
+    }
+
+    /// At least one event-kind pair is effectively colour-identical in every
+    /// palette, which is why the markers are load-bearing rather than decorative.
+    ///
+    /// Measured, not assumed (bd-xg82): the worst pair per palette is Natural
+    /// Death/Info 1.103, Deuteranopia Death/Info 1.088, Protanopia
+    /// Population/Info 1.001, Tritanopia Birth/Info 1.041, HighContrast
+    /// Population/Info 1.399. A 1.001:1 separation is the same colour to any
+    /// viewer, so the log could not be read by hue there even with perfect colour
+    /// vision.
+    ///
+    /// Asserting the floor stays LOW is deliberate and is not a bug: it records
+    /// that colour is not a usable channel here, so nobody deletes the markers
+    /// believing the palette carries the distinction. If a palette edit ever
+    /// separates these properly, this test fails and the correct response is to
+    /// update it and KEEP the markers — monochrome still has no colour at all.
+    #[test]
+    fn some_event_kinds_are_colour_identical_so_markers_carry_the_meaning() {
+        let mut worst_overall = f32::MAX;
+        for mode in [
+            TerminalPaletteMode::Natural,
+            TerminalPaletteMode::Deuteranopia,
+            TerminalPaletteMode::Protanopia,
+            TerminalPaletteMode::Tritanopia,
+            TerminalPaletteMode::HighContrast,
+        ] {
+            let mut palette = Palette::test_backend_evidence();
+            palette.mode = mode;
+            let kinds = EventKind::all();
+            let mut worst = f32::MAX;
+            for i in 0..kinds.len() {
+                for j in (i + 1)..kinds.len() {
+                    let a = palette.event_style(kinds[i]).fg.expect("kind colour");
+                    let b = palette.event_style(kinds[j]).fg.expect("kind colour");
+                    worst = worst.min(contrast_ratio(a, b));
+                }
+            }
+            assert!(
+                worst < 3.0,
+                "{mode:?}: the closest event-kind pair now separates by {worst:.3}:1. \
+                 If the palette genuinely fixed this, update this test — but KEEP the \
+                 markers, because monochrome has no colour channel at all"
+            );
+            worst_overall = worst_overall.min(worst);
+        }
+        assert!(
+            worst_overall < 1.05,
+            "at least one palette should still have a near-identical pair \
+             ({worst_overall:.3}:1 was the closest found)"
+        );
+    }
+
     /// The four trend rows must be told apart WITHOUT colour.
     ///
     /// This is the measured justification, not a precaution. Across every
