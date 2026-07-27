@@ -4443,6 +4443,24 @@ pub struct SensorContribution {
     pub total: f32,
 }
 
+/// One receiver's exact brain-facing hearing value from a production sensing pass.
+///
+/// Sensing consumes the deliberate sound present at the completed `source_tick`
+/// boundary and feeds the clamped value to the brain during the transition that
+/// completes at `observation_tick`. Keeping both ticks prevents later analytics
+/// from pairing a received value with the actuation that replaces its source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RealizedHearingObservation {
+    /// Stable identity of the agent whose hearing channel was populated.
+    pub receiver_uid: AgentUid,
+    /// Completed boundary whose emitted-sound state was consumed.
+    pub source_tick: Tick,
+    /// Transition tick whose brain input received `hearing`.
+    pub observation_tick: Tick,
+    /// Exact clamped value copied from the production hearing sensor.
+    pub hearing: f32,
+}
+
 /// What an agent would perceive if sensing ran against the completed boundary
 /// exactly as it stands, and *why*.
 ///
@@ -17496,6 +17514,8 @@ pub struct WorldState {
     combat_spike_attempts: u32,
     combat_spike_hits: u32,
     sense_saturations_total: u64,
+    realized_hearing_capture_enabled: bool,
+    latest_realized_hearing_observations: Vec<RealizedHearingObservation>,
     config_audit: Vec<ConfigAuditEntry>,
     config_revision: u64,
     resource_ledger: ResourceLedgerState,
@@ -18331,6 +18351,8 @@ impl WorldState {
             combat_spike_attempts: 0,
             combat_spike_hits: 0,
             sense_saturations_total: 0,
+            realized_hearing_capture_enabled: false,
+            latest_realized_hearing_observations: Vec::new(),
             config_audit: Vec::with_capacity(32),
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
@@ -18977,6 +18999,7 @@ impl WorldState {
         reason = "sensor arithmetic preserves the established f32 operation order shared with scalar and SIMD parity tests"
     )]
     fn stage_sense(&mut self) {
+        self.latest_realized_hearing_observations.clear();
         let agent_count = self.agents.len();
         if agent_count == 0 {
             return;
@@ -19179,6 +19202,30 @@ impl WorldState {
                 (sensors, accumulator.saturations)
             });
 
+        let mut missing_realized_hearing_identity = None;
+        if self.realized_hearing_capture_enabled {
+            let source_tick = self.tick;
+            let observation_tick = self.tick.next();
+            {
+                let identities = &self.identities;
+                let observations = &mut self.latest_realized_hearing_observations;
+                observations.reserve(handles.len());
+                for (idx, agent_id) in handles.iter().copied().enumerate() {
+                    let Some(identity) = identities.get(agent_id) else {
+                        observations.clear();
+                        missing_realized_hearing_identity = Some(agent_id);
+                        break;
+                    };
+                    observations.push(RealizedHearingObservation {
+                        receiver_uid: identity.uid,
+                        source_tick,
+                        observation_tick,
+                        hearing: sensor_results[idx].0[18],
+                    });
+                }
+            }
+        }
+
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 runtime.sensors.copy_from_slice(&sensor_results[idx].0);
@@ -19186,6 +19233,11 @@ impl WorldState {
             self.sense_saturations_total = self
                 .sense_saturations_total
                 .saturating_add(u64::from(sensor_results[idx].1));
+        }
+        if let Some(agent_id) = missing_realized_hearing_identity {
+            self.latch_scientific_fault(ScientificStateError::MissingAgentIdentity {
+                path: format!("stage_sense.realized_hearing[agent_id={}]", agent_id.raw()),
+            });
         }
     }
 
@@ -26011,6 +26063,34 @@ impl WorldState {
         self.tick
     }
 
+    /// Enable or disable exact realized-hearing capture for future sensing passes.
+    ///
+    /// Capture is disabled by default and is observational only: it does not enter
+    /// a science digest, persistence projection, replay event, RNG stream, or
+    /// simulation decision. Changing the setting clears the previous pass so a
+    /// caller cannot mistake stale observations for a newly captured tick.
+    pub fn set_realized_hearing_capture_enabled(&mut self, enabled: bool) {
+        self.realized_hearing_capture_enabled = enabled;
+        self.latest_realized_hearing_observations.clear();
+    }
+
+    /// Whether future sensing passes retain realized-hearing observations.
+    #[must_use]
+    pub const fn realized_hearing_capture_enabled(&self) -> bool {
+        self.realized_hearing_capture_enabled
+    }
+
+    /// Exact realized-hearing observations from the latest sensing pass.
+    ///
+    /// The slice is empty before the first enabled pass, after disabling capture,
+    /// and after an enabled pass with no live agents. It contains at most one row
+    /// per agent that existed when that pass began, so history never accumulates
+    /// inside the simulation core.
+    #[must_use]
+    pub fn latest_realized_hearing_observations(&self) -> &[RealizedHearingObservation] {
+        &self.latest_realized_hearing_observations
+    }
+
     /// Total fixed-point sensing channel saturations observed over this world lifetime.
     ///
     /// Any non-zero value marks the run as scientifically suspect: at least one sensor
@@ -32425,6 +32505,269 @@ mod tests {
                 channel.name
             );
         }
+    }
+
+    #[test]
+    fn realized_hearing_capture_matches_the_production_sensor_and_tick_boundary() {
+        let mut world = WorldState::new(quiet_trace_config(0x4845_4152, 0)).expect("world");
+        let receiver = world.spawn_agent(AgentData {
+            position: Position::new(40.0, 50.0),
+            ..AgentData::default()
+        });
+        let emitter = world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            ..AgentData::default()
+        });
+        let receiver_uid = world.agent_uid(receiver).expect("receiver uid");
+        world
+            .agent_runtime_mut(emitter)
+            .expect("emitter runtime")
+            .sound_multiplier = 0.75;
+        world
+            .agent_runtime_mut(receiver)
+            .expect("receiver runtime")
+            .trait_modifiers
+            .hearing = 1.25;
+
+        assert!(!world.realized_hearing_capture_enabled());
+        assert!(world.latest_realized_hearing_observations().is_empty());
+        world.stage_sense();
+        assert!(
+            world.latest_realized_hearing_observations().is_empty(),
+            "disabled capture must not retain a plausible-looking series"
+        );
+
+        world.set_realized_hearing_capture_enabled(true);
+        world.stage_sense();
+
+        let observation = world
+            .latest_realized_hearing_observations()
+            .iter()
+            .find(|observation| observation.receiver_uid == receiver_uid)
+            .expect("receiver observation");
+        let brain_facing_hearing = world
+            .agent_runtime(receiver)
+            .expect("receiver runtime")
+            .sensors[18];
+        assert_eq!(observation.source_tick, Tick(0));
+        assert_eq!(observation.observation_tick, Tick(1));
+        assert_eq!(
+            observation.hearing.to_bits(),
+            brain_facing_hearing.to_bits()
+        );
+        assert!(
+            observation.hearing > 0.0,
+            "nearby deliberate emission must reach the receiver"
+        );
+    }
+
+    #[test]
+    fn realized_hearing_capture_names_the_actuation_boundary_it_consumes() {
+        struct SoundBrain;
+
+        impl BrainRunner for SoundBrain {
+            fn kind(&self) -> &'static str {
+                "test.realized-hearing-sound"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                let mut outputs = [0.0; OUTPUT_SIZE];
+                outputs[OutputChannel::SoundLevel.index()] = 1.0;
+                outputs
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(0x4845_4152_494e_4701)
+            }
+        }
+
+        let mut world = WorldState::new(quiet_trace_config(0x0053_4f55_4e44, 0)).expect("world");
+        let receiver = world.spawn_agent(AgentData {
+            position: Position::new(40.0, 50.0),
+            ..AgentData::default()
+        });
+        let emitter = world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            ..AgentData::default()
+        });
+        let receiver_uid = world.agent_uid(receiver).expect("receiver uid");
+        world
+            .agent_runtime_mut(receiver)
+            .expect("receiver runtime")
+            .sound_multiplier = 0.0;
+        world
+            .agent_runtime_mut(emitter)
+            .expect("emitter runtime")
+            .sound_multiplier = 0.0;
+        let brain = world
+            .brain_registry_mut()
+            .expect("registry mutation")
+            .register("test.realized-hearing-sound", |_rng| {
+                Ok(Box::new(SoundBrain))
+            });
+        assert!(
+            world
+                .bind_agent_brain(emitter, brain)
+                .expect("bind sound brain")
+        );
+        world.set_realized_hearing_capture_enabled(true);
+
+        world.step().expect("actuation-producing tick");
+        let first = world
+            .latest_realized_hearing_observations()
+            .iter()
+            .find(|observation| observation.receiver_uid == receiver_uid)
+            .expect("first receiver observation");
+        assert_eq!(
+            (first.source_tick, first.observation_tick),
+            (Tick(0), Tick(1))
+        );
+        assert_eq!(
+            first.hearing, 0.0,
+            "tick-one sensing precedes tick-one actuation"
+        );
+
+        world.step().expect("actuation-consuming tick");
+        let second = world
+            .latest_realized_hearing_observations()
+            .iter()
+            .find(|observation| observation.receiver_uid == receiver_uid)
+            .expect("second receiver observation");
+        assert_eq!(
+            (second.source_tick, second.observation_tick),
+            (Tick(1), Tick(2))
+        );
+        assert!(
+            second.hearing > 0.0,
+            "tick-two sensing must consume tick-one deliberate sound"
+        );
+        assert_eq!(
+            second.hearing.to_bits(),
+            world
+                .agent_runtime(receiver)
+                .expect("receiver runtime")
+                .sensors[18]
+                .to_bits()
+        );
+    }
+
+    #[test]
+    fn realized_hearing_capture_retains_pre_cleanup_receivers_and_excludes_newborns() {
+        let mut config = quiet_trace_config(0x4c49_4645, 0);
+        config.closed = false;
+        config.population_minimum = 2;
+        config.aging_tick_interval = 1;
+        config.aging_health_decay_start = 0;
+        config.aging_health_decay_rate = 1.0;
+        config.aging_health_decay_max = 1.0;
+        let mut world = WorldState::new(config).expect("world");
+        let survivor = world.spawn_agent(AgentData {
+            position: Position::new(40.0, 50.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let doomed = world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            health: 0.5,
+            ..AgentData::default()
+        });
+        let survivor_uid = world.agent_uid(survivor).expect("survivor uid");
+        let doomed_uid = world.agent_uid(doomed).expect("doomed uid");
+        world.set_realized_hearing_capture_enabled(true);
+
+        world.step().expect("lifecycle tick");
+
+        assert_eq!(world.agent_uid(doomed), None, "doomed receiver was removed");
+        assert_eq!(
+            world.agent_count(),
+            2,
+            "population floor inserted one agent"
+        );
+        let newborn_uid = world
+            .agents()
+            .iter_handles()
+            .filter_map(|agent_id| world.agent_uid(agent_id))
+            .find(|uid| *uid != survivor_uid)
+            .expect("newborn uid");
+        let observations = world.latest_realized_hearing_observations();
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.receiver_uid == doomed_uid),
+            "sensing precedes death cleanup, so the later-dead receiver is evidence"
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.receiver_uid == survivor_uid)
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.receiver_uid != newborn_uid),
+            "population insertion follows sensing and must not be backfilled into the capture"
+        );
+        assert!(observations.iter().all(|observation| {
+            observation.source_tick == Tick(0) && observation.observation_tick == Tick(1)
+        }));
+    }
+
+    #[test]
+    fn realized_hearing_capture_is_latest_pass_only_and_science_neutral() {
+        let config = quiet_trace_config(0x004e_4555_5452_414c, 0);
+        let mut control = WorldState::new(config.clone()).expect("control world");
+        let mut instrumented = WorldState::new(config).expect("instrumented world");
+        for agent in [
+            AgentData {
+                position: Position::new(40.0, 50.0),
+                ..AgentData::default()
+            },
+            AgentData {
+                position: Position::new(50.0, 50.0),
+                ..AgentData::default()
+            },
+        ] {
+            control.spawn_agent(agent.clone());
+            instrumented.spawn_agent(agent);
+        }
+        instrumented.set_realized_hearing_capture_enabled(true);
+        assert_eq!(
+            control.world_digest_v1().expect("control initial digest"),
+            instrumented
+                .world_digest_v1()
+                .expect("instrumented initial digest")
+        );
+
+        for expected_tick in 1..=3 {
+            control.step().expect("control tick");
+            instrumented.step().expect("instrumented tick");
+            assert_eq!(
+                instrumented.latest_realized_hearing_observations().len(),
+                2,
+                "capture replaces rather than accumulates world history"
+            );
+            assert!(
+                instrumented
+                    .latest_realized_hearing_observations()
+                    .iter()
+                    .all(|observation| {
+                        observation.source_tick == Tick(expected_tick - 1)
+                            && observation.observation_tick == Tick(expected_tick)
+                    })
+            );
+            assert_eq!(
+                control.world_digest_v1().expect("control digest"),
+                instrumented.world_digest_v1().expect("instrumented digest"),
+                "observational capture changed science state at tick {expected_tick}"
+            );
+        }
+
+        instrumented.set_realized_hearing_capture_enabled(false);
+        assert!(
+            instrumented
+                .latest_realized_hearing_observations()
+                .is_empty()
+        );
     }
 
     #[test]
