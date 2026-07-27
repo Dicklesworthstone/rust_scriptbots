@@ -1143,6 +1143,9 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
             barrier_interval: std::num::NonZeroU64::new((ticks / 4).max(1)).unwrap(),
             master_seed,
             host_options: scriptbots_runtime::HostCoreOptions::default(),
+            // Isolated islands: this lane measures per-island determinism across
+            // thread counts, and migration would couple the islands it compares.
+            migration: None,
         };
         Archipelago::new(arch_cfg).context("failed to build archipelago")
     };

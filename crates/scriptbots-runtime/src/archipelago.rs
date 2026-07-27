@@ -91,14 +91,18 @@ use crate::{
     HostAccessError, HostBlocker, HostCommand, HostFault, HostHealth, HostPort, HostSessionId,
     JournalPort, ManualHostDriver, ManualInstant, RenderSnapshot,
     host_core::{HostCore, HostCoreBuildError, HostCoreOptions},
+    migrator::{
+        CandidateAgent, EmigrantSelectionRule, MigrationConfig, MigrationError, MigrationTopology,
+        select_emigrants,
+    },
 };
 use scriptbots_core::{
-    CharacterizationError, ScriptBotsConfig, Tick, TickSummary, WorldDigestV1, WorldState,
-    WorldStateError, rng_domains::OrganismId,
+    AgentUid, CharacterizationError, MigratingAgent, ScriptBotsConfig, Tick, TickSummary,
+    WorldDigestV1, WorldState, WorldStateError, rng_domains::OrganismId,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
     sync::Arc,
     time::{Duration, Instant},
@@ -225,6 +229,44 @@ pub struct ArchipelagoConfig {
     /// archipelago islands are always paused because the archipelago owns
     /// scientific time exclusively through explicit step commands.
     pub host_options: HostCoreOptions,
+    /// Cross-island migration policy, or `None` for isolated islands
+    /// (bd-16g.5.2).
+    pub migration: Option<ArchipelagoMigration>,
+}
+
+/// Cross-island migration policy for an [`Archipelago`] (bd-16g.5.2).
+///
+/// # There is deliberately no topology field
+///
+/// [`MigrationConfig`] carries one, because the migrator is usable standalone.
+/// Here it would be a second, independent description of which islands are
+/// connected — and the moment two descriptions exist they can disagree. They
+/// would disagree immediately, too: [`Topology::Ring`] normalizes to UNDIRECTED
+/// edges, so on three islands it is the complete graph, while
+/// [`MigrationTopology::Ring`] is the DIRECTED cycle `0 -> 1 -> 2 -> 0`. A
+/// caller who wrote "Ring" in both places would get one of them and no
+/// diagnostic.
+///
+/// The archipelago therefore DERIVES the migration graph from its own
+/// [`ArchipelagoConfig::topology`]: every undirected edge `{a, b}` becomes both
+/// `a -> b` and `b -> a`, since connectivity is symmetric but a move is not.
+/// One description cannot contradict itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchipelagoMigration {
+    /// Ticks between migration barriers.
+    ///
+    /// Must be a nonzero multiple of [`ArchipelagoConfig::barrier_interval`].
+    /// Migration is only physically possible at a barrier — that is the only
+    /// moment every island is at the same tick — so an interval that is not a
+    /// multiple of the barrier would either never fire or fire at a tick the
+    /// caller did not ask for. Construction rejects it rather than silently
+    /// rounding, because a migration cadence that quietly differs from the
+    /// configured one changes the science and nothing would say so.
+    pub interval_ticks: u64,
+    /// Emigrants selected per directed edge per barrier.
+    pub emigrants_per_edge: usize,
+    /// Rule that decides who leaves.
+    pub selection_rule: EmigrantSelectionRule,
 }
 
 /// Immutable per-island construction record.
@@ -269,6 +311,60 @@ pub struct BarrierReport {
     pub step_topology: StepTopology,
     /// Per-island outcomes in ascending island-id order.
     pub islands: Vec<IslandBarrierReport>,
+    /// Migration outcome, when this barrier ran one (bd-16g.5.2).
+    pub migration: Option<MigrationBarrierReport>,
+}
+
+/// One organism that actually moved during a barrier (bd-16g.5.2).
+///
+/// THIS IS THE WITNESS, and it exists because population state cannot be one.
+/// Each island mints `AgentUid` from its own allocator, so an arrival
+/// necessarily takes a fresh local UID — meaning a move is indistinguishable
+/// from a death plus a birth when read from two censuses. Only a record that
+/// names BOTH ends of the journey can say a specific organism left one island
+/// and reached another.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AppliedMigration {
+    /// Island the organism departed.
+    pub from: OrganismId,
+    /// Island and freshly minted local identity it arrived under.
+    pub to: OrganismId,
+    /// Rule that selected it.
+    pub rule: EmigrantSelectionRule,
+    /// Rank within its island under that rule (0 is the strongest match).
+    pub rank: usize,
+    /// The energy, age, or speed value that got it selected — the field that
+    /// makes "why did THIS agent leave?" answerable from the log alone.
+    pub key_value: f64,
+}
+
+/// Outcome of one barrier's migration phase (bd-16g.5.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MigrationBarrierReport {
+    /// Common tick every island had reached when migration ran.
+    pub barrier_tick: Tick,
+    /// Selection rule in force.
+    pub rule: EmigrantSelectionRule,
+    /// Every organism that moved, in canonical `(to, from, uid)` order.
+    pub moves: Vec<AppliedMigration>,
+    /// Per-island population immediately before any move was applied.
+    pub pop_before: BTreeMap<IslandId, u32>,
+    /// Per-island population immediately after every move was applied.
+    pub pop_after: BTreeMap<IslandId, u32>,
+}
+
+impl MigrationBarrierReport {
+    /// Total population across the archipelago before migration.
+    #[must_use]
+    pub fn total_before(&self) -> u32 {
+        self.pop_before.values().sum()
+    }
+
+    /// Total population across the archipelago after migration.
+    #[must_use]
+    pub fn total_after(&self) -> u32 {
+        self.pop_after.values().sum()
+    }
 }
 
 /// One island's outcome within a [`BarrierReport`].
@@ -484,6 +580,67 @@ pub enum ArchipelagoError {
     /// The next barrier tick would overflow the tick domain.
     #[error("barrier tick overflow")]
     TickOverflow,
+    /// The migration interval is not a nonzero multiple of the barrier interval.
+    #[error(
+        "migration interval {interval_ticks} must be a nonzero multiple of \
+         barrier interval {barrier_interval}"
+    )]
+    MigrationIntervalNotBarrierAligned {
+        /// Configured migration interval.
+        interval_ticks: u64,
+        /// Configured barrier interval.
+        barrier_interval: u64,
+    },
+    /// Emigrant selection failed.
+    #[error("migration selection failed: {source}")]
+    MigrationSelection {
+        /// Exact selection failure.
+        #[source]
+        source: MigrationError,
+    },
+    /// Migration did not conserve population.
+    ///
+    /// No scientific tick runs inside the migration phase, so births and deaths
+    /// are structurally zero across it and this identity is exact. A mismatch is
+    /// therefore never explainable by ordinary population dynamics — it means an
+    /// organism was duplicated or dropped.
+    #[error(
+        "migration did not conserve population: before={before}, after={after}, \
+         moves={moves}"
+    )]
+    MigrationNotConserved {
+        /// Total population before any move was applied.
+        before: u32,
+        /// Total population after every move was applied.
+        after: u32,
+        /// Number of moves applied.
+        moves: usize,
+    },
+    /// A host applied an emigration but produced no organism to carry.
+    #[error("island {island} emigrated agent {agent_uid} but parked no organism")]
+    MigrationOrganismMissing {
+        /// The source island.
+        island: IslandId,
+        /// The agent that was supposed to depart.
+        agent_uid: u64,
+    },
+    /// An organism could not be delivered and could not be returned home.
+    ///
+    /// The one failure this module cannot repair, so it is named exactly rather
+    /// than folded into a generic error: a living organism is held by no world
+    /// and the run's population has genuinely changed.
+    #[error(
+        "organism {origin} could not reach {destination} and could not be \
+         returned home: {detail}"
+    )]
+    MigrationOrganismLost {
+        /// Where the organism came from.
+        origin: OrganismId,
+        /// Where it was going.
+        destination: IslandId,
+        /// Exact failure detail.
+        detail: String,
+    },
 }
 
 struct Island {
@@ -533,6 +690,7 @@ pub struct Archipelago {
     barrier_tick: Tick,
     epoch: u64,
     latched: Option<String>,
+    migration: Option<ArchipelagoMigration>,
 }
 
 impl Archipelago {
@@ -590,10 +748,20 @@ impl Archipelago {
             barrier_interval,
             master_seed,
             host_options,
+            migration,
         } = config;
 
         if islands.is_empty() {
             return Err(ArchipelagoError::NoIslands);
+        }
+        if let Some(migration) = &migration {
+            let interval = migration.interval_ticks;
+            if interval == 0 || !interval.is_multiple_of(barrier_interval.get()) {
+                return Err(ArchipelagoError::MigrationIntervalNotBarrierAligned {
+                    interval_ticks: interval,
+                    barrier_interval: barrier_interval.get(),
+                });
+            }
         }
         if islands.len() > MAX_ISLANDS {
             return Err(ArchipelagoError::TooManyIslands {
@@ -799,6 +967,7 @@ impl Archipelago {
             barrier_tick: start_tick,
             epoch: 0,
             latched: None,
+            migration,
         })
     }
 
@@ -1055,12 +1224,33 @@ impl Archipelago {
             }
         }
 
+        // EVERY ISLAND IS NOW AT `target`. That is the precondition the whole
+        // migration protocol rests on, and it is satisfied here and nowhere
+        // else: migration must not observe an island one tick behind another,
+        // or which agents exist to be selected depends on stepping order.
+        let epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(ArchipelagoError::TickOverflow)?;
+        let migration = match self.migrate_at_barrier(epoch, target) {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::error!(
+                    barrier_tick = target.0,
+                    error = %error,
+                    "migration failed mid-barrier; archipelago latched"
+                );
+                self.latched = Some(error.to_string());
+                return Err(error);
+            }
+        };
+
         // Every island reached the barrier: commit the new views in ascending
         // island-id order. This is the only place exposed snapshots advance.
         for island in &mut self.islands {
             island.committed_snapshot = island.core.latest_snapshot();
         }
-        self.epoch += 1;
+        self.epoch = epoch;
         self.barrier_tick = target;
         let islands = self
             .islands
@@ -1078,7 +1268,353 @@ impl Archipelago {
             barrier_tick: target,
             step_topology: StepTopology::SequentialAscending,
             islands,
+            migration,
         })
+    }
+
+    /// Run this barrier's migration phase, if one is due (bd-16g.5.2).
+    ///
+    /// # The two-phase discipline, and the bug it makes unrepresentable
+    ///
+    /// Selection reads a FROZEN pre-barrier census of every island and completes
+    /// entirely before any move is applied. A per-edge select-and-apply loop
+    /// would let island 1's fittest agent be chosen for the edge to island 0 AND
+    /// the edge to island 2 — emigrating twice, i.e. being DUPLICATED — and
+    /// would let an immigrant that has just landed be re-selected as an emigrant
+    /// in the same barrier. Both become impossible when selection cannot observe
+    /// application.
+    ///
+    /// # Why conservation is exactly checkable here, and only here
+    ///
+    /// I previously recorded that the accounting identity
+    /// `after == before + births - deaths + immigrants - emigrants` was not
+    /// closable, because `TickSummary::births`/`deaths` are per-tick and a
+    /// barrier spans many ticks. That was measuring across the wrong window. NO
+    /// SCIENTIFIC TICK RUNS INSIDE THIS PHASE — every island is already at
+    /// `barrier_tick` and only migration commands are applied — so births and
+    /// deaths are structurally zero across it and the identity collapses to
+    /// `after == before`. The check below is therefore exact rather than
+    /// approximate, and a mismatch cannot be explained by population dynamics.
+    ///
+    /// Population sums are still only half the proof: an agent duplicated on one
+    /// island and lost on another leaves the total unchanged. The other half is
+    /// uniqueness of `(IslandId, AgentUid)`, which [`Self::organism_census`]
+    /// expresses and the tests assert at every barrier.
+    fn migrate_at_barrier(
+        &mut self,
+        epoch: u64,
+        barrier_tick: Tick,
+    ) -> Result<Option<MigrationBarrierReport>, ArchipelagoError> {
+        let Some(policy) = self.migration.clone() else {
+            return Ok(None);
+        };
+        if !barrier_tick.0.is_multiple_of(policy.interval_ticks) {
+            return Ok(None);
+        }
+        // The migration graph is DERIVED from the archipelago's own topology, so
+        // there is no second description that could contradict it.
+        let config = MigrationConfig {
+            interval_ticks: policy.interval_ticks,
+            emigrants_per_edge: policy.emigrants_per_edge,
+            selection_rule: policy.selection_rule,
+            topology: MigrationTopology::Custom(directed_edges(&self.edges)),
+            replace: true,
+        };
+
+        // PHASE 1 — freeze. Every candidate list is uid-ascending by
+        // construction, never slotmap handle order.
+        let candidates = self.migration_candidates();
+        let pop_before: BTreeMap<IslandId, u32> = candidates
+            .iter()
+            .map(|(&id, list)| (id, u32::try_from(list.len()).unwrap_or(u32::MAX)))
+            .collect();
+        let total_before: u32 = pop_before.values().sum();
+
+        // PHASE 2 — select everything before applying anything.
+        let plan = select_emigrants(&candidates, &config, self.master_seed, epoch)
+            .map_err(|source| ArchipelagoError::MigrationSelection { source })?;
+
+        // PHASE 3 — apply in the plan's canonical (to, from, uid) order.
+        let mut moves = Vec::with_capacity(plan.moves.len());
+        for record in &plan.moves {
+            let from = record.from_island;
+            let to = record.to_island;
+            let uid = AgentUid(record.agent_uid);
+            let from_index = self
+                .island_index(from)
+                .ok_or(ArchipelagoError::UnknownIsland { island: from })?;
+            let to_index = self
+                .island_index(to)
+                .ok_or(ArchipelagoError::UnknownIsland { island: to })?;
+
+            Self::apply_island_command(
+                &mut self.islands[from_index],
+                HostCommand::Emigrate { agent_uid: uid },
+            )?;
+            let migrant = self.islands[from_index]
+                .core
+                .take_outbound_migrant()
+                .ok_or(ArchipelagoError::MigrationOrganismMissing {
+                    island: from,
+                    agent_uid: record.agent_uid,
+                })?;
+
+            let arrival = self.deliver_migrant(to_index, from_index, from, uid, migrant)?;
+            tracing::info!(
+                barrier_tick = barrier_tick.0,
+                from = %from,
+                to = %to,
+                origin_uid = uid.get(),
+                local_uid = arrival.get(),
+                rule = ?record.selection_rule,
+                rank = record.rank,
+                key_value = record.key_value,
+                "migrated one organism"
+            );
+            moves.push(AppliedMigration {
+                from: OrganismId::new(from, uid),
+                to: OrganismId::new(to, arrival),
+                rule: record.selection_rule,
+                rank: record.rank,
+                key_value: record.key_value,
+            });
+        }
+
+        let pop_after: BTreeMap<IslandId, u32> = self
+            .islands
+            .iter()
+            .map(|island| {
+                (
+                    island.meta.id,
+                    u32::try_from(island.core.with_world(WorldState::agent_count))
+                        .unwrap_or(u32::MAX),
+                )
+            })
+            .collect();
+        let total_after: u32 = pop_after.values().sum();
+        if total_before != total_after {
+            return Err(ArchipelagoError::MigrationNotConserved {
+                before: total_before,
+                after: total_after,
+                moves: moves.len(),
+            });
+        }
+
+        for (island, before) in &pop_before {
+            let after = pop_after.get(island).copied().unwrap_or(0);
+            if *before > 0 && after == 0 {
+                tracing::warn!(
+                    island = %island,
+                    barrier_tick = barrier_tick.0,
+                    "island reached zero population by emigration"
+                );
+            }
+        }
+        tracing::info!(
+            barrier_tick = barrier_tick.0,
+            rule = ?config.selection_rule,
+            interval = config.interval_ticks,
+            total_moves = moves.len(),
+            total_before,
+            total_after,
+            conserved = true,
+            "migration barrier complete"
+        );
+
+        Ok(Some(MigrationBarrierReport {
+            barrier_tick,
+            rule: config.selection_rule,
+            moves,
+            pop_before,
+            pop_after,
+        }))
+    }
+
+    /// Per-island emigration candidates in ascending `AgentUid` order.
+    ///
+    /// Ordering is the contract, not a convenience. Slotmap handle order is an
+    /// implementation detail and handles are reused, so ranking over it would
+    /// make the emigrant set depend on allocation history rather than on the
+    /// selection rule.
+    fn migration_candidates(&self) -> BTreeMap<IslandId, Vec<CandidateAgent>> {
+        self.islands
+            .iter()
+            .map(|island| {
+                let list = island.core.with_world(|world| {
+                    let mut list: Vec<CandidateAgent> = world
+                        .agents()
+                        .iter_handles()
+                        .filter_map(|id| {
+                            let uid = world.agent_uid(id)?;
+                            let data = world.agents().snapshot(id)?;
+                            let runtime = world.agent_runtime(id)?;
+                            let speed = runtime
+                                .outputs
+                                .iter()
+                                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+                            Some(CandidateAgent {
+                                uid: uid.get(),
+                                energy: runtime.energy,
+                                health: data.health,
+                                age: data.age,
+                                speed,
+                            })
+                        })
+                        .collect();
+                    list.sort_unstable_by_key(|candidate| candidate.uid);
+                    list
+                });
+                (island.meta.id, list)
+            })
+            .collect()
+    }
+
+    /// Stage and admit one organism at its destination, returning it home if the
+    /// destination refuses.
+    ///
+    /// The recovery path is the point. `HostCore` hands a refused organism back
+    /// rather than dropping it, so a destination that cannot admit an arrival
+    /// does not cost the run an agent — it costs the barrier, which is loud.
+    /// Only when the SOURCE also refuses to take it back is an organism
+    /// genuinely lost, and that gets its own named error.
+    fn deliver_migrant(
+        &mut self,
+        to_index: usize,
+        from_index: usize,
+        from: IslandId,
+        uid: AgentUid,
+        migrant: MigratingAgent,
+    ) -> Result<AgentUid, ArchipelagoError> {
+        let to = self.islands[to_index].meta.id;
+        if let Err(returned) = self.islands[to_index].core.stage_immigrant(migrant) {
+            let detail = "destination already holds a staged organism".to_owned();
+            return Err(self.return_migrant_home(from_index, from, uid, to, returned, detail));
+        }
+        let command = HostCommand::Immigrate {
+            origin_island: from,
+            origin_uid: uid,
+        };
+        if let Err(error) = Self::apply_island_command(&mut self.islands[to_index], command) {
+            let detail = error.to_string();
+            let Some(returned) = self.islands[to_index].core.unstage_immigrant() else {
+                // The destination neither admitted nor retained it.
+                return Err(ArchipelagoError::MigrationOrganismLost {
+                    origin: OrganismId::new(from, uid),
+                    destination: to,
+                    detail,
+                });
+            };
+            return Err(self.return_migrant_home(from_index, from, uid, to, returned, detail));
+        }
+        let arrival = self.islands[to_index].core.last_arrival().ok_or(
+            ArchipelagoError::MigrationOrganismMissing {
+                island: to,
+                agent_uid: uid.get(),
+            },
+        )?;
+        Ok(arrival.local_uid)
+    }
+
+    /// Put an undeliverable organism back on the island it came from.
+    ///
+    /// Always returns an error: the barrier has failed either way. What differs
+    /// is whether the run still holds every organism, which is why the two
+    /// outcomes are distinct error variants rather than one message.
+    fn return_migrant_home(
+        &mut self,
+        from_index: usize,
+        from: IslandId,
+        uid: AgentUid,
+        destination: IslandId,
+        migrant: MigratingAgent,
+        detail: String,
+    ) -> ArchipelagoError {
+        let origin = OrganismId::new(from, uid);
+        if self.islands[from_index]
+            .core
+            .stage_immigrant(migrant)
+            .is_err()
+        {
+            return ArchipelagoError::MigrationOrganismLost {
+                origin,
+                destination,
+                detail: format!("{detail}; source could not re-stage it"),
+            };
+        }
+        let command = HostCommand::Immigrate {
+            origin_island: from,
+            origin_uid: uid,
+        };
+        match Self::apply_island_command(&mut self.islands[from_index], command) {
+            Ok(()) => {
+                tracing::warn!(
+                    origin = %origin,
+                    destination = %destination,
+                    detail = %detail,
+                    "undeliverable organism returned to its source island"
+                );
+                ArchipelagoError::MigrationOrganismLost {
+                    origin,
+                    destination,
+                    detail: format!("{detail}; organism was returned home"),
+                }
+            }
+            Err(error) => ArchipelagoError::MigrationOrganismLost {
+                origin,
+                destination,
+                detail: format!("{detail}; return home also failed: {error}"),
+            },
+        }
+    }
+
+    /// Submit one command to an island and drive until it applies.
+    ///
+    /// Shares the step path's authority-retry and health checks, so a migration
+    /// command cannot bypass a gate an ordinary step honours.
+    fn apply_island_command(
+        island: &mut Island,
+        command: HostCommand,
+    ) -> Result<(), ArchipelagoError> {
+        let island_id = island.meta.id;
+        let command_id = island.next_command_id()?;
+        let envelope = CommandEnvelope::new(command_id, command);
+        let mut port = island.core.local_port();
+        let submitted = Self::submit_step_with_authority(island_id, &mut port, &envelope)?;
+        let mut applied = Self::step_status_applied(island, &submitted)?;
+        for _attempt in 0..STEP_DRIVE_ATTEMPTS {
+            if applied {
+                break;
+            }
+            let now = island.next_instant();
+            island
+                .core
+                .drive(now)
+                .map_err(|source| ArchipelagoError::Access {
+                    island: island_id,
+                    source,
+                })?;
+            let status = port
+                .command_status(command_id)
+                .map_err(|source| ArchipelagoError::Access {
+                    island: island_id,
+                    source,
+                })?
+                .ok_or_else(|| ArchipelagoError::CommandRejected {
+                    island: island_id,
+                    detail: "migration command status was not retained".to_owned(),
+                })?;
+            applied = Self::step_status_applied(island, &status)?;
+        }
+        Self::verify_island_health(island)?;
+        if !applied {
+            return Err(ArchipelagoError::NoProgress {
+                island: island_id,
+                target: island.core.world_tick(),
+                current: island.core.world_tick(),
+                health: format!("{:?}", island.core.health()),
+            });
+        }
+        Ok(())
     }
 
     /// Step one island to the target tick through explicit step commands.
@@ -1326,6 +1862,23 @@ const fn ordered_edge(a: IslandId, b: IslandId) -> (IslandId, IslandId) {
     if a.0 <= b.0 { (a, b) } else { (b, a) }
 }
 
+/// Expand undirected archipelago edges into the sorted directed edges migration
+/// uses.
+///
+/// An archipelago edge `{a, b}` means the islands are connected; migration is
+/// directional, so it means BOTH `a -> b` and `b -> a`. Sorting matches the
+/// migrator's own normalization so the two representations are comparable.
+fn directed_edges(edges: &[(IslandId, IslandId)]) -> Vec<(IslandId, IslandId)> {
+    let mut directed = Vec::with_capacity(edges.len() * 2);
+    for &(a, b) in edges {
+        directed.push((a, b));
+        directed.push((b, a));
+    }
+    directed.sort_unstable();
+    directed.dedup();
+    directed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1449,7 +2002,24 @@ mod tests {
             barrier_interval: NonZeroU64::new(interval).expect("nonzero interval"),
             master_seed: 0x5eed_5eed_5eed_5eed,
             host_options: HostCoreOptions::default(),
+            migration: None,
         }
+    }
+
+    /// The same config with migration enabled at every barrier.
+    fn migrating_config(
+        islands: Vec<IslandSpec>,
+        interval: u64,
+        selection_rule: EmigrantSelectionRule,
+        emigrants_per_edge: usize,
+    ) -> ArchipelagoConfig {
+        let mut config = archipelago_config(islands, interval);
+        config.migration = Some(ArchipelagoMigration {
+            interval_ticks: interval,
+            emigrants_per_edge,
+            selection_rule,
+        });
+        config
     }
 
     #[test]
@@ -2377,12 +2947,11 @@ mod tests {
     /// to re-identify an arrival under the destination's allocator breaks this test
     /// LOUDLY instead of producing a plausible, wrong phylogeny.
     ///
-    /// THE SECOND HALF IS NOT YET ASSERTABLE, and is named rather than faked: the full
-    /// accounting identity is
-    ///     population_after == population_before + births - deaths + immigrants - emigrants
-    /// and `TickSummary::births`/`deaths` are PER TICK, so reconstructing them across a
-    /// multi-tick barrier needs per-barrier migration counts that do not exist until the
-    /// migrator is wired. Asserting a partial identity here would be worse than naming it.
+    /// MIGRATION IS NOW ON IN THIS TEST, which is what turns it from a guard into a
+    /// proof. It was committed while migration was unwired, so it held trivially; the
+    /// whole reason to land it early was that the first wrong `emigrate`/`immigrate`
+    /// would break it loudly. Running it against isolated islands from here on would be
+    /// keeping the shape of a guard while removing everything it guards.
     #[test]
     fn bd_16g_5_2_no_agent_is_duplicated_or_lost_across_barriers() {
         let islands: Vec<IslandId> = (0..3).map(IslandId).collect();
@@ -2390,8 +2959,13 @@ mod tests {
             .iter()
             .map(|id| spec(id.0, populated_config(None)))
             .collect();
-        let mut archipelago =
-            populated_archipelago(archipelago_config(specs, 40)).expect("valid archipelago");
+        let mut archipelago = populated_archipelago(migrating_config(
+            specs,
+            40,
+            EmigrantSelectionRule::Fittest,
+            1,
+        ))
+        .expect("valid archipelago");
 
         archipelago.step_to_barrier().expect("first barrier");
         let first = census(&archipelago, &islands);
@@ -2403,34 +2977,292 @@ mod tests {
         // Uniqueness must hold at EVERY barrier, not just once: a migrator that
         // duplicates on the third exchange is the realistic bug.
         let mut previous = first;
+        let mut total_moves = 0usize;
         for barrier in 0..4 {
             let stepped = archipelago.step_to_barrier();
             assert!(stepped.is_ok(), "barrier {barrier} must step: {stepped:?}");
+            let report = stepped.expect("checked above");
             let current = census(&archipelago, &islands);
             assert!(
                 !current.is_empty(),
                 "population collapsed at barrier {barrier}, so later barriers prove nothing"
             );
 
-            // WHY THERE IS NO "NOTHING MOVED" ASSERTION HERE, and it is a finding rather
-            // than an omission. I wrote one and it failed: island 0 and island 1 each hold
-            // their own AgentUid(1), because uids come from per-island private allocators.
-            // Comparing bare uids across islands is exactly the merge hazard bd-8jlj is
-            // filed for, and I walked into it twice.
-            //
-            // The consequence is load-bearing for bd-16g.5.2: a move is INDISTINGUISHABLE
-            // from a death plus a birth when observed from population state alone, because
-            // the arriving agent necessarily takes a fresh local uid. Conservation across
-            // migration therefore CANNOT be verified from censuses -- it requires the
-            // journaled migration record. That reorders my own inventory on this bead:
-            // journaling is not a later nicety after conservation, it is a PREREQUISITE
-            // for asserting conservation at all.
-            //
-            // What remains assertable now, and is asserted above via `census`, is
-            // uniqueness -- the half that catches duplication, which is the silent failure.
+            // CONSERVATION ACROSS THE MIGRATION ITSELF. I previously recorded that the
+            // accounting identity was not closable because TickSummary births/deaths are
+            // per tick and a barrier spans many. That was measuring across the wrong
+            // window. NO TICK RUNS INSIDE THE MIGRATION PHASE -- every island is already
+            // at the barrier tick and only migration commands are applied -- so births
+            // and deaths are structurally zero across it and the identity collapses to
+            // `after == before`. `migrate_at_barrier` enforces exactly that in
+            // production; here we check the report agrees.
+            assert!(
+                report.migration.is_some(),
+                "barrier {barrier} must have run migration"
+            );
+            let migration = report
+                .migration
+                .as_ref()
+                .expect("checked immediately above");
+            assert_eq!(
+                migration.total_before(),
+                migration.total_after(),
+                "migration must conserve population exactly at barrier {barrier}"
+            );
+            total_moves += migration.moves.len();
+
+            // THE MOVEMENT WITNESS, which population state cannot be. Each move names
+            // both ends of the journey, and both ends must exist in the census: the
+            // arrival under its fresh destination-local uid, and the departure NOT on
+            // its source island any more.
+            for applied in &migration.moves {
+                assert!(
+                    current.contains(&applied.to),
+                    "barrier {barrier}: arrival {} is missing from the census",
+                    applied.to
+                );
+                assert!(
+                    !current.contains(&applied.from),
+                    "barrier {barrier}: departed organism {} is still on its source island",
+                    applied.from
+                );
+                assert_ne!(
+                    applied.from.island, applied.to.island,
+                    "a migration must cross islands"
+                );
+            }
+
             let _ = &previous;
             previous = current;
         }
+        assert!(
+            total_moves > 0,
+            "no organism ever moved, so nothing above was actually exercised"
+        );
+    }
+
+    /// Migration moves real organisms, conserves population exactly, and is
+    /// reproducible barrier for barrier (bd-16g.5.2).
+    ///
+    /// The E2E proof the bead asks for, and the assertions are chosen for what they
+    /// would CATCH rather than for what reads well:
+    ///
+    /// - Population sums alone are NOT sufficient and are not claimed to be. An agent
+    ///   duplicated on one island and lost on another leaves the total unchanged, which
+    ///   is exactly the silent failure. Uniqueness of `(IslandId, AgentUid)` across the
+    ///   whole archipelago is the half that catches it, and `organism_census` enforces it
+    ///   as the set is built.
+    /// - A move is INDISTINGUISHABLE from a death plus a birth from population state,
+    ///   because the arrival necessarily takes a fresh local uid. So the journaled move
+    ///   record is the only witness that a specific organism travelled, and every move is
+    ///   checked against the census at both ends.
+    /// - Determinism is asserted against a SECOND archipelago built from the same seed,
+    ///   not against a stored constant, so the property proven is reproducibility rather
+    ///   than agreement with a number someone once wrote down.
+    #[test]
+    fn bd_16g_5_2_migration_conserves_population_and_repeats_exactly() {
+        let islands: Vec<IslandId> = (0..4).map(IslandId).collect();
+        let build = || {
+            let specs: Vec<IslandSpec> = islands
+                .iter()
+                .map(|id| spec(id.0, populated_config(None)))
+                .collect();
+            populated_archipelago(migrating_config(
+                specs,
+                30,
+                EmigrantSelectionRule::Fittest,
+                2,
+            ))
+            .expect("valid migrating archipelago")
+        };
+
+        let mut first = build();
+        let mut second = build();
+        let mut observed_moves = 0usize;
+
+        for barrier in 0..5 {
+            let left = first.step_to_barrier().expect("first archipelago steps");
+            let right = second.step_to_barrier().expect("second archipelago steps");
+
+            assert!(
+                left.migration.is_some() && right.migration.is_some(),
+                "barrier {barrier} must run migration on both archipelagos"
+            );
+            let left_migration = left.migration.as_ref().expect("checked immediately above");
+            let right_migration = right.migration.as_ref().expect("checked immediately above");
+
+            assert_eq!(
+                left_migration.total_before(),
+                left_migration.total_after(),
+                "barrier {barrier} must conserve population exactly"
+            );
+
+            // Same seed, same moves -- including which organism, in which order.
+            assert_eq!(
+                left_migration.moves, right_migration.moves,
+                "two archipelagos with the same master seed must migrate identically \
+                 at barrier {barrier}"
+            );
+
+            // Canonical application order is (to, from, uid). Anything else makes the
+            // outcome depend on edge iteration order.
+            let keys: Vec<_> = left_migration
+                .moves
+                .iter()
+                .map(|applied| (applied.to.island, applied.from.island, applied.from.uid))
+                .collect();
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            assert_eq!(keys, sorted, "moves must be applied in canonical order");
+
+            // No organism may move twice in one barrier: the two-phase select-all then
+            // apply-all discipline is what makes that unrepresentable, and a per-edge
+            // select-and-apply loop would duplicate the fittest agent across its edges.
+            let departures: BTreeSet<_> = left_migration
+                .moves
+                .iter()
+                .map(|applied| applied.from)
+                .collect();
+            assert_eq!(
+                departures.len(),
+                left_migration.moves.len(),
+                "an organism emigrated twice in one barrier at {barrier}"
+            );
+
+            let census = first.organism_census().expect("census readable");
+            let population: usize = islands
+                .iter()
+                .map(|&id| {
+                    first
+                        .with_island_world(id, WorldState::agent_count)
+                        .expect("island readable")
+                })
+                .sum();
+            assert_eq!(
+                census.len(),
+                population,
+                "every living agent must have exactly one archipelago identity at \
+                 barrier {barrier}"
+            );
+
+            observed_moves += left_migration.moves.len();
+        }
+
+        assert!(
+            observed_moves > 0,
+            "migration never moved anyone, so conservation held vacuously"
+        );
+    }
+
+    /// Isolated islands stay bit-identical when migration is off.
+    ///
+    /// The control for the test above: it proves the migration machinery is inert when
+    /// not configured, so a digest change elsewhere cannot be blamed on it, and that
+    /// enabling migration is what actually perturbs the islands.
+    #[test]
+    fn bd_16g_5_2_migration_off_leaves_island_digests_untouched() {
+        let specs = || {
+            (0..3)
+                .map(|id| spec(id, populated_config(None)))
+                .collect::<Vec<_>>()
+        };
+        let mut isolated =
+            populated_archipelago(archipelago_config(specs(), 30)).expect("isolated archipelago");
+        let mut migrating = populated_archipelago(migrating_config(
+            specs(),
+            30,
+            EmigrantSelectionRule::Fittest,
+            2,
+        ))
+        .expect("migrating archipelago");
+
+        for _ in 0..3 {
+            isolated.step_to_barrier().expect("isolated steps");
+            migrating.step_to_barrier().expect("migrating steps");
+        }
+
+        let mut differed = false;
+        for id in (0..3).map(IslandId) {
+            let quiet = isolated.island_digest(id).expect("isolated digest");
+            let moved = migrating.island_digest(id).expect("migrating digest");
+            if quiet != moved {
+                differed = true;
+            }
+        }
+        assert!(
+            differed,
+            "enabling migration must actually change island science; if the digests \
+             match, nothing moved and every migration test above is vacuous"
+        );
+    }
+
+    /// A migration interval that is not a multiple of the barrier is refused.
+    ///
+    /// Rounding it silently would run migration at a cadence the caller never asked
+    /// for, and a wrong migration rate changes the science while every gate stays green.
+    #[test]
+    fn bd_16g_5_2_unaligned_migration_interval_is_a_construction_error() {
+        let specs: Vec<IslandSpec> = (0..2).map(|id| spec(id, test_config(None))).collect();
+        let mut config = archipelago_config(specs, 40);
+        config.migration = Some(ArchipelagoMigration {
+            interval_ticks: 30,
+            emigrants_per_edge: 1,
+            selection_rule: EmigrantSelectionRule::Fittest,
+        });
+        assert!(matches!(
+            Archipelago::new(config),
+            Err(ArchipelagoError::MigrationIntervalNotBarrierAligned {
+                interval_ticks: 30,
+                barrier_interval: 40,
+            })
+        ));
+
+        let specs: Vec<IslandSpec> = (0..2).map(|id| spec(id, test_config(None))).collect();
+        let mut zero = archipelago_config(specs, 40);
+        zero.migration = Some(ArchipelagoMigration {
+            interval_ticks: 0,
+            emigrants_per_edge: 1,
+            selection_rule: EmigrantSelectionRule::Fittest,
+        });
+        assert!(matches!(
+            Archipelago::new(zero),
+            Err(ArchipelagoError::MigrationIntervalNotBarrierAligned {
+                interval_ticks: 0,
+                ..
+            })
+        ));
+    }
+
+    /// The migration graph is the archipelago's own topology, expanded both ways.
+    ///
+    /// Pins the reason [`ArchipelagoMigration`] has no topology field: `Topology::Ring`
+    /// normalizes to UNDIRECTED edges, so on three islands it is the complete graph,
+    /// while `MigrationTopology::Ring` is the directed cycle. Two descriptions would
+    /// disagree here immediately and silently.
+    #[test]
+    fn bd_16g_5_2_migration_edges_are_the_archipelago_topology_both_ways() {
+        let undirected = [
+            (IslandId(0), IslandId(1)),
+            (IslandId(0), IslandId(2)),
+            (IslandId(1), IslandId(2)),
+        ];
+        assert_eq!(
+            directed_edges(&undirected),
+            vec![
+                (IslandId(0), IslandId(1)),
+                (IslandId(0), IslandId(2)),
+                (IslandId(1), IslandId(0)),
+                (IslandId(1), IslandId(2)),
+                (IslandId(2), IslandId(0)),
+                (IslandId(2), IslandId(1)),
+            ],
+            "connectivity is symmetric but a move is not, so each edge expands both ways"
+        );
+        assert_ne!(
+            directed_edges(&undirected),
+            MigrationTopology::Ring.build_edges(&[IslandId(0), IslandId(1), IslandId(2)]),
+            "the two Ring meanings genuinely differ; that is why only one exists here"
+        );
     }
 
     /// The archipelago-wide census keys on `(IslandId, AgentUid)`, and the bare-UID
