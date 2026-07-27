@@ -16,10 +16,25 @@ cd "$repo_root"
 
 test_name="tests::preparation_deadline_file_pipeline_e2e_preserves_exact_retry"
 printf 'persistence-preparation-e2e: running exact proof %s through rch\n' "$test_name"
-RCH_VISIBILITY=summary \
-  rch exec -- cargo test -p scriptbots-storage --lib "$test_name" -- --exact --nocapture 2>&1 |
+RCH_VISIBILITY=verbose \
+RCH_QUEUE_WHEN_BUSY=true \
+RCH_REQUIRE_REMOTE=1 \
+RCH_NO_SELF_HEALING=1 \
+  rch --no-self-healing exec -v --no-color -- \
+    cargo test -p scriptbots-storage --lib "$test_name" -- --exact --nocapture 2>&1 |
   awk -v test_name="$test_name" '
     { print }
+    /Executing command remotely/ { witnessed_remote_dispatch = 1 }
+    /Job j-[0-9]+ submitted to [^[:space:]]+/ {
+      worker = $0
+      sub(/^.*submitted to /, "", worker)
+      sub(/[[:space:]].*$/, "", worker)
+      job = $0
+      sub(/^.*Job /, "", job)
+      sub(/[[:space:]].*$/, "", job)
+      printf "Executing command remotely: cargo test -p scriptbots-storage --lib %s -- --exact --nocapture on %s (RCH job %s)\n", test_name, worker, job
+      witnessed_remote_dispatch = 1
+    }
     /^\[RCH\] remote [^ ]+ \(/ { witnessed_remote_completion = 1 }
     /\/data\/projects\/rust_scriptbots\// { witnessed_remote_source = 1 }
     /test result: ok\. 1 passed; 0 failed;/ { witnessed_test = 1 }
@@ -59,6 +74,10 @@ RCH_VISIBILITY=summary \
     }
     END {
       failed = 0
+      if (!witnessed_remote_dispatch) {
+        printf "persistence-preparation-e2e: proof %s emitted no Executing command remotely banner\n", test_name > "/dev/stderr"
+        failed = 1
+      }
       if (!witnessed_remote_completion) {
         printf "persistence-preparation-e2e: proof %s emitted no RCH remote completion marker\n", test_name > "/dev/stderr"
         failed = 1
