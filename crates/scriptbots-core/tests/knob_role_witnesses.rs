@@ -162,6 +162,23 @@ enum Baseline {
     /// `topography_enabled` defaults to false, and the penalty and gain knobs are read
     /// only when it is true.
     TopographyEnabled,
+    /// A world where agents actually reproduce inside a short witness budget.
+    ///
+    /// The defaults are deliberately slow -- cooldown 300, attempt interval 15, chance 0.1,
+    /// energy threshold 0.65 -- so a 16-tick run produces no births at all and the whole
+    /// reproduction family reads as dead. Making births frequent is the prerequisite;
+    /// the knobs under test are then perturbed on top of it.
+    ///
+    /// NOTE the tension with bd-pdx5: these are exactly the settings whose EXTREME form
+    /// (cooldown 1, interval 1, chance 1.0) caused a compounding population runaway. The
+    /// values here are chosen to make births happen within the budget WITHOUT compounding,
+    /// and the witness budget is short enough that growth cannot run away.
+    ReproductionEnabled,
+    /// A world where the population floor actively injects agents.
+    ///
+    /// `population_minimum` defaults to 0, so the injection path never runs and every
+    /// population knob sits behind a branch a default world never takes.
+    PopulationFloorEnabled,
     /// A world where combat actually moves resources.
     ///
     /// `stage_combat` hard-gates on `spike_lengths[idx] > 0.5`; default spike length is 0
@@ -258,6 +275,21 @@ fn baseline_config(baseline: Baseline, mut config: ScriptBotsConfig) -> ScriptBo
     }
     if baseline == Baseline::TopographyEnabled {
         config.topography_enabled = true;
+    }
+    if baseline == Baseline::ReproductionEnabled {
+        // Frequent enough that a short run contains births; NOT the compounding
+        // configuration bd-pdx5 diagnosed as a runaway.
+        config.reproduction_cooldown = 2;
+        config.reproduction_attempt_interval = 1;
+        config.reproduction_attempt_chance = 1.0;
+        config.reproduction_energy_threshold = 0.1;
+        config.reproduction_partner_chance = 1.0;
+    }
+    if baseline == Baseline::PopulationFloorEnabled {
+        // A floor above the seeded agent count, checked often enough to fire.
+        config.population_minimum = 12;
+        config.population_spawn_interval = 2;
+        config.population_spawn_count = 2;
     }
     if baseline == Baseline::CombatReachable {
         // Relax the eligibility and aiming thresholds so the hit does not depend on
@@ -641,6 +673,224 @@ static WITNESSES: &[Witness] = &[
         ticks: 16,
         baseline: Baseline::Default,
     },
+    // bd-3mul: the rest of the spike and carcass families need NO new machinery -- the
+    // CombatReachable baseline already built for the first carcass slice reaches them all.
+    Witness {
+        path: "spike_radius",
+        value: || Value::from(55.0),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "spike_energy_cost",
+        value: || Value::from(0.2),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "spike_min_length",
+        value: || Value::from(0.2),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "spike_growth_rate",
+        value: || Value::from(0.05),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "spike_length_damage_bonus",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "spike_speed_damage_bonus",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "spike_alignment_cosine",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "carcass_maturity_age",
+        value: || Value::from(2),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "carcass_neighbor_exponent",
+        value: || Value::from(2.0),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "carcass_reproduction_reward",
+        value: || Value::from(9.0),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "carcass_indicator_scale",
+        value: || Value::from(2.0),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    // The reproduction family: seventeen knobs behind one prerequisite.
+    Witness {
+        path: "reproduction_energy_threshold",
+        value: || Value::from(0.4),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    // 0.05, not 0.3: the validator requires cost <= threshold, and the ReproductionEnabled
+    // baseline sets threshold to 0.1. The fifth cross-field constraint this harness has
+    // surfaced by execution rather than by reading the struct.
+    Witness {
+        path: "reproduction_energy_cost",
+        value: || Value::from(0.05),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_cooldown",
+        value: || Value::from(8),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_attempt_interval",
+        value: || Value::from(4),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_attempt_chance",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_child_energy",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_partner_chance",
+        value: || Value::from(0.2),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_rate_carnivore",
+        value: || Value::from(2.0),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_rate_herbivore",
+        value: || Value::from(2.0),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_mutation_scale",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_meta_mutation_chance",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_meta_mutation_scale",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_spawn_jitter",
+        value: || Value::from(5.0),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_spawn_back_distance",
+        value: || Value::from(5.0),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_color_jitter",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_fertility_bonus",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "reproduction_food_bonus",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    // The population-floor family: injection never runs while the floor is zero.
+    Witness {
+        path: "population_minimum",
+        value: || Value::from(20),
+        ticks: 16,
+        baseline: Baseline::PopulationFloorEnabled,
+    },
+    Witness {
+        path: "population_spawn_interval",
+        value: || Value::from(4),
+        ticks: 16,
+        baseline: Baseline::PopulationFloorEnabled,
+    },
+    Witness {
+        path: "population_spawn_count",
+        value: || Value::from(3),
+        ticks: 16,
+        baseline: Baseline::PopulationFloorEnabled,
+    },
+    Witness {
+        path: "population_crossover_chance",
+        value: || Value::from(1.0),
+        ticks: 16,
+        baseline: Baseline::PopulationFloorEnabled,
+    },
+    // These three need no prerequisite; they are read on every tick.
+    Witness {
+        path: "metabolism_ramp_floor",
+        value: || Value::from(0.5),
+        ticks: 16,
+        baseline: Baseline::Default,
+    },
+    Witness {
+        path: "metabolism_ramp_rate",
+        value: || Value::from(0.05),
+        ticks: 16,
+        baseline: Baseline::Default,
+    },
+    Witness {
+        path: "metabolism_boost_penalty",
+        value: || Value::from(0.05),
+        ticks: 16,
+        baseline: Baseline::Default,
+    },
     // bd-3mul item 3: the carcass family, now reachable.
     //
     // These were previously unwitnessable at ANY value, because
@@ -703,6 +953,18 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
     let topography_reference =
         run_material(ScriptBotsConfig::default(), 16, Baseline::TopographyEnabled)
             .expect("the topography baseline must build and step a world");
+    let reproduction_reference = run_material(
+        ScriptBotsConfig::default(),
+        16,
+        Baseline::ReproductionEnabled,
+    )
+    .expect("the reproduction baseline must build and step a world");
+    let population_reference = run_material(
+        ScriptBotsConfig::default(),
+        16,
+        Baseline::PopulationFloorEnabled,
+    )
+    .expect("the population-floor baseline must build and step a world");
 
     // Collect every failure rather than panicking on the first. One run then tells you about all
     // 17 witnesses instead of one per run, which matters when a verification cycle is minutes long
@@ -720,6 +982,8 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
             Baseline::AgingEnabled => &aging_reference,
             Baseline::SharingEnabled => &sharing_reference,
             Baseline::TopographyEnabled => &topography_reference,
+            Baseline::ReproductionEnabled => &reproduction_reference,
+            Baseline::PopulationFloorEnabled => &population_reference,
         };
         match run_material(config, witness.ticks.max(8), witness.baseline) {
             Err(reason) => broken.push(format!("{}: {reason}", witness.path)),
@@ -776,10 +1040,10 @@ fn bd_dorx_every_witness_targets_a_scientific_knob() {
 /// lie of exactly the kind bd-dorx exists to stop. A floor makes the debt visible in the test
 /// output every run while making it impossible to quietly delete a witness.
 ///
-/// 41 is the OBSERVED count -- every one of these was seen to move material state on a real run.
+/// 76 is the OBSERVED count -- every one of these was seen to move material state on a real run.
 /// It is not an aspiration. An earlier value of 17 was aspirational and left this gate red,
 /// which is the failure it exists to prevent, so the number now tracks evidence only.
-const WITNESS_COVERAGE_FLOOR: usize = 41;
+const WITNESS_COVERAGE_FLOOR: usize = 76;
 
 /// Report scientific coverage, and hold the line against it regressing.
 ///
