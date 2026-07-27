@@ -5075,6 +5075,23 @@ impl CuratedThemeId {
         }
     }
 
+    /// How many themes the `Ctrl+T` rotation visits before returning to start.
+    ///
+    /// Walked rather than hardcoded so adding a theme cannot leave a caller
+    /// iterating the wrong number of times — the failure mode that made
+    /// `test_curated_theme_id_cycling` stale when the sixth theme landed.
+    #[must_use]
+    pub fn cycle_len(self) -> usize {
+        let mut count = 1;
+        let mut current = self.next();
+        while current != self {
+            count += 1;
+            current = current.next();
+            assert!(count <= 64, "the theme cycle is not closed");
+        }
+        count
+    }
+
     /// The config-layer identity for this theme.
     ///
     /// Exhaustive on purpose — no wildcard arm. Adding a theme to either enum
@@ -9760,6 +9777,233 @@ mod tests {
         assert_eq!(app.speed_multiplier, 0.0);
     }
 
+    /// Render one production frame at a chosen theme, palette and viewport.
+    ///
+    /// `run_headless_frames` pins the palette to `test_backend_evidence`, so the
+    /// spot matrix needs its own entry point rather than a parameter that only
+    /// tests would ever pass. This drives the same `app.draw` the product uses and
+    /// reuses `HeadlessBufferEvidence`, so the matrix measures the real renderer
+    /// rather than a summary written for it.
+    fn render_matrix_frame(
+        theme: CuratedThemeId,
+        mode: TerminalPaletteMode,
+        width: u16,
+        height: u16,
+    ) -> HeadlessBufferEvidence {
+        let world = command_characterization_world();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+        app.palette = Palette::test_backend_evidence();
+        app.palette.theme_id = theme;
+        app.palette.mode = mode;
+
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| app.draw(frame)).expect("draw frame");
+        HeadlessBufferEvidence::inspect(terminal.backend().buffer(), app.snapshot().tick)
+            .expect("buffer evidence")
+    }
+
+    /// GOLDEN SPOT MATRIX: a theme may repaint the HUD but must never re-lay it out.
+    ///
+    /// This is the invariant worth pinning rather than 30 hand-copied digests. The
+    /// bead requires that themes not corrupt readability and that Ctrl+T cycling
+    /// not cause layout corruption; both reduce to the same property — chrome
+    /// theming is a COLOUR axis, so for a fixed accessibility palette every theme
+    /// must produce byte-identical cell geometry. Thirty pinned digests would go
+    /// stale on any legitimate colour edit and teach the next agent to re-bless
+    /// them without looking; this fails only when a theme actually moves
+    /// something (bd-2z0.14.2.2).
+    #[test]
+    fn every_theme_repaints_without_relaying_out_the_hud() {
+        for mode in [
+            TerminalPaletteMode::Natural,
+            TerminalPaletteMode::Deuteranopia,
+            TerminalPaletteMode::Protanopia,
+            TerminalPaletteMode::Tritanopia,
+            TerminalPaletteMode::HighContrast,
+        ] {
+            let baseline_theme = CuratedThemeId::default();
+            let baseline = render_matrix_frame(baseline_theme, mode, 80, 36);
+
+            let mut theme = baseline_theme.next();
+            let mut digests = vec![baseline.full_cell_fnv1a64.clone()];
+            while theme != baseline_theme {
+                let frame = render_matrix_frame(theme, mode, 80, 36);
+
+                assert_eq!(
+                    (
+                        frame.non_blank_cells,
+                        frame.styled_cells,
+                        frame.skipped_cells,
+                        frame.forced_width_cells,
+                        frame.empty_symbol_cells,
+                    ),
+                    (
+                        baseline.non_blank_cells,
+                        baseline.styled_cells,
+                        baseline.skipped_cells,
+                        baseline.forced_width_cells,
+                        baseline.empty_symbol_cells,
+                    ),
+                    "{mode:?}/{theme:?}: switching chrome theme changed the LAYOUT, not just \
+                     colour. Theme and accessibility palette are orthogonal axes; a theme that \
+                     moves cells corrupts the HUD on Ctrl+T"
+                );
+                assert_eq!(
+                    frame.semantic_regions, baseline.semantic_regions,
+                    "{mode:?}/{theme:?}: a theme must not add or remove semantic regions"
+                );
+
+                digests.push(frame.full_cell_fnv1a64.clone());
+                theme = theme.next();
+            }
+
+            // The matrix is only meaningful if themes actually repaint. If every
+            // digest matched, the layout assertion above would be trivially true
+            // and would pass against a theme system that does nothing.
+            let distinct = digests.iter().collect::<std::collections::BTreeSet<_>>();
+            assert!(
+                distinct.len() > 1,
+                "{mode:?}: every theme produced an identical frame digest, so the theme \
+                 system is not reaching the renderer and this matrix proves nothing"
+            );
+        }
+    }
+
+    /// Draw one production frame and return the buffer's own area.
+    ///
+    /// Deliberately does NOT go through `HeadlessBufferEvidence::inspect`. That
+    /// helper enforces a semantic-region contract — it requires strings like
+    /// "ScriptBots Terminal HUD" and "Vital Stats" to be present — which is right
+    /// for the 80x36 evidence frame and wrong as a resize probe: at 20x8 those
+    /// panels legitimately do not fit, and demanding them would assert something
+    /// the product never promised. Learned by writing the storm the other way
+    /// first and watching it reject a frame the renderer had drawn correctly.
+    fn draw_at_viewport(
+        theme: CuratedThemeId,
+        mode: TerminalPaletteMode,
+        width: u16,
+        height: u16,
+    ) -> Rect {
+        let world = command_characterization_world();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+        app.palette = Palette::test_backend_evidence();
+        app.palette.theme_id = theme;
+        app.palette.mode = mode;
+
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| app.draw(frame)).expect("draw frame");
+        terminal.backend().buffer().area
+    }
+
+    /// RESIZE STORM: the HUD must survive a spread of viewports without panicking
+    /// or producing a buffer that disagrees with the terminal it was drawn into.
+    ///
+    /// Deliberately includes sizes below the layout's comfortable minimum, down to
+    /// 1x1. A HUD that panics or writes outside its area on a small pane is a
+    /// crash waiting for someone to drag a window edge, and constraint arithmetic
+    /// is exactly where that hides. Reaching the assertion at all is most of the
+    /// proof: ratatui panics on out-of-area writes, so a renderer that overran its
+    /// rect would take the test down rather than return a wrong number.
+    #[test]
+    fn the_hud_survives_a_viewport_resize_storm() {
+        // Ordered small-to-large and back through awkward shapes: tall-thin and
+        // short-wide stress different constraint paths than a square.
+        let viewports: [(u16, u16); 12] = [
+            (20, 8),
+            (40, 12),
+            (80, 36),
+            (200, 60),
+            (80, 6),
+            (24, 60),
+            (81, 37),
+            (1, 1),
+            (2, 40),
+            (120, 3),
+            (80, 36),
+            (300, 100),
+        ];
+
+        for (width, height) in viewports {
+            let area = draw_at_viewport(
+                CuratedThemeId::default(),
+                TerminalPaletteMode::Natural,
+                width,
+                height,
+            );
+            assert_eq!(
+                (area.width, area.height),
+                (width, height),
+                "the drawn buffer must match the terminal it was drawn into at {width}x{height}"
+            );
+            assert_eq!(
+                (area.x, area.y),
+                (0, 0),
+                "{width}x{height}: the buffer origin drifted"
+            );
+        }
+
+        // The storm is only meaningful if the standard viewport still renders a
+        // complete HUD afterwards; otherwise "survived" could mean "drew nothing".
+        let evidence = render_matrix_frame(
+            CuratedThemeId::default(),
+            TerminalPaletteMode::Natural,
+            80,
+            36,
+        );
+        assert!(
+            evidence.non_blank_cells > 0,
+            "after the storm the standard viewport must still paint a populated HUD"
+        );
+    }
+
+    /// The storm must also survive theme cycling mid-resize, which is the exact
+    /// sequence the bead calls out: Ctrl+T during a PTY resize storm.
+    #[test]
+    fn theme_cycling_during_a_resize_storm_keeps_the_buffer_intact() {
+        let mut theme = CuratedThemeId::default();
+        for (width, height) in [(80, 36), (40, 12), (200, 60), (24, 50), (80, 36)] {
+            for _ in 0..CuratedThemeId::default().cycle_len() {
+                let area =
+                    draw_at_viewport(theme, TerminalPaletteMode::Deuteranopia, width, height);
+                assert_eq!(
+                    (area.width, area.height),
+                    (width, height),
+                    "{theme:?} at {width}x{height}: buffer dimensions drifted during the storm"
+                );
+                theme = theme.next();
+            }
+        }
+    }
+
+    #[test]
     #[test]
     fn headless_test_backend_frame_proves_buffer_semantics_and_current_tick() {
         let world = command_characterization_world();
