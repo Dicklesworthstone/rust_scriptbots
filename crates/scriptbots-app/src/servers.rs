@@ -970,11 +970,6 @@ impl From<SelectionUpdateRequestBody> for SelectionUpdate {
     }
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-struct SelectionAcknowledge {
-    queued: bool,
-}
-
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct ConfigPatchRequest {
     #[schema(value_type = Object, nullable = false)]
@@ -1082,7 +1077,7 @@ pub struct SpeedRequestBody {
             AgentDebugEntryDto,
             PositionDto,
             SelectionUpdateRequestBody,
-            SelectionAcknowledge,
+            CommandStatusDto,
             CommandAcknowledge,
             StepRequestBody,
             SpeedRequestBody,
@@ -1539,18 +1534,24 @@ async fn get_agents_debug(
     path = "/api/selection",
     tag = "control",
     request_body = SelectionUpdateRequestBody,
-    responses((status = 202, body = SelectionAcknowledge), (status = 400, body = ErrorResponse))
+    responses((status = 202, body = CommandStatusDto), (status = 400, body = ErrorResponse))
 )]
 async fn post_selection(
     State(state): State<ApiState>,
     Json(body): Json<SelectionUpdateRequestBody>,
-) -> Result<(StatusCode, Json<SelectionAcknowledge>), AppError> {
+) -> Result<(StatusCode, Json<CommandStatusDto>), AppError> {
     let update: SelectionUpdate = body.into();
-    run_control(move || state.handle.update_selection(update)).await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(SelectionAcknowledge { queued: true }),
-    ))
+    // Report the receipt the command actually produced. This used to discard
+    // the call's result and answer with a hardcoded `queued: true` — a literal,
+    // not a fact derived from anything — which left selection as the only
+    // control surface with no command identity at all (bd-2z0.4.9). A client
+    // could not poll it, correlate it, or tell two selections apart.
+    //
+    // 202 is still correct and is now honest rather than incidental: the body
+    // says `admitted`, not `applied`, so the status code and the payload agree
+    // that this command has been accepted and not yet applied.
+    let status = run_control(move || state.handle.update_selection(update)).await?;
+    Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
 #[utoipa::path(

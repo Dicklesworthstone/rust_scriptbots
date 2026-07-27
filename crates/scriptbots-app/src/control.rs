@@ -357,9 +357,27 @@ impl ControlHandle {
         Ok(world.agent_debug_view(query))
     }
 
-    /// Enqueue a selection update command.
-    pub fn update_selection(&self, update: SelectionUpdate) -> Result<(), ControlError> {
-        self.enqueue(ControlCommand::UpdateSelection(update))
+    /// Submit a selection update and return its admission receipt.
+    ///
+    /// This used to return `Result<(), _>`, which made selection the only
+    /// control surface a client could not follow. Every other command hands
+    /// back a [`CommandStatusDto`] carrying a command id, the admission
+    /// sequence and both revision axes; selection handed back nothing, so the
+    /// REST layer had no identity to report and invented a bare `queued: true`
+    /// instead. A client could not poll the outcome, could not tell one
+    /// selection from another, and could not distinguish a command that was
+    /// applied from one that was admitted and then dropped (bd-2z0.4.9).
+    ///
+    /// The receipt still only reaches `admitted`/`not_required` on the legacy
+    /// bus, exactly as documented on [`CommandStatusDto`]. That is a weaker
+    /// guarantee than application, and it is stated rather than dressed up:
+    /// what changes here is that the client now has an identity to ask about
+    /// at all.
+    pub fn update_selection(
+        &self,
+        update: SelectionUpdate,
+    ) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command(ControlCommand::UpdateSelection(update))
     }
 
     /// Enqueue step commands for the simulation driver to advance `count` ticks.
@@ -1577,6 +1595,54 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, 4, "invalid optimistic config command reached queue");
+    }
+
+    /// A selection submission must hand back a receipt a client can follow.
+    ///
+    /// Selection used to return `()`, so the REST layer had no identity to
+    /// report and answered with a hardcoded `queued: true`. This asserts the
+    /// three properties that made that answer useless: there is a command id,
+    /// it is distinct per submission, and the receipt is retrievable by that id
+    /// afterwards (bd-2z0.4.9).
+    #[test]
+    fn selection_submission_returns_a_followable_receipt() {
+        let (handle, _receiver) = handle();
+        let update = || SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: SelectionState::None,
+        };
+
+        let first = handle.update_selection(update()).expect("first selection");
+        let second = handle.update_selection(update()).expect("second selection");
+
+        assert_ne!(
+            first.command_id, second.command_id,
+            "two selections must be distinguishable; a client correlating receipts \
+             cannot work with a shared id"
+        );
+        assert!(
+            first.admission_sequence.is_some(),
+            "an admitted command must report the order it took on the bus"
+        );
+        assert!(
+            second.admission_sequence > first.admission_sequence,
+            "admission order must advance, got {:?} then {:?}",
+            first.admission_sequence,
+            second.admission_sequence
+        );
+
+        let looked_up = handle
+            .command_status(&first.command_id)
+            .expect("status lookup")
+            .expect("the receipt must be retrievable by its own id");
+        assert_eq!(looked_up.command_id, first.command_id);
+
+        // Stated, not dressed up: on the legacy bus this stays at
+        // admitted/not_required for its whole life. The gain here is that the
+        // client has an identity to ask about, NOT that application is proven.
+        assert_eq!(looked_up.application_state, APPLICATION_STATE_ADMITTED);
+        assert_eq!(looked_up.journal_state, JOURNAL_STATE_NOT_REQUIRED);
     }
 
     #[test]
