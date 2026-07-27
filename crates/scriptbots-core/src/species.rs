@@ -975,10 +975,18 @@ impl PhylogenyEvent {
 /// The parent bead defines speciation as a split that "persists for K consecutive
 /// samples". One sample is not enough: phenotype clustering jitters, and a cluster that
 /// appears and vanishes in a single sample is a segmentation artifact, not a lineage.
+///
+/// UNCALIBRATED. 3 is reasoned, not measured: calibrating it needs a real multi-cohort
+/// run to sweep against, which needs live cadence (bd-16g.3.6). Tracked as bd-3l5d --
+/// do not treat this value as settled evidence.
 pub const SPECIATION_PERSISTENCE_SAMPLES: usize = 3;
 
 /// Realized cross-cluster mating rate at or below which two clusters count as
 /// reproductively separated in practice.
+///
+/// UNCALIBRATED, same as [`SPECIATION_PERSISTENCE_SAMPLES`]. The bound should sit
+/// outside the realized-rate distribution of a known-panmictic run; nobody has measured
+/// that distribution yet. Tracked as bd-3l5d.
 pub const REPRODUCTIVE_SEPARATION_MAX_RATE: f64 = 0.05;
 
 /// Outcome of watching one candidate cluster across samples.
