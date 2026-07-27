@@ -478,22 +478,23 @@ impl ControlHandle {
         }
         // Nothing published yet (before the first completed tick, or a driver
         // that does not publish): fall back to the world itself.
-        let world = self.lock_world()?;
-        if let Some(latest) = world.history().last() {
-            Ok(latest.clone())
-        } else {
-            Ok(scriptbots_core::TickSummary {
-                tick: world.tick(),
-                agent_count: world.agent_count(),
-                births: 0,
-                deaths: 0,
-                total_energy: 0.0,
-                average_energy: 0.0,
-                average_health: 0.0,
-                max_age: 0,
-                spike_hits: 0,
-            })
-        }
+        self.with_world(|world| {
+            world
+                .history()
+                .last()
+                .cloned()
+                .unwrap_or_else(|| scriptbots_core::TickSummary {
+                    tick: world.tick(),
+                    agent_count: world.agent_count(),
+                    births: 0,
+                    deaths: 0,
+                    total_energy: 0.0,
+                    average_energy: 0.0,
+                    average_health: 0.0,
+                    max_age: 0,
+                    spike_hits: 0,
+                })
+        })
     }
 
     /// Retrieve a filtered debug listing of agents.
