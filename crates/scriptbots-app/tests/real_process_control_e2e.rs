@@ -208,13 +208,6 @@ fn wait_for_rest_address(
 /// 409 would be indistinguishable from "the server never came up".
 #[test]
 #[serial]
-#[ignore = "bd-0n87: real-process lifecycle exceeds the rch 9m40s client timeout when it \
-            carries the build too, so this has not yet been OBSERVED green. Run it \
-            explicitly against a warm target: cargo test -p scriptbots-app --test \
-            real_process_control_e2e -- --ignored --nocapture. Ignored rather than left \
-            in the default lane because an unverified test that fails costs every other \
-            pane, and asserting a pass I have not seen is the defect this bead family \
-            exists to prevent."]
 fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screenshot() -> Result<()> {
     let run_dir = tempdir()?;
 
@@ -342,7 +335,13 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     let exit = child.wait()?;
     guard.0 = None;
 
+    // Anchored to the manifest dir, NOT the inherited cwd: this test sets
+    // current_dir to a tempdir for the child, and a git call inheriting that
+    // returns nothing — which silently produced an EMPTY source_commit in the
+    // first green run. An evidence line with a hollow provenance field is
+    // evidence-shaped output that was never earned.
     let commit = Command::new("git")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
@@ -355,11 +354,12 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
          \"status_code\":{status_code},\"pause_code\":{pause_code},\"command_id\":\"{command_id}\",\
          \"application_state\":\"{application_state}\",\"journal_state\":\"{journal_state}\",\
          \"proved_level\":\"applied\",\"screenshot_code\":{shot_code},\
-         \"screenshot_bytes\":{},\"terminated\":{},\"source_commit\":\"{commit}\"}}",
+         \"screenshot_bytes\":{},\"child_exit\":\"{}\",\"source_commit\":\"{commit}\"}}",
         binary().display(),
         boot_log.len(),
         shot_body.len(),
-        !exit.success() || exit.code().is_some(),
+        exit.code()
+            .map_or_else(|| "signalled".to_string(), |code| code.to_string()),
     );
 
     Ok(())
