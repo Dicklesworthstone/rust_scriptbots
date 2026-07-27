@@ -23,9 +23,9 @@ use scriptbots_core::{
     ACTIVATION_CAPTURE_BUDGET, AgentUid, BrainInspectionClientId, BrainInspectionError,
     BrainInspectionRequest, BrainInspectionRevision, CharacterizationError, CompletedStepFault,
     ConfigAuditEntry, ControlCommand, ControlDisposition, DynamicAgentSnapshot,
-    DynamicWorldSnapshot, MigratingAgent, NullPersistence, PersistenceAdmissionSession,
-    PersistenceSessionError, ScientificStateError, ScriptBotsConfig, Tick, TickSummary,
-    WorldDigestV1, WorldState, apply_control_command, rng_domains::IslandId,
+    DynamicAgentVisuals, DynamicWorldSnapshot, MigratingAgent, NullPersistence,
+    PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError, ScriptBotsConfig,
+    Tick, TickSummary, WorldDigestV1, WorldState, apply_control_command, rng_domains::IslandId,
 };
 use std::{
     cell::RefCell,
@@ -75,6 +75,17 @@ pub struct HostCoreOptions {
     pub scientific_event_capacity: usize,
     /// Exact committed batches retained by the default live-memory catch-up journal.
     pub volatile_event_history_capacity: usize,
+    /// Whether each publication carries per-agent visual detail.
+    ///
+    /// Off by default. `RenderSnapshot::agent_visuals` is the only payload a
+    /// frontend that draws agent *bodies* can use, and it is the payload that
+    /// makes the `bd-pcfj` ownership transfer possible at all: once `HostCore`
+    /// owns the world, nothing outside this thread can reach `world.runtime()`.
+    ///
+    /// It is charged per agent per publication, so a headless, server, or
+    /// analysis run must not pay it. Only a host with a drawing frontend
+    /// attached should set this.
+    pub capture_agent_visuals: bool,
 }
 
 impl Default for HostCoreOptions {
@@ -89,6 +100,7 @@ impl Default for HostCoreOptions {
             protocol_event_capacity: DEFAULT_PROTOCOL_EVENT_CAPACITY,
             scientific_event_capacity: DEFAULT_SCIENTIFIC_EVENT_CAPACITY,
             volatile_event_history_capacity: DEFAULT_VOLATILE_EVENT_HISTORY_CAPACITY,
+            capture_agent_visuals: false,
         }
     }
 }
@@ -1769,8 +1781,46 @@ const fn add_hydrology_allocation_stats(
     stats.add_vector::<f32>(snapshot.water_depth.capacity());
 }
 
+/// Project per-agent visual detail in the exact order of `world.agents()`.
+///
+/// Returns an empty vector when capture is disabled. That empty case is the
+/// whole point of the option: a headless, server, or analysis host must not be
+/// charged for a payload only a drawing frontend can consume (`bd-pcfj`).
+///
+/// The result is parallel to [`DynamicWorldSnapshot::from_world`]'s `agents`
+/// because both walk `arena.iter_handles()` in the same order.
+///
+/// # Errors
+///
+/// Returns [`ScientificStateError::MissingAgentRuntime`] when a live arena row
+/// has no runtime projection. This mirrors `DynamicWorldSnapshot::from_world`
+/// deliberately: a world that cannot produce a trustworthy projection is
+/// refused rather than silently published with default-drawn agents, which
+/// would render as a plausible picture of a world that does not exist.
+fn capture_agent_visuals(
+    world: &WorldState,
+    enabled: bool,
+) -> Result<Vec<DynamicAgentVisuals>, ScientificStateError> {
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let arena = world.agents();
+    let mut visuals = Vec::with_capacity(arena.len());
+    for (dense_index, id) in arena.iter_handles().enumerate() {
+        let runtime =
+            world
+                .agent_runtime(id)
+                .ok_or_else(|| ScientificStateError::MissingAgentRuntime {
+                    path: format!("render_snapshot.agent_visuals[{dense_index}].runtime"),
+                })?;
+        visuals.push(DynamicAgentVisuals::capture(runtime));
+    }
+    Ok(visuals)
+}
+
 fn snapshot_build_stats(
     world: &DynamicWorldSnapshot,
+    agent_visuals_capacity: usize,
     summary_history: &[TickSummary],
     summary_history_capacity: usize,
     summary_history_allocated: bool,
@@ -1780,7 +1830,12 @@ fn snapshot_build_stats(
     let dynamic_agent_bytes = world
         .agents
         .capacity()
-        .saturating_mul(size_of::<DynamicAgentSnapshot>());
+        .saturating_mul(size_of::<DynamicAgentSnapshot>())
+        // Charged here rather than left out: the visual payload scales with
+        // agent cardinality exactly like `agents` does, and an accounting that
+        // silently omitted it would report a snapshot as costing half what it
+        // does the moment a drawing frontend attaches.
+        .saturating_add(agent_visuals_capacity.saturating_mul(size_of::<DynamicAgentVisuals>()));
     let layer_bytes = layers.total_capacity_bytes();
     let summary_history_bytes = summary_history_capacity.saturating_mul(size_of::<TickSummary>());
     SnapshotBuildStats {
@@ -1789,6 +1844,7 @@ fn snapshot_build_stats(
         bulk_allocations: refresh
             .bulk_allocations
             .saturating_add(usize::from(world.agents.capacity() != 0))
+            .saturating_add(usize::from(agent_visuals_capacity != 0))
             .saturating_add(usize::from(
                 summary_history_allocated && !summary_history.is_empty(),
             )),
@@ -1971,9 +2027,14 @@ impl HostCore {
         let health = HostHealth::Healthy;
         let (snapshot_layers, layer_refresh) = SnapshotLayerCache::new(&world);
         let dynamic_world = DynamicWorldSnapshot::from_world(&world)?;
+        let agent_visuals = Arc::new(capture_agent_visuals(
+            &world,
+            options.capture_agent_visuals,
+        )?);
         let summary_history = Arc::new(world.history().cloned().collect::<Vec<_>>());
         let build = snapshot_build_stats(
             &dynamic_world,
+            agent_visuals.capacity(),
             &summary_history,
             summary_history.capacity(),
             true,
@@ -2001,6 +2062,7 @@ impl HostCore {
             layers: snapshot_layers.snapshot(),
             build,
             world: dynamic_world,
+            agent_visuals,
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
         });
@@ -2833,6 +2895,10 @@ impl HostCore {
         let mut layers = self.snapshot_layers.clone();
         let refresh = layers.refresh(&self.world)?;
         let dynamic_world = DynamicWorldSnapshot::from_world(&self.world)?;
+        let agent_visuals = Arc::new(capture_agent_visuals(
+            &self.world,
+            self.options.capture_agent_visuals,
+        )?);
         let summary_history_allocated = self.revisions.scientific != self.last_published_scientific;
         let summary_history = if summary_history_allocated {
             Arc::new(self.world.history().cloned().collect::<Vec<_>>())
@@ -2841,6 +2907,7 @@ impl HostCore {
         };
         let build = snapshot_build_stats(
             &dynamic_world,
+            agent_visuals.capacity(),
             &summary_history,
             summary_history.capacity(),
             summary_history_allocated,
@@ -2879,6 +2946,7 @@ impl HostCore {
             layers: layers.snapshot(),
             build,
             world: dynamic_world,
+            agent_visuals,
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
         });
@@ -4242,6 +4310,7 @@ mod tests {
             protocol_event_capacity: 256,
             scientific_event_capacity: 64,
             volatile_event_history_capacity: 512,
+            capture_agent_visuals: false,
         }
     }
 
@@ -4399,6 +4468,94 @@ mod tests {
             assert_eq!(snapshot.world.summary.births, summary.births);
             assert_eq!(snapshot.world.summary.deaths, summary.deaths);
         }
+    }
+
+    /// Visual capture is off by default, parallel when on, and charged when on.
+    ///
+    /// The three facts are asserted together because they are one contract. A
+    /// host that published visuals unconditionally would charge every headless
+    /// and server run for a payload only a drawing frontend can use; a host that
+    /// published them out of step with `world.agents` would hand a renderer one
+    /// agent's eyes drawn on another's body; and accounting that omitted the
+    /// bytes would report a snapshot as costing what it did before the frontend
+    /// attached (`bd-pcfj`).
+    #[test]
+    fn agent_visuals_are_off_by_default_and_parallel_and_charged_when_enabled() {
+        // A populated world on purpose: the default fixture world starts empty,
+        // and an empty world would satisfy every assertion below while proving
+        // nothing about a payload that is charged per agent.
+        let mut headless = HostCore::new(
+            HostSessionId::new(77),
+            snapshot_measurement_world(8),
+            options(true),
+        )
+        .expect("host without visual capture");
+        let quiet = headless.latest_snapshot();
+        assert!(
+            !quiet.world.agents.is_empty(),
+            "the fixture world must have agents, or the gate proves nothing"
+        );
+        assert!(
+            quiet.agent_visuals.is_empty(),
+            "visual capture must be off unless a drawing frontend asked for it"
+        );
+        assert!(
+            !quiet.agent_visuals_complete(),
+            "a populated world with no visuals must report itself incomplete"
+        );
+        assert!(quiet.agent_visuals(0).is_none());
+
+        let drawing_options = HostCoreOptions {
+            capture_agent_visuals: true,
+            ..options(true)
+        };
+        let mut drawing = HostCore::new(
+            HostSessionId::new(78),
+            snapshot_measurement_world(8),
+            drawing_options,
+        )
+        .expect("host with visual capture");
+        let drawn = drawing.latest_snapshot();
+        assert_eq!(
+            drawn.agent_visuals.len(),
+            drawn.world.agents.len(),
+            "visuals must be exactly parallel to the agents they describe"
+        );
+        assert!(drawn.agent_visuals_complete());
+        assert!(drawn.agent_visuals(0).is_some());
+        assert!(
+            drawn.agent_visuals(drawn.world.agents.len()).is_none(),
+            "the accessor must be total rather than panicking past the end"
+        );
+        assert!(
+            drawn.build.total_payload_capacity_bytes > quiet.build.total_payload_capacity_bytes,
+            "the visual payload must appear in the byte accounting, not be published for free"
+        );
+
+        // The parallel invariant has to survive population change, which is
+        // where a stale or separately-cached vector would drift.
+        let mut port = drawing.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        drawing
+            .drive(ManualInstant::from_nanos(1))
+            .expect("completed explicit step");
+        let stepped = drawing.latest_snapshot();
+        assert_eq!(
+            stepped.agent_visuals.len(),
+            stepped.world.agents.len(),
+            "visuals must stay parallel across a tick that births or kills agents"
+        );
+
+        // A headless host must not start paying after a tick either.
+        let mut quiet_port = headless.local_port();
+        submit(&mut quiet_port, 1, HostCommand::Step);
+        headless
+            .drive(ManualInstant::from_nanos(1))
+            .expect("completed explicit step");
+        assert!(
+            headless.latest_snapshot().agent_visuals.is_empty(),
+            "the gate must hold on every publication, not only the first"
+        );
     }
 
     #[test]

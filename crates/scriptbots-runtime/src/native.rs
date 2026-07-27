@@ -2085,6 +2085,7 @@ mod tests {
             protocol_event_capacity: 256,
             scientific_event_capacity: 64,
             volatile_event_history_capacity: 512,
+            capture_agent_visuals: false,
         }
     }
 

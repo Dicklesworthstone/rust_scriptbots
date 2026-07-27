@@ -11,8 +11,8 @@
 use arc_swap::ArcSwap;
 use scriptbots_core::{
     AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, ConfigAuditEntry,
-    ControlCommand, DeathRecord, DynamicAgentSnapshot, DynamicWorldSnapshot, Generation,
-    HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScientificStateError,
+    ControlCommand, DeathRecord, DynamicAgentSnapshot, DynamicAgentVisuals, DynamicWorldSnapshot,
+    Generation, HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScientificStateError,
     ScriptBotsConfig, SelectionUpdate, SimulationCommand, TerrainKind, Tick, TickCombatSummary,
     TickEvents, TickSummary, toroidal_delta,
 };
@@ -589,6 +589,24 @@ pub struct RenderSnapshot {
     pub build: SnapshotBuildStats,
     /// Compact renderer-neutral dynamic world projection.
     pub world: DynamicWorldSnapshot,
+    /// Per-agent visual detail for frontends that draw agent bodies.
+    ///
+    /// Either empty, or exactly parallel to `world.agents` — index `i` here
+    /// describes the agent at index `i` there. Use [`Self::agent_visuals`]
+    /// rather than indexing directly; it is total and returns `None` for the
+    /// uncaptured case instead of panicking.
+    ///
+    /// Empty unless `HostCoreOptions::capture_agent_visuals` is set. It is a
+    /// per-agent-per-publication cost that only a drawing frontend can use, so
+    /// a headless or server-only run must not pay it (`bd-pcfj`). It sits
+    /// beside `world` rather than inside `DynamicWorldSnapshot` deliberately:
+    /// that type is the versioned wire schema the web frontend and the perf
+    /// baseline both pin by name, and widening it would either bump
+    /// `DYNAMIC_WORLD_SNAPSHOT_SCHEMA` — refusing the checked-in perf baseline
+    /// and forcing a reviewed re-baseline — or change the wire while still
+    /// claiming to be v2.
+    #[serde(with = "serde_arc")]
+    pub agent_visuals: Arc<Vec<DynamicAgentVisuals>>,
     /// Configuration in effect at this boundary.
     ///
     /// Revision-gated like `summary_history` and `layers`: the `Arc` is only
@@ -600,6 +618,31 @@ pub struct RenderSnapshot {
     /// Configuration audit trail as of this boundary, revision-gated with it.
     #[serde(with = "serde_arc")]
     pub config_audit: Arc<Vec<ConfigAuditEntry>>,
+}
+
+impl RenderSnapshot {
+    /// Visual detail for the agent at `index` in `world.agents`.
+    ///
+    /// Returns `None` when visual capture is disabled for this host, and `None`
+    /// rather than panicking for an out-of-range index. Callers that draw
+    /// bodies should treat `None` as "draw with defaults", which is exactly
+    /// what a frontend already had to do for an agent with no runtime row.
+    #[must_use]
+    pub fn agent_visuals(&self, index: usize) -> Option<&DynamicAgentVisuals> {
+        self.agent_visuals.get(index)
+    }
+
+    /// Whether every agent in this publication carries visual detail.
+    ///
+    /// This is the parallel-vector invariant stated as a predicate. `false`
+    /// means visual capture is disabled on the publishing host; a drawing
+    /// frontend should report that as a misconfiguration rather than silently
+    /// drawing every agent with defaults. Trivially `true` for an empty world,
+    /// which is correct: nothing is missing detail.
+    #[must_use]
+    pub fn agent_visuals_complete(&self) -> bool {
+        self.agent_visuals.len() == self.world.agents.len()
+    }
 }
 
 /// Hard bounds applied before a renderer-neutral projection allocates output buffers.
@@ -5291,6 +5334,7 @@ mod tests {
                 hydrology: None,
             },
             build: SnapshotBuildStats::default(),
+            agent_visuals: Arc::new(Vec::new()),
             world: DynamicWorldSnapshot {
                 tick: 10,
                 epoch: 1,
@@ -6990,6 +7034,7 @@ mod tests {
                 summary_history: Arc::new(completed_summary.into_iter().collect()),
                 layers,
                 build: SnapshotBuildStats::default(),
+                agent_visuals: Arc::new(Vec::new()),
                 world: DynamicWorldSnapshot {
                     tick: self.tick.0,
                     epoch: 0,

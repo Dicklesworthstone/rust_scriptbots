@@ -3503,6 +3503,105 @@ pub struct DynamicAgentSnapshot {
     pub brain_key: Option<u64>,
 }
 
+/// Per-agent visual detail a drawing frontend needs beyond [`DynamicAgentSnapshot`].
+///
+/// [`DynamicAgentSnapshot`] is deliberately compact: it carries what a ranking,
+/// chart, or canvas-cell aggregate needs. A frontend that draws an agent *body*
+/// needs more — wheel effort, eye geometry, sound, spike combat role and the
+/// sense-trait modifiers that scale the drawn radii — and every one of those
+/// lives on [`AgentRuntime`] rather than on the dense [`AgentData`] columns.
+///
+/// This type exists because that gap is what makes the `bd-pcfj` world-ownership
+/// transfer non-mechanical. Once `HostCore` owns the world, a renderer can no
+/// longer reach `world.runtime()`; without these fields it cannot draw at all,
+/// so no amount of re-pointing lock sites at snapshots would compile into a
+/// working frontend.
+///
+/// Deliberately EXCLUDED, and this is a finding rather than an oversight:
+/// `AgentRuntime::selection` and `AgentRuntime::indicator` are *per-viewer* UI
+/// state that currently lives in the simulation world. They must not be
+/// published in a snapshot shared by every client, because one viewer's
+/// selection is not a fact about the world. They belong in the per-client
+/// [`crate`]-external projection request instead (tracked separately).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicAgentVisuals {
+    /// Commanded left wheel effort, raw actuator value.
+    pub wheel_left: f32,
+    /// Commanded right wheel effort, raw actuator value.
+    pub wheel_right: f32,
+    /// Preferred normalized temperature, clamped to the unit interval.
+    pub temperature_preference: f32,
+    /// Net food intake during the latest completed tick.
+    pub food_delta: f32,
+    /// Commanded emitted-sound level, raw actuator value.
+    pub sound_level: f32,
+    /// Realized emitted sound.
+    pub sound_output: f32,
+    /// Emitted-sound scale.
+    pub sound_multiplier: f32,
+    /// Smell sense modifier.
+    pub trait_smell: f32,
+    /// Sound emission modifier.
+    pub trait_sound: f32,
+    /// Hearing sense modifier.
+    pub trait_hearing: f32,
+    /// Eye sense modifier.
+    pub trait_eye: f32,
+    /// Blood sense modifier.
+    pub trait_blood: f32,
+    /// Per-eye relative bearing, in radians.
+    pub eye_direction: [f32; NUM_EYES],
+    /// Per-eye field-of-view angle.
+    pub eye_fov: [f32; NUM_EYES],
+    /// Whether the brain is commanding an extended spike this tick.
+    pub spike_extended: bool,
+    /// Whether this agent landed a spike strike this tick.
+    pub spike_struck: bool,
+    /// Whether this agent was struck by a spike this tick.
+    pub spike_victim: bool,
+    /// Altruistic sharing intent output.
+    pub reproduction_intent: f32,
+}
+
+impl DynamicAgentVisuals {
+    /// Project one agent's runtime row into renderer-neutral visual detail.
+    ///
+    /// `herbivore_tendency` is not repeated here: [`DynamicAgentSnapshot`]
+    /// already carries it, and duplicating a field into two payloads published
+    /// together is how the two silently disagree.
+    #[must_use]
+    pub fn capture(runtime: &AgentRuntime) -> Self {
+        Self {
+            wheel_left: runtime.outputs.channel(OutputChannel::WheelLeft),
+            wheel_right: runtime.outputs.channel(OutputChannel::WheelRight),
+            temperature_preference: runtime.temperature_preference.clamp(0.0, 1.0),
+            food_delta: runtime.food_delta,
+            sound_level: runtime.outputs.channel(OutputChannel::SoundLevel),
+            sound_output: runtime.sound_output,
+            sound_multiplier: runtime.sound_multiplier,
+            trait_smell: runtime.trait_modifiers.smell,
+            trait_sound: runtime.trait_modifiers.sound,
+            trait_hearing: runtime.trait_modifiers.hearing,
+            trait_eye: runtime.trait_modifiers.eye,
+            trait_blood: runtime.trait_modifiers.blood,
+            eye_direction: runtime.eye_direction,
+            eye_fov: runtime.eye_fov,
+            // The renderer has always read the COMMANDED spike channel rather
+            // than the realized `spike_length` column, and this projection
+            // preserves that exactly rather than substituting a similar-looking
+            // field. The 0.5 is written literally on purpose: `BOOST_THRESHOLD`
+            // happens to hold the same number, but it is the boost contract, and
+            // borrowing it here would silently couple spike display to any
+            // future change in boost engagement.
+            spike_extended: runtime.outputs.channel(OutputChannel::SpikeTarget) > 0.5,
+            spike_struck: runtime.combat.spike_attacker,
+            spike_victim: runtime.spiked,
+            reproduction_intent: runtime.give_intent,
+        }
+    }
+}
+
 /// Dynamic world bounds and policy included with a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -49043,6 +49142,81 @@ mod tests {
                 .characterization_digest_v0()
                 .expect("repeated latched digest"),
             digest
+        );
+    }
+
+    /// Visual capture reads the runtime row, not the dense columns.
+    ///
+    /// Every field asserted here is one a drawing frontend reaches through
+    /// `world.runtime()` today and will not be able to reach once `HostCore`
+    /// owns the world (`bd-pcfj`). The eye arrays are called out individually
+    /// because they are per-eye geometry: a projection that carried only a
+    /// scalar, or that transposed direction and field-of-view, would still
+    /// compile and still draw something plausible.
+    #[test]
+    fn agent_visual_capture_carries_the_runtime_fields_a_renderer_draws() {
+        let mut runtime = AgentRuntime::default();
+        runtime.outputs[OutputChannel::WheelLeft.index()] = 0.25;
+        runtime.outputs[OutputChannel::WheelRight.index()] = 0.75;
+        runtime.outputs[OutputChannel::SoundLevel.index()] = 0.4;
+        runtime.outputs[OutputChannel::SpikeTarget.index()] = 0.9;
+        runtime.eye_direction = [0.1, 0.2, 0.3, 0.4];
+        runtime.eye_fov = [1.1, 1.2, 1.3, 1.4];
+        runtime.trait_modifiers.smell = 0.31;
+        runtime.trait_modifiers.sound = 0.42;
+        runtime.trait_modifiers.hearing = 1.03;
+        runtime.trait_modifiers.eye = 1.54;
+        runtime.trait_modifiers.blood = 1.65;
+        runtime.temperature_preference = 0.6;
+        runtime.food_delta = -0.2;
+        runtime.sound_output = 0.55;
+        runtime.sound_multiplier = 1.25;
+        runtime.give_intent = 0.33;
+        runtime.combat.spike_attacker = true;
+        runtime.spiked = false;
+
+        let visuals = DynamicAgentVisuals::capture(&runtime);
+
+        assert!((visuals.wheel_left - 0.25).abs() < f32::EPSILON);
+        assert!((visuals.wheel_right - 0.75).abs() < f32::EPSILON);
+        assert!((visuals.sound_level - 0.4).abs() < f32::EPSILON);
+        assert!((visuals.sound_output - 0.55).abs() < f32::EPSILON);
+        assert!((visuals.sound_multiplier - 1.25).abs() < f32::EPSILON);
+        assert!((visuals.temperature_preference - 0.6).abs() < f32::EPSILON);
+        assert!((visuals.food_delta + 0.2).abs() < f32::EPSILON);
+        assert!((visuals.reproduction_intent - 0.33).abs() < f32::EPSILON);
+        assert!((visuals.trait_smell - 0.31).abs() < f32::EPSILON);
+        assert!((visuals.trait_sound - 0.42).abs() < f32::EPSILON);
+        assert!((visuals.trait_hearing - 1.03).abs() < f32::EPSILON);
+        assert!((visuals.trait_eye - 1.54).abs() < f32::EPSILON);
+        assert!((visuals.trait_blood - 1.65).abs() < f32::EPSILON);
+        assert_eq!(
+            visuals.eye_direction,
+            [0.1, 0.2, 0.3, 0.4],
+            "per-eye bearing must survive the projection in eye order"
+        );
+        assert_eq!(
+            visuals.eye_fov,
+            [1.1, 1.2, 1.3, 1.4],
+            "per-eye field of view must not be transposed with bearing"
+        );
+
+        // Spike display is three independent facts: what the brain COMMANDED,
+        // whether this agent struck, and whether it was struck. Collapsing any
+        // pair of them draws the wrong body.
+        assert!(
+            visuals.spike_extended,
+            "a commanded spike above 0.5 must read as extended"
+        );
+        assert!(visuals.spike_struck, "combat.spike_attacker is the striker");
+        assert!(!visuals.spike_victim, "runtime.spiked is the victim");
+
+        // The commanded channel, not the realized column: a brain commanding
+        // nothing must not inherit the previous tick's extension.
+        runtime.outputs[OutputChannel::SpikeTarget.index()] = 0.5;
+        assert!(
+            !DynamicAgentVisuals::capture(&runtime).spike_extended,
+            "the spike threshold is strictly greater than 0.5"
         );
     }
 
