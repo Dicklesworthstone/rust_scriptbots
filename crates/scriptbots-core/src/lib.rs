@@ -1591,7 +1591,16 @@ pub fn apply_control_command(
             Ok(ControlDisposition::WorldApplied)
         }
         ControlCommand::SpawnCrossover { parent_a, parent_b } => {
-            let _ = world.try_inject_control_crossover(parent_a, parent_b)?;
+            // `?` now carries a real refusal instead of an Option that was
+            // discarded. Before bd-2ygc this reported WorldApplied even when the
+            // crossover produced no child, so a control surface told the operator
+            // two lineages had been crossed when nothing had been created.
+            //
+            // SpawnAgent above is NOT the same shape, which I checked rather than
+            // assumed: try_inject_control_agent returns Result<AgentId>, so an Ok
+            // there always means an agent exists and its `let _ =` only discards
+            // the id.
+            let _child = world.try_inject_control_crossover(parent_a, parent_b)?;
             Ok(ControlDisposition::WorldApplied)
         }
         ControlCommand::UpdateSimulation(update) => {
@@ -26857,23 +26866,45 @@ impl WorldState {
         result
     }
 
+    /// Cross two named parents, or say why it could not happen.
+    ///
+    /// Returns `AgentId` rather than `Option<AgentId>` (bd-2ygc). Every path that
+    /// used to yield `Ok(None)` is a request that CANNOT BE HONOURED — an
+    /// unresolvable parent uid, a missing snapshot, or a parent that is not
+    /// crossable yet — and the sole caller,
+    /// [`apply_control_command`], discarded the Option and reported
+    /// `ControlDisposition::WorldApplied` regardless. A control surface therefore
+    /// told the operator that two lineages had been crossed when no agent was
+    /// created, and nothing downstream disagreed.
+    ///
+    /// A typed refusal is the same rule this command family already applies
+    /// elsewhere: reject rather than silently do something other than what was
+    /// asked. `Ok` now means a child exists.
     fn try_inject_control_crossover(
         &mut self,
         parent_a: AgentUid,
         parent_b: AgentUid,
-    ) -> Result<Option<AgentId>, WorldStateError> {
+    ) -> Result<AgentId, WorldStateError> {
         self.validate_external_arrival_boundary()?;
         let Some(parent_a_id) = self.agent_id_for_control_uid(parent_a) else {
-            return Ok(None);
+            return Err(WorldStateError::InvalidConfig(
+                "crossover parent_a does not name a live agent",
+            ));
         };
         let Some(parent_b_id) = self.agent_id_for_control_uid(parent_b) else {
-            return Ok(None);
+            return Err(WorldStateError::InvalidConfig(
+                "crossover parent_b does not name a live agent",
+            ));
         };
         let Some(parent_a_state) = self.snapshot_agent(parent_a_id) else {
-            return Ok(None);
+            return Err(WorldStateError::InvalidConfig(
+                "crossover parent_a has no readable state",
+            ));
         };
         let Some(parent_b_state) = self.snapshot_agent(parent_b_id) else {
-            return Ok(None);
+            return Err(WorldStateError::InvalidConfig(
+                "crossover parent_b has no readable state",
+            ));
         };
 
         let child = AgentData {
@@ -26907,7 +26938,17 @@ impl WorldState {
             runtime.indicator.intensity = 0.6;
             runtime.indicator.color = [0.2, 0.8, 0.9];
         })
-        .map_err(WorldStateError::from)
+        .map_err(WorldStateError::from)?
+        // `try_inject_crossover_agent_with` has its own Option-returning refusals
+        // — identical parents, a missing snapshot, or a parent whose origin record
+        // is still pending this tick, which is why a freshly seeded agent cannot
+        // be crossed until its birth commits. Collapsing that None here is the
+        // last place the "reported success, created nothing" path could survive
+        // (bd-2ygc).
+        .ok_or(WorldStateError::InvalidConfig(
+            "crossover parents are not crossable this tick (identical parents, or a \
+             parent whose birth record has not yet committed)",
+        ))
     }
 
     fn pending_current_origin_record(&self, id: AgentId) -> Option<&BirthRecord> {
@@ -45389,6 +45430,59 @@ mod tests {
                 .characterization_digest_v0()
                 .expect("normalization leaves world quiescent"),
             before
+        );
+    }
+
+    /// A crossover that creates no child must REFUSE, never report success.
+    ///
+    /// The defect (bd-2ygc): `try_inject_control_crossover` returned
+    /// `Result<Option<AgentId>>` and `apply_control_command` discarded the Option
+    /// with `let _ = ...?`, then returned `ControlDisposition::WorldApplied`
+    /// unconditionally. `WorldApplied` is the strongest word in that vocabulary
+    /// and control surfaces key off it, so an operator was told two lineages had
+    /// been crossed while no agent existed — and population, the audit ring and
+    /// the logs all agreed with the lie because none of them had been told
+    /// otherwise.
+    ///
+    /// Asserts on POPULATION as well as the disposition, because a test that only
+    /// checked `is_err` would pass against an implementation that errored AND
+    /// still spawned something.
+    #[test]
+    fn a_crossover_that_cannot_produce_a_child_is_refused_not_reported_applied() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(11),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let before = world.agent_count();
+        // Uids that name no live agent: the commonest way a surface asks for a
+        // crossover that cannot happen, e.g. a selection that has since died.
+        let outcome = apply_control_command(
+            &mut world,
+            ControlCommand::SpawnCrossover {
+                parent_a: AgentUid(9_999_001),
+                parent_b: AgentUid(9_999_002),
+            },
+        );
+
+        let error = outcome.expect_err(
+            "a crossover naming parents that do not exist must be refused; reporting \
+             WorldApplied here is the defect this test exists for",
+        );
+        let text = format!("{error}");
+        assert!(
+            text.contains("parent_a"),
+            "the refusal must name WHICH parent could not be resolved so the caller can \
+             fix the request; got {text:?}"
+        );
+        assert_eq!(
+            world.agent_count(),
+            before,
+            "a refused crossover must not have created anything"
         );
     }
 
