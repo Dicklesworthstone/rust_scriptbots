@@ -1004,9 +1004,13 @@ impl<'a> TerminalApp<'a> {
         };
         let mut glyph_spans: Vec<ratatui::text::Span<'_>> = Vec::with_capacity(glyph_capacity + 1);
         if !marker.is_empty() {
+            // The truncation marker qualifies the rail rather than carrying its
+            // own signal, which is exactly what the typography scale's muted tier
+            // is for. DarkGray was a raw ANSI constant no palette could retune
+            // (bd-f4x0).
             glyph_spans.push(ratatui::text::Span::styled(
                 format!("{marker:<9}"),
-                Style::default().fg(Color::DarkGray),
+                self.palette.muted_style(),
             ));
         }
         for (offset, event) in events[first_visible..]
@@ -1851,7 +1855,10 @@ impl<'a> TerminalApp<'a> {
             lines.push(Line::from(vec![
                 Span::styled("Comfort ", self.palette.header_style()),
                 Span::raw(format!("{:>3.0}% ", comfort * 100.0)),
-                Span::styled("█".repeat(width), Style::default().fg(Color::LightGreen)),
+                // Comfort is a positive-state gauge, so it takes the same ramp
+                // entry the app uses for thriving rather than a raw ANSI green
+                // the accessibility palettes cannot retune (bd-f4x0).
+                Span::styled("█".repeat(width), self.palette.ok_style()),
             ]));
         } else {
             lines.push(Line::from(vec![Span::raw(
