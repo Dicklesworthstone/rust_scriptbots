@@ -773,30 +773,93 @@ impl<'a> TerminalApp<'a> {
         if due.is_empty() {
             return;
         }
-        let mut world = self.world.lock().expect("terminal world mutex poisoned");
-        let current_tick = world.tick().0;
-        if !due.iter().any(|item| item.tick == current_tick) {
-            return;
-        }
-        let mut config_value = match serde_json::to_value(world.config()) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(%error, "scenario config did not serialize for intervention merge");
+
+        // The world lock is scoped so the outcome can be reported AFTER it drops:
+        // pushing an event or toast needs `&mut self`, which cannot coexist with a
+        // guard borrowed from `self.world`.
+        let outcome = {
+            let mut world = self.world.lock().expect("terminal world mutex poisoned");
+            let current_tick = world.tick().0;
+            if !due.iter().any(|item| item.tick == current_tick) {
                 return;
             }
+            let mut config_value = match serde_json::to_value(world.config()) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(%error, "scenario config did not serialize for intervention merge");
+                    return;
+                }
+            };
+            let result = crate::apply_scenario_interventions(
+                &mut world,
+                &mut config_value,
+                &due,
+                current_tick,
+            );
+            (current_tick, result)
         };
-        match crate::apply_scenario_interventions(&mut world, &mut config_value, &due, current_tick)
-        {
+
+        let (current_tick, result) = outcome;
+        // Name WHAT changed, not just how many. A count alone cannot tell a
+        // drought from a meteor in a log or in the rail, and this bead requires an
+        // ecosystem crash from a mis-parameterised intervention to be obvious
+        // afterwards.
+        let changed = Self::intervention_summary(&due, current_tick);
+
+        match result {
             Ok(applied) if applied > 0 => {
                 info!(
                     tick = current_tick,
-                    applied, "applied scenario interventions"
+                    applied,
+                    changed = %changed,
+                    "applied scenario interventions"
                 );
+                // The user watched the world change; they are entitled to know it
+                // was an intervention rather than emergent behaviour. Previously
+                // this was an info! to a tracing subscriber nobody is reading
+                // while they watch the TUI (bd-16g.10).
+                self.push_event(
+                    current_tick,
+                    EventKind::Population,
+                    format!("Intervention: {changed}"),
+                );
+                self.push_toast(format!("Intervention applied: {changed}"));
             }
             Ok(_) => {}
             Err(error) => {
-                warn!(%error, tick = current_tick, "scenario intervention failed")
+                warn!(%error, tick = current_tick, changed = %changed, "scenario intervention failed");
+                // A FAILED intervention was the worse silence: the world simply
+                // did not change and nothing said why, so the run looks like the
+                // intervention had no effect rather than never happening.
+                self.push_event(
+                    current_tick,
+                    EventKind::Death,
+                    format!("Intervention FAILED ({changed}): {error}"),
+                );
+                self.push_toast(format!("Intervention failed: {error}"));
             }
+        }
+    }
+
+    /// Name the config keys the interventions due at `tick` actually set.
+    ///
+    /// The scenario format carries a JSON config patch rather than a named
+    /// intervention kind, so the honest description is the set of keys being
+    /// changed — truthful about what the product knows instead of inventing a
+    /// label for it.
+    fn intervention_summary(due: &[crate::ScenarioInterventionV1], tick: u64) -> String {
+        let mut keys: Vec<String> = due
+            .iter()
+            .filter(|item| item.tick == tick)
+            .filter_map(|item| item.set.as_object())
+            .flat_map(|object| object.keys().cloned())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.is_empty() {
+            "no config keys".to_owned()
+        } else {
+            keys.join(", ")
         }
     }
 
@@ -7980,6 +8043,54 @@ mod tests {
     /// legend to read the mortality panel. Asserting the exact ramp entry is what
     /// keeps that true — a future edit that merely picks "some palette colour"
     /// would still be retunable and still be wrong.
+    /// An applied intervention must name WHAT it changed, not just how many.
+    ///
+    /// A count alone cannot tell a drought from a meteor after the fact, and this
+    /// bead requires an ecosystem crash caused by a mis-parameterised
+    /// intervention to be obvious from the record (bd-16g.10).
+    #[test]
+    fn an_intervention_summary_names_the_config_keys_it_sets() {
+        let due = vec![
+            crate::ScenarioInterventionV1 {
+                tick: 10,
+                set: serde_json::json!({ "food_growth_rate": 0.0, "closed": true }),
+            },
+            crate::ScenarioInterventionV1 {
+                tick: 99,
+                set: serde_json::json!({ "never_mentioned": 1 }),
+            },
+        ];
+
+        let summary = TerminalApp::intervention_summary(&due, 10);
+        assert!(
+            summary.contains("food_growth_rate") && summary.contains("closed"),
+            "the summary must name every key set at this tick; got {summary:?}"
+        );
+        assert!(
+            !summary.contains("never_mentioned"),
+            "a key scheduled for a DIFFERENT tick must not be reported as applied \
+             now; got {summary:?}"
+        );
+        // Deterministic order, so two runs of the same scenario produce the same
+        // text in the log and the rail.
+        assert_eq!(summary, "closed, food_growth_rate");
+    }
+
+    /// An intervention with no keys must say so rather than rendering blank.
+    #[test]
+    fn an_empty_intervention_summary_is_stated_not_silent() {
+        let due = vec![crate::ScenarioInterventionV1 {
+            tick: 3,
+            set: serde_json::json!({}),
+        }];
+        assert_eq!(
+            TerminalApp::intervention_summary(&due, 3),
+            "no config keys",
+            "an empty patch must be described, or the feedback line reads as a \
+             truncated message"
+        );
+    }
+
     /// Terrain must be readable with no colour, in the ascii tier too.
     ///
     /// Part of the bd-xg82 monochrome audit. This was TRUE before the bead — it is
