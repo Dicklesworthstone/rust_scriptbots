@@ -12,7 +12,10 @@ use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
-use bevy::light::{DirectionalLightShadowMap, EnvironmentMapLight, LightProbe};
+use bevy::light::{
+    CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap,
+    EnvironmentMapLight, LightProbe,
+};
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
 use bevy::pbr::prelude::*;
 use bevy::prelude::*;
@@ -3780,6 +3783,59 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    /// `features.shadow_cascades` must reach the cascade config.
+    ///
+    /// Cascade count controls perspective aliasing — near-camera shadows
+    /// getting far fewer texels than distant ones — so a tier that moved
+    /// resolution but not cascades still rendered Low and Ultra with the same
+    /// blocky near field. Resolution and cascades are separate axes and both
+    /// have to be live for the tier to mean what it says.
+    #[test]
+    fn the_shadow_cascade_tier_feature_has_a_live_consumer() {
+        let source = include_str!("lib.rs");
+        let sites = |needle: &str| source.matches(needle).count();
+        assert!(
+            sites("effective.features.shadow_cascades") > 1,
+            "the cascade count must be read by production code, not only logged"
+        );
+        assert!(
+            sites("CascadeShadowConfigBuilder {") > 1,
+            "reading it is not enough; it must rebuild the CascadeShadowConfig"
+        );
+        assert!(
+            sites("cascades.bounds.len() != num_cascades") > 1,
+            "the rebuild must be conditional, or every tier evaluation churns the \
+             cascade config for no change"
+        );
+    }
+
+    /// The cascade ladder must vary, or the live consumer wires a constant.
+    #[test]
+    fn the_shadow_cascade_ladder_is_not_flat() {
+        let cascades: Vec<u8> = [
+            RenderQuality::Potato,
+            RenderQuality::Low,
+            RenderQuality::Medium,
+            RenderQuality::High,
+            RenderQuality::Ultra,
+        ]
+        .into_iter()
+        .map(|tier| tier_features(tier).shadow_cascades)
+        .collect();
+
+        assert_eq!(cascades[0], 0, "Potato has no shadows, so no cascades");
+        assert!(
+            cascades.iter().skip(1).all(|count| *count > 0),
+            "every shadowed tier must ask for at least one cascade, or the rebuild \
+             is skipped and the config silently keeps the previous tier's count"
+        );
+        assert!(
+            cascades.iter().skip(1).any(|count| *count != cascades[1]),
+            "cascade count must vary across shadowed tiers, or Low and Ultra render \
+             the same near-field aliasing"
+        );
+    }
+
     /// `features.shadow_resolution` must have a real consumer too.
     ///
     /// Shadows could already switch on and off with the tier, but every tier
@@ -4759,13 +4815,35 @@ fn handle_quality_tier_button(
 fn apply_tier_to_sun_light(
     effective: Res<EffectiveRenderSettings>,
     shadow_map: Option<ResMut<DirectionalLightShadowMap>>,
-    mut lights: Query<&mut DirectionalLight, With<TierDrivenSunLight>>,
+    mut lights: Query<(&mut DirectionalLight, &mut CascadeShadowConfig), With<TierDrivenSunLight>>,
 ) {
     if !effective.is_changed() {
         return;
     }
-    for mut light in &mut lights {
+    for (mut light, mut cascades) in &mut lights {
         light.shadows_enabled = effective.features.shadows;
+
+        // `shadow_cascades` was the third logged-but-unconsumed tier feature.
+        // Cascade COUNT is what controls perspective aliasing — shadows near
+        // the camera getting far fewer texels than distant ones — so a tier
+        // that moved resolution but not cascades still rendered Low and Ultra
+        // with the same blocky near-field (bd-2z0.14.3.3 item 2).
+        //
+        // Only `num_cascades` is overridden. `CascadeShadowConfig::default()`
+        // IS `CascadeShadowConfigBuilder::default().into()`, so rebuilding from
+        // the builder with everything else defaulted changes the cascade count
+        // and nothing about the near/far distances — this must not quietly
+        // become a shadow-range change while claiming to be a quality one.
+        if effective.features.shadows && effective.features.shadow_cascades > 0 {
+            let num_cascades = usize::from(effective.features.shadow_cascades);
+            if cascades.bounds.len() != num_cascades {
+                *cascades = CascadeShadowConfigBuilder {
+                    num_cascades,
+                    ..default()
+                }
+                .build();
+            }
+        }
     }
 
     // `shadow_resolution` was the second tier feature that existed only in logs
