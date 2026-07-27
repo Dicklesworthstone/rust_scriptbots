@@ -17,7 +17,7 @@ use std::{
     collections::VecDeque,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -1014,7 +1014,10 @@ fn lab_runtime_truncated_tail_refuses_recovery_without_mutation()
     ));
     reader.close()?;
     let retry = StorageReader::open_finished(&path_string);
-    assert!(retry.is_ok(), "truncated tail remains readable for bounded diagnostics");
+    assert!(
+        retry.is_ok(),
+        "truncated tail remains readable for bounded diagnostics"
+    );
     retry?.close()?;
     Ok(())
 }

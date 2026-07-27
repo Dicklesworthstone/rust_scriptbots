@@ -549,26 +549,101 @@ fn an_oversized_batch_is_refused_before_it_is_ever_allocated() {
     });
 
     let oversized = batch(1, 64);
-    let error = pipeline
-        .submit(&oversized)
-        .expect_err("a batch over the cap must be refused");
+    let (oversized_bytes, oversized_events) = estimate_batch_size(&oversized);
+    for attempt in 1..=2 {
+        let error = pipeline
+            .submit(&oversized)
+            .expect_err("a batch over the cap must be refused");
 
-    // The caller must be able to TELL that this was a size refusal, and by how
-    // much — a generic error would leave them unable to shrink the batch and retry.
-    let text = error.to_string();
-    assert!(
-        text.contains("too large to admit"),
-        "the refusal must name the reason; got: {text}"
+        // The caller must be able to TELL that this was a size refusal, and by how
+        // much — a generic error would leave them unable to shrink the batch and retry.
+        assert!(
+            matches!(
+                &error,
+                StorageError::PayloadTooLarge {
+                    tick: 1,
+                    bytes,
+                    events,
+                    max_bytes: 1_024,
+                    max_events: 4,
+                } if (*bytes, *events) == (oversized_bytes, oversized_events)
+            ),
+            "oversized attempt {attempt} returned an untyped or unstable refusal: {error}"
+        );
+        assert_eq!(
+            pipeline.inflight_bytes(),
+            0,
+            "oversized attempt {attempt} acquired or leaked an in-flight permit"
+        );
+    }
+
+    let reader = StorageReader::open(&path).expect("pre-admission reader");
+    assert_eq!(
+        reader
+            .persistence_watermarks()
+            .expect("pre-admission watermarks"),
+        Default::default(),
+        "an oversized retry must not mint a batch identity or advance an outbox watermark"
     );
+    assert_eq!(
+        reader
+            .run_ledger_summary()
+            .expect("pre-admission ledger")
+            .tick_count,
+        0,
+        "an oversized retry must not mutate scientific storage"
+    );
+    reader.close().expect("pre-admission reader closes");
 
     // AND THE RETRY DATA IS INTACT: nothing was consumed, so the caller still
     // holds the exact payload. Submitting a batch that FITS must still work — the
     // refusal must not have poisoned the pipeline.
-    pipeline
-        .submit(&batch(2, 2))
+    let receipt = pipeline
+        .submit_with_receipt(&batch(2, 2))
         .expect("a batch inside the budget must still be admitted after a refusal");
+    assert_eq!(
+        receipt.batch_id.get(),
+        1,
+        "refused oversized attempts must not consume persistence identities"
+    );
+
+    let final_oversized_error = pipeline
+        .submit(&oversized)
+        .expect_err("an identical oversized retry must remain refused after later traffic");
+    assert!(
+        matches!(
+            &final_oversized_error,
+            StorageError::PayloadTooLarge {
+                tick: 1,
+                bytes,
+                events,
+                max_bytes: 1_024,
+                max_events: 4,
+            } if (*bytes, *events) == (oversized_bytes, oversized_events)
+        ),
+        "the post-admission oversized retry changed disposition or estimate: \
+         {final_oversized_error}"
+    );
 
     pipeline.shutdown().expect("shutdown");
+    let reader = StorageReader::open(&path).expect("post-shutdown reader");
+    let final_watermarks = reader
+        .persistence_watermarks()
+        .expect("post-shutdown watermarks");
+    assert_eq!(final_watermarks.admitted, Some(receipt.batch_id));
+    assert_eq!(final_watermarks.applied, Some(receipt.batch_id));
+    assert_eq!(final_watermarks.durable, Some(receipt.batch_id));
+    let ledger = reader.run_ledger_summary().expect("post-shutdown ledger");
+    assert_eq!(
+        ledger.tick_count, 1,
+        "only the fitting batch may reach durable storage"
+    );
+    assert_eq!(
+        ledger.latest_tick.map(|tick| tick.tick),
+        Some(2),
+        "the only durable row must be the fitting tick"
+    );
+    reader.close().expect("post-shutdown reader closes");
     let _ = std::fs::remove_file(&path);
 }
 
