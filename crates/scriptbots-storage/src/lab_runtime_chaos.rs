@@ -1048,16 +1048,63 @@ fn lab_runtime_torn_write_refuses_recovery_without_mutation()
     )?;
     corruptor.close()?;
 
-    let error = match StorageReader::open_finished(&path_string) {
-        Ok(reader) => {
-            reader.close()?;
-            return Err("a torn JSON write was accepted".into());
-        }
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("JSON") || error.to_string().contains("json"));
-    let reader = StorageReader::open_finished(&path_string);
-    assert!(reader.is_err(), "torn payload must remain refused on retry");
+    // THE REFUSAL IS AT THE READ, NOT AT THE OPEN (bd-bbnr).
+    //
+    // This case previously required `open_finished` itself to reject the torn
+    // payload, and it had never passed. That is a rule the reader does not have
+    // and deliberately does not want: `open_finished` validates STRUCTURE —
+    // schema, persistence invariants, host-journal invariants, replay-sequence
+    // gaps — while payload CONTENT is bound lazily
+    // (`narrative_input_binding_v1` is a `OnceLock`) and parsed at the point of
+    // use. `finished_reader_reports_gap_truncation_version_and_config_corruption`
+    // encodes the same boundary and passes: it opens a config-drifted payload
+    // successfully with `?` and expects the error from
+    // `narrative_input_page_v1`.
+    //
+    // That boundary is deliberate rather than accidental. A caller may open a
+    // finished run to read metrics and never touch narrative inputs; parsing
+    // every payload at open would refuse a run that is perfectly usable, and
+    // would cost a full table scan to do it. What must hold — and what this
+    // test now actually checks — is that a torn payload is NEVER SILENTLY
+    // CONSUMED, and that refusing it does not mutate the database.
+    //
+    // The sibling truncated-tail case still refuses at OPEN, and that asymmetry
+    // is correct rather than an inconsistency: a DELETED row is a structural gap
+    // in the replay sequence, which is exactly what open-time validation covers.
+    let reader = StorageReader::open_finished(&path_string)?;
+    let error = reader
+        .narrative_input_page_v1(None, 4, 0)
+        .expect_err("a torn JSON payload must be refused when it is read");
+    let rendered = error.to_string();
+    // Assert what a diagnosis actually needs: WHICH record failed and WHY. The
+    // original case searched for the literal "JSON", which this refusal does not
+    // contain — it says "failed to deserialize payload: EOF while parsing an
+    // object". Hunting for a substring that happens to appear is how a test ends
+    // up passing for the wrong reason; naming the record and the cause is the
+    // property worth pinning.
+    assert!(
+        rendered.contains("failed to deserialize payload"),
+        "the refusal must name the decode failure, got {rendered}"
+    );
+    assert!(
+        rendered.contains("tick 4"),
+        "the refusal must name the offending record, got {rendered}"
+    );
+    reader.close()?;
+
+    // Refusing must not have repaired, rewritten, or otherwise mutated the row:
+    // a second independent reader sees exactly the same refusal.
+    let retry = StorageReader::open_finished(&path_string)?;
+    let repeated = retry
+        .narrative_input_page_v1(None, 4, 0)
+        .expect_err("torn payload must remain refused on retry");
+    assert_eq!(
+        repeated.to_string(),
+        rendered,
+        "the refusal must be identical on retry; a differing error would mean the \
+         first read changed something"
+    );
+    retry.close()?;
     Ok(())
 }
 
