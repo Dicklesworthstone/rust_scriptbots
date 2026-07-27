@@ -1147,7 +1147,31 @@ mod tests {
         )
         .expect("retained evidence verifier");
         assert!(verifier.contains("b3sum"));
-        assert!(verifier.contains("This does not re-run the simulation"));
+        // The verifier's SCOPE changed, and this assertion was pinning the old
+        // limit. Until 5b64955ad7 ("reproduce.sh actually re-executes every arm x
+        // seed") the script only checked retained artifact hashes, so it
+        // truthfully said it did not re-run the simulation. It now re-executes
+        // every arm x seed from the emitted config and compares each re-run world
+        // digest against the cited one, exiting nonzero on any mismatch.
+        //
+        // Re-adding the old sentence to make this pass would have asserted a
+        // limitation the product no longer has, and would have quietly weakened
+        // the guarantee this test exists to defend. So it asserts the STRONGER
+        // property instead: that the verifier really does re-execute and compare.
+        assert!(
+            verifier.contains("SCRIPTBOTS_DET_RUN=1"),
+            "the verifier must actually re-execute each arm x seed, not only hash \
+             retained artifacts"
+        );
+        assert!(
+            verifier.contains("digest differs on re-execution"),
+            "the verifier must compare each re-run digest against the cited one and \
+             fail when they differ; hashing artifacts alone does not reproduce a run"
+        );
+        assert!(
+            verifier.contains("did not reproduce"),
+            "the verifier must exit nonzero when any arm fails to reproduce"
+        );
 
         let repeated_lab = run_lab(temp.path().join("repeated"));
         assert_eq!(
