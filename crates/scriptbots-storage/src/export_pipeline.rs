@@ -146,4 +146,40 @@ mod tests {
         assert!(output.contains("tick,metric_name,value"));
         assert!(output.contains("100,population,42"));
     }
+
+    #[test]
+    fn jsonl_metric_export_round_trips_provenance_and_row() {
+        let mut buf = Vec::new();
+        let mut writer = MetricExportWriter::new(&mut buf, ExportFormat::JsonLines);
+        let prov = ExportProvenance {
+            run_id: "run-round-trip".into(),
+            seed: 7,
+            config_digest: "blake3:config".into(),
+            source_revision: "git:abc123".into(),
+            source_tree_digest: "blake3:tree".into(),
+            authority_decisions: vec!["conservation:pass".into(), "durable_watermark:9".into()],
+            conservation_tolerances: Some(serde_json::json!({"per_tick_relative": 1.0e-6})),
+            schema_version: 1,
+            exported_at_utc: "2026-07-27T00:00:00Z".into(),
+        };
+        writer.write_provenance(&prov).unwrap();
+        writer.write_metric_row(9, "population", 12.5).unwrap();
+
+        let mut lines = String::from_utf8(buf).unwrap().lines();
+        let envelope: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let exported = &envelope["provenance"];
+        assert_eq!(exported["run_id"], "run-round-trip");
+        assert_eq!(exported["config_digest"], "blake3:config");
+        assert_eq!(exported["source_tree_digest"], "blake3:tree");
+        assert_eq!(exported["authority_decisions"][0], "conservation:pass");
+        assert_eq!(
+            exported["conservation_tolerances"]["per_tick_relative"],
+            1.0e-6
+        );
+
+        let row: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(row["tick"], 9);
+        assert_eq!(row["metric"], "population");
+        assert_eq!(row["value"], 12.5);
+    }
 }
