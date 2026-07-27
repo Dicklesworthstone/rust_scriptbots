@@ -692,41 +692,45 @@ impl ControlHandle {
 
     /// Compute scoreboard snapshots: top predators (carnivores) by energy and oldest living agents.
     pub fn compute_scoreboard(&self, limit: usize) -> Result<Scoreboard, ControlError> {
-        let world = self.lock_world()?;
+        // Collection happens inside the seam and ranking happens outside it, so
+        // the expensive sort provably cannot hold the world lock. That used to
+        // rest on a hand-placed `drop(world)` with a comment; now the borrow
+        // ends at the closure boundary and the compiler enforces it (bd-88yj).
+        let (mut carnivores, mut oldest) = self.with_world(|world| {
+            let handles: Vec<scriptbots_core::AgentId> = world.agents().iter_handles().collect();
+            let columns = world.agents().columns();
+            let runtimes = world.runtime();
 
-        let handles: Vec<scriptbots_core::AgentId> = world.agents().iter_handles().collect();
-        let columns = world.agents().columns();
-        let runtimes = world.runtime();
+            let mut carnivores = Vec::with_capacity(handles.len() / 2 + 1);
+            let mut oldest = Vec::with_capacity(handles.len());
 
-        let mut carnivores = Vec::with_capacity(handles.len() / 2 + 1);
-        let mut oldest = Vec::with_capacity(handles.len());
+            for (idx, id) in handles.iter().enumerate() {
+                let runtime = runtimes.get(*id);
+                let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
+                let diet_core = DietClass::from_tendency(tendency);
+                let diet = DietClassDto::from(diet_core);
+                let energy = runtime.map(|rt| rt.energy).unwrap_or(0.0);
+                let health = columns.health()[idx];
+                let age = columns.ages()[idx];
+                let generation = columns.generations()[idx].0;
 
-        for (idx, id) in handles.iter().enumerate() {
-            let runtime = runtimes.get(*id);
-            let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
-            let diet_core = DietClass::from_tendency(tendency);
-            let diet = DietClassDto::from(diet_core);
-            let energy = runtime.map(|rt| rt.energy).unwrap_or(0.0);
-            let health = columns.health()[idx];
-            let age = columns.ages()[idx];
-            let generation = columns.generations()[idx].0;
+                let entry = AgentScoreEntry {
+                    agent_id: id.data().as_ffi(),
+                    energy,
+                    health,
+                    age,
+                    generation,
+                    diet,
+                };
 
-            let entry = AgentScoreEntry {
-                agent_id: id.data().as_ffi(),
-                energy,
-                health,
-                age,
-                generation,
-                diet,
-            };
-
-            if matches!(diet_core, DietClass::Carnivore) {
-                carnivores.push(entry.clone());
+                if matches!(diet_core, DietClass::Carnivore) {
+                    carnivores.push(entry.clone());
+                }
+                oldest.push(entry);
             }
-            oldest.push(entry);
-        }
 
-        drop(world); // release lock before sorting
+            (carnivores, oldest)
+        })?;
 
         if limit == 0 {
             return Ok(Scoreboard {
