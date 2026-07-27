@@ -21632,6 +21632,7 @@ impl WorldState {
                     let mut rng = SmallRngStream::seed_from_u64(seed);
                     let mut spawned: Vec<AgentId> = Vec::with_capacity(usize::from(count));
                     let mut breach_count = 0_u32;
+                    let mut first_breach: Option<ScientificStateError> = None;
                     for _ in 0..count {
                         let position = Self::sample_position_in_region(
                             region,
@@ -21643,12 +21644,23 @@ impl WorldState {
                         // reason; an internal invariant breach is counted, never panicked
                         // over, and leaves the already-spawned members intact rather than
                         // fabricating a rollback through a test-only removal path.
-                        // `_with`, not the bare spawn: the bare form passes an
+                        // `_with`, not the bare form: the bare form passes an
                         // empty runtime closure, which is exactly how every
                         // injected cohort silently kept the neutral 0.5 default
                         // and failed to be the predators it was asked for
                         // (bd-7akp).
-                        match self.try_spawn_agent_with(
+                        //
+                        // INJECT, not spawn (bd-i328). An intervention exists to
+                        // perturb a RUNNING world, so a cohort member is never a
+                        // founding arrival. `try_spawn_agent_with` is the
+                        // tick-zero-only founding path its own doc says it is:
+                        // it stamps `BirthOrigin::Seeded`, which
+                        // `try_insert_agent_with_origin` refuses after bootstrap
+                        // with `SeededArrivalAfterBootstrap`. Every member of a
+                        // mid-run cohort was therefore rejected, counted as an
+                        // anonymous breach, and recorded as an applied
+                        // intervention affecting zero agents.
+                        match self.try_inject_agent_with(
                             AgentData {
                                 position,
                                 ..AgentData::default()
@@ -21658,8 +21670,14 @@ impl WorldState {
                             },
                         ) {
                             Ok(id) => spawned.push(id),
-                            Err(_) => {
+                            Err(error) => {
                                 breach_count += 1;
+                                // Keep the typed cause. A bare counter is how a
+                                // categorical refusal of every member read as an
+                                // internal hiccup for as long as it did.
+                                if first_breach.is_none() {
+                                    first_breach = Some(error);
+                                }
                             }
                         }
                     }
@@ -21670,9 +21688,12 @@ impl WorldState {
                         }
                     }
                     if breach_count > 0 {
+                        let cause = first_breach
+                            .map_or_else(|| "unknown".to_owned(), |error| error.to_string());
                         diag_warn!(
                             breach_count,
                             key,
+                            cause = cause.as_str(),
                             "cohort injection hit an internal breach after enqueue validation"
                         );
                     }
@@ -32753,6 +32774,121 @@ mod tests {
             }
         }
         assert_eq!(bound, 5, "every cohort member carries the bound brain key");
+    }
+
+    /// A cohort injected after tick zero must actually arrive, and must arrive
+    /// as an INJECTED record rather than a founding one (bd-i328).
+    ///
+    /// bd-i328 filed this as a provenance mislabel: `InjectCohort` spawned
+    /// through `try_spawn_agent_with`, whose own doc calls it a "tick-zero-only
+    /// founding path", so a mid-run cohort was expected to enter the phylogeny
+    /// as `BirthOrigin::Seeded` founders. By the time it was picked up the
+    /// mislabel was already impossible — `try_insert_agent_with_origin` refuses
+    /// `Seeded` above tick zero with `SeededArrivalAfterBootstrap` — and the
+    /// live defect was one layer worse than filed: EVERY member was refused,
+    /// each refusal was folded into an anonymous breach counter, and the
+    /// intervention was still recorded and logged as applied.
+    ///
+    /// THE TRAP THIS TEST EXISTS TO ESCAPE: every other `InjectCohort` test in
+    /// this module enqueues before the world's first step, where `self.tick` is
+    /// still zero and the founding path is legal. The suite was green against
+    /// the one tick at which the bug cannot happen, for the one intervention
+    /// whose entire purpose is to fire mid-run. So this asserts on the
+    /// in-memory birth stream above tick zero, then checks the intervention
+    /// record's own claim against that observation instead of trusting it.
+    #[test]
+    fn a_cohort_injected_after_tick_zero_arrives_as_injected_not_seeded() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(23),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let key = world
+            .register_brain_family(
+                "mid-run-fixture".to_owned(),
+                Box::new(FixtureBrainFamily::new("mid-run-fixture")),
+            )
+            .expect("register mid-run fixture family");
+
+        // Leave tick zero behind. This is the boundary the rest of the suite
+        // never crosses, and the only side of it interventions live on.
+        world.step().expect("advance past the founding tick");
+        assert_ne!(world.tick(), Tick::zero());
+
+        let before: Vec<AgentId> = world.agents().iter_handles().collect();
+        world
+            .enqueue_intervention(Intervention::InjectCohort {
+                count: 3,
+                genome: CohortSource::RegisteredBrain { key },
+                placement: Placement::Seeded {
+                    region: Region::All,
+                    seed: 0x1328,
+                },
+                herbivore_tendency: 0.05,
+            })
+            .expect("valid mid-run injection");
+        let completion = world.step_outcome().expect("mid-run injection step");
+
+        let arrived: Vec<AgentId> = world
+            .agents()
+            .iter_handles()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(
+            arrived.len(),
+            3,
+            "a cohort injected after tick zero must actually arrive; before \
+             bd-i328 every member was refused as a post-bootstrap founding \
+             arrival and none of them existed"
+        );
+
+        let injected: Vec<_> = completion
+            .outcome
+            .births
+            .iter()
+            .filter(|record| record.origin == BirthOrigin::Injected)
+            .collect();
+        assert_eq!(
+            injected.len(),
+            3,
+            "each arrival must reach the in-memory birth stream as an INJECTED \
+             record, not merely exist in the arena; observed origins {:?}",
+            completion
+                .outcome
+                .births
+                .iter()
+                .map(|record| record.origin)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            completion
+                .outcome
+                .births
+                .iter()
+                .all(|record| record.origin != BirthOrigin::Seeded),
+            "a mid-run arrival is never a founding root of the phylogeny"
+        );
+        assert!(
+            injected.iter().all(|record| record.birth_ordinal.is_none()),
+            "an injected arrival is not a demographic birth and must not \
+             consume a birth ordinal"
+        );
+
+        // The claim, compared against the observation above rather than
+        // trusted on its own (bd-0oro).
+        let claim = world
+            .applied_interventions()
+            .back()
+            .expect("the injection must be recorded in the audit ring");
+        assert_eq!(claim.kind, "inject_cohort");
+        assert_eq!(
+            claim.agents_affected,
+            arrived.len(),
+            "the audit record must report the arrivals that actually happened"
+        );
     }
 
     #[test]
