@@ -424,10 +424,11 @@ impl ControlHandle {
             // Capture the render-relevant state under a short lock, then
             // rasterize with no lock held at all (bd-134): a slow PNG render
             // must never stall the simulation or other control reads.
-            let scene = {
-                let world = self.lock_world()?;
-                OffscreenScene::capture(&world)
-            };
+            // Capture inside the seam, rasterize outside it. The short-lock
+            // discipline recorded here for bd-134 is now structural rather than
+            // conventional: the borrow ends at the closure boundary, so a slow
+            // PNG render cannot regain the lock by accident (bd-88yj).
+            let scene = self.with_world(OffscreenScene::capture)?;
             Ok(render_offscreen_scene(&scene, width, height))
         }
         #[cfg(not(feature = "gui"))]
