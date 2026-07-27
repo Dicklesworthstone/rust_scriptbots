@@ -3939,6 +3939,76 @@ mod tests {
         );
     }
 
+    /// Migrants between DIFFERENTLY SIZED islands land inside their destination
+    /// (bd-tfso).
+    ///
+    /// `scriptbots-core` proves the normalized `(x/w, y/h)` remap in isolation,
+    /// including a far-edge migrant from 4000x4000 into 100x100. What that
+    /// cannot show is that the remap is actually reached through a real barrier
+    /// between real islands of different sizes — an archipelago that never
+    /// applied it would pass every core test and still drop agents outside the
+    /// world, where the food and terrain grids have no cell for them.
+    #[test]
+    fn bd_tfso_migrants_between_differently_sized_islands_land_in_bounds() {
+        let sizes = [(600u32, 300u32), (1200, 600), (300, 150)];
+        let specs: Vec<IslandSpec> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &(width, height))| {
+                let mut config = populated_config(None);
+                config.world_width = width;
+                config.world_height = height;
+                spec(u32::try_from(index).expect("index fits u32"), config)
+            })
+            .collect();
+        let mut archipelago = populated_archipelago(migrating_config(
+            specs,
+            30,
+            EmigrantSelectionRule::Fittest,
+            2,
+        ))
+        .expect("heterogeneous migrating archipelago");
+
+        let mut moved = 0usize;
+        for _ in 0..4 {
+            let report = archipelago.step_to_barrier().expect("barrier steps");
+            moved += report
+                .migration
+                .map_or(0, |migration| migration.moves.len());
+        }
+        assert!(
+            moved > 0,
+            "no organism crossed between differently sized worlds, so nothing was remapped"
+        );
+
+        for (index, &(width, height)) in sizes.iter().enumerate() {
+            let id = IslandId(u32::try_from(index).expect("index fits u32"));
+            let outside = archipelago
+                .with_island_world(id, |world| {
+                    world
+                        .agents()
+                        .iter_handles()
+                        .filter_map(|handle| world.agents().snapshot(handle))
+                        .filter(|data| {
+                            let x = data.position.x;
+                            let y = data.position.y;
+                            !(x.is_finite() && y.is_finite())
+                                || x < 0.0
+                                || y < 0.0
+                                || x >= width as f32
+                                || y >= height as f32
+                        })
+                        .count()
+                })
+                .expect("island readable");
+            assert_eq!(
+                outside, 0,
+                "island {id} ({width}x{height}) holds {outside} agents outside its own \
+                 bounds; a migrant that kept its source coordinates would land here"
+            );
+        }
+    }
+
     /// The migration graph is the archipelago's own topology, expanded both ways.
     ///
     /// Pins the reason [`ArchipelagoMigration`] has no topology field: `Topology::Ring`
