@@ -12,7 +12,10 @@
 //! `#[serde(rename)]` that source-level transcription would miss.
 
 use scriptbots_core::knob_roles::KNOB_ROLES;
-use scriptbots_core::{AgentData, Position, ScriptBotsConfig, WorldDigestV1, WorldState};
+use scriptbots_core::{
+    AgentData, BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig,
+    WorldDigestV1, WorldState,
+};
 use serde_json::Value;
 
 /// Flatten a serialized config into dotted leaf paths.
@@ -127,6 +130,118 @@ fn material_lanes(digest: &WorldDigestV1) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The world a witness is measured against (bd-3mul).
+///
+/// Some knobs cannot be reached from a bare default world at ANY value, and a "ghost"
+/// verdict for those would be wrong -- the knob is live, its consumer is simply behind a
+/// branch the fixture never takes. A baseline is the prerequisite that opens the branch.
+///
+/// THE INVARIANT THAT MAKES THIS SOUND: the baseline is applied to BOTH the reference and
+/// the perturbed world, so the pair still differs in exactly one knob. A prerequisite
+/// applied to only one side would be a second perturbation wearing a disguise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Baseline {
+    /// A bare default world.
+    Default,
+    /// A world where combat actually moves resources.
+    ///
+    /// `stage_combat` hard-gates on `spike_lengths[idx] > 0.5`; default spike length is 0
+    /// and grows at `spike_growth_rate` (0.005/tick), so a short run can never cross that
+    /// floor and combat is unreachable by construction (bd-pdx5). Every `carcass_*` knob
+    /// sits behind it, because `distribute_carcass_rewards` early-returns unless the victim
+    /// was `spiked`.
+    CombatReachable,
+}
+
+/// A brain that always commands a spike, so combat survives `stage_brains`.
+///
+/// The commanded spike MUST come from a brain: `stage_brains` runs before `stage_combat`
+/// and overwrites `runtime.outputs` unconditionally for every agent, so a value poked into
+/// `outputs` between ticks is gone before combat reads it.
+struct AggressorBrain;
+
+impl BrainRunner for AggressorBrain {
+    fn kind(&self) -> &'static str {
+        "test.bd-3mul-aggressor"
+    }
+
+    fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        let mut outputs = [0.0; OUTPUT_SIZE];
+        outputs[5] = 1.0; // OutputChannel::SpikeTarget
+        outputs
+    }
+
+    fn state_digest(&self) -> Option<u64> {
+        Some(0x6264_336D_756C_0001)
+    }
+}
+
+/// Per-agent spawn overrides a baseline needs, applied identically on both sides.
+///
+/// Expressed at SPAWN TIME through the public `AgentData` fields rather than by reaching
+/// into world internals: an integration test sees only the public surface, and a helper
+/// that needed private access would be proving something the real callers cannot do.
+fn baseline_agent(baseline: Baseline, index: u32, base: AgentData) -> AgentData {
+    match (baseline, index) {
+        (Baseline::CombatReachable, 0) => AgentData {
+            // Above stage_combat's 0.5 eligibility floor; decays only 0.005/tick.
+            spike_length: 5.0,
+            heading: 0.0,
+            position: Position::new(40.0, 60.0),
+            ..base
+        },
+        (Baseline::CombatReachable, 1) => AgentData {
+            // Directly ahead of the attacker, with health for the spike to take.
+            position: Position::new(45.0, 60.0),
+            health: 2.0,
+            ..base
+        },
+        _ => base,
+    }
+}
+
+/// Config prerequisites a baseline needs, applied identically on both sides.
+fn baseline_config(baseline: Baseline, mut config: ScriptBotsConfig) -> ScriptBotsConfig {
+    if baseline == Baseline::CombatReachable {
+        // Relax the eligibility and aiming thresholds so the hit does not depend on
+        // incidental drift. NOT zero for the cosine: the validator requires
+        // `spike_alignment_cosine` in the half-open interval (0, 1], so 0.0 is rejected
+        // outright. A tiny positive value admits effectively the whole forward hemisphere
+        // while staying inside the documented domain -- found by running, not by reading.
+        config.spike_min_length = 0.0;
+        config.spike_alignment_cosine = 0.001;
+    }
+    config
+}
+
+/// Bind the aggressor brain and make the attacker a carnivore, through public APIs.
+fn arm_baseline(world: &mut WorldState, baseline: Baseline) -> Result<(), String> {
+    if baseline != Baseline::CombatReachable {
+        return Ok(());
+    }
+    let attacker = world
+        .agents()
+        .iter_handles()
+        .next()
+        .ok_or_else(|| "combat baseline needs an agent".to_owned())?;
+    let key = world
+        .brain_registry_mut()
+        .map_err(|e| format!("registry: {e:?}"))?
+        .register("test.bd-3mul-aggressor", |_rng| {
+            Ok(Box::new(AggressorBrain) as Box<dyn BrainRunner>)
+        });
+    world
+        .bind_agent_brain(attacker, key)
+        .map_err(|e| format!("bind: {e:?}"))?;
+    world
+        .try_update_agent_runtime(attacker, |runtime| {
+            runtime.herbivore_tendency = 0.0;
+            runtime.energy = 1.5;
+        })
+        .map_err(|e| format!("attacker runtime: {e:?}"))?;
+    Ok(())
+}
+
 /// Deterministic world for a witness run: fixed seed, fixed agent layout, fixed tick budget.
 ///
 /// Agents are seeded explicitly rather than left to population dynamics, because a witness must
@@ -142,14 +257,20 @@ fn material_lanes(digest: &WorldDigestV1) -> Vec<(&'static str, String)> {
 fn run_material(
     config: ScriptBotsConfig,
     ticks: u64,
+    baseline: Baseline,
 ) -> Result<Vec<(&'static str, String)>, String> {
-    let mut world = WorldState::new(config).map_err(|e| format!("config rejected: {e:?}"))?;
+    let mut world = WorldState::new(baseline_config(baseline, config))
+        .map_err(|e| format!("config rejected: {e:?}"))?;
     for index in 0..6_u32 {
         let agent = world
-            .try_spawn_agent(AgentData {
-                position: Position::new(30.0 + f32::from(index as u16) * 9.0, 45.0),
-                ..AgentData::default()
-            })
+            .try_spawn_agent(baseline_agent(
+                baseline,
+                index,
+                AgentData {
+                    position: Position::new(30.0 + f32::from(index as u16) * 9.0, 45.0),
+                    ..AgentData::default()
+                },
+            ))
             .map_err(|e| format!("spawn refused: {e:?}"))?;
         world
             .try_update_agent_runtime(agent, |runtime| {
@@ -157,6 +278,7 @@ fn run_material(
             })
             .map_err(|e| format!("runtime update refused: {e:?}"))?;
     }
+    arm_baseline(&mut world, baseline)?;
     for tick in 0..ticks {
         world
             .step()
@@ -193,6 +315,7 @@ struct Witness {
     path: &'static str,
     value: fn() -> Value,
     ticks: u64,
+    baseline: Baseline,
 }
 
 /// Witnesses for scientific knobs whose consumption is proven by a two-world differential.
@@ -205,71 +328,85 @@ static WITNESSES: &[Witness] = &[
         path: "rng_seed",
         value: || Value::from(987_654_u64),
         ticks: 4,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "world_width",
         value: || Value::from(6_500),
         ticks: 2,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "world_height",
         value: || Value::from(3_500),
         ticks: 2,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_cell_size",
         value: || Value::from(25),
         ticks: 2,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_growth_rate",
         value: || Value::from(0.4),
         ticks: 6,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_decay_rate",
         value: || Value::from(0.25),
         ticks: 6,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_intake_rate",
         value: || Value::from(0.5),
         ticks: 6,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_max",
         value: || Value::from(4.0),
         ticks: 6,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "metabolism_drain",
         value: || Value::from(0.25),
         ticks: 6,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "movement_drain",
         value: || Value::from(0.25),
         ticks: 6,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "bot_speed",
         value: || Value::from(2.5),
         ticks: 4,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "bot_radius",
         value: || Value::from(25.0),
         ticks: 4,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "sense_radius",
         value: || Value::from(60.0),
         ticks: 6,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "temperature_discomfort_rate",
         value: || Value::from(0.4),
         ticks: 6,
+        baseline: Baseline::Default,
     },
     // TWO KNOBS ARE DELIBERATELY ABSENT, and the reason is a real limit of this harness shape
     // rather than an opinion about the knobs.
@@ -292,31 +429,37 @@ static WITNESSES: &[Witness] = &[
         path: "food_diffusion_rate",
         value: || Value::from(0.22),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_waste_rate",
         value: || Value::from(0.2),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_respawn_amount",
         value: || Value::from(0.3),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_respawn_interval",
         value: || Value::from(2),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_fertility_base",
         value: || Value::from(0.8),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_capacity_base",
         value: || Value::from(0.4),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     // Third batch (bd-dorx). Terrain-coupled and reproduction knobs. carcass_* is deliberately
     // absent: distribute_carcass_rewards early-returns unless a victim was `spiked`, and combat is
@@ -327,36 +470,75 @@ static WITNESSES: &[Witness] = &[
         path: "food_slope_weight",
         value: || Value::from(2.0),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_elevation_weight",
         value: || Value::from(2.0),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_moisture_weight",
         value: || Value::from(2.0),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_capacity_fertility",
         value: || Value::from(0.7),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_growth_fertility",
         value: || Value::from(0.7),
         ticks: 8,
+        baseline: Baseline::Default,
     },
     Witness {
         path: "food_decay_infertility",
         value: || Value::from(0.7),
         ticks: 8,
+        baseline: Baseline::Default,
+    },
+    // bd-3mul item 3: the carcass family, now reachable.
+    //
+    // These were previously unwitnessable at ANY value, because
+    // `distribute_carcass_rewards` early-returns unless the victim was `spiked` and combat
+    // could not happen in a short default run. bd-pdx5 established the recipe; the
+    // CombatReachable baseline applies it to both sides of the comparison, so a verdict
+    // here now means something. A ghost result for these under Baseline::Default would
+    // have been a FALSE accusation against a live knob.
+    Witness {
+        path: "carcass_health_reward",
+        value: || Value::from(9.0),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "carcass_energy_share_rate",
+        value: || Value::from(0.9),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "carcass_distribution_radius",
+        value: || Value::from(20.0),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
+    },
+    Witness {
+        path: "spike_damage",
+        value: || Value::from(0.9),
+        ticks: 16,
+        baseline: Baseline::CombatReachable,
     },
     Witness {
         path: "aging_tick_interval",
         value: || Value::from(1),
         ticks: 8,
+        baseline: Baseline::Default,
     },
 ];
 
@@ -368,8 +550,13 @@ static WITNESSES: &[Witness] = &[
 /// spent its entire life reporting coverage it did not have.
 #[test]
 fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
-    let baseline = run_material(ScriptBotsConfig::default(), 8)
+    // One reference world PER BASELINE, so a witness is always compared against a world
+    // that had the same prerequisite applied. Comparing a combat-enabled perturbation
+    // against a default reference would attribute the baseline's own effect to the knob.
+    let default_reference = run_material(ScriptBotsConfig::default(), 8, Baseline::Default)
         .expect("the default config must build and step a world");
+    let combat_reference = run_material(ScriptBotsConfig::default(), 16, Baseline::CombatReachable)
+        .expect("the combat baseline must build and step a world");
 
     // Collect every failure rather than panicking on the first. One run then tells you about all
     // 17 witnesses instead of one per run, which matters when a verification cycle is minutes long
@@ -381,10 +568,14 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
             broken.push(format!("{}: not a published path", witness.path));
             continue;
         };
-        match run_material(config, witness.ticks.max(8)) {
+        let reference = match witness.baseline {
+            Baseline::Default => &default_reference,
+            Baseline::CombatReachable => &combat_reference,
+        };
+        match run_material(config, witness.ticks.max(8), witness.baseline) {
             Err(reason) => broken.push(format!("{}: {reason}", witness.path)),
             Ok(perturbed) => {
-                let moved: Vec<&str> = baseline
+                let moved: Vec<&str> = reference
                     .iter()
                     .zip(perturbed.iter())
                     .filter(|((_, before), (_, after))| before != after)
@@ -436,10 +627,10 @@ fn bd_dorx_every_witness_targets_a_scientific_knob() {
 /// lie of exactly the kind bd-dorx exists to stop. A floor makes the debt visible in the test
 /// output every run while making it impossible to quietly delete a witness.
 ///
-/// 27 is the OBSERVED count -- every one of these was seen to move material state on a real run.
+/// 31 is the OBSERVED count -- every one of these was seen to move material state on a real run.
 /// It is not an aspiration. An earlier value of 17 was aspirational and left this gate red,
 /// which is the failure it exists to prevent, so the number now tracks evidence only.
-const WITNESS_COVERAGE_FLOOR: usize = 27;
+const WITNESS_COVERAGE_FLOOR: usize = 31;
 
 /// Report scientific coverage, and hold the line against it regressing.
 ///
