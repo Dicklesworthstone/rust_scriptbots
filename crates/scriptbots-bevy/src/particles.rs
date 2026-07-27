@@ -1712,6 +1712,120 @@ mod tests {
         }
     }
 
+    /// Canonical atlas parameters. The pinned digest below is only meaningful
+    /// for exactly these; changing any of them requires re-deriving it.
+    const CANONICAL_ATLAS_SEED: u64 = 5;
+    const CANONICAL_ATLAS_TILE_PX: u32 = 32;
+
+    /// blake3 of `bake_sprite_atlas(CANONICAL_ATLAS_SEED, CANONICAL_ATLAS_TILE_PX)`.
+    ///
+    /// REBASELINING THIS REQUIRES AN EXPLICIT REASON in the commit message
+    /// naming what changed about the atlas and why the new appearance is
+    /// correct. It is not a value to refresh until the test goes green — that
+    /// converts a real signal into a rubber stamp, which is the failure this
+    /// pin exists to prevent.
+    const CANONICAL_ATLAS_DIGEST: &str =
+        "eb074d032052d716d0c348b3c9b73004eb92b0c0433e69523edad1a7928b6a49";
+
+    /// The atlas must match a PINNED digest, not merely equal a second bake.
+    ///
+    /// `sprite_atlas_is_deterministic_and_shaped` asserts `bake(a) == bake(a)`.
+    /// That proves the bake is repeatable and nothing more: it would pass
+    /// unchanged if every sprite in the atlas were replaced, because both sides
+    /// of the comparison come from the same implementation. Deterministic drift
+    /// is exactly the thing it cannot see.
+    ///
+    /// Pinning an external constant is what makes the check falsifiable — the
+    /// expected value no longer moves when the code does.
+    #[test]
+    fn the_canonical_sprite_atlas_matches_its_pinned_digest() {
+        let atlas = bake_sprite_atlas(CANONICAL_ATLAS_SEED, CANONICAL_ATLAS_TILE_PX);
+        let digest = blake3::hash(&atlas).to_hex().to_string();
+        assert_eq!(
+            digest, CANONICAL_ATLAS_DIGEST,
+            "canonical sprite atlas changed. If this was deliberate, record WHAT changed \
+             about the atlas and why the new appearance is correct, then update the pin to \
+             {digest}. Do not refresh it merely to get green."
+        );
+    }
+
+    /// Shape, channel and transparency contracts the digest alone cannot explain.
+    ///
+    /// A digest says "different" without saying how, so these assert the
+    /// properties a reader would want named when it trips: the RGB body is
+    /// opaque white with tinting left to the shader, every tile carries real
+    /// coverage, and the ring is genuinely hollow.
+    #[test]
+    fn the_canonical_sprite_atlas_holds_its_shape_channel_and_transparency_contracts() {
+        let size = CANONICAL_ATLAS_TILE_PX as usize;
+        let tiles = SpriteKind::ALL.len();
+        let atlas = bake_sprite_atlas(CANONICAL_ATLAS_SEED, CANONICAL_ATLAS_TILE_PX);
+
+        assert_eq!(
+            atlas.len(),
+            size * tiles * size * 4,
+            "atlas is {tiles} tiles of {size}x{size} RGBA8 laid out side by side"
+        );
+
+        for tile in 0..tiles {
+            let mut covered = 0usize;
+            let mut interior = 0usize;
+            for y in 0..size {
+                for x in 0..size {
+                    let offset = (y * size * tiles + tile * size + x) * 4;
+                    let [r, g, b, a] = [
+                        atlas[offset],
+                        atlas[offset + 1],
+                        atlas[offset + 2],
+                        atlas[offset + 3],
+                    ];
+                    assert_eq!(
+                        (r, g, b),
+                        (255, 255, 255),
+                        "tile {tile} texel ({x},{y}) must be white; per-instance tinting \
+                         belongs to the shader, so a coloured atlas would tint twice"
+                    );
+                    if a > 0 {
+                        covered += 1;
+                        // Strictly interior, derived from the alpha formula
+                        // rather than assumed: alpha = clamp(0.5 - dist*2.5),
+                        // so dist == 0 (the shape boundary) is exactly 128 and
+                        // anything inside the shape exceeds it. Saturation to
+                        // 255 needs dist <= -0.2, which Ring can never reach —
+                        // its minimum distance is -0.12, capping it at 204 — so
+                        // requiring an opaque core would be false for this atlas.
+                        if a > 128 {
+                            interior += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                covered > 100,
+                "tile {tile} must carry real coverage, got {covered} texels"
+            );
+            assert!(
+                interior > 0,
+                "tile {tile} must have texels strictly inside its shape, not only \
+                 boundary falloff"
+            );
+            assert!(
+                covered < size * size,
+                "tile {tile} must not fill its whole square, or it has no silhouette"
+            );
+        }
+
+        // The ring is the one tile defined by its hole; if this fills in, the
+        // sprite has silently become a disc.
+        let ring = SpriteKind::Ring.tile_index();
+        let centre = ((size / 2) * size * tiles + ring * size + size / 2) * 4;
+        assert_eq!(
+            atlas[centre + 3],
+            0,
+            "the ring centre must be fully transparent"
+        );
+    }
+
     #[test]
     fn sprite_atlas_is_deterministic_and_shaped() {
         let a = bake_sprite_atlas(5, 32);
