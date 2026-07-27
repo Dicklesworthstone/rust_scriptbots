@@ -861,72 +861,95 @@ async fn presets_list(client: &Client, base_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn pause_command(client: &Client, base_url: &str) -> Result<()> {
-    let url = join_url(base_url, "/api/pause");
-    let response = client.post(url).send().await?;
+/// Extract the pollable command id from a control receipt body.
+///
+/// Returns `None` when the body is not a receipt or carries no id, so the
+/// caller can stay quiet rather than print a follow-up command that would not
+/// work. Absent is reported as absent.
+fn receipt_command_id(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("command_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Issue a control command and report the receipt the server actually returned.
+///
+/// All four of these printed a hardcoded success line and dropped the response
+/// body, which was read into a variable used ONLY in the error branch. `pause`
+/// and `resume` went further and announced that the simulation WAS paused or
+/// resumed. An HTTP 2xx from these endpoints means the command was admitted to
+/// a bounded queue, not that it was applied, so the operator was told a state
+/// change had completed when nothing had (bd-2z0.4.9).
+///
+/// This is the fourth surface to grow the same defect, so the four commands now
+/// share one authority rather than four near-identical bodies that drifted into
+/// two different wordings.
+///
+/// The endpoints return a `CommandStatusDto` as of this bead, so the receipt is
+/// printed and its id is offered to `status <id>` — a subcommand the CLI already
+/// shipped for ids it previously had no way to obtain.
+async fn issue_control_command(
+    client: &Client,
+    base_url: &str,
+    path: &str,
+    label: &str,
+    payload: Option<serde_json::Value>,
+) -> Result<()> {
+    let url = join_url(base_url, path);
+    let request = client.post(url);
+    let request = match payload.as_ref() {
+        Some(body) => request.json(body),
+        None => request,
+    };
+    let response = request.send().await?;
     let status = response.status();
     let body = response.text().await?;
-    if status.is_success() {
-        println!("{}", "✔ Simulation paused".green().bold());
-    } else {
-        bail!("pause failed ({status}): {body}");
+    if !status.is_success() {
+        bail!("{label} failed ({status}): {body}");
+    }
+    // "admitted", not "paused": this reports what the receipt supports.
+    println!("{}", format!("✔ {label} command admitted").green().bold());
+    println!("{body}");
+    if let Some(command_id) = receipt_command_id(&body) {
+        // `lookup-status`, not `status`: clap derives the subcommand name from
+        // `Command::LookupStatus`, and `status` is the unrelated simulation
+        // status command. Printing a command that does not exist would be the
+        // same fabricated guidance this bead is removing.
+        println!("  poll with: scriptbots-control lookup-status {command_id}");
     }
     Ok(())
+}
+
+async fn pause_command(client: &Client, base_url: &str) -> Result<()> {
+    issue_control_command(client, base_url, "/api/pause", "pause", None).await
 }
 
 async fn resume_command(client: &Client, base_url: &str) -> Result<()> {
-    let url = join_url(base_url, "/api/resume");
-    let response = client.post(url).send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if status.is_success() {
-        println!("{}", "✔ Simulation resumed".green().bold());
-    } else {
-        bail!("resume failed ({status}): {body}");
-    }
-    Ok(())
+    issue_control_command(client, base_url, "/api/resume", "resume", None).await
 }
 
 async fn step_command(client: &Client, base_url: &str, count: u64) -> Result<()> {
-    let url = join_url(base_url, "/api/step");
-    let response = client
-        .post(url)
-        .json(&serde_json::json!({ "count": count }))
-        .send()
-        .await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if status.is_success() {
-        println!(
-            "{}",
-            format!("✔ Enqueued step command ({count} ticks)")
-                .green()
-                .bold()
-        );
-    } else {
-        bail!("step failed ({status}): {body}");
-    }
-    Ok(())
+    issue_control_command(
+        client,
+        base_url,
+        "/api/step",
+        "step",
+        Some(serde_json::json!({ "count": count })),
+    )
+    .await
 }
 
 async fn speed_command(client: &Client, base_url: &str, value: f32) -> Result<()> {
-    let url = join_url(base_url, "/api/speed");
-    let response = client
-        .post(url)
-        .json(&serde_json::json!({ "speed": value }))
-        .send()
-        .await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if status.is_success() {
-        println!(
-            "{}",
-            format!("✔ Enqueued speed command ({value})").green().bold()
-        );
-    } else {
-        bail!("speed failed ({status}): {body}");
-    }
-    Ok(())
+    issue_control_command(
+        client,
+        base_url,
+        "/api/speed",
+        "speed",
+        Some(serde_json::json!({ "speed": value })),
+    )
+    .await
 }
 
 async fn status_command(client: &Client, base_url: &str) -> Result<()> {
@@ -1134,6 +1157,75 @@ fn json_pointer(path: &str) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// The CLI must recover the pollable id from a real receipt body.
+    ///
+    /// This is what closes the loop: the CLI already shipped `status <id>`
+    /// while none of its own commands returned an id, so the subcommand was
+    /// reachable and unusable at the same time (bd-2z0.4.9).
+    #[test]
+    fn a_receipt_body_yields_the_id_its_status_subcommand_needs() {
+        let body = serde_json::json!({
+            "command_id": "cmd-7",
+            "admission_sequence": 7,
+            "application_state": "admitted",
+            "journal_state": "not_required",
+            "control_revision": 3,
+            "scientific_revision": 41,
+        })
+        .to_string();
+
+        assert_eq!(receipt_command_id(&body).as_deref(), Some("cmd-7"));
+    }
+
+    /// The polling hint must name a subcommand that actually exists.
+    ///
+    /// The hint is derived from a clap variant name, so it can silently drift
+    /// if the variant is renamed. Printing a command the binary does not accept
+    /// would be a smaller version of the fabricated confirmations this bead is
+    /// removing, so the name is checked against clap rather than trusted.
+    #[test]
+    fn the_polling_hint_names_a_subcommand_clap_actually_exposes() {
+        // Assembled so this test cannot satisfy itself from its own literal.
+        let hinted = format!("{}-status", "lookup");
+        let source = include_str!("control_cli.rs");
+        assert!(
+            source.contains(&format!("scriptbots-control {hinted} ")),
+            "the polling hint changed; update what this test checks against"
+        );
+
+        let command = Cli::command();
+        let names: Vec<String> = command
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_owned())
+            .collect();
+        assert!(
+            names.contains(&hinted),
+            "the hint points at `{hinted}`, which clap does not expose; available: {names:?}"
+        );
+    }
+
+    /// A body that is not a receipt must report absent, not guess.
+    ///
+    /// The CLI prints a follow-up `status <id>` line only when there is a real
+    /// id. Inventing one would hand the operator a command that cannot work —
+    /// the same shape of fabricated confirmation this bead is removing.
+    #[test]
+    fn a_bodyless_or_idless_response_yields_no_command_id() {
+        for body in [
+            String::new(),
+            "not json at all".to_string(),
+            serde_json::json!({"success": true}).to_string(),
+            serde_json::json!({"command_id": 7}).to_string(),
+        ] {
+            assert_eq!(
+                receipt_command_id(&body),
+                None,
+                "invented an id from a body that has none: {body:?}"
+            );
+        }
+    }
+
     use std::{
         path::Path,
         sync::{Arc, Mutex},
