@@ -465,9 +465,13 @@ fn reproduce_server_hang(storage: &str) -> Result<()> {
         // just as much — it would mean the tick number is not stable and the cause
         // is timing-dependent.
         panic!(
-            "bd-w1oi did NOT reproduce within 600s with --storage {storage}. That is a RESULT, not a success: \
-             it means the failure is not deterministic on this host, and the bead's \
-             'is tick 420 stable' question is answered NO. Record it there."
+            "bd-w1oi did NOT reproduce within 600s with --storage {storage}. That is a RESULT, \
+             not a success, and what it means depends on which backend this was. For `memory`, \
+             which reproduces in ~180s, a clean 600s says the failure is less deterministic than \
+             recorded and the window is narrower than believed. For `file`, a clean 600s is the \
+             expected outcome and ISOLATES the fault to the in-memory acknowledgement path. \
+             Record which backend and which reading on bd-w1oi; do not reuse the other one's \
+             conclusion."
         );
     };
 
