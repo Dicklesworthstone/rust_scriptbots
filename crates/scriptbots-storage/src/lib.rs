@@ -13478,46 +13478,56 @@ impl Storage {
             return Ok(());
         }
 
+        // Every staged set and the persisted lookup below are keyed by (island_id, value),
+        // because each island mints these counters privately (bd-8jlj) and V15 lifted the
+        // matching unique indexes to include island_id. A run-scoped check here contradicts the
+        // schema it is guarding: it refuses arrivals the database would happily store.
         let buffered_agent_uids = self
             .buffer
             .births
             .iter()
-            .map(|row| row.agent_uid)
+            .map(|row| (row.island_id, row.agent_uid))
             .collect::<BTreeSet<_>>();
         let buffered_spawn_ordinals = self
             .buffer
             .births
             .iter()
-            .map(|row| row.spawn_ordinal)
+            .map(|row| (row.island_id, row.spawn_ordinal))
             .collect::<BTreeSet<_>>();
         let buffered_birth_ordinals = self
             .buffer
             .births
             .iter()
-            .filter_map(|row| row.birth_ordinal)
+            .filter_map(|row| row.birth_ordinal.map(|ordinal| (row.island_id, ordinal)))
             .collect::<BTreeSet<_>>();
         for row in &prepared.births {
-            if buffered_agent_uids.contains(&row.agent_uid) {
+            if buffered_agent_uids.contains(&(row.island_id, row.agent_uid)) {
                 return Err(StorageError::InvalidData {
                     context: "births.agent_uid",
-                    reason: format!("agent uid {} already has a staged arrival", row.agent_uid),
+                    reason: format!(
+                        "agent uid {} already has a staged arrival on island {}",
+                        row.agent_uid, row.island_id
+                    ),
                 });
             }
-            if buffered_spawn_ordinals.contains(&row.spawn_ordinal) {
+            if buffered_spawn_ordinals.contains(&(row.island_id, row.spawn_ordinal)) {
                 return Err(StorageError::InvalidData {
                     context: "births.spawn_ordinal",
                     reason: format!(
-                        "spawn ordinal {} already has a staged arrival",
-                        row.spawn_ordinal
+                        "spawn ordinal {} already has a staged arrival on island {}",
+                        row.spawn_ordinal, row.island_id
                     ),
                 });
             }
             if let Some(ordinal) = row.birth_ordinal
-                && buffered_birth_ordinals.contains(&ordinal)
+                && buffered_birth_ordinals.contains(&(row.island_id, ordinal))
             {
                 return Err(StorageError::InvalidData {
                     context: "births.birth_ordinal",
-                    reason: format!("birth ordinal {ordinal} already has a staged birth"),
+                    reason: format!(
+                        "birth ordinal {ordinal} already has a staged birth on island {}",
+                        row.island_id
+                    ),
                 });
             }
 
@@ -13525,10 +13535,12 @@ impl Storage {
                 "SELECT agent_uid, spawn_ordinal, birth_ordinal
                  FROM births
                  WHERE run_id = ?1
-                   AND (agent_uid = ?2 OR spawn_ordinal = ?3 OR birth_ordinal = ?4)
+                   AND island_id = ?2
+                   AND (agent_uid = ?3 OR spawn_ordinal = ?4 OR birth_ordinal = ?5)
                  LIMIT 1",
                 &[
                     sqlite_run_id(self.run_id),
+                    row.island_id.into(),
                     row.agent_uid.into(),
                     row.spawn_ordinal.into(),
                     sqlite_optional_i64(row.birth_ordinal),
@@ -13551,23 +13563,31 @@ impl Storage {
                     .birth_ordinal
                     .map(|raw| checked_u64("births.birth_ordinal", raw))
                     .transpose()?;
+                // The island is named in every one of these, because "agent uid 1 already has a
+                // persisted arrival" is ambiguous the moment islands exist -- it reads as a
+                // run-wide claim, which is exactly the conflation this guard stopped making.
+                let island = row.island_id;
                 let (context, detail) = if existing_agent_uid == new_agent_uid {
                     (
                         "births.agent_uid",
-                        format!("agent uid {new_agent_uid} already has a persisted arrival"),
+                        format!(
+                            "agent uid {new_agent_uid} already has a persisted arrival on island {island}"
+                        ),
                     )
                 } else if existing_spawn_ordinal == new_spawn_ordinal {
                     (
                         "births.spawn_ordinal",
                         format!(
-                            "spawn ordinal {new_spawn_ordinal} already has a persisted arrival"
+                            "spawn ordinal {new_spawn_ordinal} already has a persisted arrival on island {island}"
                         ),
                     )
                 } else if let Some(ordinal) = new_birth_ordinal {
                     debug_assert_eq!(existing_birth_ordinal, new_birth_ordinal);
                     (
                         "births.birth_ordinal",
-                        format!("birth ordinal {ordinal} already has a persisted birth"),
+                        format!(
+                            "birth ordinal {ordinal} already has a persisted birth on island {island}"
+                        ),
                     )
                 } else {
                     return Err(StorageError::InvalidData {
@@ -13647,10 +13667,20 @@ impl Storage {
         // `births`; and the current batch can contain a parent arrival followed by
         // a later child or death. Build one read-only view across all three
         // locations before the new outbox identity is assigned.
+        //
+        // KEYED BY (island_id, agent_uid), NOT agent_uid (bd-16g.5.5.3). Every island mints
+        // uids from its own private counter (bd-8jlj), so island 0's agent 1 and island 1's
+        // agent 1 are DIFFERENT organisms. A run-scoped view conflates them in both directions,
+        // and the second is the dangerous one: it refuses island 1's legitimate arrival as a
+        // duplicate, AND it would accept a death on island 1 by finding the matching birth on
+        // island 0 — certifying a death whose organism never existed there.
         let mut known_birth_ticks = BTreeMap::new();
         for row in self.buffer.births.iter().chain(&prepared.births) {
             known_birth_ticks.insert(
-                checked_u64("births.agent_uid", row.agent_uid)?,
+                (
+                    row.island_id,
+                    checked_u64("births.agent_uid", row.agent_uid)?,
+                ),
                 checked_u64("births.tick", row.tick)?,
             );
         }
@@ -13676,25 +13706,37 @@ impl Storage {
                     ),
                 });
             }
-            referenced_uids.extend([parent_a, parent_b].into_iter().flatten());
+            // Parents are looked up on the CHILD's island: a local birth's parents are local
+            // organisms, and a parent uid that only exists on another island is a dangling
+            // reference rather than a match.
+            referenced_uids.extend(
+                [parent_a, parent_b]
+                    .into_iter()
+                    .flatten()
+                    .map(|uid| (row.island_id, uid)),
+            );
         }
         for row in &prepared.deaths {
-            referenced_uids.insert(checked_u64("deaths.agent_uid", row.agent_uid)?);
+            referenced_uids.insert((
+                row.island_id,
+                checked_u64("deaths.agent_uid", row.agent_uid)?,
+            ));
         }
 
-        for agent_uid in referenced_uids {
+        for (island_id, agent_uid) in referenced_uids {
             let std::collections::btree_map::Entry::Vacant(entry) =
-                known_birth_ticks.entry(agent_uid)
+                known_birth_ticks.entry((island_id, agent_uid))
             else {
                 continue;
             };
             let existing = self.connection()?.query_with_params(
                 "SELECT agent_uid, tick
                  FROM births
-                 WHERE run_id = ?1 AND agent_uid = ?2
+                 WHERE run_id = ?1 AND island_id = ?2 AND agent_uid = ?3
                  LIMIT 1",
                 &[
                     sqlite_run_id(self.run_id),
+                    island_id.into(),
                     encode_u64("births.agent_uid", agent_uid)?.into(),
                 ],
             )?;
@@ -13724,11 +13766,14 @@ impl Storage {
                     continue;
                 };
                 let parent_uid = checked_u64(context, parent_uid)?;
-                let Some(parent_tick) = known_birth_ticks.get(&parent_uid).copied() else {
+                let Some(parent_tick) =
+                    known_birth_ticks.get(&(row.island_id, parent_uid)).copied()
+                else {
                     return Err(StorageError::InvalidData {
                         context,
                         reason: format!(
-                            "arrival uid {child_uid} names parent uid {parent_uid}, whose arrival was not recorded"
+                            "arrival uid {child_uid} names parent uid {parent_uid}, whose arrival was not recorded on island {}",
+                            row.island_id
                         ),
                     });
                 };
@@ -13746,10 +13791,14 @@ impl Storage {
         for row in &prepared.deaths {
             let agent_uid = checked_u64("deaths.agent_uid", row.agent_uid)?;
             let death_tick = checked_u64("deaths.tick", row.tick)?;
-            let Some(birth_tick) = known_birth_ticks.get(&agent_uid).copied() else {
+            let Some(birth_tick) = known_birth_ticks.get(&(row.island_id, agent_uid)).copied()
+            else {
                 return Err(StorageError::InvalidData {
                     context: "deaths.agent_uid",
-                    reason: format!("death uid {agent_uid} has no recorded arrival"),
+                    reason: format!(
+                        "death uid {agent_uid} has no recorded arrival on island {}",
+                        row.island_id
+                    ),
                 });
             };
             if death_tick <= birth_tick {
@@ -28821,51 +28870,140 @@ mod tests {
         Ok(())
     }
 
-    /// Ancestry coherence is run-scoped, so it refuses the uid reuse V15 made storable.
+    /// The database-level ancestry guards are per-island, and still FAIL on a wrong arrival.
     ///
-    /// bd-16g.5.5, second obstacle. Every island mints `AgentUid` from its own counter
-    /// (bd-8jlj), so island 0's agent 1 and island 1's agent 1 are DIFFERENT organisms. V15
-    /// lifted the `births` unique indexes to include `island_id` precisely so the database can
-    /// hold both. The Rust-side ancestry guard is a separate layer and still reasons per run:
-    /// it sees the second arrival as a duplicate identity and refuses the batch.
+    /// bd-16g.5.5.3. Every island mints `AgentUid`, `spawn_ordinal` and `birth_ordinal` from its
+    /// own private counter (bd-8jlj), so island 0's agent 1 and island 1's agent 1 are different
+    /// organisms. V15 lifted the unique indexes so the database can hold both; these guards were
+    /// still run-scoped and refused the second island outright.
     ///
-    /// So partitioning the schema was necessary and is not sufficient. Whoever wires the
-    /// barrier has to carry `island_id` into the ancestry/coherence checks as well, or an
-    /// archipelago cannot persist its births at all. Recorded as a test rather than a comment
-    /// so it is discovered by running the suite rather than by reading it.
+    /// A PASSING TEST OVER CORRECT DATA WOULD PROVE ALMOST NOTHING HERE, because deleting the
+    /// guards entirely would also make correct data pass. So every case below is a DELIBERATELY
+    /// WRONG arrival that the guard must still reject, and the widening is only credible because
+    /// they do:
+    ///   * a duplicate arrival on the SAME island,
+    ///   * a death whose uid has no arrival ON ITS OWN island — the sharp one, because a
+    ///     run-scoped guard ACCEPTS it by finding the matching birth on a different island, and
+    ///     so certifies a death for an organism that never lived there,
+    ///   * a birth naming a parent that exists only on another island,
+    ///   * a death that precedes its arrival.
     #[test]
-    fn ancestry_coherence_is_run_scoped_and_refuses_per_island_uid_reuse()
+    fn per_island_ancestry_guards_admit_real_islands_and_still_reject_wrong_arrivals()
     -> Result<(), Box<dyn std::error::Error>> {
-        let path = temp_db_path("storage-island-ancestry-scope");
+        let path = temp_db_path("storage-island-ancestry");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
             Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
 
-        let mut island_zero = sample_batch(10, 1.0);
-        island_zero.births = vec![sample_birth(10, 1, BirthOrigin::Born)];
-        island_zero.summary.births = 1;
-        island_zero
-            .events
-            .push(PersistenceEvent::new(PersistenceEventKind::Births, 1));
-        storage.persist_for_island(&island_zero, IslandId(0))?;
+        let arrival = |tick: u64, uid: u64| {
+            let mut batch = sample_batch(tick, 1.0);
+            batch.births = vec![sample_birth(tick, uid, BirthOrigin::Born)];
+            batch.summary.births = 1;
+            batch
+                .events
+                .push(PersistenceEvent::new(PersistenceEventKind::Births, 1));
+            batch
+        };
 
-        // Island 1's own agent 1, at a free tick so admission cannot be what refuses it.
-        let mut island_one = sample_batch(11, 1.0);
-        island_one.births = vec![sample_birth(11, 1, BirthOrigin::Born)];
-        island_one.summary.births = 1;
-        island_one
+        // THE FIX: island 0's agent 1 and island 1's agent 1 both land. Different ticks so the
+        // tick-keyed admission ledger is not what admits or refuses them.
+        storage.persist_for_island(&arrival(10, 1), IslandId(0))?;
+        storage.persist_for_island(&arrival(11, 1), IslandId(1))?;
+        storage.flush()?;
+
+        let stored: i64 = storage
+            .connection()?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM births WHERE run_id = ?1 AND agent_uid = 1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            stored, 2,
+            "both islands' agent 1 must persist; they are different organisms"
+        );
+
+        // WRONG #1: the same island claiming agent 1 arrived twice.
+        let duplicate = storage
+            .persist_for_island(&arrival(12, 1), IslandId(0))
+            .expect_err("island 0 accepted a second arrival for agent 1");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("already has a persisted arrival on island 0"),
+            "got: {duplicate}"
+        );
+
+        // WRONG #2, the one a run-scoped guard gets backwards: island 2 has never recorded
+        // agent 1, but islands 0 and 1 have. A run-scoped lookup finds one of those and admits
+        // this death for an organism that never lived on island 2.
+        let mut orphan_death = sample_batch(13, 1.0);
+        orphan_death.deaths = vec![sample_death(13, 1, DeathCause::Starvation)];
+        orphan_death.summary.deaths = 1;
+        orphan_death
+            .events
+            .push(PersistenceEvent::new(PersistenceEventKind::Deaths, 1));
+        let orphan = storage
+            .persist_for_island(&orphan_death, IslandId(2))
+            .expect_err(
+                "island 2 accepted a death for an agent it never recorded; the guard is \
+                 matching another island's arrival",
+            );
+        assert!(
+            orphan
+                .to_string()
+                .contains("has no recorded arrival on island 2"),
+            "got: {orphan}"
+        );
+
+        // WRONG #3: a birth on island 0 naming a parent that exists only on island 1. Distinct
+        // ticks throughout, so the tick-keyed admission ledger cannot be what refuses it.
+        storage.persist_for_island(&arrival(14, 77), IslandId(1))?;
+        let mut foreign_parent = sample_batch(16, 1.0);
+        let mut child = sample_birth(16, 90, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(77));
+        foreign_parent.births = vec![child];
+        foreign_parent.summary.births = 1;
+        foreign_parent
             .events
             .push(PersistenceEvent::new(PersistenceEventKind::Births, 1));
-        let refusal = storage
-            .persist_for_island(&island_one, IslandId(1))
-            .expect_err("ancestry accepted a per-island uid reuse; this test is now stale");
+        let dangling = storage
+            .persist_for_island(&foreign_parent, IslandId(0))
+            .expect_err("island 0 accepted a child whose parent lives only on island 1");
         assert!(
-            refusal
+            dangling
                 .to_string()
-                .contains("agent uid 1 already has a persisted arrival"),
-            "the refusal must be the run-scoped arrival guard, which is the layer that has to \
-             become island-aware, got: {refusal}"
+                .contains("whose arrival was not recorded on island 0"),
+            "got: {dangling}"
         );
+
+        // WRONG #4: a death that does not follow its arrival, which must stay refused.
+        let mut early_death = sample_batch(9, 1.0);
+        early_death.deaths = vec![sample_death(9, 1, DeathCause::Starvation)];
+        early_death.summary.deaths = 1;
+        early_death
+            .events
+            .push(PersistenceEvent::new(PersistenceEventKind::Deaths, 1));
+        let too_early = storage
+            .persist_for_island(&early_death, IslandId(0))
+            .expect_err("a death preceding its arrival was accepted");
+        assert!(
+            too_early
+                .to_string()
+                .contains("does not follow its arrival"),
+            "got: {too_early}"
+        );
+
+        // CONTROL: a well-formed death on the island that actually recorded the arrival lands,
+        // so the four refusals are attributable to their stated causes rather than to a writer
+        // that has latched and now rejects everything.
+        let mut real_death = sample_batch(15, 1.0);
+        real_death.deaths = vec![sample_death(15, 1, DeathCause::Starvation)];
+        real_death.summary.deaths = 1;
+        real_death
+            .events
+            .push(PersistenceEvent::new(PersistenceEventKind::Deaths, 1));
+        storage.persist_for_island(&real_death, IslandId(0))?;
 
         storage.close()?;
         Ok(())
