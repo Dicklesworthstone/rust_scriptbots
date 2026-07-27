@@ -3839,6 +3839,62 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    /// Every selection path must gate its camera commit on the enqueue result.
+    ///
+    /// The submitter returns a bool meaning ENQUEUED, not applied — a weaker
+    /// fact than the UI was treating it as (bd-2z0.7.14). Three of the four
+    /// selection paths gated on it; the clear-selection button DISCARDED it and
+    /// committed the camera anyway, so a full command queue silently dropped the
+    /// clear while the camera stopped following regardless. The user sees the
+    /// camera obey a request the simulation never received.
+    ///
+    /// This asserts the discarding form is gone. It does NOT claim the remaining
+    /// commits are correct: gating on enqueue is still optimistic, because a
+    /// queued command can be rejected later, and making the UI wait for real
+    /// application needs the receipt path this bead also asks for and which is
+    /// not built yet. Truthful about a weaker guarantee beats silent about a
+    /// false one.
+    #[test]
+    fn no_selection_path_commits_the_camera_on_a_discarded_enqueue() {
+        let source = include_str!("lib.rs");
+        // Assembled at runtime so this test cannot match its own literal — the
+        // self-satisfying-needle trap that made the bloom guard vacuous.
+        let discarded = format!("{}{}", "(submitter.submit)(command)", ";");
+        assert!(
+            !source.contains(&discarded),
+            "a selection path is discarding the enqueue result and committing the \
+             camera regardless; gate on it or propagate the failure"
+        );
+        assert!(
+            source.matches("if !(submitter.submit)(command)").count() >= 1,
+            "at least one path must refuse to commit when the enqueue fails"
+        );
+    }
+
+    /// Selection logs must claim enqueueing, not application.
+    ///
+    /// "selection cleared" reads as a completed state change. All the code knows
+    /// is that a command entered a queue, and a log that overstates what
+    /// happened is how a dropped command becomes an unexplainable UI bug later.
+    #[test]
+    fn selection_logs_do_not_claim_application() {
+        let source = include_str!("lib.rs");
+        // Assembled, not written literally: a source-scanning test that spells
+        // out its own needle finds itself and passes forever. Third time this
+        // trap has come up in this file, so it is worth naming every time.
+        let overclaim = format!("Bevy selection {} via", "cleared");
+        assert!(
+            !source.contains(&overclaim),
+            "a log message claims the selection was applied when the code only \
+             knows it was enqueued"
+        );
+        assert!(
+            source.contains("clear-selection enqueued via"),
+            "the corrected wording must be present, or this test passes against \
+             deleted logging rather than honest logging"
+        );
+    }
+
     /// A tier transition must not panic when the shadow-map resource is absent.
     ///
     /// This is the transition-FAILURE path. `DirectionalLightShadowMap` only
@@ -4663,7 +4719,7 @@ fn handle_selection_input(
             state: SelectionState::Selected,
         });
         if (submitter.submit)(command) {
-            info!("Bevy selection cleared via Escape");
+            info!("Bevy clear-selection enqueued via Escape");
             rig.follow_mode = FollowMode::Off;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
@@ -4772,7 +4828,7 @@ fn handle_selection_input(
             state: SelectionState::Selected,
         });
         if (submitter.submit)(command) {
-            info!("Bevy selection cleared via empty click");
+            info!("Bevy clear-selection enqueued via empty click");
             rig.follow_mode = FollowMode::Off;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
@@ -5004,8 +5060,22 @@ fn handle_clear_selection_button(
                 agent_ids: Vec::new(),
                 state: SelectionState::Selected,
             });
-            (submitter.submit)(command);
-            info!("Bevy clear selection button pressed");
+            // The return value is CHECKED here (bd-2z0.7.14). It used to be
+            // discarded, so a full command queue silently dropped the clear
+            // while the camera below still stopped following — the UI acting on
+            // a request the simulation never received. The other three
+            // selection paths already gated on it; this one did not, which made
+            // the failure mode inconsistent as well as invisible.
+            // `continue`, not `return`: the loop body is the unit of work. This
+            // bead is making interaction per-window, so more than one clear
+            // button will exist, and bailing out of the whole system would drop
+            // the other windows' presses on the floor — the same class of silent
+            // loss this fix exists to remove.
+            if !(submitter.submit)(command) {
+                warn!("clear-selection command could not be enqueued; leaving the camera as it is");
+                continue;
+            }
+            info!("Bevy clear selection enqueued");
             rig.follow_mode = FollowMode::Off;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
