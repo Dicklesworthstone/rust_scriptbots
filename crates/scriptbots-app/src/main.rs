@@ -374,7 +374,7 @@ fn main() -> Result<()> {
 
     // Apply OS-level priority niceness where supported.
     apply_process_niceness(cli.low_power)?;
-    let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
+    let (bootstrapped_world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
         config,
         BootstrapRequest {
             brain_preset: cli.brain,
@@ -386,6 +386,9 @@ fn main() -> Result<()> {
             config_overrides,
         },
     )?;
+    // The wrap happens HERE now, not inside bootstrap_world. This is the line
+    // bd-pcfj replaces with a move into the host thread.
+    let world: SharedWorld = Arc::new(Mutex::new(bootstrapped_world));
     let latest_summary = scriptbots_app::control::empty_latest_summary();
     let simulation_step = persistence_step_driver(&world, &persistence, &latest_summary);
 
@@ -1531,11 +1534,23 @@ struct BootstrapRequest {
     config_overrides: Vec<ConfigFieldOverride>,
 }
 
+/// Bootstrap the world and return it BY VALUE, unwrapped.
+///
+/// This used to hand back `Arc<Mutex<WorldState>>`, which meant the single point
+/// where sole ownership is given away sat inside this function rather than at
+/// the call site. bd-pcfj moves the world into a HostCore on a dedicated owner
+/// thread, and `HostCore` is `!Send` - its admission state is
+/// `Rc<RefCell<SharedHostState>>` - so the world has to be handed to that thread
+/// as a plain value and the host constructed there. Returning the value keeps
+/// that handover at one visible line instead of buried behind a wrap this
+/// function performed for the caller's convenience.
+///
+/// Callers still wrap it today. Nothing else changes yet.
 fn bootstrap_world(
     mut config: ScriptBotsConfig,
     request: BootstrapRequest,
 ) -> Result<(
-    SharedWorld,
+    WorldState,
     SharedPersistenceAdmission,
     SharedAnalytics,
     StoragePipeline,
@@ -1700,7 +1715,7 @@ fn bootstrap_world(
     }
 
     Ok((
-        Arc::new(Mutex::new(world)),
+        world,
         Arc::new(Mutex::new(persistence)),
         analytics,
         pipeline,
