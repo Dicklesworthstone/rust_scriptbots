@@ -61,6 +61,16 @@ pub struct Claim {
 pub enum NotebookRenderError {
     #[error("Missing mandatory section: {0}")]
     MissingSection(String),
+    #[error("Claim {index} has no statement text")]
+    MissingClaimText { index: usize },
+    #[error("Claim {index} has no falsification criteria")]
+    MissingFalsifier { index: usize },
+    #[error("Notebook text field {field} contains disallowed character U+{codepoint:04X}")]
+    UnsafeText { field: &'static str, codepoint: u32 },
+    #[error(
+        "Invalid session id: expected 1-128 ASCII letters, digits, periods, underscores, or hyphens"
+    )]
+    InvalidSessionId,
     #[error("Non-finite float value in output")]
     NonFiniteFloat,
     #[error("Missing run_id {0} in claim support")]
@@ -202,6 +212,98 @@ pub fn format_float_safe(val: f64) -> Result<String, NotebookRenderError> {
     Ok(format!("{val:.4}"))
 }
 
+fn is_spoofing_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{13455}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Render caller-controlled text as one literal Markdown paragraph fragment.
+///
+/// Newlines are shown as the two visible characters `\n`; every Markdown structural
+/// character is escaped, and HTML metacharacters become entities. This keeps model text and
+/// persisted identifiers visible without allowing them to create headings, links, raw HTML,
+/// code spans, lists, or tables in the trusted notebook structure.
+fn markdown_literal(field: &'static str, value: &str) -> Result<String, NotebookRenderError> {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            '\\' => escaped.push_str("\\\\"),
+            '`' => escaped.push_str("\\`"),
+            '*' => escaped.push_str("\\*"),
+            '_' => escaped.push_str("\\_"),
+            '{' => escaped.push_str("\\{"),
+            '}' => escaped.push_str("\\}"),
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
+            '(' => escaped.push_str("\\("),
+            ')' => escaped.push_str("\\)"),
+            '#' => escaped.push_str("\\#"),
+            '+' => escaped.push_str("\\+"),
+            '-' => escaped.push_str("\\-"),
+            '.' => escaped.push_str("\\."),
+            '!' => escaped.push_str("\\!"),
+            '|' => escaped.push_str("\\|"),
+            '~' => escaped.push_str("\\~"),
+            ':' => escaped.push_str("\\:"),
+            '@' => escaped.push_str("\\@"),
+            '$' => escaped.push_str("\\$"),
+            '=' => escaped.push_str("\\="),
+            character
+                if character.is_control()
+                    || (character.is_whitespace() && character != ' ')
+                    || is_spoofing_format_character(character) =>
+            {
+                return Err(NotebookRenderError::UnsafeText {
+                    field,
+                    codepoint: u32::from(character),
+                });
+            }
+            character => escaped.push(character),
+        }
+    }
+    Ok(escaped)
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), NotebookRenderError> {
+    let bytes = session_id.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 128
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+    {
+        return Err(NotebookRenderError::InvalidSessionId);
+    }
+    Ok(())
+}
+
 /// Notebook renderer enforcing claim provenance and emitting executable reproduce.sh.
 pub struct NotebookRenderer;
 
@@ -220,6 +322,17 @@ impl NotebookRenderer {
     ) -> Result<String, NotebookRenderError> {
         if goal.trim().is_empty() {
             return Err(NotebookRenderError::MissingSection("Goal".into()));
+        }
+        let rendered_goal = markdown_literal("goal", goal)?;
+        for (index, claim) in claims.iter().enumerate() {
+            if claim.text.trim().is_empty() {
+                return Err(NotebookRenderError::MissingClaimText { index: index + 1 });
+            }
+            if claim.falsifier.trim().is_empty() {
+                return Err(NotebookRenderError::MissingFalsifier { index: index + 1 });
+            }
+            markdown_literal("claim", &claim.text)?;
+            markdown_literal("falsifier", &claim.falsifier)?;
         }
 
         let mut known_run_map = BTreeMap::new();
@@ -279,7 +392,7 @@ impl NotebookRenderer {
         let mut markdown = String::new();
         markdown.push_str("# ScriptBots Autonomous Science Lab Notebook\n\n");
         markdown.push_str("## 1. Goal\n");
-        markdown.push_str(goal);
+        markdown.push_str(&rendered_goal);
         markdown.push_str("\n\n");
         markdown.push_str("## 2. Methods\n");
         markdown.push_str("- Runner: MatchedSeedExperimentRunner\n");
@@ -290,10 +403,13 @@ impl NotebookRenderer {
         markdown.push_str("## 3. Results & Claims\n");
         for (index, claim) in claims.iter().enumerate() {
             markdown.push_str(&format!("### Claim {}\n", index + 1));
-            markdown.push_str(&format!("**Statement**: {}\n\n", claim.text));
+            markdown.push_str(&format!(
+                "**Statement**: {}\n\n",
+                markdown_literal("claim", &claim.text)?
+            ));
             markdown.push_str(&format!(
                 "**Falsification Criteria**: {}\n\n",
-                claim.falsifier
+                markdown_literal("falsifier", &claim.falsifier)?
             ));
 
             match &claim.support {
@@ -303,7 +419,9 @@ impl NotebookRenderer {
                     for run in runs {
                         markdown.push_str(&format!(
                             "  - run_id: {}, arm: {}, seed: {}\n",
-                            run.run_id, run.arm_id, run.seed
+                            markdown_literal("run_id", &run.run_id)?,
+                            run.arm_id,
+                            run.seed
                         ));
                     }
                 }
@@ -328,6 +446,7 @@ impl NotebookRenderer {
         known_runs: &[RunRef],
         out_dir: &Path,
     ) -> Result<PathBuf, NotebookRenderError> {
+        validate_session_id(session_id)?;
         let markdown = Self::render_markdown(goal, claims, known_runs)?;
         let mut verified_paths = Vec::with_capacity(known_runs.len());
         for run in known_runs {
@@ -376,7 +495,7 @@ impl NotebookRenderer {
             script.push_str(&shell_single_quote(summary_path));
             script.push('\n');
             script.push_str(
-                "actual=\"$(b3sum \"$path\")\"\nactual=\"${actual%% *}\"\n\
+                "actual=\"$(b3sum -- \"$path\")\"\nactual=\"${actual%% *}\"\n\
                  test \"$actual\" = \"$expected\" || { \
                  echo \"digest mismatch: $path\" >&2; exit 1; }\n",
             );
@@ -509,7 +628,7 @@ fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), Not
          - **Alternative**: {}\n- **Family Alpha**: {}\n- **Recommended Pairs**: {}\n\
          - **Matched Pairs**: {}\n\
          - **Mean Difference (treatment - control)**: {}\n",
-        effect.metric,
+        markdown_literal("metric", &effect.metric)?,
         effect.control_arm,
         effect.treatment_arm,
         effect.estimator.as_str(),
@@ -585,13 +704,13 @@ fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), Not
         markdown.push_str(&format!(
             "  - run_id={}, arm={}, seed={}, config_digest={}, world_digest={}, \
              summary_digest={}, analysis_input_digest={}\n",
-            run.run_id,
+            markdown_literal("run_id", &run.run_id)?,
             run.arm_id,
             run.seed,
-            run.config_digest,
-            run.digest,
-            run.summary_artifact_digest,
-            run.analysis_input_digest,
+            markdown_literal("config_digest", &run.config_digest)?,
+            markdown_literal("world_digest", &run.digest)?,
+            markdown_literal("summary_artifact_digest", &run.summary_artifact_digest)?,
+            markdown_literal("analysis_input_digest", &run.analysis_input_digest)?,
         ));
     }
     Ok(())
@@ -826,6 +945,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path).unwrap(), first);
         let verifier = std::fs::read_to_string(notebook_dir.join("reproduce.sh")).unwrap();
         assert!(verifier.contains("b3sum is required"));
+        assert!(verifier.contains("b3sum -- \"$path\""));
         assert!(verifier.contains("This does not re-run the simulation"));
     }
 
@@ -886,5 +1006,152 @@ mod tests {
                 field: "multiple_comparison_evidence",
             })
         );
+    }
+
+    #[test]
+    fn hostile_notebook_text_is_literal_and_byte_stable() {
+        let mut control = run("control](https://run.example)", 0, 42);
+        control.config_digest = "<script>config()</script>".to_owned();
+        control.digest = "# forged-world-heading".to_owned();
+        let mut treatment = run("treatment", 1, 42);
+        treatment.summary_artifact_digest = "[summary](https://artifact.example)".to_owned();
+        treatment.analysis_input_digest = "<img src=x onerror=alert(1)>".to_owned();
+        let runs = vec![control, treatment];
+
+        let mut hostile_effect = effect();
+        hostile_effect.metric = "alive_agents <script>alert(1)</script>".to_owned();
+        let hostile_claim = Claim {
+            text: "## Forged result\n<script>alert(1)</script> [click](https://evil.example)"
+                .to_owned(),
+            support: Support::Effect(effect_ref(runs.clone(), hostile_effect)),
+            falsifier: "> trusted quote\n![pixel](https://evil.example/pixel)".to_owned(),
+        };
+        let goal = "# Forged goal\n<img src=x onerror=alert(1)>";
+
+        let first =
+            NotebookRenderer::render_markdown(goal, std::slice::from_ref(&hostile_claim), &runs)
+                .unwrap();
+        let second = NotebookRenderer::render_markdown(goal, &[hostile_claim], &runs).unwrap();
+        assert_eq!(first, second);
+
+        for forbidden in [
+            "<script>",
+            "<img",
+            "](https://",
+            "\n## Forged result",
+            "\n# Forged goal",
+        ] {
+            assert!(
+                !first.contains(forbidden),
+                "hostile structure `{forbidden}` reached trusted output:\n{first}"
+            );
+        }
+        for required in [
+            "\\# Forged goal\\n&lt;img",
+            "\\#\\# Forged result\\n&lt;script&gt;",
+            "\\[click\\]\\(https\\://evil\\.example\\)",
+            "alive\\_agents &lt;script&gt;",
+            "control\\]\\(https\\://run\\.example\\)",
+            "&lt;img src\\=x onerror\\=alert\\(1\\)&gt;",
+        ] {
+            assert!(
+                first.contains(required),
+                "escaped literal `{required}` missing from:\n{first}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_claim_text_and_falsifier_are_typed_errors() {
+        let runs = vec![run("control", 0, 42), run("treatment", 1, 42)];
+        let mut missing_text = claim(runs.clone());
+        missing_text.text = " \n ".to_owned();
+        assert_eq!(
+            NotebookRenderer::render_markdown("goal", &[missing_text], &runs),
+            Err(NotebookRenderError::MissingClaimText { index: 1 })
+        );
+
+        let mut missing_falsifier = claim(runs.clone());
+        missing_falsifier.falsifier.clear();
+        assert_eq!(
+            NotebookRenderer::render_markdown("goal", &[missing_falsifier], &runs),
+            Err(NotebookRenderError::MissingFalsifier { index: 1 })
+        );
+    }
+
+    #[test]
+    fn disallowed_control_characters_are_refused() {
+        let runs = vec![run("control", 0, 42), run("treatment", 1, 42)];
+        assert_eq!(markdown_literal("run_id", " run "), Ok(" run ".to_owned()));
+        assert_ne!(
+            markdown_literal("run_id", " run "),
+            markdown_literal("run_id", "run")
+        );
+        assert_eq!(
+            markdown_literal("run_id", "\nrun\n"),
+            Ok("\\nrun\\n".to_owned())
+        );
+        assert_eq!(
+            NotebookRenderer::render_markdown(
+                "population\u{0007}study",
+                &[claim(runs.clone())],
+                &runs
+            ),
+            Err(NotebookRenderError::UnsafeText {
+                field: "goal",
+                codepoint: 7,
+            })
+        );
+        assert_eq!(
+            NotebookRenderer::render_markdown("population study\t", &[claim(runs.clone())], &runs),
+            Err(NotebookRenderError::UnsafeText {
+                field: "goal",
+                codepoint: 9,
+            })
+        );
+        assert_eq!(
+            NotebookRenderer::render_markdown(
+                "population\u{202E}study",
+                &[claim(runs.clone())],
+                &runs
+            ),
+            Err(NotebookRenderError::UnsafeText {
+                field: "goal",
+                codepoint: 0x202e,
+            })
+        );
+
+        let mut unsafe_run = runs[0].clone();
+        unsafe_run.digest = "digest\u{2028}second-line".to_owned();
+        let support = vec![unsafe_run.clone(), runs[1].clone()];
+        assert_eq!(
+            NotebookRenderer::render_markdown(
+                "goal",
+                &[claim(support)],
+                &[unsafe_run, runs[1].clone()],
+            ),
+            Err(NotebookRenderError::UnsafeText {
+                field: "world_digest",
+                codepoint: 0x2028,
+            })
+        );
+    }
+
+    #[test]
+    fn session_id_cannot_inject_shell_lines() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        for unsafe_id in [
+            "",
+            "session\nprintf PWNED",
+            "session;printf-PWNED",
+            "session/path",
+        ] {
+            assert_eq!(
+                NotebookRenderer::render_notebook(unsafe_id, "goal", &[], &[], temp_dir.path(),),
+                Err(NotebookRenderError::InvalidSessionId)
+            );
+        }
+        assert!(!temp_dir.path().join("notebook.md").exists());
+        assert!(!temp_dir.path().join("reproduce.sh").exists());
     }
 }
