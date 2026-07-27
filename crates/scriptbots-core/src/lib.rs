@@ -5076,6 +5076,15 @@ pub enum InterventionError {
 /// from a host thread. An intervention applied immediately lands on whichever
 /// tick the world mutex happened to be free, which is nondeterminism walking in
 /// through the front door — and it would make a "replayable session" a lie.
+/// The diet an older journal's cohort injection implicitly used.
+///
+/// Exactly `AgentRuntime::default().herbivore_tendency`, so replaying a session
+/// recorded before bd-7akp reproduces it precisely rather than retroactively
+/// turning its cohorts into predators.
+const fn neutral_cohort_diet() -> f32 {
+    0.5
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Intervention {
@@ -5132,6 +5141,22 @@ pub enum Intervention {
         genome: CohortSource,
         /// How their positions are sampled.
         placement: Placement,
+        /// Diet the cohort is spawned with, in `[0, 1]`: 0 is a pure carnivore,
+        /// 1 a pure herbivore.
+        ///
+        /// Explicit because it was previously absent, and the absence was silent
+        /// (bd-7akp). Every member used to land on `AgentRuntime`'s default of
+        /// exactly 0.5, and the carnivore test is `tendency < carnivore_threshold`
+        /// with that threshold also defaulting to 0.5 — so `0.5 < 0.5` is false
+        /// and a "predator injection" produced a cohort that was not carnivorous.
+        /// The experiment reported one thing and the world did another.
+        ///
+        /// Defaulted on deserialize to that same 0.5 SPECIFICALLY so already
+        /// recorded journals replay bit-identically. Replay must reproduce what
+        /// actually happened, including when what happened was this bug; only new
+        /// commands get to choose.
+        #[serde(default = "neutral_cohort_diet")]
+        herbivore_tendency: f32,
     },
     /// Open or close the world to scheduled spawn arrivals from this boundary onward.
     SetClosedWorld {
@@ -5234,9 +5259,20 @@ impl Intervention {
                 Ok(())
             }
             Self::InjectCohort {
-                count, placement, ..
+                count,
+                placement,
+                herbivore_tendency,
+                ..
             } => {
                 placement.region().validate_basic()?;
+                if !herbivore_tendency.is_finite() || !(0.0..=1.0).contains(&herbivore_tendency) {
+                    // Rejected rather than clamped: a clamp would run a different
+                    // experiment than the one asked for and say nothing about it,
+                    // which this bead family explicitly forbids.
+                    return Err(WorldStateError::InvalidConfig(
+                        "cohort injection herbivore_tendency must be finite and lie in [0, 1]",
+                    ));
+                }
                 if count == 0 {
                     return Err(WorldStateError::InvalidConfig(
                         "cohort injection count must be at least 1",
@@ -21450,6 +21486,7 @@ impl WorldState {
                     count,
                     genome,
                     placement,
+                    herbivore_tendency,
                 } => {
                     let CohortSource::RegisteredBrain { key } = genome;
                     let Placement::Seeded { region, seed } = placement;
@@ -21468,10 +21505,20 @@ impl WorldState {
                         // reason; an internal invariant breach is counted, never panicked
                         // over, and leaves the already-spawned members intact rather than
                         // fabricating a rollback through a test-only removal path.
-                        match self.try_spawn_agent(AgentData {
-                            position,
-                            ..AgentData::default()
-                        }) {
+                        // `_with`, not the bare spawn: the bare form passes an
+                        // empty runtime closure, which is exactly how every
+                        // injected cohort silently kept the neutral 0.5 default
+                        // and failed to be the predators it was asked for
+                        // (bd-7akp).
+                        match self.try_spawn_agent_with(
+                            AgentData {
+                                position,
+                                ..AgentData::default()
+                            },
+                            |runtime| {
+                                runtime.herbivore_tendency = herbivore_tendency;
+                            },
+                        ) {
                             Ok(id) => spawned.push(id),
                             Err(_) => {
                                 breach_count += 1;
@@ -32293,6 +32340,119 @@ mod tests {
         assert!(!world.config().closed, "reopened after the next boundary");
     }
 
+    /// A predator injection must actually produce predators.
+    ///
+    /// The regression this bead exists for (bd-7akp): every cohort member used to
+    /// land on `AgentRuntime`'s default `herbivore_tendency` of exactly 0.5,
+    /// because the spawn passed an empty runtime closure and `bind_agent_brain`
+    /// only ever binds a brain. The carnivore test is
+    /// `tendency < carnivore_threshold` with that threshold also 0.5, and
+    /// `0.5 < 0.5` is FALSE — so "predator injection" produced a cohort that was
+    /// not carnivorous, while the log, the population count and the audit ring all
+    /// reported success. An experimenter would have concluded that introducing
+    /// predators changed nothing.
+    ///
+    /// Asserting against the world's own `carnivore_threshold` rather than a
+    /// hardcoded number, so the test still means "these are predators" if the
+    /// threshold is ever retuned.
+    #[test]
+    fn an_injected_predator_cohort_is_actually_carnivorous() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(23),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let key = world
+            .register_brain_family(
+                "predator-fixture".to_owned(),
+                Box::new(FixtureBrainFamily::new("predator-fixture")),
+            )
+            .expect("register predator fixture family");
+
+        let before: Vec<AgentId> = world.agents().iter_handles().collect();
+        let threshold = world.config().carnivore_threshold;
+
+        world
+            .enqueue_intervention(Intervention::InjectCohort {
+                count: 4,
+                genome: CohortSource::RegisteredBrain { key },
+                placement: Placement::Seeded {
+                    region: Region::All,
+                    seed: 0xF00D,
+                },
+                herbivore_tendency: 0.05,
+            })
+            .expect("valid predator injection");
+        world.step().expect("step");
+
+        let injected: Vec<AgentId> = world
+            .agents()
+            .iter_handles()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(injected.len(), 4, "the cohort must actually be spawned");
+
+        for id in injected {
+            let runtime = world
+                .runtime()
+                .get(id)
+                .expect("an injected agent must carry runtime state");
+            assert!(
+                runtime.herbivore_tendency < threshold,
+                "an injected predator must be carnivorous: tendency {} is not below \
+                 the carnivore threshold {threshold}. Before bd-7akp every member \
+                 landed on 0.5, which is exactly the threshold and therefore NOT \
+                 carnivorous",
+                runtime.herbivore_tendency
+            );
+        }
+    }
+
+    /// An out-of-range diet must be REJECTED, never clamped.
+    ///
+    /// Clamping would silently run a different experiment than the one requested,
+    /// which acceptance criterion 3 of the parent forbids in as many words.
+    #[test]
+    fn an_out_of_range_cohort_diet_is_rejected_rather_than_clamped() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(23),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let key = world
+            .register_brain_family(
+                "range-fixture".to_owned(),
+                Box::new(FixtureBrainFamily::new("range-fixture")),
+            )
+            .expect("register range fixture family");
+
+        for bad in [-0.1_f32, 1.1, f32::NAN] {
+            let error = world
+                .enqueue_intervention(Intervention::InjectCohort {
+                    count: 2,
+                    genome: CohortSource::RegisteredBrain { key },
+                    placement: Placement::Seeded {
+                        region: Region::All,
+                        seed: 7,
+                    },
+                    herbivore_tendency: bad,
+                })
+                .expect_err("an out-of-range cohort diet must be rejected");
+            let text = format!("{error}");
+            assert!(
+                text.contains("herbivore_tendency"),
+                "the rejection must name the offending field so the caller can fix \
+                 it; got {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_injected_cohort_lands_seeded_positions_with_the_bound_brain() {
         let mut world = WorldState::new(ScriptBotsConfig {
@@ -32323,6 +32483,9 @@ mod tests {
                     region,
                     seed: 0xC0_FFEE,
                 },
+                // The pre-bd-7akp default, so this test keeps asserting exactly
+                // what it asserted before the field existed.
+                herbivore_tendency: 0.5,
             })
             .expect("valid cohort injection");
         let before = world.agent_count();
@@ -32414,6 +32577,7 @@ mod tests {
                         },
                         seed: 0xBEEF,
                     },
+                    herbivore_tendency: 0.5,
                 })
                 .expect("valid cohort injection");
             world.step().expect("step");
@@ -32453,6 +32617,7 @@ mod tests {
                     region: Region::All,
                     seed: 1,
                 },
+                herbivore_tendency: 0.5,
             })
             .expect_err("a zero cohort must be rejected");
         assert!(
@@ -32468,6 +32633,7 @@ mod tests {
                     region: Region::All,
                     seed: 1,
                 },
+                herbivore_tendency: 0.5,
             })
             .expect_err("an over-headroom cohort must be rejected");
         assert!(
@@ -32489,6 +32655,7 @@ mod tests {
                     region: Region::All,
                     seed: 1,
                 },
+                herbivore_tendency: 0.5,
             })
             .expect_err("an unregistered brain key must be rejected");
         assert!(
