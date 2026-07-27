@@ -429,13 +429,109 @@ impl NotebookRenderer {
             markdown.push('\n');
         }
 
-        markdown.push_str("## 4. Reproducibility\n");
+        // THE HONESTY GATE (bd-16g.1.7). The parent bead's design requires the template to
+        // force an explicit "what would falsify this" and "what I did not test" section.
+        //
+        // Both are DERIVED from data already validated above rather than accepted as prose
+        // from a caller. That is deliberate on two counts: a derived section cannot be
+        // omitted (there is no argument a caller can forget to pass), and it cannot be
+        // fabricated -- every sentence below restates a fact this function has already
+        // checked against `known_runs`. A notebook whose limitations section is optional
+        // free text is a notebook whose limitations section is empty.
+        markdown.push_str("## 4. What Would Falsify This\n");
+        if claims.is_empty() {
+            markdown.push_str(
+                "No claims were made, so there is nothing to falsify. A session that \
+                 completed no claims establishes nothing.\n\n",
+            );
+        } else {
+            for (index, claim) in claims.iter().enumerate() {
+                markdown.push_str(&format!(
+                    "- **Claim {}**: {}\n",
+                    index + 1,
+                    markdown_literal("falsifier", &claim.falsifier)?
+                ));
+            }
+            markdown.push('\n');
+        }
+
+        markdown.push_str("## 5. What I Did Not Test\n");
+        Self::render_scope_limits(&mut markdown, known_runs);
+
+        markdown.push_str("## 6. Reproducibility\n");
         markdown.push_str(
             "`./reproduce.sh` verifies the retained summary artifacts used by this report. \
-             It does not claim to re-execute the simulation; independent same-seed execution \
-             is a separate test gate.\n",
+             It does NOT re-execute the simulation, so it proves the analysis inputs are \
+             unmodified -- not that the runs reproduce. Actual arm-by-seed re-execution is \
+             tracked as bd-16g.1.7 acceptance item 3 and is not yet implemented; treat a \
+             passing reproduce.sh as an integrity check, not a reproduction.\n",
         );
         Ok(markdown)
+    }
+
+    /// Restate the experiment's boundaries as explicit non-claims.
+    ///
+    /// Everything here is read off the executed run set. It deliberately reports what the
+    /// session DID cover and then names the boundary, rather than asserting "no other knob
+    /// was tested" -- that stronger claim needs the full knob space, which this layer does
+    /// not have. Overstating the limitations section would be its own dishonesty.
+    fn render_scope_limits(markdown: &mut String, known_runs: &[RunRef]) {
+        if known_runs.is_empty() {
+            markdown.push_str(
+                "- No runs completed, so NOTHING in this notebook is empirically \
+                 supported.\n\n",
+            );
+            return;
+        }
+
+        let mut arms: Vec<u16> = known_runs.iter().map(|run| run.arm_id).collect();
+        arms.sort_unstable();
+        arms.dedup();
+        let mut seeds: Vec<u64> = known_runs.iter().map(|run| run.seed).collect();
+        seeds.sort_unstable();
+        seeds.dedup();
+        let min_ticks = known_runs
+            .iter()
+            .map(|run| run.total_ticks)
+            .min()
+            .unwrap_or(0);
+        let max_ticks = known_runs
+            .iter()
+            .map(|run| run.total_ticks)
+            .max()
+            .unwrap_or(0);
+
+        markdown.push_str(&format!(
+            "- Only {} arm(s) were executed. Any configuration outside these arms is \
+             untested by this session.\n",
+            arms.len()
+        ));
+        markdown.push_str(&format!(
+            "- Only {} distinct seed(s) were executed. Behaviour under other seeds is \
+             untested; matched-seed pairing controls for seed variance WITHIN this \
+             cohort, it does not generalize beyond it.\n",
+            seeds.len()
+        ));
+        if min_ticks == max_ticks {
+            markdown.push_str(&format!(
+                "- Every run stopped at {min_ticks} ticks. Nothing is established about \
+                 behaviour after that horizon.\n"
+            ));
+        } else {
+            markdown.push_str(&format!(
+                "- Runs stopped between {min_ticks} and {max_ticks} ticks. Nothing is \
+                 established about behaviour after that horizon, and the UNEQUAL horizons \
+                 are themselves a confound: arms observed for different durations are not \
+                 directly comparable.\n"
+            ));
+        }
+        if seeds.len() < 3 {
+            markdown.push_str(
+                "- **Underpowered**: fewer than three distinct seeds. Any effect reported \
+                 here should be treated as a pilot observation, not a result.\n",
+            );
+        }
+        markdown.push('\n');
     }
 
     /// Renders the complete notebook artifact directory and reproduce.sh script.
@@ -1153,5 +1249,92 @@ mod tests {
         }
         assert!(!temp_dir.path().join("notebook.md").exists());
         assert!(!temp_dir.path().join("reproduce.sh").exists());
+    }
+
+    /// The honesty gate must be present and must be derived, not decorative.
+    #[test]
+    fn bd_16g_1_7_notebook_renders_both_honesty_sections() {
+        let runs = vec![run("r1", 0, 7), run("r2", 1, 7)];
+        let claims = vec![Claim {
+            text: "Higher food regrowth raises equilibrium population.".to_owned(),
+            support: Support::Descriptive(runs.clone()),
+            falsifier: "Equilibrium population does not rise when regrowth is raised.".to_owned(),
+        }];
+        let md = NotebookRenderer::render_markdown("goal", &claims, &runs).expect("renders");
+
+        assert!(md.contains("## 4. What Would Falsify This"), "{md}");
+        assert!(md.contains("## 5. What I Did Not Test"), "{md}");
+        assert!(
+            md.contains("Equilibrium population does not rise"),
+            "the falsifier must be surfaced in its own section, not only inline: {md}"
+        );
+
+        // Derived from the run set, so it cannot be a blank heading.
+        assert!(md.contains("Only 2 arm(s)"), "{md}");
+        assert!(md.contains("Only 1 distinct seed(s)"), "{md}");
+        assert!(md.contains("Every run stopped at 100 ticks"), "{md}");
+    }
+
+    /// A one-seed cohort must be labelled underpowered, not presented as a result.
+    #[test]
+    fn bd_16g_1_7_thin_seed_cohorts_are_flagged_underpowered() {
+        let thin = vec![run("r1", 0, 7), run("r2", 1, 7)];
+        let md = NotebookRenderer::render_markdown("goal", &[], &thin).expect("renders");
+        assert!(
+            md.contains("Underpowered"),
+            "two runs sharing one seed is a pilot, not a result: {md}"
+        );
+
+        let wide = vec![
+            run("r1", 0, 1),
+            run("r2", 0, 2),
+            run("r3", 0, 3),
+            run("r4", 1, 1),
+        ];
+        let md = NotebookRenderer::render_markdown("goal", &[], &wide).expect("renders");
+        assert!(
+            !md.contains("Underpowered"),
+            "three distinct seeds clears the pilot floor: {md}"
+        );
+    }
+
+    /// Unequal horizons are a confound and must be named as one.
+    #[test]
+    fn bd_16g_1_7_unequal_tick_horizons_are_reported_as_a_confound() {
+        let mut runs = vec![run("r1", 0, 1), run("r2", 1, 2)];
+        runs[1].total_ticks = 5_000;
+        let md = NotebookRenderer::render_markdown("goal", &[], &runs).expect("renders");
+        assert!(md.contains("between 100 and 5000 ticks"), "{md}");
+        assert!(
+            md.contains("confound"),
+            "arms observed for different durations are not comparable, and the notebook \
+             must say so rather than printing two numbers: {md}"
+        );
+    }
+
+    /// A session that completed nothing must say so, not render an empty gap.
+    #[test]
+    fn bd_16g_1_7_a_zero_run_session_states_that_nothing_is_supported() {
+        let md = NotebookRenderer::render_markdown("goal", &[], &[]).expect("renders");
+        assert!(
+            md.contains("NOTHING in this notebook is empirically supported"),
+            "{md}"
+        );
+        assert!(
+            md.contains("No claims were made, so there is nothing to falsify"),
+            "{md}"
+        );
+    }
+
+    /// The reproducibility blurb must not imply re-execution it does not perform.
+    #[test]
+    fn bd_16g_1_7_reproduce_blurb_does_not_overclaim_reproduction() {
+        let runs = vec![run("r1", 0, 1)];
+        let md = NotebookRenderer::render_markdown("goal", &[], &runs).expect("renders");
+        assert!(
+            md.contains("does NOT re-execute"),
+            "an integrity check must not be sold as a reproduction: {md}"
+        );
+        assert!(md.contains("integrity check, not a reproduction"), "{md}");
     }
 }
