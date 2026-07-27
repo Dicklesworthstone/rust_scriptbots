@@ -764,9 +764,26 @@ impl ControlHandle {
             ));
         }
 
-        let world = self.lock_world()?;
-        let mut config_value =
-            serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
+        // Every world read this function needs, captured ATOMICALLY in one
+        // borrow. The original held the lock from here through validation,
+        // merge and deserialization, reading config again near the end; holding
+        // one guard is what made those two reads consistent. Capturing both up
+        // front preserves that consistency exactly while moving the expensive
+        // work - a JSON merge and a full config deserialization - off the lock
+        // instead of running it under one (bd-88yj).
+        let (config_value, current_dims, current_bounds) = self.with_world(|world| {
+            let config = world.config();
+            (
+                serde_json::to_value(config),
+                (world.food().width(), world.food().height()),
+                (
+                    config.world_width,
+                    config.world_height,
+                    config.food_cell_size,
+                ),
+            )
+        })?;
+        let mut config_value = config_value.map_err(ControlError::serialization)?;
         // Range-check the REQUESTED knobs before merging them. `validate()`
         // proves admissibility (finite, non-negative) but declares no upper
         // bounds, so `food_regrowth_rate = 1e9` used to sail through from REST,
@@ -797,22 +814,21 @@ impl ControlHandle {
         let (food_w, food_h) = new_config
             .food_dimensions()
             .map_err(|err| ControlError::InvalidPatch(err.to_string()))?;
-        let current_dims = (world.food().width(), world.food().height());
-        let current = world.config();
+        let (current_width, current_height, current_cell_size) = current_bounds;
         if current_dims != (food_w, food_h)
-            || new_config.world_width != current.world_width
-            || new_config.world_height != current.world_height
-            || new_config.food_cell_size != current.food_cell_size
+            || new_config.world_width != current_width
+            || new_config.world_height != current_height
+            || new_config.food_cell_size != current_cell_size
         {
             return Err(ControlError::InvalidPatch(
                 "changing world dimensions at runtime is not supported; restart the simulation with the new configuration"
                     .into(),
             ));
         }
-        // The world lock is released BEFORE submitting, because
-        // `submit_control_command` reads tick and revision under the same
-        // non-reentrant mutex.
-        drop(world);
+        // No explicit drop is needed any more: the borrow ended at the seam
+        // above, so the submit below - which reads tick and revision under the
+        // same non-reentrant mutex - cannot deadlock against a guard this
+        // function is still holding.
         // Return the receipt, not a projection. This used to build a
         // ConfigSnapshot from the REQUESTED config and hand it back as though
         // it were current, so a client was told the new configuration was in
