@@ -17821,8 +17821,7 @@ mod command_characterization_tests {
 
     fn simulation_view(
         world: Arc<Mutex<WorldState>>,
-        command_drain: GuiCommandDrain,
-        command_reporter: GuiCommandReporter,
+        command_drain: TestCommandDrain,
     ) -> SimulationView {
         let simulation_driver = gui_simulation_driver(&world, command_drain);
         simulation_view_with_driver(simulation_driver)
@@ -17830,11 +17829,28 @@ mod command_characterization_tests {
 
     fn gui_simulation_driver(
         world: &Arc<Mutex<WorldState>>,
-        command_drain: GuiCommandDrain,
-        command_reporter: GuiCommandReporter,
+        command_drain: TestCommandDrain,
     ) -> Arc<Mutex<GuiSimulationDriver>> {
         let simulation_step = disabled_persistence_step_driver(world);
         gui_simulation_driver_with_step(world, simulation_step, command_drain)
+    }
+
+    /// The pre-identity drain shape, kept for tests.
+    ///
+    /// Production drains carry a command id (bd-tgfz). These tests assert on
+    /// world state rather than on reporting, so they keep feeding bare commands
+    /// and `identified` attaches synthetic ids at the boundary - one adapter
+    /// instead of an id threaded through every fixture.
+    type TestCommandDrain = Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync>;
+
+    fn identified(drain: TestCommandDrain) -> GuiCommandDrain {
+        Arc::new(move || {
+            (drain)()
+                .into_iter()
+                .enumerate()
+                .map(|(index, command)| (format!("test-{index}"), command))
+                .collect()
+        })
     }
 
     /// bd-jw6f: the speed control must change the OBSERVED TICK RATE, not merely assign
@@ -18053,17 +18069,19 @@ mod command_characterization_tests {
     fn gui_simulation_driver_with_step(
         world: &Arc<Mutex<WorldState>>,
         simulation_step: WorldStepDriver,
-        command_drain: GuiCommandDrain,
-        command_reporter: GuiCommandReporter,
+        command_drain: TestCommandDrain,
     ) -> Arc<Mutex<GuiSimulationDriver>> {
+        // Tests assert on world state, not on reporting, so the reporter is an
+        // explicit sink here rather than a parameter every helper must thread.
         Arc::new(Mutex::new(GuiSimulationDriver::new(
             Arc::clone(world),
             simulation_step,
-            command_drain,
+            identified(command_drain),
+            Arc::new(|_, _| {}),
         )))
     }
 
-    fn one_shot_command_drain(commands: Vec<ControlCommand>) -> GuiCommandDrain {
+    fn one_shot_command_drain(commands: Vec<ControlCommand>) -> TestCommandDrain {
         let commands = Mutex::new(Some(commands));
         Arc::new(move || {
             commands
@@ -18187,7 +18205,7 @@ mod command_characterization_tests {
             )
         };
 
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let drain: TestCommandDrain = Arc::new(Vec::new);
         let mut view = simulation_view(Arc::clone(&world), drain);
         let snapshot = view.snapshot();
         let snapshot_sequence: Vec<(u64, NarrativeEventKind)> = snapshot
@@ -18250,7 +18268,7 @@ mod command_characterization_tests {
     #[test]
     fn minimal_canvas_is_a_presentation_only_projection() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let drain: TestCommandDrain = Arc::new(Vec::new);
         let driver = gui_simulation_driver(&world, drain);
         let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
         canvas.set_minimal_canvas_mode();
@@ -18348,7 +18366,7 @@ mod command_characterization_tests {
             .expect("pre-GPUI-inspection world lock")
             .world_digest_v1()
             .expect("pre-GPUI-inspection digest");
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let drain: TestCommandDrain = Arc::new(Vec::new);
         let mut hud = simulation_view(Arc::clone(&world), Arc::clone(&drain));
         hud.inspector
             .lock()
@@ -18414,7 +18432,7 @@ mod command_characterization_tests {
     #[test]
     fn two_gpui_views_share_one_simulation_clock() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let drain: TestCommandDrain = Arc::new(Vec::new);
         let driver = gui_simulation_driver(&world, drain);
         let mut hud = simulation_view_with_driver(Arc::clone(&driver));
         let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
@@ -18627,7 +18645,8 @@ mod command_characterization_tests {
                 Arc::clone(&world),
                 simulation_step,
                 AnalyticsSnapshotProvider::empty(),
-                command_drain,
+                identified(command_drain),
+                Arc::new(|_, _| {}) as GuiCommandReporter,
                 command_submit,
             ));
             let mut app = gpui::TestApp::new();
@@ -19397,7 +19416,8 @@ mod command_characterization_tests {
             Arc::clone(&world),
             simulation_step,
             AnalyticsSnapshotProvider::empty(),
-            command_drain,
+            identified(command_drain),
+            Arc::new(|_, _| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -19516,7 +19536,8 @@ mod command_characterization_tests {
             Arc::clone(&world),
             disabled_persistence_step_driver(&world),
             AnalyticsSnapshotProvider::empty(),
-            command_drain,
+            identified(command_drain),
+            Arc::new(|_, _| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -19600,7 +19621,8 @@ mod command_characterization_tests {
             Arc::clone(&world),
             disabled_persistence_step_driver(&world),
             AnalyticsSnapshotProvider::empty(),
-            command_drain,
+            identified(command_drain),
+            Arc::new(|_, _| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -20055,7 +20077,8 @@ mod command_characterization_tests {
             Arc::clone(&world),
             simulation_step,
             AnalyticsSnapshotProvider::empty(),
-            command_drain,
+            identified(command_drain),
+            Arc::new(|_, _| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -20574,7 +20597,7 @@ mod command_characterization_tests {
     #[test]
     fn simulation_fault_survives_storage_health_refresh() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let drain: TestCommandDrain = Arc::new(Vec::new);
         let driver = gui_simulation_driver(&world, drain);
         let mut view = simulation_view_with_driver(Arc::clone(&driver));
         driver
@@ -20597,7 +20620,7 @@ mod command_characterization_tests {
     #[test]
     fn single_lock_toggle_closed_environment_updates_world_state() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let drain: TestCommandDrain = Arc::new(Vec::new);
         let view = simulation_view(Arc::clone(&world), drain);
 
         assert!(!world.lock().expect("world lock").is_closed());
