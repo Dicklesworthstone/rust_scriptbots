@@ -893,6 +893,36 @@ impl Archipelago {
             .map_err(|source| ArchipelagoError::Digest { island, source })
     }
 
+    /// Read one island's world at the current barrier boundary.
+    ///
+    /// THE SCIENCE READOUT THIS TYPE WAS MISSING. Before this, an archipelago could prove
+    /// its islands were deterministic ([`Self::island_digest`]) but not observe what
+    /// evolved on any of them -- and both halves of bd-16g.5's science acceptance
+    /// (allopatric divergence, cross-island gene flow) are statements about biology, not
+    /// about digests.
+    ///
+    /// Takes `&self`, so it cannot be called while [`Self::step_to_barrier`] holds
+    /// `&mut self`. The partially-stepped world stays unobservable by construction, which
+    /// is the invariant this module's header commits to.
+    ///
+    /// Errors identically to [`Self::island_digest`] on a latched archipelago or an
+    /// unknown island: a caller must not be able to read science out of a failed run.
+    pub fn with_island_world<R>(
+        &self,
+        island: IslandId,
+        read: impl FnOnce(&WorldState) -> R,
+    ) -> Result<R, ArchipelagoError> {
+        if let Some(detail) = &self.latched {
+            return Err(ArchipelagoError::Latched {
+                detail: detail.clone(),
+            });
+        }
+        let index = self
+            .island_index(island)
+            .ok_or(ArchipelagoError::UnknownIsland { island })?;
+        Ok(self.islands[index].core.with_world(read))
+    }
+
     /// Advance every island to the next common barrier tick.
     ///
     /// Islands step in ascending island-id order ([`StepTopology`] records the
@@ -1246,6 +1276,7 @@ mod tests {
         ShutdownCommitRequirement,
     };
     use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
+    use std::collections::BTreeSet;
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     const TEST_BRAIN_KIND: &str = "archi-test-brain";
@@ -2145,5 +2176,103 @@ mod tests {
             "island {subject:?} produced different science purely because it was declared \
              last instead of first"
         );
+    }
+
+    /// Agent identity in an archipelago is `(IslandId, AgentUid)`, and BARE UIDS COLLIDE.
+    ///
+    /// Each island allocates `AgentUid` from its own private counter, so island 0 and
+    /// island 1 both hold an `AgentUid(1)` that are DIFFERENT ORGANISMS. This module's
+    /// header states that contract; this test pins it, because the failure it prevents is
+    /// silent and lands squarely on bd-16g.5's science acceptance.
+    ///
+    /// THE HAZARD, stated concretely because I walked into it writing this test: every
+    /// lineage and species structure in `scriptbots-core` (bd-16g.3's ancestry DAG,
+    /// `SpeciesTable::members`, the phylogeny event timeline) is keyed on a BARE
+    /// `AgentUid`. Feed two islands' agents into one of those and distinct organisms merge
+    /// into one node -- no panic, no error, just a phylogeny that quietly claims island 0's
+    /// agent 1 and island 1's agent 1 are the same individual. Allopatric-speciation
+    /// evidence built that way would be plausible, publishable and wrong.
+    ///
+    /// Also exercises `with_island_world`, the readout that makes per-island science
+    /// possible at all: `island_digest` can prove two islands are identical but can never
+    /// say what evolved on either.
+    #[test]
+    fn agent_identity_is_island_scoped_and_bare_uids_collide() {
+        let specs: Vec<IslandSpec> = (0..3).map(|id| spec(id, populated_config(None))).collect();
+        let mut archipelago =
+            populated_archipelago(archipelago_config(specs, 40)).expect("valid archipelago");
+        archipelago.step_to_barrier().expect("first barrier");
+        archipelago.step_to_barrier().expect("second barrier");
+
+        let mut per_island = Vec::new();
+        for id in [IslandId(0), IslandId(1), IslandId(2)] {
+            let uids = archipelago
+                .with_island_world(id, |world| {
+                    world
+                        .ordered_agent_rng_counters_v1()
+                        .map(|states| {
+                            states
+                                .iter()
+                                .map(|state| state.agent_uid())
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .expect("island world readable");
+            // Guard against a vacuous pass: empty sets would satisfy anything below.
+            assert!(
+                !uids.is_empty(),
+                "island {id:?} has no living agents, so nothing here would prove anything"
+            );
+            per_island.push((id, uids));
+        }
+
+        // Bare UIDs OVERLAP. That is the documented design, not a bug.
+        let (_, first) = &per_island[0];
+        let (_, second) = &per_island[1];
+        assert!(
+            first.intersection(second).next().is_some(),
+            "islands allocate UIDs from private counters, so bare UIDs are expected to \
+             collide; if this ever stops being true the identity contract changed"
+        );
+
+        // The COMPOUND key is what is actually unique, and every agent has exactly one.
+        let mut compound = BTreeSet::new();
+        let mut total = 0usize;
+        for (id, uids) in &per_island {
+            for uid in uids {
+                total += 1;
+                assert!(
+                    compound.insert((*id, *uid)),
+                    "(IslandId, AgentUid) must be unique across the whole archipelago"
+                );
+            }
+        }
+        assert_eq!(compound.len(), total);
+
+        // And the merge hazard is real: keying on the bare UID loses organisms.
+        let bare: BTreeSet<_> = per_island
+            .iter()
+            .flat_map(|(_, uids)| uids.iter().copied())
+            .collect();
+        assert!(
+            bare.len() < total,
+            "if bare UIDs did not collapse organisms this hazard would not need a test; \
+             {} bare uids for {total} agents",
+            bare.len()
+        );
+    }
+
+    /// The science readout must refuse an unknown island rather than panic.
+    #[test]
+    fn with_island_world_rejects_an_unknown_island() {
+        let archipelago = Archipelago::new(archipelago_config(vec![spec(0, test_config(None))], 1))
+            .expect("single-island archipelago");
+        assert!(matches!(
+            archipelago.with_island_world(IslandId(7), |_| ()),
+            Err(ArchipelagoError::UnknownIsland {
+                island: IslandId(7)
+            })
+        ));
     }
 }

@@ -2210,6 +2210,20 @@ impl HostCore {
         self.world.world_digest_v1()
     }
 
+    /// Read the owned world through a closure, without handing out a borrow.
+    ///
+    /// `&self` is the whole safety argument: every mutating entry point on this type
+    /// takes `&mut self`, so the borrow checker already forbids observing a
+    /// partially-stepped world. Returning `&WorldState` directly would let a caller hold
+    /// that borrow across a barrier in a future refactor; a closure cannot escape.
+    ///
+    /// Exists because science readouts (per-island species, lineage, gene flow) need the
+    /// biology, and `scientific_digest_v1` only proves two worlds are identical -- it
+    /// cannot say what evolved in either one.
+    pub fn with_world<R>(&self, read: impl FnOnce(&WorldState) -> R) -> R {
+        read(&self.world)
+    }
+
     /// Nominal automatic cadence configured for this host.
     #[must_use]
     pub const fn tick_period_nanos(&self) -> u64 {
