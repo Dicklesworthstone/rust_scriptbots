@@ -3839,6 +3839,129 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    /// A tier transition must not panic when the shadow-map resource is absent.
+    ///
+    /// This is the transition-FAILURE path. `DirectionalLightShadowMap` only
+    /// exists where `PbrPlugin` is added, so a headless or partially-built app
+    /// can reach `apply_tier_to_sun_light` without it. A plain `ResMut` would
+    /// panic the whole schedule for a resource the renderer does not strictly
+    /// need — turning a missing optional into a crash — so the system takes
+    /// `Option<ResMut<..>>` and this pins that the rest of the transition still
+    /// happens: the light is still reconfigured.
+    #[test]
+    fn a_tier_transition_survives_a_missing_shadow_map_resource() {
+        let effective = EffectiveRenderSettings {
+            tier: RenderQuality::Ultra,
+            features: tier_features(RenderQuality::Ultra),
+            gpu: None,
+            requested: RenderQuality::Ultra,
+        };
+        let mut app = App::new();
+        app.insert_resource(effective)
+            .add_systems(Update, apply_tier_to_sun_light);
+        // Deliberately NO DirectionalLightShadowMap inserted.
+        let light = app
+            .world_mut()
+            .spawn((
+                DirectionalLight {
+                    shadows_enabled: false,
+                    ..default()
+                },
+                TierDrivenSunLight,
+            ))
+            .id();
+
+        app.update();
+
+        let shadows_enabled = app
+            .world()
+            .get::<DirectionalLight>(light)
+            .expect("the light must survive the transition")
+            .shadows_enabled;
+        assert!(
+            shadows_enabled,
+            "the Ultra tier must still switch shadows on even though the shadow-map \
+             resource was absent; a missing optional must degrade, not abort"
+        );
+    }
+
+    /// Resolution is restart-stable: the same inputs resolve identically.
+    ///
+    /// A "restart" for this renderer is a fresh resolve of the same settings
+    /// against the same adapter. If that were not stable, a tier could differ
+    /// between two launches of an unchanged configuration, and every golden and
+    /// every performance comparison across runs would be silently untrustworthy.
+    #[test]
+    fn resolution_is_stable_across_restarts() {
+        for (requested, class) in [
+            (RenderQuality::Auto, GpuClass::Discrete),
+            (RenderQuality::Ultra, GpuClass::Discrete),
+            (RenderQuality::Auto, GpuClass::Integrated),
+            (RenderQuality::Ultra, GpuClass::Software),
+            (RenderQuality::Auto, GpuClass::Software),
+        ] {
+            let settings = RenderSettings {
+                quality: Some(requested),
+                ..RenderSettings::default()
+            };
+            let first = resolve_effective_render_settings_for_gpu(
+                &settings,
+                Some(gpu_info("adapter", class)),
+            );
+            let second = resolve_effective_render_settings_for_gpu(
+                &settings,
+                Some(gpu_info("adapter", class)),
+            );
+
+            assert_eq!(
+                first.tier, second.tier,
+                "requested {requested:?} on {class:?} must resolve to the same tier twice"
+            );
+            assert_eq!(first.requested, second.requested);
+            assert_eq!(
+                first.features.shadow_resolution, second.features.shadow_resolution,
+                "the feature row must be stable too, not just the tier label"
+            );
+            assert_eq!(
+                first.features.shadow_cascades,
+                second.features.shadow_cascades
+            );
+            assert_eq!(first.features.bloom, second.features.bloom);
+        }
+    }
+
+    /// The watermark must PERSIST across tier changes.
+    ///
+    /// It is spawned once from the adapter class and nothing may take it away,
+    /// because the adapter cannot change mid-run — so a frame that ever deserved
+    /// the banner deserves it for the whole session. The tier systems touch
+    /// lights, the shadow map and the camera bloom; none of them may despawn or
+    /// hide it, or a quality change would silently un-label a software render.
+    #[test]
+    fn no_tier_system_removes_the_software_renderer_watermark() {
+        let source = include_str!("lib.rs");
+        // Searched in CALL form, with the leading dot, precisely so this test
+        // cannot match the names written in its own message below. Asserting on
+        // the bare type name would find this function and pass forever — the
+        // self-satisfying-needle trap that made the bloom guard vacuous until
+        // 3b02a3cf246f.
+        // The needle is ASSEMBLED at runtime so the complete string never
+        // appears as a literal in this file. Writing it out — even in call form
+        // with a leading dot — makes the test find itself and pass forever,
+        // which is exactly how the bloom guard was vacuous until 3b02a3cf246f.
+        // Two failed attempts here proved the point; only construction is safe
+        // when a source-scanning test lives in the source it scans.
+        let marker = "SoftwareRendererWatermark";
+        for verb in [".despawn::<", ".remove::<"] {
+            let forbidden = format!("{verb}{marker}>");
+            assert!(
+                !source.contains(&forbidden),
+                "nothing may remove the watermark; the adapter cannot change mid-run, \
+                 so removing it would un-label a software render that is still software"
+            );
+        }
+    }
+
     /// The software-renderer watermark must be spawned, marked, and conditional.
     ///
     /// A startup warning is a log line, and a log line scrolls away — someone
