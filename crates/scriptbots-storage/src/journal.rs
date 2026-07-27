@@ -1723,11 +1723,34 @@ fn validate_scientific_archive_boundary(
         return Ok(());
     };
     let tick = applied.tick;
+    // A lifecycle record may be OLDER than the boundary that reports it, and
+    // must never be newer (bd-it29).
+    //
+    // Equality used to hold by accident. Records created BETWEEN steps — every
+    // `HostCommand::SpawnAgent`, `SpawnCrossover`, and every archipelago
+    // immigration — were silently dropped before reaching any boundary, so the
+    // only records this validation ever saw were made during the reported tick.
+    // Once those arrivals started reaching the boundary they carry the tick they
+    // actually happened at, which is the previous one, and an equality check
+    // rejects the batch outright with InvalidData.
+    //
+    // The event's tick is WHEN IT HAPPENED; the boundary's tick is when it was
+    // reported. Conflating them would mean either refusing honest records or
+    // re-dating them to the boundary, and re-dating is worse: it would put a
+    // birth in the timeline at a tick it did not occur. So the invariant is an
+    // upper bound. A record dated in the FUTURE of its boundary is still
+    // impossible and still rejected, which is what this check was really for.
+    //
+    // THIS IS AN ALIGNMENT, NOT A LOOSENING. `validate_lifecycle_record_tick`
+    // in this crate's admission path already enforces exactly
+    // `record_tick > enclosing_tick` and has always done so; the equality here
+    // was the outlier, and it only ever held because the records that would have
+    // violated it never reached a boundary.
     if scientific.events().tick != tick
         || scientific.summary().tick != tick
         || scientific.config_revision() != applied.revisions.config.get()
-        || scientific.births().iter().any(|record| record.tick != tick)
-        || scientific.deaths().iter().any(|record| record.tick != tick)
+        || scientific.births().iter().any(|record| record.tick > tick)
+        || scientific.deaths().iter().any(|record| record.tick > tick)
         || scientific
             .resource_tick()
             .is_some_and(|record| record.tick != tick)
