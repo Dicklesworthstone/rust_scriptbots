@@ -10,11 +10,12 @@
 
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, ConfigAuditEntry,
-    ControlCommand, DeathRecord, DynamicAgentSnapshot, DynamicAgentVisuals, DynamicWorldSnapshot,
-    Generation, HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScientificStateError,
-    ScriptBotsConfig, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, Tick,
-    TickCombatSummary, TickEvents, TickSummary, toroidal_delta,
+    AgentUid, AppliedInterventionRecord, BirthRecord, BrainInspectionLimits,
+    BrainInspectionResponse, ConfigAuditEntry, ControlCommand, DeathRecord, DynamicAgentSnapshot,
+    DynamicAgentVisuals, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
+    PersistenceBatch, ResourceLedgerTick, ScientificStateError, ScriptBotsConfig, SelectionState,
+    SelectionUpdate, SimulationCommand, TerrainKind, Tick, TickCombatSummary, TickEvents,
+    TickSummary, toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -624,6 +625,27 @@ pub struct RenderSnapshot {
     /// relationship between the two is unspecified today and is `bd-ydu8`.
     #[serde(with = "serde_arc")]
     pub agent_selection: Arc<Vec<SelectionState>>,
+    /// Bounded ring of interventions the world applied or let lapse.
+    ///
+    /// Ungated for the same reason as `agent_selection`: the record's own
+    /// documentation says surfaces (TUI, REST, MCP) read this ring and emit the
+    /// `scriptbots::intervention` logs, so a headless host has to carry it.
+    ///
+    /// Revision-gated on the ring's monotonic `seq` rather than republished
+    /// every tick: interventions are rare events, so this is a pointer clone on
+    /// almost every publication, exactly like `config_audit`.
+    ///
+    /// SERIALIZED BUT NOT DESERIALIZED, and that asymmetry is forced rather than
+    /// chosen: `AppliedInterventionRecord::kind` is a `&'static str` from a fixed
+    /// label set, so the record cannot be deserialized into any lifetime shorter
+    /// than `'static` and deriving it here would require `'de: 'static` on the
+    /// whole snapshot. A decoded snapshot therefore reports an EMPTY ring rather
+    /// than the sender's — stated here because silently defaulting is exactly the
+    /// kind of gap that reads as "no interventions happened". Nothing decodes
+    /// `RenderSnapshot` today; if something ever needs to, this field has to
+    /// carry an owned label first.
+    #[serde(serialize_with = "serde_arc::serialize", skip_deserializing)]
+    pub applied_interventions: Arc<Vec<AppliedInterventionRecord>>,
     /// Configuration in effect at this boundary.
     ///
     /// Revision-gated like `summary_history` and `layers`: the `Arc` is only
@@ -5365,6 +5387,7 @@ mod tests {
             build: SnapshotBuildStats::default(),
             agent_visuals: Arc::new(Vec::new()),
             agent_selection: Arc::new(Vec::new()),
+            applied_interventions: Arc::new(Vec::new()),
             world: DynamicWorldSnapshot {
                 tick: 10,
                 epoch: 1,
@@ -7066,6 +7089,7 @@ mod tests {
                 build: SnapshotBuildStats::default(),
                 agent_visuals: Arc::new(Vec::new()),
                 agent_selection: Arc::new(Vec::new()),
+                applied_interventions: Arc::new(Vec::new()),
                 world: DynamicWorldSnapshot {
                     tick: self.tick.0,
                     epoch: 0,

@@ -20,9 +20,9 @@ use super::{
 };
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    ACTIVATION_CAPTURE_BUDGET, AgentUid, BrainInspectionClientId, BrainInspectionError,
-    BrainInspectionRequest, BrainInspectionRevision, CharacterizationError, CompletedStepFault,
-    ConfigAuditEntry, ControlCommand, ControlDisposition, DynamicAgentSnapshot,
+    ACTIVATION_CAPTURE_BUDGET, AgentUid, AppliedInterventionRecord, BrainInspectionClientId,
+    BrainInspectionError, BrainInspectionRequest, BrainInspectionRevision, CharacterizationError,
+    CompletedStepFault, ConfigAuditEntry, ControlCommand, ControlDisposition, DynamicAgentSnapshot,
     DynamicAgentVisuals, DynamicWorldSnapshot, MigratingAgent, NullPersistence,
     PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError, ScriptBotsConfig,
     SelectionState, Tick, TickSummary, WorldDigestV1, WorldState, apply_control_command,
@@ -1831,6 +1831,21 @@ fn capture_agent_visuals(
 /// has no runtime projection, for the same reason the visual capture does: a
 /// world that cannot answer for every agent is refused rather than published
 /// with a silent default that would read as "deselected".
+/// Newest sequence in the world's applied-intervention ring, or 0 when empty.
+///
+/// This is the revision signal the snapshot gates on. `seq` is documented as
+/// monotonic within the run and starting at 1, so 0 is unambiguously "nothing
+/// applied yet" rather than a real record. Gating on the newest seq rather than
+/// on the ring's length is what keeps it correct once the bounded ring starts
+/// evicting from the front: length can stay constant across an eviction that
+/// replaced the contents.
+fn latest_intervention_seq(world: &WorldState) -> u64 {
+    world
+        .applied_interventions()
+        .back()
+        .map_or(0, |record| record.seq)
+}
+
 fn capture_agent_selection(
     world: &WorldState,
 ) -> Result<Vec<SelectionState>, ScientificStateError> {
@@ -1943,6 +1958,8 @@ pub struct HostCore {
     config: Arc<ScriptBotsConfig>,
     config_audit: Arc<Vec<ConfigAuditEntry>>,
     last_published_config: ConfigRevision,
+    applied_interventions: Arc<Vec<AppliedInterventionRecord>>,
+    last_published_intervention_seq: u64,
     latest_completed_summary: Option<TickSummary>,
     next_journal_sequence: u64,
     next_lifecycle_command_sequence: u64,
@@ -2102,6 +2119,14 @@ impl HostCore {
             .cloned();
         let config = Arc::new(world.config().clone());
         let config_audit = Arc::new(world.config_audit().to_vec());
+        let applied_interventions = Arc::new(
+            world
+                .applied_interventions()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let last_published_intervention_seq = latest_intervention_seq(&world);
         let initial_snapshot = Arc::new(RenderSnapshot {
             session_id,
             revision: SnapshotRevision::new(1),
@@ -2118,6 +2143,7 @@ impl HostCore {
             world: dynamic_world,
             agent_visuals,
             agent_selection,
+            applied_interventions: Arc::clone(&applied_interventions),
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
         });
@@ -2178,6 +2204,8 @@ impl HostCore {
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
             last_published_config: revisions.config,
+            applied_interventions,
+            last_published_intervention_seq,
             latest_completed_summary,
             next_journal_sequence: 1,
             next_lifecycle_command_sequence: session_id.get(),
@@ -2984,6 +3012,21 @@ impl HostCore {
         } else {
             (Arc::clone(&self.config), Arc::clone(&self.config_audit))
         };
+        // Same revision-gating shape as config, keyed on the ring's monotonic
+        // seq: interventions are rare, so this is a pointer clone on almost
+        // every publication rather than a copy of the ring.
+        let intervention_seq = latest_intervention_seq(&self.world);
+        let applied_interventions = if intervention_seq == self.last_published_intervention_seq {
+            Arc::clone(&self.applied_interventions)
+        } else {
+            Arc::new(
+                self.world
+                    .applied_interventions()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
         let (command_queue_depth, last_applied_command) = {
             let shared = self.shared.borrow();
             (
@@ -3007,12 +3050,15 @@ impl HostCore {
             world: dynamic_world,
             agent_visuals,
             agent_selection,
+            applied_interventions: Arc::clone(&applied_interventions),
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
         });
         self.config = config;
         self.config_audit = config_audit;
         self.last_published_config = self.revisions.config;
+        self.applied_interventions = applied_interventions;
+        self.last_published_intervention_seq = intervention_seq;
         self.snapshots.publish(snapshot)?;
         self.snapshot_layers = layers;
         self.summary_history = summary_history;
@@ -4696,6 +4742,74 @@ mod tests {
             SelectionState::Selected,
             "selection must be parallel to agents, not merely the right count"
         );
+    }
+
+    /// The intervention ring reaches the snapshot, and costs nothing when idle.
+    ///
+    /// The TUI reads `world.applied_interventions()` directly today
+    /// (`terminal/mod.rs:1043`) and watermarks on `seq`; after the cutover the
+    /// snapshot is its only source. Both halves matter: a ring that never
+    /// reached the snapshot would silently stop reporting interventions, and one
+    /// republished every tick would copy a growing vector forever for events
+    /// that happen a handful of times per run.
+    #[test]
+    fn the_applied_intervention_ring_is_published_and_pointer_stable_while_idle() {
+        let mut core = HostCore::new(HostSessionId::new(80), world(0), options(true))
+            .expect("host for intervention publication");
+        let first = core.latest_snapshot();
+        assert!(
+            first.applied_interventions.is_empty(),
+            "a fresh world has applied no interventions"
+        );
+
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("completed explicit step");
+        let second = core.latest_snapshot();
+        assert!(
+            Arc::ptr_eq(&first.applied_interventions, &second.applied_interventions),
+            "a tick that applied no intervention must reuse the Arc, not rebuild it"
+        );
+
+        // Drive a real intervention through the world the same way the scenario
+        // path does, then prove the next publication carries it. Reaching past
+        // the port here is deliberate: this asserts the SNAPSHOT contract, and
+        // routing through a command would test the command path instead.
+        let mut config = core.world.config().clone();
+        config.closed = !config.closed;
+        let disposition = apply_control_command(
+            &mut core.world,
+            ControlCommand::UpdateConfig(Box::new(config)),
+        )
+        .expect("config intervention applies");
+        assert_eq!(disposition, ControlDisposition::WorldApplied);
+
+        submit(&mut port, 2, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("completed second explicit step");
+        let third = core.latest_snapshot();
+        assert_eq!(
+            third.applied_interventions.len(),
+            core.world.applied_interventions().len(),
+            "the published ring must match the world's ring exactly"
+        );
+        if !third.applied_interventions.is_empty() {
+            assert!(
+                !Arc::ptr_eq(&second.applied_interventions, &third.applied_interventions),
+                "a new intervention must produce a new payload, not a stale pointer"
+            );
+            let published_seq = third
+                .applied_interventions
+                .last()
+                .expect("non-empty ring")
+                .seq;
+            assert_eq!(
+                published_seq,
+                latest_intervention_seq(&core.world),
+                "the published ring must be current, not one intervention behind"
+            );
+        }
     }
 
     #[test]
