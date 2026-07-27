@@ -25034,6 +25034,241 @@ mod tests {
         Ok(())
     }
 
+    /// Registers a minimal run row so per-tick tables satisfy their `run_id` foreign key.
+    fn register_bare_run(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        connection.execute_with_params(
+            "INSERT INTO runs (
+                run_id, manifest_schema_version, experiment_id, variant_id,
+                scenario_id, scenario_version, normalized_config_json, config_digest,
+                root_seed_hex, rng_algorithm, rng_version, brain_roster_json,
+                source_revision, source_tree_digest, source_tree_dirty,
+                source_bundle_digest, rust_toolchain, cargo_lock_digest, target_triple,
+                started_at_unix_ms_hex, requested_tick_budget_hex, live_run_policy,
+                reproducible, manifest_json, manifest_digest
+             ) VALUES (
+                ?1, 0, NULL, NULL, 'test', 0, '{}', 'config-digest',
+                '0000000000000000', 'test-rng', 0, '[]',
+                NULL, NULL, NULL, NULL, 'test-toolchain', 'lock-digest', 'test-target',
+                '0000000000000000', NULL, 'test-live-policy', 0, '{}', 'manifest-digest'
+             )",
+            &[sqlite_run_id(run_id)],
+        )?;
+        Ok(())
+    }
+
+    /// Characterizes the V14 schema's single-world assumption at `tick_summaries`.
+    ///
+    /// bd-8djh: an archipelago closes the same tick once per island, and the V14 primary
+    /// key `(run_id, tick)` has no room for that. This pins the exact before-state and is
+    /// expected to go RED the moment the V15 island_id lift lands, which is what forces it
+    /// to be rewritten into the post-migration assertion rather than silently left behind.
+    #[test]
+    fn v14_tick_summaries_cannot_hold_two_islands_at_one_tick()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        install_scriptbots_schema(&connection)?;
+        connection.execute("PRAGMA foreign_keys = ON")?;
+        let run = RunId::new(21);
+        register_bare_run(&connection, run)?;
+
+        // The root cause, asserted rather than narrated: there is no column in which a
+        // tick summary could record which island it describes.
+        let island_id_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tick_summaries')
+                 WHERE name = 'island_id'",
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            island_id_columns, 0,
+            "tick_summaries already carries island_id; \
+             this characterization is stale and the V15 assertions should replace it"
+        );
+
+        let summary_sql = "INSERT INTO tick_summaries (
+                run_id, tick, epoch, closed, agent_count, births, deaths,
+                total_energy, average_energy, average_health
+             ) VALUES (?1, ?2, 0, 1, ?3, 0, 0, 0.0, 0.0, 0.0)";
+
+        // Island 0 closes tick 1 carrying 10 agents.
+        connection.execute_with_params(
+            summary_sql,
+            &[sqlite_run_id(run), 1_i64.into(), 10_i64.into()],
+        )?;
+
+        // Island 1 closes the SAME tick carrying a different population. Under an
+        // island-aware schema this is an ordinary second row; under V14 it is a
+        // primary-key collision at the very first tick, not at the first barrier.
+        let collision = connection
+            .execute_with_params(
+                summary_sql,
+                &[sqlite_run_id(run), 1_i64.into(), 20_i64.into()],
+            )
+            .expect_err("V14 tick_summaries accepted two islands at one tick");
+        let message = collision.to_string();
+        assert!(
+            message.contains("UNIQUE constraint failed: tick_summaries.run_id, tick"),
+            "the refusal must be attributable to the (run_id, tick) primary key itself, \
+             not merely to some uniqueness failure, got: {message}"
+        );
+
+        // CONTROL, so the refusal above is attributed to the tick collision and not merely
+        // to the row being second: the identical island-1 payload at a different tick is
+        // accepted. Without this, a schema that rejected every second insert for any
+        // reason would satisfy the assertion above.
+        connection.execute_with_params(
+            summary_sql,
+            &[sqlite_run_id(run), 2_i64.into(), 20_i64.into()],
+        )?;
+
+        // What survives is island 0's summary alone: island 1's tick-1 population has
+        // nowhere in this schema to live.
+        let stored_at_tick_one: i64 = connection
+            .query_row_with_params(
+                "SELECT agent_count FROM tick_summaries WHERE run_id = ?1 AND tick = 1",
+                &[sqlite_run_id(run)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            stored_at_tick_one, 10,
+            "island 1's tick-1 summary displaced island 0's instead of being refused"
+        );
+
+        connection.close()?;
+        Ok(())
+    }
+
+    /// Characterizes the V14 `births` unique indexes against per-island UID counters.
+    ///
+    /// bd-8djh: every island mints `AgentUid` from its own private counter (bd-8jlj), so
+    /// island 0 and island 1 both hold `AgentUid(1)` for different organisms. Because the
+    /// three `births` unique indexes are scoped to `run_id` ALONE, the second island is
+    /// refused at a DIFFERENT tick — which means lifting the primary keys alone does not
+    /// make eight islands writable, and a tick-collision test cannot see this at all.
+    #[test]
+    fn v14_births_unique_indexes_reject_a_second_island_at_a_different_tick()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        install_scriptbots_schema(&connection)?;
+        connection.execute("PRAGMA foreign_keys = ON")?;
+        let run = RunId::new(22);
+        register_bare_run(&connection, run)?;
+
+        let born_sql = "INSERT INTO births (
+                run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+                herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 0.5, 0, 1.0, 2.0, 0, 'born')";
+
+        // Island 0's first native birth: uid 1, spawn 0, birth 0, at tick 5.
+        connection.execute_with_params(
+            born_sql,
+            &[
+                sqlite_run_id(run),
+                5_i64.into(),
+                1_i64.into(),
+                0_i64.into(),
+                0_i64.into(),
+            ],
+        )?;
+
+        // Island 1's first native birth lands at a DIFFERENT tick, so the primary key
+        // (run_id, tick, agent_uid) is distinct and cannot be what refuses it. Its spawn
+        // and birth ordinals are deliberately unique here so that agent_uid is the ONLY
+        // constraint left to fire, and the failure is attributable to one index.
+        let uid_collision = connection
+            .execute_with_params(
+                born_sql,
+                &[
+                    sqlite_run_id(run),
+                    9_i64.into(),
+                    1_i64.into(),
+                    7_i64.into(),
+                    7_i64.into(),
+                ],
+            )
+            .expect_err("V14 births accepted the same agent_uid from a second island");
+        let uid_message = uid_collision.to_string();
+        assert!(
+            uid_message.contains("UNIQUE constraint failed: births.run_id, agent_uid"),
+            "the refusal must name agent_uid, so it is attributable to \
+             births_run_agent_uid_unique rather than to any other index, got: {uid_message}"
+        );
+
+        // The same holds for the per-island spawn counter, on its own index: a distinct
+        // uid at a distinct tick is still refused when spawn_ordinal repeats.
+        let spawn_collision = connection
+            .execute_with_params(
+                born_sql,
+                &[
+                    sqlite_run_id(run),
+                    9_i64.into(),
+                    2_i64.into(),
+                    0_i64.into(),
+                    8_i64.into(),
+                ],
+            )
+            .expect_err("V14 births accepted a repeated spawn_ordinal from a second island");
+        assert!(
+            spawn_collision
+                .to_string()
+                .contains("UNIQUE constraint failed: births.run_id, spawn_ordinal"),
+            "the refusal must name spawn_ordinal, so it is attributable to \
+             births_run_spawn_ordinal_unique, got: {spawn_collision}"
+        );
+
+        // And for the demographic birth counter.
+        let birth_collision = connection
+            .execute_with_params(
+                born_sql,
+                &[
+                    sqlite_run_id(run),
+                    9_i64.into(),
+                    3_i64.into(),
+                    9_i64.into(),
+                    0_i64.into(),
+                ],
+            )
+            .expect_err("V14 births accepted a repeated birth_ordinal from a second island");
+        assert!(
+            birth_collision
+                .to_string()
+                .contains("UNIQUE constraint failed: births.run_id, birth_ordinal"),
+            "the refusal must name birth_ordinal, so it is attributable to \
+             births_run_birth_ordinal_unique, got: {birth_collision}"
+        );
+
+        // CONTROL: island 1's birth is accepted once every run-scoped counter is distinct.
+        // This is what makes the three refusals above evidence about the COUNTERS rather
+        // than about the row being second, and it is the assertion that fails first if a
+        // future change makes births reject inserts for some unrelated reason.
+        connection.execute_with_params(
+            born_sql,
+            &[
+                sqlite_run_id(run),
+                9_i64.into(),
+                4_i64.into(),
+                4_i64.into(),
+                4_i64.into(),
+            ],
+        )?;
+        let stored: i64 = connection
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM births WHERE run_id = ?1",
+                &[sqlite_run_id(run)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            stored, 2,
+            "exactly island 0's birth and the distinct-counter control should have landed"
+        );
+
+        connection.close()?;
+        Ok(())
+    }
+
     #[test]
     fn recovery_requires_the_exact_supported_migration_set_without_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
