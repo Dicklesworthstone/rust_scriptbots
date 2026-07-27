@@ -4955,9 +4955,21 @@ struct HeadlessBufferEvidence {
     regions: Vec<RegionEvidence>,
 }
 
-/// Minimum height a bordered panel needs before its title can appear: the top and
-/// bottom rows are the border itself, so two rows leave nothing to draw into.
-const REGION_MIN_HEIGHT: u16 = 3;
+/// Minimum height a bordered panel needs before its title can appear.
+///
+/// ONE row, not three, and the difference matters because it decides how much the
+/// contract verifies. A ratatui `Block` with borders draws its TOP border — title
+/// included — in its first row, so a panel squeezed to one or two rows still shows
+/// its title even though it has no interior left. This was 3 on the reasoning that
+/// a bordered panel needs a top border, a bottom border, and something between;
+/// that is true of a USABLE panel and false of a titled one.
+///
+/// Measured across the whole resize ladder rather than assumed: every region with
+/// height >= 1 rendered its marker and every region with height 0 rendered nothing,
+/// with no counterexample at any of the five tiers. At 3 the contract silently
+/// declined to verify seven regions that were visibly drawing their titles —
+/// exactly the "stopped looking" failure a per-tier relaxation must avoid.
+const REGION_MIN_HEIGHT: u16 = 1;
 
 /// Whether `rect` is big enough for a bordered panel to render `marker`.
 ///
@@ -11527,6 +11539,206 @@ mod tests {
             repeat.frames[0].buffer.as_ref(),
             Some(evidence),
             "the fixed-seed TestBackend buffer evidence must be deterministic"
+        );
+    }
+
+    /// The plan 8.3 breakpoint ladder: emergency, narrow, the headless evidence
+    /// size, and both auto-expanded tiers.
+    ///
+    /// 120 is [`AUTO_EXPAND_MIN_WIDTH`], so the ladder deliberately straddles it:
+    /// the sidebar gains the mortality panel and re-proportions at that boundary,
+    /// and a golden that never crossed it would not notice the threshold moving.
+    const RESIZE_LADDER: [(u16, u16); 5] = [(40, 12), (60, 20), (80, 36), (120, 40), (160, 50)];
+
+    /// Path to the committed ladder golden.
+    fn resize_golden_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/terminal/goldens/resize_ladder.txt")
+    }
+
+    /// Serialize the ladder into the reviewable golden form.
+    ///
+    /// Deliberately LINE-PER-REGION rather than one digest per tier. A single hash
+    /// per viewport can only say "something moved"; these lines say which panel, at
+    /// which rectangle, and whether it still had room — so the diff a reviewer
+    /// reads in a PR is already the diagnosis. That is the same reason the evidence
+    /// layer grew per-region hashes in the first place.
+    fn render_resize_ladder() -> String {
+        let mut out = String::new();
+        out.push_str("# bd-2z0.14.2.6 — TUI resize ladder golden\n");
+        out.push_str(
+            "# Regenerate deliberately, never in CI:\n\
+             #   RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-app --lib -- \
+             terminal::tests::the_resize_ladder_matches_its_committed_golden\n",
+        );
+        out.push_str(
+            "# room=no means ABSENT BY LAYOUT: the rect cannot fit that panel's\n\
+             # marker at this size. That is legitimate at narrow tiers and is\n\
+             # recorded rather than hidden, so a panel silently dropping out of a\n\
+             # tier it used to fit in shows up here as a diff.\n",
+        );
+        for (width, height) in RESIZE_LADDER {
+            let (buffer, layout, tick) = matrix_frame_buffer(width, height);
+            let evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
+                .expect("every ladder tier must render an inspectable frame");
+            out.push_str(&format!(
+                "\ntier {width}x{height} frame={} regions={}\n",
+                evidence.full_cell_fnv1a64,
+                evidence.regions.len()
+            ));
+            for region in &evidence.regions {
+                out.push_str(&format!(
+                    "  {:<12} x={:<3} y={:<3} w={:<3} h={:<3} room={:<3} marker={:<3} \
+                     nonblank={:<5} hash={}\n",
+                    region.name,
+                    region.x,
+                    region.y,
+                    region.width,
+                    region.height,
+                    if region.has_room { "yes" } else { "no" },
+                    if region.marker_present { "yes" } else { "no" },
+                    region.non_blank_cells,
+                    region.fnv1a64,
+                ));
+            }
+        }
+        out
+    }
+
+    /// The committed ladder golden must match, and must be capable of not matching.
+    ///
+    /// GOLDEN DISCIPLINE, following the repo's existing scene-capture contract:
+    /// a missing golden FAILS with the candidate in the message and never
+    /// auto-blesses, and regeneration happens only under `RUST_REGEN_GOLDEN`. A
+    /// golden that silently writes itself on first run is not a golden — it agrees
+    /// with whatever it just saw.
+    #[test]
+    fn the_resize_ladder_matches_its_committed_golden() {
+        let candidate = render_resize_ladder();
+        let path = resize_golden_path();
+        let regen = std::env::var_os("RUST_REGEN_GOLDEN").is_some();
+
+        if regen {
+            std::fs::create_dir_all(path.parent().expect("golden parent"))
+                .expect("create golden dir");
+            std::fs::write(&path, &candidate).expect("write regenerated golden");
+            // Deliberately not a silent success: a run that rewrote the committed
+            // evidence must say so, or a stray env var looks like a passing test.
+            panic!(
+                "RUST_REGEN_GOLDEN was set: rewrote {} ({} bytes). Review the diff \
+                 and re-run WITHOUT the variable to verify.",
+                path.display(),
+                candidate.len()
+            );
+        }
+
+        let Ok(golden) = std::fs::read_to_string(&path) else {
+            panic!(
+                "no committed ladder golden at {}. It is NOT created automatically. \
+                 Review the candidate below, save it to that path, and commit it:\n\
+                 \n{candidate}",
+                path.display()
+            );
+        };
+
+        if golden == candidate {
+            // Pass, but prove the golden is not vacuous. A file that had lost its
+            // tiers, or whose regions were all absent-by-layout, would compare
+            // equal to an equally empty candidate and report coverage it does not
+            // have.
+            for (width, height) in RESIZE_LADDER {
+                let header = format!("tier {width}x{height} ");
+                assert!(
+                    golden.contains(&header),
+                    "the golden must pin every ladder tier; {header:?} is missing"
+                );
+            }
+            assert!(
+                golden.matches("room=yes").count() >= RESIZE_LADDER.len(),
+                "every tier must verify at least one region with room, or the \
+                 golden records a frame nothing checked"
+            );
+            return;
+        }
+
+        // Mismatch: report the FIRST differing line with its tier, because a
+        // 200-line whole-file diff does not say which panel moved.
+        let mut tier = String::from("<before any tier>");
+        for (index, (want, got)) in golden.lines().zip(candidate.lines()).enumerate() {
+            if want.starts_with("tier ") {
+                tier = want.to_string();
+            }
+            assert_eq!(
+                want,
+                got,
+                "resize ladder golden mismatch at line {} under {tier}\n  \
+                 golden:    {want}\n  candidate: {got}\n\nIf this change is \
+                 intended, regenerate with RUST_REGEN_GOLDEN=1 and review the diff.",
+                index + 1
+            );
+        }
+        assert_eq!(
+            golden.lines().count(),
+            candidate.lines().count(),
+            "the golden and the candidate differ in line count, so a whole tier or \
+             region appeared or disappeared"
+        );
+        unreachable!("golden != candidate but every line and the line count agreed");
+    }
+
+    /// The ladder must be deterministic, or the golden is noise.
+    #[test]
+    fn the_resize_ladder_is_deterministic() {
+        assert_eq!(
+            render_resize_ladder(),
+            render_resize_ladder(),
+            "two renders of the fixed-seed ladder must be byte-identical"
+        );
+    }
+
+    /// The golden comparison must FIRE. A comparison that cannot fail is the
+    /// evidence-layer version of the defect this bead keeps running into: it looks
+    /// like coverage and asserts nothing.
+    ///
+    /// Rather than trusting `assert_eq!`, this drives the real serializer and
+    /// perturbs one region's rectangle, then requires the ladder text to change at
+    /// exactly the tier that was perturbed.
+    #[test]
+    fn the_ladder_golden_detects_a_layout_change() {
+        let baseline = render_resize_ladder();
+
+        // A layout regression at one tier: pretend the emergency tier lost its
+        // rail, which is what a bad breakpoint edit would do.
+        let (buffer, layout, tick) = matrix_frame_buffer(40, 12);
+        let without_rail = FrameLayout {
+            rail: None,
+            ..layout
+        };
+        let with_rail = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
+            .expect("baseline emergency frame");
+        let changed = HeadlessBufferEvidence::inspect(&buffer, tick, &without_rail)
+            .expect("a frame without the rail region is still inspectable");
+        assert_ne!(
+            with_rail.regions.len(),
+            changed.regions.len(),
+            "dropping a region must change the region set, or the ladder cannot see \
+             a layout change at all"
+        );
+        assert!(
+            baseline.contains("rail"),
+            "the committed ladder must mention the rail somewhere, or this control \
+             is perturbing something the golden never recorded"
+        );
+
+        // And the frame hash must move when the buffer really changes, so the
+        // golden is not merely a layout summary that ignores pixels.
+        let mut repainted = buffer.clone();
+        repainted[(0, 0)].set_symbol("Z");
+        let (before, _) = HeadlessBufferEvidence::hash_cells(&buffer, buffer.area);
+        let (after, _) = HeadlessBufferEvidence::hash_cells(&repainted, repainted.area);
+        assert_ne!(
+            before, after,
+            "one changed cell must move the frame hash the golden pins"
         );
     }
 

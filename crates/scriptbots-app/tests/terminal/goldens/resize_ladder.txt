@@ -1,0 +1,69 @@
+# bd-2z0.14.2.6 — TUI resize ladder golden
+# Regenerate deliberately, never in CI:
+#   RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-app --lib -- terminal::tests::the_resize_ladder_matches_its_committed_golden
+# room=no means ABSENT BY LAYOUT: the rect cannot fit that panel's
+# marker at this size. That is legitimate at narrow tiers and is
+# recorded rather than hidden, so a panel silently dropping out of a
+# tier it used to fit in shows up here as a diff.
+
+tier 40x12 frame=03cf4456d41a84bb regions=10
+  header       x=0   y=0   w=40  h=3   room=yes marker=yes nonblank=96    hash=1a1e8f4eb4f9ba05
+  rail         x=0   y=3   w=40  h=5   room=yes marker=yes nonblank=112   hash=aa3808a21cf536fd
+  world_map    x=0   y=8   w=25  h=4   room=yes marker=yes nonblank=98    hash=76e3b54e81cff6eb
+  vital_stats  x=25  y=8   w=15  h=0   room=no  marker=no  nonblank=0     hash=d96d3868e728781a
+  trends       x=25  y=8   w=15  h=0   room=no  marker=no  nonblank=0     hash=d96d3868e728781a
+  leaderboard  x=25  y=8   w=15  h=1   room=yes marker=yes nonblank=14    hash=cf3ed80bfec8fbeb
+  oldest       x=25  y=9   w=15  h=0   room=no  marker=no  nonblank=0     hash=d96d3868e728781a
+  insights     x=25  y=9   w=15  h=0   room=no  marker=no  nonblank=0     hash=d96d3868e728781a
+  brains       x=25  y=9   w=15  h=0   room=no  marker=no  nonblank=0     hash=d96d3868e728781a
+  events       x=25  y=9   w=15  h=3   room=yes marker=yes nonblank=31    hash=8a28bf8a7322a44e
+
+tier 60x20 frame=225c2149c36d4bc0 regions=10
+  header       x=0   y=0   w=60  h=3   room=yes marker=yes nonblank=145   hash=e6209166b4bb0673
+  rail         x=0   y=3   w=60  h=5   room=yes marker=yes nonblank=166   hash=c3737e0175a1ce7f
+  world_map    x=0   y=8   w=37  h=12  room=yes marker=yes nonblank=442   hash=a7e405b3bc24990f
+  vital_stats  x=37  y=8   w=23  h=2   room=yes marker=yes nonblank=45    hash=c32f2216da5182ee
+  trends       x=37  y=10  w=23  h=1   room=yes marker=yes nonblank=21    hash=aaa10265e3006dc9
+  leaderboard  x=37  y=11  w=23  h=2   room=yes marker=yes nonblank=45    hash=3012e3ee2e918744
+  oldest       x=37  y=13  w=23  h=1   room=yes marker=yes nonblank=22    hash=682dfa0b7c9ac21e
+  insights     x=37  y=14  w=23  h=2   room=yes marker=yes nonblank=46    hash=a7dc50c42f08e72c
+  brains       x=37  y=16  w=23  h=1   room=yes marker=yes nonblank=23    hash=5311d1b5f5f5029b
+  events       x=37  y=17  w=23  h=3   room=yes marker=yes nonblank=47    hash=26efb963cf89ef52
+
+tier 80x36 frame=7a664c6de1b375e7 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=96245824130a414e
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=57787a9187d8dbf8
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=04809bf140150027
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=37998886e82aeeb5
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=4a4e9cc8abe6da48
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=f3412268cbc149ae
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=00f1798267aa6a03
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d8390d87637e79a1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=7c07c351c5b9eee9
+
+tier 120x40 frame=ad8952a539c18a93 regions=11
+  header       x=0   y=0   w=120 h=3   room=yes marker=yes nonblank=303   hash=3d10b09c8a2a1901
+  rail         x=0   y=3   w=120 h=5   room=yes marker=yes nonblank=297   hash=a5ee7a80c334c45b
+  world_map    x=0   y=8   w=70  h=32  room=yes marker=yes nonblank=2238  hash=ea03e5eece7dca28
+  vital_stats  x=70  y=8   w=50  h=4   room=yes marker=yes nonblank=157   hash=d77e8cb709023a99
+  trends       x=70  y=12  w=50  h=4   room=yes marker=yes nonblank=102   hash=0f403aef8373d538
+  leaderboard  x=70  y=16  w=50  h=4   room=yes marker=yes nonblank=103   hash=761902273140eaae
+  oldest       x=70  y=20  w=50  h=5   room=yes marker=yes nonblank=105   hash=9be2bbcf40ae90dc
+  insights     x=70  y=25  w=50  h=4   room=yes marker=yes nonblank=176   hash=0e28afffe0ea9005
+  brains       x=70  y=29  w=50  h=4   room=yes marker=yes nonblank=126   hash=9e92269dc087cafd
+  mortality    x=70  y=33  w=50  h=4   room=yes marker=yes nonblank=127   hash=e900162ea8360d9f
+  events       x=70  y=37  w=50  h=3   room=yes marker=yes nonblank=101   hash=19a6b4a79f2eeb25
+
+tier 160x50 frame=09a39d048dcf9c1a regions=11
+  header       x=0   y=0   w=160 h=3   room=yes marker=yes nonblank=411   hash=e18ee85d0e2b60c8
+  rail         x=0   y=3   w=160 h=5   room=yes marker=yes nonblank=377   hash=a4793d27589bfb63
+  world_map    x=0   y=8   w=93  h=42  room=yes marker=yes nonblank=3904  hash=587f9e10042d8564
+  vital_stats  x=93  y=8   w=67  h=6   room=yes marker=yes nonblank=242   hash=e80c66d3d2ef55e5
+  trends       x=93  y=14  w=67  h=5   room=yes marker=yes nonblank=138   hash=6bf47f5f29d9e1f3
+  leaderboard  x=93  y=19  w=67  h=6   room=yes marker=yes nonblank=141   hash=2775edf76993f1a8
+  oldest       x=93  y=25  w=67  h=5   room=yes marker=yes nonblank=139   hash=cf382a68e746f662
+  insights     x=93  y=30  w=67  h=6   room=yes marker=yes nonblank=219   hash=b80ec703ce25b625
+  brains       x=93  y=36  w=67  h=5   room=yes marker=yes nonblank=162   hash=c8fbdd8ef6a8c920
+  mortality    x=93  y=41  w=67  h=6   room=yes marker=yes nonblank=165   hash=53cd35631f8dcefd
+  events       x=93  y=47  w=67  h=3   room=yes marker=yes nonblank=135   hash=6b343fb392f7de80
