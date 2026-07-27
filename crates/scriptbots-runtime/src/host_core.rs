@@ -25,7 +25,8 @@ use scriptbots_core::{
     ConfigAuditEntry, ControlCommand, ControlDisposition, DynamicAgentSnapshot,
     DynamicAgentVisuals, DynamicWorldSnapshot, MigratingAgent, NullPersistence,
     PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError, ScriptBotsConfig,
-    Tick, TickSummary, WorldDigestV1, WorldState, apply_control_command, rng_domains::IslandId,
+    SelectionState, Tick, TickSummary, WorldDigestV1, WorldState, apply_control_command,
+    rng_domains::IslandId,
 };
 use std::{
     cell::RefCell,
@@ -1818,9 +1819,52 @@ fn capture_agent_visuals(
     Ok(visuals)
 }
 
+/// Project command-applied selection in the exact order of `world.agents()`.
+///
+/// Ungated, unlike [`capture_agent_visuals`]: selection is a control-plane fact
+/// that REST and MCP report even on a host with no renderer, so it cannot ride
+/// the drawing option. One byte per agent.
+///
+/// # Errors
+///
+/// Returns [`ScientificStateError::MissingAgentRuntime`] when a live arena row
+/// has no runtime projection, for the same reason the visual capture does: a
+/// world that cannot answer for every agent is refused rather than published
+/// with a silent default that would read as "deselected".
+fn capture_agent_selection(
+    world: &WorldState,
+) -> Result<Vec<SelectionState>, ScientificStateError> {
+    let arena = world.agents();
+    let mut selection = Vec::with_capacity(arena.len());
+    for (dense_index, id) in arena.iter_handles().enumerate() {
+        let runtime =
+            world
+                .agent_runtime(id)
+                .ok_or_else(|| ScientificStateError::MissingAgentRuntime {
+                    path: format!("render_snapshot.agent_selection[{dense_index}].runtime"),
+                })?;
+        selection.push(runtime.selection);
+    }
+    Ok(selection)
+}
+
+/// Allocated capacity of the per-agent payloads published beside `world.agents`.
+///
+/// Grouped rather than passed as loose `usize` pairs: they are the same kind of
+/// quantity, they are always supplied together, and two adjacent bare `usize`
+/// arguments are exactly the shape that gets transposed without the compiler
+/// noticing.
+#[derive(Debug, Clone, Copy, Default)]
+struct AgentPayloadCapacities {
+    /// Capacity of the gated visual payload.
+    visuals: usize,
+    /// Capacity of the ungated selection payload.
+    selection: usize,
+}
+
 fn snapshot_build_stats(
     world: &DynamicWorldSnapshot,
-    agent_visuals_capacity: usize,
+    agents: AgentPayloadCapacities,
     summary_history: &[TickSummary],
     summary_history_capacity: usize,
     summary_history_allocated: bool,
@@ -1835,7 +1879,12 @@ fn snapshot_build_stats(
         // agent cardinality exactly like `agents` does, and an accounting that
         // silently omitted it would report a snapshot as costing half what it
         // does the moment a drawing frontend attaches.
-        .saturating_add(agent_visuals_capacity.saturating_mul(size_of::<DynamicAgentVisuals>()));
+        .saturating_add(
+            agents
+                .visuals
+                .saturating_mul(size_of::<DynamicAgentVisuals>()),
+        )
+        .saturating_add(agents.selection.saturating_mul(size_of::<SelectionState>()));
     let layer_bytes = layers.total_capacity_bytes();
     let summary_history_bytes = summary_history_capacity.saturating_mul(size_of::<TickSummary>());
     SnapshotBuildStats {
@@ -1844,7 +1893,8 @@ fn snapshot_build_stats(
         bulk_allocations: refresh
             .bulk_allocations
             .saturating_add(usize::from(world.agents.capacity() != 0))
-            .saturating_add(usize::from(agent_visuals_capacity != 0))
+            .saturating_add(usize::from(agents.visuals != 0))
+            .saturating_add(usize::from(agents.selection != 0))
             .saturating_add(usize::from(
                 summary_history_allocated && !summary_history.is_empty(),
             )),
@@ -2031,10 +2081,14 @@ impl HostCore {
             &world,
             options.capture_agent_visuals,
         )?);
+        let agent_selection = Arc::new(capture_agent_selection(&world)?);
         let summary_history = Arc::new(world.history().cloned().collect::<Vec<_>>());
         let build = snapshot_build_stats(
             &dynamic_world,
-            agent_visuals.capacity(),
+            AgentPayloadCapacities {
+                visuals: agent_visuals.capacity(),
+                selection: agent_selection.capacity(),
+            },
             &summary_history,
             summary_history.capacity(),
             true,
@@ -2063,6 +2117,7 @@ impl HostCore {
             build,
             world: dynamic_world,
             agent_visuals,
+            agent_selection,
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
         });
@@ -2899,6 +2954,7 @@ impl HostCore {
             &self.world,
             self.options.capture_agent_visuals,
         )?);
+        let agent_selection = Arc::new(capture_agent_selection(&self.world)?);
         let summary_history_allocated = self.revisions.scientific != self.last_published_scientific;
         let summary_history = if summary_history_allocated {
             Arc::new(self.world.history().cloned().collect::<Vec<_>>())
@@ -2907,7 +2963,10 @@ impl HostCore {
         };
         let build = snapshot_build_stats(
             &dynamic_world,
-            agent_visuals.capacity(),
+            AgentPayloadCapacities {
+                visuals: agent_visuals.capacity(),
+                selection: agent_selection.capacity(),
+            },
             &summary_history,
             summary_history.capacity(),
             summary_history_allocated,
@@ -2947,6 +3006,7 @@ impl HostCore {
             build,
             world: dynamic_world,
             agent_visuals,
+            agent_selection,
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
         });
@@ -4555,6 +4615,86 @@ mod tests {
         assert!(
             headless.latest_snapshot().agent_visuals.is_empty(),
             "the gate must hold on every publication, not only the first"
+        );
+
+        // Selection is NOT gated, and this is the point of the pairing: a
+        // headless host still answers "which agents are selected" for REST and
+        // MCP. Asserting it on the host whose visuals are off is what would
+        // catch someone folding selection into the drawing option.
+        let quiet_now = headless.latest_snapshot();
+        assert_eq!(
+            quiet_now.agent_selection.len(),
+            quiet_now.world.agents.len(),
+            "selection must be published even with no renderer attached"
+        );
+        assert_eq!(quiet_now.agent_selection(0), SelectionState::None);
+        assert_eq!(
+            quiet_now.agent_selection(quiet_now.world.agents.len()),
+            SelectionState::None,
+            "an out-of-range read is unselected, not a panic"
+        );
+    }
+
+    /// A selection command reaches the snapshot, and only the named agent.
+    ///
+    /// This is the round trip the cutover depends on: after `HostCore` owns the
+    /// world, a frontend submits `UpdateSelection` and can only learn the result
+    /// by reading it back from a published snapshot. A host that applied the
+    /// command but never republished selection would leave every client showing
+    /// a stale highlight with no way to notice.
+    #[test]
+    fn an_applied_selection_command_is_visible_in_the_next_snapshot() {
+        let mut core = HostCore::new(
+            HostSessionId::new(79),
+            snapshot_measurement_world(4),
+            options(true),
+        )
+        .expect("host for selection round trip");
+        let target = core
+            .world
+            .agents()
+            .iter_handles()
+            .next()
+            .expect("fixture world has agents")
+            .raw();
+        assert!(
+            core.latest_snapshot()
+                .agent_selection
+                .iter()
+                .all(|state| *state == SelectionState::None),
+            "nothing is selected before the command"
+        );
+
+        let mut port = core.local_port();
+        submit(
+            &mut port,
+            1,
+            HostCommand::UpdateSelection(SelectionUpdate {
+                mode: SelectionMode::Replace,
+                agent_ids: vec![target],
+                state: SelectionState::Selected,
+            }),
+        );
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("selection command applied");
+
+        let snapshot = core.latest_snapshot();
+        let selected = snapshot
+            .agent_selection
+            .iter()
+            .filter(|state| **state == SelectionState::Selected)
+            .count();
+        assert_eq!(selected, 1, "exactly the named agent must be selected");
+        let index = snapshot
+            .world
+            .agents
+            .iter()
+            .position(|agent| agent.id == target)
+            .expect("target agent is still in the projection");
+        assert_eq!(
+            snapshot.agent_selection(index),
+            SelectionState::Selected,
+            "selection must be parallel to agents, not merely the right count"
         );
     }
 

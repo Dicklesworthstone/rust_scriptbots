@@ -13,8 +13,8 @@ use scriptbots_core::{
     AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, ConfigAuditEntry,
     ControlCommand, DeathRecord, DynamicAgentSnapshot, DynamicAgentVisuals, DynamicWorldSnapshot,
     Generation, HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScientificStateError,
-    ScriptBotsConfig, SelectionUpdate, SimulationCommand, TerrainKind, Tick, TickCombatSummary,
-    TickEvents, TickSummary, toroidal_delta,
+    ScriptBotsConfig, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, Tick,
+    TickCombatSummary, TickEvents, TickSummary, toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -607,6 +607,23 @@ pub struct RenderSnapshot {
     /// claiming to be v2.
     #[serde(with = "serde_arc")]
     pub agent_visuals: Arc<Vec<DynamicAgentVisuals>>,
+    /// Command-applied selection state, parallel to `world.agents`.
+    ///
+    /// Ungated, unlike `agent_visuals`, because selection is not a drawing
+    /// concern. `ControlCommand::UpdateSelection` is a control command like any
+    /// other: REST, MCP, the CLI and every frontend submit it, the world applies
+    /// it, and `AgentDebugInfo` reports it back over the API. A headless host
+    /// with no renderer still has to answer "which agents are selected", so
+    /// gating this behind a drawing option would break the server lane.
+    ///
+    /// It is one byte per agent, so publishing it unconditionally costs less
+    /// than the branch that would decide whether to.
+    ///
+    /// This is deliberately NOT the same thing as `ProjectionRequest::selection`
+    /// and `ProjectedAgent::selected`, which are per-client overlay state. The
+    /// relationship between the two is unspecified today and is `bd-ydu8`.
+    #[serde(with = "serde_arc")]
+    pub agent_selection: Arc<Vec<SelectionState>>,
     /// Configuration in effect at this boundary.
     ///
     /// Revision-gated like `summary_history` and `layers`: the `Arc` is only
@@ -630,6 +647,18 @@ impl RenderSnapshot {
     #[must_use]
     pub fn agent_visuals(&self, index: usize) -> Option<&DynamicAgentVisuals> {
         self.agent_visuals.get(index)
+    }
+
+    /// Command-applied selection for the agent at `index` in `world.agents`.
+    ///
+    /// Total: an out-of-range index reads as unselected rather than panicking,
+    /// which is also the right answer for an agent that no longer exists.
+    #[must_use]
+    pub fn agent_selection(&self, index: usize) -> SelectionState {
+        self.agent_selection
+            .get(index)
+            .copied()
+            .unwrap_or(SelectionState::None)
     }
 
     /// Whether every agent in this publication carries visual detail.
@@ -5335,6 +5364,7 @@ mod tests {
             },
             build: SnapshotBuildStats::default(),
             agent_visuals: Arc::new(Vec::new()),
+            agent_selection: Arc::new(Vec::new()),
             world: DynamicWorldSnapshot {
                 tick: 10,
                 epoch: 1,
@@ -7035,6 +7065,7 @@ mod tests {
                 layers,
                 build: SnapshotBuildStats::default(),
                 agent_visuals: Arc::new(Vec::new()),
+                agent_selection: Arc::new(Vec::new()),
                 world: DynamicWorldSnapshot {
                     tick: self.tick.0,
                     epoch: 0,

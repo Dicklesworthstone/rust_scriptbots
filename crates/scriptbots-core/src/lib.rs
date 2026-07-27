@@ -3517,19 +3517,16 @@ pub struct DynamicAgentSnapshot {
 /// so no amount of re-pointing lock sites at snapshots would compile into a
 /// working frontend.
 ///
-/// `AgentRuntime::selection` is deliberately EXCLUDED, and that is a finding
-/// rather than an oversight: it is *per-viewer* UI state that currently lives in
-/// the simulation world. It must not be published in a snapshot shared by every
-/// client, because one viewer's selection is not a fact about the world. It
-/// belongs in the per-client projection request instead (`bd-ydu8`).
+/// `indicator` is included. Its doc comment says "UI highlight pulse state",
+/// which reads like viewer state; it is not. The tick loop decays it every step,
+/// combat and damage events write it, and `world_step_output_tail_digest` covers
+/// it alongside `food_delta` and `spiked`. It is a simulation-owned visual event
+/// channel, so a renderer reading it from a shared snapshot sees exactly what
+/// the simulation produced.
 ///
-/// `indicator` IS included, and the distinction matters. Its doc comment says
-/// "UI highlight pulse state", which reads like viewer state and is what made me
-/// exclude it at first. It is not: the tick loop decays it every step, combat
-/// and damage events write it, and it is encoded into the world state digest
-/// alongside `food_delta` and `spiked`. It is a simulation-owned visual event
-/// channel and a deterministic fact about the world, so a renderer reading it
-/// from a shared snapshot sees exactly what the simulation produced.
+/// `AgentRuntime::selection` is NOT here, and its absence is not an exclusion —
+/// it rides on [`crate`]'s render snapshot ungated, because control surfaces
+/// need it even when nothing is drawing. See `RenderSnapshot::agent_selection`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicAgentVisuals {
