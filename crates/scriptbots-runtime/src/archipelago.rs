@@ -94,10 +94,11 @@ use crate::{
 };
 use scriptbots_core::{
     CharacterizationError, ScriptBotsConfig, Tick, TickSummary, WorldDigestV1, WorldState,
-    WorldStateError,
+    WorldStateError, rng_domains::OrganismId,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     num::NonZeroU64,
     sync::Arc,
     time::{Duration, Instant},
@@ -928,6 +929,58 @@ impl Archipelago {
         Ok(self.islands[index].core.with_world(read))
     }
 
+    /// Every living organism in the archipelago, keyed by its globally unique
+    /// scientific identity.
+    ///
+    /// THE CORRECT PATH, GIVEN A HOME SO NOBODY HAND-ROLLS THE WRONG ONE
+    /// (bd-8jlj). [`Self::with_island_world`] hands out one island's
+    /// [`WorldState`], and the obvious way to survey the whole archipelago is to
+    /// call it per island and union the results. Every lineage and species
+    /// structure in `scriptbots-core` is keyed on a BARE [`AgentUid`], and each
+    /// island mints UIDs from its own private counter — so that union silently
+    /// collapses island 0's agent 1 and island 1's agent 1 into one organism. No
+    /// panic, no typed error; just a phylogeny that claims two unrelated
+    /// individuals are the same one.
+    ///
+    /// This returns [`OrganismId`] values instead, so the island travels with
+    /// every element and the collapse cannot happen by accident. A caller that
+    /// genuinely wants a cross-island gene pool has to discard the island axis
+    /// deliberately, which is a decision someone can review.
+    ///
+    /// The set is barrier-consistent: it reads committed island worlds through
+    /// `&self`, so it cannot interleave with [`Self::step_to_barrier`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchipelagoError::Latched`] once an island fault has latched the
+    /// archipelago — a census taken then would describe a partially-stepped
+    /// epoch — or [`ArchipelagoError::Digest`] if an island's per-agent identity
+    /// state cannot be read.
+    pub fn organism_census(&self) -> Result<BTreeSet<OrganismId>, ArchipelagoError> {
+        if let Some(detail) = &self.latched {
+            return Err(ArchipelagoError::Latched {
+                detail: detail.clone(),
+            });
+        }
+        let mut census = BTreeSet::new();
+        for island in &self.islands {
+            let id = island.meta.id;
+            let states = island
+                .core
+                .with_world(WorldState::ordered_agent_rng_counters_v1)
+                .map_err(|source| ArchipelagoError::Digest { island: id, source })?;
+            for state in states {
+                let organism = OrganismId::new(id, state.agent_uid());
+                debug_assert!(
+                    !census.contains(&organism),
+                    "one island cannot hold two agents with the same uid"
+                );
+                census.insert(organism);
+            }
+        }
+        Ok(census)
+    }
+
     /// Advance every island to the next common barrier tick.
     ///
     /// Islands step in ascending island-id order ([`StepTopology`] records the
@@ -1282,7 +1335,6 @@ mod tests {
     };
     use scriptbots_core::AgentUid;
     use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
-    use std::collections::BTreeSet;
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     const TEST_BRAIN_KIND: &str = "archi-test-brain";
@@ -2297,31 +2349,24 @@ mod tests {
     /// `emigrate`/`immigrate` exist deliberately: the digest-sensitive mutation should be
     /// born already guarded, so a wrong move fails loudly the first time it lands rather
     /// than corrupting lineage data that looks plausible.
-    fn census(archipelago: &Archipelago, islands: &[IslandId]) -> BTreeSet<(IslandId, AgentUid)> {
-        let mut seen = BTreeSet::new();
+    /// The census now comes from production code ([`Archipelago::organism_census`],
+    /// bd-8jlj) rather than a test-local reimplementation. That matters: a guard
+    /// that surveys the archipelago its own private way proves the guard is
+    /// correct, not that the shipped path is.
+    fn census(archipelago: &Archipelago, islands: &[IslandId]) -> BTreeSet<OrganismId> {
+        let census = archipelago
+            .organism_census()
+            .expect("archipelago census readable");
+        // Uniqueness is enforced inside `organism_census` by the set itself; what
+        // this adds is that every island the caller named is actually represented,
+        // so a census that silently skipped an island cannot pass as a full one.
         for &id in islands {
-            let uids = archipelago
-                .with_island_world(id, |world| {
-                    world
-                        .ordered_agent_rng_counters_v1()
-                        .map(|states| {
-                            states
-                                .iter()
-                                .map(|state| state.agent_uid())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .expect("island world readable");
-            for uid in uids {
-                assert!(
-                    seen.insert((id, uid)),
-                    "duplicate archipelago identity ({id:?}, {uid:?}): an agent exists \
-                     twice, which population sums alone would not reveal"
-                );
-            }
+            assert!(
+                census.iter().any(|organism| organism.island == id),
+                "island {id:?} contributed nothing to the census"
+            );
         }
-        seen
+        census
     }
 
     /// No agent is duplicated or lost across barriers.
@@ -2359,9 +2404,8 @@ mod tests {
         // duplicates on the third exchange is the realistic bug.
         let mut previous = first;
         for barrier in 0..4 {
-            archipelago
-                .step_to_barrier()
-                .unwrap_or_else(|error| panic!("barrier {barrier} stepped: {error:?}"));
+            let stepped = archipelago.step_to_barrier();
+            assert!(stepped.is_ok(), "barrier {barrier} must step: {stepped:?}");
             let current = census(&archipelago, &islands);
             assert!(
                 !current.is_empty(),
@@ -2387,5 +2431,79 @@ mod tests {
             let _ = &previous;
             previous = current;
         }
+    }
+
+    /// The archipelago-wide census keys on `(IslandId, AgentUid)`, and the bare-UID
+    /// union it replaces provably loses organisms (bd-8jlj).
+    ///
+    /// THE DECISION THIS PINS. bd-8jlj asked whether core's lineage/species APIs should
+    /// take an island-scoped key or whether an archipelago layer should key on the pair.
+    /// The answer is the pair, because ancestry and species are properties of ONE
+    /// interbreeding population and allopatry means the islands' pools are separate --
+    /// so the core structures are right as they are, and the danger lives entirely in
+    /// how a caller COMBINES them.
+    ///
+    /// That makes this test the real guard: it does the wrong thing and the right thing
+    /// side by side over the same live archipelago and shows the wrong one is lossy. A
+    /// test that only asserted the census is unique would pass just as happily against a
+    /// single island, where bare UIDs are already unique and nothing is at stake.
+    #[test]
+    fn bd_8jlj_census_keys_on_the_island_pair_and_bare_uids_lose_organisms() {
+        let islands: Vec<IslandId> = (0..3).map(IslandId).collect();
+        let specs: Vec<IslandSpec> = islands
+            .iter()
+            .map(|id| spec(id.0, populated_config(None)))
+            .collect();
+        let mut archipelago =
+            populated_archipelago(archipelago_config(specs, 40)).expect("valid archipelago");
+        archipelago.step_to_barrier().expect("first barrier");
+
+        let census = archipelago.organism_census().expect("census readable");
+        assert!(
+            !census.is_empty(),
+            "an empty census would satisfy everything below vacuously"
+        );
+        for &id in &islands {
+            assert!(
+                census.iter().any(|organism| organism.island == id),
+                "every island must contribute, or the union below is not a real union"
+            );
+        }
+
+        // THE WRONG THING, written out so the loss is visible rather than argued.
+        let bare: BTreeSet<AgentUid> = census.iter().map(|organism| organism.uid).collect();
+        assert!(
+            bare.len() < census.len(),
+            "if discarding the island axis were harmless this hazard would need no type; \
+             {} bare uids for {} organisms",
+            bare.len(),
+            census.len()
+        );
+
+        // Ordering is island-major, which is the canonical order every barrier and
+        // migration surface uses. A caller that relied on UID-major order would read
+        // one island's population as another's.
+        let ordered: Vec<IslandId> = census.iter().map(|organism| organism.island).collect();
+        let mut sorted = ordered.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            ordered, sorted,
+            "OrganismId must order island-major so a census iterates island by island"
+        );
+
+        // And the pair is genuinely unique: the set's own length is the population.
+        let total: usize = islands
+            .iter()
+            .map(|&id| {
+                archipelago
+                    .with_island_world(id, WorldState::agent_count)
+                    .expect("island world readable")
+            })
+            .sum();
+        assert_eq!(
+            census.len(),
+            total,
+            "the census must hold exactly one entry per living agent"
+        );
     }
 }

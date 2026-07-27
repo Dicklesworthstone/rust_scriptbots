@@ -212,6 +212,65 @@ impl std::fmt::Display for IslandId {
     }
 }
 
+/// Globally unique scientific identity of one organism in an archipelago (bd-8jlj).
+///
+/// # The decision this type records
+///
+/// bd-8jlj asked for one written-down answer: do the core lineage and species APIs take
+/// an island-scoped key, or does an archipelago-level layer key on `(IslandId, AgentUid)`
+/// and never union raw UID sets? **The answer is the second, and this type is what makes
+/// it structural rather than a convention.**
+///
+/// The reason is scientific, not economic. Ancestry and species are properties of ONE
+/// interbreeding population. `SpeciesTable`, the ancestry DAG, and the phylogeny timeline
+/// are correct exactly as they are *within a world*, and the entire premise of allopatric
+/// speciation (bd-16g.5) is that separate islands have separate gene pools. Threading an
+/// `IslandId` through those structures would push an archipelago concept into every
+/// single-world consumer and would still not stop anyone unioning two islands' results
+/// afterwards — it would relocate the hazard, not remove it.
+///
+/// # The hazard, and why a newtype is the fix
+///
+/// Every island's [`WorldState`](crate::WorldState) mints [`AgentUid`] from its own
+/// private counter, so island 0 and island 1 both hold `AgentUid(1)` and those are
+/// DIFFERENT ORGANISMS. Feed two islands' bare UIDs into one `BTreeSet`, one
+/// `SpeciesTable`, or one ancestry DAG and the distinct organisms silently collapse into
+/// a single node. Nothing panics; the result is a phylogeny that asserts two unrelated
+/// individuals are the same one, and a cross-cluster mating rate computed over a gene
+/// pool that never existed. That is the failure class bd-16g.5.3 warns about for RNG
+/// coupling: plausible, publishable, and wrong.
+///
+/// Because this is a newtype and not a tuple alias, an archipelago-wide census cannot be
+/// assembled out of bare UIDs by accident — the collection's element type names the
+/// island, so the merge has to be written deliberately to happen at all.
+///
+/// # Ordering
+///
+/// `Ord` is derived, so it is `(island, uid)` — island-major. A `BTreeSet<OrganismId>`
+/// therefore iterates in ascending island order and, within an island, ascending UID
+/// order, which is the same canonical order every migration and barrier surface uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OrganismId {
+    /// The island whose private allocator minted [`Self::uid`].
+    pub island: IslandId,
+    /// The organism's UID, unique only within `island`.
+    pub uid: AgentUid,
+}
+
+impl OrganismId {
+    /// Pair a world-local UID with the island that minted it.
+    #[must_use]
+    pub const fn new(island: IslandId, uid: AgentUid) -> Self {
+        Self { island, uid }
+    }
+}
+
+impl std::fmt::Display for OrganismId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/agent-{}", self.island, self.uid.get())
+    }
+}
+
 /// Seed for one island's stream in one domain (bd-16g.5.3).
 ///
 /// `kdf(root_seed, ISLAND_TAG, domain_tag, island_id)`, length-prefixed FNV-1a in the same
