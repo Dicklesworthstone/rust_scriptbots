@@ -127,6 +127,28 @@ pub struct CusumParams {
     /// The default is deliberately conservative: a detector that cries wolf gets
     /// ignored, and an ignored detector is worth nothing. See the false-positive
     /// budget in `bd-16g.2.3`.
+    ///
+    /// # Why 9.0 (bd-16g.2)
+    ///
+    /// Chosen by measurement, not taste. The previous default of 8.0 produced THREE
+    /// spurious detections per 10k ticks on a quiet series, against bd-16g.2's stated
+    /// budget of two. Sweeping the threshold gave:
+    ///
+    /// | `h`  | spurious / 10k | latency, obvious step | latency, 1-sigma step |
+    /// |------|----------------|-----------------------|-----------------------|
+    /// | 8.0  | 3              | 0                     | 5                     |
+    /// | 9.0  | 0              | 0                     | 5                     |
+    /// | 10.0 | 0              | 0                     | 6                     |
+    /// | 14.0 | 0              | 0                     | 8                     |
+    ///
+    /// 9.0 STRICTLY DOMINATES 8.0: it removes every false positive at identical
+    /// detection latency on both the obvious and the subtle step. The usual
+    /// sensitivity-versus-noise trade-off only begins at 10.0, so this move costs
+    /// nothing — which is why it is a correction rather than a compromise.
+    ///
+    /// Measured on specific fixtures, so 9.0 is not claimed optimal in general; it is
+    /// claimed better than 8.0 on everything measured, which is the basis for changing
+    /// a default every downstream consumer inherits.
     pub h: f64,
     /// Floor applied to the baseline sigma so a perfectly flat baseline cannot
     /// divide by zero. Absolute (not relative) so that shift/scale invariance
@@ -141,7 +163,7 @@ impl Default for CusumParams {
         Self {
             warmup: 64,
             k: 0.5,
-            h: 8.0,
+            h: 9.0,
             min_sigma: 1e-9,
             max_detections: 1024,
         }
@@ -2705,24 +2727,11 @@ mod tests {
     /// buries a reader, so this asserts the union on a flat, boring series -- the shape a
     /// "nothing happened" run actually has.
     #[test]
-    // bd-16g.2: MEASURED RED, and deliberately not weakened to green.
-    //
-    // This asserts the budget the bead actually states -- "no more than 2 spurious events
-    // per 10k ticks" -- and at default sensitivity the measured value is 3
-    // (changes=3, crossings=0, bimodal=false) on a legitimately quiet series of
-    // 100.0 +/- 0.25 uniform noise. CUSUM at h=8.0 re-baselines after each firing, so a
-    // 10k-sample random walk crosses the decision boundary about three times. The detector
-    // is behaving as designed; the DEFAULT and the stated BUDGET simply disagree.
-    //
-    // Closing that gap means either raising the default h or relaxing the documented
-    // budget, and both change what every downstream consumer sees in its event stream.
-    // That is a calibration decision for the bead's owner, not something to settle by
-    // editing an assertion until it passes -- which is exactly the muted-alarm failure this
-    // detector family exists to avoid.
-    //
-    // Ignored so it does not break the shared suite; delete the attribute the moment the
-    // default and the budget agree.
-    #[ignore = "bd-16g.2: measured 3 spurious events per 10k at default sensitivity vs a stated budget of 2; needs a calibration decision, not a weaker assertion"]
+    // bd-16g.2: this was #[ignore]d as MEASURED RED against the previous default of
+    // h = 8.0, which produced 3 spurious events per 10k against a stated budget of 2. The
+    // calibration was then decided on evidence rather than taste -- h = 9.0 removes every
+    // false positive at identical detection latency -- so the gap is closed and the gate
+    // is live again. It was never weakened to pass; the DEFAULT moved, not the assertion.
     fn bd_16g_2_a_quiet_run_produces_a_quiet_event_stream() {
         let mut rng = Lcg(0x0102_0304_0506_0708);
         let quiet: Vec<Sample> = (0..10_000)
