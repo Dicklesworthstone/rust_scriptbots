@@ -99,6 +99,21 @@ pub struct AgentStyle {
     pub spike_srgb: Srgb,
     /// Extended-spike HDR emissive gain.
     pub spike_emissive_gain: f32,
+    /// Hearing-organ (ear) material color.
+    ///
+    /// Added by bd-sqji so the ear has an authority at all. Backends were each
+    /// authoring their own; the value here is the one world-gfx already used, so
+    /// adopting it MOVES authority without restyling anything. Choosing a
+    /// different hue is a palette decision and belongs in its own change.
+    pub ear_srgb: Srgb,
+    /// Eye sclera color.
+    ///
+    /// See [`AgentStyle::ear_srgb`] on why this carries the pre-existing value.
+    pub eye_sclera_srgb: Srgb,
+    /// Eye pupil color.
+    ///
+    /// See [`AgentStyle::ear_srgb`] on why this carries the pre-existing value.
+    pub eye_pupil_srgb: Srgb,
 }
 
 /// Stable-hue food mote response.
@@ -296,6 +311,9 @@ pub const BIOLUMINESCENT_DARK_FIELD_V1: VisualStyleV1 = {
             selection_rim_srgb: [0.72, 0.94, 1.00],
             spike_srgb: spike_core,
             spike_emissive_gain: 6.00,
+            ear_srgb: [0.32, 0.62, 0.92],
+            eye_sclera_srgb: [0.97, 0.98, 1.00],
+            eye_pupil_srgb: [0.08, 0.11, 0.18],
         },
         food: FoodStyle {
             core_srgb: food_core,

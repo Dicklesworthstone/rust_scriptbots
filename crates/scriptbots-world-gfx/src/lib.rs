@@ -1437,6 +1437,20 @@ mod tests {
                 "let wheel_base_color = vec3<f32>(0.14, 0.16, 0.21);",
             ),
             ("mouth", "let mouth_color = vec3<f32>("),
+            ("flame", "mix(vec3<f32>(1.0, 0.62, 0.22)"),
+            ("spike", "mix(vec3<f32>(0.96, 0.44, 0.24)"),
+            // Each pattern must include enough of the ORIGINAL EXPRESSION to be
+            // unmistakable, not just its colour literal. Routing a value into a
+            // generated constant puts that literal into the prelude, so a bare
+            // `vec3<f32>(0.32, 0.62, 0.92)` matches the very declaration that
+            // proves the ear WAS routed — this test failed exactly that way when
+            // the ear landed, which is the trap every future ornament inherits.
+            (
+                "ears",
+                "vec3<f32>(0.32, 0.62, 0.92) * (0.9 + trait_sound * 0.45)",
+            ),
+            ("sclera", "let sclera_color = vec3<f32>(0.97, 0.98, 1.0);"),
+            ("pupil", "let pupil_color = vec3<f32>(0.08, 0.11, 0.18);"),
         ] {
             assert!(
                 !source.contains(literal),
@@ -1467,11 +1481,18 @@ mod tests {
         let source = super::agent_shader_source();
         let agents = visual::BIOLUMINESCENT_DARK_FIELD_V1.agents;
 
+        let boost = visual::BIOLUMINESCENT_DARK_FIELD_V1.events.boost;
         for (label, value) in [
             ("herbivore", agents.herbivore_srgb),
             ("carnivore", agents.carnivore_srgb),
             ("wheel", agents.wheel_srgb),
             ("selection rim", agents.selection_rim_srgb),
+            ("spike", agents.spike_srgb),
+            ("ear", agents.ear_srgb),
+            ("eye sclera", agents.eye_sclera_srgb),
+            ("eye pupil", agents.eye_pupil_srgb),
+            ("boost core", boost.core_srgb),
+            ("boost accent", boost.accent_srgb),
         ] {
             let rendered = format!("vec3<f32>({:?}, {:?}, {:?})", value[0], value[1], value[2]);
             assert!(
@@ -2638,6 +2659,12 @@ fn agent_shader_source() -> String {
     let carnivore = palette.agents.carnivore_srgb;
     let wheel = palette.agents.wheel_srgb;
     let rim = palette.agents.selection_rim_srgb;
+    let spike = palette.agents.spike_srgb;
+    let ear = palette.agents.ear_srgb;
+    let sclera = palette.agents.eye_sclera_srgb;
+    let pupil = palette.agents.eye_pupil_srgb;
+    let boost_core = palette.events.boost.core_srgb;
+    let boost_accent = palette.events.boost.accent_srgb;
     format!(
         "// GENERATED from scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1 (bd-2z0.7.11).\n\
          // Do not hand-edit these values; change the palette in core instead.\n\
@@ -2647,6 +2674,12 @@ fn agent_shader_source() -> String {
          const CORE_AGENT_CARNIVORE_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
          const CORE_AGENT_WHEEL_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
          const CORE_AGENT_SELECTION_RIM_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_AGENT_SPIKE_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_AGENT_EAR_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_AGENT_EYE_SCLERA_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_AGENT_EYE_PUPIL_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_EVENT_BOOST_CORE_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
+         const CORE_EVENT_BOOST_ACCENT_SRGB: vec3<f32> = vec3<f32>({:?}, {:?}, {:?});\n\
          {AGENTS_WGSL}",
         halo[0],
         halo[1],
@@ -2666,6 +2699,24 @@ fn agent_shader_source() -> String {
         rim[0],
         rim[1],
         rim[2],
+        spike[0],
+        spike[1],
+        spike[2],
+        ear[0],
+        ear[1],
+        ear[2],
+        sclera[0],
+        sclera[1],
+        sclera[2],
+        pupil[0],
+        pupil[1],
+        pupil[2],
+        boost_core[0],
+        boost_core[1],
+        boost_core[2],
+        boost_accent[0],
+        boost_accent[1],
+        boost_accent[2],
     )
 }
 
@@ -2986,7 +3037,10 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
     let flame_radius = body_radius * (0.18 + boost * 0.4);
     let flame_center = vec2<f32>(0.0, -body_half_length - flame_half * 0.6);
     let flame_dist = capsule_distance(local - flame_center, flame_half, flame_radius);
-    let flame_color = mix(vec3<f32>(1.0, 0.62, 0.22), vec3<f32>(1.0, 0.8, 0.3), sound_output);
+    // Core authority: the boost trail is an event cue, and visual::visual_cue
+    // builds BoostTrail from events.boost core/accent. The local orange endpoints
+    // were a different scheme from core's cyan pair entirely (bd-sqji).
+    let flame_color = mix(CORE_EVENT_BOOST_CORE_SRGB, CORE_EVENT_BOOST_ACCENT_SRGB, sound_output);
     layer(&accum_rgb, &accum_alpha, flame_color, smooth_mask(flame_dist) * 0.8);
   }
 
@@ -2995,7 +3049,13 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let spike_radius = body_radius * 0.32;
   let spike_center = vec2<f32>(0.0, body_half_length + spike_radius);
   let spike_dist = capsule_distance(local - spike_center, spike_half, spike_radius);
-  let spike_color = mix(vec3<f32>(0.96, 0.44, 0.24), vec3<f32>(0.98, 0.58, 0.32), clamp(spiked, 0.0, 1.0));
+  // Core authority: visual::agent_visual_params sets spike_color from
+  // agents.spike_srgb, a single colour rather than a two-endpoint ramp. The
+  // strike cue is preserved as a BRIGHTNESS step on that one chroma — an
+  // intensity, which core does not author, the same split used for the selection
+  // rim's glow. The old local endpoints were orange against core's pale pink
+  // (bd-sqji).
+  let spike_color = mix(CORE_AGENT_SPIKE_SRGB * 0.94, CORE_AGENT_SPIKE_SRGB, clamp(spiked, 0.0, 1.0));
   layer(&accum_rgb, &accum_alpha, spike_color, smooth_mask(spike_dist));
 
   // Mouth
@@ -3030,7 +3090,10 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let ear_scale = clamp(0.6 + trait_hearing * 0.45, 0.6, 1.6);
   let ear_radius = max(body_radius * 0.28, 1.5) * ear_scale;
   let ear_offset = body_half_length * 0.15;
-  let ear_color_base = vec3<f32>(0.32, 0.62, 0.92) * (0.9 + trait_sound * 0.45);
+  // Core authority: agents.ear_srgb, added by bd-sqji because no authority
+  // existed. The trait_sound term stays local — it is an intensity response, not
+  // a chroma, and core does not author it.
+  let ear_color_base = CORE_AGENT_EAR_SRGB * (0.9 + trait_sound * 0.45);
   let ear_left_center = vec2<f32>(-(body_radius + ear_radius * 0.45), -ear_offset);
   let ear_right_center = vec2<f32>(body_radius + ear_radius * 0.45, -ear_offset);
   let ear_left_dist = circle_distance(local - ear_left_center, ear_radius);
@@ -3042,8 +3105,10 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let eye_dirs = vec4<f32>(v.eye_dirs.x, v.eye_dirs.y, v.eye_dirs.z, v.eye_dirs.w);
   let eye_fov = vec4<f32>(v.eye_fov.x, v.eye_fov.y, v.eye_fov.z, v.eye_fov.w);
   let base_eye_radius = max(body_radius * 0.14, 1.2);
-  let sclera_color = vec3<f32>(0.97, 0.98, 1.0);
-  let pupil_color = vec3<f32>(0.08, 0.11, 0.18);
+  // Core authority: agents.eye_sclera_srgb / eye_pupil_srgb, both added by
+  // bd-sqji because no authority existed for either.
+  let sclera_color = CORE_AGENT_EYE_SCLERA_SRGB;
+  let pupil_color = CORE_AGENT_EYE_PUPIL_SRGB;
   for (var i: i32 = 0; i < 4; i = i + 1) {
     let angle = eye_dirs[i];
     let dir = vec2<f32>(cos(angle), sin(angle));
