@@ -249,3 +249,44 @@ fn bd_ydmr_the_determinism_gate_can_detect_a_changed_run() {
          do not depend on the run and every comparison in this file is vacuous"
     );
 }
+
+/// Mutating `RAYON_NUM_THREADS` at runtime does NOT change the pool, which is why
+/// the determinism matrix builds explicit bounded pools instead (bd-0dmc).
+///
+/// The archipelago det-check CLI originally varied its "thread matrix" by calling
+/// `std::env::set_var("RAYON_NUM_THREADS", ...)` between cells. Rayon reads that
+/// variable once, when the global pool is first initialized; every later write is
+/// inert. A matrix built that way runs every cell at the same width while
+/// printing that it covered [1, 4, 8, 3] — a success signal claiming more than it
+/// observed, in a diagnostic tool.
+///
+/// This pins the underlying behaviour so nobody reintroduces that approach.
+#[test]
+fn bd_0dmc_setting_rayon_num_threads_at_runtime_does_not_change_the_pool() {
+    // Force the global pool to exist before touching the variable.
+    let initial = rayon::current_num_threads();
+    assert!(initial > 0, "rayon must report a live global pool");
+
+    for requested in ["1", "3", "8"] {
+        // SAFETY: a well-formed Unicode value; this mirrors exactly what the old
+        // det-check did, which is the point of the test.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("RAYON_NUM_THREADS", requested);
+        }
+        assert_eq!(
+            rayon::current_num_threads(),
+            initial,
+            "setting RAYON_NUM_THREADS={requested} after the global pool exists changed \
+             the reported width; if rayon ever gains that behaviour this guard should be \
+             revisited, but until then a det-check must use explicit bounded pools"
+        );
+    }
+
+    // And the supported way DOES work, which is what makes the matrix real.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("bounded pool");
+    assert_eq!(pool.install(rayon::current_num_threads), 2);
+}

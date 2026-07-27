@@ -1104,7 +1104,10 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
 }
 
 fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
-    use scriptbots_runtime::archipelago::{Archipelago, ArchipelagoConfig, IslandId, IslandSpec};
+    use scriptbots_runtime::archipelago::{
+        Archipelago, ArchipelagoConfig, ArchipelagoMigration, IslandId, IslandSpec,
+    };
+    use scriptbots_runtime::migrator::EmigrantSelectionRule;
 
     println!(
         "{} Starting archipelago determinism self-check matrix for {} ticks...",
@@ -1112,81 +1115,167 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         ticks
     );
 
-    let master_seed = match cli.rng_seed {
-        Some(seed) => seed,
-        None => 987654321,
-    };
-
+    let master_seed = cli.rng_seed.unwrap_or(987_654_321);
     let mut base_config = compose_config(cli)?;
     base_config.rng_seed = Some(master_seed);
 
-    let thread_matrix = [Some("1"), Some("4"), Some("8"), Some("3")];
-    let island_count = 8usize;
+    const ISLANDS: u32 = 8;
+    let barriers = 4u32;
+    let barrier_interval = (ticks / u64::from(barriers)).max(1);
 
-    let build_arch = |thread_count: Option<&str>| -> Result<Archipelago> {
-        if let Some(tc) = thread_count {
-            // SAFETY: Process initialization during CLI setup before spawn
-            unsafe {
-                std::env::set_var("RAYON_NUM_THREADS", tc);
-            }
-        }
-        let specs: Vec<IslandSpec> = (0..island_count)
-            .map(|id| IslandSpec {
-                id: IslandId(u32::try_from(id).expect("island index fits u32")),
+    // MIGRATION IS ON. It used to be disabled here, with the comment that it
+    // "would couple the islands it compares" -- but coupling is not the problem
+    // a determinism gate has. The requirement is that the SAME coupling
+    // reproduces, and the migrator is the component most likely to carry an
+    // order dependence, so excluding it removed exactly what most needed gating.
+    let build = |order: &[u32]| -> Result<Archipelago> {
+        let specs: Vec<IslandSpec> = order
+            .iter()
+            .map(|&id| IslandSpec {
+                id: IslandId(id),
                 label: format!("island-{id}"),
                 config: base_config.clone(),
             })
             .collect();
-        let arch_cfg = ArchipelagoConfig {
+        Archipelago::new(ArchipelagoConfig {
             islands: specs,
             topology: scriptbots_runtime::Topology::Ring,
-            barrier_interval: std::num::NonZeroU64::new((ticks / 4).max(1)).unwrap(),
+            barrier_interval: std::num::NonZeroU64::new(barrier_interval)
+                .expect("barrier interval is at least one"),
             master_seed,
             host_options: scriptbots_runtime::HostCoreOptions::default(),
-            // Isolated islands: this lane measures per-island determinism across
-            // thread counts, and migration would couple the islands it compares.
-            migration: None,
-        };
-        Archipelago::new(arch_cfg).context("failed to build archipelago")
+            migration: Some(ArchipelagoMigration {
+                interval_ticks: barrier_interval,
+                emigrants_per_edge: 1,
+                selection_rule: EmigrantSelectionRule::Fittest,
+            }),
+        })
+        .context("failed to build archipelago")
     };
 
-    let mut baseline_digests = Vec::new();
-
-    for (idx, &threads) in thread_matrix.iter().enumerate() {
-        let mut arch = build_arch(threads)?;
-        for _ in 0..4 {
-            arch.step_to_barrier().context("step to barrier")?;
-        }
-        let mut cell_digests = Vec::new();
-        for i in 0..island_count {
-            let digest = arch
-                .island_digest(IslandId(u32::try_from(i).expect("island index fits u32")))
-                .context("island digest")?
-                .overall;
-            cell_digests.push(digest);
-        }
-
-        if idx == 0 {
-            baseline_digests = cell_digests;
-        } else {
-            for i in 0..island_count {
-                if cell_digests[i] != baseline_digests[i] {
-                    println!(
-                        "{} Divergence on island {} under RAYON_NUM_THREADS={:?}",
-                        "✖".red().bold(),
-                        i,
-                        threads
-                    );
-                    bail!("archipelago determinism check failed");
+    // Per-island digests plus the migration record, which is the half a
+    // per-island comparison cannot see: every island can be individually
+    // reproducible while the barrier that moves organisms between them is not.
+    let run = |order: &[u32]| -> Result<(Vec<String>, Vec<String>)> {
+        let mut arch = build(order)?;
+        let mut migrations = Vec::new();
+        for _ in 0..barriers {
+            let report = arch.step_to_barrier().context("step to barrier")?;
+            if let Some(migration) = report.migration {
+                for applied in &migration.moves {
+                    migrations.push(format!(
+                        "t{} {} -> {}",
+                        migration.barrier_tick.0, applied.from, applied.to
+                    ));
                 }
             }
+        }
+        let digests = (0..ISLANDS)
+            .map(|id| {
+                arch.island_digest(IslandId(id))
+                    .context("island digest")
+                    .map(|digest| digest.overall)
+            })
+            .collect::<Result<Vec<String>>>()?;
+        Ok((digests, migrations))
+    };
+
+    // EXPLICIT BOUNDED POOLS, NOT `RAYON_NUM_THREADS`. This matrix previously
+    // varied thread counts by writing that variable between cells. Rayon reads
+    // it once, when the global pool is first built, so every later write is
+    // inert and all four cells ran at one width while the summary line claimed
+    // it had covered [1, 4, 8, 3]. That is a diagnostic tool reporting coverage
+    // it never had. `bd_0dmc_setting_rayon_num_threads_at_runtime_does_not_
+    // change_the_pool` in tests/archipelago_determinism.rs pins that behaviour
+    // so the approach cannot come back.
+    let run_on = |order: &[u32], threads: usize| -> Result<(Vec<String>, Vec<String>)> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .context("failed to build a bounded Rayon pool for the determinism matrix")?;
+        let observed = pool.install(rayon::current_num_threads);
+        if observed != threads {
+            bail!(
+                "Rayon reported {observed} threads inside a {threads}-thread pool; this \
+                 matrix would compare identical configurations and prove nothing"
+            );
+        }
+        pool.install(|| run(order))
+    };
+
+    let ascending: Vec<u32> = (0..ISLANDS).collect();
+    let (baseline_digests, baseline_migrations) = run_on(&ascending, 1)?;
+
+    if baseline_migrations.is_empty() {
+        bail!(
+            "no organism migrated during the baseline run, so the migration half of this \
+             check compares two empty lists; raise --det-check-archipelago ticks"
+        );
+    }
+    if baseline_digests
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        < 2
+    {
+        bail!(
+            "every island produced an identical digest, so this check would pass even if \
+             the digest ignored island state entirely"
+        );
+    }
+
+    // 4 threads puts islands > threads and forces work stealing; 3 is a
+    // non-divisor of 8 and breaks chunking assumptions. Both are cells a plain
+    // 1-vs-N comparison misses.
+    let mut cells: Vec<(String, Vec<u32>, usize)> = vec![
+        ("threads=8".to_owned(), ascending.clone(), 8),
+        ("threads=4".to_owned(), ascending.clone(), 4),
+        ("threads=3".to_owned(), ascending.clone(), 3),
+    ];
+    // Declaration order must not reach the science: this catches order-dependent
+    // seeding and UID allocation, which no thread-count variation surfaces.
+    cells.push((
+        "island order reversed".to_owned(),
+        (0..ISLANDS).rev().collect(),
+        4,
+    ));
+
+    for (label, order, threads) in cells {
+        let (digests, migrations) = run_on(&order, threads)?;
+        for (island, (left, right)) in baseline_digests.iter().zip(&digests).enumerate() {
+            if left != right {
+                println!(
+                    "{} FIRST DIVERGENCE at island {island} under {label}: baseline {left}, \
+                     candidate {right}",
+                    "✖".red().bold()
+                );
+                bail!("archipelago determinism check failed");
+            }
+        }
+        if migrations != baseline_migrations {
+            println!(
+                "{} migration record diverged under {label}: {} baseline moves vs {} \
+                 candidate moves",
+                "✖".red().bold(),
+                baseline_migrations.len(),
+                migrations.len()
+            );
+            bail!("archipelago determinism check failed");
         }
     }
 
     println!(
-        "{} Archipelago determinism self-check passed for 8 islands x {} ticks across thread matrix [1, 4, 8, 3]!",
+        "{} Archipelago determinism self-check passed: {} islands x {} ticks, migration on, \
+         across bounded pools [1, 8, 4, 3] and a reversed island order ({} moves compared).",
         "✔".green().bold(),
-        ticks
+        ISLANDS,
+        ticks,
+        baseline_migrations.len()
+    );
+    println!(
+        "{} Scope: this compares runs of THIS binary. WorldDigestV1 is a regression oracle \
+         for one pinned build lane, not a cross-platform reproducibility promise.",
+        "ℹ".blue().bold()
     );
     Ok(())
 }
@@ -2979,11 +3068,40 @@ impl Renderer for ServerRenderer {
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
         info!("ScriptBots server mode starting (headless background simulation with REST/MCP API)");
         let target_interval = std::time::Duration::from_millis(16);
+        let reporter = ctx.control_runtime.command_reporter();
         while !matches!(
             ctx.control_runtime.status(),
             scriptbots_app::servers::ControlRuntimeStatus::Failed(_)
         ) {
             let start = std::time::Instant::now();
+            // Server mode APPLIES the commands it admits. This loop previously
+            // stepped the world and never drained the bus, so every command a
+            // REST, MCP, CLI or websocket client submitted was admitted and then
+            // ignored: receipts stayed at `admitted` forever, and once the
+            // bounded queue filled at capacity everything after it was rejected
+            // as queue-full. The one frontend with no UI to hide it was the one
+            // that never applied anything (bd-88yj).
+            match ctx.world.lock() {
+                Ok(mut world) => {
+                    for bus in (ctx.command_drain.as_ref())() {
+                        let outcome = match scriptbots_core::apply_control_command(
+                            &mut world,
+                            bus.command,
+                        ) {
+                            Ok(_) => scriptbots_app::CommandOutcome::Applied,
+                            Err(error) => {
+                                warn!(%error, receipt = %bus.id, "server rejected a drained control command");
+                                scriptbots_app::CommandOutcome::Rejected
+                            }
+                        };
+                        reporter(&bus.id, outcome);
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "world mutex poisoned in server mode; stopping loop");
+                    break;
+                }
+            }
             if let Err(error) = (ctx.simulation_step)() {
                 warn!(%error, "Simulation step failed in server mode; stopping loop");
                 break;
