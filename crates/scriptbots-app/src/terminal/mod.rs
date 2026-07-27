@@ -1469,15 +1469,20 @@ impl<'a> TerminalApp<'a> {
             .rev()
             .map(|e| e.deaths as u64)
             .collect();
+        // Births and deaths are literally the Birth and Death event kinds, so they
+        // take the same ramp entries the event log uses rather than raw ANSI
+        // green/red. Beyond consistency this is the accessibility fix: green
+        // versus red is indistinguishable under the deuteranopia and protanopia
+        // palettes this app ships, and the raw constants bypassed them (bd-f4x0).
         if !births_data.is_empty() {
             let spark = Sparkline::default()
-                .style(Style::default().fg(Color::Green))
+                .style(self.palette.event_style(EventKind::Birth))
                 .data(&births_data);
             frame.render_widget(spark, trend_layout[2]);
         }
         if !deaths_data.is_empty() {
             let spark = Sparkline::default()
-                .style(Style::default().fg(Color::Red))
+                .style(self.palette.event_style(EventKind::Death))
                 .data(&deaths_data);
             frame.render_widget(spark, trend_layout[3]);
         }
@@ -1726,7 +1731,7 @@ impl<'a> TerminalApp<'a> {
         if let Some(error) = &self.simulation_fault {
             lines.push(Line::from(vec![
                 Span::styled("Simulation ", self.palette.header_style()),
-                Span::styled(format!("fault: {error}"), Style::default().fg(Color::Red)),
+                Span::styled(format!("fault: {error}"), self.palette.error_style()),
             ]));
         }
         let committed = self
@@ -1735,11 +1740,11 @@ impl<'a> TerminalApp<'a> {
             .map_or_else(|| "pending".to_owned(), |tick| format!("t{tick}"));
         let (storage_state, storage_style) = if let Some(error) = &self.analytics_status.last_error
         {
-            (format!("error: {error}"), Style::default().fg(Color::Red))
+            (format!("error: {error}"), self.palette.error_style())
         } else if self.analytics_status.stopped {
-            ("stopped".to_owned(), Style::default().fg(Color::Yellow))
+            ("stopped".to_owned(), self.palette.warn_style())
         } else {
-            ("active".to_owned(), Style::default().fg(Color::Green))
+            ("active".to_owned(), self.palette.ok_style())
         };
         let lag = self
             .analytics_status
@@ -5355,6 +5360,30 @@ impl Palette {
         Style::default().fg(color)
     }
 
+    /// Status chrome colours, drawn from the theme's palette-aware ramp.
+    ///
+    /// Status text was hand-coded to `Color::Green` / `Color::Yellow` /
+    /// `Color::Red`, which is an accessibility defect rather than only a styling
+    /// one: red-versus-green is the exact confusion pair for deuteranopia and
+    /// protanopia, this app SHIPS palettes for both, and raw ANSI constants
+    /// bypass them entirely. A colourblind operator could not tell "active" from
+    /// "error" in the storage row (bd-f4x0).
+    ///
+    /// These reuse the event ramp rather than introducing a fourth colour
+    /// vocabulary, so a status row and the event log agree about what "good" and
+    /// "bad" look like, and every accessibility palette retunes both at once.
+    fn ok_style(&self) -> Style {
+        self.event_style(EventKind::Birth)
+    }
+
+    fn warn_style(&self) -> Style {
+        self.event_style(EventKind::Population)
+    }
+
+    fn error_style(&self) -> Style {
+        self.event_style(EventKind::Death)
+    }
+
     fn has_color(&self) -> bool {
         self.level.is_some()
     }
@@ -7731,6 +7760,104 @@ mod tests {
     /// covered the day it is added — and if the two enums ever diverge, this
     /// fails with the offending theme named rather than a config silently
     /// relocating a user somewhere else.
+    /// Success and failure must be TELLABLE APART in every accessibility palette.
+    ///
+    /// This is the substance behind routing status chrome through the ramp. The
+    /// old code hand-coded `Color::Green` for "active" and `Color::Red` for
+    /// "error", which is the exact pair deuteranopic and protanopic viewers
+    /// cannot separate — and this app ships palettes for both, so the raw
+    /// constants were bypassing the very feature meant to help.
+    ///
+    /// I first wrote this as a measured LUMINANCE separation, on the theory that
+    /// two hues at the same lightness are one colour to a viewer who cannot see
+    /// the hue difference. MEASURING REJECTED THE ASSERTION, not the palettes.
+    /// Every shipped palette separates status by HUE: ok-vs-error runs from
+    /// 1.23:1 (Natural) to 3.14:1 (HighContrast), and Deuteranopia's ok-vs-warn
+    /// is 1.12:1. That is deliberate — the CVD palettes retune hue onto the
+    /// blue-yellow axis those viewers CAN separate and never promised a lightness
+    /// ramp. Demanding one would have required redesigning all five palettes.
+    ///
+    /// Weakening the threshold until the current values cleared it would have
+    /// been worse than deleting it: a gate tuned to its own inputs proves
+    /// nothing. The measured numbers are recorded on the bead and the monochromat
+    /// case they imply is filed rather than silently accepted.
+    #[test]
+    fn ok_warn_and_error_are_distinct_colours_in_every_accessibility_palette() {
+        for mode in [
+            TerminalPaletteMode::Natural,
+            TerminalPaletteMode::Deuteranopia,
+            TerminalPaletteMode::Protanopia,
+            TerminalPaletteMode::Tritanopia,
+            TerminalPaletteMode::HighContrast,
+        ] {
+            let mut palette = Palette::test_backend_evidence();
+            palette.mode = mode;
+
+            let ok = palette
+                .ok_style()
+                .fg
+                .expect("ok status must carry a colour");
+            let warn = palette
+                .warn_style()
+                .fg
+                .expect("warn status must carry a colour");
+            let err = palette
+                .error_style()
+                .fg
+                .expect("error status must carry a colour");
+
+            assert_ne!(
+                ok, err,
+                "{mode:?}: ok and error must not be the same colour"
+            );
+            assert_ne!(
+                ok, warn,
+                "{mode:?}: ok and warn must not be the same colour"
+            );
+            assert_ne!(
+                warn, err,
+                "{mode:?}: warn and error must not be the same colour"
+            );
+
+            // None may be a named ANSI constant: those bypass the palette
+            // entirely, which is the defect this change removed.
+            for (label, color) in [("ok", ok), ("warn", warn), ("error", err)] {
+                assert!(
+                    matches!(color, Color::Rgb(_, _, _)),
+                    "{mode:?}: the {label} status must come from the palette ramp as an \
+                     explicit RGB value, not a named ANSI colour the palette cannot \
+                     retune; got {color:?}"
+                );
+            }
+        }
+    }
+
+    /// The status ramp must actually move when the accessibility palette does.
+    ///
+    /// The negative control for the test above: if `ok_style` returned a
+    /// constant, the separations would still hold and nothing would reveal that
+    /// the palettes were being ignored — which is precisely how the raw ANSI
+    /// constants passed unnoticed.
+    #[test]
+    fn status_chrome_retunes_with_the_accessibility_palette() {
+        let mut natural = Palette::test_backend_evidence();
+        natural.mode = TerminalPaletteMode::Natural;
+        let mut deuter = Palette::test_backend_evidence();
+        deuter.mode = TerminalPaletteMode::Deuteranopia;
+
+        assert_ne!(
+            natural.ok_style().fg,
+            deuter.ok_style().fg,
+            "the ok status colour must be retuned by the accessibility palette; a \
+             constant here means the palette is decorative"
+        );
+        assert_ne!(
+            natural.error_style().fg,
+            deuter.error_style().fg,
+            "the error status colour must be retuned by the accessibility palette"
+        );
+    }
+
     #[test]
     fn every_theme_round_trips_through_the_config_identity() {
         let start = CuratedThemeId::default();
@@ -8918,8 +9045,15 @@ mod tests {
         // Reviewed 2026-07-20 (bd-16g.2.4): the narrative rail now occupies five rows
         // between the header and the body by design, shrinking the map's cell counts
         // and changing the full-cell digest accordingly.
+        // Reviewed 2026-07-27 (bd-f4x0): status chrome moved off hand-coded ANSI
+        // Green/Yellow/Red onto the palette-aware event ramp, so fg colours in the
+        // storage/simulation status rows and the births/deaths sparklines changed.
+        // INSPECTED: the cell counts pinned above are byte-identical across the
+        // change (2361/1526/0/0/0 before and after), so nothing moved on screen —
+        // only the colours the digest also hashes. A layout regression would have
+        // shifted those counts first.
         assert_eq!(
-            evidence.full_cell_fnv1a64, "0bfc28a0bdf694bd",
+            evidence.full_cell_fnv1a64, "c518b8f39fabf19c",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
         assert_eq!(
