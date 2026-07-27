@@ -27,7 +27,58 @@ pub struct RunSummary {
     pub summary_artifact_digest: String,
     /// Retained artifact path, when a production runner materialized one.
     pub summary_path: Option<String>,
+    /// Canonical arm identity from `experiment_runner::ScenarioVariant::variant_id`.
+    ///
+    /// REQUIRED FOR REPRODUCTION (bd-16g.1.7 item 3). `arm_id: u16` is an ordinal that
+    /// cannot resolve back to a variant, and `config_digest` can VERIFY a config without
+    /// being able to RECREATE one. Without these two fields a reproduce script can only
+    /// re-hash what it was given, which is an integrity check, not a reproduction.
+    pub variant_id: String,
+    /// The arm's exact config overrides, so the run can be rebuilt rather than recognized.
+    pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// Provenance schema version this row was WRITTEN at.
+    ///
+    /// Stored rather than assumed, because per bd-2z0.5.6's policy a digest is only
+    /// comparable within one version, and a verifier that cannot see the written version
+    /// is forced to report a schema bump as corruption.
+    pub provenance_version: u32,
     analysis_input_digest: String,
+}
+
+/// Current lab run-summary provenance version (bd-2z0.5.6 policy, per-table versioning).
+///
+/// Bumped 1 -> 2 when `variant_id` and `config_overrides` were folded INTO the digest.
+/// Per the policy this does not invalidate retained v1 artifacts; it makes them
+/// NotComparable, which [`RunSummary::verify_analysis_input`] reports as its own outcome.
+pub const LAB_RUN_SUMMARY_VERSION: u32 = 2;
+
+/// Whether a row's analysis-input digest can be checked, and if so whether it held.
+///
+/// Three outcomes, not two. bd-2z0.5.6's policy turns on the distinction between "this
+/// digest disagrees" and "this digest answers a different question": a boolean forces a
+/// v1 artifact read by v2 code to be reported as corruption, which is how teams talk
+/// themselves into leaving new provenance outside the digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisInputVerdict {
+    /// Same version, digest recomputed and matched.
+    Valid,
+    /// Same version, digest disagrees. The row has been tampered with or detached.
+    Mismatch,
+    /// Written at a different provenance version. NOT a mismatch.
+    NotComparable {
+        /// Version the row was written at.
+        written: u32,
+        /// Version this build computes.
+        current: u32,
+    },
+}
+
+impl AnalysisInputVerdict {
+    /// True only when the row is usable as scientific evidence by THIS build.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        matches!(self, Self::Valid)
+    }
 }
 
 impl RunSummary {
@@ -43,6 +94,8 @@ impl RunSummary {
         metrics: BTreeMap<String, f64>,
         summary_artifact_digest: String,
         summary_path: Option<String>,
+        variant_id: String,
+        config_overrides: BTreeMap<String, serde_json::Value>,
     ) -> Self {
         let analysis_input_digest = analysis_input_digest(
             &run_id,
@@ -53,6 +106,8 @@ impl RunSummary {
             ticks,
             &metrics,
             &summary_artifact_digest,
+            &variant_id,
+            &config_overrides,
         );
         Self {
             run_id,
@@ -64,6 +119,9 @@ impl RunSummary {
             metrics,
             summary_artifact_digest,
             summary_path,
+            variant_id,
+            config_overrides,
+            provenance_version: LAB_RUN_SUMMARY_VERSION,
             analysis_input_digest,
         }
     }
@@ -74,8 +132,18 @@ impl RunSummary {
         &self.analysis_input_digest
     }
 
-    fn has_valid_analysis_input_digest(&self) -> bool {
-        self.analysis_input_digest
+    /// Check the row against its own provenance, distinguishing all three outcomes.
+    #[must_use]
+    pub fn verify_analysis_input(&self) -> AnalysisInputVerdict {
+        // Version FIRST. Recomputing a v1 digest with v2 inputs would disagree, and
+        // reporting that as Mismatch is the exact confusion the policy forbids.
+        if self.provenance_version != LAB_RUN_SUMMARY_VERSION {
+            return AnalysisInputVerdict::NotComparable {
+                written: self.provenance_version,
+                current: LAB_RUN_SUMMARY_VERSION,
+            };
+        }
+        if self.analysis_input_digest
             == analysis_input_digest(
                 &self.run_id,
                 self.arm_id,
@@ -85,7 +153,18 @@ impl RunSummary {
                 self.ticks,
                 &self.metrics,
                 &self.summary_artifact_digest,
+                &self.variant_id,
+                &self.config_overrides,
             )
+        {
+            AnalysisInputVerdict::Valid
+        } else {
+            AnalysisInputVerdict::Mismatch
+        }
+    }
+
+    fn has_valid_analysis_input_digest(&self) -> bool {
+        self.verify_analysis_input().is_valid()
     }
 }
 
@@ -104,9 +183,15 @@ fn analysis_input_digest(
     ticks: u64,
     metrics: &BTreeMap<String, f64>,
     summary_artifact_digest: &str,
+    variant_id: &str,
+    config_overrides: &BTreeMap<String, serde_json::Value>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"scriptbots.lab-run-summary.v1\0");
+    // v2 (bd-16g.1.7): variant_id and config_overrides joined the digest. Per bd-2z0.5.6
+    // the new reproduction inputs go INSIDE the digest -- provenance the integrity digest
+    // does not cover is not provenance -- and the version tag is what keeps v1 artifacts
+    // reported as NotComparable rather than corrupt.
+    hasher.update(b"scriptbots.lab-run-summary.v2\0");
     hash_len_prefixed(&mut hasher, run_id.as_bytes());
     hasher.update(&arm_id.to_le_bytes());
     hasher.update(&seed.to_le_bytes());
@@ -121,6 +206,23 @@ fn analysis_input_digest(
         hasher.update(&value.to_bits().to_le_bytes());
     }
     hash_len_prefixed(&mut hasher, summary_artifact_digest.as_bytes());
+    hash_len_prefixed(&mut hasher, variant_id.as_bytes());
+    let override_count =
+        u64::try_from(config_overrides.len()).expect("map length fits u64 on supported targets");
+    hasher.update(&override_count.to_le_bytes());
+    for (key, value) in config_overrides {
+        hash_len_prefixed(&mut hasher, key.as_bytes());
+        // CANONICALIZE. `serde_json`'s `preserve_order` is on workspace-wide, so a nested
+        // object hashes by INSERTION order unless its keys are sorted first. Two code
+        // paths building the same logical config would otherwise digest differently.
+        let canonical = crate::precedence::canonical_value(value);
+        hash_len_prefixed(
+            &mut hasher,
+            serde_json::to_string(&canonical)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
     hasher.finalize().to_hex().to_string()
 }
 
@@ -1183,6 +1285,11 @@ mod tests {
                 .collect(),
             format!("summary-{run_id}"),
             None,
+            format!("arm-{arm_id:03}"),
+            BTreeMap::from([(
+                "food_regrowth_rate".to_owned(),
+                serde_json::json!(0.1 * f64::from(arm_id + 1)),
+            )]),
         )
     }
 
@@ -2018,6 +2125,130 @@ mod tests {
         assert_eq!(
             less.effects[0].alternative,
             AlternativeHypothesis::TreatmentLess
+        );
+    }
+
+    /// A row written at an older provenance version is NOT CORRUPT.
+    ///
+    /// This is the bd-2z0.5.6 policy's whole point. Before the third outcome existed, a v1
+    /// artifact read by v2 code recomputed a different digest and reported Mismatch --
+    /// indistinguishable from tampering, and the reason teams talk themselves into leaving
+    /// new provenance outside the digest.
+    #[test]
+    fn bd_16g_1_7_an_older_provenance_version_is_not_comparable_not_a_mismatch() {
+        let mut old = report_summary("r1", 0, 7, [("alive_agents", 100.0)]);
+        old.provenance_version = 1;
+
+        let verdict = old.verify_analysis_input();
+        assert_eq!(
+            verdict,
+            AnalysisInputVerdict::NotComparable {
+                written: 1,
+                current: LAB_RUN_SUMMARY_VERSION,
+            }
+        );
+        assert_ne!(
+            verdict,
+            AnalysisInputVerdict::Mismatch,
+            "a schema bump must never be reported as corruption"
+        );
+        assert!(
+            !verdict.is_valid(),
+            "still unusable as evidence by this build"
+        );
+    }
+
+    /// Tampering within the current version is still a Mismatch.
+    #[test]
+    fn bd_16g_1_7_tampering_at_the_current_version_is_still_a_mismatch() {
+        let mut row = report_summary("r1", 0, 7, [("alive_agents", 100.0)]);
+        assert_eq!(row.verify_analysis_input(), AnalysisInputVerdict::Valid);
+
+        row.seed = 8;
+        assert_eq!(
+            row.verify_analysis_input(),
+            AnalysisInputVerdict::Mismatch,
+            "NotComparable must not become a way to launder a detached row"
+        );
+    }
+
+    /// The reproduction inputs are actually COVERED by the digest.
+    ///
+    /// If they were carried alongside it, every assertion here would pass while the config
+    /// silently drifted -- reproducible in principle, unverified in fact.
+    #[test]
+    fn bd_16g_1_7_reproduction_inputs_are_inside_the_digest() {
+        let base = report_summary("r1", 0, 7, [("alive_agents", 100.0)]);
+
+        let mut changed_variant = base.clone();
+        changed_variant.variant_id = "arm-999".to_owned();
+        assert_eq!(
+            changed_variant.verify_analysis_input(),
+            AnalysisInputVerdict::Mismatch,
+            "variant_id must be covered by the digest"
+        );
+
+        let mut changed_config = base.clone();
+        changed_config
+            .config_overrides
+            .insert("food_regrowth_rate".to_owned(), serde_json::json!(999.0));
+        assert_eq!(
+            changed_config.verify_analysis_input(),
+            AnalysisInputVerdict::Mismatch,
+            "config_overrides must be covered by the digest"
+        );
+    }
+
+    /// Key ORDER inside a nested config value must not change the digest.
+    ///
+    /// `serde_json`'s `preserve_order` is enabled workspace-wide, so a nested object
+    /// serializes in INSERTION order. Two code paths building the same logical config would
+    /// otherwise produce two different digests for one config -- a false mismatch that
+    /// looks exactly like tampering.
+    #[test]
+    fn bd_16g_1_7_nested_config_key_order_does_not_change_the_digest() {
+        let forward = {
+            let mut map = serde_json::Map::new();
+            map.insert("alpha".to_owned(), serde_json::json!(1));
+            map.insert("beta".to_owned(), serde_json::json!(2));
+            map.insert("gamma".to_owned(), serde_json::json!(3));
+            serde_json::Value::Object(map)
+        };
+        let reversed = {
+            let mut map = serde_json::Map::new();
+            map.insert("gamma".to_owned(), serde_json::json!(3));
+            map.insert("beta".to_owned(), serde_json::json!(2));
+            map.insert("alpha".to_owned(), serde_json::json!(1));
+            serde_json::Value::Object(map)
+        };
+
+        // Guard the premise: if preserve_order is ever disabled these are already equal as
+        // strings and the test would pass without proving anything.
+        assert_ne!(
+            serde_json::to_string(&forward).unwrap(),
+            serde_json::to_string(&reversed).unwrap(),
+            "premise: preserve_order makes insertion order observable in the raw encoding"
+        );
+
+        let build = |nested: serde_json::Value| {
+            RunSummary::from_verified_parts(
+                "r1".to_owned(),
+                0,
+                7,
+                "config".to_owned(),
+                "digest".to_owned(),
+                100,
+                BTreeMap::from([("alive_agents".to_owned(), 100.0)]),
+                "summary".to_owned(),
+                None,
+                "arm-000".to_owned(),
+                BTreeMap::from([("nested".to_owned(), nested)]),
+            )
+        };
+        assert_eq!(
+            build(forward).analysis_input_digest(),
+            build(reversed).analysis_input_digest(),
+            "one logical config must have exactly one digest"
         );
     }
 }

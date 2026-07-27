@@ -25,6 +25,13 @@ pub struct RunRef {
     pub summary_artifact_digest: String,
     pub analysis_input_digest: String,
     pub summary_path: Option<String>,
+    /// Canonical arm identity, so a reproduction can rebuild the arm rather than
+    /// recognize its digest (bd-16g.1.7 item 3).
+    pub variant_id: String,
+    /// The arm's exact config overrides.
+    pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// Provenance schema version this run was written at (bd-2z0.5.6 policy).
+    pub provenance_version: u32,
 }
 
 /// Provenance support payload attached to a scientific claim.
@@ -122,6 +129,9 @@ impl From<&RunSummary> for RunRef {
             summary_artifact_digest: summary.summary_artifact_digest.clone(),
             analysis_input_digest: summary.analysis_input_digest().to_owned(),
             summary_path: summary.summary_path.clone(),
+            variant_id: summary.variant_id.clone(),
+            config_overrides: summary.config_overrides.clone(),
+            provenance_version: summary.provenance_version,
         }
     }
 }
@@ -378,6 +388,15 @@ impl NotebookRenderer {
                         "analysis_input_digest",
                     ),
                     (known.summary_path == run_ref.summary_path, "summary_path"),
+                    (known.variant_id == run_ref.variant_id, "variant_id"),
+                    (
+                        known.config_overrides == run_ref.config_overrides,
+                        "config_overrides",
+                    ),
+                    (
+                        known.provenance_version == run_ref.provenance_version,
+                        "provenance_version",
+                    ),
                 ] {
                     if !matches {
                         return Err(NotebookRenderError::RunProvenanceMismatch {
@@ -832,6 +851,12 @@ mod tests {
             summary_artifact_digest: format!("summary-{run_id}"),
             analysis_input_digest: format!("analysis-{run_id}"),
             summary_path: None,
+            variant_id: format!("arm-{arm_id:03}"),
+            config_overrides: BTreeMap::from([(
+                "food_regrowth_rate".to_owned(),
+                serde_json::json!(0.1 * f64::from(arm_id + 1)),
+            )]),
+            provenance_version: super::super::stats::LAB_RUN_SUMMARY_VERSION,
         }
     }
 
@@ -886,6 +911,11 @@ mod tests {
             BTreeMap::from([("alive_agents".to_owned(), value)]),
             format!("summary-{run_id}"),
             None,
+            format!("arm-{arm_id:03}"),
+            BTreeMap::from([(
+                "food_regrowth_rate".to_owned(),
+                serde_json::json!(0.1 * f64::from(arm_id + 1)),
+            )]),
         )
     }
 

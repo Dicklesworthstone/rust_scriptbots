@@ -382,7 +382,17 @@ pub fn canonical_layer_bytes(fields: &JsonValue) -> Vec<u8> {
 ///
 /// Array order is preserved — element order is data, while object key order is
 /// an accident of construction.
-fn canonical_value(value: &JsonValue) -> JsonValue {
+/// Recursively sort object keys so a JSON value has ONE canonical byte form.
+///
+/// `serde_json`'s `preserve_order` feature is enabled workspace-wide (unified by a
+/// dependency), so `Value::Object` serializes in INSERTION order. Any digest computed over
+/// un-canonicalized JSON therefore depends on how the map was built, which makes it
+/// unstable across code paths that produce the same logical value.
+///
+/// Shared with `lab::stats` (bd-16g.1.7) rather than duplicated: two canonicalizers that
+/// drift apart would produce two digests for one config, which is exactly the failure the
+/// digest exists to catch.
+pub(crate) fn canonical_value(value: &JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();

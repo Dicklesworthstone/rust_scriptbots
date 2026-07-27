@@ -330,6 +330,20 @@ fn completed_run_summaries(
                 bundle_dir.display()
             )
         })?;
+        // The arm's actual overrides, not just its ordinal. An out-of-range arm is a hard
+        // error rather than an empty map: empty overrides are a VALID config (the defaults),
+        // so defaulting here would digest a broken run as a clean default-config run.
+        let config_overrides = spec
+            .arms
+            .get(usize::from(arm_id))
+            .ok_or_else(|| {
+                format!(
+                    "run {} names arm {arm_id} but the spec declares only {} arm(s)",
+                    record.run_id,
+                    spec.arms.len()
+                )
+            })?
+            .clone();
         summaries.push(RunSummary::from_verified_parts(
             record.run_id.clone(),
             arm_id,
@@ -340,6 +354,8 @@ fn completed_run_summaries(
             BTreeMap::from([("alive_agents".to_owned(), f64::from(alive_agents))]),
             summary_entry.blake3_hex.clone(),
             Some(summary_path.to_string_lossy().into_owned()),
+            record.variant_id.clone(),
+            config_overrides,
         ));
     }
     Ok(summaries)
@@ -938,6 +954,8 @@ mod tests {
                         )]),
                         format!("summary-{run_id}"),
                         None,
+                        format!("arm-{arm_id:03}"),
+                        arm.clone(),
                     ));
                 }
             }
@@ -1196,6 +1214,8 @@ mod tests {
                 .to_hex()
                 .to_string(),
             None,
+            treatment.variant_id.clone(),
+            treatment.config_overrides.clone(),
         );
         assert_ne!(
             render(&changed),
