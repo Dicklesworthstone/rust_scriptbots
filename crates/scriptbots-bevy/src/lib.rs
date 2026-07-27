@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::prelude::*;
+use bevy::camera::{ManualTextureViewHandle, RenderTarget};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
@@ -22,7 +23,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::view::{ColorGrading, Hdr};
 use bevy::ui::{BorderColor, BorderRadius};
-use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
+use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin, WindowRef};
 use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use bevy_post_process::bloom::Bloom;
@@ -3839,6 +3840,69 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    /// Pointer input must resolve to the window its own camera renders to.
+    ///
+    /// This is the per-window half of bd-2z0.7.14. The failure it prevents is
+    /// silent: with two windows, reading the cursor from `PrimaryWindow` while
+    /// projecting through that cursor's unrelated camera picks an agent the
+    /// user never clicked on, and every individual step succeeds, so nothing
+    /// reports anything.
+    #[test]
+    fn pointer_input_resolves_to_the_cameras_own_window() {
+        let primary = Entity::from_raw_u32(1).expect("entity index 1 is valid");
+        let secondary = Entity::from_raw_u32(2).expect("entity index 2 is valid");
+
+        assert_eq!(
+            camera_target_window(&RenderTarget::Window(WindowRef::Primary), Some(primary)),
+            Some(primary),
+            "a primary-ref camera must follow whichever entity currently holds PrimaryWindow"
+        );
+
+        // THE REGRESSION THIS EXISTS TO CATCH: an explicit window ref must not
+        // fall back to the primary window. That fallback is exactly what
+        // projected a click in the second window through the first window's
+        // cursor.
+        assert_eq!(
+            camera_target_window(
+                &RenderTarget::Window(WindowRef::Entity(secondary)),
+                Some(primary)
+            ),
+            Some(secondary),
+            "a camera rendering to a secondary window must read that window's cursor, \
+             not the primary window's"
+        );
+
+        // Absent is absent, not a guess.
+        assert_eq!(
+            camera_target_window(&RenderTarget::Window(WindowRef::Primary), None),
+            None,
+            "with no primary window there is no pointer window to fall back to"
+        );
+    }
+
+    /// A camera that renders off-screen has no pointer window at all.
+    ///
+    /// The positive control is the test above: these same inputs DO resolve for
+    /// window targets, so `None` here is a decision about off-screen targets
+    /// rather than the function failing to resolve anything.
+    #[test]
+    fn offscreen_cameras_have_no_pointer_window() {
+        let primary = Entity::from_raw_u32(1).expect("entity index 1 is valid");
+        for target in [
+            RenderTarget::TextureView(ManualTextureViewHandle(0)),
+            RenderTarget::None {
+                size: UVec2::splat(4),
+            },
+        ] {
+            assert_eq!(
+                camera_target_window(&target, Some(primary)),
+                None,
+                "an off-screen target has no cursor, so it must not borrow the \
+                 primary window's: {target:?}"
+            );
+        }
+    }
+
     /// Every selection path must gate its camera commit on the enqueue result.
     ///
     /// The submitter returns a bool meaning ENQUEUED, not applied — a weaker
@@ -4699,10 +4763,33 @@ fn format_event_feed(events: &[HudEvent]) -> String {
     line
 }
 
+/// Resolve which window a camera's pointer input belongs to.
+///
+/// Pointer-driven selection used to read the cursor from whichever window
+/// carried [`PrimaryWindow`] while projecting that cursor through
+/// [`PrimaryCamera`]. With a single window those are the same window and the
+/// bug is invisible. With two, a click in the second window is projected
+/// through the FIRST window's cursor position, so the pick lands somewhere the
+/// user never clicked — and silently, because every step succeeds
+/// (bd-2z0.7.14).
+///
+/// Returns `None` when the camera does not render to a window at all. An image
+/// target, a manual texture view and a disabled target have no cursor, so the
+/// honest answer is "no window" rather than a fallback to the primary one.
+/// Falling back is precisely what produced the wrong-window pick.
+fn camera_target_window(target: &RenderTarget, primary: Option<Entity>) -> Option<Entity> {
+    match target {
+        RenderTarget::Window(WindowRef::Primary) => primary,
+        RenderTarget::Window(WindowRef::Entity(window)) => Some(*window),
+        RenderTarget::Image(_) | RenderTarget::TextureView(_) | RenderTarget::None { .. } => None,
+    }
+}
+
 fn handle_selection_input(
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
-    windows: Query<&Window, With<PrimaryWindow>>,
+    windows: Query<&Window>,
+    primary_window: Query<Entity, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<PrimaryCamera>>,
     state: Res<SnapshotState>,
     submitter: Option<Res<CommandSubmitter>>,
@@ -4736,14 +4823,23 @@ fn handle_selection_input(
         None => return,
     };
 
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let Some(cursor_pos) = window.cursor_position() else {
+    let Ok((camera, transform)) = camera_query.single() else {
         return;
     };
 
-    let Ok((camera, transform)) = camera_query.single() else {
+    // Read the cursor from the window this camera actually renders to, not from
+    // whichever window happens to hold `PrimaryWindow` (bd-2z0.7.14). The camera
+    // is resolved FIRST because it is what names the window; doing it the other
+    // way round is what let the two drift apart.
+    let Some(target_window) = camera_target_window(&camera.target, primary_window.single().ok())
+    else {
+        return;
+    };
+    let Some(cursor_pos) = windows
+        .get(target_window)
+        .ok()
+        .and_then(|window| window.cursor_position())
+    else {
         return;
     };
     let Ok(ray) = camera.viewport_to_world(transform, cursor_pos) else {
