@@ -217,9 +217,10 @@ const SCRIPTBOTS_SCHEMA_V11_VERSION: i64 = 11;
 const SCRIPTBOTS_SCHEMA_V12_VERSION: i64 = 12;
 const SCRIPTBOTS_SCHEMA_V13_VERSION: i64 = 13;
 const SCRIPTBOTS_SCHEMA_V14_VERSION: i64 = 14;
+const SCRIPTBOTS_SCHEMA_V15_VERSION: i64 = 15;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 15;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 16;
 
 /// Accumulates one tick's per-island batches and releases them only as a COMPLETE barrier.
 ///
@@ -1602,7 +1603,100 @@ const SCRIPTBOTS_SCHEMA_V15: &str = r#"
     PRAGMA user_version = 15;
 "#;
 
-const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 10] = [
+/// V16 migration: let `migrations` express an actual migration, and bound the island columns.
+///
+/// THE DEFECT THIS FIXES. `AppliedMigration` (archipelago.rs) carries TWO organism identities —
+/// `from: OrganismId::new(from, uid)` and `to: OrganismId::new(to, arrival)` — and `uid` and
+/// `arrival` DIFFER, because a `AgentUid` is unique only within the island that minted it
+/// (bd-8jlj). A migrating organism necessarily changes local identity when it crosses. The V6
+/// table has ONE `agent_uid` column, so it could record the departure identity or the arrival
+/// identity but never both: nothing linked a migrations row to the birth row it caused in the
+/// destination island, the per-island conservation identity could not close, and "trace this
+/// organism across islands" was unanswerable offline although the live producer knew the answer.
+///
+/// DONE NOW BECAUSE BOTH TABLES ARE EMPTY. They have had zero writers since V6, so this rebuild
+/// carries no rows and risks nothing. Doing it before anything writes is the difference between
+/// a schema fix and a data migration; it will never be cheaper.
+///
+/// THE SELF-EDGE CHECK IS VERIFIED SAFE, NOT ASSUMED: topology validation already refuses
+/// self-edges with `ArchipelagoError::SelfEdge` (`normalized_edges` in archipelago.rs), so the
+/// migrator cannot emit `island_id_from == island_id_to`. The constraint makes a corrupted or
+/// hand-written row impossible rather than merely unlikely, matching the CHECK discipline the
+/// rest of this DDL keeps.
+///
+/// THE ISLAND BOUNDS CLOSE A GAP V15 LEFT. V15 bounded every per-tick `island_id` to the `u32`
+/// domain `IslandId` can present, but did not touch these two tables — so until now they
+/// accepted island ids the rest of the schema refused.
+///
+/// REBUILT BY RENAMING ASIDE AND CREATING UNDER THE FINAL NAME, never create-copy-drop-rename.
+/// `ALTER TABLE ... RENAME TO` rewrites a table's stored SQL text, and `storage.recovery_schema`
+/// digests that text byte-for-byte, so a rename-terminated rebuild produces a database that is
+/// structurally correct and refuses its own fingerprint. V15 learned that the hard way.
+///
+/// THE COLUMN NAMES ARE ASYMMETRIC — `agent_uid` and `agent_uid_to` — AND THAT IS DELIBERATE.
+/// The obvious pairing is `agent_uid_from`/`agent_uid_to`, and the first version of this
+/// migration did exactly that. It was refused by
+/// `v6_scientific_schema_is_only_ever_extended_by_later_migrations`: renaming `agent_uid` REWRITES
+/// a frozen V6 column, and the frozen order may only ever be APPENDED to. The guard is right and
+/// weakening it for a table that happens to be empty would trade a real invariant for tidier
+/// names, so the new column is appended last instead.
+///
+/// Read them as: `agent_uid` is the identity the organism DEPARTED under, minted by
+/// `island_id_from`; `agent_uid_to` is the identity it ARRIVED under, minted by `island_id_to`.
+/// They differ by construction. Anyone tempted to "fix" the asymmetry should re-read the guard
+/// first.
+///
+/// The backfill copies `agent_uid` into `agent_uid_to`, which is exact because both tables have
+/// had zero writers since V6 and therefore hold no rows. Were a row to exist, it would surface
+/// as departure == arrival — an impossible migration, and so detectable — rather than as a
+/// plausible wrong answer.
+const SCRIPTBOTS_SCHEMA_V16: &str = r#"
+    ALTER TABLE islands RENAME TO islands_pre_v16;
+    CREATE TABLE islands (
+        run_id TEXT NOT NULL,
+        island_id INTEGER NOT NULL
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
+        label TEXT NOT NULL,
+        config_hash BLOB NOT NULL,
+        config_json TEXT NOT NULL,
+        PRIMARY KEY (run_id, island_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO islands (run_id, island_id, label, config_hash, config_json)
+    SELECT run_id, island_id, label, config_hash, config_json FROM islands_pre_v16;
+    DROP TABLE islands_pre_v16;
+
+    ALTER TABLE migrations RENAME TO migrations_pre_v16;
+    CREATE TABLE migrations (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        island_id_from INTEGER NOT NULL
+            CHECK (island_id_from >= 0 AND island_id_from <= 4294967295),
+        island_id_to INTEGER NOT NULL
+            CHECK (island_id_to >= 0 AND island_id_to <= 4294967295),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        rule TEXT NOT NULL CHECK (rule <> ''),
+        key_value REAL NOT NULL,
+        rank INTEGER NOT NULL CHECK (rank >= 0),
+        agent_uid_to INTEGER NOT NULL CHECK (agent_uid_to >= 0),
+        CHECK (island_id_from <> island_id_to),
+        PRIMARY KEY (run_id, tick, seq),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO migrations (
+        run_id, tick, seq, island_id_from, island_id_to,
+        agent_uid, rule, key_value, rank, agent_uid_to
+    )
+    SELECT run_id, tick, seq, island_id_from, island_id_to,
+           agent_uid, rule, key_value, rank, agent_uid
+    FROM migrations_pre_v16;
+    DROP TABLE migrations_pre_v16;
+
+    PRAGMA user_version = 16;
+"#;
+
+const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 11] = [
     (
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         "create_multi_run_schema",
@@ -1649,9 +1743,14 @@ const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 10] = [
         SCRIPTBOTS_SCHEMA_V14,
     ),
     (
-        SCRIPTBOTS_SCHEMA_VERSION,
+        SCRIPTBOTS_SCHEMA_V15_VERSION,
         "partition_per_tick_tables_by_island",
         SCRIPTBOTS_SCHEMA_V15,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_VERSION,
+        "migrations_carry_both_organism_identities",
+        SCRIPTBOTS_SCHEMA_V16,
     ),
 ];
 
@@ -1791,7 +1890,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
     // Every suffix of the chain is a legal lineage: a database joins at whatever version it
     // was left at and runs forward from there. Enumerated rather than computed so that adding
     // a migration without extending this list fails loudly instead of accepting a gap.
-    const LINEAGE: [i64; 10] = [
+    const LINEAGE: [i64; 11] = [
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         SCRIPTBOTS_SCHEMA_V7_VERSION,
         SCRIPTBOTS_SCHEMA_V8_VERSION,
@@ -1801,6 +1900,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
         SCRIPTBOTS_SCHEMA_V12_VERSION,
         SCRIPTBOTS_SCHEMA_V13_VERSION,
         SCRIPTBOTS_SCHEMA_V14_VERSION,
+        SCRIPTBOTS_SCHEMA_V15_VERSION,
         SCRIPTBOTS_SCHEMA_VERSION,
     ];
     let applied_is_valid = result.applied.is_empty()
@@ -24221,8 +24321,12 @@ mod tests {
                 "add_narrative_input_replay_contract",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V15_VERSION,
                 "partition_per_tick_tables_by_island",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "migrations_carry_both_organism_identities",
             ),
         ];
         assert_eq!(migrations.len(), expected.len());
@@ -25263,7 +25367,7 @@ mod tests {
 
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 10);
+        assert_eq!(migrations.len(), 11);
         for (index, (expected_version, expected_name)) in [
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
@@ -25292,8 +25396,12 @@ mod tests {
                 "add_narrative_input_replay_contract",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V15_VERSION,
                 "partition_per_tick_tables_by_island",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "migrations_carry_both_organism_identities",
             ),
         ]
         .into_iter()
@@ -25827,6 +25935,23 @@ mod tests {
         Ok(())
     }
 
+    /// Every table a post-V12 migration rebuilt, so the V12 fixture must restore all of them.
+    ///
+    /// V15 rebuilt the seven per-tick tables; V16 rebuilt `islands` and `migrations`. A
+    /// downgrade that reverted only one migration's worth would leave a database that is not
+    /// V12 and would be asserted to be.
+    const POST_V12_REBUILT_TABLES: [&str; 9] = [
+        "tick_summaries",
+        "metrics",
+        "events",
+        "replay_events",
+        "agents",
+        "births",
+        "deaths",
+        "islands",
+        "migrations",
+    ];
+
     /// The per-tick tables V15 partitions by `island_id`, in migration order.
     const V15_PARTITIONED_TABLES: [&str; 7] = [
         "tick_summaries",
@@ -25869,7 +25994,24 @@ mod tests {
         connection: &Connection,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let canonical = canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?;
-        for table in V15_PARTITIONED_TABLES {
+        for table in POST_V12_REBUILT_TABLES {
+            // `islands` and `migrations` are recreated EMPTY rather than copied down, because
+            // V16 renamed a column (`agent_uid` became `agent_uid_from`/`agent_uid_to`) and a
+            // by-name copy is therefore impossible. That is sound only while they have no
+            // writers, so the emptiness is ASSERTED rather than assumed — the moment
+            // bd-16g.5.5.1 populates them this fires and forces a real down-conversion instead
+            // of silently discarding rows.
+            let recreate_empty = matches!(table, "islands" | "migrations");
+            if recreate_empty {
+                let rows: i64 = connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"))?
+                    .get_typed(0)?;
+                assert_eq!(
+                    rows, 0,
+                    "{table} now holds rows, so this fixture can no longer recreate it empty; \
+                     V16 renamed a column and the downgrade needs a real column mapping"
+                );
+            }
             let carried = connection
                 .query(&format!(
                     "SELECT name FROM pragma_table_info('{table}')
@@ -25917,9 +26059,11 @@ mod tests {
                     }
                 }
             }
-            connection.execute(&format!(
-                "INSERT INTO {table} ({carried}) SELECT {carried} FROM {aside}"
-            ))?;
+            if !recreate_empty {
+                connection.execute(&format!(
+                    "INSERT INTO {table} ({carried}) SELECT {carried} FROM {aside}"
+                ))?;
+            }
             // Dropped before the indexes are recreated: the renamed table still owns the V15
             // index names, and creating the V12 ones first would collide.
             connection.execute(&format!("DROP TABLE {aside}"))?;
@@ -26183,6 +26327,142 @@ mod tests {
             (decode::<f64>(&row, 2, "tick_summaries.total_energy")? - 1.5).abs() < f64::EPSILON,
             "the migration must carry the original measurement across the table rebuild"
         );
+
+        connection.close()?;
+        Ok(())
+    }
+
+    /// A `migrations` row can express AN ACTUAL MIGRATION, not merely that one occurred.
+    ///
+    /// bd-16g.5.5.7. The V6 shape had a single `agent_uid` and could therefore say "an organism
+    /// moved from island 1 to island 3" while being structurally unable to say WHICH organism
+    /// arrived. A uid is unique only within the island that minted it (bd-8jlj), and the
+    /// destination mints a fresh one on arrival, so the departure and arrival identities differ
+    /// and the destination's `births` row carries the arrival uid. With only one column, nothing
+    /// linked the migration to the birth it caused.
+    ///
+    /// THE ASSERTION IS THAT ALL FOUR PARTS ARE INDEPENDENTLY RECOVERABLE — source island,
+    /// destination island, departing identity, arriving identity — with four DISTINCT values, so
+    /// a schema that collapsed the two uids into one, or that stored the same value in both
+    /// columns, fails. "Some migration occurred" is what the old shape could already say.
+    #[test]
+    fn v16_migrations_can_express_a_whole_migration() -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        install_scriptbots_schema(&connection)?;
+        connection.execute("PRAGMA foreign_keys = ON")?;
+        let run = RunId::new(31);
+        register_bare_run(&connection, run)?;
+
+        // `agent_uid` is the DEPARTING identity and `agent_uid_to` the ARRIVING one; the
+        // asymmetry is forced by the V6 append-only rule and is documented on the V16 migration.
+        let migration_sql = "INSERT INTO migrations (
+                run_id, tick, seq, island_id_from, island_id_to,
+                agent_uid, agent_uid_to, rule, key_value, rank
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'fittest', 4.5, 0)";
+
+        // Island 1's agent 7 departs and arrives on island 3 as agent 42. Every value distinct,
+        // so no pair can be confused for another if the columns were ever transposed.
+        connection.execute_with_params(
+            migration_sql,
+            &[
+                sqlite_run_id(run),
+                11_i64.into(),
+                0_i64.into(),
+                1_i64.into(),
+                3_i64.into(),
+                7_i64.into(),
+                42_i64.into(),
+            ],
+        )?;
+
+        let row = connection.query_row_with_params(
+            "SELECT island_id_from, island_id_to, agent_uid, agent_uid_to, rule, rank
+             FROM migrations WHERE run_id = ?1 AND tick = 11 AND seq = 0",
+            &[sqlite_run_id(run)],
+        )?;
+        assert_eq!(decode::<i64>(&row, 0, "migrations.island_id_from")?, 1);
+        assert_eq!(decode::<i64>(&row, 1, "migrations.island_id_to")?, 3);
+        assert_eq!(
+            decode::<i64>(&row, 2, "migrations.agent_uid")?,
+            7,
+            "the departing identity must survive independently of the arriving one"
+        );
+        assert_eq!(
+            decode::<i64>(&row, 3, "migrations.agent_uid_to")?,
+            42,
+            "the ARRIVING identity is what links this migration to the destination island's \
+             birth row; collapsing it into the departing uid is the defect V16 exists to fix"
+        );
+        assert_eq!(decode::<String>(&row, 4, "migrations.rule")?, "fittest");
+        assert_eq!(decode::<i64>(&row, 5, "migrations.rank")?, 0);
+
+        // A self-migration is refused. Safe to enforce because topology validation already
+        // rejects self-edges (ArchipelagoError::SelfEdge), so the migrator cannot emit one.
+        let self_edge = connection
+            .execute_with_params(
+                migration_sql,
+                &[
+                    sqlite_run_id(run),
+                    12_i64.into(),
+                    0_i64.into(),
+                    2_i64.into(),
+                    2_i64.into(),
+                    1_i64.into(),
+                    2_i64.into(),
+                ],
+            )
+            .expect_err("a migration from an island to itself was accepted");
+        assert!(
+            self_edge.to_string().contains("CHECK constraint failed"),
+            "got: {self_edge}"
+        );
+
+        // The island bound V15 applied everywhere else now covers these tables too.
+        let out_of_range = connection
+            .execute_with_params(
+                migration_sql,
+                &[
+                    sqlite_run_id(run),
+                    13_i64.into(),
+                    0_i64.into(),
+                    1_i64.into(),
+                    (SCRIPTBOTS_MAX_ISLAND_ID + 1).into(),
+                    1_i64.into(),
+                    2_i64.into(),
+                ],
+            )
+            .expect_err("an island beyond the IslandId domain was accepted");
+        assert!(
+            out_of_range.to_string().contains("CHECK constraint failed"),
+            "got: {out_of_range}"
+        );
+
+        let island_bound = connection
+            .execute_with_params(
+                "INSERT INTO islands (run_id, island_id, label, config_hash, config_json)
+                 VALUES (?1, ?2, 'over', X'00', '{}')",
+                &[sqlite_run_id(run), (SCRIPTBOTS_MAX_ISLAND_ID + 1).into()],
+            )
+            .expect_err("islands accepted an id beyond the IslandId domain");
+        assert!(
+            island_bound.to_string().contains("CHECK constraint failed"),
+            "got: {island_bound}"
+        );
+
+        // CONTROL: a well-formed second migration lands, so the three refusals are attributable
+        // to their stated causes rather than to a wedged table.
+        connection.execute_with_params(
+            migration_sql,
+            &[
+                sqlite_run_id(run),
+                14_i64.into(),
+                0_i64.into(),
+                3_i64.into(),
+                1_i64.into(),
+                42_i64.into(),
+                9_i64.into(),
+            ],
+        )?;
 
         connection.close()?;
         Ok(())
@@ -26495,7 +26775,8 @@ mod tests {
                 (12, 'create_plain_content_narrative_search', 'forged'),
                 (13, 'add_durable_command_claims', 'forged'),
                 (14, 'add_narrative_input_replay_contract', 'forged'),
-                (15, 'partition_per_tick_tables_by_island', 'forged');
+                (15, 'partition_per_tick_tables_by_island', 'forged'),
+                (16, 'migrations_carry_both_organism_identities', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -26505,7 +26786,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 15;",
+             PRAGMA user_version = 16;",
         )?;
         connection.close()?;
 
