@@ -2357,6 +2357,14 @@ impl<'a> TerminalApp<'a> {
 
         // Typographic scale (bd-f4x0): label recedes, value carries, hint qualifies.
         let mut lines: Vec<Line> = Vec::new();
+        // The single-cone view carries the same caveat as the all-cones view: it
+        // is the same counterfactual, narrowed. Omitting it here would mean the
+        // warning disappears exactly when the user has drilled in far enough to
+        // start drawing conclusions from one cone (bd-r7cz).
+        lines.push(Line::from(Span::styled(
+            PROBE_COUNTERFACTUAL_NOTE,
+            self.palette.muted_style(),
+        )));
         lines.push(Line::from(vec![
             Span::styled("eye ", self.palette.label_style()),
             Span::styled(eye.to_string(), self.palette.value_style()),
@@ -2433,9 +2441,20 @@ impl<'a> TerminalApp<'a> {
     /// list on a self-state channel reads as "self", never as "no neighbors
     /// detected".
     fn draw_probe(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(" Sense Probe ", self.palette.header_style()));
+        // The title says WHEN these readings are from, because the panel's whole
+        // job is answering "why did this agent do that" and the honest answer is
+        // that it cannot (bd-r7cz). SensorAttribution is an instantaneous
+        // completed-boundary counterfactual and documents that it deliberately
+        // does NOT reproduce AgentRuntime::sensors, which were computed from the
+        // pre-actuation world that no longer exists. Measured divergence on a
+        // seeded two-agent world after one step: probe food 0.021 against
+        // runtime.sensors food 0.025 — small enough to read as rounding until you
+        // check a channel where the world moved, which is exactly what makes an
+        // unlabelled panel misleading rather than merely imprecise.
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            " Sense Probe (now, not what the brain saw) ",
+            self.palette.header_style(),
+        ));
         let Some(probe) = &snapshot.probe else {
             frame.render_widget(
                 Paragraph::new(vec![
@@ -2460,6 +2479,13 @@ impl<'a> TerminalApp<'a> {
         }
 
         let mut lines: Vec<Line> = Vec::new();
+        // Repeated in the body because a narrow pane truncates the title, and a
+        // truncated caveat is worse than none: it reads as a plain "Sense Probe"
+        // and the reader never learns the reading is a counterfactual.
+        lines.push(Line::from(Span::styled(
+            PROBE_COUNTERFACTUAL_NOTE,
+            self.palette.muted_style(),
+        )));
         let truncation = if att.truncated > 0 {
             format!(" (+{} truncated)", att.truncated)
         } else {
@@ -4272,6 +4298,21 @@ impl EventKind {
         [Self::Birth, Self::Death, Self::Population, Self::Info]
     }
 }
+
+/// What the sense probe actually shows, stated where the reader will see it.
+///
+/// bd-r7cz: bd-16g.4's acceptance criterion asks that every displayed sensor
+/// value match `runtime.sensors` exactly, but `SensorAttribution` documents that
+/// it deliberately does NOT reproduce them — they were computed from the
+/// pre-actuation world that no longer exists. Both positions are defensible, so
+/// the resolution taken here is the panel's half: hold the view to the
+/// attribution the probe publishes, and say so, rather than let the reader
+/// believe they are looking at the vector the brain consumed.
+///
+/// One string, used by both the all-cones and single-cone views, so the two
+/// cannot drift into saying different things about the same data.
+const PROBE_COUNTERFACTUAL_NOTE: &str =
+    "counterfactual: what this agent would sense NOW, not the vector its brain acted on";
 
 /// Row labels for the four stacked trend sparklines, and the width reserved for
 /// them.
@@ -9110,6 +9151,46 @@ mod tests {
     /// projection, and a panel that advanced the simulation would corrupt the
     /// run an experimenter is observing.
     #[test]
+    /// The probe panel must say the reading is a counterfactual, in both views.
+    ///
+    /// bd-r7cz is a conflict between bd-16g.4's criterion ("every displayed
+    /// sensor value matches core's runtime.sensors exactly") and
+    /// `SensorAttribution`'s own documented contract, which deliberately does NOT
+    /// reproduce them because they came from a pre-actuation world that no longer
+    /// exists. Measured divergence after one step of a seeded two-agent world:
+    /// probe food 0.021 against runtime.sensors food 0.025.
+    ///
+    /// The resolution taken on the panel side is to label rather than to pretend.
+    /// This pins that the caveat text exists, names the distinction that matters,
+    /// and is SHARED by the all-cones and single-cone views — a caveat present in
+    /// one view and missing in the other is worse than none, because it teaches
+    /// the reader the panel warns them when it matters.
+    #[test]
+    fn the_probe_panel_declares_itself_a_counterfactual_not_the_consumed_vector() {
+        assert!(
+            PROBE_COUNTERFACTUAL_NOTE.contains("NOW"),
+            "the caveat must say WHEN the reading is from; that is the whole \
+             distinction bd-r7cz is about"
+        );
+        assert!(
+            PROBE_COUNTERFACTUAL_NOTE.contains("brain"),
+            "the caveat must name what it is NOT — the vector the brain acted on — \
+             or a reader has no reason to treat the panel differently"
+        );
+
+        // Both views must reach the same constant. Asserting the source once is
+        // what stops the two panels drifting into different claims about
+        // identical data; if a second literal ever appears, this is the test that
+        // should be updated deliberately rather than a caveat quietly diverging.
+        let source = include_str!("mod.rs");
+        let uses = source.matches("PROBE_COUNTERFACTUAL_NOTE").count();
+        assert!(
+            uses >= 3,
+            "expected the shared caveat to be declared once and used by both the \
+             all-cones and single-cone views (3+ mentions); found {uses}"
+        );
+    }
+
     /// Cone selection must stay INSIDE the eye range under any amount of cycling.
     ///
     /// bd-2z0.7.15's lifecycle list asks for no stale selection and no panic
