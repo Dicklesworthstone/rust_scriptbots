@@ -391,9 +391,31 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
             after minutes of simulation). Run explicitly: cargo test -p scriptbots-app \
             --test real_process_control_e2e -- --ignored bd_w1oi --nocapture"]
 fn bd_w1oi_server_mode_stops_simulating_on_a_storage_acknowledgement_timeout() -> Result<()> {
+    reproduce_server_hang("memory")
+}
+
+/// The same reproduction against --storage file.
+///
+/// The cheap discriminator the bead asks for: if the FILE backend hangs too, the
+/// persistence boundary is the cause and :memory: is incidental; if it survives,
+/// the fault is isolated to the in-memory path. Either answer halves the search
+/// space, and neither needs a product change — only this argument.
+#[test]
+#[serial]
+#[ignore = "bd-w1oi reproduction (file backend): ~5 minutes by construction. Run explicitly: \
+            cargo test -p scriptbots-app --test real_process_control_e2e -- --ignored \
+            bd_w1oi_server_mode_with_file_storage --nocapture"]
+fn bd_w1oi_server_mode_with_file_storage() -> Result<()> {
+    reproduce_server_hang("file")
+}
+
+/// Drive the shipped binary in server mode until it stops simulating, or until a
+/// bounded deadline. The run directory is a tempdir, so a `file` backend writes its
+/// runs/ database there rather than into the repository.
+fn reproduce_server_hang(storage: &str) -> Result<()> {
     let run_dir = tempdir()?;
     let mut child = Command::new(binary())
-        .args(["--mode", "server", "--storage", "memory"])
+        .args(["--mode", "server", "--storage", storage])
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_CONTROL_MCP", "disabled")
@@ -443,7 +465,7 @@ fn bd_w1oi_server_mode_stops_simulating_on_a_storage_acknowledgement_timeout() -
         // just as much — it would mean the tick number is not stable and the cause
         // is timing-dependent.
         panic!(
-            "bd-w1oi did NOT reproduce within 600s. That is a RESULT, not a success: \
+            "bd-w1oi did NOT reproduce within 600s with --storage {storage}. That is a RESULT, not a success: \
              it means the failure is not deterministic on this host, and the bead's \
              'is tick 420 stable' question is answered NO. Record it there."
         );
@@ -461,7 +483,7 @@ fn bd_w1oi_server_mode_stops_simulating_on_a_storage_acknowledgement_timeout() -
         })
         .unwrap_or_else(|| "unparsed".to_string());
     println!(
-        "{{\"schema\":\"scriptbots.bd-w1oi-repro.v1\",\"reproduced\":true,\"failure_tick\":\"{tick}\",\
+        "{{\"schema\":\"scriptbots.bd-w1oi-repro.v1\",\"storage\":\"{storage}\",\"reproduced\":true,\"failure_tick\":\"{tick}\",\
          \"first_observed_tick\":\"420\",\"stable\":{},\"detail\":{:?}}}",
         tick == "420",
         failure.trim()
