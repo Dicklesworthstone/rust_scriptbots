@@ -446,6 +446,12 @@ struct TerminalApp<'a> {
     /// painting.
     day_night: (u32, f32),
     event_log: VecDeque<EventEntry>,
+    /// Highest `AppliedInterventionRecord::seq` already reported to the user.
+    ///
+    /// The core audit ring is bounded, so a surface must watermark rather than
+    /// re-read it — the seq field is documented for exactly this. Starting at 0
+    /// is correct because core's sequence starts at 1 (bd-16g.10).
+    intervention_watermark: u64,
     last_event_tick: u64,
     snapshot: Snapshot,
     baseline: Option<Baseline>,
@@ -584,6 +590,7 @@ impl<'a> TerminalApp<'a> {
             terrain,
             day_night,
             event_log: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
+            intervention_watermark: 0,
             last_event_tick: 0,
             snapshot: Snapshot::default(),
             baseline: None,
@@ -745,6 +752,10 @@ impl<'a> TerminalApp<'a> {
         for _ in 0..steps {
             if !self.scenario.interventions.is_empty() {
                 self.apply_due_interventions();
+                // After the world has stepped, report anything core actually
+                // applied or expired — including interventions this surface did
+                // not issue, such as a scripted scenario or another surface.
+                self.report_applied_interventions();
             }
             if let Err(error) = (self.simulation_step)() {
                 step_error = Some(Arc::<str>::from(error.to_string()));
@@ -837,6 +848,77 @@ impl<'a> TerminalApp<'a> {
                     format!("Intervention FAILED ({changed}): {error}"),
                 );
                 self.push_toast(format!("Intervention failed: {error}"));
+            }
+        }
+    }
+
+    /// Report every intervention core has applied or expired since the last check.
+    ///
+    /// Core already records each one — kind, region, agents and cells affected,
+    /// and the tick a timed effect lapses — in a bounded audit ring whose `seq`
+    /// field is documented as the thing "surfaces watermark on". Nothing consumed
+    /// it, so a drought that genuinely suppressed regrowth across a third of the
+    /// map, and the moment it lapsed, were both invisible to the person watching
+    /// (bd-16g.10).
+    ///
+    /// Expiry matters as much as application. A drought silently ending looks
+    /// exactly like food recovering on its own, which is the wrong conclusion to
+    /// draw from a resilience experiment.
+    fn report_applied_interventions(&mut self) {
+        let fresh: Vec<(u64, String, EventKind)> = {
+            let world = match self.world.lock() {
+                Ok(world) => world,
+                Err(_) => return,
+            };
+            world
+                .applied_interventions()
+                .iter()
+                .filter(|record| record.seq > self.intervention_watermark)
+                .map(|record| {
+                    let region = Self::region_label(&record.region);
+                    let message = if record.expired {
+                        format!("{} lapsed [{region}]", record.kind)
+                    } else {
+                        let mut text = format!(
+                            "{} [{region}] agents={} cells={}",
+                            record.kind, record.agents_affected, record.cells_affected
+                        );
+                        if let Some(expires) = record.expires_at {
+                            // A timed effect that does not say when it ends is a
+                            // mystery the user has to time with a stopwatch.
+                            text.push_str(&format!(" until t{}", expires.0));
+                        }
+                        text
+                    };
+                    // Expiry is bookkeeping; application is the event worth
+                    // noticing, so they do not share a colour or a marker.
+                    let kind = if record.expired {
+                        EventKind::Info
+                    } else {
+                        EventKind::Population
+                    };
+                    (record.seq, message, kind)
+                })
+                .collect()
+        };
+
+        for (seq, message, kind) in fresh {
+            self.intervention_watermark = self.intervention_watermark.max(seq);
+            info!(seq, %message, "intervention recorded");
+            let tick = self.snapshot.tick;
+            self.push_event(tick, kind, message);
+        }
+    }
+
+    /// Compact, honest description of the region an intervention targeted.
+    fn region_label(region: &scriptbots_core::Region) -> String {
+        match region {
+            scriptbots_core::Region::All => "all".to_owned(),
+            scriptbots_core::Region::Disc { x, y, radius } => {
+                format!("disc {x:.0},{y:.0} r{radius:.0}")
+            }
+            scriptbots_core::Region::Rect { x, y, w, h } => {
+                format!("rect {x:.0},{y:.0} {w:.0}x{h:.0}")
             }
         }
     }
@@ -8043,6 +8125,43 @@ mod tests {
     /// legend to read the mortality panel. Asserting the exact ramp entry is what
     /// keeps that true — a future edit that merely picks "some palette colour"
     /// would still be retunable and still be wrong.
+    /// Region labels must be legible and must distinguish the shapes.
+    ///
+    /// The seam is the reason this matters: a rect near an edge wraps on both
+    /// axes, so an operator reading "rect 78,2 40x40" on an 80-wide torus needs
+    /// the origin and extent to reason about what was actually hit. A label that
+    /// only said "rect" would make two very different interventions look alike
+    /// (bd-16g.10).
+    #[test]
+    fn region_labels_distinguish_the_shapes_and_carry_their_geometry() {
+        use scriptbots_core::Region;
+
+        let all = TerminalApp::region_label(&Region::All);
+        let disc = TerminalApp::region_label(&Region::Disc {
+            x: 12.0,
+            y: 34.0,
+            radius: 5.0,
+        });
+        let rect = TerminalApp::region_label(&Region::Rect {
+            x: 78.0,
+            y: 2.0,
+            w: 40.0,
+            h: 40.0,
+        });
+
+        assert_eq!(all, "all");
+        assert!(
+            disc.contains("12") && disc.contains("34") && disc.contains('5'),
+            "a disc label must carry centre and radius; got {disc:?}"
+        );
+        assert!(
+            rect.contains("78") && rect.contains("40"),
+            "a rect label must carry origin and extent so a seam-wrapping region \
+             can be reasoned about; got {rect:?}"
+        );
+        assert_ne!(disc, rect, "the shapes must not render identically");
+    }
+
     /// An applied intervention must name WHAT it changed, not just how many.
     ///
     /// A count alone cannot tell a drought from a meteor after the fact, and this
