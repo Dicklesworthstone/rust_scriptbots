@@ -2961,8 +2961,16 @@ impl SimulationView {
         self.submit_control_command(ControlCommand::UpdateConfig(Box::new(new_config)))
     }
 
-    fn apply_preset(&mut self, preset: PresetKind, _cx: &mut Context<Self>) {
-        self.submit_config_update(|config| preset.apply_to_config(config));
+    /// Apply a preset, reporting whether the edit was actually enqueued.
+    ///
+    /// Caught by the derived guard rather than by review: when
+    /// `submit_config_update` was changed to return its enqueue result
+    /// (1eae95a2d2), this caller kept discarding it, so a refused preset looked
+    /// identical to an applied one. Ignoring a plain `bool` is not a compile
+    /// error, which is exactly why the class needs a guard and not vigilance
+    /// (bd-hhsl).
+    fn apply_preset(&mut self, preset: PresetKind, _cx: &mut Context<Self>) -> bool {
+        self.submit_config_update(|config| preset.apply_to_config(config))
     }
 
     fn canvas_to_world(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
@@ -7093,7 +7101,12 @@ impl SimulationView {
             .child({
                 let apply = |label: &'static str, preset: PresetKind| {
                     let listener = cx.listener(move |this, _e: &MouseDownEvent, _, cx| {
-                        this.apply_preset(preset, cx);
+                        if !this.apply_preset(preset, cx) {
+                            warn!(
+                                ?preset,
+                                "preset could not be enqueued; the configuration is unchanged"
+                            );
+                        }
                     });
                     base_button(label.into()).on_mouse_down(MouseButton::Left, listener)
                 };

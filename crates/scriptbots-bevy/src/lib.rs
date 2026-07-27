@@ -9158,6 +9158,7 @@ mod tests {
 /// logging. A noisy guard gets suppressed, which is worse than none.
 #[cfg(test)]
 mod acknowledgement_guard {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     /// This module's own text is cut from every file before scanning.
@@ -9230,6 +9231,30 @@ mod acknowledgement_guard {
             "return the CommandStatusDto the control call already produces",
         ),
     ];
+
+    /// Calls that unambiguously reach the command bus.
+    ///
+    /// These three are the ONLY hand-written entries left, and they are seeds
+    /// rather than a registry: everything else is derived from them by
+    /// following the call graph. bd-hhsl was raised to P1 because a
+    /// hand-maintained registry missed two live defects in one session -
+    /// render's `submit_config_update` and the websocket's plain
+    /// `handle.pause()` - and a guard that misses what it exists to catch is
+    /// worse than none, because it manufactures confidence.
+    const BUS_SEEDS: &[&str] = &[
+        "(submitter.submit)(",
+        "(self.command_submit.as_ref())(",
+        "self.commands.try_send(",
+    ];
+
+    /// The file whose methods a `handle.` / `state.handle.` receiver names.
+    ///
+    /// Names are not identities. `apply_preset` exists in both the REST layer
+    /// and the GPUI layer, and `step` means one thing on `ControlHandle` and
+    /// another on `WorldState`. Qualifying by receiver AND by defining file is
+    /// what keeps the derived set from flagging `world.step()`, which an
+    /// earlier draft of this derivation did.
+    const CONTROL_HANDLE_FILE: &str = "crates/scriptbots-app/src/control.rs";
 
     /// Calls that submit a command from inside a control method.
     const SUBMITTING_CALLS: &[&str] = &["self.enqueue(", "self.submit_control_command("];
@@ -9374,6 +9399,152 @@ mod acknowledgement_guard {
         out
     }
 
+    /// One function as the derivation sees it.
+    struct DerivedFn {
+        file: String,
+        name: String,
+        signature: String,
+        body: String,
+        is_test: bool,
+    }
+
+    /// Split a source file into functions, signatures accumulated to the brace.
+    ///
+    /// String literals are blanked first so a test that quotes a call cannot be
+    /// read as making one — the self-reference trap that made three earlier
+    /// guards vacuous.
+    fn derived_functions(file: &str, text: &str) -> Vec<DerivedFn> {
+        let mut out = Vec::new();
+        let mut current: Option<(String, String, Vec<String>)> = None;
+        let mut collecting = false;
+        let mut previous = String::new();
+        let mut is_test = false;
+        for raw in text.lines() {
+            let line = blank_string_literals(raw.trim());
+            if line.starts_with("//") {
+                continue;
+            }
+            if let Some(name) = declared_function_name(&line) {
+                if let Some((n, sig, body)) = current.take() {
+                    out.push(DerivedFn {
+                        file: file.to_owned(),
+                        name: n,
+                        signature: sig,
+                        body: body.join("\n"),
+                        is_test,
+                    });
+                }
+                is_test = previous.contains("#[test]");
+                collecting = !line.contains('{');
+                current = Some((name, line.clone(), Vec::new()));
+                previous = line;
+                continue;
+            }
+            if collecting && let Some((_, sig, _)) = current.as_mut() {
+                sig.push(' ');
+                sig.push_str(&line);
+                collecting = !line.contains('{');
+                previous = line;
+                continue;
+            }
+            if let Some((_, _, body)) = current.as_mut() {
+                body.push(line.clone());
+            }
+            previous = line;
+        }
+        if let Some((n, sig, body)) = current {
+            out.push(DerivedFn {
+                file: file.to_owned(),
+                name: n,
+                signature: sig,
+                body: body.join("\n"),
+                is_test,
+            });
+        }
+        out
+    }
+
+    /// Replace `"..."` contents so quoted code is not read as code.
+    fn blank_string_literals(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut inside = false;
+        let mut escaped = false;
+        for ch in line.chars() {
+            match (inside, ch) {
+                (false, '"') => {
+                    inside = true;
+                    out.push('"');
+                }
+                (false, _) => out.push(ch),
+                (true, _) if escaped => escaped = false,
+                (true, '\\') => escaped = true,
+                (true, '"') => {
+                    inside = false;
+                    out.push('"');
+                }
+                (true, _) => {}
+            }
+        }
+        out
+    }
+
+    /// Does this signature return something a caller could drop on the floor?
+    ///
+    /// A function returning unit, or `Result<(), _>`, has no receipt to
+    /// discard — `enqueue(cmd)?` is correct code. Conflating "reaches the bus"
+    /// with "hands back an answer" made an earlier draft flag it.
+    fn yields_a_receipt(signature: &str) -> bool {
+        if !signature.contains("-> ") || signature.contains("Result<(), ") {
+            return false;
+        }
+        signature.contains(RECEIPT_TYPE) || signature.contains("-> bool")
+    }
+
+    /// DERIVE the submitter set instead of listing it.
+    ///
+    /// Seeded from the three calls that unambiguously reach the bus, then
+    /// closed over the call graph. Returns the functions that both reach the
+    /// bus AND hand back an answer, mapped to the files that define them so a
+    /// caller can be matched by receiver rather than by bare name.
+    fn derived_submitters(sources: &[(String, String)]) -> BTreeMap<String, BTreeSet<String>> {
+        let all: Vec<DerivedFn> = sources
+            .iter()
+            .flat_map(|(file, text)| derived_functions(file, text))
+            .collect();
+
+        let mut reaches_bus: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for f in all.iter().filter(|f| !f.is_test) {
+            if BUS_SEEDS.iter().any(|seed| f.body.contains(seed)) {
+                reaches_bus
+                    .entry(f.name.clone())
+                    .or_default()
+                    .insert(f.file.clone());
+            }
+        }
+        // Transitive closure. Five passes is far beyond the observed depth
+        // (submit -> enqueue is two), and a fixed bound cannot hang the build.
+        for _ in 0..5 {
+            let known: BTreeSet<String> = reaches_bus.keys().cloned().collect();
+            for f in all.iter().filter(|f| !f.is_test) {
+                if known.iter().any(|s| f.body.contains(&format!(".{s}("))) {
+                    reaches_bus
+                        .entry(f.name.clone())
+                        .or_default()
+                        .insert(f.file.clone());
+                }
+            }
+        }
+
+        reaches_bus
+            .into_iter()
+            .filter(|(name, files)| {
+                all.iter().any(|f| {
+                    &f.name == name && files.contains(&f.file) && yields_a_receipt(&f.signature)
+                })
+            })
+            .collect()
+    }
+
     /// `fn name` at the start of a declaration, ignoring calls and types.
     fn declared_function_name(raw: &str) -> Option<String> {
         let line = raw.trim_start();
@@ -9465,6 +9636,93 @@ mod acknowledgement_guard {
             }
         }
         out
+    }
+
+    /// Discarded calls to any DERIVED submitter, matched by receiver.
+    ///
+    /// `self.NAME(` counts only where NAME is defined in that same file, and
+    /// `handle.NAME(` / `state.handle.NAME(` only where NAME is a
+    /// `ControlHandle` method. Without that qualification the set flags
+    /// `world.step()`, because `step` is also a `ControlHandle` method — names
+    /// are not identities.
+    fn discarded_calls_to_derived_submitters(sources: &[(String, String)]) -> Vec<Offence> {
+        let submitters = derived_submitters(sources);
+        let mut out = Vec::new();
+        for (file, text) in sources {
+            let mut previous = String::new();
+            for (index, raw) in text.lines().enumerate() {
+                let line = raw.trim();
+                if line.starts_with("//") || line.is_empty() {
+                    continue;
+                }
+                for (name, definitions) in &submitters {
+                    let mut receivers = Vec::new();
+                    if definitions.contains(file) {
+                        receivers.push(format!("self.{name}("));
+                    }
+                    if definitions.iter().any(|d| d == CONTROL_HANDLE_FILE) {
+                        receivers.push(format!("handle.{name}("));
+                        receivers.push(format!("state.handle.{name}("));
+                    }
+                    let dropped = receivers.iter().any(|call| {
+                        line.contains(&format!("let _ = {call}"))
+                            || (line.starts_with(call.as_str())
+                                && line.ends_with(';')
+                                && !previous.ends_with('='))
+                    });
+                    if dropped {
+                        out.push(Offence {
+                            file: file.clone(),
+                            line_no: index + 1,
+                            line: line.to_owned(),
+                            problem: format!(
+                                "`{name}` reaches the command bus and returns an answer, and this \
+                                 call drops it"
+                            ),
+                            fix: "bind the result and act on it, or propagate it to a caller that \
+                                  can"
+                            .to_owned(),
+                        });
+                        break;
+                    }
+                }
+                previous = line.to_owned();
+            }
+        }
+        out
+    }
+
+    /// No call to a derived submitter may drop its answer.
+    ///
+    /// This is the rule the hand-written registry could not be: it finds
+    /// submitters by following the call graph from three bus seeds, so a
+    /// helper added tomorrow is covered the moment it reaches the bus.
+    #[test]
+    fn no_derived_submitter_call_discards_its_answer() {
+        let sources = scanned_sources();
+        let submitters = derived_submitters(&sources);
+
+        // Anchor: derivation must actually find the known submitters. An empty
+        // or tiny set would make this test pass while checking nothing.
+        for expected in ["pause", "resume", "set_speed", "submit_config_update"] {
+            assert!(
+                submitters.contains_key(expected),
+                "derivation lost `{expected}`; the seeds or the closure are wrong, and this \
+                 guard is checking almost nothing. Derived: {:?}",
+                submitters.keys().collect::<Vec<_>>()
+            );
+        }
+
+        let offences = discarded_calls_to_derived_submitters(&sources);
+        assert!(
+            offences.is_empty(),
+            "a call to a command submitter drops the answer it was handed (bd-hhsl):{}",
+            offences
+                .iter()
+                .map(Offence::to_string)
+                .collect::<Vec<_>>()
+                .join("")
+        );
     }
 
     /// A method that submits a command must return the receipt, not a projection.
@@ -9600,6 +9858,90 @@ mod acknowledgement_guard {
         assert!(
             discarded_submissions(&corrected).is_empty(),
             "the guard fires on the corrected form, so it would forbid its own fix"
+        );
+    }
+
+    /// The derived rule must catch both defects the hand registry missed.
+    ///
+    /// This is the justification for bd-hhsl's P1 bump, kept executable. The
+    /// listed registry matched call fragments like
+    /// `run_control(move || state.handle.`, so it scored zero on BOTH of these
+    /// while they were live:
+    ///   render's `submit_config_update` dropping its enqueue result, and
+    ///   the websocket channel's plain `let _ = handle.pause()`.
+    /// Derivation finds them because it follows the call graph from the bus
+    /// rather than from a list someone has to remember to update.
+    #[test]
+    fn derivation_catches_both_defects_the_listed_registry_missed() {
+        // A minimal two-file world: the handle defines the submitters, the
+        // surfaces call them. Paths matter — the receiver rule keys on them.
+        let sources = vec![
+            (
+                CONTROL_HANDLE_FILE.to_owned(),
+                [
+                    "fn enqueue(&self, command: ControlCommand) -> Result<(), ControlError> {",
+                    "    self.commands.try_send(command)",
+                    "}",
+                    "pub fn pause(&self) -> Result<CommandStatusDto, ControlError> {",
+                    "    self.submit_control_command(ControlCommand::Pause)",
+                    "}",
+                    "fn submit_control_command(&self, cmd: ControlCommand) -> Result<CommandStatusDto, ControlError> {",
+                    "    self.enqueue(cmd)?;",
+                    "}",
+                ]
+                .join("\n"),
+            ),
+            (
+                "crates/scriptbots-app/src/servers.rs".to_owned(),
+                "async fn ws() {\n    let _ = handle.pause();\n}".to_owned(),
+            ),
+            (
+                "crates/scriptbots-render/src/lib.rs".to_owned(),
+                [
+                    "fn submit_control_command(&self, command: ControlCommand) -> bool {",
+                    "    (self.command_submit.as_ref())(command)",
+                    "}",
+                    "fn submit_config_update(&self) -> bool {",
+                    "    let _ = self.submit_control_command(ControlCommand::UpdateConfig(c));",
+                    "    true",
+                    "}",
+                ]
+                .join("\n"),
+            ),
+        ];
+
+        let submitters = derived_submitters(&sources);
+        assert!(
+            submitters.contains_key("pause"),
+            "`pause` must be derived through submit_control_command -> enqueue -> bus; \
+             the chain broke. Derived: {:?}",
+            submitters.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !submitters.contains_key("enqueue"),
+            "`enqueue` returns Result<(), _> and has no answer to drop; flagging it would \
+             condemn `self.enqueue(cmd)?`, which is correct code"
+        );
+
+        let offences = discarded_calls_to_derived_submitters(&sources);
+        let files: Vec<&str> = offences.iter().map(|o| o.file.as_str()).collect();
+        assert!(
+            files.contains(&"crates/scriptbots-app/src/servers.rs"),
+            "the websocket miss went uncaught again: {offences:#?}"
+        );
+        assert!(
+            files.contains(&"crates/scriptbots-render/src/lib.rs"),
+            "the render miss went uncaught again: {offences:#?}"
+        );
+
+        // And it must stay quiet on a call that binds the answer.
+        let corrected = vec![(
+            "crates/scriptbots-app/src/servers.rs".to_owned(),
+            "async fn ws() {\n    let status = handle.pause()?;\n}".to_owned(),
+        )];
+        assert!(
+            discarded_calls_to_derived_submitters(&corrected).is_empty(),
+            "the derived rule fires on a bound call, so it would forbid its own fix"
         );
     }
 
