@@ -286,6 +286,15 @@ pub fn probe_gpu_capability() -> Option<GpuInfo> {
     let class = gpu_class_from_device_type(info.device_type);
     let limits = adapter.limits();
     let features = adapter.features();
+    // Absent rather than zero/empty (bd-2z0.14.3.3): wgpu reports 0 for an
+    // unknown vendor or device id and an empty string for an unreported driver.
+    // Storing those verbatim would turn "the backend told us nothing" into a
+    // positive claim about vendor 0 or a driver named "", which is exactly the
+    // kind of confident-looking non-evidence this bead family keeps removing.
+    let vendor_id = (info.vendor != 0).then_some(info.vendor);
+    let device_id = (info.device != 0).then_some(info.device);
+    let driver = (!info.driver.is_empty()).then(|| info.driver.clone());
+    let driver_info = (!info.driver_info.is_empty()).then(|| info.driver_info.clone());
     Some(GpuInfo {
         name: info.name,
         backend: format!("{:?}", info.backend),
@@ -293,6 +302,10 @@ pub fn probe_gpu_capability() -> Option<GpuInfo> {
         vram_bytes: None,
         max_texture_2d: Some(limits.max_texture_dimension_2d),
         timestamp_queries: features.contains(wgpu::Features::TIMESTAMP_QUERY),
+        vendor_id,
+        device_id,
+        driver,
+        driver_info,
     })
 }
 
@@ -370,6 +383,10 @@ pub(crate) fn resolve_effective_render_settings_for_gpu(
                 adapter = %info.name,
                 backend = %info.backend,
                 class = ?info.class,
+                vendor_id = ?info.vendor_id,
+                device_id = ?info.device_id,
+                driver = info.driver.as_deref().unwrap_or("<unreported>"),
+                driver_info = info.driver_info.as_deref().unwrap_or("<unreported>"),
                 max_texture_2d = ?info.max_texture_2d,
                 timestamp_queries = info.timestamp_queries,
                 "GPU capability report"
@@ -7177,6 +7194,10 @@ mod tests {
             vram_bytes: None,
             max_texture_2d: Some(16_384),
             timestamp_queries: true,
+            vendor_id: None,
+            device_id: None,
+            driver: None,
+            driver_info: None,
         }
     }
 
@@ -7220,6 +7241,10 @@ mod tests {
             vram_bytes: None,
             max_texture_2d: Some(16_384),
             timestamp_queries: true,
+            vendor_id: None,
+            device_id: None,
+            driver: None,
+            driver_info: None,
         }
     }
 

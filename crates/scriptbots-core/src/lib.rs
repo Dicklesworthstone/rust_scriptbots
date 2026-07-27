@@ -11419,6 +11419,28 @@ pub struct GpuInfo {
     pub max_texture_2d: Option<u32>,
     /// Whether GPU timestamp queries are available (perf instrumentation).
     pub timestamp_queries: bool,
+    /// Backend-specific vendor id, usually a 16-bit PCI vendor id
+    /// (bd-2z0.14.3.3).
+    ///
+    /// `None` means the backend did not report one, which is a different fact
+    /// from "vendor 0" — wgpu uses 0 for unknown, and storing that verbatim
+    /// would turn absent evidence into a positive claim about a vendor.
+    #[serde(default)]
+    pub vendor_id: Option<u32>,
+    /// Backend-specific device id. `None` when unreported, as for `vendor_id`.
+    #[serde(default)]
+    pub device_id: Option<u32>,
+    /// Driver name as reported by the backend, e.g. `radv`, `NVIDIA`.
+    ///
+    /// The acceptance for bd-2z0.14.3.3 names DRIVER explicitly in framebuffer
+    /// evidence: two runs on the same adapter and different driver builds can
+    /// render differently, so a capture that records only the adapter cannot
+    /// explain that difference.
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// Free-form driver version/build string.
+    #[serde(default)]
+    pub driver_info: Option<String>,
 }
 
 /// VRAM at or above which an integrated GPU earns Medium instead of Low.

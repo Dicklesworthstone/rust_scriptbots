@@ -141,6 +141,20 @@ pub struct CaptureProvenance {
     pub backend: String,
     /// Device class (DiscreteGpu/IntegratedGpu/Cpu/...) or `unknown`.
     pub device_type: String,
+    /// Driver name reported by the adapter that produced this frame.
+    ///
+    /// The bd-2z0.14.3.3 acceptance names DRIVER explicitly, and it is not
+    /// redundant with `adapter_name`: the same adapter on two driver builds can
+    /// render differently, so a capture recording only the adapter cannot
+    /// explain a golden that moved. `None` means the backend reported none.
+    #[serde(default)]
+    pub adapter_driver: Option<String>,
+    /// Free-form driver version/build string from the same adapter.
+    #[serde(default)]
+    pub adapter_driver_info: Option<String>,
+    /// Backend-specific vendor id, when reported.
+    #[serde(default)]
+    pub adapter_vendor_id: Option<u32>,
     /// Effective quality tier the capture rendered at.
     pub quality_tier: String,
     /// Viewport `[width, height]` in pixels.
@@ -917,6 +931,19 @@ impl<'a> OffscreenCapture<'a> {
             adapter_name: self.adapter_name.clone(),
             backend: self.backend.clone(),
             device_type: self.device_type.clone(),
+            // Sourced from the resolved adapter rather than restated, so the
+            // evidence cannot disagree with the capability report.
+            adapter_driver: self
+                .effective
+                .gpu
+                .as_ref()
+                .and_then(|info| info.driver.clone()),
+            adapter_driver_info: self
+                .effective
+                .gpu
+                .as_ref()
+                .and_then(|info| info.driver_info.clone()),
+            adapter_vendor_id: self.effective.gpu.as_ref().and_then(|info| info.vendor_id),
             quality_tier: format!("{:?}", self.effective.tier),
             viewport: [self.viewport.0, self.viewport.1],
             colorspace: "rgba8-srgb".to_string(),
@@ -1473,6 +1500,14 @@ fn configure_session<'a>(
                 vram_bytes: None,
                 max_texture_2d: Some(device.limits().max_texture_dimension_2d),
                 timestamp_queries: device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+                // The ACTUAL render device's identity, not None: this is the
+                // adapter that produced the frame, so its driver is the thing
+                // capture evidence has to be able to name (bd-2z0.14.3.3).
+                // Absent rather than zero/empty, matching probe_gpu_capability.
+                vendor_id: (info.vendor != 0).then_some(info.vendor),
+                device_id: (info.device != 0).then_some(info.device),
+                driver: (!info.driver.is_empty()).then(|| info.driver.clone()),
+                driver_info: (!info.driver_info.is_empty()).then(|| info.driver_info.clone()),
             },
             format!("{:?}", info.device_type),
         )
@@ -2109,6 +2144,9 @@ mod tests {
             adapter_name: "test-adapter".to_string(),
             backend: "Metal".to_string(),
             device_type: "IntegratedGpu".to_string(),
+            adapter_driver: None,
+            adapter_driver_info: None,
+            adapter_vendor_id: None,
             quality_tier: "Medium".to_string(),
             viewport: [256, 256],
             colorspace: "rgba8-srgb".to_string(),
@@ -2159,6 +2197,10 @@ mod tests {
             vram_bytes: None,
             max_texture_2d: Some(16_384),
             timestamp_queries: true,
+            vendor_id: None,
+            device_id: None,
+            driver: None,
+            driver_info: None,
         }
     }
 
@@ -2413,6 +2455,60 @@ mod tests {
         );
     }
 
+    /// Driver identity must survive into the serialized evidence.
+    ///
+    /// bd-2z0.14.3.3 names DRIVER explicitly in framebuffer evidence, and it is
+    /// not redundant with the adapter name: the same adapter on two driver
+    /// builds can render differently, so a capture recording only the adapter
+    /// cannot explain a golden that moved. Absent is represented as an explicit
+    /// null rather than an empty string, so "the backend reported nothing" stays
+    /// distinguishable from "the driver is named nothing".
+    #[test]
+    fn provenance_carries_adapter_driver_identity() {
+        let mut provenance = CaptureProvenance {
+            schema: PROVENANCE_SCHEMA.to_string(),
+            world_digest: None,
+            scene: "unit".to_string(),
+            seed: 7,
+            tick: 3,
+            frontend: "bevy_offscreen".to_string(),
+            adapter_name: "Apple M4".to_string(),
+            backend: "Metal".to_string(),
+            device_type: "IntegratedGpu".to_string(),
+            adapter_driver: Some("Metal 3".to_string()),
+            adapter_driver_info: Some("build 42".to_string()),
+            adapter_vendor_id: Some(0x106b),
+            quality_tier: "High".to_string(),
+            viewport: [256, 256],
+            colorspace: "rgba8-srgb".to_string(),
+            rustc_version: "rustc test".to_string(),
+            target_triple: "aarch64-apple-darwin".to_string(),
+            source_commit: None,
+            lock_digest: None,
+            corrupt: false,
+        };
+
+        let json = serde_json::to_value(&provenance).expect("serialize");
+        assert_eq!(json["adapter_driver"], "Metal 3");
+        assert_eq!(json["adapter_driver_info"], "build 42");
+        assert_eq!(json["adapter_vendor_id"], 0x106b);
+
+        // Unreported driver stays an explicit null, never an empty string.
+        provenance.adapter_driver = None;
+        provenance.adapter_vendor_id = None;
+        let json = serde_json::to_value(&provenance).expect("serialize");
+        assert!(
+            json.get("adapter_driver")
+                .is_some_and(serde_json::Value::is_null),
+            "an unreported driver must serialize as null, so absence of evidence \
+             stays distinguishable from a driver named empty"
+        );
+        assert!(
+            json.get("adapter_vendor_id")
+                .is_some_and(serde_json::Value::is_null)
+        );
+    }
+
     /// Provenance JSON written before build identity existed must still decode.
     ///
     /// This is the exact shape of the committed goldens under
@@ -2528,6 +2624,9 @@ mod tests {
             adapter_name: "test-adapter".to_string(),
             backend: "Vulkan".to_string(),
             device_type: "Software".to_string(),
+            adapter_driver: None,
+            adapter_driver_info: None,
+            adapter_vendor_id: None,
             quality_tier: "Potato".to_string(),
             viewport: [16, 16],
             colorspace: "rgba8-srgb".to_string(),
