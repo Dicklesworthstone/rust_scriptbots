@@ -527,7 +527,25 @@ struct TerminalApp<'a> {
 
 impl<'a> TerminalApp<'a> {
     fn new(renderer: &TerminalRenderer, ctx: RendererContext<'a>) -> Self {
-        let palette = Palette::detect();
+        let mut palette = Palette::detect();
+        // Adopt the run's configured chrome theme. bd-2z0.14.2.2's V11 reopen
+        // recorded that core's TuiThemeId was declared but never consumed, so a
+        // theme chosen in config had no effect on what the terminal actually
+        // painted. Read from the world's own config rather than plumbing a new
+        // field through RendererContext, which every renderer implements.
+        {
+            let configured = ctx
+                .world
+                .lock()
+                .map(|world| world.config().render.theme)
+                .unwrap_or_default();
+            palette.apply_config_theme(configured);
+            info!(
+                theme = palette.theme_label(),
+                configured = configured.is_some(),
+                "terminal chrome theme resolved"
+            );
+        }
         let canvas_capability = palette.canvas_capability();
         info!(
             tier = canvas_capability.label(),
@@ -4750,6 +4768,37 @@ impl CuratedThemeId {
         }
     }
 
+    /// The config-layer identity for this theme.
+    ///
+    /// Exhaustive on purpose — no wildcard arm. Adding a theme to either enum
+    /// then fails to compile here rather than silently mapping the new one onto
+    /// an old identity, which is how a persisted theme would quietly become a
+    /// different theme (bd-2z0.14.2.2).
+    #[must_use]
+    pub const fn to_config(self) -> scriptbots_core::TuiThemeId {
+        match self {
+            Self::BioluminescentDarkField => scriptbots_core::TuiThemeId::BioluminescentDarkField,
+            Self::CyberpunkAurora => scriptbots_core::TuiThemeId::CyberpunkAurora,
+            Self::Darcula => scriptbots_core::TuiThemeId::Darcula,
+            Self::LumenLight => scriptbots_core::TuiThemeId::LumenLight,
+            Self::NordicFrost => scriptbots_core::TuiThemeId::NordicFrost,
+            Self::HighContrast => scriptbots_core::TuiThemeId::HighContrast,
+        }
+    }
+
+    /// Resolve a config-layer theme identity into the renderer's theme.
+    #[must_use]
+    pub const fn from_config(id: scriptbots_core::TuiThemeId) -> Self {
+        match id {
+            scriptbots_core::TuiThemeId::BioluminescentDarkField => Self::BioluminescentDarkField,
+            scriptbots_core::TuiThemeId::CyberpunkAurora => Self::CyberpunkAurora,
+            scriptbots_core::TuiThemeId::Darcula => Self::Darcula,
+            scriptbots_core::TuiThemeId::LumenLight => Self::LumenLight,
+            scriptbots_core::TuiThemeId::NordicFrost => Self::NordicFrost,
+            scriptbots_core::TuiThemeId::HighContrast => Self::HighContrast,
+        }
+    }
+
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -5189,8 +5238,24 @@ impl Palette {
             level,
             emoji,
             emoji_narrow: false,
+            // `default()`, not a restated literal. This read CyberpunkAurora
+            // while CuratedThemeId::default() is BioluminescentDarkField, so the
+            // documented default and the constructed one disagreed
+            // (bd-2z0.14.2.2).
+            theme_id: CuratedThemeId::default(),
             mode,
-            theme_id: CuratedThemeId::CyberpunkAurora,
+        }
+    }
+
+    /// Adopt the run's configured chrome theme, if it named one.
+    ///
+    /// `None` means the config never expressed a preference, which must leave the
+    /// detected default alone rather than resetting it — the two are different
+    /// states and collapsing them would make an unset config silently override a
+    /// theme the user is already on.
+    fn apply_config_theme(&mut self, configured: Option<scriptbots_core::TuiThemeId>) {
+        if let Some(id) = configured {
+            self.theme_id = CuratedThemeId::from_config(id);
         }
     }
 
@@ -7658,6 +7723,87 @@ mod tests {
                 "the keyboard cycle must visit more than one theme"
             );
         });
+    }
+
+    /// Every theme must survive a round trip through the config layer.
+    ///
+    /// Walks the cycle rather than restating a list, so a seventh theme is
+    /// covered the day it is added — and if the two enums ever diverge, this
+    /// fails with the offending theme named rather than a config silently
+    /// relocating a user somewhere else.
+    #[test]
+    fn every_theme_round_trips_through_the_config_identity() {
+        let start = CuratedThemeId::default();
+        let mut theme = start;
+        loop {
+            let via_config = CuratedThemeId::from_config(theme.to_config());
+            assert_eq!(
+                via_config, theme,
+                "{theme:?} did not survive the config round trip; it came back as \
+                 {via_config:?}"
+            );
+
+            // Serde is the actual persistence boundary, so exercise it rather
+            // than trusting the in-memory mapping.
+            let encoded =
+                serde_json::to_string(&theme.to_config()).expect("a theme identity must serialise");
+            let decoded: scriptbots_core::TuiThemeId =
+                serde_json::from_str(&encoded).expect("a theme identity must deserialise");
+            assert_eq!(
+                CuratedThemeId::from_config(decoded),
+                theme,
+                "{theme:?} did not survive serde; encoded as {encoded}"
+            );
+
+            theme = theme.next();
+            if theme == start {
+                break;
+            }
+        }
+    }
+
+    /// The DEFAULT theme in particular must be representable in config.
+    ///
+    /// Called out separately because it was not: core's TuiThemeId shipped
+    /// without BioluminescentDarkField while the terminal defaults to it, so the
+    /// one theme nearly every run displays was the one that could not be
+    /// persisted (bd-2z0.14.2.2).
+    #[test]
+    fn the_default_theme_is_representable_in_the_config_layer() {
+        let default = CuratedThemeId::default();
+        assert_eq!(
+            CuratedThemeId::from_config(default.to_config()),
+            default,
+            "the default theme must round-trip, or a user on it cannot persist it"
+        );
+    }
+
+    /// A configured theme must actually reach the palette, and an unset config
+    /// must leave the detected theme alone.
+    #[test]
+    fn the_configured_theme_is_adopted_and_none_leaves_the_default_alone() {
+        let mut palette = Palette::test_backend_evidence();
+        let detected = palette.theme_id;
+
+        palette.apply_config_theme(None);
+        assert_eq!(
+            palette.theme_id, detected,
+            "an unset config must not override the detected theme; None and a \
+             chosen theme are different states"
+        );
+
+        // Pick a theme that is definitely not the current one, so a no-op
+        // implementation cannot pass.
+        let wanted = detected.next();
+        assert_ne!(
+            wanted, detected,
+            "the cycle must move for this to prove anything"
+        );
+        palette.apply_config_theme(Some(wanted.to_config()));
+        assert_eq!(
+            palette.theme_id, wanted,
+            "a configured theme must be adopted by the palette"
+        );
     }
 
     /// The advertised keybinding hints must name bindings that exist.

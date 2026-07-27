@@ -11823,6 +11823,15 @@ pub struct RenderDayNightSettings {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiThemeId {
+    /// bd-9pqz art direction derived from `visual::BIOLUMINESCENT_DARK_FIELD_V1`,
+    /// and the terminal frontend's DEFAULT theme.
+    ///
+    /// Added by bd-2z0.14.2.2. Without it this enum could not represent the theme
+    /// almost every run actually displays, so a user on the default had nothing
+    /// to persist and any config round-trip silently relocated them to another
+    /// theme. Reading an older config is unaffected: no previously written value
+    /// changes meaning.
+    BioluminescentDarkField,
     /// Cyberpunk Aurora theme.
     CyberpunkAurora,
     /// Darcula theme.
