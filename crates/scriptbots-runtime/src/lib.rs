@@ -5247,6 +5247,8 @@ mod tests {
     fn projection_snapshot() -> RenderSnapshot {
         let summary_history = Arc::new((1..=10).map(projection_summary).collect::<Vec<_>>());
         RenderSnapshot {
+            config: Arc::new(ScriptBotsConfig::default()),
+            config_audit: Arc::new(Vec::new()),
             session_id: HostSessionId::new(44),
             revision: SnapshotRevision::new(7),
             revisions: HostRevisions {
@@ -6974,6 +6976,8 @@ mod tests {
                 spike_hits: 0,
             });
             self.latest_snapshot = Some(Arc::new(RenderSnapshot {
+                config: Arc::new(ScriptBotsConfig::default()),
+                config_audit: Arc::new(Vec::new()),
                 session_id: self.session_id,
                 revision,
                 revisions: self.revisions,
