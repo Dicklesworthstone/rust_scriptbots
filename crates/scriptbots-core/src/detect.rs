@@ -1184,6 +1184,149 @@ impl BimodalityScore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// bd-16g.2: the auto-narrated timeline.
+//
+// The narration CITES THE EVIDENCE, never the thresholds. "population fell 63%
+// (1,842 -> 681)" tells a reader what happened; "score 12.4 exceeded h=8.0" tells
+// them how the detector is configured, which they did not ask and cannot act on.
+// The configured bounds still travel in DetectionEvidence::params for anyone
+// auditing sensitivity — they are simply not the story.
+//
+// Text is TEMPLATED AND DETERMINISTIC, never generated. bd-16g.2 is explicit that
+// the event stream must be reproducible and diffable so two runs of a seed can be
+// compared line by line; an LLM may narrate on top of this, but not inside it.
+// ---------------------------------------------------------------------------
+
+impl DetectionEvidence {
+    /// One line of deterministic narrative prose for this detection.
+    ///
+    /// Byte-stable for identical evidence: number formatting goes through
+    /// [`crate::narrative_text`], so grouping and precision cannot drift between call
+    /// sites and corrupt a diff.
+    #[must_use]
+    pub fn narrate(&self) -> String {
+        use crate::narrative_text::{count, count_transition, fixed, pct_magnitude};
+
+        match (self.kind, self.class) {
+            (DetectionKind::ChangePoint, EvidenceClass::Shift(direction)) => {
+                let verb = match direction {
+                    Direction::Up => "rose",
+                    Direction::Down => "fell",
+                };
+                let (before, after) = self.sides();
+                format!(
+                    "t={} {} {} {}% ({})",
+                    self.start_tick,
+                    self.metric,
+                    verb,
+                    pct_magnitude(before, after),
+                    count_transition(before, after)
+                )
+            }
+            (DetectionKind::ThresholdCrossing, EvidenceClass::Crossing(direction)) => {
+                let verb = match direction {
+                    Direction::Up => "rose past",
+                    Direction::Down => "fell below",
+                };
+                let (before, after) = self.sides();
+                format!(
+                    "t={} {} {} {} ({})",
+                    self.start_tick,
+                    self.metric,
+                    verb,
+                    fixed(self.level_or(after), 2),
+                    count_transition(before, after)
+                )
+            }
+            (DetectionKind::Regime, EvidenceClass::Regime(regime)) => {
+                let phrase = match regime {
+                    Regime::Growth => "grew steadily",
+                    Regime::Equilibrium => "held steady",
+                    Regime::Oscillation => "oscillated",
+                    Regime::Collapse => "collapsed",
+                };
+                format!(
+                    "t={}-{} {} {} over {} samples",
+                    self.start_tick,
+                    self.end_tick,
+                    self.metric,
+                    phrase,
+                    count(self.samples as f64)
+                )
+            }
+            (DetectionKind::Bimodality, EvidenceClass::Bimodal(is_bimodal)) => {
+                let (lower, upper) = self.sides();
+                let (lower_n, upper_n) = self
+                    .before
+                    .zip(self.after)
+                    .map_or((0, 0), |(b, a)| (b.samples, a.samples));
+                if is_bimodal {
+                    format!(
+                        "t={}-{} {} split into two clusters: {} near {}, {} near {}",
+                        self.start_tick,
+                        self.end_tick,
+                        self.metric,
+                        count(lower_n as f64),
+                        fixed(lower, 2),
+                        count(upper_n as f64),
+                        fixed(upper, 2)
+                    )
+                } else {
+                    format!(
+                        "t={}-{} {} remained a single population ({} samples)",
+                        self.start_tick,
+                        self.end_tick,
+                        self.metric,
+                        count(self.samples as f64)
+                    )
+                }
+            }
+            // A kind/class pair that does not correspond is a construction bug, not a
+            // narration case. Saying so is better than inventing prose for it.
+            (kind, class) => format!(
+                "t={} {} produced inconsistent evidence ({kind:?} with {class:?})",
+                self.start_tick, self.metric
+            ),
+        }
+    }
+
+    /// Before/after means, defaulting to zero when a side is absent.
+    fn sides(&self) -> (f64, f64) {
+        (
+            self.before.map_or(0.0, |side| side.mean),
+            self.after.map_or(0.0, |side| side.mean),
+        )
+    }
+
+    /// The configured `level` for a crossing, falling back to the observed value.
+    fn level_or(&self, fallback: f64) -> f64 {
+        self.params
+            .iter()
+            .find(|(name, _)| *name == "level")
+            .map_or(fallback, |(_, value)| *value)
+    }
+}
+
+/// Render an ordered, deterministic narrative timeline from detection evidence.
+///
+/// Ordering is by `(start_tick, end_tick, metric, kind)` — total and independent of
+/// the order evidence was collected in, so two runs of a seed produce byte-identical
+/// timelines that diff cleanly. That diffability is the entire point of templating the
+/// prose rather than generating it.
+#[must_use]
+pub fn narrate_timeline(evidence: &[DetectionEvidence]) -> Vec<String> {
+    let mut ordered: Vec<&DetectionEvidence> = evidence.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.start_tick
+            .cmp(&b.start_tick)
+            .then(a.end_tick.cmp(&b.end_tick))
+            .then(a.metric.cmp(b.metric))
+            .then((a.kind as u8).cmp(&(b.kind as u8)))
+    });
+    ordered.iter().map(|item| item.narrate()).collect()
+}
+
 fn validate_series(series: &[Sample]) -> Result<(), DetectError> {
     for (index, sample) in series.iter().enumerate() {
         if !sample.value.is_finite() {
@@ -2614,5 +2757,142 @@ mod tests {
             crossings.len(),
             split.is_bimodal
         );
+    }
+
+    // ---- bd-16g.2: the narrated timeline ----
+
+    /// Build one evidence item of each kind from a fixture with a real step change.
+    fn timeline_fixture() -> Vec<DetectionEvidence> {
+        let series: Vec<Sample> = (0..300)
+            .map(|i| Sample::new(i as u64, if i < 150 { 1000.0 } else { 300.0 }))
+            .collect();
+        let cusum = CusumParams::default();
+        let thresholds = [Threshold {
+            name: "floor",
+            level: 500.0,
+            direction: CrossDirection::Falling,
+        }];
+        let values: Vec<f64> = series.iter().map(|s| s.value).collect();
+
+        let mut out = Vec::new();
+        for change in change_points_cusum(&series, cusum).expect("valid") {
+            out.push(change.evidence("population", series.len(), cusum));
+        }
+        for crossing in threshold_crossings(&series, &thresholds).expect("valid") {
+            out.push(crossing.evidence("population", series.len()));
+        }
+        for window in regimes(&series, RegimeParams::default()).expect("valid") {
+            out.push(window.evidence("population", series.len()));
+        }
+        let split = bimodality(&values, BimodalityParams::default()).expect("valid");
+        out.push(split.evidence("population", 0, 299, BimodalityParams::default()));
+        out
+    }
+
+    /// THE RULE, made enforceable: narration cites evidence, never thresholds.
+    ///
+    /// "population fell 70% (1,000 -> 300)" tells a reader what happened. "score 12.4
+    /// exceeded h=8.0" tells them how the detector is configured -- something they did not
+    /// ask for and cannot act on. Prose that leaks tuning parameters trains readers to
+    /// ignore it, which is the same failure mode as a detector that cries wolf.
+    ///
+    /// The configured bounds still travel in `params` for anyone auditing sensitivity;
+    /// they are simply not the story, and this test is what keeps them out of it.
+    #[test]
+    fn bd_16g_2_narration_cites_evidence_and_never_restates_thresholds() {
+        let forbidden = [
+            "min_score",
+            "min_separation",
+            "min_cluster_fraction",
+            "warmup",
+            "h=",
+            "k=",
+            "threshold",
+            "exceeded",
+            "p_value",
+        ];
+        for evidence in timeline_fixture() {
+            let text = evidence.narrate();
+            assert!(!text.is_empty(), "{:?} narrated to nothing", evidence.kind);
+            assert!(
+                !text.contains("inconsistent evidence"),
+                "kind/class mismatch reached narration: {text}"
+            );
+            for token in forbidden {
+                assert!(
+                    !text.contains(token),
+                    "{:?} narration leaked the configured bound {token:?}: {text}",
+                    evidence.kind
+                );
+            }
+            assert!(
+                text.contains("population"),
+                "narration must name the metric it describes: {text}"
+            );
+        }
+    }
+
+    /// The narrated line must carry the observed magnitude, not just a verdict.
+    #[test]
+    fn bd_16g_2_change_point_narration_reads_like_the_bead_specifies() {
+        let evidence = timeline_fixture();
+        let change = evidence
+            .iter()
+            .find(|e| e.kind == DetectionKind::ChangePoint)
+            .expect("the fixture contains a step change");
+        let text = change.narrate();
+        println!("NARRATION change_point: {text}");
+        assert!(
+            text.contains("fell"),
+            "a downward step must read as a fall: {text}"
+        );
+        assert!(
+            text.contains('%'),
+            "the magnitude must be a percentage: {text}"
+        );
+        assert!(
+            text.contains("->"),
+            "the before/after transition must be shown: {text}"
+        );
+        assert!(
+            text.contains(','),
+            "counts must be thousands-grouped by narrative_text: {text}"
+        );
+    }
+
+    /// The timeline must be totally ordered and byte-identical across runs.
+    ///
+    /// Diffability is the whole reason this prose is templated rather than generated: two
+    /// runs of one seed must produce timelines that diff line by line, so a reviewer sees
+    /// exactly which story changed.
+    #[test]
+    fn bd_16g_2_timeline_is_deterministic_and_totally_ordered() {
+        let evidence = timeline_fixture();
+        let first = narrate_timeline(&evidence);
+        let second = narrate_timeline(&evidence);
+        assert_eq!(first, second, "identical evidence must narrate identically");
+        assert!(!first.is_empty(), "the fixture must produce a timeline");
+
+        // Order of collection must not matter.
+        let mut shuffled = evidence.clone();
+        shuffled.reverse();
+        assert_eq!(
+            narrate_timeline(&shuffled),
+            first,
+            "the timeline must be ordered by evidence, not by collection order"
+        );
+
+        for line in &first {
+            println!("TIMELINE {line}");
+        }
+    }
+
+    /// A timeline over no detections is empty, not a sentence saying nothing happened.
+    ///
+    /// A quiet run should produce a quiet stream. Emitting "no events detected" as a line
+    /// would put a row in every diff and defeat the budget this bead measures elsewhere.
+    #[test]
+    fn bd_16g_2_a_quiet_timeline_is_empty() {
+        assert!(narrate_timeline(&[]).is_empty());
     }
 }
