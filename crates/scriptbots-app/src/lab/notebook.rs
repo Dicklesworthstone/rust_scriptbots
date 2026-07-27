@@ -479,11 +479,13 @@ impl NotebookRenderer {
 
         markdown.push_str("## 6. Reproducibility\n");
         markdown.push_str(
-            "`./reproduce.sh` verifies the retained summary artifacts used by this report. \
-             It does NOT re-execute the simulation, so it proves the analysis inputs are \
-             unmodified -- not that the runs reproduce. Actual arm-by-seed re-execution is \
-             tracked as bd-16g.1.7 acceptance item 3 and is not yet implemented; treat a \
-             passing reproduce.sh as an integrity check, not a reproduction.\n",
+            "`./reproduce.sh` does two things. It verifies the retained summary artifacts \
+             are unmodified, and -- with `SCRIPTBOTS_BIN` set to the simulator binary -- it \
+             re-executes every arm x seed from the exact emitted config layer and compares \
+             each re-run world digest against the one cited here, exiting nonzero if any \
+             run fails or any digest differs. The emitted configs are retained beside this \
+             notebook as evidence. Summary and adjusted-p table re-derivation is not yet \
+             included; digest agreement is the reproduction claim it makes.\n",
         );
         Ok(markdown)
     }
@@ -597,7 +599,7 @@ impl NotebookRenderer {
         script.push_str("#!/usr/bin/env bash\nset -euo pipefail\n\n");
         script.push_str("# Retained-evidence verifier for session: ");
         script.push_str(session_id);
-        script.push_str("\n# This does not re-run the simulation.\n\n");
+        script.push_str("\n# Verifies retained evidence, then re-executes every arm x seed.\n\n");
         script.push_str(
             "command -v b3sum >/dev/null 2>&1 || { \
              echo 'b3sum is required to verify BLAKE3 evidence' >&2; exit 2; }\n",
@@ -616,6 +618,82 @@ impl NotebookRenderer {
             );
         }
         script.push_str("echo '[VERIFY] Retained analysis inputs match the notebook evidence.'\n");
+
+        // === RE-EXECUTION (bd-16g.1.7 item 3) ===
+        //
+        // The block above hashes retained files. That is an integrity check and proves
+        // nothing about reproducibility, which is why the acceptance says re-execution must
+        // never be substituted by retained-file hashing. Now that RunRef carries the arm's
+        // exact config_overrides (12ba9ab09e), the script can write the real config layer
+        // and run it.
+        //
+        // rng_seed is a CONFIG FIELD rather than a flag, so one emitted file fully
+        // determines the run -- there is no second channel through which a seed could
+        // disagree with the config it was paired with.
+        //
+        // The emitted configs are written NEXT TO THE NOTEBOOK and never cleaned up. They
+        // are evidence: they are the exact bytes the reproduction fed the simulator, and a
+        // script that deletes them on exit destroys the artifact that makes its own result
+        // inspectable.
+        script.push_str(
+            "\n# --- Re-execution: rerun every arm x seed and compare world digests ---\n",
+        );
+        script.push_str(
+            "if [ -z \"${SCRIPTBOTS_BIN:-}\" ]; then\n               echo 'set SCRIPTBOTS_BIN to the scriptbots-app binary to re-execute' >&2\n               exit 2\nfi\n",
+        );
+        script.push_str(
+            "work=\"$(cd \"$(dirname \"$0\")\" && pwd)/reproduce-configs\"\nmkdir -p \"$work\"\n",
+        );
+        script.push_str("rerun_failures=0\n");
+
+        for run in known_runs {
+            // The emitted config is the arm's overrides plus the pinned seed, serialized
+            // with serde so the file is exactly what the runner parses -- never hand-built
+            // text that could drift from the real schema.
+            let mut layer = serde_json::Map::new();
+            for (key, value) in &run.config_overrides {
+                layer.insert(key.clone(), value.clone());
+            }
+            layer.insert("rng_seed".to_owned(), serde_json::json!(run.seed));
+            let layer_json = serde_json::to_string(&serde_json::Value::Object(layer))
+                .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+
+            let safe_name = run
+                .run_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>();
+            script.push_str("cfg=\"$work/");
+            script.push_str(&safe_name);
+            script.push_str(".json\"\n");
+            script.push_str("printf '%s' ");
+            script.push_str(&shell_single_quote(&layer_json));
+            script.push_str(" > \"$cfg\"\n");
+
+            script.push_str("out=\"$(SCRIPTBOTS_DET_RUN=1 SCRIPTBOTS_DET_TICKS=");
+            script.push_str(&run.total_ticks.to_string());
+            script.push_str(" \"$SCRIPTBOTS_BIN\" --config \"$cfg\")\" || { echo 'run failed: ");
+            script.push_str(&safe_name);
+            script.push_str("' >&2; rerun_failures=$((rerun_failures+1)); }\n");
+
+            // Compare the RE-EXECUTED world digest against the cited one. This assertion is
+            // what makes the script a reproduction rather than a checksum.
+            script.push_str("expected_digest=");
+            script.push_str(&shell_single_quote(&run.digest));
+            script.push_str("\n");
+            script.push_str(
+                "case \"$out\" in *\"$expected_digest\"*) ;; *) echo 'digest differs on re-execution: ",
+            );
+            script.push_str(&safe_name);
+            script.push_str("' >&2; rerun_failures=$((rerun_failures+1));; esac\n");
+        }
+
+        script.push_str(
+            "test \"$rerun_failures\" -eq 0 || { echo \"[FAIL] $rerun_failures run(s) did not reproduce\" >&2; exit 1; }\n",
+        );
+        script.push_str(
+            "echo '[VERIFY] Every arm x seed re-executed and matched its cited digest.'\n",
+        );
 
         let reproduce_path = out_dir.join("reproduce.sh");
         fs::write(&reproduce_path, &script).map_err(|e| NotebookRenderError::Io(e.to_string()))?;
@@ -1072,7 +1150,10 @@ mod tests {
         let verifier = std::fs::read_to_string(notebook_dir.join("reproduce.sh")).unwrap();
         assert!(verifier.contains("b3sum is required"));
         assert!(verifier.contains("b3sum -- \"$path\""));
-        assert!(verifier.contains("This does not re-run the simulation"));
+        // Was: asserted the script does NOT re-run. bd-16g.1.7 item 3 made it re-run, so
+        // the retained-evidence check this test guards now coexists with re-execution
+        // rather than standing in for it.
+        assert!(verifier.contains("re-executes every arm x seed"));
     }
 
     #[test]
@@ -1361,10 +1442,75 @@ mod tests {
     fn bd_16g_1_7_reproduce_blurb_does_not_overclaim_reproduction() {
         let runs = vec![run("r1", 0, 1)];
         let md = NotebookRenderer::render_markdown("goal", &[], &runs).expect("renders");
+        // The blurb used to disclose that nothing was re-executed. It now re-executes, so
+        // the honest disclosure moved: what it must NOT overclaim is table re-derivation,
+        // which is still absent. A test that pins a limitation outlives the limitation.
         assert!(
-            md.contains("does NOT re-execute"),
-            "an integrity check must not be sold as a reproduction: {md}"
+            md.contains("re-executes every arm x seed"),
+            "the notebook must state what reproduce.sh actually does: {md}"
         );
-        assert!(md.contains("integrity check, not a reproduction"), "{md}");
+        assert!(
+            md.contains("table re-derivation is not yet"),
+            "the remaining gap must stay disclosed rather than quietly dropped: {md}"
+        );
+    }
+
+    /// The emitted script must actually RE-EXECUTE, not only re-hash.
+    ///
+    /// The defect this bead names is that reproduce.sh "explicitly hashes retained
+    /// summaries instead of rerunning every arm and seed". These assertions fail if anyone
+    /// reverts to that shape.
+    #[test]
+    fn bd_16g_1_7_reproduce_script_reruns_every_arm_and_seed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runs = vec![run("r1", 0, 11), run("r2", 1, 12)];
+        let mut summaries = Vec::new();
+        for item in &runs {
+            let path = dir.path().join(format!("{}.json", item.run_id));
+            std::fs::write(&path, b"{}").expect("write summary");
+            let mut owned = item.clone();
+            owned.summary_path = Some(path.to_string_lossy().into_owned());
+            owned.summary_artifact_digest = blake3::hash(b"{}").to_hex().to_string();
+            summaries.push(owned);
+        }
+        let out = dir.path().join("nb");
+        NotebookRenderer::render_notebook("session-1", "goal", &[], &summaries, &out)
+            .expect("renders");
+        let script = std::fs::read_to_string(out.join("reproduce.sh")).expect("script");
+
+        // It invokes the real runner, once per run, with the pinned tick budget.
+        assert_eq!(
+            script.matches("SCRIPTBOTS_DET_RUN=1").count(),
+            summaries.len(),
+            "every arm x seed must be re-executed:\n{script}"
+        );
+        assert!(script.contains("SCRIPTBOTS_DET_TICKS=100"), "{script}");
+
+        // It writes the EXACT config layer, seed included, rather than assuming defaults.
+        assert!(
+            script.contains("\"rng_seed\":11") && script.contains("\"rng_seed\":12"),
+            "each run's seed must be pinned into its emitted config: {script}"
+        );
+        assert!(
+            script.contains("food_regrowth_rate"),
+            "the arm's overrides must reach the emitted config: {script}"
+        );
+
+        // It compares re-executed digests and fails the script on any difference.
+        assert!(
+            script.contains("digest differs on re-execution"),
+            "{script}"
+        );
+        assert!(script.contains("did not reproduce"), "{script}");
+        assert!(
+            script.contains("exit 1"),
+            "a mismatch must exit nonzero: {script}"
+        );
+
+        // And it never deletes the evidence it just produced.
+        assert!(
+            !script.contains("rm -"),
+            "emitted configs are evidence and must not be cleaned up: {script}"
+        );
     }
 }
