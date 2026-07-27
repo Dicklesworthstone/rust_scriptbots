@@ -25996,8 +25996,9 @@ mod tests {
         let canonical = canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?;
         for table in POST_V12_REBUILT_TABLES {
             // `islands` and `migrations` are recreated EMPTY rather than copied down, because
-            // V16 renamed a column (`agent_uid` became `agent_uid_from`/`agent_uid_to`) and a
-            // by-name copy is therefore impossible. That is sound only while they have no
+            // V16 changed their column sets -- `migrations` gained `agent_uid_to` and both
+            // tables gained tighter CHECKs -- so a by-name copy down to the V12 shape would
+            // have to drop a NOT NULL column. That is sound only while they have no
             // writers, so the emptiness is ASSERTED rather than assumed — the moment
             // bd-16g.5.5.1 populates them this fires and forces a real down-conversion instead
             // of silently discarding rows.
