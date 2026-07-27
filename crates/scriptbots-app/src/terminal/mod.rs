@@ -7980,6 +7980,84 @@ mod tests {
     /// legend to read the mortality panel. Asserting the exact ramp entry is what
     /// keeps that true — a future edit that merely picks "some palette colour"
     /// would still be retunable and still be wrong.
+    /// Terrain must be readable with no colour, in the ascii tier too.
+    ///
+    /// Part of the bd-xg82 monochrome audit. This was TRUE before the bead — it is
+    /// pinned rather than fixed, because an audit that lives only in a comment
+    /// stops being true the moment someone reuses a glyph, and the reader would
+    /// have no warning.
+    #[test]
+    fn every_terrain_kind_has_a_distinct_glyph_without_colour() {
+        let mut palette = Palette::test_backend_evidence();
+        // Force the ascii tier: emoji mode substitutes pictographs, and the
+        // guarantee has to hold on the plainest terminal, not the richest.
+        palette.emoji = false;
+
+        let kinds = [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ];
+        let mut seen: Vec<char> = Vec::new();
+        for kind in kinds {
+            let (glyph, _) = palette.terrain_symbol(kind, 0.5);
+            assert!(
+                !seen.contains(&glyph),
+                "{kind:?} reuses glyph {glyph:?}; two terrain kinds that share a \
+                 glyph are one terrain in monochrome"
+            );
+            seen.push(glyph);
+        }
+        assert_eq!(seen.len(), kinds.len(), "every terrain kind needs a glyph");
+    }
+
+    /// KNOWN GAP, pinned so it cannot be quietly forgotten or wrongly assumed
+    /// fixed.
+    ///
+    /// `agent_symbol` varies its glyph by diet — but only as a FALLBACK. For a
+    /// cell holding one agent it prefers a HEADING character, and heading is
+    /// almost always available, so the common case renders an arrow whose diet is
+    /// carried by colour alone. In monochrome a herbivore and a carnivore are the
+    /// same arrow.
+    ///
+    /// This is a genuine TRADE rather than an omission: one cell can show heading
+    /// or diet, not both. Removing heading would regress sighted readers, and a
+    /// combined vocabulary (headings x diet classes, across the emoji/narrow/ascii
+    /// tiers) is an art-direction decision under bd-9pqz. Recorded here with a
+    /// failure message that says what to do rather than leaving the next reader to
+    /// rediscover the trade.
+    #[test]
+    fn a_lone_agent_conveys_diet_by_colour_alone_bd_xg82_known_gap() {
+        let mut palette = Palette::test_backend_evidence();
+        palette.emoji = false;
+
+        let base = Style::default();
+        let mut glyphs: Vec<char> = Vec::new();
+        for class in [
+            DietClass::Herbivore,
+            DietClass::Omnivore,
+            DietClass::Carnivore,
+        ] {
+            let mut occupancy = CellOccupancy::default();
+            // One agent, with a heading — the ordinary case, which is exactly
+            // where the glyph channel is unavailable.
+            occupancy.add(class, false, 1.0, 0.0, 0.0, 0.5, 1);
+            let (glyph, _) = palette.agent_symbol(&occupancy, base);
+            glyphs.push(glyph);
+        }
+
+        let all_same = glyphs.iter().all(|g| *g == glyphs[0]);
+        assert!(
+            all_same,
+            "a lone agent now renders diet-distinct glyphs {glyphs:?} — the known \
+             gap this test records has been CLOSED. Update or delete this test and \
+             note it on bd-xg82; do not simply relax it"
+        );
+    }
+
     /// Every event kind must be distinguishable with no colour at all.
     ///
     /// The log rendered all four kinds as identically-formatted text and carried
