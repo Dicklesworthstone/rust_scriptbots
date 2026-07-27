@@ -10,11 +10,11 @@
 
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, ControlCommand,
-    DeathRecord, DynamicAgentSnapshot, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
-    PersistenceBatch, ResourceLedgerTick, ScientificStateError, ScriptBotsConfig, SelectionUpdate,
-    SimulationCommand, TerrainKind, Tick, TickCombatSummary, TickEvents, TickSummary,
-    toroidal_delta,
+    AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, ConfigAuditEntry,
+    ControlCommand, DeathRecord, DynamicAgentSnapshot, DynamicWorldSnapshot, Generation,
+    HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScientificStateError,
+    ScriptBotsConfig, SelectionUpdate, SimulationCommand, TerrainKind, Tick, TickCombatSummary,
+    TickEvents, TickSummary, toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -589,6 +589,17 @@ pub struct RenderSnapshot {
     pub build: SnapshotBuildStats,
     /// Compact renderer-neutral dynamic world projection.
     pub world: DynamicWorldSnapshot,
+    /// Configuration in effect at this boundary.
+    ///
+    /// Revision-gated like `summary_history` and `layers`: the `Arc` is only
+    /// re-allocated when `revisions.config` moves, so publishing every tick
+    /// costs a pointer clone rather than a config copy. Control surfaces read
+    /// config from here instead of locking the world (bd-88yj).
+    #[serde(with = "serde_arc")]
+    pub config: Arc<ScriptBotsConfig>,
+    /// Configuration audit trail as of this boundary, revision-gated with it.
+    #[serde(with = "serde_arc")]
+    pub config_audit: Arc<Vec<ConfigAuditEntry>>,
 }
 
 /// Hard bounds applied before a renderer-neutral projection allocates output buffers.

@@ -22,10 +22,10 @@ use arc_swap::ArcSwap;
 use scriptbots_core::{
     ACTIVATION_CAPTURE_BUDGET, AgentUid, BrainInspectionClientId, BrainInspectionError,
     BrainInspectionRequest, BrainInspectionRevision, CharacterizationError, CompletedStepFault,
-    ControlCommand, ControlDisposition, DynamicAgentSnapshot, DynamicWorldSnapshot, MigratingAgent,
-    NullPersistence, PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError,
-    ScriptBotsConfig, Tick, TickSummary, WorldDigestV1, WorldState, apply_control_command,
-    rng_domains::IslandId,
+    ConfigAuditEntry, ControlCommand, ControlDisposition, DynamicAgentSnapshot,
+    DynamicWorldSnapshot, MigratingAgent, NullPersistence, PersistenceAdmissionSession,
+    PersistenceSessionError, ScientificStateError, ScriptBotsConfig, Tick, TickSummary,
+    WorldDigestV1, WorldState, apply_control_command, rng_domains::IslandId,
 };
 use std::{
     cell::RefCell,
@@ -1832,6 +1832,11 @@ pub struct HostCore {
     cadence_credit: u128,
     next_snapshot: SnapshotRevision,
     last_published_scientific: ScientificRevision,
+    /// Config and audit published with the last snapshot, reused while
+    /// `revisions.config` is unchanged so a tick costs a pointer clone.
+    config: Arc<ScriptBotsConfig>,
+    config_audit: Arc<Vec<ConfigAuditEntry>>,
+    last_published_config: ConfigRevision,
     latest_completed_summary: Option<TickSummary>,
     next_journal_sequence: u64,
     next_lifecycle_command_sequence: u64,
@@ -1980,6 +1985,8 @@ impl HostCore {
             .next_back()
             .filter(|summary| summary.tick == world.tick())
             .cloned();
+        let config = Arc::new(world.config().clone());
+        let config_audit = Arc::new(world.config_audit().to_vec());
         let initial_snapshot = Arc::new(RenderSnapshot {
             session_id,
             revision: SnapshotRevision::new(1),
@@ -1994,6 +2001,8 @@ impl HostCore {
             layers: snapshot_layers.snapshot(),
             build,
             world: dynamic_world,
+            config: Arc::clone(&config),
+            config_audit: Arc::clone(&config_audit),
         });
         let snapshots = SnapshotHub::new(initial_snapshot);
         let command_archive_requirement = journal.shutdown_commit_requirement();
@@ -2049,6 +2058,9 @@ impl HostCore {
             cadence_credit: 0,
             next_snapshot: SnapshotRevision::new(2),
             last_published_scientific: revisions.scientific,
+            config: Arc::clone(&config),
+            config_audit: Arc::clone(&config_audit),
+            last_published_config: revisions.config,
             latest_completed_summary,
             next_journal_sequence: 1,
             next_lifecycle_command_sequence: session_id.get(),
@@ -2835,6 +2847,17 @@ impl HostCore {
             &layers,
             refresh,
         );
+        // Config and its audit move only when revisions.config moves, so this
+        // is a pointer clone on every tick that does not change configuration.
+        let config_changed = self.revisions.config != self.last_published_config;
+        let (config, config_audit) = if config_changed {
+            (
+                Arc::new(self.world.config().clone()),
+                Arc::new(self.world.config_audit().to_vec()),
+            )
+        } else {
+            (Arc::clone(&self.config), Arc::clone(&self.config_audit))
+        };
         let (command_queue_depth, last_applied_command) = {
             let shared = self.shared.borrow();
             (
@@ -2856,7 +2879,12 @@ impl HostCore {
             layers: layers.snapshot(),
             build,
             world: dynamic_world,
+            config: Arc::clone(&config),
+            config_audit: Arc::clone(&config_audit),
         });
+        self.config = config;
+        self.config_audit = config_audit;
+        self.last_published_config = self.revisions.config;
         self.snapshots.publish(snapshot)?;
         self.snapshot_layers = layers;
         self.summary_history = summary_history;
