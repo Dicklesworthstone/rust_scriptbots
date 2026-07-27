@@ -77,5 +77,10 @@ bevy_render = ["dep:scriptbots-bevy"]
 
 [dev-dependencies]
 rand = { workspace = true }
+# bd-ydmr: the archipelago determinism gate builds bounded Rayon pools so it can
+# compare science across thread counts. It must live in this crate because
+# scriptbots-runtime takes core with default-features = false, leaving `parallel`
+# off there and any such test vacuous.
+rayon = { workspace = true }
 tempfile = "3.13"
 serial_test = "3.0"
