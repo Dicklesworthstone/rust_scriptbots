@@ -56,7 +56,12 @@ use std::{
 use tracing::{error, info, warn};
 
 /// Launch context supplied by the ScriptBots application shell.
-pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> bool + Send + Sync>;
+/// Submit a command and receive the identity it was admitted under.
+///
+/// `None` is a refusal. `Some(id)` names the submission, which is what a bare
+/// `bool` could never do — and why every acknowledgement fix in this file could
+/// only ever reach `admitted` (bd-k7nq).
+pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync>;
 pub type CommandDrainFn = Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync>;
 pub type ControlHealthFn = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
@@ -1256,11 +1261,20 @@ fn apply_auto_pause_to_state(state: &mut SimControlData, reason: &str) {
 }
 
 fn submit_simulation_command(submitter: &CommandSubmitter, command: SimulationCommand) -> bool {
-    let accepted = (submitter.submit)(ControlCommand::UpdateSimulation(command));
-    if !accepted {
-        warn!("failed to enqueue simulation control command");
+    // The identity is logged rather than returned: every caller here gates on a
+    // yes/no, and widening them all is the receipt-plumbing slice, not this one.
+    // Naming it in the log is still strictly more than the bool carried before
+    // (bd-k7nq).
+    match (submitter.submit)(ControlCommand::UpdateSimulation(command)) {
+        Some(command_id) => {
+            debug!(%command_id, "simulation control command enqueued");
+            true
+        }
+        None => {
+            warn!("failed to enqueue simulation control command");
+            false
+        }
     }
-    accepted
 }
 
 /// Submit a playback command and reconcile local state with the answer.
@@ -3905,7 +3919,7 @@ mod quality_tier_consumer_tests {
 
     fn submitter_answering(accepted: bool) -> CommandSubmitter {
         CommandSubmitter {
-            submit: Arc::new(move |_| accepted),
+            submit: Arc::new(move |_| accepted.then(|| "test-cmd".to_owned())),
         }
     }
 
@@ -4094,8 +4108,14 @@ mod quality_tier_consumer_tests {
             "a selection path is discarding the enqueue result and committing the \
              camera regardless; gate on it or propagate the failure"
         );
+        // The gating form moved when the submitter began returning an
+        // identity instead of a bool (bd-k7nq): a refusal is now `None`, so the
+        // guard looks for the binding form rather than the negated one.
         assert!(
-            source.matches("if !(submitter.submit)(command)").count() >= 1,
+            source
+                .matches("let Some(command_id) = (submitter.submit)(command)")
+                .count()
+                >= 1,
             "at least one path must refuse to commit when the enqueue fails"
         );
     }
@@ -4985,8 +5005,8 @@ fn handle_selection_input(
             agent_ids: Vec::new(),
             state: SelectionState::Selected,
         });
-        if (submitter.submit)(command) {
-            info!("Bevy clear-selection enqueued via Escape");
+        if let Some(command_id) = (submitter.submit)(command) {
+            info!(%command_id, "Bevy clear-selection enqueued via Escape");
             rig.follow_mode = FollowMode::Off;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
@@ -5086,7 +5106,7 @@ fn handle_selection_input(
             state: SelectionState::Selected,
         });
 
-        if !(submitter.submit)(command) {
+        let Some(command_id) = (submitter.submit)(command) else {
             // Previously this failure was entirely silent: the result was
             // consumed by `&& !extend`, so a refused shift-click reported
             // nothing at all and a refused plain click only skipped the camera.
@@ -5095,8 +5115,8 @@ fn handle_selection_input(
                 intent, "selection command could not be enqueued; selection unchanged"
             );
             return;
-        }
-        info!(agent_id, intent, "Bevy selection enqueued");
+        };
+        info!(agent_id, intent, %command_id, "Bevy selection enqueued");
         if !extend {
             rig.follow_mode = FollowMode::Selected;
             rig.pan = Vec2::ZERO;
@@ -5108,8 +5128,8 @@ fn handle_selection_input(
             agent_ids: Vec::new(),
             state: SelectionState::Selected,
         });
-        if (submitter.submit)(command) {
-            info!("Bevy clear-selection enqueued via empty click");
+        if let Some(command_id) = (submitter.submit)(command) {
+            info!(%command_id, "Bevy clear-selection enqueued via empty click");
             rig.follow_mode = FollowMode::Off;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
@@ -5363,11 +5383,11 @@ fn handle_clear_selection_button(
             // button will exist, and bailing out of the whole system would drop
             // the other windows' presses on the floor — the same class of silent
             // loss this fix exists to remove.
-            if !(submitter.submit)(command) {
+            let Some(command_id) = (submitter.submit)(command) else {
                 warn!("clear-selection command could not be enqueued; leaving the camera as it is");
                 continue;
-            }
-            info!("Bevy clear selection enqueued");
+            };
+            info!(%command_id, "Bevy clear selection enqueued");
             rig.follow_mode = FollowMode::Off;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
@@ -8444,7 +8464,7 @@ mod tests {
                 if let ControlCommand::UpdateSelection(update) = command {
                     sink.lock().unwrap().push(update.mode);
                 }
-                true
+                Some("test-cmd".to_owned())
             }),
         });
         app.insert_resource(CameraRig::default());
@@ -8483,7 +8503,7 @@ mod tests {
         let mut app = App::new();
         app.add_systems(Update, handle_clear_selection_button);
         app.insert_resource(CommandSubmitter {
-            submit: Arc::new(move |_| accepted),
+            submit: Arc::new(move |_| accepted.then(|| "test-cmd".to_owned())),
         });
         app.insert_resource(CameraRig {
             follow_mode: FollowMode::Selected,
@@ -8716,7 +8736,7 @@ mod tests {
                     panic!("step button submitted the wrong command kind");
                 };
                 assert!(command.step_once, "step command lost its edge");
-                accepted
+                accepted.then(|| "test-cmd".to_owned())
             }),
         });
         app.world_mut().spawn((
@@ -9550,7 +9570,12 @@ mod acknowledgement_guard {
         if !signature.contains("-> ") || signature.contains("Result<(), ") {
             return false;
         }
-        signature.contains(RECEIPT_TYPE) || signature.contains("-> bool")
+        // `Option<String>` is the submit-boundary receipt: an id on admission,
+        // `None` on refusal. It joins the list because the bus envelope made it
+        // the answer the Bevy and GPUI closures now hand back (bd-k7nq).
+        signature.contains(RECEIPT_TYPE)
+            || signature.contains("-> bool")
+            || signature.contains("-> Option<String>")
     }
 
     /// DERIVE the submitter set instead of listing it.

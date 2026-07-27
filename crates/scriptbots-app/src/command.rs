@@ -84,39 +84,66 @@ impl CommandBusCounters {
     }
 }
 
+/// A command on the bus, carrying the identity minted when it was submitted.
+///
+/// The bus used to carry a bare `ControlCommand`, which is the reason every
+/// acknowledgement fix this session could only ever reach `admitted`: the
+/// surface that submitted a command had no name for it, so nothing downstream
+/// could report what became of it. Identity is minted at the submit boundary
+/// and travels WITH the command (bd-k7nq).
+#[derive(Debug, Clone)]
+pub struct BusCommand {
+    /// Identity the submitter can poll and the applier can report against.
+    pub id: String,
+    /// The command itself.
+    pub command: ControlCommand,
+}
+
 /// Cloneable producer for the bounded control-command ingress.
 #[derive(Clone, Debug)]
 pub struct CommandSender {
-    inner: mpsc::Sender<ControlCommand>,
+    inner: mpsc::Sender<BusCommand>,
     counters: Arc<CommandBusCounters>,
+    /// Mints identity for submissions that do not bring their own.
+    next_id: Arc<AtomicU64>,
 }
 
 impl CommandSender {
     /// Attempt to enqueue one command without waiting for capacity.
-    pub fn try_send(&self, command: ControlCommand) -> Result<(), CommandSendError> {
+    /// Mint an identity for a submission that does not carry one.
+    ///
+    /// The `gui-` prefix marks provenance: these come from the closure Bevy and
+    /// GPUI hold, not from `ControlHandle`, and keeping the two id spaces
+    /// visibly distinct means an id can never collide across the two paths.
+    pub fn mint_id(&self) -> String {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("gui-{n}")
+    }
+
+    pub fn try_send(&self, id: String, command: ControlCommand) -> Result<(), CommandSendError> {
         let span = trace_span!(
             "control_command_bus.try_send",
             channel_id = COMMAND_BUS_TELEMETRY_ID
         );
         let _entered = span.enter();
-        let result = match self.inner.try_send(command) {
+        let result = match self.inner.try_send(BusCommand { id, command }) {
             Ok(()) => {
                 self.counters
                     .admitted_commands
                     .fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            Err(mpsc::SendError::Full(command)) => {
+            Err(mpsc::SendError::Full(envelope)) => {
                 self.counters
                     .full_rejections
                     .fetch_add(1, Ordering::Relaxed);
-                Err(CommandSendError::Full(command))
+                Err(CommandSendError::Full(envelope.command))
             }
-            Err(mpsc::SendError::Disconnected(command) | mpsc::SendError::Cancelled(command)) => {
+            Err(mpsc::SendError::Disconnected(envelope) | mpsc::SendError::Cancelled(envelope)) => {
                 self.counters
                     .disconnected_rejections
                     .fetch_add(1, Ordering::Relaxed);
-                Err(CommandSendError::Disconnected(command))
+                Err(CommandSendError::Disconnected(envelope.command))
             }
         };
         let outcome = match &result {
@@ -159,7 +186,7 @@ impl CommandSender {
     }
 
     #[cfg(test)]
-    fn try_reserve(&self) -> Result<mpsc::SendPermit<'_, ControlCommand>, mpsc::SendError<()>> {
+    fn try_reserve(&self) -> Result<mpsc::SendPermit<'_, BusCommand>, mpsc::SendError<()>> {
         self.inner.try_reserve()
     }
 }
@@ -171,13 +198,13 @@ impl CommandSender {
 /// receiver handle; the channel itself remains the bounded Asupersync queue.
 #[derive(Debug)]
 pub struct CommandReceiver {
-    inner: Mutex<mpsc::Receiver<ControlCommand>>,
+    inner: Mutex<mpsc::Receiver<BusCommand>>,
     counters: Arc<CommandBusCounters>,
 }
 
 impl CommandReceiver {
     /// Attempt to receive one command without blocking.
-    pub fn try_recv(&self) -> Result<ControlCommand, CommandRecvError> {
+    pub fn try_recv(&self) -> Result<BusCommand, CommandRecvError> {
         let result = self
             .inner
             .lock()
@@ -197,7 +224,7 @@ impl CommandReceiver {
         }
     }
 
-    fn drain_bounded(&self) -> Vec<ControlCommand> {
+    fn drain_bounded(&self) -> Vec<BusCommand> {
         let mut receiver = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let mut commands = Vec::new();
         for _ in 0..receiver.capacity() {
@@ -243,8 +270,14 @@ impl CommandReceiver {
 /// Calls are mutex-serialized so one preloaded batch cannot split between
 /// callbacks. Application-order FIFO still requires exactly one logical
 /// consumer; concurrent callers must not apply returned batches out of order.
-pub type CommandDrain = Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync>;
-pub type CommandSubmit = Arc<dyn Fn(ControlCommand) -> bool + Send + Sync>;
+pub type CommandDrain = Arc<dyn Fn() -> Vec<BusCommand> + Send + Sync>;
+/// Submit a command and receive the identity it was admitted under.
+///
+/// `None` means refused. `Some(id)` is a name the caller can poll and that the
+/// applier will report against - which is what the previous `bool` could never
+/// express, and why surfaces holding this closure could only ever say
+/// `admitted` (bd-k7nq).
+pub type CommandSubmit = Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync>;
 
 /// Create a bounded legacy control-command bus.
 ///
@@ -259,6 +292,7 @@ pub fn create_command_bus(capacity: usize) -> (CommandSender, CommandReceiver) {
         CommandSender {
             inner: sender,
             counters: Arc::clone(&counters),
+            next_id: Arc::new(AtomicU64::new(0)),
         },
         CommandReceiver {
             inner: Mutex::new(receiver),
@@ -268,7 +302,7 @@ pub fn create_command_bus(capacity: usize) -> (CommandSender, CommandReceiver) {
 }
 
 #[must_use]
-pub fn drain_pending_commands(receiver: &CommandReceiver) -> Vec<ControlCommand> {
+pub fn drain_pending_commands(receiver: &CommandReceiver) -> Vec<BusCommand> {
     let span = trace_span!(
         "control_command_bus.drain",
         channel_id = COMMAND_BUS_TELEMETRY_ID
@@ -299,17 +333,18 @@ pub fn make_command_submit(sender: CommandSender) -> CommandSubmit {
         if let Err(error) = command.validate() {
             sender.record_validation_rejection();
             warn!(%error, "rejected invalid control command before queue admission");
-            return false;
+            return None;
         }
-        match sender.try_send(command) {
-            Ok(()) => true,
+        let id = sender.mint_id();
+        match sender.try_send(id.clone(), command) {
+            Ok(()) => Some(id),
             Err(CommandSendError::Full(_command)) => {
                 warn!("control command queue full; command rejected");
-                false
+                None
             }
             Err(CommandSendError::Disconnected(_command)) => {
                 warn!("control command queue disconnected; command rejected");
-                false
+                None
             }
         }
     })
@@ -327,13 +362,14 @@ mod validation_tests {
         let (sender, receiver) = create_command_bus(1);
         let telemetry = sender.clone();
         let submit = make_command_submit(sender);
-        assert!(!(submit)(ControlCommand::UpdateSimulation(
-            SimulationCommand {
+        assert!(
+            (submit)(ControlCommand::UpdateSimulation(SimulationCommand {
                 paused: Some(false),
                 speed_multiplier: Some(f32::NAN),
                 step_once: false,
-            }
-        )));
+            }))
+            .is_none()
+        );
         assert!(matches!(receiver.try_recv(), Err(CommandRecvError::Empty)));
         assert_eq!(telemetry.telemetry_snapshot().validation_rejections, 1);
     }
@@ -342,20 +378,25 @@ mod validation_tests {
     fn finite_speed_is_admitted_and_clamped_when_applied() {
         let (sender, receiver) = create_command_bus(1);
         let submit = make_command_submit(sender);
-        assert!((submit)(ControlCommand::UpdateSimulation(
-            SimulationCommand {
+        assert!(
+            (submit)(ControlCommand::UpdateSimulation(SimulationCommand {
                 paused: Some(false),
                 speed_multiplier: Some(128.0),
                 step_once: false,
-            }
-        )));
+            }))
+            .is_none()
+        );
 
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let pending = drain_pending_commands(&receiver);
         assert_eq!(pending.len(), 1);
         let disposition = apply_control_command(
             &mut world,
-            pending.into_iter().next().expect("one playback command"),
+            pending
+                .into_iter()
+                .next()
+                .expect("one playback command")
+                .command,
         )
         .expect("normalized playback disposition");
         assert_eq!(
@@ -773,9 +814,10 @@ mod tests {
     fn current_capacity_32_bus_accepts_32_and_rejects_the_33rd() {
         let (sender, receiver) = create_command_bus(32);
         for index in 0..32 {
-            let result = sender.try_send(ControlCommand::UpdateSimulation(
-                SimulationCommand::default(),
-            ));
+            let result = sender.try_send(
+                "t-1".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand::default()),
+            );
             assert!(result.is_ok(), "command {index} should fit: {result:?}");
         }
         let overflow = ControlCommand::UpdateSimulation(SimulationCommand {
@@ -784,7 +826,7 @@ mod tests {
             step_once: true,
         });
         let error = sender
-            .try_send(overflow)
+            .try_send("t-overflow".to_owned(), overflow)
             .expect_err("the thirty-third command must be returned");
         let recovered = match error {
             CommandSendError::Full(ControlCommand::UpdateSimulation(recovered)) => recovered,
@@ -811,18 +853,24 @@ mod tests {
         assert_eq!(sender.telemetry_snapshot().queued_commands, 0);
 
         sender
-            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: Some(true),
-                speed_multiplier: None,
-                step_once: false,
-            }))
+            .try_send(
+                "t-x".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(true),
+                    speed_multiplier: None,
+                    step_once: false,
+                }),
+            )
             .expect("pause fits");
         sender
-            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: None,
-                speed_multiplier: Some(2.0),
-                step_once: false,
-            }))
+            .try_send(
+                "t-x".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: None,
+                    speed_multiplier: Some(2.0),
+                    step_once: false,
+                }),
+            )
             .expect("speed fits");
 
         let full = sender.telemetry_snapshot();
@@ -854,9 +902,10 @@ mod tests {
         assert_eq!(aborted.cancellation_count, 1);
         assert!(matches!(receiver.try_recv(), Err(CommandRecvError::Empty)));
         sender
-            .try_send(ControlCommand::UpdateSimulation(
-                SimulationCommand::default(),
-            ))
+            .try_send(
+                "t-y".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand::default()),
+            )
             .expect("aborted reservation released capacity");
     }
 
@@ -872,10 +921,16 @@ mod tests {
         });
 
         let error = permit
-            .try_send(command)
+            .try_send(BusCommand {
+                id: "t-cmd".to_owned(),
+                command,
+            })
             .expect_err("closed receiver must reject reserved commit");
         let recovered = match error {
-            mpsc::SendError::Disconnected(ControlCommand::UpdateSimulation(recovered)) => recovered,
+            mpsc::SendError::Disconnected(BusCommand {
+                command: ControlCommand::UpdateSimulation(recovered),
+                ..
+            }) => recovered,
             other => panic!("expected exact disconnected playback command, got {other:?}"),
         };
         assert_eq!(
@@ -893,11 +948,14 @@ mod tests {
         let (sender, receiver) = create_command_bus(1);
         drop(receiver);
         let error = sender
-            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: Some(false),
-                speed_multiplier: Some(7.0),
-                step_once: true,
-            }))
+            .try_send(
+                "t-x".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(false),
+                    speed_multiplier: Some(7.0),
+                    step_once: true,
+                }),
+            )
             .expect_err("closed receiver rejects command");
         let recovered = match error {
             CommandSendError::Disconnected(ControlCommand::UpdateSimulation(recovered)) => {
@@ -917,27 +975,33 @@ mod tests {
     fn dropping_last_sender_drains_fifo_then_reports_typed_disconnect() {
         let (sender, receiver) = create_command_bus(2);
         sender
-            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: Some(true),
-                speed_multiplier: None,
-                step_once: false,
-            }))
+            .try_send(
+                "t-x".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(true),
+                    speed_multiplier: None,
+                    step_once: false,
+                }),
+            )
             .expect("pause fits");
         sender
-            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: None,
-                speed_multiplier: Some(4.0),
-                step_once: false,
-            }))
+            .try_send(
+                "t-x".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: None,
+                    speed_multiplier: Some(4.0),
+                    step_once: false,
+                }),
+            )
             .expect("speed fits");
         drop(sender);
 
         let drained = drain_pending_commands(&receiver);
         assert_eq!(drained.len(), 2);
-        let ControlCommand::UpdateSimulation(first) = &drained[0] else {
+        let ControlCommand::UpdateSimulation(first) = &drained[0].command else {
             panic!("first command should be playback");
         };
-        let ControlCommand::UpdateSimulation(second) = &drained[1] else {
+        let ControlCommand::UpdateSimulation(second) = &drained[1].command else {
             panic!("second command should be playback");
         };
         assert_eq!(first.paused, Some(true));
@@ -952,11 +1016,14 @@ mod tests {
     async fn tokio_producer_uses_sync_admission_without_runtime_coupling() {
         let (sender, receiver) = create_command_bus(1);
         tokio::spawn(async move {
-            sender.try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: Some(true),
-                speed_multiplier: None,
-                step_once: false,
-            }))
+            sender.try_send(
+                "t-x".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(true),
+                    speed_multiplier: None,
+                    step_once: false,
+                }),
+            )
         })
         .await
         .expect("tokio producer task")
@@ -965,6 +1032,7 @@ mod tests {
         let ControlCommand::UpdateSimulation(received) = receiver
             .try_recv()
             .expect("plain-thread consumer receives command")
+            .command
         else {
             panic!("expected playback command");
         };
@@ -977,11 +1045,14 @@ mod tests {
         let (sender, receiver) = create_command_bus(SPEEDS.len());
         for speed_multiplier in SPEEDS {
             sender
-                .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                    paused: None,
-                    speed_multiplier: Some(speed_multiplier),
-                    step_once: false,
-                }))
+                .try_send(
+                    "t-x".to_owned(),
+                    ControlCommand::UpdateSimulation(SimulationCommand {
+                        paused: None,
+                        speed_multiplier: Some(speed_multiplier),
+                        step_once: false,
+                    }),
+                )
                 .expect("batch command fits");
         }
         drop(sender);
@@ -1014,8 +1085,8 @@ mod tests {
         let mut observed = batches
             .into_iter()
             .flatten()
-            .map(|command| {
-                let ControlCommand::UpdateSimulation(playback) = command else {
+            .map(|bus| {
+                let ControlCommand::UpdateSimulation(playback) = bus.command else {
                     panic!("expected playback command");
                 };
                 playback
@@ -1052,12 +1123,12 @@ mod tests {
                     ControlDisposition::WorldApplied
                 ));
                 sender
-                    .try_send(command)
+                    .try_send("t-cmd".to_owned(), command)
                     .expect("scheduled command enters bounded bus");
             }
 
-            for command in drain_pending_commands(&receiver) {
-                let queued_disposition = apply_control_command(&mut queued, command)
+            for bus in drain_pending_commands(&receiver) {
+                let queued_disposition = apply_control_command(&mut queued, bus.command)
                     .expect("queued scheduled command applies");
                 assert!(matches!(
                     queued_disposition,
@@ -1080,27 +1151,39 @@ mod tests {
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let (sender, receiver) = create_command_bus(2);
         sender
-            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: Some(true),
-                speed_multiplier: None,
-                step_once: false,
-            }))
+            .try_send(
+                "t-x".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(true),
+                    speed_multiplier: None,
+                    step_once: false,
+                }),
+            )
             .expect("pause fits");
         let mut updated = world.config().clone();
         updated.food_max = 0.73;
         sender
-            .try_send(ControlCommand::UpdateConfig(Box::new(updated)))
+            .try_send(
+                "t-cfg".to_owned(),
+                ControlCommand::UpdateConfig(Box::new(updated)),
+            )
             .expect("config fits");
 
         let commands = drain_pending_commands(&receiver);
         assert_eq!(commands.len(), 2);
-        assert!(matches!(commands[0], ControlCommand::UpdateSimulation(_)));
-        assert!(matches!(commands[1], ControlCommand::UpdateConfig(_)));
+        assert!(matches!(
+            commands[0].command,
+            ControlCommand::UpdateSimulation(_)
+        ));
+        assert!(matches!(
+            commands[1].command,
+            ControlCommand::UpdateConfig(_)
+        ));
 
         let dispositions = commands
             .into_iter()
-            .map(|command| {
-                apply_control_command(&mut world, command).expect("ordered command application")
+            .map(|bus| {
+                apply_control_command(&mut world, bus.command).expect("ordered command application")
             })
             .collect::<Vec<_>>();
         assert!(matches!(
@@ -1121,21 +1204,27 @@ mod tests {
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let (sender, receiver) = create_command_bus(2);
         sender
-            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: Some(true),
-                speed_multiplier: None,
-                step_once: true,
-            }))
+            .try_send(
+                "t-x".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(true),
+                    speed_multiplier: None,
+                    step_once: true,
+                }),
+            )
             .expect("step fits");
         let mut updated = world.config().clone();
         updated.food_max = 0.73;
         sender
-            .try_send(ControlCommand::UpdateConfig(Box::new(updated)))
+            .try_send(
+                "t-cfg".to_owned(),
+                ControlCommand::UpdateConfig(Box::new(updated)),
+            )
             .expect("config fits");
 
         let mut deferred_playback = Vec::new();
-        for command in drain_pending_commands(&receiver) {
-            match apply_control_command(&mut world, command).expect("apply drained command") {
+        for bus in drain_pending_commands(&receiver) {
+            match apply_control_command(&mut world, bus.command).expect("apply drained command") {
                 ControlDisposition::WorldApplied => {}
                 ControlDisposition::Playback(command) => deferred_playback.push(command),
             }
@@ -1164,15 +1253,15 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let mut updated = world.lock().expect("world lock").config().clone();
         updated.food_max = 0.73;
-        assert!(submit(ControlCommand::UpdateConfig(Box::new(updated))));
+        assert!(submit(ControlCommand::UpdateConfig(Box::new(updated))).is_some());
 
         runtime.shutdown().expect("control runtime shutdown");
         let observed_at_shutdown = world.lock().expect("world lock").config().food_max;
         assert!((observed_at_shutdown - 0.73).abs() > f32::EPSILON);
 
         let mut world_guard = world.lock().expect("world lock");
-        for command in (drain.as_ref())() {
-            let _ = apply_control_command(&mut world_guard, command)
+        for bus in (drain.as_ref())() {
+            let _ = apply_control_command(&mut world_guard, bus.command)
                 .expect("apply command after shutdown");
         }
         drop(world_guard);

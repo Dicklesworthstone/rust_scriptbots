@@ -882,7 +882,11 @@ impl ControlHandle {
         {
             return Ok(existing.clone());
         }
-        self.enqueue(cmd)?;
+        // Identity is decided BEFORE the send, because the bus now carries it:
+        // the applier can only report against a name that travelled with the
+        // command. A refused enqueue therefore consumes a sequence number,
+        // which leaves harmless gaps in admission order rather than handing two
+        // different commands the same identity.
         let id_num = self
             .command_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -890,6 +894,7 @@ impl ControlHandle {
         let command_id = idempotency_key
             .map(str::to_owned)
             .unwrap_or_else(|| format!("cmd-{id_num}"));
+        self.enqueue(&command_id, cmd)?;
         // Report what actually happened: the command took an admission order on the
         // bounded bus. It has NOT been drained by the simulation driver, has not been
         // applied to the world, and the legacy app-owned bus writes no journal record
@@ -968,12 +973,12 @@ impl ControlHandle {
         self.submit_control_command_with_key(command, idempotency_key)
     }
 
-    fn enqueue(&self, command: ControlCommand) -> Result<(), ControlError> {
+    fn enqueue(&self, id: &str, command: ControlCommand) -> Result<(), ControlError> {
         if let Err(error) = command.validate() {
             self.commands.record_validation_rejection();
             return Err(ControlError::InvalidPatch(error.to_string()));
         }
-        match self.commands.try_send(command) {
+        match self.commands.try_send(id.to_owned(), command) {
             Ok(()) => Ok(()),
             Err(CommandSendError::Full(_command)) => Err(ControlError::CommandQueueFull),
             Err(CommandSendError::Disconnected(_command)) => Err(ControlError::CommandQueueClosed),
@@ -1357,8 +1362,8 @@ mod tests {
     }
 
     fn drain_and_apply(receiver: &crate::command::CommandReceiver, world: &mut WorldState) {
-        for command in crate::command::drain_pending_commands(receiver) {
-            let _ = scriptbots_core::apply_control_command(world, command)
+        for bus in crate::command::drain_pending_commands(receiver) {
+            let _ = scriptbots_core::apply_control_command(world, bus.command)
                 .expect("drained test command applies");
         }
     }

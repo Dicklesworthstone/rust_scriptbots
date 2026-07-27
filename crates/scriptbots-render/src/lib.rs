@@ -2521,7 +2521,7 @@ mod gui_window_layout_tests {
 struct GuiSession {
     simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
     analytics: AnalyticsSnapshotProvider,
-    command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+    command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     /// Focus and hover describe one experiment, not one window. Sharing the
     /// inspector state keeps Lab selection, World highlighting, and camera
     /// follow on the same agent while each window retains its own presentation.
@@ -2539,7 +2539,7 @@ impl GuiSession {
         simulation_step: WorldStepDriver,
         analytics: AnalyticsSnapshotProvider,
         command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
-        command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+        command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     ) -> Self {
         let mut inspector_state = InspectorState::default();
         if let Ok(world_guard) = world.lock() {
@@ -2647,7 +2647,7 @@ pub fn run_demo(
     simulation_step: WorldStepDriver,
     analytics: AnalyticsSnapshotProvider,
     command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
-    command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+    command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     health_probe: GuiHealthProbe,
 ) -> Result<(), GuiRunError> {
     if let Ok(world) = world.lock()
@@ -2734,7 +2734,7 @@ struct SimulationView {
     simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
     analytics_provider: AnalyticsSnapshotProvider,
     title: SharedString,
-    command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+    command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     camera: Arc<Mutex<Camera>>,
     /// Window-local GPUI atlas images for the continuously sampled world field.
     ///
@@ -2808,7 +2808,7 @@ impl SimulationView {
         simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
         analytics_provider: AnalyticsSnapshotProvider,
         title: SharedString,
-        command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+        command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
         selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
         selection_submission: Arc<Mutex<()>>,
     ) -> Self {
@@ -2896,13 +2896,19 @@ impl SimulationView {
             .lock()
             .map(|world| world.tick().0)
             .unwrap_or_default();
-        let accepted = (self.command_submit.as_ref())(command.clone());
-        if accepted {
-            debug!(tick, source = "gui", payload = ?command, "GPUI control command enqueued");
-        } else {
-            warn!(tick, source = "gui", payload = ?command, "failed to enqueue GPUI control command");
+        // The submitter now hands back the identity the command was admitted
+        // under, so the GPUI layer can finally NAME what it submitted instead
+        // of only knowing that something was accepted (bd-k7nq).
+        let admitted = (self.command_submit.as_ref())(command.clone());
+        match admitted.as_deref() {
+            Some(command_id) => {
+                debug!(tick, source = "gui", %command_id, payload = ?command, "GPUI control command enqueued");
+            }
+            None => {
+                warn!(tick, source = "gui", payload = ?command, "failed to enqueue GPUI control command");
+            }
         }
-        accepted
+        admitted.is_some()
     }
 
     fn submit_simulation_command(&self, command: SimulationCommand) -> bool {
@@ -18042,7 +18048,7 @@ mod command_characterization_tests {
             simulation_driver,
             AnalyticsSnapshotProvider::empty(),
             "command characterization".into(),
-            Arc::new(|_command: ControlCommand| true),
+            Arc::new(|_command: ControlCommand| Some("test-cmd".to_owned())),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(())),
         )
@@ -18565,14 +18571,14 @@ mod command_characterization_tests {
                 });
             let record = Arc::clone(&submitted);
             let submit = Arc::clone(&pending);
-            let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+            let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
                 Arc::new(move |command| {
                     record
                         .lock()
                         .expect("shortcut submitted log")
                         .push(command.clone());
                     submit.lock().expect("shortcut command queue").push(command);
-                    true
+                    Some("test-cmd".to_owned())
                 });
             let step_world = Arc::clone(&world);
             let simulation_step: WorldStepDriver =
@@ -19336,13 +19342,13 @@ mod command_characterization_tests {
                 std::mem::take(&mut *commands)
             });
         let submit_commands = Arc::clone(&pending_commands);
-        let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+        let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
             Arc::new(move |command| {
                 submit_commands
                     .lock()
                     .expect("single-step command queue")
                     .push(command);
-                true
+                Some("test-cmd".to_owned())
             });
         let step_world = Arc::clone(&world);
         let simulation_step: WorldStepDriver =
@@ -19450,13 +19456,13 @@ mod command_characterization_tests {
         let world = command_characterization_world();
         let submitted_commands = Arc::new(Mutex::new(Vec::new()));
         let captured_commands = Arc::clone(&submitted_commands);
-        let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+        let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
             Arc::new(move |command| {
                 captured_commands
                     .lock()
                     .expect("closed-world submitted command queue")
                     .push(command);
-                true
+                Some("test-cmd".to_owned())
             });
         let drain_commands = Arc::clone(&submitted_commands);
         let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
@@ -19534,13 +19540,13 @@ mod command_characterization_tests {
             .expect("spawn select-all fixture agent");
         let submitted_commands = Arc::new(Mutex::new(Vec::new()));
         let captured_commands = Arc::clone(&submitted_commands);
-        let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+        let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
             Arc::new(move |command| {
                 captured_commands
                     .lock()
                     .expect("select-all submitted command queue")
                     .push(command);
-                true
+                Some("test-cmd".to_owned())
             });
         let drain_commands = Arc::clone(&submitted_commands);
         let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
@@ -19655,7 +19661,7 @@ mod command_characterization_tests {
             "rejected selection".into(),
             Arc::new(move |_command| {
                 captured_attempts.fetch_add(1, AtomicOrdering::Relaxed);
-                false
+                None
             }),
             Arc::clone(&projection),
             Arc::new(Mutex::new(())),
@@ -19732,7 +19738,7 @@ mod command_characterization_tests {
                     .lock()
                     .expect("rapid-selection command queue")
                     .push(command);
-                true
+                Some("test-cmd".to_owned())
             }),
             Arc::clone(&projection),
             Arc::new(Mutex::new(())),
@@ -19844,7 +19850,7 @@ mod command_characterization_tests {
                 title.into(),
                 Arc::new(move |_command| {
                     captured_attempts.fetch_add(1, AtomicOrdering::Relaxed);
-                    true
+                    Some("test-cmd".to_owned())
                 }),
                 Arc::clone(&projection),
                 Arc::clone(&submission),
@@ -19987,13 +19993,13 @@ mod command_characterization_tests {
                 std::mem::take(&mut *commands)
             });
         let submit_commands = Arc::clone(&pending_commands);
-        let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> =
+        let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
             Arc::new(move |command| {
                 submit_commands
                     .lock()
                     .expect("production-repaint command queue")
                     .push(command);
-                true
+                Some("test-cmd".to_owned())
             });
         let step_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted_steps = Arc::clone(&step_calls);
@@ -20099,7 +20105,8 @@ mod command_characterization_tests {
                         speed_multiplier: None,
                         step_once: true,
                     }
-                )),
+                ))
+                .is_some(),
                 "production GPUI step command must be admitted"
             );
             app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
