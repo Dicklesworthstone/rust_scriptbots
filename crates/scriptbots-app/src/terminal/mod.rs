@@ -2018,21 +2018,24 @@ impl<'a> TerminalApp<'a> {
                 Span::raw(format!("{:>4}", ana.deaths_total)),
             ]));
             // Simple horizontal bars to visualize proportions
-            let parts = [
-                ("C", ana.deaths_combat_carnivore as u64, Color::Red),
-                ("H", ana.deaths_combat_herbivore as u64, Color::LightRed),
-                ("S", ana.deaths_starvation as u64, Color::Yellow),
-                ("A", ana.deaths_aging as u64, Color::Gray),
-                ("U", ana.deaths_unknown as u64, Color::DarkGray),
-            ];
             let total = ana.deaths_total.max(1) as u64;
-            for (label, count, color) in parts {
+            for cause in MortalityCause::all() {
+                let count = match cause {
+                    MortalityCause::CombatCarnivore => ana.deaths_combat_carnivore,
+                    MortalityCause::CombatHerbivore => ana.deaths_combat_herbivore,
+                    MortalityCause::Starvation => ana.deaths_starvation,
+                    MortalityCause::Aging => ana.deaths_aging,
+                    MortalityCause::Unknown => ana.deaths_unknown,
+                } as u64;
                 let width = ((count * 20) / total).clamp(0, 20) as usize;
                 let bar = "█".repeat(width);
                 lines.push(Line::from(vec![
-                    Span::styled(format!(" {:>2} ", label), self.palette.header_style()),
-                    Span::styled(bar, Style::default().fg(color)),
-                    Span::raw(format!(" {:>3}", count)),
+                    Span::styled(
+                        format!(" {:>2} ", cause.label()),
+                        self.palette.header_style(),
+                    ),
+                    Span::styled(bar, self.palette.mortality_style(cause)),
+                    Span::raw(format!(" {count:>3}")),
                 ]));
             }
         } else {
@@ -3968,6 +3971,45 @@ enum EventKind {
     Info,
 }
 
+/// Why an agent died, as the mortality panel breaks it down.
+///
+/// Named rather than passed as a bare colour so the panel and its palette
+/// mapping cannot disagree about which bar is which, and so adding a cause is a
+/// compile error in one place instead of a silently unstyled sixth bar
+/// (bd-f4x0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MortalityCause {
+    CombatCarnivore,
+    CombatHerbivore,
+    Starvation,
+    Aging,
+    Unknown,
+}
+
+impl MortalityCause {
+    /// The column label shown beside the bar.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CombatCarnivore => "C",
+            Self::CombatHerbivore => "H",
+            Self::Starvation => "S",
+            Self::Aging => "A",
+            Self::Unknown => "U",
+        }
+    }
+
+    /// Every cause, in display order.
+    const fn all() -> [Self; 5] {
+        [
+            Self::CombatCarnivore,
+            Self::CombatHerbivore,
+            Self::Starvation,
+            Self::Aging,
+            Self::Unknown,
+        ]
+    }
+}
+
 impl Snapshot {
     fn from_world(world: &WorldState) -> Self {
         let config = world.config();
@@ -5372,6 +5414,40 @@ impl Palette {
     /// These reuse the event ramp rather than introducing a fourth colour
     /// vocabulary, so a status row and the event log agree about what "good" and
     /// "bad" look like, and every accessibility palette retunes both at once.
+    /// Colour for one mortality cause, drawn from the ramps that already name
+    /// these concepts elsewhere in the app.
+    ///
+    /// The mortality bars were hand-coded Red / LightRed / Yellow / Gray /
+    /// DarkGray. Two problems, only one of which is styling. Red against
+    /// LightRed and Gray against DarkGray are barely separable with full colour
+    /// vision and collapse entirely under the deuteranopia and protanopia
+    /// palettes this app ships, because named ANSI constants cannot be retuned.
+    /// And the colours were arbitrary: nothing tied the bar for "killed by a
+    /// carnivore" to the colour carnivores are actually drawn in.
+    ///
+    /// So each cause takes the palette entry that already MEANS it: combat
+    /// deaths use the diet colour of the killer, starvation uses the energy
+    /// ramp it depletes, and the two residual causes take dimmed chrome rather
+    /// than competing with real signal. Switching accessibility palette retunes
+    /// all five at once, and a reader who has learned what carnivore cyan looks
+    /// like on the map reads the mortality panel without a legend (bd-f4x0).
+    fn mortality_style(&self, cause: MortalityCause) -> Style {
+        let theme = self.theme();
+        match cause {
+            // Killed BY a carnivore, so it carries the carnivore's colour.
+            MortalityCause::CombatCarnivore => Style::default().fg(theme.diet[2]),
+            MortalityCause::CombatHerbivore => Style::default().fg(theme.diet[0]),
+            // Starvation is energy reaching zero; the energy spark is that ramp.
+            MortalityCause::Starvation => Style::default().fg(theme.energy_spark),
+            // Aging and unknown are background facts rather than events to react
+            // to, so they recede — the bead's "restraint" applied to a readout.
+            MortalityCause::Aging => Style::default().fg(theme.accent),
+            MortalityCause::Unknown => Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::DIM),
+        }
+    }
+
     fn ok_style(&self) -> Style {
         self.event_style(EventKind::Birth)
     }
@@ -7781,6 +7857,91 @@ mod tests {
     /// been worse than deleting it: a gate tuned to its own inputs proves
     /// nothing. The measured numbers are recorded on the bead and the monochromat
     /// case they imply is filed rather than silently accepted.
+    /// Mortality bars must come from the palette, and combat causes must match
+    /// the diet colours their killers are drawn in.
+    ///
+    /// The semantic tie is the point, not just palette-awareness: a reader who
+    /// has learned what a carnivore looks like on the map should not need a
+    /// legend to read the mortality panel. Asserting the exact ramp entry is what
+    /// keeps that true — a future edit that merely picks "some palette colour"
+    /// would still be retunable and still be wrong.
+    #[test]
+    fn mortality_bars_take_the_palette_ramp_that_names_each_cause() {
+        for mode in [
+            TerminalPaletteMode::Natural,
+            TerminalPaletteMode::Deuteranopia,
+            TerminalPaletteMode::Protanopia,
+            TerminalPaletteMode::Tritanopia,
+            TerminalPaletteMode::HighContrast,
+        ] {
+            let mut palette = Palette::test_backend_evidence();
+            palette.mode = mode;
+            let theme = palette.theme();
+
+            assert_eq!(
+                palette
+                    .mortality_style(MortalityCause::CombatCarnivore)
+                    .fg
+                    .expect("combat-carnivore deaths must carry a colour"),
+                theme.diet[2],
+                "{mode:?}: deaths by carnivore must use the carnivore diet colour"
+            );
+            assert_eq!(
+                palette
+                    .mortality_style(MortalityCause::CombatHerbivore)
+                    .fg
+                    .expect("combat-herbivore deaths must carry a colour"),
+                theme.diet[0],
+                "{mode:?}: deaths by herbivore must use the herbivore diet colour"
+            );
+            assert_eq!(
+                palette
+                    .mortality_style(MortalityCause::Starvation)
+                    .fg
+                    .expect("starvation deaths must carry a colour"),
+                theme.energy_spark,
+                "{mode:?}: starvation must use the energy ramp it depletes"
+            );
+
+            // No cause may fall back to a named ANSI constant, which is what
+            // bypassed the accessibility palettes before.
+            for cause in MortalityCause::all() {
+                let fg = palette
+                    .mortality_style(cause)
+                    .fg
+                    .unwrap_or_else(|| panic!("{cause:?} must carry a colour"));
+                assert!(
+                    matches!(fg, Color::Rgb(_, _, _)),
+                    "{mode:?}: {cause:?} must take an explicit RGB value from the \
+                     palette, not a named ANSI colour the palette cannot retune; got \
+                     {fg:?}"
+                );
+            }
+        }
+    }
+
+    /// Every cause must be labelled, so the panel survives without colour at all.
+    ///
+    /// bd-xg82 records that these ramps separate by hue rather than luminance, so
+    /// colour alone is not a sufficient channel on a hue-blind display. The
+    /// labels are what make this panel readable anyway, and that is worth pinning
+    /// rather than leaving as an accident of the current layout.
+    #[test]
+    fn every_mortality_cause_carries_a_non_colour_label() {
+        let mut seen: Vec<&str> = Vec::new();
+        for cause in MortalityCause::all() {
+            let label = cause.label();
+            assert!(!label.is_empty(), "{cause:?} must have a label");
+            assert!(
+                !seen.contains(&label),
+                "{cause:?} reuses the label {label:?}; duplicate labels defeat the \
+                 non-colour channel"
+            );
+            seen.push(label);
+        }
+        assert_eq!(seen.len(), 5, "every cause must appear exactly once");
+    }
+
     #[test]
     fn ok_warn_and_error_are_distinct_colours_in_every_accessibility_palette() {
         for mode in [
