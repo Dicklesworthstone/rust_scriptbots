@@ -9173,8 +9173,61 @@ mod acknowledgement_guard {
         "crates/scriptbots-app/src",
         "crates/scriptbots-bevy/src",
         "crates/scriptbots-render/src",
+        "crates/scriptbots-runtime/src",
         "crates/scriptbots-web/src",
         "crates/scriptbots-world-gfx/src",
+    ];
+
+    /// Crates deliberately NOT scanned, each with the bead that decided it.
+    ///
+    /// The point of this list is that it does not exist to shrink the work — it
+    /// exists so that a crate is never merely FORGOTTEN. Before it, the scanned
+    /// set was an explicit list and a newly added crate was silently outside
+    /// the guard while every test stayed green, which is the failure mode where
+    /// a guard is most dangerous because it still reads as protection. A new
+    /// crate now fails the build until someone writes down which of the two
+    /// things it is (bd-hhsl).
+    ///
+    /// Each entry states why the crate has no command surface. These are not
+    /// permanent: `an_exempt_crate_must_still_have_no_command_surface` below
+    /// re-derives that claim on every build, so an exemption cannot become a
+    /// hiding place for a submitter added later.
+    const EXEMPT_CRATE_DIRS: &[(&str, &str, &str)] = &[
+        (
+            "crates/scriptbots-core/src",
+            "bd-hhsl",
+            "defines and APPLIES ControlCommand; it is the target of commands, not a submitter",
+        ),
+        (
+            "crates/scriptbots-storage/src",
+            "bd-hhsl",
+            "persistence; no control surface",
+        ),
+        (
+            "crates/scriptbots-analytics/src",
+            "bd-hhsl",
+            "offline analysis over persisted data; no control surface",
+        ),
+        (
+            "crates/scriptbots-index/src",
+            "bd-hhsl",
+            "spatial index; no control surface",
+        ),
+        (
+            "crates/scriptbots-brain/src",
+            "bd-hhsl",
+            "neural substrate; no control surface",
+        ),
+        (
+            "crates/scriptbots-brain-ml/src",
+            "bd-hhsl",
+            "neural substrate; no control surface",
+        ),
+        (
+            "crates/scriptbots-brain-neuro/src",
+            "bd-hhsl",
+            "neural substrate; no control surface",
+        ),
     ];
 
     /// Calls that submit a command and hand back an answer about its fate.
@@ -9690,6 +9743,121 @@ mod acknowledgement_guard {
             }
         }
         out
+    }
+
+    /// Is this crate directory accounted for, either way?
+    ///
+    /// Extracted so the negative case is a permanent test rather than a claim.
+    fn crate_dir_is_accounted(dir: &str) -> bool {
+        SCANNED_CRATE_DIRS.contains(&dir) || EXEMPT_CRATE_DIRS.iter().any(|(d, _, _)| *d == dir)
+    }
+
+    /// The accounting must reject a crate nobody has decided about.
+    ///
+    /// A gate whose failing case was never exercised is a gate nobody has
+    /// tested. This is the whole mechanism in miniature: a name that is in
+    /// neither list must come back unaccounted.
+    #[test]
+    fn a_crate_in_neither_list_is_unaccounted() {
+        assert!(
+            !crate_dir_is_accounted("crates/scriptbots-newly-added/src"),
+            "a crate in neither list was reported as accounted for, so adding one would slip \
+             past this gate silently"
+        );
+        assert!(
+            crate_dir_is_accounted("crates/scriptbots-app/src"),
+            "a scanned crate must be accounted for"
+        );
+        assert!(
+            crate_dir_is_accounted("crates/scriptbots-core/src"),
+            "an exempt crate must be accounted for"
+        );
+    }
+
+    /// Every crate in the workspace is either scanned or explicitly exempt.
+    ///
+    /// This closes the gap that mattered most. The crate-reached anchor catches
+    /// a RENAMED crate — a declared directory that yields nothing — but nothing
+    /// caught an ADDED one, and a new crate is exactly how a submitter enters
+    /// this tree unnoticed once nobody is watching. Enumerating the filesystem
+    /// and demanding an answer for each converts silence into a decision, which
+    /// is the whole point of deriving the registry in the first place
+    /// (bd-hhsl).
+    #[test]
+    fn every_crate_is_scanned_or_exempt_with_a_reason() {
+        let root = workspace_root();
+        let entries = std::fs::read_dir(root.join("crates")).expect("crates/ is readable");
+        let mut unaccounted = Vec::new();
+        let mut seen = 0usize;
+        for entry in entries.flatten() {
+            if !entry.path().join("src").is_dir() {
+                continue;
+            }
+            seen += 1;
+            let dir = format!("crates/{}/src", entry.file_name().to_string_lossy());
+            if !crate_dir_is_accounted(&dir) {
+                unaccounted.push(dir);
+            }
+        }
+
+        assert!(
+            seen >= SCANNED_CRATE_DIRS.len(),
+            "only {seen} crates were found on disk; the enumeration is broken and this test \
+             is checking nothing"
+        );
+        assert!(
+            unaccounted.is_empty(),
+            "these crates are neither scanned nor exempt, so a command submitter added to one \
+             would be invisible to this guard. Add each to SCANNED_CRATE_DIRS, or to \
+             EXEMPT_CRATE_DIRS with the bead that decided it and why: {unaccounted:#?}"
+        );
+
+        // An exemption that names a directory which no longer exists is a lie
+        // the next reader would trust.
+        for (dir, bead, _) in EXEMPT_CRATE_DIRS {
+            assert!(
+                root.join(dir).is_dir(),
+                "exemption for {dir} ({bead}) points at a directory that does not exist; \
+                 remove the entry rather than leaving a stale claim"
+            );
+        }
+    }
+
+    /// An exempt crate must still have no command surface.
+    ///
+    /// Without this, an exemption is a permanent hiding place: someone adds a
+    /// submitter to an exempt crate and the guard stays silent forever. The
+    /// claim written in the exemption is re-derived from the source on every
+    /// build, so it either remains true or the build says so.
+    #[test]
+    fn an_exempt_crate_must_still_have_no_command_surface() {
+        let root = workspace_root();
+        let mut offenders = Vec::new();
+        for (dir, bead, why) in EXEMPT_CRATE_DIRS {
+            let mut sources = Vec::new();
+            collect_sources(&root.join(dir), &root, &mut sources);
+            let reaches_bus = sources.iter().any(|(_, text)| {
+                BUS_SEEDS.iter().any(|seed| {
+                    text.lines()
+                        .map(str::trim)
+                        .any(|line| !line.starts_with("//") && line.contains(seed))
+                })
+            });
+            if reaches_bus {
+                offenders.push(format!(
+                    "{dir} is exempt under {bead} because it \"{why}\", but it now reaches the \
+                     command bus"
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an exemption has gone stale; scan the crate instead of exempting it:{}",
+            offenders
+                .iter()
+                .map(|o| format!("\n  {o}"))
+                .collect::<String>()
+        );
     }
 
     /// No call to a derived submitter may drop its answer.
