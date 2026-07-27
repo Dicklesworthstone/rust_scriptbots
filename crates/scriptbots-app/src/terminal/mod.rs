@@ -279,8 +279,17 @@ fn run_event_loop(
         app.maybe_step_simulation(now);
 
         if now.duration_since(app.last_draw) >= app.draw_interval {
-            terminal.draw(|frame| app.draw(frame))?;
+            // Publish the frame that is now on screen so
+            // GET /api/screenshot/ascii can serve exactly it. The clone is bounded
+            // by the terminal size and happens at most once per draw_interval, not
+            // once per event-loop iteration.
+            let mut presented: Option<Buffer> = None;
+            terminal.draw(|frame| {
+                app.draw(frame);
+                presented = Some(frame.buffer_mut().clone());
+            })?;
             app.last_draw = Instant::now();
+            app.publish_presented_frame(presented);
         }
 
         let next_draw_due = app.last_draw + app.draw_interval;
@@ -372,9 +381,13 @@ impl TerminalRenderer {
             // The layout is read back from the app AFTER the draw, so the regions
             // hashed below are the rectangles the widgets actually painted into.
             let layout = app.frame_layout(backend_buffer.area);
-            let buffer =
+            let evidence =
                 HeadlessBufferEvidence::inspect(backend_buffer, app.snapshot().tick, &layout)?;
-            report.record(app.snapshot(), buffer);
+            // Headless still PRESENTS frames, so the screenshot endpoint works in
+            // headless+REST deployments rather than refusing there. The buffer is
+            // already in hand for the evidence pass above.
+            app.publish_presented_frame(Some(backend_buffer.clone()));
+            report.record(app.snapshot(), evidence);
         }
 
         let world_digest = match app.world.lock() {
@@ -470,6 +483,12 @@ struct TerminalApp<'a> {
     /// Sub-cell tier probed once at startup; the canvas never re-reads the
     /// environment while painting.
     canvas_capability: CanvasCapability,
+    /// Where each presented frame is published for `GET /api/screenshot/ascii`.
+    ///
+    /// The endpoint serves the exact buffer displayed here rather than
+    /// re-rasterizing the world, so the served bytes, the `S`-key file, and the
+    /// cells on screen are one artifact (bd-2z0.14.2.6).
+    presented_frame: crate::servers::SharedPresentedFrame,
     /// The one resolved motion policy for this session, from
     /// [`resolve_motion_policy`] over all four sources at startup.
     ///
@@ -639,6 +658,7 @@ impl<'a> TerminalApp<'a> {
             // better picture, and a terminal without color falls back anyway.
             map_canvas_enabled: true,
             canvas_capability,
+            presented_frame: ctx.control_runtime.presented_frame_slot(),
             motion,
             map_density: Vec::new(),
             analytics: None,
@@ -1174,6 +1194,23 @@ impl<'a> TerminalApp<'a> {
         }
         if let Some(tooltip) = &self.hover_tooltip {
             self.draw_hover_tooltip(frame, tooltip, frame.area());
+        }
+    }
+
+    /// Publish a presented frame for the REST screenshot endpoint.
+    ///
+    /// A `None` buffer publishes NOTHING rather than clearing the slot: a draw that
+    /// somehow failed to yield a buffer must not make the endpoint report that no
+    /// frame was ever presented, which would turn a capture miss into a false claim
+    /// about the frontend's state.
+    fn publish_presented_frame(&self, buffer: Option<Buffer>) {
+        if let Some(buffer) = buffer {
+            self.presented_frame.store(Some(std::sync::Arc::new(
+                crate::servers::PresentedTerminalFrame {
+                    tick: self.snapshot.tick,
+                    buffer,
+                },
+            )));
         }
     }
 

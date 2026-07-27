@@ -67,6 +67,39 @@ pub fn default_control_rest_base_url() -> String {
     format!("http://{DEFAULT_CONTROL_REST_ADDRESS}")
 }
 
+/// The last terminal frame actually PRESENTED to a user.
+///
+/// `GET /api/screenshot/ascii` used to answer by re-rasterizing terrain and food
+/// into its own ≤96x48 ASCII grid — a THIRD renderer, agreeing with neither the
+/// sub-cell canvas nor the flat map, and containing no panels at all. It was not a
+/// low-fidelity screenshot; it was a different renderer's output wearing the
+/// screenshot's name, which is the same defect `save_ascii_snapshot` had before
+/// bd-2z0.14.2.6 item (1) replaced it (bd-0oro).
+///
+/// The buffer is published rather than a serialized string so the render path pays
+/// only for a clone: ANSI/plain serialization happens in the handler, on the rare
+/// request, through the SAME `terminal::export` functions the `S` key uses. One
+/// serializer means the served bytes and the saved bytes cannot drift.
+#[derive(Debug, Clone)]
+pub struct PresentedTerminalFrame {
+    /// The simulation tick the frame was drawn for.
+    pub tick: u64,
+    /// The exact buffer that was presented.
+    pub buffer: ratatui::buffer::Buffer,
+}
+
+/// Wait-free publication slot for [`PresentedTerminalFrame`].
+///
+/// Same shape as [`SharedLatestSummary`]: readers never block, and a request that
+/// lands mid-frame gets the previous frame rather than a torn one.
+pub type SharedPresentedFrame = Arc<arc_swap::ArcSwapOption<PresentedTerminalFrame>>;
+
+/// A fresh, empty presented-frame slot.
+#[must_use]
+pub fn empty_presented_frame() -> SharedPresentedFrame {
+    Arc::new(arc_swap::ArcSwapOption::from(None))
+}
+
 /// Configuration for the hosted control surfaces.
 #[derive(Debug, Clone)]
 pub struct ControlServerConfig {
@@ -80,6 +113,15 @@ pub struct ControlServerConfig {
     /// Environment parsing failures retained until the fallible launch boundary.
     #[doc(hidden)]
     pub environment_errors: Vec<String>,
+    /// Shared slot the terminal frontend publishes presented frames into and
+    /// `GET /api/screenshot/ascii` reads.
+    ///
+    /// Carried on the config for the same reason `ControlRuntime::command_reporter`
+    /// is carried on the runtime (bd-tgfz): the writer is the terminal frontend,
+    /// several calls from where the server is built, and widening four signatures to
+    /// reach it would touch files other panes are actively editing. Defaulted, so no
+    /// existing `..ControlServerConfig::default()` construction changes.
+    pub presented_frame: SharedPresentedFrame,
 }
 
 impl Default for ControlServerConfig {
@@ -93,6 +135,7 @@ impl Default for ControlServerConfig {
             },
             scenario: None,
             environment_errors: Vec::new(),
+            presented_frame: empty_presented_frame(),
         }
     }
 }
@@ -381,6 +424,10 @@ pub struct ControlRuntime {
     /// away from where the bus is built, and widening four signatures to reach
     /// it would touch files other panes are actively editing (bd-tgfz).
     command_reporter: CommandReporter,
+    /// The slot the terminal frontend publishes presented frames into, shared with
+    /// the REST server so `GET /api/screenshot/ascii` serves what was displayed
+    /// instead of re-rasterizing the world (bd-2z0.14.2.6).
+    presented_frame: SharedPresentedFrame,
     shutdown: watch::Sender<bool>,
     thread: Option<JoinHandle<Result<()>>>,
     status: watch::Receiver<ControlRuntimeStatus>,
@@ -417,6 +464,9 @@ impl ControlRuntime {
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Starting);
         let status_for_thread = status_tx.clone();
+        // Taken before the reservation moves into the server thread, so the runtime
+        // and the REST state hold THE SAME slot rather than two empty ones.
+        let presented_frame = reservation.config.presented_frame.clone();
         let handle = ControlHandle::new(world.clone(), command_tx.clone(), latest_summary);
         // Derived before the handle moves into the axum state: the reporter
         // shares the ledger, so an outcome recorded through it is the same
@@ -455,6 +505,7 @@ impl ControlRuntime {
             Ok(ControlStartupSignal::Ready) => Ok((
                 Self {
                     command_reporter,
+                    presented_frame,
                     shutdown,
                     thread: Some(thread),
                     status: status_rx,
@@ -499,6 +550,15 @@ impl ControlRuntime {
     #[must_use]
     pub fn command_reporter(&self) -> CommandReporter {
         Arc::clone(&self.command_reporter)
+    }
+
+    /// The slot a frontend publishes its presented frames into.
+    ///
+    /// Handed out as a clone of the Arc, so the frontend writes exactly where
+    /// `GET /api/screenshot/ascii` reads (bd-2z0.14.2.6).
+    #[must_use]
+    pub fn presented_frame_slot(&self) -> SharedPresentedFrame {
+        Arc::clone(&self.presented_frame)
     }
 
     /// Return the latest runtime lifecycle state without blocking.
@@ -620,6 +680,7 @@ impl ControlRuntime {
             // explicitly a no-op rather than a panic: tests that never apply a
             // command should not have to care that they hold one.
             command_reporter: Arc::new(|_, _| {}),
+            presented_frame: empty_presented_frame(),
             shutdown: watch::channel(false).0,
             thread: None,
             status,
@@ -853,6 +914,9 @@ async fn start_control_servers(
 struct ApiState {
     handle: ControlHandle,
     scenario: Option<Arc<ScenarioIdentityV0>>,
+    /// The frame the terminal frontend last presented, or empty when no terminal
+    /// frontend is running. Read by `GET /api/screenshot/ascii`.
+    presented_frame: SharedPresentedFrame,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1125,6 +1189,17 @@ impl AppError {
         }
     }
 
+    /// The request was well-formed but the process cannot satisfy it in its current
+    /// mode — distinct from `bad_request` (the caller's fault) and `not_found` (the
+    /// resource does not exist). Used by `/api/screenshot/ascii` when no terminal
+    /// frontend has presented a frame.
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
     fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1354,16 +1429,57 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     }
 }
 
-/// Return an ASCII snapshot of the current world mini-map.
+/// Return the exact terminal frame the user is looking at, as text.
+///
+/// UPGRADED FIDELITY, SAME ENDPOINT (bd-2z0.14.2.6 item 2). This used to answer by
+/// calling `ascii_map()`, which re-rasterizes terrain and food into its own ≤96x48
+/// grid: a third renderer, agreeing with neither the sub-cell canvas nor the flat
+/// map, with no agents and no panels. Two visually different worlds could serve
+/// identical bytes, and a frame with a broken widget served clean.
+///
+/// It now serves the buffer the terminal actually presented, serialized by the same
+/// `terminal::export` functions the `S` key writes to disk — so the served bytes,
+/// the saved bytes, and the displayed cells are one artifact rather than three.
+///
+/// WHEN NO TERMINAL FRONTEND IS RUNNING it REFUSES with 409 rather than falling
+/// back to the old rasterization. A synthesized map returned under the name
+/// "screenshot" is the exact defect this replaced; a caller that wants world state
+/// has `/api/ticks/latest` and `/api/screenshot/png`, both of which say what they
+/// are.
 #[utoipa::path(
     get,
     path = "/api/screenshot/ascii",
     tag = "control",
-    responses((status = 200, description = "ASCII screenshot", content_type = "text/plain"))
+    responses(
+        (status = 200, description = "The exact presented terminal frame as text", content_type = "text/plain"),
+        (status = 409, description = "no terminal frontend has presented a frame", body = ErrorResponse)
+    )
 )]
 async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, AppError> {
-    let text = run_control(move || state.handle.ascii_map()).await?;
-    Ok((StatusCode::OK, text).into_response())
+    let Some(frame) = state.presented_frame.load_full() else {
+        return Err(AppError::conflict(
+            "no terminal frame has been presented: this endpoint serves the exact \
+             buffer the terminal frontend displayed, and this process is not running \
+             one (headless, server-only, or GUI mode). It deliberately does not \
+             substitute a re-rasterized world map, which would be a different \
+             renderer's output under the name 'screenshot'.",
+        ));
+    };
+    // Serialization is pure CPU over a cloned buffer and touches no lock, so it
+    // does not need the blocking pool the world-lock handlers use.
+    let text = crate::terminal::export::buffer_to_plain_text(&frame.buffer);
+    Ok((
+        StatusCode::OK,
+        [
+            ("x-scriptbots-frame-tick", frame.tick.to_string()),
+            (
+                "x-scriptbots-frame-size",
+                format!("{}x{}", frame.buffer.area.width, frame.buffer.area.height),
+            ),
+        ],
+        text,
+    )
+        .into_response())
 }
 
 /// Rasterize the current world offscreen and return it as a 1024x576 PNG.
@@ -1899,6 +2015,7 @@ fn prepare_rest_server(
     let state = ApiState {
         handle,
         scenario: config.scenario.clone(),
+        presented_frame: Arc::clone(&config.presented_frame),
     };
     let mut openapi = ApiDoc::openapi();
     openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
@@ -3189,12 +3306,118 @@ mod tests {
         );
     }
 
+    /// THE SCREENSHOT ENDPOINT SERVES THE PRESENTED BUFFER, BYTE FOR BYTE.
+    ///
+    /// The identity that matters is served == exported: both go through
+    /// `terminal::export::buffer_to_plain_text` over the same published buffer, so a
+    /// caller polling REST and a user pressing `S` cannot get two different pictures
+    /// of one frame. Asserted against the real handler rather than by inspection.
+    #[tokio::test]
+    async fn screenshot_ascii_serves_the_exact_presented_buffer() {
+        let (handle, _receiver) = handle();
+        let slot = empty_presented_frame();
+
+        // A buffer with content at a known cell, so "served the right frame" is
+        // distinguishable from "served an empty one".
+        let area = ratatui::layout::Rect::new(0, 0, 12, 3);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        buffer[(0, 0)].set_symbol("Z");
+        buffer[(11, 2)].set_symbol("Q");
+        slot.store(Some(std::sync::Arc::new(PresentedTerminalFrame {
+            tick: 4242,
+            buffer: buffer.clone(),
+        })));
+
+        let state = ApiState {
+            handle,
+            scenario: None,
+            presented_frame: std::sync::Arc::clone(&slot),
+        };
+        let Ok(response) = screenshot_ascii(State(state)).await else {
+            panic!("a published frame must be served, not refused");
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-scriptbots-frame-tick")
+                .and_then(|value| value.to_str().ok()),
+            Some("4242"),
+            "the response must identify WHICH frame it served"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-scriptbots-frame-size")
+                .and_then(|value| value.to_str().ok()),
+            Some("12x3")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read screenshot body");
+        let served = String::from_utf8(body.to_vec()).expect("screenshot must be UTF-8");
+        assert_eq!(
+            served,
+            crate::terminal::export::buffer_to_plain_text(&buffer),
+            "the served bytes must equal the export of the SAME buffer; if these \
+             diverge there are two serializers again"
+        );
+        // Non-vacuity: the export must actually carry the painted cells, or the
+        // equality above would hold for two empty strings.
+        assert!(
+            served.contains('Z') && served.contains('Q'),
+            "the served frame must contain the painted cells: {served:?}"
+        );
+    }
+
+    /// WITH NO PRESENTED FRAME, THE ENDPOINT REFUSES INSTEAD OF SUBSTITUTING.
+    ///
+    /// This is the acceptance criterion's refusal path, and it is the whole point of
+    /// the change: the old handler answered every request by re-rasterizing the
+    /// world, so a headless or GUI-mode process returned a synthesized map under the
+    /// name "screenshot". A 409 that explains itself is strictly more useful than a
+    /// 200 that is not what it claims (bd-0oro).
+    #[tokio::test]
+    async fn screenshot_ascii_refuses_when_no_frame_was_presented() {
+        let (handle, _receiver) = handle();
+        let state = ApiState {
+            handle,
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let Err(error) = screenshot_ascii(State(state)).await else {
+            panic!("an unpresented frame must refuse, not synthesize one");
+        };
+        assert_eq!(
+            error.status,
+            StatusCode::CONFLICT,
+            "the refusal must be a 409: the request is well-formed and the process \
+             simply has no frame, which is neither the caller's error nor a missing \
+             resource"
+        );
+        assert!(
+            error
+                .message
+                .contains("no terminal frame has been presented"),
+            "the refusal must say what is missing: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("re-rasterized"),
+            "and must name what it is deliberately NOT doing, so the next reader does \
+             not restore the fallback as a convenience: {}",
+            error.message
+        );
+    }
+
     #[tokio::test]
     async fn rest_patch_rejects_non_finite_value_with_field_path_before_admission() {
         let (handle, receiver) = handle();
         let state = ApiState {
             handle,
             scenario: None,
+            presented_frame: empty_presented_frame(),
         };
         let result = patch_config(
             State(state.clone()),
@@ -3252,6 +3475,7 @@ mod tests {
         let bare = ApiState {
             handle: bare_handle,
             scenario: None,
+            presented_frame: empty_presented_frame(),
         };
         let missing = match get_scenario(State(bare)).await {
             Ok(_) => panic!("a server without scenario context must 404"),
@@ -3267,6 +3491,7 @@ mod tests {
         let state = ApiState {
             handle: state_handle,
             scenario: Some(Arc::new(identity)),
+            presented_frame: empty_presented_frame(),
         };
         let Json(view) = match get_scenario(State(state)).await {
             Ok(view) => view,
@@ -3292,6 +3517,7 @@ mod tests {
         let state = ApiState {
             handle: control,
             scenario: None,
+            presented_frame: empty_presented_frame(),
         };
 
         // `AppError` is deliberately not `Debug` (it carries a client-facing message),
