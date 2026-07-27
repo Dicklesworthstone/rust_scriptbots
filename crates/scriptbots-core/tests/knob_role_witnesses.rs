@@ -143,6 +143,25 @@ fn material_lanes(digest: &WorldDigestV1) -> Vec<(&'static str, String)> {
 enum Baseline {
     /// A bare default world.
     Default,
+    /// A world where age-related decay is switched on.
+    ///
+    /// `aging_health_decay_max` defaults to 0.0 and the validator requires
+    /// `max >= rate`, so NO positive decay rate can be set from a default world at any
+    /// value. `aging_health_decay_start` also defaults to 12_000, far beyond any witness
+    /// tick budget. Both have to move together for the family to be reachable at all --
+    /// the cross-field case this bead was filed around.
+    AgingEnabled,
+    /// A world where agents actually give food to each other.
+    ///
+    /// The sharing knobs are read only while a `give_intent` is being commanded, and an
+    /// unbound agent never commands one, so the whole family sits behind a branch a
+    /// default world never takes.
+    SharingEnabled,
+    /// A world where terrain topography affects movement.
+    ///
+    /// `topography_enabled` defaults to false, and the penalty and gain knobs are read
+    /// only when it is true.
+    TopographyEnabled,
     /// A world where combat actually moves resources.
     ///
     /// `stage_combat` hard-gates on `spike_lengths[idx] > 0.5`; default spike length is 0
@@ -176,6 +195,25 @@ impl BrainRunner for AggressorBrain {
     }
 }
 
+/// A brain that always commands giving, so the sharing knobs are actually read.
+struct GiverBrain;
+
+impl BrainRunner for GiverBrain {
+    fn kind(&self) -> &'static str {
+        "test.bd-3mul-giver"
+    }
+
+    fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        let mut outputs = [0.0; OUTPUT_SIZE];
+        outputs[8] = 1.0; // OutputChannel::GiveIntent
+        outputs
+    }
+
+    fn state_digest(&self) -> Option<u64> {
+        Some(0x6264_336D_756C_0002)
+    }
+}
+
 /// Per-agent spawn overrides a baseline needs, applied identically on both sides.
 ///
 /// Expressed at SPAWN TIME through the public `AgentData` fields rather than by reaching
@@ -202,6 +240,25 @@ fn baseline_agent(baseline: Baseline, index: u32, base: AgentData) -> AgentData 
 
 /// Config prerequisites a baseline needs, applied identically on both sides.
 fn baseline_config(baseline: Baseline, mut config: ScriptBotsConfig) -> ScriptBotsConfig {
+    if baseline == Baseline::AgingEnabled {
+        // Both must move: the validator requires max >= rate, and the default start is
+        // 12_000 ticks away. Deliberately generous so the family is unambiguously live.
+        config.aging_health_decay_max = 0.5;
+        config.aging_health_decay_rate = 0.05;
+        config.aging_health_decay_start = 1;
+        config.aging_tick_interval = 1;
+    }
+    if baseline == Baseline::SharingEnabled {
+        // Agents must be close enough to reach each other, and the rate must be large
+        // enough that a short run moves a measurable amount.
+        config.food_sharing_distance = 60.0;
+        config.food_sharing_radius = 60.0;
+        config.food_sharing_rate = 0.5;
+        config.food_transfer_rate = 0.5;
+    }
+    if baseline == Baseline::TopographyEnabled {
+        config.topography_enabled = true;
+    }
     if baseline == Baseline::CombatReachable {
         // Relax the eligibility and aiming thresholds so the hit does not depend on
         // incidental drift. NOT zero for the cosine: the validator requires
@@ -216,6 +273,25 @@ fn baseline_config(baseline: Baseline, mut config: ScriptBotsConfig) -> ScriptBo
 
 /// Bind the aggressor brain and make the attacker a carnivore, through public APIs.
 fn arm_baseline(world: &mut WorldState, baseline: Baseline) -> Result<(), String> {
+    if baseline == Baseline::SharingEnabled {
+        let key = world
+            .brain_registry_mut()
+            .map_err(|e| format!("registry: {e:?}"))?
+            .register("test.bd-3mul-giver", |_rng| {
+                Ok(Box::new(GiverBrain) as Box<dyn BrainRunner>)
+            });
+        for handle in world.agents().iter_handles().collect::<Vec<_>>() {
+            world
+                .bind_agent_brain(handle, key)
+                .map_err(|e| format!("bind giver: {e:?}"))?;
+            world
+                .try_update_agent_runtime(handle, |runtime| {
+                    runtime.energy = 1.5;
+                })
+                .map_err(|e| format!("giver runtime: {e:?}"))?;
+        }
+        return Ok(());
+    }
     if baseline != Baseline::CombatReachable {
         return Ok(());
     }
@@ -502,6 +578,69 @@ static WITNESSES: &[Witness] = &[
         ticks: 8,
         baseline: Baseline::Default,
     },
+    // bd-3mul: three more families unlocked by one baseline each. Every one of these was
+    // unreachable at ANY value from a default world, so a ghost verdict would have been a
+    // false accusation rather than a finding.
+    Witness {
+        path: "aging_health_decay_rate",
+        value: || Value::from(0.2),
+        ticks: 16,
+        baseline: Baseline::AgingEnabled,
+    },
+    Witness {
+        path: "aging_health_decay_max",
+        value: || Value::from(0.9),
+        ticks: 16,
+        baseline: Baseline::AgingEnabled,
+    },
+    Witness {
+        path: "aging_health_decay_start",
+        value: || Value::from(4),
+        ticks: 16,
+        baseline: Baseline::AgingEnabled,
+    },
+    Witness {
+        path: "aging_energy_penalty_rate",
+        value: || Value::from(0.4),
+        ticks: 16,
+        baseline: Baseline::AgingEnabled,
+    },
+    Witness {
+        path: "food_sharing_rate",
+        value: || Value::from(0.9),
+        ticks: 16,
+        baseline: Baseline::SharingEnabled,
+    },
+    Witness {
+        path: "food_sharing_distance",
+        value: || Value::from(20.0),
+        ticks: 16,
+        baseline: Baseline::SharingEnabled,
+    },
+    Witness {
+        path: "food_sharing_radius",
+        value: || Value::from(20.0),
+        ticks: 16,
+        baseline: Baseline::SharingEnabled,
+    },
+    Witness {
+        path: "topography_energy_penalty",
+        value: || Value::from(0.2),
+        ticks: 16,
+        baseline: Baseline::TopographyEnabled,
+    },
+    Witness {
+        path: "topography_speed_gain",
+        value: || Value::from(0.9),
+        ticks: 16,
+        baseline: Baseline::TopographyEnabled,
+    },
+    Witness {
+        path: "topography_enabled",
+        value: || Value::from(true),
+        ticks: 16,
+        baseline: Baseline::Default,
+    },
     // bd-3mul item 3: the carcass family, now reachable.
     //
     // These were previously unwitnessable at ANY value, because
@@ -557,6 +696,13 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
         .expect("the default config must build and step a world");
     let combat_reference = run_material(ScriptBotsConfig::default(), 16, Baseline::CombatReachable)
         .expect("the combat baseline must build and step a world");
+    let aging_reference = run_material(ScriptBotsConfig::default(), 16, Baseline::AgingEnabled)
+        .expect("the aging baseline must build and step a world");
+    let sharing_reference = run_material(ScriptBotsConfig::default(), 16, Baseline::SharingEnabled)
+        .expect("the sharing baseline must build and step a world");
+    let topography_reference =
+        run_material(ScriptBotsConfig::default(), 16, Baseline::TopographyEnabled)
+            .expect("the topography baseline must build and step a world");
 
     // Collect every failure rather than panicking on the first. One run then tells you about all
     // 17 witnesses instead of one per run, which matters when a verification cycle is minutes long
@@ -571,6 +717,9 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
         let reference = match witness.baseline {
             Baseline::Default => &default_reference,
             Baseline::CombatReachable => &combat_reference,
+            Baseline::AgingEnabled => &aging_reference,
+            Baseline::SharingEnabled => &sharing_reference,
+            Baseline::TopographyEnabled => &topography_reference,
         };
         match run_material(config, witness.ticks.max(8), witness.baseline) {
             Err(reason) => broken.push(format!("{}: {reason}", witness.path)),
@@ -627,10 +776,10 @@ fn bd_dorx_every_witness_targets_a_scientific_knob() {
 /// lie of exactly the kind bd-dorx exists to stop. A floor makes the debt visible in the test
 /// output every run while making it impossible to quietly delete a witness.
 ///
-/// 31 is the OBSERVED count -- every one of these was seen to move material state on a real run.
+/// 41 is the OBSERVED count -- every one of these was seen to move material state on a real run.
 /// It is not an aspiration. An earlier value of 17 was aspirational and left this gate red,
 /// which is the failure it exists to prevent, so the number now tracks evidence only.
-const WITNESS_COVERAGE_FLOOR: usize = 31;
+const WITNESS_COVERAGE_FLOOR: usize = 41;
 
 /// Report scientific coverage, and hold the line against it regressing.
 ///
