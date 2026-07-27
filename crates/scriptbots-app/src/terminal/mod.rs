@@ -50,8 +50,8 @@ use supports_color::{ColorLevel, Stream, on_cached};
 use tracing::{debug, info, warn};
 
 use crate::{
-    CommandDrain, CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics, SharedWorld,
-    WorldStepDriver,
+    CommandDrain, CommandOutcome, CommandReporter, CommandSubmit, ControlRuntime,
+    ScenarioIdentityV0, SharedAnalytics, SharedWorld, WorldStepDriver,
     renderer::{Renderer, RendererContext},
 };
 
@@ -428,6 +428,7 @@ struct TerminalApp<'a> {
     analytics_provider: SharedAnalytics,
     control: &'a ControlRuntime,
     command_drain: CommandDrain,
+    command_reporter: CommandReporter,
     command_submit: CommandSubmit,
     scenario: Arc<ScenarioIdentityV0>,
     tick_interval: Duration,
@@ -465,6 +466,14 @@ struct TerminalApp<'a> {
     /// Sub-cell tier probed once at startup; the canvas never re-reads the
     /// environment while painting.
     canvas_capability: CanvasCapability,
+    /// The one resolved motion policy for this session, from
+    /// [`resolve_motion_policy`] over all four sources at startup.
+    ///
+    /// Held rather than recomputed because three of the four sources are process
+    /// facts (env, probed capability, config) that cannot change mid-run, and a
+    /// paint path that re-resolved per frame could disagree with the cause the
+    /// startup log already reported.
+    motion: MotionPolicy,
     /// Grow-only per-sub-pixel agent counts backing the canvas crowding pass.
     map_density: Vec<u16>,
     analytics: Option<TerminalAnalytics>,
@@ -560,22 +569,46 @@ impl<'a> TerminalApp<'a> {
             canvas = canvas_capability.use_canvas(),
             "terminal sub-cell canvas capability probed"
         );
-        let (terrain, day_night) = {
+        let (terrain, day_night, config_reduced_motion, quality) = {
             let world = ctx
                 .world
                 .lock()
                 .expect("world mutex poisoned while capturing terrain");
+            let render = &world.config().render;
             (
                 TerrainView::from(world.terrain()),
-                world.config().render.resolved_day_night(),
+                render.resolved_day_night(),
+                render.reduced_motion,
+                render.quality,
             )
         };
+        // The single motion decision for this session, taken once here so no paint
+        // path has to re-derive it and none of them can disagree. NO_COLOR reaches
+        // this through the probed capability rather than through the environment
+        // argument, so a colorless terminal is reported as a CAPABILITY reduction
+        // and not miscredited to an operator request that was never made.
+        let motion = resolve_motion_policy(
+            config_reduced_motion,
+            is_reduced_motion_requested(),
+            canvas_capability.depth.is_some(),
+            quality,
+        );
+        info!(
+            policy = ?motion,
+            reduced = motion.is_reduced(),
+            config = ?config_reduced_motion,
+            env = is_reduced_motion_requested(),
+            has_colour = canvas_capability.depth.is_some(),
+            quality = ?quality,
+            "terminal motion policy resolved"
+        );
         let mut app = Self {
             world: Arc::clone(&ctx.world),
             simulation_step: Arc::clone(&ctx.simulation_step),
             analytics_provider: ctx.analytics.clone(),
             control: ctx.control_runtime,
             command_drain: Arc::clone(&ctx.command_drain),
+            command_reporter: ctx.control_runtime.command_reporter(),
             command_submit: Arc::clone(&ctx.command_submit),
             scenario: Arc::clone(&ctx.scenario),
             tick_interval: renderer.tick_interval,
@@ -602,6 +635,7 @@ impl<'a> TerminalApp<'a> {
             // better picture, and a terminal without color falls back anyway.
             map_canvas_enabled: true,
             canvas_capability,
+            motion,
             map_density: Vec::new(),
             analytics: None,
             analytics_revision: None,
@@ -790,10 +824,24 @@ impl<'a> TerminalApp<'a> {
                 // the submission that caused it (bd-0s7x).
                 for bus in (self.command_drain.as_ref())() {
                     let receipt = bus.id;
+                    // The report comes from HERE, the only place that knows
+                    // whether the world took the command. This is what turns a
+                    // carried identity into an observed outcome, and what makes
+                    // a receipt advance past `admitted` in production rather
+                    // than only in the app path (bd-tgfz).
                     match apply_control_command(&mut world, bus.command) {
-                        Ok(ControlDisposition::WorldApplied) => {}
-                        Ok(ControlDisposition::Playback(command)) => playback.push(command),
+                        Ok(ControlDisposition::WorldApplied) => {
+                            (self.command_reporter)(&receipt, CommandOutcome::Applied);
+                        }
+                        Ok(ControlDisposition::Playback(command)) => {
+                            // Playback is an application too: the command was
+                            // accepted and routed, it simply lands on the
+                            // driver rather than on world state.
+                            (self.command_reporter)(&receipt, CommandOutcome::Applied);
+                            playback.push(command);
+                        }
                         Err(error) => {
+                            (self.command_reporter)(&receipt, CommandOutcome::Rejected);
                             warn!(%error, %receipt, "terminal rejected a drained control command");
                         }
                     }
@@ -1820,6 +1868,7 @@ impl<'a> TerminalApp<'a> {
                     canvas,
                     day_night: self.day_night,
                     capability: self.canvas_capability,
+                    motion: self.motion,
                     density: &mut self.map_density,
                     viewport,
                 },
@@ -5132,8 +5181,15 @@ pub struct TickPhase {
 }
 
 impl TickPhase {
-    pub fn compute(tick: u64, paused: bool, sub_step: u8) -> Self {
-        let reduced = is_reduced_motion_requested();
+    /// Build the clock for one frame under an already-resolved motion policy.
+    ///
+    /// The policy is an ARGUMENT rather than something this reads for itself: it
+    /// used to call [`is_reduced_motion_requested`] directly, which saw only two of
+    /// the four sources that get a say and so could animate on a Potato tier or
+    /// against a persisted `reduced_motion: true`. One resolution, passed in, is
+    /// what makes the documented precedence rule the only rule (bd-2z0.14.2.4).
+    pub fn compute(tick: u64, paused: bool, sub_step: u8, motion: MotionPolicy) -> Self {
+        let reduced = motion.is_reduced();
         let sub = if paused || reduced {
             0.0
         } else {
@@ -5189,8 +5245,17 @@ impl EventPulseRing {
     }
 }
 
+/// Whether the operator asked for reduced motion through the environment.
+///
+/// This answers exactly ONE of the four sources [`resolve_motion_policy`] weighs.
+/// It deliberately does NOT consult `NO_COLOR`: that is a statement about what the
+/// terminal can display, it already reaches the policy through the probed
+/// [`CanvasCapability::depth`], and reading it here too would report a colorless
+/// terminal as [`MotionPolicy::ReducedByEnvironment`] — crediting a request the
+/// operator never made. The variants exist to carry the cause, so a cause that
+/// arrives by two paths is a cause that can be reported wrongly.
 pub fn is_reduced_motion_requested() -> bool {
-    std::env::var("SCRIPTBOTS_REDUCED_MOTION").is_ok() || std::env::var("NO_COLOR").is_ok()
+    std::env::var("SCRIPTBOTS_REDUCED_MOTION").is_ok()
 }
 
 /// Why motion was reduced, or that it was not.
@@ -6349,10 +6414,37 @@ struct MapWidget<'a> {
     day_night: (u32, f32),
     /// The probed sub-cell tier; supplies the quantization depth.
     capability: CanvasCapability,
+    /// The session's resolved motion policy, governing canvas life (shimmer and
+    /// food pulse). Carried rather than re-resolved so the frame cannot animate
+    /// against the cause the startup log reported.
+    motion: MotionPolicy,
     /// Grow-only per-sub-pixel agent counts, reused across frames.
     density: &'a mut Vec<u16>,
     /// The world window being shown; the sole screen<->world transform.
     viewport: CanvasViewport,
+}
+
+/// The pulse value a still frame uses: the MIDPOINT of the swing, not zero.
+///
+/// Reduced motion has to remove the movement without changing what the map means.
+/// Zero would park every water tile and food dot at the dark end of its own swing,
+/// so a reduced-motion user would see a permanently dimmer world and read it as
+/// less food or deeper water. The midpoint is the average of what the animation
+/// already showed, which is the same reasoning [`TickPhase::pulse`] uses when it
+/// returns the mean of its bounds.
+const CANVAS_PULSE_STILL: f32 = 0.5;
+
+/// The shared per-tile pulse phase, or a still frame when motion is reduced.
+///
+/// Single chokepoint for canvas life so water and food cannot end up honoring the
+/// policy differently — they read the same [`visual::shimmer`] and must stop for
+/// the same reasons (bd-2z0.14.2.4).
+fn tile_pulse(motion: MotionPolicy, tick: u64, tile_x: u32, tile_y: u32) -> f32 {
+    if motion.is_reduced() {
+        CANVAS_PULSE_STILL
+    } else {
+        visual::shimmer(tick, tile_x, tile_y)
+    }
 }
 
 /// Terrain alpha, deliberately below [`subcell::ALPHA_SOLID`]: terrain must land
@@ -6813,7 +6905,7 @@ impl MapWidget<'_> {
                 if matches!(kind, TerrainKind::DeepWater | TerrainKind::ShallowWater)
                     && let Some((tx, ty)) = ctx.terrain.tile_coords(u, v)
                 {
-                    let pulse = visual::shimmer(tick, tx, ty);
+                    let pulse = tile_pulse(ctx.motion, tick, tx, ty);
                     scale *=
                         1.0 - CANVAS_WATER_SHIMMER_SWING + 2.0 * CANVAS_WATER_SHIMMER_SWING * pulse;
                 }
@@ -6839,7 +6931,9 @@ impl MapWidget<'_> {
                     let pulse = ctx
                         .terrain
                         .tile_coords(u, v)
-                        .map_or(0.5, |(tx, ty)| visual::shimmer(tick, tx, ty));
+                        .map_or(CANVAS_PULSE_STILL, |(tx, ty)| {
+                            tile_pulse(ctx.motion, tick, tx, ty)
+                        });
                     let glow = (1.0 - CANVAS_FOOD_PULSE_SWING
                         + 2.0 * CANVAS_FOOD_PULSE_SWING * pulse)
                         * day_scale.max(CANVAS_NIGHT_FLOOR);
@@ -7174,6 +7268,10 @@ mod tests {
     }
 
     /// [`render_canvas_frame_with`] against an explicit viewport.
+    ///
+    /// Motion defaults to [`MotionPolicy::Full`] so every pre-existing canvas test
+    /// keeps exercising the animated path it was written against; the reduced path
+    /// is opted into explicitly by [`render_canvas_frame_motion`].
     fn render_canvas_frame_viewport(
         snapshot: &Snapshot,
         terrain: &TerrainView,
@@ -7181,6 +7279,46 @@ mod tests {
         day_night: (u32, f32),
         capability: CanvasCapability,
         viewport: CanvasViewport,
+    ) -> Buffer {
+        render_canvas_frame_full(
+            snapshot,
+            terrain,
+            cells,
+            day_night,
+            capability,
+            viewport,
+            MotionPolicy::Full,
+        )
+    }
+
+    /// [`render_canvas_frame`] under an explicit motion policy.
+    fn render_canvas_frame_motion(
+        snapshot: &Snapshot,
+        terrain: &TerrainView,
+        cells: (u16, u16),
+        day_night: (u32, f32),
+        motion: MotionPolicy,
+    ) -> Buffer {
+        render_canvas_frame_full(
+            snapshot,
+            terrain,
+            cells,
+            day_night,
+            canvas_test_capability(),
+            CanvasViewport::new(1.0, (0.5, 0.5)),
+            motion,
+        )
+    }
+
+    /// The one canvas render helper every other one funnels into.
+    fn render_canvas_frame_full(
+        snapshot: &Snapshot,
+        terrain: &TerrainView,
+        cells: (u16, u16),
+        day_night: (u32, f32),
+        capability: CanvasCapability,
+        viewport: CanvasViewport,
+        motion: MotionPolicy,
     ) -> Buffer {
         let palette = Palette::test_backend_evidence();
         let mut scratch =
@@ -7198,6 +7336,7 @@ mod tests {
             canvas: Some(&mut canvas),
             day_night,
             capability,
+            motion,
             density: &mut density,
             viewport,
         }
@@ -7315,6 +7454,7 @@ mod tests {
             canvas: None,
             day_night: canvas_test_day_night(),
             capability: canvas_test_capability(),
+            motion: MotionPolicy::Full,
             density: &mut Vec::new(),
             viewport: CanvasViewport::new(1.0, (0.5, 0.5)),
         }
@@ -7553,6 +7693,163 @@ mod tests {
             frame_at(quarter),
             "the same tick must produce a byte-identical frame"
         );
+    }
+
+    /// Reduced motion must STILL the water shimmer, and the assertion is written
+    /// so it cannot pass on a codebase where the shimmer never moved.
+    ///
+    /// The freeze half alone is vacuous — it holds trivially if canvas life is
+    /// dead — so the second half proves the gate suppressed something real by
+    /// requiring the full policy to differ from the reduced one somewhere in the
+    /// period. Before this wiring, `SCRIPTBOTS_REDUCED_MOTION` and a persisted
+    /// `reduced_motion: true` had NO effect on this path at all: the canvas read
+    /// [`visual::shimmer`] unconditionally.
+    #[test]
+    fn reduced_motion_stills_the_water_shimmer_without_dimming_it() {
+        let water = TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::DeepWater],
+            elevations: vec![0.5],
+            moisture: vec![0.5],
+            fertility: vec![0.0],
+        };
+        let frame_at = |tick: u64, motion: MotionPolicy| {
+            let mut snapshot = Snapshot::default();
+            snapshot.tick = tick;
+            render_canvas_frame_motion(&snapshot, &water, (4, 2), (0, 0.0), motion)
+        };
+
+        // A zero-length day cycle pins daylight, so the shimmer is the only thing
+        // left that could vary across these ticks.
+        let still = frame_at(0, MotionPolicy::ReducedByEnvironment);
+        for tick in 1..visual::SHIMMER_PERIOD_TICKS {
+            assert_eq!(
+                frame_at(tick, MotionPolicy::ReducedByEnvironment),
+                still,
+                "reduced motion must render tick {tick} identically to tick 0"
+            );
+        }
+
+        let animated_somewhere = (0..visual::SHIMMER_PERIOD_TICKS)
+            .any(|tick| frame_at(tick, MotionPolicy::Full) != still);
+        assert!(
+            animated_somewhere,
+            "the still frame must differ from the animated one somewhere in the \
+             period, or this test would also pass with the shimmer removed"
+        );
+    }
+
+    /// The food pulse is the canvas's second animated path and reads the same
+    /// shared phase, so it has to stop for the same reason. Covered separately
+    /// rather than by inspection of the shared helper: the two call sites are
+    /// what a user sees, and one of them honoring the policy is not the contract.
+    #[test]
+    fn reduced_motion_stills_the_food_pulse() {
+        let land = TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::Grass],
+            elevations: vec![0.5],
+            moisture: vec![0.5],
+            fertility: vec![1.0],
+        };
+        let frame_at = |tick: u64, motion: MotionPolicy| {
+            let mut snapshot = Snapshot::default();
+            snapshot.tick = tick;
+            snapshot.food = FoodView {
+                width: 1,
+                height: 1,
+                cells: vec![1.0],
+                max: 1.0,
+                mean: 1.0,
+            };
+            render_canvas_frame_motion(&snapshot, &land, (4, 2), (0, 0.0), motion)
+        };
+
+        let still = frame_at(0, MotionPolicy::ReducedByEnvironment);
+        for tick in 1..visual::SHIMMER_PERIOD_TICKS {
+            assert_eq!(
+                frame_at(tick, MotionPolicy::ReducedByEnvironment),
+                still,
+                "reduced motion must freeze the food pulse at tick {tick}"
+            );
+        }
+
+        let animated_somewhere = (0..visual::SHIMMER_PERIOD_TICKS)
+            .any(|tick| frame_at(tick, MotionPolicy::Full) != still);
+        assert!(
+            animated_somewhere,
+            "food must pulse under full motion, or the freeze above proves nothing"
+        );
+    }
+
+    /// Every reducing SOURCE must reach the canvas, not just the environment one.
+    ///
+    /// This is the assertion that closes the gap the slice existed for.
+    /// [`resolve_motion_policy`] was correct and had NO production caller, so a
+    /// persisted `reduced_motion: true` and a Potato quality tier were resolved by
+    /// nothing and changed nothing on screen. Composing the real rule with the real
+    /// paint path is the only way to show the source actually arrives; a unit test
+    /// of the rule alone passed happily while the canvas ignored it.
+    #[test]
+    fn every_reducing_source_reaches_the_canvas() {
+        let water = TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::DeepWater],
+            elevations: vec![0.5],
+            moisture: vec![0.5],
+            fertility: vec![0.0],
+        };
+        let frame_at = |tick: u64, motion: MotionPolicy| {
+            let mut snapshot = Snapshot::default();
+            snapshot.tick = tick;
+            render_canvas_frame_motion(&snapshot, &water, (4, 2), (0, 0.0), motion)
+        };
+
+        // (label, policy resolved from exactly one reducing source in isolation)
+        let reducing_sources = [
+            (
+                "persisted config",
+                resolve_motion_policy(Some(true), false, true, None),
+            ),
+            (
+                "environment request",
+                resolve_motion_policy(None, true, true, None),
+            ),
+            (
+                "no-colour capability",
+                resolve_motion_policy(None, false, false, None),
+            ),
+            (
+                "potato quality tier",
+                resolve_motion_policy(
+                    None,
+                    false,
+                    true,
+                    Some(scriptbots_core::RenderQuality::Potato),
+                ),
+            ),
+        ];
+
+        let animated = frame_at(0, MotionPolicy::Full);
+        let moving_tick = (1..visual::SHIMMER_PERIOD_TICKS)
+            .find(|tick| frame_at(*tick, MotionPolicy::Full) != animated)
+            .expect("full motion must move the canvas for this test to mean anything");
+
+        for (label, policy) in reducing_sources {
+            assert!(
+                policy.is_reduced(),
+                "{label} must resolve to a reduced policy, got {policy:?}"
+            );
+            assert_eq!(
+                frame_at(moving_tick, policy),
+                frame_at(0, policy),
+                "{label} resolved to {policy:?} but the canvas still animated \
+                 between tick 0 and tick {moving_tick}"
+            );
+        }
     }
 
     /// Crowding must be zero for the common case and must keep climbing without
@@ -12352,8 +12649,8 @@ mod tests {
 
     #[test]
     fn test_tick_phase_determinism() {
-        let tp1 = TickPhase::compute(120, false, 4);
-        let tp2 = TickPhase::compute(120, false, 4);
+        let tp1 = TickPhase::compute(120, false, 4, MotionPolicy::Full);
+        let tp2 = TickPhase::compute(120, false, 4, MotionPolicy::Full);
         assert_eq!(tp1, tp2, "TickPhase calculation must be deterministic");
         assert_eq!(tp1.tick, 120);
         assert!((tp1.phase - (4.0 / 16.0) / 60.0).abs() < 1e-5);
@@ -12361,10 +12658,49 @@ mod tests {
 
     #[test]
     fn test_tick_phase_paused_frozen() {
-        let tp_paused = TickPhase::compute(120, true, 4);
+        let tp_paused = TickPhase::compute(120, true, 4, MotionPolicy::Full);
         assert_eq!(tp_paused.phase, 0.0, "paused phase must be frozen at 0.0");
         let pulse = tp_paused.pulse(1.0, 0.2, 0.8);
         assert_eq!(pulse, 0.5, "paused pulse must be static mid-value");
+    }
+
+    /// The clock must honor the RESOLVED policy, and it must do so for every
+    /// reducing cause rather than only the environment one it used to read.
+    ///
+    /// This also removes a hidden environment dependency from the two tests above:
+    /// while `compute` called [`is_reduced_motion_requested`] itself, running the
+    /// suite with `SCRIPTBOTS_REDUCED_MOTION` or `NO_COLOR` set turned their
+    /// animated expectations red for a reason that had nothing to do with the code.
+    #[test]
+    fn tick_phase_freezes_under_every_reduced_policy() {
+        for policy in [
+            MotionPolicy::ReducedByEnvironment,
+            MotionPolicy::ReducedByCapability,
+            MotionPolicy::ReducedByQualityTier,
+            MotionPolicy::ReducedByConfig,
+        ] {
+            let tp = TickPhase::compute(120, false, 4, policy);
+            assert!(
+                tp.reduced_motion,
+                "{policy:?} must reach the clock as reduced"
+            );
+            assert_eq!(
+                tp.phase, 0.0,
+                "{policy:?} must freeze the phase even while running"
+            );
+            assert_eq!(
+                tp.pulse(1.0, 0.2, 0.8),
+                0.5,
+                "{policy:?} must hold the pulse at its mid-value"
+            );
+        }
+
+        let full = TickPhase::compute(120, false, 4, MotionPolicy::Full);
+        assert!(
+            !full.reduced_motion && full.phase > 0.0,
+            "full motion must still advance the clock, or the freeze assertions \
+             above hold for a clock that never ran"
+        );
     }
 
     #[test]
