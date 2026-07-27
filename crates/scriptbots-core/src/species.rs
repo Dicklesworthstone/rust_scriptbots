@@ -970,6 +970,296 @@ impl PhylogenyEvent {
     }
 }
 
+/// Consecutive samples a newly observed cluster must persist before it counts.
+///
+/// The parent bead defines speciation as a split that "persists for K consecutive
+/// samples". One sample is not enough: phenotype clustering jitters, and a cluster that
+/// appears and vanishes in a single sample is a segmentation artifact, not a lineage.
+pub const SPECIATION_PERSISTENCE_SAMPLES: usize = 3;
+
+/// Realized cross-cluster mating rate at or below which two clusters count as
+/// reproductively separated in practice.
+pub const REPRODUCTIVE_SEPARATION_MAX_RATE: f64 = 0.05;
+
+/// Outcome of watching one candidate cluster across samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpeciationVerdict {
+    /// Present for the required number of consecutive samples.
+    Persisted {
+        /// The cluster that held.
+        species: SpeciesId,
+        /// Sample tick it was first observed at.
+        first_seen: Tick,
+        /// Sample tick the requirement was met at.
+        confirmed_at: Tick,
+    },
+    /// Vanished before persisting. Cluster jitter, not a lineage.
+    Transient {
+        /// The cluster that did not hold.
+        species: SpeciesId,
+        /// Sample tick it was first observed at.
+        first_seen: Tick,
+        /// Last sample tick it was present at.
+        last_seen: Tick,
+        /// How many consecutive samples it managed, always below the requirement.
+        samples: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSplit {
+    first_seen: Tick,
+    last_seen: Tick,
+    samples: usize,
+}
+
+/// Stateful gate that only reports a split once it has held for K samples.
+///
+/// # Why this is stateful
+/// [`diff_species_tables`] compares two adjacent tables and cannot know whether a cluster
+/// it just saw appear will still be there next sample. Persistence is a property of a
+/// SEQUENCE, so something has to carry the candidate set across samples.
+///
+/// # The first sample is a baseline, not a wave of speciations
+/// Every species present at the first `observe` is an INCUMBENT. Treating them as
+/// candidates would report the founding population as a mass speciation event on the
+/// first sample of every run, which is the most obvious way to make this signal useless.
+#[derive(Debug, Clone, Default)]
+pub struct SpeciationWatch {
+    required_samples: usize,
+    primed: bool,
+    pending: BTreeMap<SpeciesId, PendingSplit>,
+    established: BTreeSet<SpeciesId>,
+}
+
+impl SpeciationWatch {
+    /// Build a watch requiring `required_samples` consecutive observations.
+    ///
+    /// A requirement of 0 or 1 is clamped up to 1: "persisted for zero samples" is not a
+    /// meaningful claim, and silently accepting it would disable the gate while looking
+    /// configured.
+    #[must_use]
+    pub fn new(required_samples: usize) -> Self {
+        Self {
+            required_samples: required_samples.max(1),
+            primed: false,
+            pending: BTreeMap::new(),
+            established: BTreeSet::new(),
+        }
+    }
+
+    /// Consecutive samples this watch requires.
+    #[must_use]
+    pub const fn required_samples(&self) -> usize {
+        self.required_samples
+    }
+
+    /// Candidates currently being watched, in ID order.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Feed one segmentation sample; returns every verdict this sample settled.
+    ///
+    /// Verdicts are emitted in `SpeciesId` order so the sequence is byte-identical
+    /// across runs of the same seed, which the parent bead's acceptance requires.
+    pub fn observe(&mut self, table: &SpeciesTable) -> Vec<SpeciationVerdict> {
+        let present: BTreeSet<SpeciesId> = table.species.iter().map(|s| s.id).collect();
+
+        if !self.primed {
+            self.primed = true;
+            self.established = present;
+            return Vec::new();
+        }
+
+        let mut verdicts = Vec::new();
+
+        // Candidates that are gone this sample failed to persist. Settle them FIRST so a
+        // species that vanishes and is later re-minted under the same ID cannot silently
+        // resume an old streak.
+        let vanished: Vec<SpeciesId> = self
+            .pending
+            .keys()
+            .copied()
+            .filter(|id| !present.contains(id))
+            .collect();
+        for id in vanished {
+            let split = self.pending.remove(&id).expect("key came from this map");
+            verdicts.push(SpeciationVerdict::Transient {
+                species: id,
+                first_seen: split.first_seen,
+                last_seen: split.last_seen,
+                samples: split.samples,
+            });
+        }
+
+        for id in present.iter().copied() {
+            if self.established.contains(&id) {
+                continue;
+            }
+            let split = self.pending.entry(id).or_insert(PendingSplit {
+                first_seen: table.tick,
+                last_seen: table.tick,
+                samples: 0,
+            });
+            split.last_seen = table.tick;
+            split.samples += 1;
+            if split.samples >= self.required_samples {
+                let first_seen = split.first_seen;
+                self.pending.remove(&id);
+                self.established.insert(id);
+                verdicts.push(SpeciationVerdict::Persisted {
+                    species: id,
+                    first_seen,
+                    confirmed_at: table.tick,
+                });
+            }
+        }
+
+        // MEMORY BOUND. Retire established IDs that are no longer present. `next_id` is
+        // monotonic, so a retired ID is never re-minted and remembering it forever buys
+        // nothing -- but over a 50k-tick run it would grow this set without limit.
+        // After this, the watch holds O(live species), not O(species ever seen).
+        self.established.retain(|id| present.contains(id));
+
+        verdicts.sort_by_key(|v| match v {
+            SpeciationVerdict::Persisted { species, .. }
+            | SpeciationVerdict::Transient { species, .. } => *species,
+        });
+        verdicts
+    }
+
+    /// Species this watch is currently tracking as established.
+    ///
+    /// Bounded by the number of LIVE species, not by how many have ever existed.
+    #[must_use]
+    pub fn established_count(&self) -> usize {
+        self.established.len()
+    }
+}
+
+/// Realized mating counts between and within clusters over a window of births.
+///
+/// This is a MEASUREMENT of what actually happened, not an inference from phenotype
+/// distance. Two clusters can sit far apart in phenotype space and still interbreed
+/// freely; the bead asks for the realized rate precisely because the geometric answer
+/// and the reproductive answer disagree in exactly the interesting cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MatingSeparation {
+    /// Two-parent births where both parents were in the same species.
+    pub within: usize,
+    /// Two-parent births where the parents were in different species.
+    pub cross: usize,
+    /// Two-parent births where at least one parent had no known species.
+    ///
+    /// Counted separately and never folded into `within`. A parent that died before this
+    /// sample is absent from the members list, and quietly treating "we do not know" as
+    /// "same species" would manufacture separation out of mortality.
+    pub unattributable: usize,
+    /// Arrivals with fewer than two distinct parents: they carry no mating signal.
+    pub asexual: usize,
+}
+
+impl MatingSeparation {
+    /// Two-parent births this measurement could attribute to a pair of species.
+    #[must_use]
+    pub const fn attributed(&self) -> usize {
+        self.within + self.cross
+    }
+
+    /// Fraction of attributed matings that crossed species, or `None` if none were seen.
+    ///
+    /// `None` is load-bearing. With no observed matings the rate is UNDEFINED, and
+    /// returning 0.0 would report perfect reproductive separation for a window in which
+    /// nothing reproduced -- the single most dangerous wrong answer this type can give.
+    #[must_use]
+    pub fn cross_rate(&self) -> Option<f64> {
+        let attributed = self.attributed();
+        if attributed == 0 {
+            return None;
+        }
+        Some(self.cross as f64 / attributed as f64)
+    }
+}
+
+/// Whether a persisted split is a species, given what actually mated.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SpeciationStatus {
+    /// Persisted and reproductively separated in practice. A speciation.
+    Speciation {
+        /// Realized cross-cluster mating rate, at or below the bound.
+        cross_rate: f64,
+    },
+    /// Persisted, but the clusters still interbreed. A polymorphism, not a species.
+    ///
+    /// This is the case that makes the gate worth having: a stable bimodal trait inside
+    /// one interbreeding population looks exactly like a speciation to a clustering pass.
+    Polymorphic {
+        /// Realized cross-cluster mating rate, above the bound.
+        cross_rate: f64,
+    },
+    /// Persisted, but too few matings were observed to decide either way.
+    Undetermined,
+    /// Did not persist for the required number of samples.
+    Transient,
+}
+
+/// Classify a verdict against the realized mating record.
+#[must_use]
+pub fn classify_speciation(
+    verdict: &SpeciationVerdict,
+    separation: &MatingSeparation,
+    max_cross_rate: f64,
+) -> SpeciationStatus {
+    if matches!(verdict, SpeciationVerdict::Transient { .. }) {
+        return SpeciationStatus::Transient;
+    }
+    match separation.cross_rate() {
+        None => SpeciationStatus::Undetermined,
+        Some(rate) if rate <= max_cross_rate => SpeciationStatus::Speciation { cross_rate: rate },
+        Some(rate) => SpeciationStatus::Polymorphic { cross_rate: rate },
+    }
+}
+
+/// Measure realized cross-cluster mating over a window of birth records.
+///
+/// Membership is read from `table`, so a birth is attributed using the species the
+/// parents belong to AT SEGMENTATION TIME. Callers should pass a birth window adjacent to
+/// the sample; a window spanning many segmentations attributes old matings to new labels.
+#[must_use]
+pub fn measure_cross_cluster_mating(
+    births: &[crate::BirthRecord],
+    table: &SpeciesTable,
+) -> MatingSeparation {
+    let mut owner: BTreeMap<AgentUid, SpeciesId> = BTreeMap::new();
+    for species in &table.species {
+        for uid in &species.members {
+            owner.insert(*uid, species.id);
+        }
+    }
+
+    let mut out = MatingSeparation::default();
+    for birth in births {
+        let (Some(a), Some(b)) = (birth.parent_a, birth.parent_b) else {
+            out.asexual += 1;
+            continue;
+        };
+        if a == b {
+            // Self-parented arrivals are budding, not mating: counting them as `within`
+            // would let a purely asexual population read as reproductively separated.
+            out.asexual += 1;
+            continue;
+        }
+        match (owner.get(&a), owner.get(&b)) {
+            (Some(sa), Some(sb)) if sa == sb => out.within += 1,
+            (Some(_), Some(_)) => out.cross += 1,
+            _ => out.unattributable += 1,
+        }
+    }
+    out
+}
+
 /// A bimodality hint from the detector kernel, reduced to what this gate needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeciationHint {
@@ -1860,5 +2150,303 @@ mod tests {
             text.contains('9'),
             "the last known size must appear: {text}"
         );
+    }
+
+    fn birth(uid: u64, parents: (Option<u64>, Option<u64>)) -> crate::BirthRecord {
+        crate::BirthRecord {
+            tick: Tick(1),
+            agent_uid: AgentUid(uid),
+            spawn_ordinal: uid,
+            birth_ordinal: Some(uid),
+            origin: crate::BirthOrigin::Born,
+            parent_a: parents.0.map(AgentUid),
+            parent_b: parents.1.map(AgentUid),
+            brain_kind: None,
+            brain_key: None,
+            herbivore_tendency: 0.5,
+            generation: crate::Generation(1),
+            position: crate::Position::default(),
+            is_hybrid: false,
+        }
+    }
+
+    /// A cluster that appears and vanishes is segmentation jitter, not a lineage.
+    #[test]
+    fn bd_16g_3_a_split_must_persist_before_it_counts() {
+        let mut watch = SpeciationWatch::new(3);
+        // Sample 1 is the baseline: incumbents are not speciations.
+        assert!(
+            watch
+                .observe(&table(0, vec![sp(1, "Alpha-1", 20, 0)]))
+                .is_empty(),
+            "the founding population is not a wave of speciations"
+        );
+
+        // Beta appears and holds for two samples -- still one short.
+        for tick in [10, 20] {
+            let v = watch.observe(&table(
+                tick,
+                vec![sp(1, "Alpha-1", 15, 0), sp(2, "Beta-2", 5, 10)],
+            ));
+            assert!(v.is_empty(), "two of three samples must not confirm: {v:?}");
+        }
+
+        // It vanishes on the third. That is a transient, and it must be REPORTED,
+        // not silently dropped -- a candidate that failed is evidence too.
+        let v = watch.observe(&table(30, vec![sp(1, "Alpha-1", 20, 0)]));
+        assert_eq!(v.len(), 1);
+        assert!(
+            matches!(
+                v[0],
+                SpeciationVerdict::Transient {
+                    species: SpeciesId(2),
+                    samples: 2,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        assert_eq!(
+            watch.pending_count(),
+            0,
+            "a settled candidate must be dropped"
+        );
+    }
+
+    /// A cluster that holds for K samples is confirmed exactly once.
+    #[test]
+    fn bd_16g_3_a_persisting_split_confirms_once_and_only_once() {
+        let mut watch = SpeciationWatch::new(3);
+        watch.observe(&table(0, vec![sp(1, "Alpha-1", 20, 0)]));
+
+        let mut confirmations = 0;
+        for tick in [10, 20, 30, 40, 50] {
+            for v in watch.observe(&table(
+                tick,
+                vec![sp(1, "Alpha-1", 15, 0), sp(2, "Beta-2", 5, 10)],
+            )) {
+                match v {
+                    SpeciationVerdict::Persisted {
+                        species,
+                        first_seen,
+                        confirmed_at,
+                    } => {
+                        confirmations += 1;
+                        assert_eq!(species, SpeciesId(2));
+                        assert_eq!(first_seen, Tick(10), "the streak started at first sight");
+                        assert_eq!(confirmed_at, Tick(30), "third consecutive sample");
+                    }
+                    other => panic!("unexpected verdict: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            confirmations, 1,
+            "an established species must not re-confirm every sample"
+        );
+    }
+
+    /// A re-minted ID must not resume the streak it abandoned.
+    #[test]
+    fn bd_16g_3_a_vanished_candidate_does_not_resume_its_old_streak() {
+        let mut watch = SpeciationWatch::new(3);
+        watch.observe(&table(0, vec![sp(1, "Alpha-1", 20, 0)]));
+        let two = || vec![sp(1, "Alpha-1", 15, 0), sp(2, "Beta-2", 5, 10)];
+
+        watch.observe(&table(10, two()));
+        watch.observe(&table(20, two()));
+        watch.observe(&table(30, vec![sp(1, "Alpha-1", 20, 0)])); // transient
+        watch.observe(&table(40, two())); // streak restarts at 1
+        let v = watch.observe(&table(50, two())); // 2 of 3
+        assert!(
+            v.is_empty(),
+            "the abandoned streak must not carry over and confirm early: {v:?}"
+        );
+        let v = watch.observe(&table(60, two()));
+        assert!(
+            matches!(v.as_slice(), [SpeciationVerdict::Persisted { .. }]),
+            "the restarted streak confirms on its own third sample: {v:?}"
+        );
+    }
+
+    /// The measurement counts what actually mated, and refuses to guess.
+    #[test]
+    fn bd_16g_3_cross_cluster_mating_is_measured_not_inferred() {
+        // sp() gives species 1 members 1000.., species 2 members 2000..
+        let t = table(10, vec![sp(1, "Alpha-1", 4, 0), sp(2, "Beta-2", 4, 0)]);
+        let births = vec![
+            birth(90, (Some(1000), Some(1001))), // within species 1
+            birth(91, (Some(2000), Some(2001))), // within species 2
+            birth(92, (Some(1000), Some(2000))), // CROSS
+            birth(93, (Some(1000), None)),       // asexual
+            birth(94, (Some(1000), Some(1000))), // self-parented: budding
+            birth(95, (Some(1000), Some(7777))), // parent 7777 is dead/unknown
+        ];
+        let m = measure_cross_cluster_mating(&births, &t);
+        assert_eq!(m.within, 2);
+        assert_eq!(m.cross, 1);
+        assert_eq!(
+            m.asexual, 2,
+            "no-parent and self-parent both carry no signal"
+        );
+        assert_eq!(
+            m.unattributable, 1,
+            "an unknown parent must never be folded into `within`"
+        );
+        assert_eq!(m.attributed(), 3);
+        let rate = m.cross_rate().expect("matings were observed");
+        assert!((rate - 1.0 / 3.0).abs() < 1e-12, "{rate}");
+    }
+
+    /// No observed matings means UNDEFINED, never "perfectly separated".
+    #[test]
+    fn bd_16g_3_no_matings_is_undetermined_not_separation() {
+        let t = table(10, vec![sp(1, "Alpha-1", 4, 0), sp(2, "Beta-2", 4, 0)]);
+        let m = measure_cross_cluster_mating(&[birth(90, (Some(1000), None))], &t);
+        assert_eq!(m.attributed(), 0);
+        assert_eq!(
+            m.cross_rate(),
+            None,
+            "a window with no matings has no rate; 0.0 would claim perfect separation"
+        );
+
+        let persisted = SpeciationVerdict::Persisted {
+            species: SpeciesId(2),
+            first_seen: Tick(10),
+            confirmed_at: Tick(30),
+        };
+        assert_eq!(
+            classify_speciation(&persisted, &m, REPRODUCTIVE_SEPARATION_MAX_RATE),
+            SpeciationStatus::Undetermined,
+            "silence is not evidence of separation"
+        );
+    }
+
+    /// THE CASE THIS GATE EXISTS FOR: a stable polymorphism inside one gene pool.
+    ///
+    /// Two clusters, persistent across every sample, freely interbreeding. Phenotype
+    /// clustering alone calls this a speciation; the realized mating record says it is
+    /// one population with two forms.
+    #[test]
+    fn bd_16g_3_a_persistent_interbreeding_split_is_polymorphism_not_speciation() {
+        let mut watch = SpeciationWatch::new(3);
+        watch.observe(&table(0, vec![sp(1, "Alpha-1", 20, 0)]));
+        let mut verdict = None;
+        for tick in [10, 20, 30] {
+            if let Some(v) = watch
+                .observe(&table(
+                    tick,
+                    vec![sp(1, "Alpha-1", 10, 0), sp(2, "Beta-2", 10, 10)],
+                ))
+                .into_iter()
+                .next()
+            {
+                verdict = Some(v);
+            }
+        }
+        let verdict = verdict.expect("the split persisted for three samples");
+        assert!(matches!(verdict, SpeciationVerdict::Persisted { .. }));
+
+        let t = table(30, vec![sp(1, "Alpha-1", 4, 0), sp(2, "Beta-2", 4, 0)]);
+        let interbreeding = vec![
+            birth(90, (Some(1000), Some(2000))),
+            birth(91, (Some(1001), Some(2001))),
+            birth(92, (Some(1002), Some(2002))),
+            birth(93, (Some(1000), Some(1001))),
+        ];
+        let m = measure_cross_cluster_mating(&interbreeding, &t);
+        let status = classify_speciation(&verdict, &m, REPRODUCTIVE_SEPARATION_MAX_RATE);
+        assert!(
+            matches!(status, SpeciationStatus::Polymorphic { .. }),
+            "persistence alone must not promote an interbreeding split: {status:?}"
+        );
+
+        // Same persisted split, but the two forms stopped mating across.
+        let separated = vec![
+            birth(90, (Some(1000), Some(1001))),
+            birth(91, (Some(1002), Some(1003))),
+            birth(92, (Some(2000), Some(2001))),
+            birth(93, (Some(2002), Some(2003))),
+        ];
+        let m = measure_cross_cluster_mating(&separated, &t);
+        assert!(
+            matches!(
+                classify_speciation(&verdict, &m, REPRODUCTIVE_SEPARATION_MAX_RATE),
+                SpeciationStatus::Speciation { cross_rate } if cross_rate == 0.0
+            ),
+            "a persisted split with no cross-mating IS a speciation"
+        );
+    }
+
+    /// A transient never reaches the mating question at all.
+    #[test]
+    fn bd_16g_3_a_transient_is_classified_transient_whatever_the_matings_say() {
+        let t = table(10, vec![sp(1, "Alpha-1", 4, 0), sp(2, "Beta-2", 4, 0)]);
+        let m = measure_cross_cluster_mating(&[birth(90, (Some(1000), Some(1001)))], &t);
+        assert_eq!(m.cross_rate(), Some(0.0), "perfect separation on paper");
+        let transient = SpeciationVerdict::Transient {
+            species: SpeciesId(2),
+            first_seen: Tick(10),
+            last_seen: Tick(20),
+            samples: 2,
+        };
+        assert_eq!(
+            classify_speciation(&transient, &m, REPRODUCTIVE_SEPARATION_MAX_RATE),
+            SpeciationStatus::Transient,
+            "a cluster that did not hold cannot be rescued by its mating record"
+        );
+    }
+
+    /// A zero requirement would disable the gate while looking configured.
+    #[test]
+    fn bd_16g_3_persistence_requirement_is_clamped_to_at_least_one() {
+        assert_eq!(SpeciationWatch::new(0).required_samples(), 1);
+        assert_eq!(SpeciationWatch::new(1).required_samples(), 1);
+        assert_eq!(SpeciationWatch::new(7).required_samples(), 7);
+    }
+
+    /// Verdict order must not depend on the order species appear in the table.
+    #[test]
+    fn bd_16g_3_verdicts_are_emitted_in_stable_id_order() {
+        let run = |order: Vec<Species>| {
+            let mut watch = SpeciationWatch::new(1);
+            watch.observe(&table(0, vec![sp(1, "Alpha-1", 20, 0)]));
+            watch.observe(&table(10, order))
+        };
+        let forward = run(vec![
+            sp(1, "Alpha-1", 5, 0),
+            sp(2, "Beta-2", 5, 10),
+            sp(3, "Gamma-3", 5, 10),
+        ]);
+        let reversed = run(vec![
+            sp(3, "Gamma-3", 5, 10),
+            sp(2, "Beta-2", 5, 10),
+            sp(1, "Alpha-1", 5, 0),
+        ]);
+        assert_eq!(forward.len(), 2);
+        assert_eq!(
+            forward, reversed,
+            "the same seed must produce a byte-identical event list"
+        );
+    }
+
+    /// The watch must stay bounded by LIVE species, not by species ever seen.
+    ///
+    /// The bead requires a documented memory bound. An unbounded `established` set would
+    /// be invisible in every short test and would only show up as drift in a 50k-tick run.
+    #[test]
+    fn bd_16g_3_watch_memory_is_bounded_by_live_species() {
+        let mut watch = SpeciationWatch::new(1);
+        watch.observe(&table(0, vec![sp(1, "Alpha-1", 5, 0)]));
+        // 200 species are minted and go extinct one after another, never overlapping.
+        for n in 2..202u64 {
+            watch.observe(&table(n * 10, vec![sp(n, &format!("Sp-{n}"), 5, n * 10)]));
+        }
+        assert_eq!(
+            watch.established_count(),
+            1,
+            "only the live species may be retained"
+        );
+        assert_eq!(watch.pending_count(), 0);
     }
 }
