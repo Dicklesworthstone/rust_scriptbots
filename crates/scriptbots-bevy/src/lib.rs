@@ -1263,6 +1263,47 @@ fn submit_simulation_command(submitter: &CommandSubmitter, command: SimulationCo
     accepted
 }
 
+/// Submit a playback command and reconcile local state with the answer.
+///
+/// The playback handlers edit local UI state first and submit second. That is
+/// only sound if the submission succeeds. When it is refused, the HUD keeps
+/// showing a pause state and speed the simulation never agreed to, and the two
+/// stay diverged until something unrelated happens to overwrite them — the
+/// operator reads "running at 2.0x" off a host that is still paused at 1.0x.
+/// `submit_simulation_command` already warns, but a warning in the log does not
+/// un-lie the number on screen (bd-2z0.7.14).
+///
+/// So a refusal rolls the optimistic edit back. Restoring from
+/// [`SimControlSnapshot`] is exactly right rather than merely convenient: it
+/// carries the three fields these handlers set and deliberately does NOT carry
+/// `pending_steps`, which the science driver consumes concurrently and which a
+/// wholesale restore would clobber.
+///
+/// This returns nothing on purpose. Both outcomes are fully handled here, so
+/// there is no result for a caller to drop on the floor — which is the failure
+/// this function exists to remove.
+fn submit_playback_command(
+    submitter: &CommandSubmitter,
+    command: SimulationCommand,
+    controls: &SimulationControl,
+    previous: &SimControlSnapshot,
+) {
+    if submit_simulation_command(submitter, command) {
+        return;
+    }
+    controls.update(|state| {
+        state.paused = previous.paused;
+        state.speed_multiplier = previous.speed_multiplier;
+        state.auto_pause_reason = previous.auto_pause_reason.clone();
+    });
+    warn!(
+        paused = previous.paused,
+        speed_multiplier = previous.speed_multiplier,
+        "playback command refused; local playback state rolled back so the HUD keeps \
+         matching the simulation"
+    );
+}
+
 const DIAGNOSTIC_REPORT_INTERVAL: u32 = 300;
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
 const CAMERA_MAX_DISTANCE: f32 = 6000.0;
@@ -3840,6 +3881,130 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    /// Build a control in a known non-default state, then apply the optimistic
+    /// edit the playback handlers perform before submitting.
+    ///
+    /// The pre-state is deliberately NOT the default: if it were, a rollback
+    /// test could pass because the restore happened to coincide with
+    /// `SimControlData::default()` rather than because anything was restored.
+    fn optimistically_edited_controls() -> (SimulationControl, SimControlSnapshot) {
+        let controls = SimulationControl::new();
+        controls.update(|state| {
+            state.paused = true;
+            state.speed_multiplier = 2.0;
+            state.auto_pause_reason = Some("host stalled".to_string());
+        });
+        let before = controls.snapshot();
+        controls.update(|state| {
+            state.paused = false;
+            state.speed_multiplier = 4.0;
+            state.auto_pause_reason = None;
+        });
+        (controls, before)
+    }
+
+    fn submitter_answering(accepted: bool) -> CommandSubmitter {
+        CommandSubmitter {
+            submit: Arc::new(move |_| accepted),
+        }
+    }
+
+    /// A refused playback command must not leave the HUD showing it as applied.
+    ///
+    /// This drives the real submit path with a real refusing submitter rather
+    /// than scanning source, so it fails if the rollback stops working for any
+    /// reason — not only if the call is deleted.
+    #[test]
+    fn a_refused_playback_command_rolls_the_local_state_back() {
+        let (controls, before) = optimistically_edited_controls();
+
+        submit_playback_command(
+            &submitter_answering(false),
+            SimulationCommand::default(),
+            &controls,
+            &before,
+        );
+
+        let after = controls.snapshot();
+        assert!(
+            after.paused,
+            "a refused command must not leave the HUD showing a running simulation"
+        );
+        assert!(
+            (after.speed_multiplier - 2.0).abs() < f32::EPSILON,
+            "speed must return to what the simulation actually has, got {}",
+            after.speed_multiplier
+        );
+        assert_eq!(
+            after.auto_pause_reason.as_deref(),
+            Some("host stalled"),
+            "the auto-pause reason still applies: the host never received the command \
+             that would have cleared it"
+        );
+    }
+
+    /// Positive control: an ACCEPTED command must keep the optimistic edit.
+    ///
+    /// Without this, the rollback test above would still pass if the code
+    /// rolled back unconditionally — which would be a different bug wearing the
+    /// same green checkmark.
+    #[test]
+    fn an_accepted_playback_command_keeps_the_local_edit() {
+        let (controls, before) = optimistically_edited_controls();
+
+        submit_playback_command(
+            &submitter_answering(true),
+            SimulationCommand::default(),
+            &controls,
+            &before,
+        );
+
+        let after = controls.snapshot();
+        assert!(
+            !after.paused,
+            "an accepted command must keep the edit the operator asked for"
+        );
+        assert!(
+            (after.speed_multiplier - 4.0).abs() < f32::EPSILON,
+            "accepted speed change must stand, got {}",
+            after.speed_multiplier
+        );
+        assert_eq!(
+            after.auto_pause_reason, None,
+            "an accepted resume clears the auto-pause reason"
+        );
+    }
+
+    /// A rollback must not disturb `pending_steps`.
+    ///
+    /// The science driver consumes `pending_steps` concurrently, so a step
+    /// banked between the snapshot and the refusal is not ours to erase.
+    /// `SimControlSnapshot` omits the field for exactly this reason; this test
+    /// pins that omission as load-bearing rather than incidental.
+    #[test]
+    fn rolling_back_leaves_concurrently_banked_steps_alone() {
+        let (controls, before) = optimistically_edited_controls();
+        // Stand in for the driver banking a step after `before` was taken.
+        controls.update(|state| state.pending_steps = 3);
+
+        submit_playback_command(
+            &submitter_answering(false),
+            SimulationCommand::default(),
+            &controls,
+            &before,
+        );
+
+        let pending = controls
+            .0
+            .lock()
+            .expect("control mutex should not be poisoned in this test")
+            .pending_steps;
+        assert_eq!(
+            pending, 3,
+            "rollback erased a step the driver had already banked"
+        );
+    }
+
     /// Pointer input must resolve to the window its own camera renders to.
     ///
     /// This is the per-window half of bd-2z0.7.14. The failure it prevents is
@@ -4942,6 +5107,9 @@ fn handle_playback_buttons(
         if *interaction != Interaction::Pressed {
             continue;
         }
+        // Captured before the optimistic edit below, so a refusal has something
+        // truthful to restore.
+        let before = controls.snapshot();
         let mut command_to_send: Option<SimulationCommand> = None;
         controls.update(|state| {
             let mut command = SimulationCommand::default();
@@ -5010,11 +5178,16 @@ fn handle_playback_buttons(
         });
 
         if let (Some(submitter), Some(command)) = (submitter.as_ref(), command_to_send) {
-            let step_once = command.step_once;
-            if !submit_simulation_command(submitter, command) && step_once {
-                // A rejected command cannot disappear. Fall back to the local
-                // driver edge, while preserving any pending unconsumed step.
-                controls.update(enqueue_step_request);
+            if command.step_once {
+                // Step keeps its own repair and is deliberately NOT rolled back.
+                // A rejected step cannot simply disappear: it falls back to the
+                // local driver edge, and `paused = true` is part of stepping
+                // rather than an optimistic edit to undo.
+                if !submit_simulation_command(submitter, command) {
+                    controls.update(enqueue_step_request);
+                }
+            } else {
+                submit_playback_command(submitter, command, &controls, &before);
             }
         }
     }
@@ -5027,6 +5200,7 @@ fn handle_playback_shortcuts(
 ) {
     let command_is_authoritative = submitter.is_some();
     if keys.just_pressed(KeyCode::Space) {
+        let before = controls.snapshot();
         let mut command = SimulationCommand::default();
         controls.update(|state| {
             state.paused = !state.paused;
@@ -5039,8 +5213,8 @@ fn handle_playback_shortcuts(
             command.paused = Some(state.paused);
             command.speed_multiplier = Some(state.speed_multiplier);
         });
-        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
-            let _ = submit_simulation_command(submitter, command);
+        if let Some(submitter) = submitter.as_ref() {
+            submit_playback_command(submitter, command, &controls, &before);
         }
     }
 
@@ -5064,6 +5238,7 @@ fn handle_playback_shortcuts(
     }
 
     if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {
+        let before = controls.snapshot();
         let mut command = SimulationCommand::default();
         controls.update(|state| {
             state.speed_multiplier =
@@ -5077,12 +5252,13 @@ fn handle_playback_shortcuts(
             command.speed_multiplier = Some(state.speed_multiplier);
             command.paused = Some(false);
         });
-        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
-            let _ = submit_simulation_command(submitter, command);
+        if let Some(submitter) = submitter.as_ref() {
+            submit_playback_command(submitter, command, &controls, &before);
         }
     }
 
     if keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract) {
+        let before = controls.snapshot();
         let mut command = SimulationCommand::default();
         controls.update(|state| {
             state.speed_multiplier = (state.speed_multiplier - SPEED_STEP).max(MIN_SPEED);
@@ -5101,8 +5277,8 @@ fn handle_playback_shortcuts(
             command.speed_multiplier = Some(state.speed_multiplier);
             command.paused = Some(state.paused);
         });
-        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
-            let _ = submit_simulation_command(submitter, command);
+        if let Some(submitter) = submitter.as_ref() {
+            submit_playback_command(submitter, command, &controls, &before);
         }
     }
 }
