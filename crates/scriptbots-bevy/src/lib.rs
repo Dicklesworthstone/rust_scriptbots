@@ -12,7 +12,7 @@ use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
-use bevy::light::{EnvironmentMapLight, LightProbe};
+use bevy::light::{DirectionalLightShadowMap, EnvironmentMapLight, LightProbe};
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
 use bevy::pbr::prelude::*;
 use bevy::prelude::*;
@@ -3780,6 +3780,65 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    /// `features.shadow_resolution` must have a real consumer too.
+    ///
+    /// Shadows could already switch on and off with the tier, but every tier
+    /// that had them rendered into the same 2048px map, so the tier changed
+    /// shadow PRESENCE and never shadow COST. This pins that the resolution is
+    /// read, that it reaches bevy's `DirectionalLightShadowMap`, and that the
+    /// zero Potato reports is refused rather than written.
+    #[test]
+    fn the_shadow_resolution_tier_feature_has_a_live_consumer() {
+        let source = include_str!("lib.rs");
+        let sites = |needle: &str| source.matches(needle).count();
+        assert!(
+            sites("effective.features.shadow_resolution") > 1,
+            "the shadow resolution must be read by production code, not only logged"
+        );
+        assert!(
+            sites("shadow_map.size = requested;") > 1,
+            "reading it is not enough; it must reach DirectionalLightShadowMap"
+        );
+        assert!(
+            sites("if !effective.features.shadows {") > 1,
+            "resolution must not be applied when shadows are off, or Potato's zero \
+             reaches bevy and gets silently rounded to a power of two"
+        );
+    }
+
+    /// The tiers must actually differ in shadow cost, or the consumer above is
+    /// wiring a constant.
+    ///
+    /// A live consumer of a value that never changes still leaves Potato and
+    /// Ultra rendering identical shadows, which is the defect one layer up.
+    #[test]
+    fn the_shadow_resolution_ladder_is_not_flat() {
+        let resolutions: Vec<u32> = [
+            RenderQuality::Potato,
+            RenderQuality::Low,
+            RenderQuality::Medium,
+            RenderQuality::High,
+            RenderQuality::Ultra,
+        ]
+        .into_iter()
+        .map(|tier| tier_features(tier).shadow_resolution)
+        .collect();
+
+        assert_eq!(resolutions[0], 0, "Potato has no shadows, so no shadow map");
+        for (tier, resolution) in resolutions.iter().enumerate().skip(1) {
+            assert!(
+                resolution.is_power_of_two(),
+                "tier {tier} resolution {resolution} must be a power of two; bevy \
+                 rounds anything else and the tier would not get what it asked for"
+            );
+        }
+        assert!(
+            resolutions.iter().skip(1).any(|r| *r != resolutions[1]),
+            "shadow resolution must vary across tiers, or a live consumer still \
+             renders Potato and Ultra identically"
+        );
+    }
+
     /// `features.bloom` must have a real consumer, not just a log line.
     ///
     /// Before bd-2z0.14.3.3 this crate never attached a `Bloom` component to any
@@ -4699,6 +4758,7 @@ fn handle_quality_tier_button(
 /// still be startup-only, which is the defect this bead names.
 fn apply_tier_to_sun_light(
     effective: Res<EffectiveRenderSettings>,
+    shadow_map: Option<ResMut<DirectionalLightShadowMap>>,
     mut lights: Query<&mut DirectionalLight, With<TierDrivenSunLight>>,
 ) {
     if !effective.is_changed() {
@@ -4706,6 +4766,46 @@ fn apply_tier_to_sun_light(
     }
     for mut light in &mut lights {
         light.shadows_enabled = effective.features.shadows;
+    }
+
+    // `shadow_resolution` was the second tier feature that existed only in logs
+    // (bd-2z0.14.3.3 item 2). Shadows could switch on and off with the tier, but
+    // Potato and Ultra rendered them into the same 2048px map, so the tier
+    // changed shadow PRESENCE and never shadow COST — which is most of what the
+    // setting is for.
+    //
+    // Skipped entirely when shadows are off: the tier reports resolution 0 for
+    // Potato, and bevy requires a power of two, so writing 0 would trip its own
+    // validator and get silently rounded rather than respected.
+    let Some(mut shadow_map) = shadow_map else {
+        // Absent only in test apps built without PbrPlugin. Missing the resource
+        // is not a reason to panic a renderer that is otherwise fine.
+        return;
+    };
+    if !effective.features.shadows {
+        return;
+    }
+    let requested = effective.features.shadow_resolution as usize;
+    if requested == 0 || !requested.is_power_of_two() {
+        warn!(
+            requested,
+            tier = ?effective.tier,
+            "tier shadow resolution is not a usable shadow-map size; leaving the \
+             current map untouched rather than letting bevy silently round it"
+        );
+        return;
+    }
+    // Written only on an actual change: a blind write per tier evaluation would
+    // mark the resource changed forever and force shadow-map reallocation work
+    // that nothing asked for.
+    if shadow_map.size != requested {
+        info!(
+            previous = shadow_map.size,
+            size = requested,
+            tier = ?effective.tier,
+            "directional shadow map resized to match the quality tier"
+        );
+        shadow_map.size = requested;
     }
 }
 
