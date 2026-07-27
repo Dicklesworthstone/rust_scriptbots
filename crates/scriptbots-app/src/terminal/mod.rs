@@ -8292,6 +8292,136 @@ mod tests {
         );
     }
 
+    /// Collect the GLYPHS a palette would paint, ignoring colour entirely.
+    ///
+    /// Deliberately drops the `Style` that `terrain_symbol` and `agent_symbol`
+    /// also return. That is the whole separation being tested: vocabulary is
+    /// which characters get drawn, theme is what colour they are. Fingerprinting
+    /// the style too would make every comparison below fail for the right reason
+    /// and prove nothing about vocabulary.
+    fn vocabulary_fingerprint(palette: &Palette) -> Vec<char> {
+        let mut glyphs = Vec::new();
+        for kind in [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ] {
+            // Two food levels because the emoji tier swaps in lush/barren
+            // variants above and below a threshold; sampling one would miss half
+            // the vocabulary.
+            for food in [0.1_f32, 0.9] {
+                let (glyph, _style) = palette.terrain_symbol(kind, food);
+                glyphs.push(glyph);
+            }
+        }
+        for class in [
+            DietClass::Herbivore,
+            DietClass::Omnivore,
+            DietClass::Carnivore,
+        ] {
+            for crowd in 1..=3 {
+                let mut occupancy = CellOccupancy::default();
+                for _ in 0..crowd {
+                    occupancy.add(class, false, 1.0, 0.0, 0.0, 0.5, 1);
+                }
+                let (glyph, _style) = palette.agent_symbol(&occupancy, Style::default());
+                glyphs.push(glyph);
+            }
+        }
+        glyphs
+    }
+
+    /// Build a palette at a chosen vocabulary tier and theme.
+    fn palette_at(emoji: bool, narrow: bool, theme: CuratedThemeId) -> Palette {
+        let mut palette = Palette::test_backend_evidence();
+        palette.emoji = emoji;
+        palette.emoji_narrow = narrow;
+        palette.theme_id = theme;
+        palette
+    }
+
+    /// CAPABILITY VOCABULARIES ARE INDEPENDENT OF CHROME THEMES.
+    ///
+    /// The bead treats theme and capability as orthogonal axes: a theme decides
+    /// colour, a capability tier decides which glyphs the terminal can render.
+    /// This asserts the second axis does not move when the first does — cycling
+    /// Ctrl+T must never silently downgrade an emoji terminal to ascii, or
+    /// promote an ascii one into glyphs it cannot draw.
+    ///
+    /// Both directions are asserted deliberately. A test that only checked
+    /// "glyphs are equal across themes" would pass if the fingerprint were
+    /// constant for every input — the same shape as a keybinding-registry check
+    /// that passes for a control which does nothing. The tier-difference
+    /// assertion below is what proves the probe can see a vocabulary change at
+    /// all (bd-2z0.14.2.2).
+    #[test]
+    fn capability_vocabularies_do_not_move_when_the_chrome_theme_does() {
+        let tiers: [(&str, bool, bool); 3] = [
+            ("emoji", true, false),
+            ("emoji-narrow", true, true),
+            ("ascii", false, false),
+        ];
+
+        let mut per_tier: Vec<(&str, Vec<char>)> = Vec::new();
+
+        for (label, emoji, narrow) in tiers {
+            let baseline_theme = CuratedThemeId::default();
+            let baseline = vocabulary_fingerprint(&palette_at(emoji, narrow, baseline_theme));
+
+            let mut theme = baseline_theme.next();
+            while theme != baseline_theme {
+                let fingerprint = vocabulary_fingerprint(&palette_at(emoji, narrow, theme));
+                assert_eq!(
+                    fingerprint, baseline,
+                    "{label}: switching chrome theme to {theme:?} changed the GLYPHS. Theme and \
+                     capability vocabulary are orthogonal axes; a theme that alters which \
+                     characters are drawn would silently change what a terminal can render"
+                );
+                theme = theme.next();
+            }
+
+            // Capability probing must not consult the theme either.
+            let probed: Vec<_> = {
+                let mut seen = Vec::new();
+                let mut theme = baseline_theme;
+                loop {
+                    let palette = palette_at(emoji, narrow, theme);
+                    let capability = palette.canvas_capability();
+                    seen.push((capability.mode, capability.depth));
+                    theme = theme.next();
+                    if theme == baseline_theme {
+                        break;
+                    }
+                }
+                seen
+            };
+            assert!(
+                probed.windows(2).all(|pair| pair[0] == pair[1]),
+                "{label}: the probed canvas capability changed with the chrome theme; \
+                 capability must come from terminal facts, not from styling"
+            );
+
+            per_tier.push((label, baseline));
+        }
+
+        // NEGATIVE CONTROL. If every tier produced the same fingerprint, the
+        // equality assertions above would be vacuously true and this test would
+        // pass against a renderer that ignored capability entirely.
+        for (i, (label_a, a)) in per_tier.iter().enumerate() {
+            for (label_b, b) in per_tier.iter().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "{label_a} and {label_b} produced identical glyph vocabularies, so this \
+                     test cannot detect a vocabulary change and proves nothing about \
+                     independence"
+                );
+            }
+        }
+    }
+
     /// Terrain must be readable with no colour, in the ascii tier too.
     ///
     /// Part of the bd-xg82 monochrome audit. This was TRUE before the bead — it is
