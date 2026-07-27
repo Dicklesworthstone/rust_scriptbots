@@ -649,6 +649,65 @@ impl<'a> TerminalApp<'a> {
         }
     }
 
+    /// Persist the chosen chrome theme through the run config path.
+    ///
+    /// Without this, the theme system forgot on exit: bd-2z0.14.2.2 landed the
+    /// READ half (config initialises the palette, with a proven serde round trip)
+    /// and nothing wrote back, so Ctrl+T changed the current session only and a
+    /// restart silently returned the user to the default.
+    ///
+    /// Goes through `ControlCommand::UpdateConfig` on the same command bus every
+    /// other mutation uses rather than writing `WorldState` directly — bd-37m's
+    /// rule, and the reason a themed session is replayable at all: the change
+    /// lands inside the tick loop as a journaled command instead of whenever the
+    /// world mutex happened to be free.
+    ///
+    /// Reads the CURRENT config and edits one field rather than composing a fresh
+    /// `ScriptBotsConfig`. A default-constructed config would silently revert
+    /// every other setting in the run — world size, seed, thresholds — which is a
+    /// far worse bug than the one being fixed, and it would look like a theme
+    /// change in the journal.
+    fn persist_theme_choice(&self, theme: CuratedThemeId) {
+        let mut config = match self.world.lock() {
+            Ok(world) => world.config().clone(),
+            Err(_) => {
+                warn!("terminal world mutex poisoned; chrome theme not persisted");
+                return;
+            }
+        };
+        if config.render.theme == Some(theme.to_config()) {
+            // Already recorded. Skipping keeps the journal free of no-op config
+            // rows, which matter here: a replay reader counting interventions
+            // should not see one per keypress that changed nothing.
+            return;
+        }
+        config.render.theme = Some(theme.to_config());
+        if (self.command_submit.as_ref())(ControlCommand::UpdateConfig(Box::new(config))) {
+            info!(
+                theme = theme.label(),
+                "chrome theme persisted to run config"
+            );
+        } else {
+            // Surfaced rather than swallowed: a theme that silently fails to
+            // persist is exactly the bug this method exists to fix, wearing a
+            // different hat.
+            warn!(
+                theme = theme.label(),
+                "terminal renderer failed to enqueue the chrome theme config update"
+            );
+        }
+    }
+
+    /// Drain the command bus and hand back what this surface submitted.
+    ///
+    /// Test-only. Draining is destructive by nature, so production must never
+    /// call this — the tick loop owns the real drain and would lose commands to a
+    /// competing reader.
+    #[cfg(test)]
+    fn drain_submitted_control_commands(&self) -> Vec<ControlCommand> {
+        (self.command_drain.as_ref())()
+    }
+
     fn apply_simulation_commands(&mut self, commands: Vec<SimulationCommand>) -> bool {
         if commands.is_empty() {
             return false;
@@ -2761,6 +2820,11 @@ impl<'a> TerminalApp<'a> {
             }
             CommandPaletteAction::CycleTheme => {
                 let lbl = self.palette.cycle_theme();
+                // Persisted here too: the command palette is a second entry point
+                // to the same control, and a theme that survives a restart only
+                // when chosen by keyboard would be a subtler bug than not
+                // persisting at all (bd-2z0.14.2.2).
+                self.persist_theme_choice(self.palette.theme_id);
                 self.push_toast(format!("Theme: {lbl}"));
             }
             CommandPaletteAction::CyclePalette => {
@@ -2931,6 +2995,7 @@ impl<'a> TerminalApp<'a> {
             (KeyCode::Char('t') | KeyCode::Char('T'), KeyModifiers::CONTROL) => {
                 let theme_label = self.palette.cycle_theme();
                 info!(theme = %theme_label, "terminal chrome theme cycled");
+                self.persist_theme_choice(self.palette.theme_id);
                 self.push_toast(format!("Theme: {theme_label}"));
                 return Ok(false);
             }
@@ -8634,6 +8699,134 @@ mod tests {
             deuter.error_style().fg,
             "the error status colour must be retuned by the accessibility palette"
         );
+    }
+
+    /// Ctrl+T must PERSIST the theme, not just change the current session.
+    ///
+    /// The gap this closes: the read half landed in dded064de2 — config
+    /// initialises the palette, with a proven serde round trip — and nothing ever
+    /// wrote back, so a theme chosen with Ctrl+T was forgotten on exit and the
+    /// user silently returned to the default. A theme system that forgets is not
+    /// a theme system (bd-2z0.14.2.2).
+    ///
+    /// Asserts the submitted config carries the NEW theme rather than merely that
+    /// some command was submitted: an UpdateConfig persisting the OLD value would
+    /// satisfy a weaker test while leaving the bug exactly in place.
+    #[test]
+    fn ctrl_t_persists_the_chosen_theme_through_the_config_command_path() {
+        with_shortcut_app(|app| {
+            // Clear anything startup enqueued so the assertion sees only this
+            // keypress.
+            let _ = app.drain_submitted_control_commands();
+            let before = app.palette.theme_id;
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .expect("ctrl-t is handled");
+            let after = app.palette.theme_id;
+            assert_ne!(after, before, "Ctrl+T must advance the theme");
+
+            let persisted = app
+                .drain_submitted_control_commands()
+                .into_iter()
+                .find_map(|command| match command {
+                    ControlCommand::UpdateConfig(config) => Some(config.render.theme),
+                    _ => None,
+                })
+                .expect(
+                    "Ctrl+T must submit an UpdateConfig so the theme survives a restart; \
+                     without one the choice lives only in this session",
+                );
+
+            assert_eq!(
+                persisted,
+                Some(after.to_config()),
+                "the persisted theme must be the one now displayed, not the previous one"
+            );
+        });
+    }
+
+    /// The persisted config must preserve every OTHER setting.
+    ///
+    /// The dangerous implementation composes a fresh ScriptBotsConfig and silently
+    /// reverts world size, seed and thresholds — a far worse bug than the one
+    /// being fixed, and one that would read in the journal as a theme change.
+    #[test]
+    fn persisting_a_theme_preserves_the_rest_of_the_config() {
+        with_shortcut_app(|app| {
+            let _ = app.drain_submitted_control_commands();
+            let (width, height, seed) = {
+                let world = app.world.lock().expect("world lock");
+                let config = world.config();
+                (config.world_width, config.world_height, config.rng_seed)
+            };
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .expect("ctrl-t is handled");
+
+            let config = app
+                .drain_submitted_control_commands()
+                .into_iter()
+                .find_map(|command| match command {
+                    ControlCommand::UpdateConfig(config) => Some(config),
+                    _ => None,
+                })
+                .expect("an UpdateConfig must have been submitted");
+
+            assert_eq!(
+                (config.world_width, config.world_height, config.rng_seed),
+                (width, height, seed),
+                "persisting a theme must not disturb world size or seed; a freshly \
+                 composed config would silently reset the whole run"
+            );
+        });
+    }
+
+    /// The full loop: submit, APPLY, and then re-persisting must be a no-op.
+    ///
+    /// Applying the drained command is what makes this a round trip rather than a
+    /// claim about one. It proves the write actually reaches the world's config —
+    /// the thing a restart would read — and only then does the no-op guard mean
+    /// anything, because the guard compares against exactly that stored value.
+    ///
+    /// The guard matters beyond tidiness: a config row per keypress that changed
+    /// nothing pollutes the command journal replay reads.
+    #[test]
+    fn a_persisted_theme_reaches_the_world_config_and_does_not_re_enqueue() {
+        with_shortcut_app(|app| {
+            let _ = app.drain_submitted_control_commands();
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .expect("ctrl-t is handled");
+            let chosen = app.palette.theme_id;
+
+            // Apply what was submitted, exactly as the tick loop would.
+            let submitted = app.drain_submitted_control_commands();
+            {
+                let mut world = app.world.lock().expect("world lock");
+                for command in submitted {
+                    apply_control_command(&mut world, command)
+                        .expect("the config update must be accepted");
+                }
+            }
+
+            let stored = {
+                let world = app.world.lock().expect("world lock");
+                world.config().render.theme
+            };
+            assert_eq!(
+                stored,
+                Some(chosen.to_config()),
+                "the theme must reach the world config; that is what a restart reads"
+            );
+
+            // Now the guard has something to compare against.
+            app.persist_theme_choice(chosen);
+            assert!(
+                app.drain_submitted_control_commands().is_empty(),
+                "persisting a theme the config already holds must not enqueue a second \
+                 identical config update"
+            );
+        });
     }
 
     #[test]
