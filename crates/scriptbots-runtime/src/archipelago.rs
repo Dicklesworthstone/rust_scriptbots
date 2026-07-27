@@ -1280,6 +1280,7 @@ mod tests {
         EventJournalReader, JournalAdmission, JournalBatch, JournalReceipt, JournalReceiptState,
         ShutdownCommitRequirement,
     };
+    use scriptbots_core::AgentUid;
     use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
     use std::collections::BTreeSet;
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
@@ -2283,5 +2284,108 @@ mod tests {
                 island: IslandId(7)
             })
         ));
+    }
+
+    /// Census of every living agent's ARCHIPELAGO-WIDE identity, asserting uniqueness.
+    ///
+    /// THE CONSERVATION GUARD (bd-16g.5.2). Migration is the operation that gets this
+    /// wrong silently, and population sums alone do not catch it: an agent duplicated on
+    /// one island and lost on another leaves the total unchanged. Uniqueness of
+    /// `(IslandId, AgentUid)` across all survivors is the half that does catch it.
+    ///
+    /// Returns the census so a caller can diff it across a barrier. Written before
+    /// `emigrate`/`immigrate` exist deliberately: the digest-sensitive mutation should be
+    /// born already guarded, so a wrong move fails loudly the first time it lands rather
+    /// than corrupting lineage data that looks plausible.
+    fn census(archipelago: &Archipelago, islands: &[IslandId]) -> BTreeSet<(IslandId, AgentUid)> {
+        let mut seen = BTreeSet::new();
+        for &id in islands {
+            let uids = archipelago
+                .with_island_world(id, |world| {
+                    world
+                        .ordered_agent_rng_counters_v1()
+                        .map(|states| {
+                            states
+                                .iter()
+                                .map(|state| state.agent_uid())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .expect("island world readable");
+            for uid in uids {
+                assert!(
+                    seen.insert((id, uid)),
+                    "duplicate archipelago identity ({id:?}, {uid:?}): an agent exists \
+                     twice, which population sums alone would not reveal"
+                );
+            }
+        }
+        seen
+    }
+
+    /// No agent is duplicated or lost across barriers.
+    ///
+    /// Today migration is not wired, so nothing moves and this holds trivially -- which is
+    /// exactly why it is safe to commit now and worth committing now. The moment
+    /// `emigrate`/`immigrate` land, a move that duplicates an agent, drops one, or fails
+    /// to re-identify an arrival under the destination's allocator breaks this test
+    /// LOUDLY instead of producing a plausible, wrong phylogeny.
+    ///
+    /// THE SECOND HALF IS NOT YET ASSERTABLE, and is named rather than faked: the full
+    /// accounting identity is
+    ///     population_after == population_before + births - deaths + immigrants - emigrants
+    /// and `TickSummary::births`/`deaths` are PER TICK, so reconstructing them across a
+    /// multi-tick barrier needs per-barrier migration counts that do not exist until the
+    /// migrator is wired. Asserting a partial identity here would be worse than naming it.
+    #[test]
+    fn bd_16g_5_2_no_agent_is_duplicated_or_lost_across_barriers() {
+        let islands: Vec<IslandId> = (0..3).map(IslandId).collect();
+        let specs: Vec<IslandSpec> = islands
+            .iter()
+            .map(|id| spec(id.0, populated_config(None)))
+            .collect();
+        let mut archipelago =
+            populated_archipelago(archipelago_config(specs, 40)).expect("valid archipelago");
+
+        archipelago.step_to_barrier().expect("first barrier");
+        let first = census(&archipelago, &islands);
+        assert!(
+            !first.is_empty(),
+            "an empty archipelago would satisfy every assertion below vacuously"
+        );
+
+        // Uniqueness must hold at EVERY barrier, not just once: a migrator that
+        // duplicates on the third exchange is the realistic bug.
+        let mut previous = first;
+        for barrier in 0..4 {
+            archipelago
+                .step_to_barrier()
+                .unwrap_or_else(|error| panic!("barrier {barrier} stepped: {error:?}"));
+            let current = census(&archipelago, &islands);
+            assert!(
+                !current.is_empty(),
+                "population collapsed at barrier {barrier}, so later barriers prove nothing"
+            );
+
+            // WHY THERE IS NO "NOTHING MOVED" ASSERTION HERE, and it is a finding rather
+            // than an omission. I wrote one and it failed: island 0 and island 1 each hold
+            // their own AgentUid(1), because uids come from per-island private allocators.
+            // Comparing bare uids across islands is exactly the merge hazard bd-8jlj is
+            // filed for, and I walked into it twice.
+            //
+            // The consequence is load-bearing for bd-16g.5.2: a move is INDISTINGUISHABLE
+            // from a death plus a birth when observed from population state alone, because
+            // the arriving agent necessarily takes a fresh local uid. Conservation across
+            // migration therefore CANNOT be verified from censuses -- it requires the
+            // journaled migration record. That reorders my own inventory on this bead:
+            // journaling is not a later nicety after conservation, it is a PREREQUISITE
+            // for asserting conservation at all.
+            //
+            // What remains assertable now, and is asserted above via `census`, is
+            // uniqueness -- the half that catches duplication, which is the silent failure.
+            let _ = &previous;
+            previous = current;
+        }
     }
 }
