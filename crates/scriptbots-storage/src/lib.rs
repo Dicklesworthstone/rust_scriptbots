@@ -221,11 +221,20 @@ pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 15;
 
 /// Inclusive upper bound enforced on every `island_id` column by the V15 schema.
 ///
-/// `IslandId` is a `u16` in memory, so this is the exact widest value the in-memory type can
-/// present. The database bound is stated in terms of that type rather than as a round number:
-/// a wider value in SQLite could only arrive from a corrupted file or a non-ScriptBots writer,
-/// and it must be refused at the storage boundary rather than truncated on readback.
-pub const SCRIPTBOTS_MAX_ISLAND_ID: i64 = u16::MAX as i64;
+/// This is the widest value `scriptbots_core::rng_domains::IslandId` can present. The database
+/// bound is stated in terms of that type rather than as a round number: a wider value in SQLite
+/// could only arrive from a corrupted file or a non-ScriptBots writer, and it must be refused at
+/// the storage boundary rather than truncated on readback.
+///
+/// IT IS `u32`, NOT `u16`, AND THE DISTINCTION IS LOAD-BEARING. bd-8djh's description said
+/// island_id was `u16` in memory and this constant was first written as `u16::MAX`, which would
+/// have refused every island above 65535 that the canonical type permits. bd-cxcf had already
+/// converged three competing `IslandId` declarations onto the `u32` newtype and deleted the
+/// `u16` one (29c6d6edfa) — the bead text was simply older than the type. A storage bound
+/// derived from a prose description rather than from the type is exactly how a schema silently
+/// narrows a domain, so this tracks `IslandId`'s payload width and the test asserts the round
+/// trip at the boundary.
+pub const SCRIPTBOTS_MAX_ISLAND_ID: i64 = u32::MAX as i64;
 
 /// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
@@ -1223,7 +1232,7 @@ const SCRIPTBOTS_SCHEMA_V15: &str = r#"
         average_energy REAL NOT NULL,
         average_health REAL NOT NULL,
         island_id INTEGER NOT NULL DEFAULT 0
-            CHECK (island_id >= 0 AND island_id <= 65535),
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
         PRIMARY KEY (run_id, island_id, tick),
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
@@ -1243,7 +1252,7 @@ const SCRIPTBOTS_SCHEMA_V15: &str = r#"
         name TEXT NOT NULL CHECK (name <> ''),
         value REAL NOT NULL,
         island_id INTEGER NOT NULL DEFAULT 0
-            CHECK (island_id >= 0 AND island_id <= 65535),
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
         PRIMARY KEY (run_id, island_id, tick, name),
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
@@ -1259,7 +1268,7 @@ const SCRIPTBOTS_SCHEMA_V15: &str = r#"
         kind TEXT NOT NULL CHECK (kind <> ''),
         count INTEGER NOT NULL CHECK (count >= 0),
         island_id INTEGER NOT NULL DEFAULT 0
-            CHECK (island_id >= 0 AND island_id <= 65535),
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
         PRIMARY KEY (run_id, island_id, tick, kind),
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
@@ -1283,7 +1292,7 @@ const SCRIPTBOTS_SCHEMA_V15: &str = r#"
         counterpart_position_x REAL,
         counterpart_position_y REAL,
         island_id INTEGER NOT NULL DEFAULT 0
-            CHECK (island_id >= 0 AND island_id <= 65535),
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
         PRIMARY KEY (run_id, island_id, tick, seq),
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
@@ -1343,7 +1352,7 @@ const SCRIPTBOTS_SCHEMA_V15: &str = r#"
         hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
         hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
         island_id INTEGER NOT NULL DEFAULT 0
-            CHECK (island_id >= 0 AND island_id <= 65535),
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
         PRIMARY KEY (run_id, island_id, tick, agent_uid),
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
@@ -1385,7 +1394,7 @@ const SCRIPTBOTS_SCHEMA_V15: &str = r#"
         is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
         origin TEXT NOT NULL CHECK (origin IN ('born', 'seeded', 'injected')),
         island_id INTEGER NOT NULL DEFAULT 0
-            CHECK (island_id >= 0 AND island_id <= 65535),
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
         CHECK (origin <> 'seeded' OR tick = 0),
         CHECK (
             (origin = 'born' AND birth_ordinal IS NOT NULL)
@@ -1434,7 +1443,7 @@ const SCRIPTBOTS_SCHEMA_V15: &str = r#"
         hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
         hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
         island_id INTEGER NOT NULL DEFAULT 0
-            CHECK (island_id >= 0 AND island_id <= 65535),
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
         PRIMARY KEY (run_id, island_id, tick, agent_uid),
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
@@ -25698,9 +25707,15 @@ mod tests {
         Ok(())
     }
 
-    /// `island_id` round-trips the full `u16` domain and refuses anything outside it.
+    /// `island_id` round-trips the full `IslandId` domain and refuses anything outside it.
+    ///
+    /// The bound is asserted against `IslandId`'s own payload type rather than a literal, so
+    /// this test fails if the schema and the in-memory type ever disagree again. They already
+    /// did once: the first version of this bound was `u16::MAX`, taken from bd-8djh's prose,
+    /// while bd-cxcf had converged `IslandId` on `u32` — a schema that would have refused every
+    /// island above 65535.
     #[test]
-    fn v15_island_id_round_trips_the_u16_domain_and_bounds_it()
+    fn v15_island_id_round_trips_the_island_id_domain_and_bounds_it()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&connection)?;
@@ -25713,8 +25728,8 @@ mod tests {
                 total_energy, average_energy, average_health
              ) VALUES (?1, ?2, ?3, 0, 1, 0, 0, 0, 0.0, 0.0, 0.0)";
 
-        // The widest island an in-memory u16 can present must survive the SQLite boundary
-        // exactly, with no truncation and no panic on readback.
+        // The widest island IslandId can present must survive the SQLite boundary exactly,
+        // with no truncation and no panic on readback.
         connection.execute_with_params(
             summary_sql,
             &[
@@ -25730,10 +25745,12 @@ mod tests {
             )?
             .get_typed(0)?;
         assert_eq!(stored, SCRIPTBOTS_MAX_ISLAND_ID);
+        // Narrowed through IslandId's OWN payload type, not a hardcoded width: if the newtype
+        // is ever rewidened, this fails rather than silently capping the schema below it.
         assert_eq!(
-            u16::try_from(stored)?,
-            u16::MAX,
-            "the stored bound must narrow back to the in-memory IslandId type exactly"
+            scriptbots_core::rng_domains::IslandId(u32::try_from(stored)?),
+            scriptbots_core::rng_domains::IslandId(u32::MAX),
+            "the stored bound must narrow back to the canonical IslandId exactly"
         );
 
         for rejected in [-1_i64, SCRIPTBOTS_MAX_ISLAND_ID + 1] {
@@ -25742,7 +25759,7 @@ mod tests {
                     summary_sql,
                     &[sqlite_run_id(run), rejected.into(), 2_i64.into()],
                 )
-                .expect_err("an island_id outside the u16 domain was accepted");
+                .expect_err("an island_id outside the IslandId domain was accepted");
             assert!(
                 refusal.to_string().contains("CHECK constraint failed"),
                 "island_id {rejected} must be refused by the CHECK constraint at the \
