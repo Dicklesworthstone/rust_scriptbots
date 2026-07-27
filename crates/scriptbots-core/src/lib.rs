@@ -73,6 +73,7 @@ pub mod infotheory;
 pub mod interventions;
 pub mod knob_roles;
 pub mod map_elites;
+pub mod migration;
 pub mod narrative_text;
 pub mod permalink;
 pub mod phylo;
@@ -82,6 +83,8 @@ pub mod rng_domains;
 pub mod sense_fixed;
 pub mod species;
 pub mod visual;
+
+pub use migration::{MigratingAgent, MigrationTransferError};
 
 pub use checkpoint::{
     CheckpointBrainRegistryRequirementV1, CheckpointBrainRegistryRequirementsV1,
