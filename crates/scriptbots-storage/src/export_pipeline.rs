@@ -3,6 +3,180 @@
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
+// ============================================================================
+// SCHEMA EVOLUTION AND DIGEST COMPARABILITY POLICY (bd-2z0.5.6)
+//
+// This is the compatibility policy the acceptance requires, made executable
+// rather than left as prose, because it is the decision that several downstream
+// beads were each about to make separately and differently.
+//
+// THE PROBLEM. Every export artifact carries an integrity digest. When a table
+// gains a provenance field -- and it will, because provenance is exactly the
+// thing that grows -- there appear to be only two options, and both are bad:
+//
+//   (a) Fold the new field into the digest. Old artifacts now fail verification
+//       even though nothing about them changed or is wrong.
+//   (b) Carry the new field outside the digest. Old artifacts stay valid, but
+//       the new field is not covered by the integrity guarantee -- it is
+//       reproducible in principle and unverified in fact.
+//
+// THE DECISION: NEITHER. The dilemma is an artifact of treating a digest as a
+// global truth. A digest is a claim about bytes UNDER A STATED SCHEMA. Comparing
+// digests across schema versions is a category error, not a mismatch.
+//
+// So the policy is:
+//   1. Schema version is PER TABLE, not one global number for the whole export.
+//      Adding a field to the run table must not invalidate metric artifacts.
+//   2. A new field is folded INTO the digest and bumps that table's version.
+//      Provenance that the integrity digest does not cover is not provenance.
+//   3. Readers accept older versions (forward-compatible reads), but a digest is
+//      only comparable to another digest of the SAME (table, version).
+//   4. A comparison across versions reports NOT COMPARABLE, which is a distinct
+//      outcome from MISMATCH. Collapsing those two is what makes teams choose
+//      (b): they see old artifacts "failing" and conclude the digest must not
+//      cover new fields. It was never a failure -- it was a question nobody was
+//      allowed to answer as "that is not the same question".
+//
+// WHY THIS UNBLOCKS bd-16g.1.7. Its reproduce.sh cannot rerun an arm because the
+// lab's RunSummary/RunRef keep `arm_id: u16` plus a config digest, and a digest
+// verifies a config without being able to recreate it. Adding the arm identity
+// looked like a forced choice between (a) and (b). Under this policy it is
+// neither: bump the run table's version, cover the new field, and let older
+// artifacts report NotComparable instead of failing.
+// ============================================================================
+
+/// Canonical export table families (bd-2z0.5.6).
+///
+/// Typed rather than a `&str` deliberately. The generic `write_row(&str, ...)`
+/// envelope on [`CoreTableExportWriter`] is what let an arbitrary table name
+/// masquerade as schema coverage: passing the strings "run", "agent" and
+/// "lineage" to a writer that validates neither made three canonical tables
+/// look delivered when none existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportTable {
+    /// One row per run: identity, seed, config, provenance.
+    Run,
+    /// One row per agent observation.
+    Agent,
+    /// One row per lineage edge.
+    Lineage,
+    /// One row per narrative/domain event.
+    Event,
+    /// One row per (tick, metric) sample.
+    Metric,
+}
+
+impl ExportTable {
+    /// Stable snake_case name used in artifacts and filenames.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Agent => "agent",
+            Self::Lineage => "lineage",
+            Self::Event => "event",
+            Self::Metric => "metric",
+        }
+    }
+
+    /// Current schema version for this table.
+    ///
+    /// PER TABLE by policy: adding a field to `run` must not invalidate every
+    /// retained `metric` artifact. Bump exactly the table you changed.
+    #[must_use]
+    pub const fn current_version(self) -> u32 {
+        match self {
+            // All families start at 1. When a table gains a field, bump ONLY its
+            // arm here and say why in the commit -- the version number is the
+            // only thing standing between a real mismatch and a false one.
+            Self::Run | Self::Agent | Self::Lineage | Self::Event | Self::Metric => 1,
+        }
+    }
+
+    /// Every canonical family, for exhaustive iteration in tests and tooling.
+    pub const ALL: [Self; 5] = [
+        Self::Run,
+        Self::Agent,
+        Self::Lineage,
+        Self::Event,
+        Self::Metric,
+    ];
+}
+
+/// Identity a digest is scoped to. A digest means nothing without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaId {
+    /// Which canonical table.
+    pub table: ExportTable,
+    /// That table's schema version at write time.
+    pub version: u32,
+}
+
+impl SchemaId {
+    /// Schema identity for a table at its current version.
+    #[must_use]
+    pub const fn current(table: ExportTable) -> Self {
+        Self {
+            table,
+            version: table.current_version(),
+        }
+    }
+}
+
+/// Whether two artifacts' digests may be compared at all.
+///
+/// The three outcomes are deliberately distinct. A verifier that cannot say
+/// "not comparable" is forced to report a schema change as data corruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestComparability {
+    /// Same table, same version: digests are directly comparable.
+    Comparable,
+    /// Same table, different versions. NOT a mismatch -- a different question.
+    DifferentVersion {
+        /// Version the verifier expected.
+        expected: u32,
+        /// Version the artifact was written at.
+        found: u32,
+    },
+    /// Different tables entirely: comparing them is meaningless.
+    DifferentTable {
+        /// Table the verifier expected.
+        expected: ExportTable,
+        /// Table the artifact actually holds.
+        found: ExportTable,
+    },
+}
+
+impl DigestComparability {
+    /// True only when a digest equality check is a meaningful question.
+    #[must_use]
+    pub const fn is_comparable(self) -> bool {
+        matches!(self, Self::Comparable)
+    }
+}
+
+/// Decide whether two schema identities admit a digest comparison.
+///
+/// Call this BEFORE comparing digests. Comparing first and interpreting the
+/// result afterwards is how a schema bump gets reported as corruption.
+#[must_use]
+pub const fn compare_schema(expected: SchemaId, found: SchemaId) -> DigestComparability {
+    if expected.table as u8 != found.table as u8 {
+        return DigestComparability::DifferentTable {
+            expected: expected.table,
+            found: found.table,
+        };
+    }
+    if expected.version != found.version {
+        return DigestComparability::DifferentVersion {
+            expected: expected.version,
+            found: found.version,
+        };
+    }
+    DigestComparability::Comparable
+}
+
 /// Export format for run analytics data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportFormat {
@@ -336,5 +510,112 @@ mod tests {
             assert_eq!(exported["table"], table);
             assert_eq!(exported["row"][key], value);
         }
+    }
+
+    /// A schema bump must read as "different question", never as corruption.
+    #[test]
+    fn bd_2z0_5_6_a_version_bump_is_not_a_digest_mismatch() {
+        let v1 = SchemaId {
+            table: ExportTable::Run,
+            version: 1,
+        };
+        let v2 = SchemaId {
+            table: ExportTable::Run,
+            version: 2,
+        };
+        let verdict = compare_schema(v1, v2);
+        assert_eq!(
+            verdict,
+            DigestComparability::DifferentVersion {
+                expected: 1,
+                found: 2
+            }
+        );
+        assert!(
+            !verdict.is_comparable(),
+            "a cross-version digest comparison is not a meaningful question"
+        );
+        assert_ne!(
+            verdict,
+            DigestComparability::DifferentTable {
+                expected: ExportTable::Run,
+                found: ExportTable::Run
+            },
+            "a version bump must not be reported as a table mix-up"
+        );
+    }
+
+    /// Comparing two different tables is meaningless regardless of version.
+    #[test]
+    fn bd_2z0_5_6_different_tables_never_compare() {
+        let run = SchemaId::current(ExportTable::Run);
+        let metric = SchemaId::current(ExportTable::Metric);
+        assert_eq!(run.version, metric.version, "both start at 1 today");
+        assert_eq!(
+            compare_schema(run, metric),
+            DigestComparability::DifferentTable {
+                expected: ExportTable::Run,
+                found: ExportTable::Metric
+            },
+            "equal version numbers must not make two different tables comparable"
+        );
+    }
+
+    /// The same table at the same version is the ONLY comparable case.
+    #[test]
+    fn bd_2z0_5_6_only_identical_schema_ids_are_comparable() {
+        for table in ExportTable::ALL {
+            let id = SchemaId::current(table);
+            assert!(
+                compare_schema(id, id).is_comparable(),
+                "{} must compare with itself",
+                table.as_str()
+            );
+            for other in ExportTable::ALL {
+                if other != table {
+                    assert!(
+                        !compare_schema(id, SchemaId::current(other)).is_comparable(),
+                        "{} must not compare with {}",
+                        table.as_str(),
+                        other.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Versions are PER TABLE: bumping one must not disturb the others.
+    #[test]
+    fn bd_2z0_5_6_schema_versions_are_scoped_per_table() {
+        // The whole point of per-table versioning is that a `run` change leaves
+        // retained `metric` artifacts comparable. Simulate the bump.
+        let metric_before = SchemaId::current(ExportTable::Metric);
+        let bumped_run = SchemaId {
+            table: ExportTable::Run,
+            version: ExportTable::Run.current_version() + 1,
+        };
+        assert!(
+            compare_schema(metric_before, SchemaId::current(ExportTable::Metric)).is_comparable(),
+            "bumping the run table must not invalidate metric artifacts"
+        );
+        assert!(!compare_schema(SchemaId::current(ExportTable::Run), bumped_run).is_comparable());
+    }
+
+    /// Table names are stable identifiers and must not collide.
+    #[test]
+    fn bd_2z0_5_6_table_names_are_stable_and_distinct() {
+        let mut names: Vec<&str> = ExportTable::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(
+            names,
+            ["run", "agent", "lineage", "event", "metric"],
+            "these strings appear in retained artifacts; changing one is a schema break"
+        );
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            ExportTable::ALL.len(),
+            "names must be distinct"
+        );
     }
 }
