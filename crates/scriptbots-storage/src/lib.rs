@@ -6208,35 +6208,57 @@ impl StorageBuffer {
             context,
             reason: format!("non-finite value {value}"),
         };
-        let [summary] = self.ticks.as_slice() else {
+        // ONE TICK SUMMARY PER ISLAND, all at the enclosing tick (bd-16g.5.5).
+        //
+        // This was `[summary]` -- exactly one -- which is the single-world form and is what
+        // blocked barrier fusion: an archipelago barrier legitimately carries one summary per
+        // island for the same tick. Generalising it is NOT a relaxation. The rule is still
+        // "exactly one summary per boundary"; the boundary is now (island, tick) rather than
+        // tick alone, and a repeated island is refused explicitly below, so a batch can no
+        // more carry two summaries for one island than it could before.
+        if self.ticks.is_empty() {
             return Err(StorageError::InvalidData {
                 context: "ticks",
-                reason: format!(
-                    "an outbox batch must contain exactly one tick summary, found {}",
-                    self.ticks.len()
-                ),
-            });
-        };
-        let summary_tick = checked_u64("ticks.tick", summary.tick)?;
-        if summary_tick != enclosing_tick {
-            return Err(StorageError::InvalidData {
-                context: "ticks.tick",
-                reason: format!(
-                    "tick summary {summary_tick} does not match enclosing batch tick {enclosing_tick}"
-                ),
+                reason: "an outbox batch must contain at least one tick summary, found 0"
+                    .to_owned(),
             });
         }
-        checked_u64("ticks.epoch", summary.epoch)?;
-        checked_usize("ticks.agent_count", summary.agent_count)?;
-        let summary_births = checked_usize("ticks.births", summary.births)?;
-        let summary_deaths = checked_usize("ticks.deaths", summary.deaths)?;
-        for (context, value) in [
-            ("ticks.total_energy", summary.total_energy),
-            ("ticks.average_energy", summary.average_energy),
-            ("ticks.average_health", summary.average_health),
-        ] {
-            if !value.is_finite() {
-                return Err(invalid(context, value));
+        let mut summaries: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
+        for summary in &self.ticks {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
+            let summary_tick = checked_u64("ticks.tick", summary.tick)?;
+            if summary_tick != enclosing_tick {
+                return Err(StorageError::InvalidData {
+                    context: "ticks.tick",
+                    reason: format!(
+                        "tick summary {summary_tick} does not match enclosing batch tick {enclosing_tick}"
+                    ),
+                });
+            }
+            checked_u64("ticks.epoch", summary.epoch)?;
+            checked_usize("ticks.agent_count", summary.agent_count)?;
+            let summary_births = checked_usize("ticks.births", summary.births)?;
+            let summary_deaths = checked_usize("ticks.deaths", summary.deaths)?;
+            for (context, value) in [
+                ("ticks.total_energy", summary.total_energy),
+                ("ticks.average_energy", summary.average_energy),
+                ("ticks.average_health", summary.average_health),
+            ] {
+                if !value.is_finite() {
+                    return Err(invalid(context, value));
+                }
+            }
+            if summaries
+                .insert(summary.island_id, (summary_births, summary_deaths))
+                .is_some()
+            {
+                return Err(StorageError::InvalidData {
+                    context: "ticks.island_id",
+                    reason: format!(
+                        "island {} has more than one tick summary in the enclosing batch",
+                        summary.island_id
+                    ),
+                });
             }
         }
         for row in &self.metrics {
@@ -6245,10 +6267,11 @@ impl StorageBuffer {
                 return Err(invalid("metrics.value", row.value));
             }
         }
-        let mut birth_event_rows = 0usize;
-        let mut birth_event_total = 0usize;
-        let mut death_event_rows = 0usize;
-        let mut death_event_total = 0usize;
+        // Counted PER ISLAND. Summed batch-wide these would let one island's surplus births
+        // cancel another's shortfall, so a fused barrier would balance while both islands'
+        // books were individually wrong.
+        let mut birth_events: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
+        let mut death_events: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
         for row in &self.events {
             observer.checkpoint(PreparationStage::Validate, progress)?;
             let row_tick = checked_u64("events.tick", row.tick)?;
@@ -6263,22 +6286,28 @@ impl StorageBuffer {
             let count = checked_usize("events.count", row.count)?;
             match row.kind.as_str() {
                 "births" => {
-                    birth_event_rows += 1;
-                    birth_event_total = birth_event_total.checked_add(count).ok_or_else(|| {
-                        StorageError::InvalidData {
-                            context: "events.births",
-                            reason: "birth event total overflow".to_owned(),
-                        }
-                    })?;
+                    let entry = birth_events.entry(row.island_id).or_insert((0, 0));
+                    entry.0 += 1;
+                    entry.1 =
+                        entry
+                            .1
+                            .checked_add(count)
+                            .ok_or_else(|| StorageError::InvalidData {
+                                context: "events.births",
+                                reason: "birth event total overflow".to_owned(),
+                            })?;
                 }
                 "deaths" => {
-                    death_event_rows += 1;
-                    death_event_total = death_event_total.checked_add(count).ok_or_else(|| {
-                        StorageError::InvalidData {
-                            context: "events.deaths",
-                            reason: "death event total overflow".to_owned(),
-                        }
-                    })?;
+                    let entry = death_events.entry(row.island_id).or_insert((0, 0));
+                    entry.0 += 1;
+                    entry.1 =
+                        entry
+                            .1
+                            .checked_add(count)
+                            .ok_or_else(|| StorageError::InvalidData {
+                                context: "events.deaths",
+                                reason: "death event total overflow".to_owned(),
+                            })?;
                 }
                 _ => {}
             }
@@ -6336,21 +6365,25 @@ impl StorageBuffer {
                 checked_u64("births.parent_b", parent_b)?;
             }
             checked_u32("births.generation", row.generation)?;
-            if !birth_agent_uids.insert(row.agent_uid) {
+            // Keyed by (island, value), because every island mints these from its own private
+            // counter (bd-8jlj). Run-scoped sets would refuse island 1's agent 1 as a duplicate
+            // of island 0's, which is precisely the identity V15's lifted unique indexes exist
+            // to keep distinct.
+            if !birth_agent_uids.insert((row.island_id, row.agent_uid)) {
                 return Err(StorageError::InvalidData {
                     context: "births.agent_uid",
                     reason: format!(
-                        "agent uid {} has more than one arrival in the enclosing batch",
-                        row.agent_uid
+                        "agent uid {} has more than one arrival on island {} in the enclosing batch",
+                        row.agent_uid, row.island_id
                     ),
                 });
             }
-            if !birth_spawn_ordinals.insert(row.spawn_ordinal) {
+            if !birth_spawn_ordinals.insert((row.island_id, row.spawn_ordinal)) {
                 return Err(StorageError::InvalidData {
                     context: "births.spawn_ordinal",
                     reason: format!(
-                        "spawn ordinal {} has more than one arrival in the enclosing batch",
-                        row.spawn_ordinal
+                        "spawn ordinal {} has more than one arrival on island {} in the enclosing batch",
+                        row.spawn_ordinal, row.island_id
                     ),
                 });
             }
@@ -6360,12 +6393,13 @@ impl StorageBuffer {
                 .transpose()?;
             validate_birth_origin_ordinal(row.origin, birth_ordinal)?;
             if let Some(birth_ordinal) = row.birth_ordinal
-                && !birth_ordinals.insert(birth_ordinal)
+                && !birth_ordinals.insert((row.island_id, birth_ordinal))
             {
                 return Err(StorageError::InvalidData {
                     context: "births.birth_ordinal",
                     reason: format!(
-                        "birth ordinal {birth_ordinal} has more than one birth in the enclosing batch"
+                        "birth ordinal {birth_ordinal} has more than one birth on island {} in the enclosing batch",
+                        row.island_id
                     ),
                 });
             }
@@ -6387,12 +6421,12 @@ impl StorageBuffer {
             checked_u64("deaths.agent_uid", row.agent_uid)?;
             checked_u32("deaths.age", row.age)?;
             checked_u32("deaths.generation", row.generation)?;
-            if !death_uids.insert(row.agent_uid) {
+            if !death_uids.insert((row.island_id, row.agent_uid)) {
                 return Err(StorageError::InvalidData {
                     context: "deaths.agent_uid",
                     reason: format!(
-                        "agent uid {} has more than one death in the enclosing batch",
-                        row.agent_uid
+                        "agent uid {} has more than one death on island {} in the enclosing batch",
+                        row.agent_uid, row.island_id
                     ),
                 });
             }
@@ -6406,51 +6440,86 @@ impl StorageBuffer {
                 }
             }
         }
-        let mut born_records = 0usize;
-        for row in &self.births {
-            observer.checkpoint(PreparationStage::Validate, progress)?;
-            born_records =
-                born_records.saturating_add(usize::from(row.origin == BirthOrigin::Born));
-        }
-        if summary_births != born_records {
-            return Err(StorageError::InvalidData {
-                context: "ticks.births",
-                reason: format!(
-                    "tick summary reports {summary_births} demographic births, but the batch carries {born_records} Born origin rows"
-                ),
-            });
-        }
-        if summary_deaths != self.deaths.len() {
-            return Err(StorageError::InvalidData {
-                context: "ticks.deaths",
-                reason: format!(
-                    "tick summary reports {summary_deaths} deaths, but the batch carries {} death rows",
-                    self.deaths.len()
-                ),
-            });
-        }
-        for (context, expected, rows, total) in [
-            (
-                "events.births",
-                summary_births,
-                birth_event_rows,
-                birth_event_total,
-            ),
-            (
-                "events.deaths",
-                summary_deaths,
-                death_event_rows,
-                death_event_total,
-            ),
-        ] {
-            let expected_rows = usize::from(expected > 0);
-            if rows != expected_rows || total != expected {
+        // Every record must belong to an island that declared a summary, or its counts would be
+        // checked against nothing. This is what stops a fused barrier smuggling in rows for an
+        // island that never closed the tick.
+        let mut born_records: BTreeMap<i64, usize> = BTreeMap::new();
+        let mut death_records: BTreeMap<i64, usize> = BTreeMap::new();
+        for (context, island) in self
+            .births
+            .iter()
+            .map(|row| ("births.island_id", row.island_id))
+            .chain(
+                self.deaths
+                    .iter()
+                    .map(|row| ("deaths.island_id", row.island_id)),
+            )
+            .chain(
+                self.events
+                    .iter()
+                    .map(|row| ("events.island_id", row.island_id)),
+            )
+        {
+            if !summaries.contains_key(&island) {
                 return Err(StorageError::InvalidData {
                     context,
                     reason: format!(
-                        "expected {expected_rows} canonical event row(s) totaling {expected}, found {rows} row(s) totaling {total}"
+                        "island {island} has rows in the enclosing batch but no tick summary"
                     ),
                 });
+            }
+        }
+        for row in &self.births {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
+            if row.origin == BirthOrigin::Born {
+                *born_records.entry(row.island_id).or_insert(0) += 1;
+            }
+        }
+        for row in &self.deaths {
+            observer.checkpoint(PreparationStage::Validate, progress)?;
+            *death_records.entry(row.island_id).or_insert(0) += 1;
+        }
+        for (island, (summary_births, summary_deaths)) in &summaries {
+            let born = born_records.get(island).copied().unwrap_or(0);
+            if *summary_births != born {
+                return Err(StorageError::InvalidData {
+                    context: "ticks.births",
+                    reason: format!(
+                        "island {island} tick summary reports {summary_births} demographic births, but the batch carries {born} Born origin rows"
+                    ),
+                });
+            }
+            let died = death_records.get(island).copied().unwrap_or(0);
+            if *summary_deaths != died {
+                return Err(StorageError::InvalidData {
+                    context: "ticks.deaths",
+                    reason: format!(
+                        "island {island} tick summary reports {summary_deaths} deaths, but the batch carries {died} death rows"
+                    ),
+                });
+            }
+            for (context, expected, observed) in [
+                (
+                    "events.births",
+                    *summary_births,
+                    birth_events.get(island).copied().unwrap_or((0, 0)),
+                ),
+                (
+                    "events.deaths",
+                    *summary_deaths,
+                    death_events.get(island).copied().unwrap_or((0, 0)),
+                ),
+            ] {
+                let expected_rows = usize::from(expected > 0);
+                let (rows, total) = observed;
+                if rows != expected_rows || total != expected {
+                    return Err(StorageError::InvalidData {
+                        context,
+                        reason: format!(
+                            "island {island} expected {expected_rows} canonical event row(s) totaling {expected}, found {rows} row(s) totaling {total}"
+                        ),
+                    });
+                }
             }
         }
         let mut replay_keys = BTreeSet::new();
@@ -16090,6 +16159,77 @@ impl Storage {
         let (receipt, newly_admitted) = self.stage_outbox(tick, &prepared)?;
         if newly_admitted {
             self.enqueue_staged(receipt.batch_id, prepared)?;
+        }
+        Ok(())
+    }
+
+    /// Admit one archipelago barrier: every island's rows for a single tick, as ONE batch.
+    ///
+    /// bd-16g.5.5. This exists because the outbox batch ledger admits a single batch per
+    /// `(run_id, tick)`. Submitting each island separately through [`Self::persist_for_island`]
+    /// is refused at the SECOND island with a payload-digest conflict, no matter what order
+    /// the submissions arrive in — `same_tick_multi_island_submission_is_refused_by_the_batch_
+    /// ledger` pins that. Fusing is therefore not an optimisation; it is the only shape in
+    /// which an archipelago can persist a tick at all.
+    ///
+    /// THE ISLANDS ARE SORTED HERE RATHER THAN TRUSTED IN CALLER ORDER. The fused buffer is
+    /// hashed into the batch's identity, so two callers presenting the same barrier in
+    /// different island orders would otherwise mint two different batch ids for identical
+    /// science. The outbox retry contract requires an identical payload to reproduce an
+    /// identical batch id; sorting by `island_id` makes that true by construction instead of
+    /// by asking every caller to remember. This is the same reasoning that rules out N
+    /// concurrent submissions, applied to the fused form.
+    ///
+    /// A barrier is one tick by definition, so a batch whose tick disagrees is refused rather
+    /// than silently fused into the wrong boundary.
+    pub fn persist_barrier(
+        &mut self,
+        islands: &[(IslandId, &PersistenceBatch)],
+    ) -> Result<(), StorageError> {
+        if self.terminally_failed {
+            return Err(StorageError::TerminallyFailed);
+        }
+        let Some((_, first)) = islands.first() else {
+            return Err(StorageError::InvalidData {
+                context: "storage_batch_ledger.barrier",
+                reason: "an archipelago barrier must carry at least one island".to_owned(),
+            });
+        };
+        let tick = first.summary.tick.0;
+
+        let mut ordered: Vec<(IslandId, &PersistenceBatch)> = islands.to_vec();
+        ordered.sort_by_key(|(island, _)| island.0);
+        for window in ordered.windows(2) {
+            if window[0].0 == window[1].0 {
+                return Err(StorageError::InvalidData {
+                    context: "storage_batch_ledger.barrier",
+                    reason: format!(
+                        "island {} appears twice in one barrier; each island contributes exactly \
+                         one batch per tick",
+                        window[0].0.0
+                    ),
+                });
+            }
+        }
+
+        let mut fused = StorageBuffer::default();
+        for (island, payload) in &ordered {
+            if payload.summary.tick.0 != tick {
+                return Err(StorageError::InvalidData {
+                    context: "storage_batch_ledger.barrier",
+                    reason: format!(
+                        "island {} carries tick {} in a barrier at tick {tick}; a barrier is one \
+                         tick across every island",
+                        island.0, payload.summary.tick.0
+                    ),
+                });
+            }
+            fused.append(Self::prepare_batch_for_island(payload, *island)?);
+        }
+
+        let (receipt, newly_admitted) = self.stage_outbox(tick, &fused)?;
+        if newly_admitted {
+            self.enqueue_staged(receipt.batch_id, fused)?;
         }
         Ok(())
     }
@@ -27739,6 +27879,170 @@ mod tests {
                 );
             }
         }
+
+        storage.close()?;
+        Ok(())
+    }
+
+    /// A fused barrier lands every island at ONE tick (bd-16g.5.5).
+    ///
+    /// This is the assertion `persist_for_island_partitions_every_table_by_its_island` could
+    /// not make. Separate per-island submissions collide in the tick-keyed batch ledger, so
+    /// that test has to spread its islands across ticks; fusing the barrier into one batch is
+    /// what makes the same-tick case reachable through the real writer at all.
+    ///
+    /// `COUNT(DISTINCT island_id)` must EQUAL the island count AT THAT ONE TICK — not merely
+    /// be non-zero, and not merely be right in aggregate. A writer that fused the rows but
+    /// stamped one island, or that dropped all but the last island's rows, satisfies every
+    /// weaker check and fails this one.
+    #[test]
+    fn a_fused_barrier_lands_every_island_at_one_tick() -> Result<(), Box<dyn std::error::Error>> {
+        const ISLANDS: i64 = 8;
+        const BARRIER_TICK: u64 = 42;
+
+        let path = temp_db_path("storage-barrier-fusion");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let mut batches = Vec::new();
+        for island in 0..ISLANDS {
+            let mut batch = sample_batch(BARRIER_TICK, 5.5);
+            // Distinct uids per island: the run-scoped arrival guard still refuses the reuse an
+            // archipelago actually produces, which is the next item on this bead and is pinned
+            // by `ancestry_coherence_is_run_scoped_and_refuses_per_island_uid_reuse`.
+            let uid = u64::try_from(island)? + 1;
+            batch.births = vec![sample_birth(BARRIER_TICK, uid, BirthOrigin::Born)];
+            batch.summary.births = 1;
+            batch
+                .events
+                .push(PersistenceEvent::new(PersistenceEventKind::Births, 1));
+            batches.push((IslandId(u32::try_from(island)?), batch));
+        }
+        // Presented in DESCENDING island order on purpose: the barrier sorts internally, and
+        // `a_fused_barrier_has_one_identity_regardless_of_island_order` proves the identity
+        // does not depend on how the caller happened to assemble it.
+        let barrier: Vec<(IslandId, &PersistenceBatch)> = batches
+            .iter()
+            .rev()
+            .map(|(island, batch)| (*island, batch))
+            .collect();
+        storage.persist_barrier(&barrier)?;
+        storage.flush()?;
+
+        let connection = storage.connection()?;
+        for table in ["tick_summaries", "metrics", "events", "agents", "births"] {
+            let at_barrier: i64 = connection
+                .query_row_with_params(
+                    &format!(
+                        "SELECT COUNT(DISTINCT island_id) FROM {table}
+                         WHERE run_id = ?1 AND tick = ?2"
+                    ),
+                    &[
+                        sqlite_run_id(storage.run_id),
+                        i64::try_from(BARRIER_TICK)?.into(),
+                    ],
+                )?
+                .get_typed(0)?;
+            assert_eq!(
+                at_barrier, ISLANDS,
+                "{table} holds {at_barrier} island(s) at the barrier tick instead of {ISLANDS}; \
+                 the fusion collapsed or dropped part of the barrier"
+            );
+        }
+
+        storage.close()?;
+        Ok(())
+    }
+
+    /// A barrier's batch identity is independent of the order its islands are presented in.
+    ///
+    /// The fused buffer is hashed into the batch id, and the outbox retry contract requires an
+    /// identical payload to reproduce an identical id. If caller order leaked into the digest,
+    /// a retry that assembled the same barrier differently would mint a second batch for
+    /// science already admitted — the exact duplicate-application hazard the outbox exists to
+    /// prevent. Asserted by replaying the same barrier reversed against the SAME database: the
+    /// second call must be recognised as already admitted rather than refused as a conflicting
+    /// payload or accepted as new work.
+    #[test]
+    fn a_fused_barrier_has_one_identity_regardless_of_island_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-barrier-order");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let batches: Vec<(IslandId, PersistenceBatch)> = (0..4)
+            .map(|island| (IslandId(island), sample_batch(9, 1.0)))
+            .collect();
+        let ascending: Vec<(IslandId, &PersistenceBatch)> = batches
+            .iter()
+            .map(|(island, batch)| (*island, batch))
+            .collect();
+        let descending: Vec<(IslandId, &PersistenceBatch)> =
+            ascending.iter().rev().copied().collect();
+
+        storage.persist_barrier(&ascending)?;
+        // Same science, opposite presentation order. A caller-order-dependent digest would
+        // make this a conflicting payload at an already-admitted tick.
+        storage.persist_barrier(&descending)?;
+        storage.flush()?;
+
+        let summaries: i64 = storage
+            .connection()?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1 AND tick = 9",
+                &[sqlite_run_id(storage.run_id)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            summaries, 4,
+            "the reordered replay must be recognised as the same barrier, leaving one row per \
+             island rather than duplicating or dropping the tick"
+        );
+
+        storage.close()?;
+        Ok(())
+    }
+
+    /// A barrier is one tick across every island, and refuses anything else.
+    #[test]
+    fn a_fused_barrier_refuses_mixed_ticks_and_repeated_islands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-barrier-refusals");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let at_five = sample_batch(5, 1.0);
+        let at_six = sample_batch(6, 1.0);
+
+        let empty = storage
+            .persist_barrier(&[])
+            .expect_err("an empty barrier was admitted");
+        assert!(empty.to_string().contains("at least one island"));
+
+        let mixed = storage
+            .persist_barrier(&[(IslandId(0), &at_five), (IslandId(1), &at_six)])
+            .expect_err("a barrier spanning two ticks was admitted");
+        assert!(
+            mixed.to_string().contains("a barrier is one tick"),
+            "got: {mixed}"
+        );
+
+        let repeated = storage
+            .persist_barrier(&[(IslandId(2), &at_five), (IslandId(2), &at_five)])
+            .expect_err("a barrier repeating one island was admitted");
+        assert!(
+            repeated
+                .to_string()
+                .contains("appears twice in one barrier"),
+            "got: {repeated}"
+        );
+
+        // CONTROL: a well-formed barrier over the same batches is admitted, so the three
+        // refusals above are attributable to their stated causes and not to the fixture.
+        storage.persist_barrier(&[(IslandId(0), &at_five), (IslandId(1), &at_five)])?;
 
         storage.close()?;
         Ok(())
