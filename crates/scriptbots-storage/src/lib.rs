@@ -221,6 +221,140 @@ const SCRIPTBOTS_SCHEMA_V14_VERSION: i64 = 14;
 /// Current schema version for new ScriptBots run databases.
 pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 15;
 
+/// Accumulates one tick's per-island batches and releases them only as a COMPLETE barrier.
+///
+/// bd-16g.5.5. Islands step one at a time and each emits its own [`PersistenceBatch`], but the
+/// outbox admits a single batch per `(run_id, tick)`, so they cannot be persisted as they
+/// arrive. This holds them until every island has reported, then hands
+/// [`Storage::persist_barrier`] the whole tick at once.
+///
+/// REFUSING AN INCOMPLETE BARRIER IS THE POINT, not a safety afterthought. The archipelago's
+/// own contract is that storage must never observe a partial barrier: a tick where island 3
+/// closed and island 4 did not is a state the simulation never occupied, and persisting it
+/// would put a half-stepped world into the durable record where a later reader cannot tell it
+/// from a real one. [`Self::completed_barrier`] therefore refuses rather than persisting what
+/// it has, and the archipelago retries the barrier instead.
+///
+/// This is a storage-side sink on purpose: `scriptbots-storage` depends on `scriptbots-runtime`
+/// and not the reverse, so the archipelago cannot call storage directly. The runtime side
+/// injects ports through `Archipelago::with_factories`' `journal_factory` seam and the wiring
+/// that joins the two lives in `scriptbots-app`, the only crate depending on both.
+#[derive(Debug)]
+pub struct ArchipelagoBarrierSink {
+    expected: BTreeSet<IslandId>,
+    pending: BTreeMap<IslandId, PersistenceBatch>,
+    tick: Option<u64>,
+}
+
+impl ArchipelagoBarrierSink {
+    /// Build a sink that expects exactly `islands` to report every barrier.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an empty island set: a barrier over no islands has no meaning, and accepting one
+    /// would make [`Self::is_complete`] vacuously true on the first call.
+    pub fn new(islands: impl IntoIterator<Item = IslandId>) -> Result<Self, StorageError> {
+        let expected: BTreeSet<IslandId> = islands.into_iter().collect();
+        if expected.is_empty() {
+            return Err(StorageError::InvalidData {
+                context: "archipelago_barrier.islands",
+                reason: "a barrier sink must expect at least one island".to_owned(),
+            });
+        }
+        Ok(Self {
+            expected,
+            pending: BTreeMap::new(),
+            tick: None,
+        })
+    }
+
+    /// Record one island's batch for the barrier in progress.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an island the sink does not expect, a second batch from an island that already
+    /// reported, and a batch whose tick disagrees with the barrier in progress. Each of those
+    /// is a caller error that would otherwise surface as a silently malformed barrier.
+    pub fn admit(&mut self, island: IslandId, batch: PersistenceBatch) -> Result<(), StorageError> {
+        if !self.expected.contains(&island) {
+            return Err(StorageError::InvalidData {
+                context: "archipelago_barrier.island_id",
+                reason: format!(
+                    "island {} is not part of this archipelago; the sink expects {:?}",
+                    island.0,
+                    self.expected.iter().map(|id| id.0).collect::<Vec<u32>>()
+                ),
+            });
+        }
+        let tick = batch.summary.tick.0;
+        match self.tick {
+            None => self.tick = Some(tick),
+            Some(barrier_tick) if barrier_tick != tick => {
+                return Err(StorageError::InvalidData {
+                    context: "archipelago_barrier.tick",
+                    reason: format!(
+                        "island {} reported tick {tick} into a barrier at tick {barrier_tick}",
+                        island.0
+                    ),
+                });
+            }
+            Some(_) => {}
+        }
+        if self.pending.insert(island, batch).is_some() {
+            return Err(StorageError::InvalidData {
+                context: "archipelago_barrier.island_id",
+                reason: format!("island {} reported twice in one barrier", island.0),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether every expected island has reported for the barrier in progress.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.pending.len() == self.expected.len()
+    }
+
+    /// Borrow the barrier as island/batch pairs, refusing anything incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact set of islands still outstanding, so a stalled barrier names what it
+    /// is waiting for rather than reporting a generic failure.
+    pub fn completed_barrier(&self) -> Result<Vec<(IslandId, &PersistenceBatch)>, StorageError> {
+        if !self.is_complete() {
+            let missing: Vec<u32> = self
+                .expected
+                .iter()
+                .filter(|island| !self.pending.contains_key(island))
+                .map(|island| island.0)
+                .collect();
+            return Err(StorageError::InvalidData {
+                context: "archipelago_barrier.incomplete",
+                reason: format!(
+                    "barrier is missing island(s) {missing:?}; storage must never observe a \
+                     partial barrier, so this is retried rather than persisted"
+                ),
+            });
+        }
+        Ok(self
+            .pending
+            .iter()
+            .map(|(island, batch)| (*island, batch))
+            .collect())
+    }
+
+    /// Drop the accumulated barrier and start the next one.
+    ///
+    /// Call after a successful persist. Kept explicit rather than folded into the persist path
+    /// so a failed admission leaves the exact barrier intact for the retry the archipelago
+    /// contract promises.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.tick = None;
+    }
+}
+
 /// Inclusive upper bound enforced on every `island_id` column by the V15 schema.
 ///
 /// This is the widest value `scriptbots_core::rng_domains::IslandId` can present. The database
@@ -16163,6 +16297,18 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist a completed barrier accumulated by an [`ArchipelagoBarrierSink`].
+    ///
+    /// The sink owns the batches, so this takes them by reference through its accessor rather
+    /// than forcing the caller to rebuild the pair slice.
+    pub fn persist_barrier_from(
+        &mut self,
+        sink: &ArchipelagoBarrierSink,
+    ) -> Result<(), StorageError> {
+        let pairs = sink.completed_barrier()?;
+        self.persist_barrier(&pairs)
+    }
+
     /// Admit one archipelago barrier: every island's rows for a single tick, as ONE batch.
     ///
     /// bd-16g.5.5. This exists because the outbox batch ledger admits a single batch per
@@ -27881,6 +28027,112 @@ mod tests {
         }
 
         storage.close()?;
+        Ok(())
+    }
+
+    /// The sink drives a real barrier into storage, and refuses a partial one.
+    ///
+    /// bd-16g.5.5. `persist_barrier` had no caller; this is it. The test exercises the whole
+    /// path an archipelago takes — per-island batches accumulated as islands step, then one
+    /// fused admission at barrier completion — and asserts the partition survives it, so the
+    /// capability is demonstrated by behaviour rather than by the method existing.
+    ///
+    /// The partial-barrier refusal is asserted BEFORE the complete one, because that ordering
+    /// is what proves the completion check is real: if `completed_barrier` returned whatever it
+    /// held, the first call would have persisted seven islands and the second would have been
+    /// operating on already-consumed state.
+    #[test]
+    fn a_barrier_sink_persists_only_complete_barriers() -> Result<(), Box<dyn std::error::Error>> {
+        const ISLANDS: u32 = 8;
+        const BARRIER_TICK: u64 = 21;
+
+        let path = temp_db_path("storage-barrier-sink");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let mut sink = ArchipelagoBarrierSink::new((0..ISLANDS).map(IslandId))?;
+
+        // Islands step one at a time, so the barrier is partial for most of its life.
+        for island in 0..ISLANDS - 1 {
+            sink.admit(IslandId(island), sample_batch(BARRIER_TICK, 5.5))?;
+            assert!(!sink.is_complete());
+            let refusal = storage
+                .persist_barrier_from(&sink)
+                .expect_err("a partial barrier was persisted");
+            assert!(
+                refusal.to_string().contains("missing island"),
+                "the refusal must name the outstanding islands, got: {refusal}"
+            );
+        }
+
+        sink.admit(IslandId(ISLANDS - 1), sample_batch(BARRIER_TICK, 5.5))?;
+        assert!(sink.is_complete());
+        storage.persist_barrier_from(&sink)?;
+        sink.clear();
+        storage.flush()?;
+
+        let at_barrier: i64 = storage
+            .connection()?
+            .query_row_with_params(
+                "SELECT COUNT(DISTINCT island_id) FROM tick_summaries
+                 WHERE run_id = ?1 AND tick = ?2",
+                &[
+                    sqlite_run_id(storage.run_id),
+                    i64::try_from(BARRIER_TICK)?.into(),
+                ],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            at_barrier,
+            i64::from(ISLANDS),
+            "the sink must deliver every island of the barrier, not the last one to report"
+        );
+
+        storage.close()?;
+        Ok(())
+    }
+
+    /// The sink refuses the caller errors that would produce a malformed barrier.
+    #[test]
+    fn a_barrier_sink_refuses_unknown_repeated_and_mistimed_islands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            ArchipelagoBarrierSink::new(Vec::new()).is_err(),
+            "an empty island set would make is_complete vacuously true"
+        );
+
+        let mut sink = ArchipelagoBarrierSink::new([IslandId(0), IslandId(1)])?;
+
+        let unknown = sink
+            .admit(IslandId(9), sample_batch(3, 1.0))
+            .expect_err("an island outside the archipelago was admitted");
+        assert!(
+            unknown
+                .to_string()
+                .contains("is not part of this archipelago")
+        );
+
+        sink.admit(IslandId(0), sample_batch(3, 1.0))?;
+
+        let repeated = sink
+            .admit(IslandId(0), sample_batch(3, 1.0))
+            .expect_err("an island reported twice into one barrier");
+        assert!(repeated.to_string().contains("reported twice"));
+
+        let mistimed = sink
+            .admit(IslandId(1), sample_batch(4, 1.0))
+            .expect_err("a batch from another tick joined the barrier");
+        assert!(
+            mistimed.to_string().contains("into a barrier at tick 3"),
+            "got: {mistimed}"
+        );
+
+        // CONTROL: the right island at the right tick completes the barrier, so the three
+        // refusals are attributable to their stated causes and not to a wedged sink.
+        sink.admit(IslandId(1), sample_batch(3, 1.0))?;
+        assert!(sink.is_complete());
+
         Ok(())
     }
 
