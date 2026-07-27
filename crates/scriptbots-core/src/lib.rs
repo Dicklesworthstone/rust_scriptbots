@@ -3517,12 +3517,19 @@ pub struct DynamicAgentSnapshot {
 /// so no amount of re-pointing lock sites at snapshots would compile into a
 /// working frontend.
 ///
-/// Deliberately EXCLUDED, and this is a finding rather than an oversight:
-/// `AgentRuntime::selection` and `AgentRuntime::indicator` are *per-viewer* UI
-/// state that currently lives in the simulation world. They must not be
-/// published in a snapshot shared by every client, because one viewer's
-/// selection is not a fact about the world. They belong in the per-client
-/// [`crate`]-external projection request instead (tracked separately).
+/// `AgentRuntime::selection` is deliberately EXCLUDED, and that is a finding
+/// rather than an oversight: it is *per-viewer* UI state that currently lives in
+/// the simulation world. It must not be published in a snapshot shared by every
+/// client, because one viewer's selection is not a fact about the world. It
+/// belongs in the per-client projection request instead (`bd-ydu8`).
+///
+/// `indicator` IS included, and the distinction matters. Its doc comment says
+/// "UI highlight pulse state", which reads like viewer state and is what made me
+/// exclude it at first. It is not: the tick loop decays it every step, combat
+/// and damage events write it, and it is encoded into the world state digest
+/// alongside `food_delta` and `spiked`. It is a simulation-owned visual event
+/// channel and a deterministic fact about the world, so a renderer reading it
+/// from a shared snapshot sees exactly what the simulation produced.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicAgentVisuals {
@@ -3562,6 +3569,9 @@ pub struct DynamicAgentVisuals {
     pub spike_victim: bool,
     /// Altruistic sharing intent output.
     pub reproduction_intent: f32,
+    /// Simulation-owned highlight pulse: combat and damage write it, the tick
+    /// loop decays it, and the world state digest covers it.
+    pub indicator: IndicatorState,
 }
 
 impl DynamicAgentVisuals {
@@ -3598,6 +3608,7 @@ impl DynamicAgentVisuals {
             spike_struck: runtime.combat.spike_attacker,
             spike_victim: runtime.spiked,
             reproduction_intent: runtime.give_intent,
+            indicator: runtime.indicator,
         }
     }
 }
@@ -49174,6 +49185,10 @@ mod tests {
         runtime.give_intent = 0.33;
         runtime.combat.spike_attacker = true;
         runtime.spiked = false;
+        runtime.indicator = IndicatorState {
+            intensity: 42.0,
+            color: [0.2, 0.8, 0.9],
+        };
 
         let visuals = DynamicAgentVisuals::capture(&runtime);
 
@@ -49210,6 +49225,13 @@ mod tests {
         );
         assert!(visuals.spike_struck, "combat.spike_attacker is the striker");
         assert!(!visuals.spike_victim, "runtime.spiked is the victim");
+
+        // Carried because it is simulation state, not viewer state: the tick
+        // loop decays it, combat writes it, and the world digest covers it.
+        // Excluding it would have made a renderer unable to draw damage flashes
+        // that the simulation is authoritative about.
+        assert!((visuals.indicator.intensity - 42.0).abs() < f32::EPSILON);
+        assert_eq!(visuals.indicator.color, [0.2, 0.8, 0.9]);
 
         // The commanded channel, not the realized column: a brain commanding
         // nothing must not inherit the previous tick's extension.
