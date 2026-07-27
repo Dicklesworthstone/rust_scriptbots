@@ -290,9 +290,25 @@ pub struct IslandMeta {
 
 /// The recorded island step-ordering policy of one barrier.
 ///
-/// `HostCore` is `!Send`, so v1 steps islands sequentially on the owning
-/// thread while each island's tick pipeline parallelizes internally. Scaling
-/// work (bd-16g.5.4) may add topologies; reports always record which one ran.
+/// `HostCore` is `!Send`, so islands step sequentially on the owning thread while each island's
+/// tick pipeline parallelizes internally. Reports always record which policy ran.
+///
+/// OUTER-ISLAND PARALLELISM IS STRUCTURALLY EXCLUDED, NOT MERELY UNIMPLEMENTED (bd-5tyo). This
+/// doc used to say scaling work "may add topologies", which reads as pending — someone will get
+/// to it. That is not the situation. An island IS a [`HostCore`], `HostCore` is `!Send` by
+/// deliberate design because it owns same-thread command ports, and stepping islands on separate
+/// threads therefore requires changing the host ownership model. That is bd-pcfj's decision to
+/// make, not a gap in this module.
+///
+/// So there is ONE variant because one is correct under the current ownership model, and the
+/// enum stays `#[non_exhaustive]` for the day that model changes rather than because more
+/// variants are owed. Scaling work (bd-16g.5.4) should measure the INNER parallelism each island
+/// already has; measuring it against an outer topology the ownership model forbids would be
+/// comparing against something that cannot exist.
+///
+/// `outer_island_parallelism_stays_excluded_while_host_core_is_not_send` fails to compile if
+/// `HostCore` ever becomes `Send`, so this justification expires visibly instead of silently
+/// outliving the constraint it rests on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum StepTopology {
@@ -2106,6 +2122,35 @@ mod tests {
     use scriptbots_core::AgentUid;
     use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+    /// Pins the premise of bd-5tyo's parallel-topology rescope: `HostCore` is `!Send`.
+    ///
+    /// [`StepTopology`] has one variant because an island is a `HostCore`, `HostCore` owns
+    /// same-thread command ports, and outer-island parallelism is therefore excluded by the
+    /// ownership model rather than merely unimplemented. That reasoning is only honest while
+    /// its premise holds, so the premise is CHECKED rather than asserted in prose.
+    ///
+    /// HOW IT FAILS, since a negative trait bound cannot be written directly: two blanket impls
+    /// overlap only for `Send` types. Resolving `probe` for a `!Send` type picks the first impl
+    /// unambiguously and compiles; for a `Send` type BOTH apply and the call is ambiguous, so
+    /// this stops compiling. If someone makes `HostCore` `Send` — the change that would unlock
+    /// outer parallelism — this breaks and the rescope's justification is reconsidered, instead
+    /// of a stale "structurally excluded" comment outliving the structure it described.
+    #[allow(
+        dead_code,
+        reason = "the guard is the trait resolution itself; nothing needs to call it at runtime"
+    )]
+    trait AmbiguousOnlyIfSend<Marker> {
+        fn probe() {}
+    }
+    impl<T: ?Sized> AmbiguousOnlyIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousOnlyIfSend<u8> for T {}
+
+    #[test]
+    fn outer_island_parallelism_stays_excluded_while_host_core_is_not_send() {
+        // Compiles only because HostCore is !Send. See the trait above for why.
+        <HostCore as AmbiguousOnlyIfSend<_>>::probe();
+    }
 
     const TEST_BRAIN_KIND: &str = "archi-test-brain";
     const TEST_BRAIN_FACTORY_DIGEST: u64 = 0xA5C1_1A60_7E57_0001;
