@@ -11753,6 +11753,103 @@ mod tests {
         );
     }
 
+    /// PANELS MUST STAY IN BOUNDS AND MUST NOT OVERLAP, at every viewport and in
+    /// every view mode.
+    ///
+    /// The existing resize storm asserts the drawn buffer matches the terminal it
+    /// was drawn into and that the origin did not drift — "it did not crash and did
+    /// not shift". It says nothing about whether the LAYOUT is right at those sizes,
+    /// and it structurally cannot: without named rectangles there is nothing to
+    /// compare. That is what [`FrameLayout`] made checkable.
+    ///
+    /// OVERLAP IS THE INVARIANT WORTH HAVING, and it is invisible to everything else
+    /// in this file. Two panels sharing cells means one paints over the other; the
+    /// region hashes would faithfully hash whatever ended up there and report a
+    /// healthy frame, and the goldens would pin the overlap as expected output. A
+    /// human notices this instantly and no assertion in the suite does.
+    ///
+    /// [`FrameLayout::compute`] is pure, so this sweeps far more shapes than a
+    /// render-based test could afford: every viewport in a coarse grid, crossed with
+    /// all eight combinations of the three view flags.
+    #[test]
+    fn the_layout_authority_keeps_panels_in_bounds_and_disjoint() {
+        let mut checked = 0usize;
+        let mut with_panels = 0usize;
+
+        for width in [1_u16, 2, 3, 20, 39, 40, 41, 60, 80, 119, 120, 121, 160, 300] {
+            for height in [1_u16, 2, 3, 8, 12, 20, 36, 40, 50, 60, 100] {
+                for rail_visible in [false, true] {
+                    for expanded in [false, true] {
+                        for probe_enabled in [false, true] {
+                            let area = Rect::new(0, 0, width, height);
+                            let layout =
+                                FrameLayout::compute(area, rail_visible, expanded, probe_enabled);
+                            let regions = layout.regions();
+                            checked += 1;
+
+                            // 1. Every rectangle stays inside the frame. A panel
+                            // placed past the edge is clipped silently at paint time,
+                            // so the frame still looks plausible while a panel is
+                            // partly or wholly gone.
+                            for (name, rect, _) in &regions {
+                                assert!(
+                                    rect.right() <= area.right() && rect.bottom() <= area.bottom(),
+                                    "{width}x{height} rail={rail_visible} expanded={expanded} \
+                                     probe={probe_enabled}: region {name:?} at \
+                                     ({},{})+{}x{} escapes the {width}x{height} frame",
+                                    rect.x,
+                                    rect.y,
+                                    rect.width,
+                                    rect.height
+                                );
+                            }
+
+                            // 2. No two panels share a cell. Only rectangles with
+                            // real area can overlap; a zero-height panel at a narrow
+                            // tier is absent by layout, not a collision.
+                            let solid: Vec<_> = regions
+                                .iter()
+                                .filter(|(_, rect, _)| rect.width > 0 && rect.height > 0)
+                                .collect();
+                            if solid.len() > 1 {
+                                with_panels += 1;
+                            }
+                            for (i, (name_a, a, _)) in solid.iter().enumerate() {
+                                for (name_b, b, _) in solid.iter().skip(i + 1) {
+                                    let overlap = a.intersection(*b);
+                                    assert!(
+                                        overlap.width == 0 || overlap.height == 0,
+                                        "{width}x{height} rail={rail_visible} \
+                                         expanded={expanded} probe={probe_enabled}: regions \
+                                         {name_a:?} and {name_b:?} overlap on \
+                                         {}x{} cells — one is painting over the other, and \
+                                         every hash-based check in this file would record \
+                                         the result as healthy",
+                                        overlap.width,
+                                        overlap.height
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Positive anchors: a sweep that computed nothing, or that never produced a
+        // frame with two real panels, would satisfy every assertion above while
+        // proving nothing at all.
+        assert!(
+            checked > 1000,
+            "the sweep must actually cover the grid, only computed {checked} layouts"
+        );
+        assert!(
+            with_panels > 100,
+            "the sweep must reach viewports with multiple real panels, or the \
+             overlap check never had two rectangles to compare ({with_panels})"
+        );
+    }
+
     /// One capability row: a label plus the exact tier to render it at.
     ///
     /// `depth: None` is the NO_COLOR / colourless-terminal case, which the canvas
