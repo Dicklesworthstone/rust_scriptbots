@@ -74,6 +74,7 @@ mod serde_optional_arc {
     }
 }
 
+pub mod allopatry;
 pub mod archipelago;
 pub mod channel;
 pub mod host_core;
