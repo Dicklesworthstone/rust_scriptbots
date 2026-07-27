@@ -328,6 +328,41 @@ pub(crate) fn resolve_effective_render_settings_for_gpu(
             .unwrap_or(RenderQuality::Medium),
         explicit => explicit,
     };
+    // Software rasterizers run at Potato and nowhere else (bd-2z0.14.3.3).
+    //
+    // This OVERRIDES an explicit request, which is deliberate and is why it
+    // warns rather than logging quietly: an operator who asked for Ultra on
+    // llvmpipe is going to get Potato, and discovering that from a frame rate
+    // instead of a log line is the dishonesty this bead is about. The clamp is
+    // applied after resolution so the warning can name both what was asked for
+    // and what was imposed.
+    //
+    // `requested` is deliberately NOT rewritten to Potato. It is what
+    // distinguishes "Auto happened to resolve here" from "the operator chose
+    // this", and AdaptiveQualityGovernor::for_launch keys on it. Rewriting it
+    // would silently disable adaptation for Auto launches by making them look
+    // explicit. On a software adapter the governor is inert anyway — ceiling
+    // equals initial equals Potato, the bottom rung — but it should be inert
+    // for the honest reason.
+    let tier = if gpu
+        .as_ref()
+        .is_some_and(|info| info.class == GpuClass::Software)
+    {
+        if tier != RenderQuality::Potato {
+            warn!(
+                requested = ?requested,
+                resolved = ?tier,
+                imposed = ?RenderQuality::Potato,
+                adapter = gpu.as_ref().map_or("<unknown>", |info| info.name.as_str()),
+                "software rasterizer detected: forcing Potato. This lane is not \
+                 GPU-accelerated and must not be read as representative performance \
+                 or as pixel evidence"
+            );
+        }
+        RenderQuality::Potato
+    } else {
+        tier
+    };
     let features = tier_features(tier);
     match &gpu {
         Some(info) => {
@@ -7094,16 +7129,33 @@ mod tests {
         }
     }
 
+    /// Explicit tiers are honoured and Auto lands on the ladder.
+    ///
+    /// Driven through the pure `_for_gpu` form against a fixed HARDWARE adapter.
+    /// It previously called `resolve_effective_render_settings`, which probes
+    /// the real GPU, so its result depended on the host: on a software-rasterizer
+    /// worker the software clamp (bd-2z0.14.3.3 item 4) correctly turns an
+    /// explicit Low into Potato and the assertion failed. That was the test
+    /// being environment-dependent rather than the clamp being wrong — the
+    /// property it means to check belongs to the resolution logic, not to
+    /// whatever adapter the machine happens to have. The live probe itself stays
+    /// covered by the capability-report test above.
     #[test]
     fn effective_settings_honor_explicit_tiers_and_auto() {
-        let explicit = resolve_effective_render_settings(&RenderSettings {
-            quality: Some(RenderQuality::Low),
-            ..RenderSettings::default()
-        });
+        let hardware = gpu_info("Apple M4", GpuClass::Discrete);
+
+        let explicit = resolve_effective_render_settings_for_gpu(
+            &RenderSettings {
+                quality: Some(RenderQuality::Low),
+                ..RenderSettings::default()
+            },
+            Some(hardware.clone()),
+        );
         assert_eq!(explicit.tier, RenderQuality::Low);
         assert!(!explicit.features.ssao, "Low has no SSAO");
 
-        let auto = resolve_effective_render_settings(&RenderSettings::default());
+        let auto =
+            resolve_effective_render_settings_for_gpu(&RenderSettings::default(), Some(hardware));
         assert!(
             matches!(
                 auto.tier,
@@ -7157,6 +7209,108 @@ mod tests {
             RenderQuality::Auto,
             "Auto must still resolve to a concrete rung"
         );
+    }
+
+    /// A fixed adapter so tier-clamp tests never depend on the host's real GPU.
+    fn gpu_info(name: &str, class: GpuClass) -> GpuInfo {
+        GpuInfo {
+            name: name.to_string(),
+            backend: "Vulkan".to_string(),
+            class,
+            vram_bytes: None,
+            max_texture_2d: Some(16_384),
+            timestamp_queries: true,
+        }
+    }
+
+    /// A software rasterizer is forced to Potato, even over an explicit request.
+    ///
+    /// Overriding the operator is the point: llvmpipe cannot deliver Ultra, and
+    /// letting the tier claim otherwise is exactly the false-capability problem
+    /// this bead names. The override is loud rather than quiet.
+    #[test]
+    fn a_software_adapter_is_forced_to_potato_whatever_was_requested() {
+        let software = gpu_info("llvmpipe (LLVM 21.1.8, 256 bits)", GpuClass::Software);
+        for requested in [
+            RenderQuality::Auto,
+            RenderQuality::Ultra,
+            RenderQuality::High,
+            RenderQuality::Medium,
+            RenderQuality::Low,
+            RenderQuality::Potato,
+        ] {
+            let settings = RenderSettings {
+                quality: Some(requested),
+                ..RenderSettings::default()
+            };
+            let effective =
+                resolve_effective_render_settings_for_gpu(&settings, Some(software.clone()));
+            assert_eq!(
+                effective.tier,
+                RenderQuality::Potato,
+                "requested {requested:?} on a software rasterizer must resolve to Potato"
+            );
+            assert!(
+                !effective.features.bloom && !effective.features.ssao,
+                "the imposed tier must carry Potato's feature row, not the requested one"
+            );
+        }
+    }
+
+    /// The clamp must not rewrite `requested`.
+    ///
+    /// `requested` is what separates "Auto resolved here" from "the operator
+    /// chose this", and the governor keys on it. Rewriting it to Potato would
+    /// silently disable adaptation for Auto launches by making them look
+    /// explicit — a bug that would only show as a renderer that never adapts.
+    #[test]
+    fn forcing_potato_preserves_what_the_operator_actually_requested() {
+        let software = gpu_info("llvmpipe", GpuClass::Software);
+
+        let auto = resolve_effective_render_settings_for_gpu(
+            &RenderSettings::default(),
+            Some(software.clone()),
+        );
+        assert_eq!(auto.tier, RenderQuality::Potato);
+        assert_eq!(
+            auto.requested,
+            RenderQuality::Auto,
+            "an Auto launch must still read as Auto after the clamp"
+        );
+
+        let explicit = resolve_effective_render_settings_for_gpu(
+            &RenderSettings {
+                quality: Some(RenderQuality::Ultra),
+                ..RenderSettings::default()
+            },
+            Some(software),
+        );
+        assert_eq!(explicit.tier, RenderQuality::Potato);
+        assert_eq!(
+            explicit.requested,
+            RenderQuality::Ultra,
+            "the operator's rejected choice must remain visible, not be rewritten \
+             into agreement with what was imposed"
+        );
+    }
+
+    /// Real hardware is untouched by the clamp, so it narrows nothing that works.
+    #[test]
+    fn hardware_adapters_keep_the_tier_they_resolved_to() {
+        for class in [GpuClass::Discrete, GpuClass::Integrated] {
+            let effective = resolve_effective_render_settings_for_gpu(
+                &RenderSettings {
+                    quality: Some(RenderQuality::Ultra),
+                    ..RenderSettings::default()
+                },
+                Some(gpu_info("Apple M4", class)),
+            );
+            assert_eq!(
+                effective.tier,
+                RenderQuality::Ultra,
+                "{class:?} must keep an explicitly requested Ultra"
+            );
+        }
     }
 
     #[test]
