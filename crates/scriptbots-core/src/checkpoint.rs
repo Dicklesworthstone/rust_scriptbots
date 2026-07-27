@@ -1049,6 +1049,29 @@ impl WorldState {
             .iter()
             .map(BirthRecordCheckpointV1::restore)
             .collect();
+        // bd-it29: restored pending birth records count as NOT YET REPORTED, so
+        // the restored world reports them at its next boundary exactly as the
+        // source world does. I first wrote the opposite — treat them as already
+        // reported — and `evolved_world_round_trips_by_uid_and_continues_
+        // identically` caught it: the source reported an agent injected between
+        // steps and the restored world silently dropped it, which is the very
+        // omission this fix exists to remove, reintroduced through the restore
+        // path.
+        //
+        // This is sound rather than merely convenient because capture already
+        // refuses a world holding deferred output: `pending_death_records` is a
+        // capture blocker, and birth records only survive capture as tick-zero
+        // roots or as between-step arrivals — in both cases unreported. A
+        // checkpoint therefore cannot carry a birth record that a boundary has
+        // already reported, so zero is not an assumption about the general case,
+        // it is the only reachable state. The debug assertion below pins that,
+        // because it is the premise the choice rests on.
+        debug_assert_eq!(
+            state.pending_birth_records.is_empty(),
+            restored.pending_birth_records.is_empty(),
+            "restore must not invent or drop pending birth records"
+        );
+        restored.reported_lifecycle_records = (0, 0);
         // Lifecycle metrics are host output, not science state. Capturable tick-zero pending rows
         // are Seeded/Injected roots and were never lifecycle metrics in the source. At later
         // disabled boundaries the marker prevents a caller from splicing persistence onto an

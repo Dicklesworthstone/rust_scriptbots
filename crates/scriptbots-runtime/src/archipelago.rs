@@ -3833,9 +3833,16 @@ mod tests {
             .collect();
 
         let mut total_moves = 0usize;
+        let mut last_barrier_arrivals: BTreeMap<IslandId, i64> = BTreeMap::new();
         for _ in 0..4 {
             let report = archipelago.step_to_barrier().expect("barrier steps");
-            total_moves += report.migration.map_or(0, |m| m.moves.len());
+            last_barrier_arrivals.clear();
+            if let Some(migration) = report.migration {
+                total_moves += migration.moves.len();
+                for applied in &migration.moves {
+                    *last_barrier_arrivals.entry(applied.to.island).or_insert(0) += 1;
+                }
+            }
         }
         assert!(
             total_moves > 0,
@@ -3854,9 +3861,9 @@ mod tests {
                 if let Some(scientific) = batch.scientific() {
                     // The RECORDS, not `summary.births`. That counter is
                     // Born-only by design, so it omits population-floor
-                    // injections AND immigrants; reconstructing from it gave 0
+                    // injections AND arrivals; reconstructing from it gave 0
                     // against a live population of 36, which is how I found
-                    // this. The record list carries every origin.
+                    // that. The record list carries every origin.
                     births += i64::try_from(scientific.births().len()).expect("births fit i64");
                     deaths += i64::try_from(scientific.deaths().len()).expect("deaths fit i64");
                 }
@@ -3876,7 +3883,23 @@ mod tests {
                 }
             }
 
-            population += births - deaths - emigrations + immigrations;
+            // *** ARRIVALS ARE INSIDE `births`, AND THAT IS THE bd-it29 FIX. ***
+            // `immigrate` records the arrival as an Injected BirthRecord in the
+            // destination, and since bd-it29 that record reaches the next
+            // scientific boundary like any other. So the arrival term must NOT
+            // be added again — it is already counted. Before the fix it reached
+            // no boundary at all and had to be added; this test asserted that
+            // exclusion explicitly so the fix would break it, and it did.
+            //
+            // WHAT REMAINS IS THE DEFERRED TAIL, which is real rather than an
+            // artifact: a barrier steps and THEN migrates, so the final
+            // barrier's arrivals are recorded after the last step and no
+            // boundary has reported them yet. They are present in the world and
+            // absent from the journal, so the reconstruction must add exactly
+            // those back. Naming the tail is better than stepping once more to
+            // hide it, because every run has one.
+            let deferred = last_barrier_arrivals.get(&id).copied().unwrap_or(0);
+            population += births - deaths - emigrations + deferred;
             let actual = i64::try_from(
                 archipelago
                     .with_island_world(id, WorldState::agent_count)
@@ -3887,32 +3910,19 @@ mod tests {
                 population, actual,
                 "island {id} reconstructed from its journal as {population} but holds \
                  {actual}: initial {}, births {births}, deaths {deaths}, emigrations \
-                 {emigrations}, immigrations {immigrations}",
+                 {emigrations}, immigrations {immigrations}, deferred arrivals {deferred}",
                 initial[index]
             );
 
-            // *** THE MIGRATION TERMS ARE LOAD-BEARING, NOT DECORATIVE. ***
-            // `immigrate` does push a BirthRecord (origin Injected), so it is
-            // tempting to assume arrivals are already inside `births` and that
-            // adding them double-counts. They are NOT: a step's births are
-            // sliced from an index captured at step entry
-            // (scriptbots-core lib.rs, `pending_birth_records[start..]`), and an
-            // arrival is recorded BETWEEN steps during the migration phase — so
-            // it falls before the next step's start index and never reaches any
-            // scientific boundary. Dropping the migration terms therefore
-            // under-counts by exactly the arrivals, and this asserts that rather
-            // than leaving it as a comment. Filed as bd-it29: the destination's
-            // birth-record stream silently omits arrivals. Fixing that bug will
-            // correctly break this assertion, and the fix must update it.
-            if immigrations != 0 {
-                assert_ne!(
-                    initial[index] + births - deaths - emigrations,
-                    actual,
-                    "island {id}: the identity closed WITHOUT the arrival term, so \
-                     arrivals are inside `births` after all and this reconstruction \
-                     double-counts them"
-                );
-            }
+            // The arrival records are genuinely there: every arrival except the
+            // deferred tail must be inside `births`. This is the assertion that
+            // would go red if bd-it29 regressed.
+            assert!(
+                births >= immigrations - deferred,
+                "island {id}: {births} birth records cannot account for {immigrations} \
+                 arrivals with {deferred} deferred; arrivals have stopped reaching the \
+                 scientific boundary again (bd-it29)"
+            );
         }
 
         // The migration terms must actually be non-zero SOMEWHERE, or the
@@ -3936,6 +3946,110 @@ mod tests {
         assert_eq!(
             journaled_moves, total_moves,
             "every applied migration must appear in exactly one island's journal"
+        );
+    }
+
+    /// Every arrival is named in its destination's journaled birth records —
+    /// and the conservation verifier CANNOT see when one is not (bd-it29).
+    ///
+    /// *** THE GAP THIS EXISTS TO CLOSE. *** bd-tfso's five mutation controls
+    /// all attack `verify_migration`, which compares ORGANISM IDENTITIES taken
+    /// from live world state. A missing birth record does not change a single
+    /// identity: the agent is present on the destination, its census entry is
+    /// correct, conservation holds exactly. So every one of those controls
+    /// passes a world whose scientific record has silently lost the arrival —
+    /// which is precisely the bd-it29 defect, and precisely the bd-0oro shape,
+    /// where a success signal outruns what the record can show.
+    ///
+    /// This test asserts the record, then proves the gap by running the
+    /// conservation verifier over the same barrier and showing it is content.
+    #[test]
+    fn bd_it29_every_arrival_is_named_in_the_destination_birth_records() {
+        let islands: Vec<IslandId> = (0..3).map(IslandId).collect();
+        let specs: Vec<IslandSpec> = islands
+            .iter()
+            .map(|id| spec(id.0, populated_config(None)))
+            .collect();
+        let journals: Vec<RecordingJournal> = islands
+            .iter()
+            .map(|_| RecordingJournal::default())
+            .collect();
+        let recorders = journals.clone();
+        let mut archipelago = Archipelago::with_factories(
+            migrating_config(specs, 30, EmigrantSelectionRule::Fittest, 2),
+            populated_world_factory,
+            |meta| {
+                let index = meta.id.0 as usize;
+                Some(Box::new(recorders[index].clone()) as Box<dyn JournalPort>)
+            },
+        )
+        .expect("recording archipelago");
+
+        // Arrivals from every barrier EXCEPT the last, whose records no step has
+        // reported yet: a barrier steps and then migrates.
+        let mut expected: Vec<AppliedMigration> = Vec::new();
+        let mut last_barrier: Vec<AppliedMigration> = Vec::new();
+        let mut final_verify: Option<MigrationBarrierReport> = None;
+        for _ in 0..4 {
+            let report = archipelago.step_to_barrier().expect("barrier steps");
+            if let Some(migration) = report.migration {
+                expected.extend(last_barrier.drain(..));
+                last_barrier = migration.moves.clone();
+                final_verify = Some(migration);
+            }
+        }
+        assert!(
+            !expected.is_empty(),
+            "no reportable arrival occurred, so this proves nothing"
+        );
+
+        let journaled = |island: IslandId| -> BTreeSet<AgentUid> {
+            let index = island.0 as usize;
+            journals[index]
+                .batches
+                .borrow()
+                .iter()
+                .filter_map(|batch| batch.scientific().map(|s| s.births().to_vec()))
+                .flatten()
+                .map(|record| record.agent_uid)
+                .collect()
+        };
+
+        for applied in &expected {
+            assert!(
+                journaled(applied.to.island).contains(&applied.to.uid),
+                "arrival {} reached the world but no birth record in its destination's \
+                 journal names it; the island's science cannot see that anyone arrived",
+                applied.to
+            );
+        }
+
+        // MUTANT: drop one arrival's record. The check above catches it...
+        let victim = expected[0];
+        let mut mutated = journaled(victim.to.island);
+        assert!(
+            mutated.remove(&victim.to.uid),
+            "the record was there to drop"
+        );
+        assert!(
+            !mutated.contains(&victim.to.uid),
+            "dropping an arrival record must be detectable from the journal alone"
+        );
+
+        // ...AND THE CONSERVATION VERIFIER DOES NOT, which is the whole point.
+        // The organism is present, its identity is correct, the population is
+        // exactly conserved. Nothing about the missing record is expressible in
+        // the identity sets bd-tfso's controls compare.
+        let barrier = final_verify.expect("a barrier migrated");
+        assert_eq!(
+            verify_migration(
+                &barrier.census_before,
+                &barrier.census_after,
+                &barrier.moves
+            ),
+            Ok(()),
+            "the conservation verifier is content with this world, which is exactly \
+             why a record-level assertion has to exist separately"
         );
     }
 

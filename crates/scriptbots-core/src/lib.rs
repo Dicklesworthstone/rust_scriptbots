@@ -17910,6 +17910,24 @@ pub struct WorldState {
     #[allow(dead_code)]
     pending_spawns: Vec<SpawnOrder>,
     pending_birth_records: Vec<BirthRecord>,
+    /// How many pending birth/death records have already been reported on a
+    /// scientific boundary (bd-it29).
+    ///
+    /// NOT the same as "how many exist when a step begins", which is what this
+    /// replaced. A record created BETWEEN steps — every `HostCommand::SpawnAgent`,
+    /// `SpawnCrossover`, and every archipelago immigration — sat below the
+    /// step-entry index and was therefore never reported at any boundary, not
+    /// merely reported late. With `persistence_interval == 0` the pending
+    /// records are then cleared outright, so the evidence was destroyed. That
+    /// directly contradicted `ScientificBoundary`'s stated purpose, which is to
+    /// stop a disabled or deferred persistence cadence from silently erasing
+    /// birth and death evidence.
+    ///
+    /// A watermark fixes it without the opposite error: slicing from zero would
+    /// re-report every record that persistence had not yet drained, at every
+    /// boundary until it did. This advances instead, and is reset wherever the
+    /// pending vectors are emptied or rolled back.
+    reported_lifecycle_records: (usize, usize),
     pending_death_records: Vec<DeathRecord>,
     pending_lifecycle_birth_metrics: Vec<BirthRecord>,
     pending_lifecycle_death_metrics: Vec<DeathRecord>,
@@ -18762,6 +18780,7 @@ impl WorldState {
             pending_deaths: Vec::new(),
             pending_spawns: Vec::new(),
             pending_birth_records: Vec::new(),
+            reported_lifecycle_records: (0, 0),
             pending_death_records: Vec::new(),
             pending_lifecycle_birth_metrics: Vec::new(),
             pending_lifecycle_death_metrics: Vec::new(),
@@ -22414,6 +22433,16 @@ impl WorldState {
             .restore_append_checkpoint(receipt.arena_checkpoint);
         self.pending_birth_records
             .truncate(receipt.pending_birth_records_before);
+        // A rollback can shorten the vector below the watermark; clamping keeps
+        // the slice in `step_outcome_observed` in bounds (bd-it29).
+        self.reported_lifecycle_records.0 = self
+            .reported_lifecycle_records
+            .0
+            .min(self.pending_birth_records.len());
+        self.reported_lifecycle_records.1 = self
+            .reported_lifecycle_records
+            .1
+            .min(self.pending_death_records.len());
         self.rng = receipt.rng_before;
         self.next_agent_uid = receipt.next_agent_uid_before;
         self.next_spawn_ordinal = receipt.next_spawn_ordinal_before;
@@ -24456,6 +24485,7 @@ impl WorldState {
             }
             self.pending_birth_records.clear();
             self.pending_death_records.clear();
+            self.reported_lifecycle_records = (0, 0);
             self.pending_lifecycle_birth_metrics.clear();
             self.pending_lifecycle_death_metrics.clear();
             self.replay_events.clear();
@@ -24757,6 +24787,8 @@ impl WorldState {
 
         let birth_records = std::mem::take(&mut self.pending_birth_records);
         let death_records = std::mem::take(&mut self.pending_death_records);
+        // The vectors are now empty, so nothing is "already reported" (bd-it29).
+        self.reported_lifecycle_records = (0, 0);
         if lifecycle_enabled || analytics.lifecycle_events == 0 {
             self.pending_lifecycle_birth_metrics.clear();
             self.pending_lifecycle_death_metrics.clear();
@@ -24944,8 +24976,26 @@ impl WorldState {
         self.validate_step_generation_headroom(next_tick)?;
         let step_started_at = observer.begin_step(next_tick);
         let previous_epoch = self.epoch;
-        let birth_record_start = self.pending_birth_records.len();
-        let death_record_start = self.pending_death_records.len();
+        // bd-it29: the already-REPORTED watermark, not the current length.
+        // Records created between steps live below the current length and must
+        // still reach this boundary.
+        //
+        // FOUNDING ROOTS ARE THE EXCEPTION, and the distinction is the whole
+        // correctness of this fix. Whatever is pending when the world's FIRST
+        // step begins was created before the timeline started — tick-zero
+        // `Seeded`/`Injected` roots, which `checkpoint.rs` names as roots and
+        // which the persistence path already carries. They are not births that
+        // occurred during tick 1. A watermark without this guard sweeps them
+        // into the first boundary and breaks the per-tick delta semantics that
+        // `StepOutcome.births` has always had; eight existing tests said so
+        // when I first wrote it that way, and they were right.
+        if self.tick == Tick::zero() {
+            self.reported_lifecycle_records = (
+                self.pending_birth_records.len(),
+                self.pending_death_records.len(),
+            );
+        }
+        let (birth_record_start, death_record_start) = self.reported_lifecycle_records;
 
         macro_rules! observed_stage {
             ($stage:expr, $body:block) => {{
@@ -25141,6 +25191,13 @@ impl WorldState {
         });
         let births = self.pending_birth_records[birth_record_start..].to_vec();
         let deaths = self.pending_death_records[death_record_start..].to_vec();
+        // Advance the watermark past everything this boundary reports, so a
+        // record that persistence has not yet drained is not replayed at the
+        // next boundary (bd-it29).
+        self.reported_lifecycle_records = (
+            self.pending_birth_records.len(),
+            self.pending_death_records.len(),
+        );
         let combat = TickCombatSummary {
             spike_attempts: self.combat_spike_attempts,
             spike_hits: self.combat_spike_hits,
@@ -49664,6 +49721,114 @@ mod tests {
             world.agents.snapshot(id),
             Some(before_agent),
             "the rejected tick must not mutate agent scalar state"
+        );
+    }
+
+    /// An agent inserted BETWEEN steps must still reach the next scientific
+    /// boundary (bd-it29).
+    ///
+    /// THE BUG THIS WAS BORN RED AGAINST. `StepOutcome.births` was sliced from
+    /// an index captured at STEP ENTRY, so any record created outside a step
+    /// fell below that index and was never reported at any boundary — not late,
+    /// never. With `persistence_interval == 0` the pending records are then
+    /// cleared outright, so the arrival was genuinely gone rather than merely
+    /// deferred.
+    ///
+    /// THAT IS NOT A MIGRATION BUG, WHICH IS WHY THE TEST DOES NOT MIGRATE.
+    /// Every between-step insertion has it: `HostCommand::SpawnAgent` and
+    /// `SpawnCrossover` apply through the command pipeline outside the tick
+    /// loop, exactly like an immigration does. Migration is simply where it
+    /// became visible, because an archipelago barrier steps and then migrates.
+    ///
+    /// It also contradicts `ScientificBoundary`'s own stated purpose — that the
+    /// runtime journal exists so "disabled or deferred persistence cadence"
+    /// cannot silently erase birth evidence. This is that erasure.
+    #[test]
+    fn bd_it29_agents_inserted_between_steps_reach_the_next_scientific_boundary() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 600,
+            world_height: 300,
+            food_cell_size: 50,
+            rng_seed: Some(0x17_2900_1729),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("valid world");
+
+        // One step first, so the world is past its founding boundary and the
+        // insertion below is unambiguously BETWEEN steps.
+        world.step().expect("first step");
+
+        let injected = world
+            .try_inject_agent(AgentData::default())
+            .expect("between-step injection");
+        let injected_uid = world.agent_uid(injected).expect("injected agent has a uid");
+
+        let completion = world.step_outcome().expect("second step");
+        let reported: Vec<AgentUid> = completion
+            .outcome
+            .births
+            .iter()
+            .map(|record| record.agent_uid)
+            .collect();
+
+        assert!(
+            reported.contains(&injected_uid),
+            "an agent inserted between steps must appear in the next boundary's birth \
+             records; got {reported:?} for injected uid {injected_uid:?}. Without this \
+             the destination of a migration grows by one agent that no scientific \
+             record explains."
+        );
+    }
+
+    /// A record already reported at one boundary must not be reported again.
+    ///
+    /// The guard on the fix above. The step-entry index was not arbitrary — it
+    /// stopped records that persistence had not yet drained from being replayed
+    /// at every subsequent boundary. Slicing from zero would fix bd-it29 and
+    /// introduce duplicate births, which is the same corruption in the other
+    /// direction, so the watermark has to advance rather than reset.
+    #[test]
+    fn bd_it29_a_reported_birth_is_never_reported_twice() {
+        // A cadence greater than one leaves reported records pending across
+        // several boundaries, which is exactly when double-reporting appears.
+        let config = ScriptBotsConfig {
+            world_width: 600,
+            world_height: 300,
+            food_cell_size: 50,
+            rng_seed: Some(0x17_2900_172a),
+            persistence_interval: 4,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let (mut world, mut session) = world_with_session(config, SpyPersistence::default());
+
+        session.step(&mut world).expect("first step");
+        let injected = world
+            .try_inject_agent(AgentData::default())
+            .expect("between-step injection");
+        let injected_uid = world.agent_uid(injected).expect("injected agent has a uid");
+
+        let mut sightings = 0usize;
+        for _ in 0..3 {
+            let completion = session.step_outcome(&mut world).expect("step");
+            sightings += completion
+                .outcome
+                .births
+                .iter()
+                .filter(|record| record.agent_uid == injected_uid)
+                .count();
+            session
+                .finish_completion(&mut world, completion)
+                .expect("finish step");
+        }
+        assert_eq!(
+            sightings, 1,
+            "the injected agent must be reported at exactly one boundary, not once per \
+             boundary until persistence drains it"
         );
     }
 }
