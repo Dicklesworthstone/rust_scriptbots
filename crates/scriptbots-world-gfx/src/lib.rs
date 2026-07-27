@@ -76,6 +76,17 @@ pub struct AgentInstance {
     /// Authoritative semantic sRGB body color. The GPU staging boundary decodes
     /// RGB to linear exactly once before the sRGB render target encodes output.
     pub color: [f32; 4],
+    /// Authoritative semantic sRGB mouth color, resolved by
+    /// `scriptbots_core::visual` and carried here rather than recomputed.
+    ///
+    /// Packed as a RESOLVED colour rather than as its inputs (bd-rl1h). Core
+    /// derives `mouth_color` by mixing the death and combat event colours by
+    /// `mouth_activity`, and that activity needs `sound_multiplier`, which this
+    /// instance never carried. Uploading the multiplier would let the shader
+    /// re-implement core's expression and drift from it; uploading the answer
+    /// moves the authority boundary instead, which is what the body `color`
+    /// above already does.
+    pub mouth_color: [f32; 3],
     pub glow: f32,  // 0..1 extra glow (e.g., reproduction/spike)
     pub boost: f32, // 0..1 boost intensity
     pub spiked: f32,
@@ -1398,33 +1409,23 @@ mod tests {
     /// silently grow, and so removing an entry is a deliberate act in a diff.
     #[test]
     fn backend_local_agent_chroma_is_declared_not_discovered() {
-        // Down from four (bd-rl1h). Each remaining entry names the exact reason
-        // it could not simply follow the nose precedent, because "not done yet"
-        // and "blocked on an input the instance does not carry" need different
-        // work and should not look the same to whoever reads this next.
-        const STILL_BACKEND_LOCAL: [&str; 1] = [
-            "mouth: local hot-event interpolation — core's mouth_activity needs \
-             sound_multiplier, which AgentInstance does not upload",
-        ];
+        // EMPTY as of bd-rl1h: every ornament this bead named is routed. The
+        // constant stays rather than being deleted, because an empty declaration
+        // is a claim worth keeping honest — a future ornament that authors its
+        // own chroma must be added here deliberately, and that shows in a diff.
+        const STILL_BACKEND_LOCAL: [&str; 0] = [];
         let source = super::agent_shader_source();
 
-        // The declaration is only honest if this really is still local.
         assert!(
-            source.contains("let mouth_color = vec3<f32>("),
-            "the mouth is declared backend-local; if it has been routed through core, \
-             remove it from STILL_BACKEND_LOCAL rather than leaving a stale claim"
-        );
-        assert_eq!(
-            STILL_BACKEND_LOCAL.len(),
-            1,
-            "shrinking this list is the goal; growing it means a new divergence was \
-             introduced without routing it through core"
+            STILL_BACKEND_LOCAL.is_empty(),
+            "growing this list means a new divergence was introduced without \
+             routing it through core"
         );
 
-        // The three routed this pass must NOT drift back to local authorship.
-        // Asserting their absence is what makes the shrunken list trustworthy:
-        // without it, someone could reintroduce a literal and the count would
-        // still read as progress.
+        // The routed ornaments must NOT drift back to local authorship. Asserting
+        // their absence is what makes an empty list trustworthy: without it,
+        // someone could reintroduce a literal and the empty list would still read
+        // as complete.
         for (label, literal) in [
             (
                 "stripe",
@@ -1435,6 +1436,7 @@ mod tests {
                 "wheels",
                 "let wheel_base_color = vec3<f32>(0.14, 0.16, 0.21);",
             ),
+            ("mouth", "let mouth_color = vec3<f32>("),
         ] {
             assert!(
                 !source.contains(literal),
@@ -1442,6 +1444,14 @@ mod tests {
                  literal is back in the shader; the backends disagree again"
             );
         }
+
+        // The mouth is routed by CARRYING the resolved colour, not by a generated
+        // constant, so its proof is that the shader consumes the per-instance
+        // value it is handed.
+        assert!(
+            source.contains("let mouth_color = v.mouth_color.rgb;"),
+            "the mouth must read the core-resolved colour carried on the instance"
+        );
     }
 
     /// The routed ornaments must carry CORE's values, not lookalikes.
@@ -2537,6 +2547,7 @@ struct AgentInstanceGpu {
     data7: [f32; 4],
     data8: [f32; 4],
     data9: [f32; 4],
+    data10: [f32; 4],
 }
 
 fn agent_instance_gpu(agent: &AgentInstance) -> AgentInstanceGpu {
@@ -2581,6 +2592,16 @@ fn agent_instance_gpu(agent: &AgentInstance) -> AgentInstanceGpu {
         data7: [agent.glow, agent.boost, agent.spiked, agent.spike_length],
         data8: agent.eye_dirs,
         data9: agent.eye_fov,
+        // Kept in semantic sRGB, NOT converted to linear like the body colour on
+        // data6. Every ornament in this shader is authored in sRGB and composited
+        // by `layer` in that space, so converting only the mouth would make it the
+        // one ornament in a different space (bd-rl1h).
+        data10: [
+            agent.mouth_color[0],
+            agent.mouth_color[1],
+            agent.mouth_color[2],
+            0.0,
+        ],
     }
 }
 
@@ -2679,7 +2700,8 @@ impl AgentPipeline {
                         6 => Float32x4,
                         7 => Float32x4,
                         8 => Float32x4,
-                        9 => Float32x4
+                        9 => Float32x4,
+                        10 => Float32x4
                     ],
                 }],
             },
@@ -2805,6 +2827,7 @@ struct InInst {
   @location(7) data7: vec4<f32>,
   @location(8) data8: vec4<f32>,
   @location(9) data9: vec4<f32>,
+  @location(10) data10: vec4<f32>,
 };
 
 struct VsOut {
@@ -2821,6 +2844,8 @@ struct VsOut {
   @location(9) eye_dirs: vec4<f32>,
   @location(10) eye_fov: vec4<f32>,
   @location(11) extras: vec2<f32>,
+  // Core-resolved mouth chroma, carried through rather than recomputed here.
+  @location(12) mouth_color: vec4<f32>,
 };
 
 struct View { v0: vec4<f32>, v1: vec4<f32> }; // v0=(viewport.x,viewport.y,time,scale) v1=(offset_x,offset_y,_,_)
@@ -2885,6 +2910,7 @@ fn vs_main(inst: InInst, @builtin(vertex_index) vid: u32) -> VsOut {
   o.eye_dirs = inst.data8;
   o.eye_fov = inst.data9;
   o.extras = vec2<f32>(inst.data7.z, inst.data7.w);
+  o.mouth_color = inst.data10;
   return o;
 }
 
@@ -2979,13 +3005,14 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let mouth_local = local - mouth_center;
   let mouth_swapped = vec2<f32>(mouth_local.y, mouth_local.x);
   let mouth_dist = capsule_distance(mouth_swapped, mouth_half_length, mouth_radius);
-  let eat_level = clamp(abs(food_delta), 0.0, 1.5);
-  let yell_level = max(sound_output, sound_level);
-  let mouth_color = vec3<f32>(
-      0.85 + eat_level * 0.08,
-      0.28 + eat_level * 0.3,
-      0.32 + yell_level * 0.12
-  );
+  // Core authority: visual::agent_visual_params derives mouth_color as
+  // mix(events.death.core, events.combat.core, mouth_activity), where
+  // mouth_activity folds in sound_multiplier — a value this instance does not
+  // carry. So the RESOLVED colour is packed per instance rather than its inputs
+  // (bd-rl1h): re-deriving it here from food_delta/sound_output alone would be a
+  // different function wearing the same name, which is how the local literal
+  // below diverged in the first place.
+  let mouth_color = v.mouth_color.rgb;
   layer(&accum_rgb, &accum_alpha, clamp(mouth_color, vec3<f32>(0.0), vec3<f32>(1.0)), smooth_mask(mouth_dist));
 
   // Nose

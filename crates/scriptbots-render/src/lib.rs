@@ -1351,6 +1351,12 @@ mod wgpu_capture_test {
             trait_blood: 0.5,
             selection,
             color,
+            // Test fixture: core's canonical resting mouth, so the fixture agrees
+            // with the product rather than inventing a stand-in colour.
+            mouth_color: scriptbots_core::visual::BIOLUMINESCENT_DARK_FIELD_V1
+                .events
+                .death
+                .core_srgb,
             glow,
             boost,
             spiked: 0.0,
@@ -17061,6 +17067,21 @@ fn build_gpu_agent_instance(
         body_color = apply_palette(body_color, palette);
     }
 
+    // The mouth chroma travels as a RESOLVED colour (bd-rl1h). core owns it via
+    // visual::agent_visual_params, but its `mouth_activity` term needs
+    // `sound_multiplier`, which AgentInstance does not carry — so the shader
+    // cannot reproduce core's expression from what it receives. Resolving here,
+    // where `visuals` already exists, keeps one authority instead of two.
+    //
+    // The palette transform is applied for the same reason the body colour above
+    // gets it: an accessibility palette that recoloured the body but left the
+    // mouth at its canonical hue would break the very mapping the palette exists
+    // to provide.
+    let mut mouth_color = rgba_from_triplet_with_alpha(visuals.mouth_color, 1.0);
+    if !palette_is_natural {
+        mouth_color = apply_palette(mouth_color, palette);
+    }
+
     let selection = match agent.selection {
         SelectionState::Hovered => 1.0,
         SelectionState::Selected => 2.0,
@@ -17097,6 +17118,7 @@ fn build_gpu_agent_instance(
         trait_blood: agent.trait_blood,
         selection,
         color: [body_color.r, body_color.g, body_color.b, body_color.a],
+        mouth_color: [mouth_color.r, mouth_color.g, mouth_color.b],
         glow,
         boost,
         spiked,
