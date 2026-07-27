@@ -9110,6 +9110,114 @@ mod tests {
     /// projection, and a panel that advanced the simulation would corrupt the
     /// run an experimenter is observing.
     #[test]
+    /// Cone selection must stay INSIDE the eye range under any amount of cycling.
+    ///
+    /// bd-2z0.7.15's lifecycle list asks for no stale selection and no panic
+    /// across eye-count changes. The selection is an index into a per-eye
+    /// projection, so an index that outran NUM_EYES would either panic or — worse
+    /// — read a neighbouring eye's channels and look entirely plausible, which is
+    /// the exact failure the irregular 0/5/12/21 layout makes so easy.
+    ///
+    /// Cycles well past a full lap in both directions rather than once, because
+    /// an off-by-one in the wrap arithmetic only shows up after the boundary is
+    /// crossed repeatedly.
+    #[test]
+    fn cone_selection_never_leaves_the_eye_range_however_far_it_is_cycled() {
+        with_shortcut_app(|app| {
+            for _ in 0..(NUM_EYES * 3 + 2) {
+                app.cycle_eye_selection(true);
+                if let Some(eye) = app.selected_eye {
+                    assert!(
+                        eye < NUM_EYES,
+                        "forward cycling produced eye {eye}, outside 0..{NUM_EYES}; a \
+                         projection indexed with it would read another eye's channels"
+                    );
+                    assert!(
+                        scriptbots_core::eye_channel_indices(eye).is_some(),
+                        "eye {eye} must own sensor channels, or the panel has nothing \
+                         truthful to render"
+                    );
+                }
+            }
+            for _ in 0..(NUM_EYES * 3 + 2) {
+                app.cycle_eye_selection(false);
+                if let Some(eye) = app.selected_eye {
+                    assert!(
+                        eye < NUM_EYES,
+                        "backward cycling produced eye {eye}, outside 0..{NUM_EYES}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// An out-of-range eye owns no sensor channels, which is what makes the
+    /// panel's fallback correct rather than merely defensive.
+    ///
+    /// `draw_probe_cone` renders "eye N is out of range" when `for_eye` yields
+    /// nothing. This pins the PRECONDITION that fallback rests on: the channel
+    /// authority refuses an eye outside the range instead of wrapping or
+    /// returning a neighbour's indices. If it ever returned Some for an
+    /// out-of-range eye, the panel would render a real-looking cone built from
+    /// another eye's channels — the irregular 0/5/12/21 layout makes that
+    /// indistinguishable by eye.
+    ///
+    /// Scoped honestly: this asserts the authority, NOT the widget write. Driving
+    /// draw_probe_cone needs a constructed ProbeSnapshot and a Frame, which is a
+    /// larger fixture than this slice builds; the render path's None branch
+    /// remains covered by inspection only.
+    #[test]
+    fn an_out_of_range_eye_owns_no_channels_so_the_panel_fallback_is_sound() {
+        for beyond in [NUM_EYES, NUM_EYES + 1, NUM_EYES + 7, usize::MAX] {
+            assert!(
+                scriptbots_core::eye_channel_indices(beyond).is_none(),
+                "eye {beyond} is outside 0..{NUM_EYES} and must own no channels; \
+                 returning Some here would let the panel render another eye's data \
+                 as this one"
+            );
+        }
+        // The negative control: in-range eyes DO own channels, so the assertion
+        // above is not vacuously true for every input.
+        for eye in 0..NUM_EYES {
+            assert!(
+                scriptbots_core::eye_channel_indices(eye).is_some(),
+                "eye {eye} is in range and must own channels"
+            );
+        }
+    }
+
+    /// Selection must survive a focus change without silently misattributing.
+    ///
+    /// The lifecycle case that matters most: the selection is an eye INDEX, not a
+    /// binding to one agent, so it persists when focus moves. That is intended —
+    /// every agent has the same eye count — but it must be true by construction
+    /// rather than by luck, and the index must remain valid for whoever is
+    /// inspected next.
+    #[test]
+    fn a_cone_selection_survives_a_focus_change_and_stays_valid() {
+        with_shortcut_app(|app| {
+            app.cycle_eye_selection(true);
+            let selected = app.selected_eye.expect("cycling once selects a cone");
+
+            // Move focus the way a user would, through the real binding.
+            app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+                .expect("focus oldest is handled");
+            app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+                .expect("focus manual is handled");
+
+            assert_eq!(
+                app.selected_eye,
+                Some(selected),
+                "a focus change must not silently drop or shift the selected cone"
+            );
+            assert!(
+                selected < NUM_EYES,
+                "the surviving selection must still index a real eye"
+            );
+        });
+    }
+
+    #[test]
     fn selecting_a_cone_does_not_advance_the_simulation() {
         let world = command_characterization_world();
         {
