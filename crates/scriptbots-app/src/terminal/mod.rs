@@ -47,7 +47,7 @@ use scriptbots_storage::MetricReading;
 use serde::Serialize;
 use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     CommandDrain, CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics, SharedWorld,
@@ -644,8 +644,14 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn submit_simulation_command(&self, command: SimulationCommand) {
-        if !(self.command_submit.as_ref())(ControlCommand::UpdateSimulation(command)) {
-            warn!("terminal renderer failed to enqueue simulation command");
+        // `CommandSubmit` now yields the receipt id on admission rather than a
+        // bare bool, so a rejection is `None` and a success carries something an
+        // operator can correlate with the command ledger.
+        match (self.command_submit.as_ref())(ControlCommand::UpdateSimulation(command)) {
+            Some(receipt) => {
+                debug!(%receipt, "simulation command enqueued");
+            }
+            None => warn!("terminal renderer failed to enqueue simulation command"),
         }
     }
 
@@ -682,10 +688,30 @@ impl<'a> TerminalApp<'a> {
             return;
         }
         config.render.theme = Some(theme.to_config());
-        if (self.command_submit.as_ref())(ControlCommand::UpdateConfig(Box::new(config))) {
+        if let Some(receipt) =
+            (self.command_submit.as_ref())(ControlCommand::UpdateConfig(Box::new(config)))
+        {
+            // ENQUEUED, not persisted (bd-0s7x). `command_submit` yields
+            // `Some(receipt)` from `try_send(..) => Ok(())`, which is queue
+            // admission and nothing more: it does not mean the command was
+            // drained, applied, or written anywhere. This line used to say "persisted to run config", which
+            // asserted an outcome this surface never observes — if the command is
+            // dropped after admission the log claims success and the next launch
+            // silently disagrees, which is the very failure the write-back work
+            // existed to remove, reappearing as a false report.
+            //
+            // Reporting real application needs a receipt that advances past
+            // ADMITTED. The CommandLedger now makes that possible, but nothing
+            // publishes application yet, so that belongs with the receipt lane.
+            // When it lands this wording becomes wrong, which is the good kind of
+            // wrong.
+            // The receipt is logged so this claim is checkable: an operator can
+            // follow that id into the command ledger and see what actually became
+            // of it, instead of taking a bare "enqueued" on trust.
             info!(
                 theme = theme.label(),
-                "chrome theme persisted to run config"
+                %receipt,
+                "chrome theme change enqueued for the run config"
             );
         } else {
             // Surfaced rather than swallowed: a theme that silently fails to
@@ -705,7 +731,14 @@ impl<'a> TerminalApp<'a> {
     /// competing reader.
     #[cfg(test)]
     fn drain_submitted_control_commands(&self) -> Vec<ControlCommand> {
+        // The bus now carries `BusCommand { id, command }` so an applier can
+        // report against the admitted identity. These tests assert on the command
+        // itself, so the id is dropped here rather than threaded through every
+        // assertion.
         (self.command_drain.as_ref())()
+            .into_iter()
+            .map(|bus| bus.command)
+            .collect()
     }
 
     fn apply_simulation_commands(&mut self, commands: Vec<SimulationCommand>) -> bool {
@@ -748,11 +781,21 @@ impl<'a> TerminalApp<'a> {
                 None
             } else {
                 let mut playback = Vec::new();
-                for command in (self.command_drain.as_ref())() {
-                    match apply_control_command(&mut world, command) {
+                // The bus now hands over `BusCommand { id, command }`. This loop is
+                // the APPLIER — the point at which a receipt could truthfully
+                // advance past admitted — and `id` is the identity to report
+                // against. Publishing that outcome belongs to the ledger/receipt
+                // lane rather than here, so this only carries the id into the
+                // diagnostics for now: a rejection is at least traceable back to
+                // the submission that caused it (bd-0s7x).
+                for bus in (self.command_drain.as_ref())() {
+                    let receipt = bus.id;
+                    match apply_control_command(&mut world, bus.command) {
                         Ok(ControlDisposition::WorldApplied) => {}
                         Ok(ControlDisposition::Playback(command)) => playback.push(command),
-                        Err(error) => warn!(%error, "terminal rejected a drained control command"),
+                        Err(error) => {
+                            warn!(%error, %receipt, "terminal rejected a drained control command");
+                        }
                     }
                 }
                 Some(playback)
@@ -8952,6 +8995,53 @@ mod tests {
         });
     }
 
+    /// Submitting alone must NOT change the run config.
+    ///
+    /// This pins the distinction a log line was blurring (bd-0s7x). `command_submit`
+    /// returning true is queue ADMISSION — `try_send(..) => Ok(())` — and nothing
+    /// more. Until something drains and applies the command the world config is
+    /// untouched, so any surface that reports "persisted" on a true return is
+    /// asserting an outcome it never observed.
+    ///
+    /// Deliberately the complement of
+    /// `a_persisted_theme_reaches_the_world_config_and_does_not_re_enqueue`, which
+    /// proves the config DOES change once the command is applied. One test without
+    /// the other cannot tell "the write works" apart from "the write happens at
+    /// submit time".
+    #[test]
+    fn submitting_a_theme_change_does_not_by_itself_reach_the_run_config() {
+        with_shortcut_app(|app| {
+            let before = {
+                let world = app.world.lock().expect("world lock");
+                world.config().render.theme
+            };
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .expect("ctrl-t is handled");
+
+            let after = {
+                let world = app.world.lock().expect("world lock");
+                world.config().render.theme
+            };
+            assert_eq!(
+                after, before,
+                "the run config must be unchanged until the queued command is drained \
+                 and applied; a surface claiming persistence at submit time would be \
+                 reporting this state as though it had already changed"
+            );
+
+            // And the command really was enqueued, so this is proving ordering
+            // rather than that nothing happened at all.
+            assert!(
+                app.drain_submitted_control_commands()
+                    .iter()
+                    .any(|command| matches!(command, ControlCommand::UpdateConfig(_))),
+                "the config update must have been enqueued; otherwise this test would \
+                 pass against a Ctrl+T that submitted nothing"
+            );
+        });
+    }
+
     /// The full loop: submit, APPLY, and then re-persisting must be a no-op.
     ///
     /// Applying the drained command is what makes this a round trip rather than a
@@ -10648,9 +10738,13 @@ mod tests {
         let (runtime, _unused_drain, _unused_submit) = crate::servers::ControlRuntime::dummy();
         let (sender, receiver) = crate::command::create_command_bus(1);
         sender
-            .try_send(ControlCommand::UpdateSimulation(
-                SimulationCommand::default(),
-            ))
+            // The bus now admits under an explicit identity so an applier can
+            // report against it; this fixture only needs the queue full, so the
+            // id is a fixed literal rather than a minted one.
+            .try_send(
+                "test-fill".to_owned(),
+                ControlCommand::UpdateSimulation(SimulationCommand::default()),
+            )
             .expect("fill command queue");
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
