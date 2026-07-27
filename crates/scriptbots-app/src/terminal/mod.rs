@@ -4808,6 +4808,39 @@ fn srgb_lifted(srgb: scriptbots_core::visual::Srgb, lift: f32) -> Color {
     Color::Rgb(byte(srgb[0]), byte(srgb[1]), byte(srgb[2]))
 }
 
+/// WCAG 2.x relative luminance of a terminal colour.
+///
+/// The sRGB channels are linearised with the standard piecewise transfer
+/// function before weighting. Using the raw 0..1 channel values instead — which
+/// is the usual shortcut — inflates the luminance of dark colours and makes
+/// failing pairs look passable, so it is exactly the shortcut a contrast gate
+/// must not take.
+fn relative_luminance(color: Color) -> f32 {
+    let linear = |c: f32| {
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let [r, g, b] = color_channels(color);
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+/// WCAG 2.x contrast ratio between two terminal colours, in `1.0..=21.0`.
+///
+/// Order-independent by construction: the lighter colour is always the
+/// numerator, so a caller cannot get a misleadingly small ratio by passing
+/// foreground and background the wrong way round.
+fn contrast_ratio(a: Color, b: Color) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+/// WCAG AA threshold for normal-size text.
+const WCAG_AA_NORMAL_TEXT: f32 = 4.5;
+
 fn rgb(hex: u32) -> Color {
     Color::Rgb(
         ((hex >> 16) & 0xFF) as u8,
@@ -9917,13 +9950,16 @@ mod tests {
 
     #[test]
     fn test_theme_palette_wcag_contrast_spot_checks() {
-        let themes = [
-            CuratedThemeId::CyberpunkAurora,
-            CuratedThemeId::Darcula,
-            CuratedThemeId::LumenLight,
-            CuratedThemeId::NordicFrost,
-            CuratedThemeId::HighContrast,
-        ];
+        // BioluminescentDarkField was missing from this list, so the DEFAULT
+        // theme — the one almost every run actually shows — was the single theme
+        // never checked. Walk the cycle instead of restating a list, so a seventh
+        // theme is covered the day it is added.
+        let mut themes = vec![CuratedThemeId::default()];
+        let mut current = CuratedThemeId::default().next();
+        while current != CuratedThemeId::default() {
+            themes.push(current);
+            current = current.next();
+        }
         let palettes = [
             TerminalPaletteMode::Natural,
             TerminalPaletteMode::Deuteranopia,
@@ -9932,6 +9968,7 @@ mod tests {
             TerminalPaletteMode::HighContrast,
         ];
 
+        let mut failures: Vec<String> = Vec::new();
         for theme in themes {
             for mode in palettes {
                 let p = Palette {
@@ -9941,12 +9978,93 @@ mod tests {
                     mode,
                     theme_id: theme,
                 };
-                let _hdr_style = p.header_style();
-                let _acc_style = p.accent_style();
-                assert_ne!(p.mode_label(), "", "palette mode label must not be empty");
-                assert_ne!(p.theme_label(), "", "theme label must not be empty");
+                let t = p.theme();
+
+                // Real text-on-background pairs the status bar actually paints,
+                // not constructed styles. The previous version of this test built
+                // two styles, DISCARDED them, and asserted the labels were
+                // non-empty — which passes for any colour whatsoever, including a
+                // theme painting black on black. bd-2z0.14.2.2 forbids counting
+                // style construction or nonempty labels as a contrast proof.
+                for (label, fg, bg) in [
+                    ("paused status", t.paused_fg, t.paused_bg),
+                    ("running status", t.running_fg, t.running_bg),
+                ] {
+                    let ratio = contrast_ratio(fg, bg);
+                    if ratio < WCAG_AA_NORMAL_TEXT {
+                        failures.push(format!(
+                            "{theme:?} + {mode:?} {label}: {ratio:.2}:1 \
+                             (needs {WCAG_AA_NORMAL_TEXT}:1) fg={fg:?} bg={bg:?}"
+                        ));
+                    }
+                }
             }
         }
+
+        assert!(
+            failures.is_empty(),
+            "these theme x palette pairs fail WCAG AA for normal text:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// The contrast math itself must be right, or every gate built on it is
+    /// decoration.
+    ///
+    /// Pinned against the two values WCAG fixes by definition — black on white is
+    /// exactly 21:1 and any colour against itself is exactly 1:1 — plus the
+    /// linearisation, which is the part a shortcut implementation gets wrong. A
+    /// naive version that skips the transfer function and weights raw channels
+    /// reports mid grey on white as roughly 1.9:1; the correct value is above 3.9,
+    /// so this catches precisely that substitution.
+    #[test]
+    fn the_contrast_ratio_math_matches_wcag() {
+        let black = Color::Rgb(0, 0, 0);
+        let white = Color::Rgb(255, 255, 255);
+
+        let extreme = contrast_ratio(black, white);
+        assert!(
+            (extreme - 21.0).abs() < 0.01,
+            "black on white must be 21:1, got {extreme:.4}"
+        );
+        assert!(
+            (contrast_ratio(white, black) - extreme).abs() < 1e-6,
+            "the ratio must not depend on argument order"
+        );
+        assert!(
+            (contrast_ratio(white, white) - 1.0).abs() < 1e-6,
+            "a colour against itself must be 1:1"
+        );
+
+        // 50% grey is the discriminating case for the transfer function.
+        let grey = Color::Rgb(128, 128, 128);
+        let grey_on_white = contrast_ratio(grey, white);
+        assert!(
+            (3.9..4.1).contains(&grey_on_white),
+            "mid grey on white must be about 3.95:1 with sRGB linearisation; got \
+             {grey_on_white:.3}. A value near 1.9 means the channels were weighted \
+             without linearising, which flatters dark colours and lets failing \
+             pairs pass"
+        );
+
+        // Tie the math to the GATE's threshold. The theme sweep above currently
+        // passes for every pair, and a gate that has never rejected anything is
+        // indistinguishable from one that cannot. These two pin both sides of
+        // WCAG_AA_NORMAL_TEXT so the sweep's green is meaningful.
+        assert!(
+            grey_on_white < WCAG_AA_NORMAL_TEXT,
+            "mid grey on white is below AA and the gate must say so"
+        );
+        assert!(
+            contrast_ratio(Color::Rgb(40, 40, 40), black) < WCAG_AA_NORMAL_TEXT,
+            "near-black on black must fail the gate; if this passes, the gate \
+             would accept unreadable text"
+        );
+        assert!(
+            contrast_ratio(black, white) >= WCAG_AA_NORMAL_TEXT,
+            "black on white must pass the gate, or the threshold rejects everything \
+             and the sweep is green for the wrong reason"
+        );
     }
 
     #[test]
