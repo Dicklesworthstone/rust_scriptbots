@@ -636,57 +636,58 @@ impl ControlHandle {
     /// Render a coarse ASCII map of terrain, food, and agents — the server-side
     /// equivalent of the terminal renderer's saved snapshots.
     pub fn ascii_map(&self) -> Result<String, ControlError> {
-        let world = self.lock_world()?;
-        let food = world.food();
-        let terrain = world.terrain();
-        let grid_w = food.width().max(1) as usize;
-        let grid_h = food.height().max(1) as usize;
-        let width = grid_w.clamp(16, 96);
-        let height = grid_h.clamp(8, 48);
-        let food_max = world.config().food_max.max(f32::EPSILON);
-        let world_w = (world.config().world_width as f32).max(1.0);
-        let world_h = (world.config().world_height as f32).max(1.0);
-        let tiles = terrain.tiles();
-        let cells = food.cells();
+        self.with_world(|world| {
+            let food = world.food();
+            let terrain = world.terrain();
+            let grid_w = food.width().max(1) as usize;
+            let grid_h = food.height().max(1) as usize;
+            let width = grid_w.clamp(16, 96);
+            let height = grid_h.clamp(8, 48);
+            let food_max = world.config().food_max.max(f32::EPSILON);
+            let world_w = (world.config().world_width as f32).max(1.0);
+            let world_h = (world.config().world_height as f32).max(1.0);
+            let tiles = terrain.tiles();
+            let cells = food.cells();
 
-        let mut rows = vec![vec![' '; width]; height];
-        for (y, row) in rows.iter_mut().enumerate() {
-            for (x, slot) in row.iter_mut().enumerate() {
-                let cell_x = (x * grid_w) / width;
-                let cell_y = (y * grid_h) / height;
-                let idx = cell_y * grid_w + cell_x;
-                let kind = tiles.get(idx).map(|tile| tile.kind);
-                let food_level = cells.get(idx).copied().unwrap_or(0.0) / food_max;
-                let base = match kind {
-                    Some(TerrainKind::DeepWater) => '~',
-                    Some(TerrainKind::ShallowWater) => '=',
-                    Some(TerrainKind::Sand) => '.',
-                    Some(TerrainKind::Grass) => ',',
-                    Some(TerrainKind::Bloom) => '*',
-                    Some(TerrainKind::Rock) => '^',
-                    None => ' ',
-                };
-                *slot = if food_level > 0.66 {
-                    '#'
-                } else if food_level > 0.33 {
-                    '+'
-                } else {
-                    base
-                };
+            let mut rows = vec![vec![' '; width]; height];
+            for (y, row) in rows.iter_mut().enumerate() {
+                for (x, slot) in row.iter_mut().enumerate() {
+                    let cell_x = (x * grid_w) / width;
+                    let cell_y = (y * grid_h) / height;
+                    let idx = cell_y * grid_w + cell_x;
+                    let kind = tiles.get(idx).map(|tile| tile.kind);
+                    let food_level = cells.get(idx).copied().unwrap_or(0.0) / food_max;
+                    let base = match kind {
+                        Some(TerrainKind::DeepWater) => '~',
+                        Some(TerrainKind::ShallowWater) => '=',
+                        Some(TerrainKind::Sand) => '.',
+                        Some(TerrainKind::Grass) => ',',
+                        Some(TerrainKind::Bloom) => '*',
+                        Some(TerrainKind::Rock) => '^',
+                        None => ' ',
+                    };
+                    *slot = if food_level > 0.66 {
+                        '#'
+                    } else if food_level > 0.33 {
+                        '+'
+                    } else {
+                        base
+                    };
+                }
             }
-        }
-        for pos in world.agents().columns().positions() {
-            let x = (((pos.x / world_w) * width as f32) as usize).min(width - 1);
-            let y = (((pos.y / world_h) * height as f32) as usize).min(height - 1);
-            rows[y][x] = '@';
-        }
+            for pos in world.agents().columns().positions() {
+                let x = (((pos.x / world_w) * width as f32) as usize).min(width - 1);
+                let y = (((pos.y / world_h) * height as f32) as usize).min(height - 1);
+                rows[y][x] = '@';
+            }
 
-        let mut out = format!("ScriptBots tick {}\n", world.tick().0);
-        for row in rows {
-            out.extend(row);
-            out.push('\n');
-        }
-        Ok(out)
+            let mut out = format!("ScriptBots tick {}\n", world.tick().0);
+            for row in rows {
+                out.extend(row);
+                out.push('\n');
+            }
+            out
+        })
     }
 
     /// Compute scoreboard snapshots: top predators (carnivores) by energy and oldest living agents.
