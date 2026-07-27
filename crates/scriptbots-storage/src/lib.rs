@@ -51,7 +51,9 @@ use scriptbots_core::{
         NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION, NARRATIVE_INPUT_V1_SCHEMA_VERSION,
         NarrativeInputRecordV1, NarrativeInputV1, SubjectRef,
     },
-    rng_domains::{AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain},
+    rng_domains::{
+        AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, IslandId, RngDomain,
+    },
     world_counters_digest_v1,
 };
 use scriptbots_runtime::{
@@ -1786,6 +1788,10 @@ const AGENT_COLUMNS: &[&str] = &[
     "hit_herbivore",
     "hit_by_carnivore",
     "hit_by_herbivore",
+    // Appended last, matching the V15 column order. The binding order in `insert_agents` is
+    // positional against this list, so a column added anywhere but the end would silently
+    // shift every subsequent value into the wrong column.
+    "island_id",
 ];
 
 /// Number of values bound by [`scriptbots_agent_insert_sql`].
@@ -4187,6 +4193,21 @@ struct TickRow {
     total_energy: f64,
     average_energy: f64,
     average_health: f64,
+    /// Which island produced this row (bd-16g.5.5).
+    ///
+    /// CARRIED PER ROW, NOT AS A SCALAR ON THE BUFFER OR THE PIPELINE. The writer's buffer
+    /// accumulates across batches and flushes on per-table thresholds, so rows from several
+    /// islands coexist in one buffer before any flush; a single island scalar would stamp the
+    /// wrong island onto every row that arrived from a different batch, and no schema
+    /// constraint can catch that.
+    ///
+    /// `#[serde(default)]` is the same DURABILITY requirement documented on [`ReplayEventRow`]:
+    /// rows are serialized into the outbox payload, so a batch admitted by a pre-island binary
+    /// and recovered by a later one presents JSON without this key. Absent means the emitter
+    /// predated islands, which IS island 0 — the archipelago of one that V15 encodes — so the
+    /// default is the correct value here rather than a placeholder.
+    #[serde(default)]
+    island_id: i64,
 }
 
 /// Metric row written to the `metrics` table.
@@ -4195,6 +4216,9 @@ struct MetricRow {
     tick: i64,
     name: String,
     value: f64,
+    /// Owning island; see [`TickRow::island_id`] for why this is per-row and defaulted.
+    #[serde(default)]
+    island_id: i64,
 }
 
 /// Event row persisted for analytics.
@@ -4203,6 +4227,9 @@ struct EventRow {
     tick: i64,
     kind: String,
     count: i64,
+    /// Owning island; see [`TickRow::island_id`] for why this is per-row and defaulted.
+    #[serde(default)]
+    island_id: i64,
 }
 
 /// Narrative event row persisted for run timeline.
@@ -4761,20 +4788,27 @@ struct PreparedPersistenceBatch {
 
 impl PreparedPersistenceBatch {
     #[cfg(test)]
+    /// Prepare a single-world batch; a single world IS island 0 under V15.
     fn from_batch(batch: &PersistenceBatch) -> Result<Self, StorageError> {
         let mut observer = UnboundedPreparation;
-        Self::from_batch_observed(batch, &mut observer, PreparationProgress::default())
+        Self::from_batch_observed(
+            batch,
+            IslandId(0),
+            &mut observer,
+            PreparationProgress::default(),
+        )
     }
 
     fn from_batch_observed<Observer>(
         batch: &PersistenceBatch,
+        island: IslandId,
         observer: &mut Observer,
         progress: PreparationProgress,
     ) -> Result<Self, StorageError>
     where
         Observer: PreparationObserver,
     {
-        let storage = Storage::prepare_batch_observed(batch, observer, progress)?;
+        let storage = Storage::prepare_batch_observed(batch, island, observer, progress)?;
         let analytics = PendingAnalytics::from_batch_observed(batch, observer, progress)?;
         observer.checkpoint(PreparationStage::Complete, progress)?;
         Ok(Self {
@@ -4827,6 +4861,9 @@ struct AgentRow {
     hit_herbivore: bool,
     hit_by_carnivore: bool,
     hit_by_herbivore: bool,
+    /// Owning island; see [`TickRow::island_id`] for why this is per-row and defaulted.
+    #[serde(default)]
+    island_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4845,6 +4882,13 @@ struct BirthRow {
     position_y: f64,
     is_hybrid: bool,
     origin: BirthOrigin,
+    /// Owning island; see [`TickRow::island_id`] for why this is per-row and defaulted.
+    ///
+    /// This is also what makes the per-island `AgentUid`/`spawn_ordinal`/`birth_ordinal`
+    /// counters (bd-8jlj) storable at all: V15 lifted the three `births` unique indexes to
+    /// include `island_id`, so island 1's agent 1 is a different organism from island 0's.
+    #[serde(default)]
+    island_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4866,6 +4910,9 @@ struct DeathRow {
     hit_herbivore: bool,
     hit_by_carnivore: bool,
     hit_by_herbivore: bool,
+    /// Owning island; see [`TickRow::island_id`] for why this is per-row and defaulted.
+    #[serde(default)]
+    island_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4899,6 +4946,9 @@ struct ReplayEventRow {
     /// event emission.
     #[serde(default)]
     interaction_value: Option<f64>,
+    /// Owning island; see [`TickRow::island_id`] for why this is per-row and defaulted.
+    #[serde(default)]
+    island_id: i64,
 }
 
 /// Aggregate event count grouped by replay event type.
@@ -15872,13 +15922,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Prepare a single-world batch; a single world IS island 0 under V15.
     fn prepare_batch(payload: &PersistenceBatch) -> Result<StorageBuffer, StorageError> {
+        Self::prepare_batch_for_island(payload, IslandId(0))
+    }
+
+    fn prepare_batch_for_island(
+        payload: &PersistenceBatch,
+        island: IslandId,
+    ) -> Result<StorageBuffer, StorageError> {
         let mut observer = UnboundedPreparation;
-        Self::prepare_batch_observed(payload, &mut observer, PreparationProgress::default())
+        Self::prepare_batch_observed(
+            payload,
+            island,
+            &mut observer,
+            PreparationProgress::default(),
+        )
     }
 
     fn prepare_batch_observed<Observer>(
         payload: &PersistenceBatch,
+        island: IslandId,
         observer: &mut Observer,
         progress: PreparationProgress,
     ) -> Result<StorageBuffer, StorageError>
@@ -15888,6 +15952,10 @@ impl Storage {
         observer.checkpoint(PreparationStage::Materialize, progress)?;
         let summary = &payload.summary;
         let tick = encode_u64("ticks.tick", summary.tick.0)?;
+        // Widened, never narrowed: `IslandId` is a u32 newtype (bd-cxcf) and `i64` holds that
+        // domain exactly, matching the V15 column's CHECK bound. Converting through a smaller
+        // type here would reintroduce the narrowing that bd-8djh's u16 bound already cost once.
+        let island_id = i64::from(island.0);
         let mut prepared = StorageBuffer {
             ticks: Vec::with_capacity(1),
             metrics: Vec::with_capacity(payload.metrics.len()),
@@ -15911,6 +15979,7 @@ impl Storage {
             total_energy: f64::from(summary.total_energy),
             average_energy: f64::from(summary.average_energy),
             average_health: f64::from(summary.average_health),
+            island_id,
         });
 
         for metric in &payload.metrics {
@@ -15924,6 +15993,7 @@ impl Storage {
                     progress,
                 )?,
                 value: metric.value,
+                island_id,
             });
         }
 
@@ -15942,34 +16012,35 @@ impl Storage {
                     )?,
                 },
                 count: checked_i64("events.count", event.count)?,
+                island_id,
             });
         }
 
         for agent in &payload.agents {
             observer.checkpoint(PreparationStage::Materialize, progress)?;
             prepared.agents.push(agent_row_from_snapshot_observed(
-                tick, agent, observer, progress,
+                tick, island_id, agent, observer, progress,
             )?);
         }
 
         for birth in &payload.births {
             observer.checkpoint(PreparationStage::Materialize, progress)?;
-            prepared
-                .births
-                .push(birth_row_from_record_observed(birth, observer, progress)?);
+            prepared.births.push(birth_row_from_record_observed(
+                birth, island_id, observer, progress,
+            )?);
         }
 
         for death in &payload.deaths {
             observer.checkpoint(PreparationStage::Materialize, progress)?;
-            prepared
-                .deaths
-                .push(death_row_from_record_observed(death, observer, progress)?);
+            prepared.deaths.push(death_row_from_record_observed(
+                death, island_id, observer, progress,
+            )?);
         }
 
         for (seq, event) in payload.replay_events.iter().enumerate() {
             observer.checkpoint(PreparationStage::Materialize, progress)?;
             prepared.replay_events.push(replay_row_from_event_observed(
-                event, tick, seq, observer, progress,
+                event, tick, island_id, seq, observer, progress,
             )?);
         }
 
@@ -15999,12 +16070,23 @@ impl Storage {
 
     /// Durably admit and apply a simulation payload through the same outbox protocol as the
     /// asynchronous worker, buffering scientific rows until thresholds or an explicit flush.
+    ///
+    /// Attributes the batch to [`IslandId`] 0; see [`Self::persist_for_island`].
     pub fn persist(&mut self, payload: &PersistenceBatch) -> Result<(), StorageError> {
+        self.persist_for_island(payload, IslandId(0))
+    }
+
+    /// Durably admit and apply one island's payload (bd-16g.5.5).
+    pub fn persist_for_island(
+        &mut self,
+        payload: &PersistenceBatch,
+        island: IslandId,
+    ) -> Result<(), StorageError> {
         if self.terminally_failed {
             return Err(StorageError::TerminallyFailed);
         }
         let tick = payload.summary.tick.0;
-        let prepared = Self::prepare_batch(payload)?;
+        let prepared = Self::prepare_batch_for_island(payload, island)?;
         let (receipt, newly_admitted) = self.stage_outbox(tick, &prepared)?;
         if newly_admitted {
             self.enqueue_staged(receipt.batch_id, prepared)?;
@@ -16037,8 +16119,8 @@ impl Storage {
         }
         let sql = "insert or replace into tick_summaries (
                 run_id, tick, epoch, closed, agent_count, births, deaths,
-                total_energy, average_energy, average_health
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+                total_energy, average_energy, average_health, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -16053,6 +16135,7 @@ impl Storage {
                     row.total_energy.into(),
                     row.average_energy.into(),
                     row.average_health.into(),
+                    row.island_id.into(),
                 ],
             )?;
         }
@@ -16067,8 +16150,8 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        let sql = "insert or replace into metrics (run_id, tick, name, value)
-                   values (?1, ?2, ?3, ?4)";
+        let sql = "insert or replace into metrics (run_id, tick, name, value, island_id)
+                   values (?1, ?2, ?3, ?4, ?5)";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -16077,6 +16160,7 @@ impl Storage {
                     row.tick.into(),
                     row.name.as_str().into(),
                     row.value.into(),
+                    row.island_id.into(),
                 ],
             )?;
         }
@@ -16091,8 +16175,8 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        let sql = "insert or replace into events (run_id, tick, kind, count)
-                   values (?1, ?2, ?3, ?4)";
+        let sql = "insert or replace into events (run_id, tick, kind, count, island_id)
+                   values (?1, ?2, ?3, ?4, ?5)";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -16101,6 +16185,7 @@ impl Storage {
                     row.tick.into(),
                     row.kind.as_str().into(),
                     row.count.into(),
+                    row.island_id.into(),
                 ],
             )?;
         }
@@ -16159,6 +16244,7 @@ impl Storage {
                     sqlite_bool(row.hit_herbivore),
                     sqlite_bool(row.hit_by_carnivore),
                     sqlite_bool(row.hit_by_herbivore),
+                    row.island_id.into(),
                 ],
             )?;
         }
@@ -16176,8 +16262,8 @@ impl Storage {
         let sql = "insert into births (
                 run_id, tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
                 brain_kind, brain_key, herbivore_tendency,
-                generation, position_x, position_y, is_hybrid, origin
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
+                generation, position_x, position_y, is_hybrid, origin, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -16197,6 +16283,7 @@ impl Storage {
                     row.position_y.into(),
                     sqlite_bool(row.is_hybrid),
                     row.origin.as_str().into(),
+                    row.island_id.into(),
                 ],
             )?;
         }
@@ -16216,8 +16303,8 @@ impl Storage {
                 herbivore_tendency, brain_kind, brain_key,
                 energy, food_balance_total, cause, was_hybrid,
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
-                hit_by_carnivore, hit_by_herbivore
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
+                hit_by_carnivore, hit_by_herbivore, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -16240,6 +16327,7 @@ impl Storage {
                     sqlite_bool(row.hit_herbivore),
                     sqlite_bool(row.hit_by_carnivore),
                     sqlite_bool(row.hit_by_herbivore),
+                    row.island_id.into(),
                 ],
             )?;
         }
@@ -16323,13 +16411,13 @@ impl Storage {
         let replace_sql = "insert or replace into replay_events (
                 run_id, tick, seq, agent_uid, scope, event_type, payload,
                 position_x, position_y,
-                counterpart_uid, counterpart_position_x, counterpart_position_y
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+                counterpart_uid, counterpart_position_x, counterpart_position_y, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
         let insert_sql = "insert into replay_events (
                 run_id, tick, seq, agent_uid, scope, event_type, payload,
                 position_x, position_y,
-                counterpart_uid, counterpart_position_x, counterpart_position_y
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+                counterpart_uid, counterpart_position_x, counterpart_position_y, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
         for row in rows {
             let sql = if row.event_type == NARRATIVE_INPUT_EVENT_TYPE {
                 insert_sql
@@ -16353,6 +16441,7 @@ impl Storage {
                     sqlite_optional_i64(row.counterpart),
                     counterpart_x,
                     counterpart_y,
+                    row.island_id.into(),
                 ],
             )?;
         }
@@ -17503,17 +17592,55 @@ impl StorageSink {
     }
 
     /// Admit a persistence batch and wait until its exact payload is in the worker outbox.
+    ///
+    /// A single-world run is the archipelago of one that schema V15 encodes, so this attributes
+    /// the batch to [`IslandId`] 0. Archipelago callers must use
+    /// [`Self::submit_with_receipt_for_island`] instead: attributing every island's rows to 0
+    /// would collapse the partition while leaving every column populated, which is exactly the
+    /// failure `COUNT(DISTINCT island_id)` exists to catch.
     pub fn submit_with_receipt(
         &self,
         payload: &PersistenceBatch,
     ) -> Result<AdmissionReceipt, StorageError> {
-        let mut clock = |_| Instant::now();
-        self.submit_with_receipt_using_clock(payload, &mut clock)
+        self.submit_with_receipt_for_island(payload, IslandId(0))
     }
 
+    /// Admit a persistence batch on behalf of a named island (bd-16g.5.5).
+    ///
+    /// One [`PersistenceBatch`] is one island's boundary — it carries a single `TickSummary` —
+    /// so the barrier adapter submits each island's batch SERIALLY IN ASCENDING `island_id`
+    /// ORDER through this one pipeline. That ordering, not batching them together, is what
+    /// keeps batch identity independent of thread scheduling, which the outbox retry contract
+    /// depends on: an identical payload must reproduce an identical batch id.
+    pub fn submit_with_receipt_for_island(
+        &self,
+        payload: &PersistenceBatch,
+        island: IslandId,
+    ) -> Result<AdmissionReceipt, StorageError> {
+        let mut clock = |_| Instant::now();
+        self.submit_with_receipt_using_clock_for_island(payload, island, &mut clock)
+    }
+
+    /// Single-world clock-injected submission; a single world IS island 0 under V15.
+    ///
+    /// Test-only: production submits through [`Self::submit_with_receipt`] or
+    /// [`Self::submit_with_receipt_for_island`], both of which supply their own clock.
+    #[cfg(test)]
     fn submit_with_receipt_using_clock<Clock>(
         &self,
         payload: &PersistenceBatch,
+        clock: &mut Clock,
+    ) -> Result<AdmissionReceipt, StorageError>
+    where
+        Clock: FnMut(PreparationStage) -> Instant,
+    {
+        self.submit_with_receipt_using_clock_for_island(payload, IslandId(0), clock)
+    }
+
+    fn submit_with_receipt_using_clock_for_island<Clock>(
+        &self,
+        payload: &PersistenceBatch,
+        island: IslandId,
         clock: &mut Clock,
     ) -> Result<AdmissionReceipt, StorageError>
     where
@@ -17583,9 +17710,13 @@ impl StorageSink {
             max_inflight: self.budget.max_inflight_bytes,
         })?;
 
-        let prepared =
-            PreparedPersistenceBatch::from_batch_observed(payload, &mut preparation, progress)
-                .inspect_err(|error| self.publish_preparation_error(error, tick))?;
+        let prepared = PreparedPersistenceBatch::from_batch_observed(
+            payload,
+            island,
+            &mut preparation,
+            progress,
+        )
+        .inspect_err(|error| self.publish_preparation_error(error, tick))?;
         debug!(
             schema = "scriptbots.persistence-preparation.v1",
             phase = "prepared",
@@ -19635,11 +19766,18 @@ fn shutdown_worker_storage(
 #[cfg(test)]
 fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> Result<AgentRow, StorageError> {
     let mut observer = UnboundedPreparation;
-    agent_row_from_snapshot_observed(tick, agent, &mut observer, PreparationProgress::default())
+    agent_row_from_snapshot_observed(
+        tick,
+        0,
+        agent,
+        &mut observer,
+        PreparationProgress::default(),
+    )
 }
 
 fn agent_row_from_snapshot_observed<Observer>(
     tick: i64,
+    island_id: i64,
     agent: &AgentState,
     observer: &mut Observer,
     progress: PreparationProgress,
@@ -19661,6 +19799,7 @@ where
     observer.checkpoint(PreparationStage::Materialize, progress)?;
     Ok(AgentRow {
         tick,
+        island_id,
         agent_uid: uid,
         generation: i64::from(data.generation.0),
         age: i64::from(data.age),
@@ -19818,6 +19957,7 @@ fn replay_row_from_event(
     replay_row_from_event_observed(
         event,
         tick,
+        0,
         seq,
         &mut observer,
         PreparationProgress::default(),
@@ -19865,6 +20005,7 @@ where
 fn replay_row_from_event_observed<Observer>(
     event: &ReplayEvent,
     tick: i64,
+    island_id: i64,
     seq: usize,
     observer: &mut Observer,
     progress: PreparationProgress,
@@ -20129,6 +20270,7 @@ where
 
     Ok(ReplayEventRow {
         tick: row_tick,
+        island_id,
         seq: row_seq,
         agent_uid: optional_agent_uid("replay_events.agent_uid", event.agent_uid)?,
         scope,
@@ -20402,7 +20544,8 @@ macro_rules! replay_event_columns {
     () => {
         "tick, seq, agent_uid, scope, event_type, payload,
          position_x, position_y,
-         counterpart_uid, counterpart_position_x, counterpart_position_y"
+         counterpart_uid, counterpart_position_x, counterpart_position_y,
+         island_id"
     };
 }
 
@@ -20476,6 +20619,11 @@ fn replay_event_row_from_query_row(row: &Row) -> Result<ReplayEventRow, StorageE
             seq,
         )?,
         interaction_value: None,
+        // Read back from the row rather than defaulted: defaulting here would assert island 0
+        // for a row that may have come from any island, which is provenance the reader never
+        // observed. The column is part of `replay_event_columns!()` so every reader widens at
+        // once.
+        island_id: decode(row, 11, "replay_events.island_id")?,
     })
 }
 
@@ -20699,12 +20847,27 @@ fn position_from_columns((x, y): (f64, f64)) -> Position {
 
 #[cfg(test)]
 fn birth_row_from_record(record: &BirthRecord) -> Result<BirthRow, StorageError> {
+    birth_row_from_record_on_island(record, 0)
+}
+
+/// Island-addressed variant for the archipelago tests; the plain wrapper is single-world.
+#[cfg(test)]
+fn birth_row_from_record_on_island(
+    record: &BirthRecord,
+    island_id: i64,
+) -> Result<BirthRow, StorageError> {
     let mut observer = UnboundedPreparation;
-    birth_row_from_record_observed(record, &mut observer, PreparationProgress::default())
+    birth_row_from_record_observed(
+        record,
+        island_id,
+        &mut observer,
+        PreparationProgress::default(),
+    )
 }
 
 fn birth_row_from_record_observed<Observer>(
     record: &BirthRecord,
+    island_id: i64,
     observer: &mut Observer,
     progress: PreparationProgress,
 ) -> Result<BirthRow, StorageError>
@@ -20719,6 +20882,7 @@ where
         .transpose()?;
     Ok(BirthRow {
         tick: encode_u64("births.tick", record.tick.0)?,
+        island_id,
         agent_uid: encode_u64("births.agent_uid", record.agent_uid.get())?,
         spawn_ordinal: encode_u64("births.spawn_ordinal", record.spawn_ordinal)?,
         birth_ordinal,
@@ -20771,11 +20935,12 @@ fn decode_death_cause(value: &str) -> Result<DeathCause, StorageError> {
 #[cfg(test)]
 fn death_row_from_record(record: &DeathRecord) -> Result<DeathRow, StorageError> {
     let mut observer = UnboundedPreparation;
-    death_row_from_record_observed(record, &mut observer, PreparationProgress::default())
+    death_row_from_record_observed(record, 0, &mut observer, PreparationProgress::default())
 }
 
 fn death_row_from_record_observed<Observer>(
     record: &DeathRecord,
+    island_id: i64,
     observer: &mut Observer,
     progress: PreparationProgress,
 ) -> Result<DeathRow, StorageError>
@@ -20785,6 +20950,7 @@ where
     observer.checkpoint(PreparationStage::Materialize, progress)?;
     Ok(DeathRow {
         tick: encode_u64("deaths.tick", record.tick.0)?,
+        island_id,
         agent_uid: encode_u64("deaths.agent_uid", record.agent_uid.get())?,
         age: i64::from(record.age),
         generation: i64::from(record.generation.0),
@@ -22305,9 +22471,15 @@ mod tests {
             SCRIPTBOTS_AGENT_COLUMN_COUNT,
             "canonical agent insert placeholder count drifted from its column list"
         );
+        // Derived from the column list rather than hardcoded: a literal `?40` here silently
+        // encodes the column count in a second place, and adding `island_id` (bd-16g.5.5)
+        // proved it drifts. The property under test is that the LAST placeholder is the
+        // highest-numbered one, i.e. the bindings run 1..=N in order with none dropped.
+        let final_placeholder = format!("?{SCRIPTBOTS_AGENT_COLUMN_COUNT})");
         assert!(
-            scriptbots_agent_insert_sql().ends_with("?40)"),
-            "canonical agent insert no longer binds all production columns in order"
+            scriptbots_agent_insert_sql().ends_with(&final_placeholder),
+            "canonical agent insert no longer binds all production columns in order: \
+             expected it to end with {final_placeholder}"
         );
 
         production_connection.close()?;
@@ -24667,6 +24839,14 @@ mod tests {
         assert_eq!(row.counterpart, None);
         assert_eq!(row.counterpart_position, None);
         assert_eq!(row.interaction_value, None);
+        // bd-16g.5.5: the same durability property for island_id. A payload admitted before
+        // islands existed carries no such key, and absent must mean island 0 -- the
+        // archipelago of one -- rather than a deserialization failure that would strand a
+        // durably admitted batch.
+        assert_eq!(
+            row.island_id, 0,
+            "a pre-island outbox row must replay as island 0, not fail to decode"
+        );
 
         let modern = ReplayEventRow {
             tick: 7,
@@ -24679,6 +24859,7 @@ mod tests {
             counterpart: Some(13),
             counterpart_position: Some((3.0, 4.0)),
             interaction_value: Some(0.25),
+            island_id: 3,
         };
         let encoded = serde_json::to_string(&modern).expect("row serializes");
         let decoded: ReplayEventRow =
@@ -27447,6 +27628,218 @@ mod tests {
             matches_expected,
             "expected InvalidData for {expected}, got {result:?}"
         );
+    }
+
+    /// The real write path attributes each island's rows to that island (bd-16g.5.5).
+    ///
+    /// The V15 schema tests prove the TABLES can hold eight islands; this proves the WRITER
+    /// puts them there. It goes through `persist_for_island` and the normal flush rather than
+    /// direct SQL, so it fails if any of the seven insert statements drops the column or binds
+    /// it positionally in the wrong slot.
+    ///
+    /// `COUNT(DISTINCT island_id)` MUST EQUAL THE ISLAND COUNT, NOT MERELY BE NON-ZERO. A
+    /// writer that stamped a constant island onto every row would leave the column present,
+    /// non-null and indexed on every table, and would satisfy any weaker check while
+    /// collapsing the partition the column exists to preserve.
+    ///
+    /// ISLANDS WRITE AT DISTINCT TICKS HERE, AND THAT IS A LIMITATION RATHER THAN A CHOICE.
+    /// The outbox batch ledger admits one batch per `(run_id, tick)`, so eight islands
+    /// submitting the same tick as separate batches collide ABOVE the science tables, in
+    /// admission. `same_tick_multi_island_submission_is_refused_by_the_batch_ledger` pins that
+    /// boundary exactly; until a barrier fuses all islands into one batch, this is the
+    /// strongest end-to-end partition proof the writer can support.
+    #[test]
+    fn persist_for_island_partitions_every_table_by_its_island()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ISLANDS: i64 = 8;
+
+        let path = temp_db_path("storage-island-partition");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        for island in 0..ISLANDS {
+            let island_id = IslandId(u32::try_from(island)?);
+            // Two ticks per island, disjoint across islands, because admission is keyed by tick.
+            let arrival_tick = 42 + u64::try_from(island)? * 2;
+            let death_tick = arrival_tick + 1;
+
+            let mut arrival = sample_batch(arrival_tick, 5.5);
+            // Every island reuses the SAME agent_uid and spawn/birth ordinals, because every
+            // island mints them from its own private counter (bd-8jlj). Under V14's run-scoped
+            // unique indexes the second island here was rejected outright; that these all land
+            // is the write-path half of what V15's lifted indexes made possible.
+            // Distinct uids per island, which is NOT what an archipelago produces. Each island
+            // mints uids from its own counter, so island 0 and island 1 both hold agent 1 --
+            // and V15's lifted unique indexes make that storable. The Rust-side ancestry guard
+            // still refuses it because it reasons run-scoped;
+            // `ancestry_coherence_is_run_scoped_and_refuses_per_island_uid_reuse` pins that,
+            // and this test sidesteps it so it can measure the per-table partition instead.
+            let uid = u64::try_from(island)? + 1;
+            arrival.births = vec![sample_birth(arrival_tick, uid, BirthOrigin::Born)];
+            // The writer cross-checks the summary against the record streams AND against the
+            // canonical event rows, so all three have to agree or the batch is refused before
+            // any island logic runs.
+            arrival.summary.births = 1;
+            arrival
+                .events
+                .push(PersistenceEvent::new(PersistenceEventKind::Births, 1));
+            storage.persist_for_island(&arrival, island_id)?;
+
+            // Deaths land a tick later because an ancestry guard refuses a death that does not
+            // FOLLOW its arrival. That guard is run-scoped rather than island-scoped, which is
+            // recorded on bd-16g.5.5: with per-island uid counters, island 0's agent 1 and
+            // island 7's agent 1 are different organisms that it currently treats as one.
+            let mut departure = sample_batch(death_tick, 5.5);
+            departure.deaths = vec![sample_death(death_tick, uid, DeathCause::Starvation)];
+            departure.summary.deaths = 1;
+            departure
+                .events
+                .push(PersistenceEvent::new(PersistenceEventKind::Deaths, 1));
+            storage.persist_for_island(&departure, island_id)?;
+        }
+        storage.flush()?;
+
+        let connection = storage.connection()?;
+        for table in [
+            "tick_summaries",
+            "metrics",
+            "events",
+            "agents",
+            "births",
+            "deaths",
+        ] {
+            let distinct: i64 = connection
+                .query_row_with_params(
+                    &format!("SELECT COUNT(DISTINCT island_id) FROM {table} WHERE run_id = ?1"),
+                    &[sqlite_run_id(storage.run_id)],
+                )?
+                .get_typed(0)?;
+            assert_eq!(
+                distinct, ISLANDS,
+                "{table} collapsed its island partition: the writer stamped {distinct} distinct \
+                 island(s) across {ISLANDS} islands"
+            );
+
+            // Every island must be individually addressable, not merely collectively distinct:
+            // a writer that permuted the labels would still produce ISLANDS distinct values.
+            for island in 0..ISLANDS {
+                let rows: i64 = connection
+                    .query_row_with_params(
+                        &format!(
+                            "SELECT COUNT(*) FROM {table} WHERE run_id = ?1 AND island_id = ?2"
+                        ),
+                        &[sqlite_run_id(storage.run_id), island.into()],
+                    )?
+                    .get_typed(0)?;
+                assert!(
+                    rows > 0,
+                    "{table} has no rows for island {island}, so the partition is uneven \
+                     even though it holds {ISLANDS} distinct values"
+                );
+            }
+        }
+
+        storage.close()?;
+        Ok(())
+    }
+
+    /// Ancestry coherence is run-scoped, so it refuses the uid reuse V15 made storable.
+    ///
+    /// bd-16g.5.5, second obstacle. Every island mints `AgentUid` from its own counter
+    /// (bd-8jlj), so island 0's agent 1 and island 1's agent 1 are DIFFERENT organisms. V15
+    /// lifted the `births` unique indexes to include `island_id` precisely so the database can
+    /// hold both. The Rust-side ancestry guard is a separate layer and still reasons per run:
+    /// it sees the second arrival as a duplicate identity and refuses the batch.
+    ///
+    /// So partitioning the schema was necessary and is not sufficient. Whoever wires the
+    /// barrier has to carry `island_id` into the ancestry/coherence checks as well, or an
+    /// archipelago cannot persist its births at all. Recorded as a test rather than a comment
+    /// so it is discovered by running the suite rather than by reading it.
+    #[test]
+    fn ancestry_coherence_is_run_scoped_and_refuses_per_island_uid_reuse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-island-ancestry-scope");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let mut island_zero = sample_batch(10, 1.0);
+        island_zero.births = vec![sample_birth(10, 1, BirthOrigin::Born)];
+        island_zero.summary.births = 1;
+        island_zero
+            .events
+            .push(PersistenceEvent::new(PersistenceEventKind::Births, 1));
+        storage.persist_for_island(&island_zero, IslandId(0))?;
+
+        // Island 1's own agent 1, at a free tick so admission cannot be what refuses it.
+        let mut island_one = sample_batch(11, 1.0);
+        island_one.births = vec![sample_birth(11, 1, BirthOrigin::Born)];
+        island_one.summary.births = 1;
+        island_one
+            .events
+            .push(PersistenceEvent::new(PersistenceEventKind::Births, 1));
+        let refusal = storage
+            .persist_for_island(&island_one, IslandId(1))
+            .expect_err("ancestry accepted a per-island uid reuse; this test is now stale");
+        assert!(
+            refusal
+                .to_string()
+                .contains("agent uid 1 already has a persisted arrival"),
+            "the refusal must be the run-scoped arrival guard, which is the layer that has to \
+             become island-aware, got: {refusal}"
+        );
+
+        storage.close()?;
+        Ok(())
+    }
+
+    /// Admission, not the schema, is what still blocks a real barrier (bd-16g.5.5).
+    ///
+    /// V15 partitioned the seven science tables, and `persist_for_island` now carries the
+    /// island onto every row. This pins the obstacle ONE LAYER ABOVE that: the outbox batch
+    /// ledger admits a single batch per `(run_id, tick)`, so two islands submitting the same
+    /// tick as SEPARATE batches are refused at admission with a payload-digest conflict,
+    /// before any island-aware code runs.
+    ///
+    /// THIS VINDICATES bd-16g.5.5's ORIGINAL "ONE BATCH PER BARRIER" WORDING, which I had
+    /// recorded a deviation from. I argued that per-island batches submitted serially in
+    /// ascending island order were equivalent, because the property at stake is that batch
+    /// identity must not depend on thread scheduling. That reasoning was right about
+    /// determinism and wrong about admission: the ledger is keyed by tick, so per-island
+    /// batches at one tick collide by construction no matter what order they are submitted in.
+    /// The barrier must fuse all islands' rows into ONE batch, exactly as the bead said.
+    ///
+    /// Written as a characterization of the CURRENT boundary rather than an aspiration: it
+    /// goes red the moment barrier fusion lands, which forces it to be rewritten rather than
+    /// left behind asserting something that is no longer true.
+    #[test]
+    fn same_tick_multi_island_submission_is_refused_by_the_batch_ledger()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-island-same-tick");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        storage.persist_for_island(&sample_batch(7, 1.0), IslandId(0))?;
+
+        // A different island, same tick, and a payload that genuinely differs.
+        let refusal = storage
+            .persist_for_island(&sample_batch(7, 2.0), IslandId(1))
+            .expect_err("the batch ledger accepted two islands at one tick");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("tick 7 was already admitted"),
+            "the refusal must come from tick-keyed admission, which is the thing that has to \
+             change for a barrier to submit N islands at one tick, got: {message}"
+        );
+
+        // CONTROL: the same island-1 payload at a free tick is admitted, so the refusal above
+        // is attributable to the tick collision rather than to anything about island 1.
+        storage.persist_for_island(&sample_batch(8, 2.0), IslandId(1))?;
+
+        storage.close()?;
+        Ok(())
     }
 
     #[test]

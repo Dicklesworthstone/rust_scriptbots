@@ -2111,6 +2111,10 @@ pub(super) fn prepare_host_journal_archive(
                     ),
                 });
             }
+            // Single-world (island 0), stated rather than assumed: the host journal carries no
+            // island today. The barrier adapter that supplies a real island through this path is
+            // the remaining half of bd-16g.5.5; until it lands, an archipelago archived through
+            // here would attribute every island to 0.
             Storage::prepare_batch(payload)
         })
         .transpose()?;
