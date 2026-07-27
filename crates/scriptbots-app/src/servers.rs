@@ -996,12 +996,6 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
     }
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct CommandAcknowledge {
-    pub success: bool,
-    pub message: String,
-}
-
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct StepRequestBody {
     #[serde(default = "default_step_count")]
@@ -1078,7 +1072,6 @@ pub struct SpeedRequestBody {
             PositionDto,
             SelectionUpdateRequestBody,
             CommandStatusDto,
-            CommandAcknowledge,
             StepRequestBody,
             SpeedRequestBody,
             SimulationStatusDto
@@ -1745,28 +1738,28 @@ async fn get_control_status(
     post,
     path = "/api/pause",
     tag = "control",
-    responses((status = 200, body = CommandAcknowledge))
+    responses((status = 200, body = CommandStatusDto))
 )]
-async fn post_pause(State(state): State<ApiState>) -> Result<Json<CommandAcknowledge>, AppError> {
-    run_control(move || state.handle.pause()).await?;
-    Ok(Json(CommandAcknowledge {
-        success: true,
-        message: "simulation pause command enqueued".into(),
-    }))
+async fn post_pause(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+    // The receipt was already built and then thrown away here, and the client
+    // was handed `success: true` plus a prose string instead — a claim with no
+    // command id, no admission order and no revisions, so nothing could be
+    // polled or correlated (bd-2z0.4.9). The parallel /api/control/* endpoint
+    // kept its receipt; this one did not, which made observability depend on
+    // which URL the caller happened to use.
+    let status = run_control(move || state.handle.pause()).await?;
+    Ok(Json(status))
 }
 
 #[utoipa::path(
     post,
     path = "/api/resume",
     tag = "control",
-    responses((status = 200, body = CommandAcknowledge))
+    responses((status = 200, body = CommandStatusDto))
 )]
-async fn post_resume(State(state): State<ApiState>) -> Result<Json<CommandAcknowledge>, AppError> {
-    run_control(move || state.handle.resume()).await?;
-    Ok(Json(CommandAcknowledge {
-        success: true,
-        message: "simulation resume command enqueued".into(),
-    }))
+async fn post_resume(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
+    let status = run_control(move || state.handle.resume()).await?;
+    Ok(Json(status))
 }
 
 #[utoipa::path(
@@ -1774,18 +1767,19 @@ async fn post_resume(State(state): State<ApiState>) -> Result<Json<CommandAcknow
     path = "/api/step",
     tag = "control",
     request_body = StepRequestBody,
-    responses((status = 200, body = CommandAcknowledge))
+    responses((status = 200, body = CommandStatusDto))
 )]
 async fn post_step(
     State(state): State<ApiState>,
     body: Option<Json<StepRequestBody>>,
-) -> Result<Json<CommandAcknowledge>, AppError> {
+) -> Result<Json<CommandStatusDto>, AppError> {
     let count = body.map(|b| b.count).unwrap_or(1);
-    run_control(move || state.handle.step_count(count)).await?;
-    Ok(Json(CommandAcknowledge {
-        success: true,
-        message: format!("simulation step command ({count} ticks) enqueued"),
-    }))
+    // `step_count` submits `count` commands and returns the LAST receipt. The
+    // reported id therefore identifies the final step, not the batch; a caller
+    // polling it learns about that one command. Saying so beats implying the
+    // receipt covers all of them.
+    let status = run_control(move || state.handle.step_count(count)).await?;
+    Ok(Json(status))
 }
 
 #[utoipa::path(
@@ -1793,17 +1787,14 @@ async fn post_step(
     path = "/api/speed",
     tag = "control",
     request_body = SpeedRequestBody,
-    responses((status = 200, body = CommandAcknowledge))
+    responses((status = 200, body = CommandStatusDto))
 )]
 async fn post_speed(
     State(state): State<ApiState>,
     Json(body): Json<SpeedRequestBody>,
-) -> Result<Json<CommandAcknowledge>, AppError> {
-    run_control(move || state.handle.set_speed(body.speed)).await?;
-    Ok(Json(CommandAcknowledge {
-        success: true,
-        message: format!("simulation speed command ({}) enqueued", body.speed),
-    }))
+) -> Result<Json<CommandStatusDto>, AppError> {
+    let status = run_control(move || state.handle.set_speed(body.speed)).await?;
+    Ok(Json(status))
 }
 
 #[utoipa::path(
@@ -2315,21 +2306,29 @@ impl ToolHandler for ControlTool {
                 let snapshot = run_control_mcp_sync(move || handle.apply_patch(patch_value))?;
                 make_tool_result(snapshot)
             }
+            // These four returned the REQUEST echoed back as though it were the
+            // result: `{"paused": true}` restated what was asked for, and
+            // `{"stepped": count}` / `{"speed": speed}` echoed the caller's own
+            // arguments. None of it was observed — a fabricated confirmation
+            // reads exactly like a real one, and the receipt that could have
+            // answered honestly was built and discarded (bd-2z0.4.9). This also
+            // left the GetCommandStatus tool below able to look up ids that no
+            // other tool ever handed out.
             ControlToolKind::Pause => {
                 let handle = self.handle.clone();
-                run_control_mcp_sync(move || handle.pause())?;
-                make_tool_result(json!({"paused": true}))
+                let status = run_control_mcp_sync(move || handle.pause())?;
+                make_tool_result(status)
             }
             ControlToolKind::Resume => {
                 let handle = self.handle.clone();
-                run_control_mcp_sync(move || handle.resume())?;
-                make_tool_result(json!({"paused": false}))
+                let status = run_control_mcp_sync(move || handle.resume())?;
+                make_tool_result(status)
             }
             ControlToolKind::Step => {
                 let count = arguments.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
                 let handle = self.handle.clone();
-                run_control_mcp_sync(move || handle.step_count(count))?;
-                make_tool_result(json!({"stepped": count}))
+                let status = run_control_mcp_sync(move || handle.step_count(count))?;
+                make_tool_result(status)
             }
             ControlToolKind::SetSpeed => {
                 let speed = arguments
@@ -2339,8 +2338,8 @@ impl ToolHandler for ControlTool {
                         McpError::new(McpErrorCode::InvalidParams, "missing 'speed' parameter")
                     })? as f32;
                 let handle = self.handle.clone();
-                run_control_mcp_sync(move || handle.set_speed(speed))?;
-                make_tool_result(json!({"speed": speed}))
+                let status = run_control_mcp_sync(move || handle.set_speed(speed))?;
+                make_tool_result(status)
             }
             ControlToolKind::GetStatus => {
                 let handle = self.handle.clone();
@@ -2446,6 +2445,54 @@ mod tests {
         net::{TcpListener, TcpStream},
         sync::atomic::{AtomicBool, Ordering},
     };
+
+    /// No transport may discard a control command's receipt.
+    ///
+    /// This is a GUARD over a shape, not a fix for one site. The same defect
+    /// had appeared independently on three surfaces and each one looked like a
+    /// local oversight until they were counted together: four REST endpoints
+    /// answering a hardcoded `success: true`, four MCP tools echoing the
+    /// caller's own arguments back as the result, and a CLI printing
+    /// "✔ Simulation paused" off an HTTP 2xx. Meanwhile both MCP and the CLI
+    /// shipped a command-status lookup for ids that no command ever returned
+    /// (bd-2z0.4.9).
+    ///
+    /// A ninth instance is easy to add and hard to notice, so the shape is
+    /// checked instead of the instances. A control call whose line both starts
+    /// the statement and ends it with `;` bound nothing — the receipt went
+    /// nowhere. Bound calls continue onto an expression, so they do not match.
+    #[test]
+    fn no_control_command_discards_its_receipt() {
+        let source = include_str!("servers.rs");
+        // Assembled at runtime: a source-scanning test that spells out its own
+        // needle matches itself and passes forever.
+        let openers = [
+            format!("run_control(move || {}.", "state.handle"),
+            format!("run_control_mcp_sync(move || {}.", "handle"),
+        ];
+
+        let discarded: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                openers.iter().any(|opener| line.starts_with(opener)) && line.ends_with(';')
+            })
+            .collect();
+
+        assert!(
+            discarded.is_empty(),
+            "these control calls throw away the receipt they were handed, leaving the \
+             caller with no command id to poll: {discarded:#?}"
+        );
+
+        // Positive control: the bound form must actually be present, or this
+        // test would pass just as happily against a file where every control
+        // call had been deleted.
+        assert!(
+            source.contains("let status = run_control(move || state.handle.pause())"),
+            "the receipt-bearing form is missing; this guard is checking nothing"
+        );
+    }
 
     fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
