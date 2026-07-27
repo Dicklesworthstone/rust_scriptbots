@@ -4117,6 +4117,21 @@ mod quality_tier_consumer_tests {
             "a log message claims the selection was applied when the code only \
              knows it was enqueued"
         );
+
+        // The agent-selection path had the same defect one step earlier: these
+        // fired during command construction, before the submitter was even
+        // asked. Announcing a selection you have not yet tried to enqueue is a
+        // stronger claim than announcing one you have.
+        for premature in [
+            format!("Bevy selection {}", "replace"),
+            format!("Bevy selection {} -> add", "toggle"),
+            format!("Bevy selection {} -> clear", "toggle"),
+        ] {
+            assert!(
+                !source.contains(&premature),
+                "a selection log fires before the submitter is asked: {premature:?}"
+            );
+        }
         assert!(
             source.contains("clear-selection enqueued via"),
             "the corrected wording must be present, or this test passes against \
@@ -5052,32 +5067,37 @@ fn handle_selection_input(
 
     if let Some(agent) = best {
         let agent_id = encode_agent_id(agent.id);
-        let command = if extend {
+        // The intent is NAMED here but not announced. These logs used to fire
+        // during command construction, before the submitter had been asked, so
+        // the log claimed a selection change that a full queue then dropped
+        // (bd-2z0.7.14). Deciding and reporting are now separate steps.
+        let (mode, intent) = if extend {
             if matches!(agent.selection, SelectionState::Selected) {
-                info!(agent_id, "Bevy selection toggle -> clear");
-                ControlCommand::UpdateSelection(SelectionUpdate {
-                    mode: SelectionMode::Clear,
-                    agent_ids: vec![agent_id],
-                    state: SelectionState::Selected,
-                })
+                (SelectionMode::Clear, "toggle -> clear")
             } else {
-                info!(agent_id, "Bevy selection toggle -> add");
-                ControlCommand::UpdateSelection(SelectionUpdate {
-                    mode: SelectionMode::Add,
-                    agent_ids: vec![agent_id],
-                    state: SelectionState::Selected,
-                })
+                (SelectionMode::Add, "toggle -> add")
             }
         } else {
-            info!(agent_id, "Bevy selection replace");
-            ControlCommand::UpdateSelection(SelectionUpdate {
-                mode: SelectionMode::Replace,
-                agent_ids: vec![agent_id],
-                state: SelectionState::Selected,
-            })
+            (SelectionMode::Replace, "replace")
         };
+        let command = ControlCommand::UpdateSelection(SelectionUpdate {
+            mode,
+            agent_ids: vec![agent_id],
+            state: SelectionState::Selected,
+        });
 
-        if (submitter.submit)(command) && !extend {
+        if !(submitter.submit)(command) {
+            // Previously this failure was entirely silent: the result was
+            // consumed by `&& !extend`, so a refused shift-click reported
+            // nothing at all and a refused plain click only skipped the camera.
+            warn!(
+                agent_id,
+                intent, "selection command could not be enqueued; selection unchanged"
+            );
+            return;
+        }
+        info!(agent_id, intent, "Bevy selection enqueued");
+        if !extend {
             rig.follow_mode = FollowMode::Selected;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
@@ -8439,6 +8459,80 @@ mod tests {
         assert_eq!(entries[0], SelectionMode::Clear);
 
         println!("Captured command log entries: {:?}", *entries);
+    }
+
+    /// The camera state this bead cares about: what it follows, where it is
+    /// panned, and whether it was told to recentre.
+    const STARTING_PAN: Vec2 = Vec2::new(37.0, -19.0);
+
+    /// Drive the clear-selection button with a submitter that answers `accepted`
+    /// and report the camera state afterwards.
+    ///
+    /// `pan` and `recenter_now` are set to values `CameraRig::default()` does
+    /// NOT produce, so "unchanged" is a real observation rather than the
+    /// absence of a default. That distinction is not theoretical: the default
+    /// has `recenter_now: true`, and letting `..default()` supply it made the
+    /// first version of this test assert against the value it had silently
+    /// inherited. `follow_mode` does coincide with the default, because
+    /// `Selected` is the only honest starting point for clearing a selection;
+    /// the accepted-case control below is what proves the handler moves it.
+    ///
+    /// Fields are returned individually because `CameraRig` is not `Clone`, and
+    /// a production type should not grow a derive to suit a test.
+    fn clear_selection_button_camera_after(accepted: bool) -> (FollowMode, Vec2, bool) {
+        let mut app = App::new();
+        app.add_systems(Update, handle_clear_selection_button);
+        app.insert_resource(CommandSubmitter {
+            submit: Arc::new(move |_| accepted),
+        });
+        app.insert_resource(CameraRig {
+            follow_mode: FollowMode::Selected,
+            pan: STARTING_PAN,
+            recenter_now: false,
+            ..CameraRig::default()
+        });
+        app.world_mut()
+            .spawn((Button, ClearSelectionButton, Interaction::Pressed));
+        app.update();
+        let rig = app.world().resource::<CameraRig>();
+        (rig.follow_mode, rig.pan, rig.recenter_now)
+    }
+
+    /// A refused clear must leave the camera exactly where it was.
+    ///
+    /// This is the behavioural form of the guard that slice 1 could only assert
+    /// by scanning source. It runs the real system through a real refusing
+    /// submitter, so it fails if the gate stops working for any reason rather
+    /// than only if the `if !` is textually deleted.
+    #[test]
+    fn a_refused_clear_selection_does_not_move_the_camera() {
+        let (follow_mode, pan, recenter_now) = clear_selection_button_camera_after(false);
+        assert_eq!(
+            follow_mode,
+            FollowMode::Selected,
+            "the simulation never received the clear, so the camera must keep following"
+        );
+        assert_eq!(
+            pan, STARTING_PAN,
+            "a refused clear must not reset the operator's pan"
+        );
+        assert!(!recenter_now, "a refused clear must not trigger a recentre");
+    }
+
+    /// Positive control: an ACCEPTED clear does move the camera.
+    ///
+    /// Without this, the test above would pass equally well against a handler
+    /// that had simply stopped touching the camera at all.
+    #[test]
+    fn an_accepted_clear_selection_releases_the_camera() {
+        let (follow_mode, pan, recenter_now) = clear_selection_button_camera_after(true);
+        assert_eq!(
+            follow_mode,
+            FollowMode::Off,
+            "an accepted clear stops following the now-cleared selection"
+        );
+        assert_eq!(pan, Vec2::ZERO, "an accepted clear resets the pan");
+        assert!(recenter_now, "an accepted clear recentres");
     }
 
     #[test]
