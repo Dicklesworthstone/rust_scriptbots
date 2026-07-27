@@ -11556,13 +11556,107 @@ mod tests {
             .join("tests/terminal/goldens/resize_ladder.txt")
     }
 
-    /// Serialize the ladder into the reviewable golden form.
+    /// Append one frame's evidence in the reviewable golden form.
     ///
-    /// Deliberately LINE-PER-REGION rather than one digest per tier. A single hash
-    /// per viewport can only say "something moved"; these lines say which panel, at
-    /// which rectangle, and whether it still had room — so the diff a reviewer
-    /// reads in a PR is already the diagnosis. That is the same reason the evidence
-    /// layer grew per-region hashes in the first place.
+    /// Deliberately LINE-PER-REGION rather than one digest per row. A single hash
+    /// can only say "something moved"; these lines say which panel, at which
+    /// rectangle, and whether it still had room — so the diff a reviewer reads in a
+    /// PR is already the diagnosis. That is the same reason the evidence layer grew
+    /// per-region hashes in the first place.
+    ///
+    /// Shared by the resize ladder and the capability matrix. A second serializer
+    /// would be a second thing that can be wrong, and the two goldens would drift
+    /// into disagreeing about what a region line means.
+    fn append_frame_evidence(out: &mut String, header: &str, evidence: &HeadlessBufferEvidence) {
+        out.push_str(&format!(
+            "\n{header} frame={} regions={}\n",
+            evidence.full_cell_fnv1a64,
+            evidence.regions.len()
+        ));
+        for region in &evidence.regions {
+            out.push_str(&format!(
+                "  {:<12} x={:<3} y={:<3} w={:<3} h={:<3} room={:<3} marker={:<3} \
+                 nonblank={:<5} hash={}\n",
+                region.name,
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                if region.has_room { "yes" } else { "no" },
+                if region.marker_present { "yes" } else { "no" },
+                region.non_blank_cells,
+                region.fnv1a64,
+            ));
+        }
+    }
+
+    /// The shared no-auto-bless golden workflow.
+    ///
+    /// One implementation for every golden in this module, following the repo's
+    /// existing scene-capture contract: a missing golden FAILS with the candidate in
+    /// the message, `RUST_REGEN_GOLDEN` rewrites and then refuses to pass, and a
+    /// mismatch names the first differing line under its row header.
+    ///
+    /// `row_prefix` is the token that starts a row header (`"tier "` /
+    /// `"capability "`), so the mismatch message can attribute the line.
+    fn compare_golden(path: &std::path::Path, candidate: &str, row_prefix: &str, regen_test: &str) {
+        if std::env::var_os("RUST_REGEN_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().expect("golden parent"))
+                .expect("create golden dir");
+            std::fs::write(path, candidate).expect("write regenerated golden");
+            // Deliberately not a silent success: a run that rewrote the committed
+            // evidence must say so, or a stray env var looks like a passing test.
+            panic!(
+                "RUST_REGEN_GOLDEN was set: rewrote {} ({} bytes). Review the diff \
+                 and re-run WITHOUT the variable to verify.",
+                path.display(),
+                candidate.len()
+            );
+        }
+
+        let Ok(golden) = std::fs::read_to_string(path) else {
+            panic!(
+                "no committed golden at {}. It is NOT created automatically. Review \
+                 the candidate below, save it to that path, and commit it:\n\n{candidate}",
+                path.display()
+            );
+        };
+
+        if golden == candidate {
+            return;
+        }
+
+        let mut row = format!("<before any {}row>", row_prefix.trim());
+        for (index, (want, got)) in golden.lines().zip(candidate.lines()).enumerate() {
+            if want.starts_with(row_prefix) {
+                row = want.to_string();
+            }
+            assert_eq!(
+                want,
+                got,
+                "golden mismatch in {} at line {} under {row}\n  golden:    {want}\n  \
+                 candidate: {got}\n\nIf this change is intended, regenerate with \
+                 RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-app --lib -- {regen_test} \
+                 and review the diff. Full candidate for review:\n\n{candidate}",
+                path.display(),
+                index + 1
+            );
+        }
+        // Line counts differ with no differing line among the common prefix: a whole
+        // row or region appeared or disappeared. The full candidate goes in the
+        // message for the same reason the missing-golden path prints it — a reviewer
+        // cannot bless a change they cannot see.
+        assert_eq!(
+            golden.lines().count(),
+            candidate.lines().count(),
+            "{} and its candidate differ in line count, so a whole row or region \
+             appeared or disappeared. Full candidate:\n\n{candidate}",
+            path.display()
+        );
+        unreachable!("golden != candidate but every line and the line count agreed");
+    }
+
+    /// Serialize the resize ladder into the reviewable golden form.
     fn render_resize_ladder() -> String {
         let mut out = String::new();
         out.push_str("# bd-2z0.14.2.6 — TUI resize ladder golden\n");
@@ -11581,26 +11675,7 @@ mod tests {
             let (buffer, layout, tick) = matrix_frame_buffer(width, height);
             let evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
                 .expect("every ladder tier must render an inspectable frame");
-            out.push_str(&format!(
-                "\ntier {width}x{height} frame={} regions={}\n",
-                evidence.full_cell_fnv1a64,
-                evidence.regions.len()
-            ));
-            for region in &evidence.regions {
-                out.push_str(&format!(
-                    "  {:<12} x={:<3} y={:<3} w={:<3} h={:<3} room={:<3} marker={:<3} \
-                     nonblank={:<5} hash={}\n",
-                    region.name,
-                    region.x,
-                    region.y,
-                    region.width,
-                    region.height,
-                    if region.has_room { "yes" } else { "no" },
-                    if region.marker_present { "yes" } else { "no" },
-                    region.non_blank_cells,
-                    region.fnv1a64,
-                ));
-            }
+            append_frame_evidence(&mut out, &format!("tier {width}x{height}"), &evidence);
         }
         out
     }
@@ -11615,75 +11690,452 @@ mod tests {
     #[test]
     fn the_resize_ladder_matches_its_committed_golden() {
         let candidate = render_resize_ladder();
-        let path = resize_golden_path();
-        let regen = std::env::var_os("RUST_REGEN_GOLDEN").is_some();
 
-        if regen {
-            std::fs::create_dir_all(path.parent().expect("golden parent"))
-                .expect("create golden dir");
-            std::fs::write(&path, &candidate).expect("write regenerated golden");
-            // Deliberately not a silent success: a run that rewrote the committed
-            // evidence must say so, or a stray env var looks like a passing test.
-            panic!(
-                "RUST_REGEN_GOLDEN was set: rewrote {} ({} bytes). Review the diff \
-                 and re-run WITHOUT the variable to verify.",
-                path.display(),
-                candidate.len()
+        // Vacuity guards BEFORE the comparison, because "golden == candidate" is
+        // also true of two equally empty files. A candidate that had lost its tiers,
+        // or whose regions were all absent-by-layout, would compare equal to an
+        // equally hollow golden and report coverage it does not have.
+        for (width, height) in RESIZE_LADDER {
+            let header = format!("tier {width}x{height} ");
+            assert!(
+                candidate.contains(&header),
+                "the ladder must render every tier; {header:?} is missing"
             );
         }
+        assert!(
+            candidate.matches("room=yes").count() >= RESIZE_LADDER.len(),
+            "every tier must verify at least one region with room, or the golden \
+             records frames nothing checked"
+        );
 
-        let Ok(golden) = std::fs::read_to_string(&path) else {
-            panic!(
-                "no committed ladder golden at {}. It is NOT created automatically. \
-                 Review the candidate below, save it to that path, and commit it:\n\
-                 \n{candidate}",
-                path.display()
-            );
+        compare_golden(
+            &resize_golden_path(),
+            &candidate,
+            "tier ",
+            "terminal::tests::the_resize_ladder_matches_its_committed_golden",
+        );
+    }
+
+    /// One capability row: a label plus the exact tier to render it at.
+    ///
+    /// `depth: None` is the NO_COLOR / colourless-terminal case, which the canvas
+    /// deliberately answers by staying on the flat map — density without colour is a
+    /// regression, not a degradation (see `CanvasCapability::use_canvas`). Recording
+    /// it here is what makes that decision documented behaviour rather than a
+    /// comment.
+    struct CapabilityRow {
+        label: &'static str,
+        mode: SubCellMode,
+        depth: Option<ColorDepth>,
+        emoji: bool,
+        narrow: bool,
+    }
+
+    /// The capability matrix: every colour depth, every sub-cell vocabulary, and
+    /// every emoji tier, each row varying from a neighbour on ONE axis so a diff
+    /// points at the axis that moved.
+    ///
+    /// *** WHY THE EMOJI ROWS ARE FLAT-MAP ROWS, and not braille rows. ***
+    /// My first version varied emoji/narrow/ascii on top of `braille/truecolor` and
+    /// `every_capability_tier_renders_differently` caught it: those three rows
+    /// rendered the BYTE-IDENTICAL frame. That is correct product behaviour, not a
+    /// bug — when the sub-cell canvas is active the map paints dots from world
+    /// samples and never calls `terrain_symbol`/`agent_symbol`, so the emoji
+    /// vocabulary has nothing to select. The vocabulary is only OBSERVABLE where the
+    /// flat one-glyph-per-cell map is drawn: `SubCellMode::Ascii` (no sub-cell
+    /// density) or `depth: None` (`use_canvas` declines to paint an uncoloured
+    /// braille field).
+    ///
+    /// Left as three identical braille rows, the golden would have looked like three
+    /// tiers of emoji coverage while proving nothing about emoji at all. Recorded
+    /// here because a future reader adding "emoji at truecolor" would reintroduce
+    /// exactly that.
+    ///
+    /// Not a full cross product: 4 depths x 4 modes x 3 emoji tiers is 48 frames to
+    /// review, and most would pin combinations a covered row already proves. These 9
+    /// cover every value of every axis at least once, each where it is observable.
+    fn capability_matrix_rows() -> Vec<CapabilityRow> {
+        vec![
+            // Canvas tiers: depth and sub-cell mode are what vary. Emoji is held
+            // fixed because the canvas path cannot see it.
+            CapabilityRow {
+                label: "canvas braille/truecolor",
+                mode: SubCellMode::Braille,
+                depth: Some(ColorDepth::TrueColor),
+                emoji: true,
+                narrow: false,
+            },
+            CapabilityRow {
+                label: "canvas braille/256",
+                mode: SubCellMode::Braille,
+                depth: Some(ColorDepth::Ansi256),
+                emoji: true,
+                narrow: false,
+            },
+            CapabilityRow {
+                label: "canvas braille/16",
+                mode: SubCellMode::Braille,
+                depth: Some(ColorDepth::Ansi16),
+                emoji: true,
+                narrow: false,
+            },
+            CapabilityRow {
+                label: "canvas quadrant/truecolor",
+                mode: SubCellMode::Quadrant,
+                depth: Some(ColorDepth::TrueColor),
+                emoji: true,
+                narrow: false,
+            },
+            CapabilityRow {
+                label: "canvas half-block/truecolor",
+                mode: SubCellMode::HalfBlock,
+                depth: Some(ColorDepth::TrueColor),
+                emoji: true,
+                narrow: false,
+            },
+            // Flat-map tiers: here the glyph vocabulary is what the user actually
+            // sees, so this is where the emoji axis belongs.
+            CapabilityRow {
+                label: "flat ascii/emoji",
+                mode: SubCellMode::Ascii,
+                depth: Some(ColorDepth::TrueColor),
+                emoji: true,
+                narrow: false,
+            },
+            CapabilityRow {
+                label: "flat ascii/emoji-narrow",
+                mode: SubCellMode::Ascii,
+                depth: Some(ColorDepth::TrueColor),
+                emoji: true,
+                narrow: true,
+            },
+            CapabilityRow {
+                label: "flat ascii/no-emoji",
+                mode: SubCellMode::Ascii,
+                depth: Some(ColorDepth::TrueColor),
+                emoji: false,
+                narrow: false,
+            },
+        ]
+    }
+
+    /// The `depth: None` fallback decision, pinned directly rather than as a golden
+    /// row — and the reason it CANNOT be a distinguishable golden row is worth
+    /// recording, because it looks like a missing tier.
+    ///
+    /// `use_canvas()` declines to paint an uncoloured braille field (density without
+    /// colour is a regression, not a degradation), so a colourless braille terminal
+    /// falls back to the flat map. That decision is real and asserted here. What it
+    /// is NOT is visible as a distinct FRAME: the flat map takes its colour from
+    /// `Palette::level`, never from `CanvasCapability::depth`, and the deterministic
+    /// evidence palette has `level: None` — so "no-colour braille" and "truecolor
+    /// ascii" render byte-identically under test even though a real truecolor
+    /// terminal would colour that flat map.
+    ///
+    /// I found this by adding both as golden rows and having
+    /// `every_capability_tier_renders_differently` reject them as identical. Keeping
+    /// them both would have pinned one frame twice and called it two tiers of
+    /// coverage. The flat-map colour axis is not reachable from a unit test because
+    /// `supports_color::ColorLevel` has private fields (already documented at
+    /// `ColorSupport::from_level`), so proving it needs an env-driven integration
+    /// test — recorded on the bead as remaining work rather than faked here.
+    #[test]
+    fn a_colourless_terminal_falls_back_to_the_flat_map() {
+        let colourless = CanvasCapability {
+            mode: SubCellMode::Braille,
+            depth: None,
         };
+        assert!(
+            colourless.has_sub_cell_density(),
+            "braille is still the CAPABLE vocabulary; the fallback must be a colour \
+             decision, not a vocabulary one"
+        );
+        assert!(
+            !colourless.use_canvas(),
+            "a colourless terminal must fall back to the flat map rather than paint \
+             an uncoloured braille field"
+        );
 
-        if golden == candidate {
-            // Pass, but prove the golden is not vacuous. A file that had lost its
-            // tiers, or whose regions were all absent-by-layout, would compare
-            // equal to an equally empty candidate and report coverage it does not
-            // have.
-            for (width, height) in RESIZE_LADDER {
-                let header = format!("tier {width}x{height} ");
+        // And the coloured counterpart must NOT fall back, or the assertion above
+        // would hold for a canvas that never paints at all.
+        let coloured = CanvasCapability {
+            mode: SubCellMode::Braille,
+            depth: Some(ColorDepth::TrueColor),
+        };
+        assert!(
+            coloured.use_canvas(),
+            "a coloured braille terminal must use the canvas"
+        );
+    }
+
+    /// Path to the committed capability golden.
+    fn capability_golden_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/terminal/goldens/capability_matrix.txt")
+    }
+
+    /// Render one production frame at an explicit capability tier and theme.
+    ///
+    /// The capability is FORCED rather than probed, because probing reads the
+    /// process environment and a test that mutated `TERM`/`NO_COLOR` would be the
+    /// kind that passes alone and fails in a parallel run — the same reasoning
+    /// `CanvasCapability::detect` already documents for taking its inputs as
+    /// arguments.
+    fn capability_frame(
+        row: &CapabilityRow,
+        theme: CuratedThemeId,
+        width: u16,
+        height: u16,
+    ) -> (Buffer, FrameLayout, u64) {
+        let world = command_characterization_world();
+        // AGENTS ARE REQUIRED, not incidental. The flat map's terrain glyphs are
+        // IDENTICAL between the emoji-narrow and no-emoji tiers by design (both use
+        // '≈', '~', '·', '"'), so those two tiers can only be told apart by their
+        // AGENT glyphs. Over an agent-free world the capability golden would be
+        // pinning two byte-identical rows and calling them separate coverage, which
+        // is why the bead's acceptance insists on a fixed NONEMPTY seeded snapshot.
+        // Three diets so the diet-dependent glyphs are all exercised.
+        // Seeded through the production ControlCommand path rather than a direct
+        // arena poke, so the agents these tiers render are the ones the product
+        // would have created.
+        {
+            let mut guard = world.lock().expect("seed capability world");
+            for herbivore_tendency in [0.0_f32, 0.5, 1.0] {
+                let disposition = scriptbots_core::apply_control_command(
+                    &mut guard,
+                    scriptbots_core::ControlCommand::SpawnAgent { herbivore_tendency },
+                )
+                .expect("spawn capability-matrix agent");
                 assert!(
-                    golden.contains(&header),
-                    "the golden must pin every ladder tier; {header:?} is missing"
+                    matches!(disposition, ControlDisposition::WorldApplied),
+                    "seeding must actually reach the world, got {disposition:?}"
                 );
             }
-            assert!(
-                golden.matches("room=yes").count() >= RESIZE_LADDER.len(),
-                "every tier must verify at least one region with room, or the \
-                 golden records a frame nothing checked"
+        }
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+        app.palette = Palette::test_backend_evidence();
+        app.palette.theme_id = theme;
+        app.palette.emoji = row.emoji;
+        app.palette.emoji_narrow = row.narrow;
+        app.canvas_capability = CanvasCapability {
+            mode: row.mode,
+            depth: row.depth,
+        };
+
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| app.draw(frame)).expect("draw frame");
+        let buffer = terminal.backend().buffer().clone();
+        let layout = app.frame_layout(buffer.area);
+        (buffer, layout, app.snapshot().tick)
+    }
+
+    /// The capability matrix at the 80x36 evidence viewport, under the default theme.
+    fn render_capability_matrix() -> String {
+        let mut out = String::new();
+        out.push_str("# bd-2z0.14.2.6 — TUI capability degradation golden\n");
+        out.push_str(
+            "# Regenerate deliberately, never in CI:\n\
+             #   RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-app --lib -- \
+             terminal::tests::the_capability_matrix_matches_its_committed_golden\n",
+        );
+        out.push_str(
+            "# THIS FILE IS THE DOCUMENTATION OF DEGRADATION BEHAVIOUR. Each row is\n\
+             # the SAME seeded snapshot at the same 80x36 viewport, rendered at one\n\
+             # capability tier. Rows must differ from each other: two tiers with the\n\
+             # same hashes would mean the renderer ignored the probe, and this file\n\
+             # would be one frame repeated under eight names.\n\
+             #\n\
+             # WHY THE FLAT ROWS CARRY NO COLOUR-DEPTH TOKEN. The canvas rows honour\n\
+             # CanvasCapability::depth (it selects the quantizer), so truecolor/256/16\n\
+             # are real distinctions there. The FLAT map takes its colour from\n\
+             # Palette::level and never reads depth, so labelling a flat row\n\
+             # 'truecolor' would claim a property the frame does not have. The flat\n\
+             # colour axis is not covered here at all — see\n\
+             # a_colourless_terminal_falls_back_to_the_flat_map for what IS pinned and\n\
+             # why the rest needs an env-driven integration test.\n",
+        );
+        for row in capability_matrix_rows() {
+            let (buffer, layout, tick) = capability_frame(
+                &row,
+                CuratedThemeId::default(),
+                CAPABILITY_GOLDEN_SIZE.0,
+                CAPABILITY_GOLDEN_SIZE.1,
             );
-            return;
+            let evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
+                .expect("every capability tier must render an inspectable frame");
+            append_frame_evidence(&mut out, &format!("capability {}", row.label), &evidence);
+        }
+        out
+    }
+
+    /// The viewport the capability matrix renders at: the headless evidence size, so
+    /// capability is the only axis moving between rows.
+    const CAPABILITY_GOLDEN_SIZE: (u16, u16) = (80, 36);
+
+    /// GLYPHS ONLY, dropping every colour and modifier.
+    ///
+    /// The separation this projection exists for: a chrome theme decides COLOUR, a
+    /// capability tier decides which CHARACTERS can be drawn. Fingerprinting style
+    /// too would make the theme comparison below fail for the right reason and prove
+    /// nothing about vocabulary — the same reasoning `vocabulary_fingerprint` already
+    /// documents at the palette level, applied to a real rendered frame.
+    fn frame_glyph_digest(buffer: &Buffer) -> String {
+        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = OFFSET_BASIS;
+        let area = buffer.area;
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                for byte in buffer[(x, y)].symbol().as_bytes() {
+                    hash ^= u64::from(*byte);
+                    hash = hash.wrapping_mul(PRIME);
+                }
+                hash ^= 0xff;
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        format!("{hash:016x}")
+    }
+
+    #[test]
+    fn the_capability_matrix_matches_its_committed_golden() {
+        let candidate = render_capability_matrix();
+
+        // Vacuity guards before comparison, same discipline as the ladder.
+        for row in capability_matrix_rows() {
+            let header = format!("capability {} ", row.label);
+            assert!(
+                candidate.contains(&header),
+                "the matrix must render every capability row; {header:?} is missing"
+            );
         }
 
-        // Mismatch: report the FIRST differing line with its tier, because a
-        // 200-line whole-file diff does not say which panel moved.
-        let mut tier = String::from("<before any tier>");
-        for (index, (want, got)) in golden.lines().zip(candidate.lines()).enumerate() {
-            if want.starts_with("tier ") {
-                tier = want.to_string();
-            }
-            assert_eq!(
-                want,
-                got,
-                "resize ladder golden mismatch at line {} under {tier}\n  \
-                 golden:    {want}\n  candidate: {got}\n\nIf this change is \
-                 intended, regenerate with RUST_REGEN_GOLDEN=1 and review the diff.",
-                index + 1
+        compare_golden(
+            &capability_golden_path(),
+            &candidate,
+            "capability ",
+            "terminal::tests::the_capability_matrix_matches_its_committed_golden",
+        );
+    }
+
+    /// EVERY CAPABILITY TIER MUST RENDER DIFFERENTLY FROM EVERY OTHER.
+    ///
+    /// This is the assertion that stops the capability golden from being decoration.
+    /// A golden of nine rows proves nothing if the renderer ignores the probe — the
+    /// nine frames would be identical, the file would still compare equal to itself
+    /// forever, and it would look like nine tiers of coverage. Pairwise distinctness
+    /// is what makes the probe observably consulted.
+    #[test]
+    fn every_capability_tier_renders_differently() {
+        let mut seen: std::collections::HashMap<String, &'static str> =
+            std::collections::HashMap::new();
+        for row in capability_matrix_rows() {
+            let (buffer, layout, tick) = capability_frame(
+                &row,
+                CuratedThemeId::default(),
+                CAPABILITY_GOLDEN_SIZE.0,
+                CAPABILITY_GOLDEN_SIZE.1,
             );
+            let evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
+                .expect("capability frame must be inspectable");
+            if let Some(previous) = seen.insert(evidence.full_cell_fnv1a64.clone(), row.label) {
+                panic!(
+                    "capability tiers {previous:?} and {:?} rendered the SAME frame \
+                     ({}). Two tiers that cannot be told apart mean the renderer did \
+                     not consult the probe, and a golden over them would be nine \
+                     copies of one row.",
+                    row.label, evidence.full_cell_fnv1a64
+                );
+            }
         }
         assert_eq!(
-            golden.lines().count(),
-            candidate.lines().count(),
-            "the golden and the candidate differ in line count, so a whole tier or \
-             region appeared or disappeared"
+            seen.len(),
+            capability_matrix_rows().len(),
+            "every row must contribute a distinct frame"
         );
-        unreachable!("golden != candidate but every line and the line count agreed");
+    }
+
+    /// CAPABILITY VOCABULARY MUST NOT MOVE WITH THE CHROME THEME, proven through a
+    /// real rendered frame rather than at the palette API.
+    ///
+    /// `capability_vocabularies_do_not_move_when_the_chrome_theme_does` already
+    /// asserts this over `terminal_symbol`/`agent_symbol`. That is the right unit
+    /// test and it is not sufficient for a GOLDEN, because a golden is only
+    /// trustworthy if the frame it pins was not silently coloured by whatever theme
+    /// happened to be active. A capability golden that passed because it inherited
+    /// the active theme would prove nothing about capability.
+    ///
+    /// BOTH directions, deliberately. Glyphs must be identical across every theme,
+    /// AND the full frame hash must differ somewhere — without the second half this
+    /// passes against a renderer where the theme reaches nothing at all, which is
+    /// the same failure shape as a keybinding check that passes for a dead control.
+    #[test]
+    fn capability_frames_are_independent_of_the_chrome_theme() {
+        let mut themes_that_changed_colour = 0usize;
+        for row in capability_matrix_rows() {
+            let baseline_theme = CuratedThemeId::default();
+            let (baseline_buffer, baseline_layout, baseline_tick) = capability_frame(
+                &row,
+                baseline_theme,
+                CAPABILITY_GOLDEN_SIZE.0,
+                CAPABILITY_GOLDEN_SIZE.1,
+            );
+            let baseline_glyphs = frame_glyph_digest(&baseline_buffer);
+            let baseline_full =
+                HeadlessBufferEvidence::inspect(&baseline_buffer, baseline_tick, &baseline_layout)
+                    .expect("baseline capability frame")
+                    .full_cell_fnv1a64;
+
+            let mut theme = baseline_theme.next();
+            while theme != baseline_theme {
+                let (buffer, layout, tick) = capability_frame(
+                    &row,
+                    theme,
+                    CAPABILITY_GOLDEN_SIZE.0,
+                    CAPABILITY_GOLDEN_SIZE.1,
+                );
+                assert_eq!(
+                    frame_glyph_digest(&buffer),
+                    baseline_glyphs,
+                    "{}: chrome theme {theme:?} changed which GLYPHS were drawn. Theme \
+                     and capability are orthogonal axes; a theme that alters the \
+                     vocabulary would silently promote or demote what the terminal can \
+                     render, and this golden would be pinning the theme instead of the \
+                     capability",
+                    row.label
+                );
+                let full = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
+                    .expect("themed capability frame")
+                    .full_cell_fnv1a64;
+                if full != baseline_full {
+                    themes_that_changed_colour += 1;
+                }
+                theme = theme.next();
+            }
+        }
+        // The negative control. If no theme ever changed a frame, the equality above
+        // held because the theme reaches nothing — not because the axes are
+        // independent.
+        assert!(
+            themes_that_changed_colour > 0,
+            "no chrome theme changed any capability frame, so the glyph-equality \
+             assertions above are vacuous: they would also hold for a renderer that \
+             ignores themes entirely"
+        );
     }
 
     /// The ladder must be deterministic, or the golden is noise.
