@@ -717,20 +717,52 @@ impl ControlHandle {
         Ok(cache.get(command_id).cloned())
     }
 
-    fn submit_control_command(
+    /// Submit a command, honouring an idempotency key when one is supplied.
+    ///
+    /// [`scriptbots_runtime::HostPort::submit`] is documented as "submit or
+    /// retry a logical command", with the command id as a "stable idempotency
+    /// key" whose retry "returns its existing status". This path met none of
+    /// that: ids were minted from a server-side counter, so a client that timed
+    /// out and retried submitted a SECOND command. For `Pause` that is
+    /// harmless, but a retried `Step` advances the simulation twice and a
+    /// retried config patch applies twice — the client cannot tell, because
+    /// both attempts return a cheerful receipt with different ids (bd-k7nq).
+    ///
+    /// With a key, a repeat returns the ORIGINAL receipt and enqueues nothing.
+    /// Without one, behaviour is exactly as before, so this is opt-in per call
+    /// rather than a change to every existing caller.
+    ///
+    /// LOCK ORDER IS DELIBERATE. The world is read and released BEFORE the
+    /// status cache is taken, preserving the world-then-cache order this
+    /// function already had; taking them the other way round would invert it
+    /// against every other reader here. The cache lock is then held across the
+    /// enqueue so the check and the insert are atomic — otherwise two
+    /// concurrent retries of the same key both miss and both enqueue, which is
+    /// the very duplicate this exists to prevent. `enqueue` touches only the
+    /// command channel, so holding the cache across it cannot deadlock.
+    fn submit_control_command_with_key(
         &self,
         cmd: ControlCommand,
+        idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
-        self.enqueue(cmd)?;
         let (tick, rev) = {
             let world = self.lock_world()?;
             (world.tick().0, world.config_revision())
         };
+        let mut cache = lock_cache(&self.status_cache);
+        if let Some(key) = idempotency_key
+            && let Some(existing) = cache.get(key)
+        {
+            return Ok(existing.clone());
+        }
+        self.enqueue(cmd)?;
         let id_num = self
             .command_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        let command_id = format!("cmd-{id_num}");
+        let command_id = idempotency_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("cmd-{id_num}"));
         // Report what actually happened: the command took an admission order on the
         // bounded bus. It has NOT been drained by the simulation driver, has not been
         // applied to the world, and the legacy app-owned bus writes no journal record
@@ -747,9 +779,35 @@ impl ControlHandle {
             control_revision: rev,
             scientific_revision: tick,
         };
-        let mut cache = lock_cache(&self.status_cache);
         cache.insert(command_id, status.clone());
         Ok(status)
+    }
+
+    /// Submit a command without an idempotency key.
+    ///
+    /// Every existing caller keeps its previous behaviour: a retry here is a
+    /// new command, because the caller supplied nothing to recognise it by.
+    fn submit_control_command(
+        &self,
+        cmd: ControlCommand,
+    ) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command_with_key(cmd, None)
+    }
+
+    /// Submit any control command, optionally keyed for safe retry.
+    ///
+    /// This is the [`scriptbots_runtime::HostPort`]-shaped entry point: one
+    /// command, one optional stable key, one receipt. Surfaces that can carry a
+    /// client-supplied key (an `Idempotency-Key` header, an MCP argument)
+    /// should use it so a timeout-and-retry cannot double-apply. The
+    /// command-specific helpers below remain for callers that have no key to
+    /// offer.
+    pub fn submit_command(
+        &self,
+        command: ControlCommand,
+        idempotency_key: Option<&str>,
+    ) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command_with_key(command, idempotency_key)
     }
 
     fn enqueue(&self, command: ControlCommand) -> Result<(), ControlError> {
@@ -1657,6 +1715,98 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, 4, "invalid optimistic config command reached queue");
+    }
+
+    /// A keyed retry returns the original receipt and enqueues nothing.
+    ///
+    /// The receipt equality alone would be satisfied by a cache that answered
+    /// correctly while still submitting a duplicate, so the queue depth is what
+    /// actually carries this test: a retried `Step` that reaches the bus twice
+    /// advances the simulation twice, and the client cannot tell (bd-k7nq).
+    #[test]
+    fn a_keyed_retry_does_not_submit_a_second_command() {
+        let (handle, receiver) = handle();
+
+        let first = handle
+            .submit_command(ControlCommand::Step, Some("client-abc"))
+            .expect("first submit");
+        let retry = handle
+            .submit_command(ControlCommand::Step, Some("client-abc"))
+            .expect("retry of the same logical command");
+
+        assert_eq!(
+            first.command_id, "client-abc",
+            "a supplied key must become the command id, or the client cannot poll what it sent"
+        );
+        assert_eq!(
+            first.command_id, retry.command_id,
+            "a retry must return the original receipt"
+        );
+        assert_eq!(
+            first.admission_sequence, retry.admission_sequence,
+            "a retry must not take a second admission order"
+        );
+
+        let mut queued = 0;
+        while receiver.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(
+            queued, 1,
+            "the retry reached the command bus; a retried Step would advance the simulation twice"
+        );
+    }
+
+    /// Positive control: distinct keys are distinct commands.
+    ///
+    /// Without this, the test above would pass against an implementation that
+    /// deduplicated everything and only ever submitted once.
+    #[test]
+    fn distinct_keys_submit_distinct_commands() {
+        let (handle, receiver) = handle();
+
+        let first = handle
+            .submit_command(ControlCommand::Step, Some("step-1"))
+            .expect("first");
+        let second = handle
+            .submit_command(ControlCommand::Step, Some("step-2"))
+            .expect("second");
+
+        assert_ne!(first.command_id, second.command_id);
+        assert!(
+            second.admission_sequence > first.admission_sequence,
+            "distinct commands must take distinct admission orders"
+        );
+
+        let mut queued = 0;
+        while receiver.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 2, "two distinct commands must both reach the bus");
+    }
+
+    /// An unkeyed submit stays non-idempotent, as every existing caller expects.
+    #[test]
+    fn an_unkeyed_submit_is_still_a_new_command_each_time() {
+        let (handle, receiver) = handle();
+
+        let first = handle
+            .submit_command(ControlCommand::Step, None)
+            .expect("a");
+        let second = handle
+            .submit_command(ControlCommand::Step, None)
+            .expect("b");
+
+        assert_ne!(
+            first.command_id, second.command_id,
+            "without a key there is nothing to recognise a retry by, so these are two commands"
+        );
+
+        let mut queued = 0;
+        while receiver.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 2);
     }
 
     /// A selection submission must hand back a receipt a client can follow.
