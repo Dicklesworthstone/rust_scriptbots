@@ -9137,3 +9137,334 @@ mod tests {
         );
     }
 }
+
+/// Workspace guard for the acknowledgement class (bd-d6gv).
+///
+/// THE CLASS: a UI or client asserting an outcome the host never acknowledged.
+/// It was fixed in seventeen sites across five surfaces — Bevy, the control
+/// layer, REST, MCP and the CLI — under bd-2z0.7.14 and bd-2z0.4.9. It kept
+/// regenerating because a boolean is a PLAUSIBLE-LOOKING receipt: `true` reads
+/// like success, so each surface invented its own and no reviewer saw a lie.
+///
+/// Three guards landed with those fixes, but each was scoped to a single file,
+/// so an eighth instance in a new file or crate was caught by none of them.
+/// This one is workspace-wide, which is the whole point.
+///
+/// SCOPE IS DETECTION, AND DELIBERATELY NARROW. It catches a submitted command
+/// whose answer is thrown away, and the two receipt literals that were really
+/// fabricated. It does NOT catch the log-ordering form — announcing an outcome
+/// before the submitter is even asked, which was `426f4083a9` — because that is
+/// not a discard and a rule loose enough to catch it would fire on ordinary
+/// logging. A noisy guard gets suppressed, which is worse than none.
+#[cfg(test)]
+mod acknowledgement_guard {
+    use std::path::{Path, PathBuf};
+
+    /// This module's own text is cut from every file before scanning.
+    ///
+    /// Three separate tests during bd-2z0.7.14 and bd-2z0.4.9 matched their own
+    /// literals and passed forever. A source-scanning guard that can read
+    /// itself is not a guard.
+    const GUARD_MODULE_MARKER: &str = "mod acknowledgement_guard";
+
+    /// Crates carrying a user- or client-facing surface.
+    const SCANNED_CRATE_DIRS: &[&str] = &[
+        "crates/scriptbots-app/src",
+        "crates/scriptbots-bevy/src",
+        "crates/scriptbots-render/src",
+        "crates/scriptbots-web/src",
+        "crates/scriptbots-world-gfx/src",
+    ];
+
+    /// Calls that submit a command and hand back an answer about its fate.
+    ///
+    /// Each entry is (call fragment, what the answer actually means, what to do
+    /// with it). The third field is the reason this guard is actionable rather
+    /// than merely red: bd-ikts.5 established that a message naming the fix
+    /// gets obeyed while one naming the smell gets suppressed.
+    const COMMAND_SUBMITTERS: &[(&str, &str, &str)] = &[
+        (
+            "(submitter.submit)",
+            "a bool meaning ENQUEUED, not applied",
+            "gate the UI change on it and report the refusal instead of committing anyway",
+        ),
+        (
+            "submit_simulation_command(",
+            "a bool meaning ENQUEUED, not applied",
+            "call submit_playback_command so a refusal rolls the local state back",
+        ),
+        (
+            "run_control(move || state.handle.",
+            "a CommandStatusDto receipt",
+            "return the receipt so the client has a command id it can poll",
+        ),
+        (
+            "run_control_mcp_sync(move || handle.",
+            "a CommandStatusDto receipt",
+            "return the receipt instead of echoing the request back as the result",
+        ),
+    ];
+
+    /// Literals that fabricate a receipt out of nothing.
+    ///
+    /// Both were real: `queued: true` was the entire body of POST
+    /// /api/selection, and `success: true` answered four REST control
+    /// endpoints. Neither was derived from anything the host said.
+    const FABRICATED_RECEIPTS: &[(&str, &str)] = &[
+        (
+            "success: true",
+            "return the CommandStatusDto the control call already produces",
+        ),
+        (
+            "queued: true",
+            "return the CommandStatusDto the control call already produces",
+        ),
+    ];
+
+    /// One detected offence, carrying enough to act on without hunting.
+    #[derive(Debug)]
+    struct Offence {
+        file: String,
+        line_no: usize,
+        line: String,
+        problem: String,
+        fix: String,
+    }
+
+    impl std::fmt::Display for Offence {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "\n  {}:{}\n    {}\n    problem: {}\n    fix: {}",
+                self.file, self.line_no, self.line, self.problem, self.fix
+            )
+        }
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root above crates/scriptbots-bevy")
+            .to_path_buf()
+    }
+
+    /// Every scanned source as (repo-relative path, text with this guard cut).
+    fn scanned_sources() -> Vec<(String, String)> {
+        let root = workspace_root();
+        let mut out = Vec::new();
+        for dir in SCANNED_CRATE_DIRS {
+            collect_sources(&root.join(dir), &root, &mut out);
+        }
+        out
+    }
+
+    fn collect_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_sources(&path, root, out);
+                continue;
+            }
+            if !path.extension().is_some_and(|ext| ext == "rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let text = text
+                .split_once(GUARD_MODULE_MARKER)
+                .map_or(text.as_str(), |(before, _)| before)
+                .to_owned();
+            let display = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            out.push((display, text));
+        }
+    }
+
+    /// Submissions whose answer is bound to nothing.
+    ///
+    /// A control call whose line both opens the statement and ends it with a
+    /// semicolon bound no result, so the answer went nowhere. A bound call
+    /// continues into an expression and does not match. `let _ =` is the
+    /// explicit form of the same thing.
+    fn discarded_submissions(sources: &[(String, String)]) -> Vec<Offence> {
+        let mut out = Vec::new();
+        for (file, text) in sources {
+            for (index, raw) in text.lines().enumerate() {
+                let line = raw.trim();
+                if line.starts_with("//") {
+                    continue;
+                }
+                for (fragment, meaning, fix) in COMMAND_SUBMITTERS {
+                    let opens_and_closes = line.starts_with(fragment) && line.ends_with(';');
+                    let explicitly_dropped = line.contains(&format!("let _ = {fragment}"));
+                    if opens_and_closes || explicitly_dropped {
+                        out.push(Offence {
+                            file: file.clone(),
+                            line_no: index + 1,
+                            line: line.to_owned(),
+                            problem: format!("discards {meaning}"),
+                            fix: (*fix).to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Receipt literals invented rather than observed.
+    fn fabricated_receipts(sources: &[(String, String)]) -> Vec<Offence> {
+        let mut out = Vec::new();
+        for (file, text) in sources {
+            for (index, raw) in text.lines().enumerate() {
+                let line = raw.trim();
+                if line.starts_with("//") {
+                    continue;
+                }
+                for (literal, fix) in FABRICATED_RECEIPTS {
+                    if line.contains(literal) {
+                        out.push(Offence {
+                            file: file.clone(),
+                            line_no: index + 1,
+                            line: line.to_owned(),
+                            problem: format!(
+                                "answers with the hardcoded literal `{literal}`, which is not \
+                                 derived from anything the host said"
+                            ),
+                            fix: (*fix).to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// No surface may throw away the answer to a command it submitted.
+    #[test]
+    fn no_surface_discards_a_command_submission_result() {
+        let sources = scanned_sources();
+
+        // POSITIVE ANCHOR. A scan that matches nothing is indistinguishable
+        // from a clean tree, and one run during bd-2z0.4.9 reported
+        // "running 0 tests / test result: ok" and read exactly like a pass.
+        // If the submitters have vanished from the scan, the scope is wrong.
+        let submitter_mentions = sources
+            .iter()
+            .flat_map(|(_, text)| text.lines())
+            .filter(|line| {
+                COMMAND_SUBMITTERS
+                    .iter()
+                    .any(|(fragment, _, _)| line.contains(fragment))
+            })
+            .count();
+        assert!(
+            submitter_mentions >= 8,
+            "only {submitter_mentions} command-submitter call sites were scanned; the scan is \
+             mis-scoped and this guard is checking nothing"
+        );
+
+        // Every declared crate must actually have been reached. Without this,
+        // renaming or moving a crate directory would silently drop it from
+        // coverage while the guard stayed green — the failure mode where a
+        // guard is most dangerous, because it still reads as protection.
+        for dir in SCANNED_CRATE_DIRS {
+            assert!(
+                sources.iter().any(|(file, _)| file.starts_with(dir)),
+                "no sources were scanned under {dir}; the path is stale, so that crate's \
+                 surfaces are unguarded while this test still passes"
+            );
+        }
+
+        let offences = discarded_submissions(&sources);
+        assert!(
+            offences.is_empty(),
+            "a surface discards the answer to a command it submitted, so the caller is acting \
+             on an outcome the host never acknowledged (bd-d6gv):{}",
+            offences
+                .iter()
+                .map(Offence::to_string)
+                .collect::<Vec<_>>()
+                .join("")
+        );
+    }
+
+    /// No surface may answer with a receipt it made up.
+    #[test]
+    fn no_surface_fabricates_a_receipt_literal() {
+        let offences = fabricated_receipts(&scanned_sources());
+        assert!(
+            offences.is_empty(),
+            "a surface reports success from a literal rather than from the host's answer \
+             (bd-d6gv):{}",
+            offences
+                .iter()
+                .map(Offence::to_string)
+                .collect::<Vec<_>>()
+                .join("")
+        );
+    }
+
+    /// The guard must fire on a known offence.
+    ///
+    /// Proven against the REAL pre-fix code rather than an invented sample: the
+    /// three lines below are transcribed from `a3e820fb9c^` and
+    /// `eb5312e58f^`, at which revisions this detection finds 4 and 8 offences
+    /// respectively. A guard whose negative case was never proven is a guard
+    /// nobody has tested.
+    #[test]
+    fn the_guard_fires_on_the_offences_it_was_built_from() {
+        let historical = vec![(
+            "crates/scriptbots-app/src/servers.rs".to_owned(),
+            [
+                "async fn post_pause() {",
+                "    run_control(move || state.handle.pause()).await?;",
+                "    Ok(Json(CommandAcknowledge {",
+                "        success: true,",
+                "    }))",
+                "}",
+                "fn clear() {",
+                "    let _ = submit_simulation_command(submitter, command);",
+                "}",
+            ]
+            .join("\n"),
+        )];
+
+        let discards = discarded_submissions(&historical);
+        assert_eq!(
+            discards.len(),
+            2,
+            "the discard rule stopped detecting the code it was built from: {discards:#?}"
+        );
+        assert!(
+            discards.iter().any(|o| o.fix.contains("command id")),
+            "the message must name the fix, not just the smell"
+        );
+
+        let fabrications = fabricated_receipts(&historical);
+        assert_eq!(
+            fabrications.len(),
+            1,
+            "the literal rule stopped detecting the code it was built from: {fabrications:#?}"
+        );
+
+        // And it must stay quiet on the corrected form, or it would fire on
+        // every fix it just demanded.
+        let corrected = vec![(
+            "corrected.rs".to_owned(),
+            "    let status = run_control(move || state.handle.pause()).await?;".to_owned(),
+        )];
+        assert!(
+            discarded_submissions(&corrected).is_empty(),
+            "the guard fires on the corrected form, so it would forbid its own fix"
+        );
+    }
+}
