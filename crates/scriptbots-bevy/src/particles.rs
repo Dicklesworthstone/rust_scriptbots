@@ -1712,6 +1712,146 @@ mod tests {
         }
     }
 
+    /// Drive the REAL scheduler, pool, instance writer, ordering path and atlas
+    /// bake to full capacity, and return deterministic JSON evidence.
+    ///
+    /// Mock-free by construction: every stage is the production type. Nothing
+    /// here constructs a GPU device or a render graph, so this does NOT claim
+    /// live renderer wiring — that stays owned by bd-2z0.14.1.7. What it proves
+    /// is that the stages compose deterministically end to end, which no single
+    /// unit test can show because each one stops at its own boundary.
+    fn particle_pipeline_evidence(capacity: usize) -> serde_json::Value {
+        let scheduler = CueScheduler::new(0x5EED_2026);
+        let mut pool = ParticlePool::with_capacity(capacity);
+        pool.overflow = OverflowPolicy::DropOldestAmbient;
+
+        let mut scheduled = 0usize;
+        let mut admitted = 0usize;
+        let mut rejected = 0usize;
+
+        // Enough cues to overrun the pool, so the eviction policy is exercised
+        // rather than merely present. Ambient-producing kinds fill it; the
+        // Shards/SparkCone cues then have to displace something.
+        let kinds = [
+            VisualCueKind::Sparkle,
+            VisualCueKind::Nibble,
+            VisualCueKind::Wilt,
+            VisualCueKind::Shards,
+            VisualCueKind::SparkCone,
+        ];
+        for tick in 0..24u64 {
+            for (ordinal, kind) in kinds.iter().enumerate() {
+                let batch = scheduler.schedule(
+                    tick,
+                    u32::try_from(ordinal).expect("ordinal fits"),
+                    &cue(*kind),
+                    [tick as f32, ordinal as f32, 0.0],
+                );
+                for particle in batch.particles {
+                    scheduled += 1;
+                    if pool.spawn(particle).is_some() {
+                        admitted += 1;
+                    } else {
+                        rejected += 1;
+                    }
+                }
+            }
+        }
+
+        // Real instance writer.
+        let mut instances = Vec::new();
+        pool.write_instance_buffer(&mut instances);
+
+        // Real ordering path, fed from the instances just written.
+        let depths: Vec<(u32, f32)> = instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| (u32::try_from(index).expect("index fits"), instance.pos0[2]))
+            .collect();
+        let mut order = Vec::new();
+        let mut scratch = Vec::new();
+        blend_order_into(
+            &depths,
+            BlendOrderPolicy::BucketSort,
+            &mut order,
+            &mut scratch,
+        );
+
+        // Real atlas bake, hashed rather than embedded.
+        let atlas = bake_sprite_atlas(CANONICAL_ATLAS_SEED, CANONICAL_ATLAS_TILE_PX);
+
+        // Order and instance streams are summarised by digest so the evidence
+        // stays small while still changing if any element moves.
+        let mut order_bytes = Vec::with_capacity(order.len() * 4);
+        for slot in &order {
+            order_bytes.extend_from_slice(&slot.to_le_bytes());
+        }
+        let mut instance_bytes = Vec::with_capacity(instances.len() * 12);
+        for instance in &instances {
+            for axis in instance.pos0 {
+                instance_bytes.extend_from_slice(&axis.to_le_bytes());
+            }
+        }
+
+        serde_json::json!({
+            "schema": "scriptbots.particle-pipeline-evidence.v1",
+            "capacity": capacity,
+            "scheduled": scheduled,
+            "admitted": admitted,
+            "rejected": rejected,
+            "live_count": pool.live_count(),
+            "instances": instances.len(),
+            "order_len": order.len(),
+            "order_digest": blake3::hash(&order_bytes).to_hex().to_string(),
+            "instance_position_digest": blake3::hash(&instance_bytes).to_hex().to_string(),
+            "atlas_digest": blake3::hash(&atlas).to_hex().to_string(),
+            "claims_live_renderer_wiring": false,
+        })
+    }
+
+    /// The stages compose deterministically end to end, at full capacity, with
+    /// the eviction policy actually engaged.
+    ///
+    /// Each stage already has unit coverage, but every one of those stops at its
+    /// own boundary — a pool test cannot see the instance writer, and an
+    /// ordering test cannot see the pool. This runs the real chain twice and
+    /// requires identical evidence, so a nondeterminism introduced at any seam
+    /// shows up here rather than as an unreproducible frame later.
+    #[test]
+    fn the_real_particle_pipeline_is_deterministic_at_full_capacity() {
+        const CAPACITY: usize = 64;
+        let first = particle_pipeline_evidence(CAPACITY);
+        let second = particle_pipeline_evidence(CAPACITY);
+        assert_eq!(
+            first, second,
+            "the same seed and cue schedule must produce identical pipeline evidence"
+        );
+
+        // The run has to be a real one, or the determinism claim is vacuous.
+        assert_eq!(first["live_count"], CAPACITY, "the pool must end up FULL");
+        assert_eq!(
+            first["instances"], CAPACITY,
+            "the instance writer must emit one instance per live particle"
+        );
+        assert_eq!(
+            first["order_len"], CAPACITY,
+            "every instance must be ordered"
+        );
+        assert!(
+            first["scheduled"].as_u64().expect("scheduled") > CAPACITY as u64,
+            "the schedule must overrun capacity, or eviction never engages"
+        );
+        assert!(
+            first["rejected"].as_u64().expect("rejected") > 0,
+            "a full pool must reject some ambient spawns; zero means the overflow \
+             policy was never exercised and this proves less than it appears to"
+        );
+        assert_eq!(
+            first["claims_live_renderer_wiring"], false,
+            "this evidence is stage composition only; live wiring is bd-2z0.14.1.7"
+        );
+    }
+
     /// Canonical atlas parameters. The pinned digest below is only meaningful
     /// for exactly these; changing any of them requires re-deriving it.
     const CANONICAL_ATLAS_SEED: u64 = 5;
