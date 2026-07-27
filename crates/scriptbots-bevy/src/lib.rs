@@ -1453,6 +1453,14 @@ struct HudElements {
 #[derive(Component)]
 struct TierDrivenSunLight;
 
+/// Marks the persistent SOFTWARE RENDERER banner (bd-2z0.14.3.3 item 4).
+///
+/// Exists so the watermark is addressable — a test can assert it is present on
+/// a software adapter and absent on hardware — rather than being an anonymous
+/// node that nothing can check for.
+#[derive(Component)]
+struct SoftwareRendererWatermark;
+
 /// Cycles the render quality tier at runtime.
 #[derive(Component)]
 struct QualityTierButton;
@@ -2453,6 +2461,38 @@ fn setup_scene(
         ..default()
     };
     let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
+
+    // Persistent SOFTWARE RENDERER watermark (bd-2z0.14.3.3 item 4).
+    //
+    // The startup warning is a log line, and a log line scrolls away — someone
+    // reading a screenshot, a screen recording, or a bug report has no way to
+    // know the frame came from llvmpipe rather than a GPU. The tier is already
+    // forced to Potato in that case (f243255fd51), so the picture is genuinely
+    // not representative, and the frame itself has to say so.
+    //
+    // Spawned once and never removed: the adapter cannot change mid-run, so
+    // there is no state to keep in sync and nothing that can silently drop it.
+    // Anchored top-right so it does not overlap the top-left HUD panel.
+    if effective
+        .gpu
+        .as_ref()
+        .is_some_and(|info| info.class == GpuClass::Software)
+    {
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(12.0),
+                right: Val::Px(12.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.35, 0.10, 0.10, 0.82)),
+            Text::new("SOFTWARE RENDERER — not GPU accelerated, not representative"),
+            TextFont::from_font_size(15.0),
+            TextColor(Color::srgb(1.0, 0.85, 0.85)),
+            SoftwareRendererWatermark,
+        ));
+    }
 
     let hud_root = commands
         .spawn((
@@ -3759,6 +3799,22 @@ mod adaptive_governor_tests {
 mod quality_tier_consumer_tests {
     use super::*;
 
+    /// A fixed adapter so tier-consumer tests never depend on the host's GPU.
+    fn gpu_info(name: &str, class: GpuClass) -> GpuInfo {
+        GpuInfo {
+            name: name.to_string(),
+            backend: "Vulkan".to_string(),
+            class,
+            vram_bytes: None,
+            max_texture_2d: Some(16_384),
+            timestamp_queries: true,
+            vendor_id: None,
+            device_id: None,
+            driver: None,
+            driver_info: None,
+        }
+    }
+
     /// The defect this bead names, as an assertion: the resolved tier must be
     /// READ by a live system, not merely resolved, logged and inserted.
     ///
@@ -3780,6 +3836,73 @@ mod quality_tier_consumer_tests {
         assert!(
             production.contains("shadows_enabled: effective.features.shadows"),
             "the sun light must take its shadow state from the tier, not a literal"
+        );
+    }
+
+    /// The software-renderer watermark must be spawned, marked, and conditional.
+    ///
+    /// A startup warning is a log line, and a log line scrolls away — someone
+    /// reading a screenshot, a recording or a bug report otherwise has no way to
+    /// know the frame came from llvmpipe. Since the tier is already forced to
+    /// Potato in that case, the picture is genuinely not representative and the
+    /// FRAME has to carry that, not just the console.
+    #[test]
+    fn the_software_renderer_watermark_is_spawned_only_on_a_software_adapter() {
+        let source = include_str!("lib.rs");
+        let sites = |needle: &str| source.matches(needle).count();
+
+        assert!(
+            sites("SoftwareRendererWatermark") > 2,
+            "the watermark needs a marker component, a spawn site, and this assertion"
+        );
+        assert!(
+            sites("SOFTWARE RENDERER") > 1,
+            "the banner text must exist in production, not only in this test"
+        );
+        assert!(
+            source.contains(
+                "info.class == GpuClass::Software\n        })\n    {\n        commands.spawn(("
+            ) || source.contains("is_some_and(|info| info.class == GpuClass::Software)"),
+            "the spawn must be gated on a software adapter; an unconditional banner \
+             would libel every hardware run as unaccelerated"
+        );
+    }
+
+    /// The watermark and the forced tier must agree.
+    ///
+    /// They are two expressions of one fact. If a future edit forced Potato
+    /// without the banner, or banners without forcing, the renderer would be
+    /// telling the operator two different stories about the same adapter.
+    #[test]
+    fn the_watermark_condition_matches_the_forced_potato_condition() {
+        let software = gpu_info("llvmpipe", GpuClass::Software);
+        let effective = resolve_effective_render_settings_for_gpu(
+            &RenderSettings::default(),
+            Some(software.clone()),
+        );
+        assert_eq!(
+            effective.tier,
+            RenderQuality::Potato,
+            "the same adapter that earns a watermark must also be forced to Potato"
+        );
+        assert!(
+            effective
+                .gpu
+                .as_ref()
+                .is_some_and(|info| info.class == GpuClass::Software),
+            "the resolved settings must retain the adapter class the watermark keys on"
+        );
+
+        let hardware = resolve_effective_render_settings_for_gpu(
+            &RenderSettings::default(),
+            Some(gpu_info("Apple M4", GpuClass::Discrete)),
+        );
+        assert!(
+            hardware
+                .gpu
+                .as_ref()
+                .is_some_and(|info| info.class != GpuClass::Software),
+            "hardware must not satisfy the watermark condition"
         );
     }
 
