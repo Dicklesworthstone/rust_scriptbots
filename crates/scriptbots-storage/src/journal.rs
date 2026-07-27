@@ -19,9 +19,9 @@ use scriptbots_runtime::{
     EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason,
     EventCommitment, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot,
     EventSequence, EventSequenceRange, HostAccessError, HostCommand, HostRevisions, HostSessionId,
-    JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
-    JournalReceiptState, JournaledScientificEvent, RejectionReason, RunId, ScientificBoundary,
-    ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
+    IslandId, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort,
+    JournalReceipt, JournalReceiptState, JournaledScientificEvent, RejectionReason, RunId,
+    ScientificBoundary, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -689,6 +689,16 @@ enum HostCommandPostcardV1 {
         parent_a: u64,
         parent_b: u64,
     },
+    // Appended for the variants a0f6bf0119 added to HostCommand. Appended, not
+    // inserted: the discriminant order above is durable, so placing these
+    // anywhere but the end would silently reinterpret every existing V1 archive.
+    Emigrate {
+        agent_uid: u64,
+    },
+    Immigrate {
+        origin_island: u32,
+        origin_uid: u64,
+    },
 }
 
 impl HostCommandPostcardV1 {
@@ -716,6 +726,16 @@ impl HostCommandPostcardV1 {
             HostCommand::SpawnCrossover { parent_a, parent_b } => Self::SpawnCrossover {
                 parent_a: parent_a.get(),
                 parent_b: parent_b.get(),
+            },
+            HostCommand::Emigrate { agent_uid } => Self::Emigrate {
+                agent_uid: agent_uid.get(),
+            },
+            HostCommand::Immigrate {
+                origin_island,
+                origin_uid,
+            } => Self::Immigrate {
+                origin_island: origin_island.0,
+                origin_uid: origin_uid.get(),
             },
         }
     }
@@ -747,6 +767,16 @@ impl HostCommandPostcardV1 {
                 parent_a: AgentUid(parent_a),
                 parent_b: AgentUid(parent_b),
             },
+            Self::Emigrate { agent_uid } => HostCommand::Emigrate {
+                agent_uid: AgentUid(agent_uid),
+            },
+            Self::Immigrate {
+                origin_island,
+                origin_uid,
+            } => HostCommand::Immigrate {
+                origin_island: IslandId(origin_island),
+                origin_uid: AgentUid(origin_uid),
+            },
         }
     }
 }
@@ -771,6 +801,15 @@ enum HostCommandPostcardRefV1<'a> {
     SpawnCrossover {
         parent_a: u64,
         parent_b: u64,
+    },
+    // Mirrors the owned enum above, including its append-only position: the two
+    // must encode identically or a borrowed write and an owned read disagree.
+    Emigrate {
+        agent_uid: u64,
+    },
+    Immigrate {
+        origin_island: u32,
+        origin_uid: u64,
     },
 }
 
@@ -799,6 +838,16 @@ impl<'a> HostCommandPostcardRefV1<'a> {
             HostCommand::SpawnCrossover { parent_a, parent_b } => Self::SpawnCrossover {
                 parent_a: parent_a.get(),
                 parent_b: parent_b.get(),
+            },
+            HostCommand::Emigrate { agent_uid } => Self::Emigrate {
+                agent_uid: agent_uid.get(),
+            },
+            HostCommand::Immigrate {
+                origin_island,
+                origin_uid,
+            } => Self::Immigrate {
+                origin_island: origin_island.0,
+                origin_uid: origin_uid.get(),
             },
         }
     }

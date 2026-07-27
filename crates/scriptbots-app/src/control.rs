@@ -215,6 +215,20 @@ pub fn empty_latest_summary() -> SharedLatestSummary {
 /// command an admission order and nothing on that path observes application.
 pub const APPLICATION_STATE_ADMITTED: &str = "admitted";
 
+/// Wire tag of `scriptbots_runtime::ApplicationState::Applied`.
+///
+/// Reachable only when something OBSERVES a command being applied to the world
+/// and reports it back. Nothing on the legacy path does that yet, which is why
+/// this constant exists alongside a ledger that can hold it rather than being
+/// written anywhere on submission (bd-k7nq).
+pub const APPLICATION_STATE_APPLIED: &str = "applied";
+
+/// Wire tag of `scriptbots_runtime::ApplicationState::Rejected`.
+///
+/// A command that reached the applier and was refused there — distinct from one
+/// refused at admission, which never gets a receipt at all.
+pub const APPLICATION_STATE_REJECTED: &str = "rejected";
+
 /// Wire tag of `scriptbots_runtime::JournalState::NotRequired`.
 ///
 /// That variant exists precisely "for non-runtime and historical producers", which is
@@ -240,6 +254,111 @@ pub struct CommandStatusDto {
     pub scientific_revision: u64,
 }
 
+/// The two-axis record of what has happened to each submitted command.
+///
+/// Eight instances of one defect were fixed across five surfaces by teaching
+/// each of them to say `admitted` instead of asserting an outcome the host
+/// never acknowledged. That was the right correction, but it left `admitted` as
+/// the END of the road rather than the first step: nothing could ever move a
+/// command past it, so a caller still had no way to learn what actually
+/// happened next (bd-k7nq).
+///
+/// This is the mechanism that lets a receipt advance. It replaces a bare
+/// `HashMap<String, CommandStatusDto>` whose only operation was insert, which
+/// is why nothing could advance: there was no notion of a transition at all,
+/// so there was nothing to call when a command was applied.
+///
+/// TRANSITIONS ARE VALIDATED rather than assumed. `admitted` may become
+/// `applied` or `rejected`; a terminal state may not silently change to
+/// another; an unknown id is refused rather than invented. A ledger that
+/// accepted any write would let a caller report an outcome it had not observed
+/// — the same defect one level down, which is exactly the trap this whole line
+/// of work has been about.
+#[derive(Debug, Default)]
+pub struct CommandLedger {
+    entries: std::collections::HashMap<String, CommandStatusDto>,
+}
+
+/// Why a ledger transition was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LedgerError {
+    /// No command was ever admitted under this id.
+    Unknown(String),
+    /// The command already reached a terminal state.
+    AlreadyTerminal {
+        command_id: String,
+        current: String,
+        attempted: String,
+    },
+}
+
+impl std::fmt::Display for LedgerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(id) => write!(
+                f,
+                "no command was admitted under id `{id}`; a receipt cannot be advanced for a \
+                 command that was never submitted"
+            ),
+            Self::AlreadyTerminal {
+                command_id,
+                current,
+                attempted,
+            } => write!(
+                f,
+                "command `{command_id}` is already `{current}` and cannot become `{attempted}`; \
+                 a terminal outcome is not revisable"
+            ),
+        }
+    }
+}
+
+impl CommandLedger {
+    /// Is this application state one that can no longer change?
+    fn is_terminal(state: &str) -> bool {
+        state == APPLICATION_STATE_APPLIED || state == APPLICATION_STATE_REJECTED
+    }
+
+    /// Record a freshly admitted command.
+    fn admit(&mut self, status: CommandStatusDto) {
+        self.entries.insert(status.command_id.clone(), status);
+    }
+
+    /// The receipt for an id, if one was ever admitted.
+    fn get(&self, command_id: &str) -> Option<&CommandStatusDto> {
+        self.entries.get(command_id)
+    }
+
+    /// Advance a command to a terminal application state.
+    ///
+    /// Returns the updated receipt so a caller reports what the ledger now
+    /// holds rather than what it assumed it would hold.
+    fn resolve(
+        &mut self,
+        command_id: &str,
+        application_state: &str,
+    ) -> Result<CommandStatusDto, LedgerError> {
+        let entry = self
+            .entries
+            .get_mut(command_id)
+            .ok_or_else(|| LedgerError::Unknown(command_id.to_owned()))?;
+        if Self::is_terminal(&entry.application_state) {
+            // Re-reporting the SAME terminal state is a retry, not a conflict:
+            // an applier that replays its report must not be punished for it.
+            if entry.application_state == application_state {
+                return Ok(entry.clone());
+            }
+            return Err(LedgerError::AlreadyTerminal {
+                command_id: command_id.to_owned(),
+                current: entry.application_state.clone(),
+                attempted: application_state.to_owned(),
+            });
+        }
+        entry.application_state = application_state.to_owned();
+        Ok(entry.clone())
+    }
+}
+
 /// Request payload for setting simulation speed multiplier.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SpeedRequest {
@@ -253,7 +372,7 @@ pub struct ControlHandle {
     commands: CommandSender,
     knobs_cache: KnobsCache,
     latest_summary: SharedLatestSummary,
-    status_cache: std::sync::Arc<Mutex<std::collections::HashMap<String, CommandStatusDto>>>,
+    status_cache: std::sync::Arc<Mutex<CommandLedger>>,
     command_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -268,7 +387,7 @@ impl ControlHandle {
             commands,
             knobs_cache: std::sync::Arc::new(Mutex::new(None)),
             latest_summary,
-            status_cache: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            status_cache: std::sync::Arc::new(Mutex::new(CommandLedger::default())),
             command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -787,7 +906,7 @@ impl ControlHandle {
             control_revision: rev,
             scientific_revision: tick,
         };
-        cache.insert(command_id, status.clone());
+        cache.admit(status.clone());
         Ok(status)
     }
 
@@ -800,6 +919,37 @@ impl ControlHandle {
         cmd: ControlCommand,
     ) -> Result<CommandStatusDto, ControlError> {
         self.submit_control_command_with_key(cmd, None)
+    }
+
+    /// Report that a submitted command reached the world.
+    ///
+    /// This is the call that makes `admitted` a first step instead of the end
+    /// of the road. Whatever drains the bus and applies a command is the only
+    /// thing that can honestly say so, so the report comes FROM the applier
+    /// rather than being assumed at submission time — which is the whole
+    /// distinction eight fixes across five surfaces were about (bd-k7nq).
+    ///
+    /// Refuses an unknown id and refuses to revise a terminal outcome, because
+    /// a ledger that accepted any write would let a caller record an outcome it
+    /// never observed. Re-reporting the same terminal state is allowed, so an
+    /// applier that replays its report is not punished for it.
+    pub fn mark_applied(&self, command_id: &str) -> Result<CommandStatusDto, ControlError> {
+        self.resolve_command(command_id, APPLICATION_STATE_APPLIED)
+    }
+
+    /// Report that a submitted command reached the world and was refused there.
+    pub fn mark_rejected(&self, command_id: &str) -> Result<CommandStatusDto, ControlError> {
+        self.resolve_command(command_id, APPLICATION_STATE_REJECTED)
+    }
+
+    fn resolve_command(
+        &self,
+        command_id: &str,
+        application_state: &str,
+    ) -> Result<CommandStatusDto, ControlError> {
+        lock_cache(&self.status_cache)
+            .resolve(command_id, application_state)
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))
     }
 
     /// Submit any control command, optionally keyed for safe retry.
@@ -1726,6 +1876,78 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, 4, "invalid optimistic config command reached queue");
+    }
+
+    /// A receipt can advance from admitted to applied.
+    ///
+    /// This is the guarantee that did not exist before: every prior fix taught
+    /// a surface to say `admitted` honestly, but nothing could move a command
+    /// past it, so a caller had no way to learn what happened next.
+    #[test]
+    fn a_receipt_advances_from_admitted_to_applied() {
+        let (handle, _receiver) = handle();
+        let admitted = handle.pause(None).expect("pause admitted");
+        assert_eq!(admitted.application_state, APPLICATION_STATE_ADMITTED);
+
+        let applied = handle
+            .mark_applied(&admitted.command_id)
+            .expect("the applier reports application");
+        assert_eq!(applied.application_state, APPLICATION_STATE_APPLIED);
+        assert_eq!(
+            applied.command_id, admitted.command_id,
+            "advancing must not mint a new identity"
+        );
+
+        // And the advance is visible to anyone polling the id, which is the
+        // only reason a caller was given an identity in the first place.
+        let polled = handle
+            .command_status(&admitted.command_id)
+            .expect("lookup")
+            .expect("the command is known");
+        assert_eq!(polled.application_state, APPLICATION_STATE_APPLIED);
+    }
+
+    /// A terminal outcome is not revisable, and an unknown id is refused.
+    ///
+    /// Without both, the ledger would let a caller record an outcome it never
+    /// observed — the same defect one level down from the one this whole line
+    /// of work removed from five surfaces.
+    #[test]
+    fn the_ledger_refuses_invented_and_revised_outcomes() {
+        let (handle, _receiver) = handle();
+
+        let unknown = handle.mark_applied("never-submitted");
+        assert!(
+            unknown.is_err(),
+            "a receipt was advanced for a command that was never submitted"
+        );
+
+        let admitted = handle.resume(None).expect("resume admitted");
+        handle
+            .mark_applied(&admitted.command_id)
+            .expect("first report");
+
+        // Replaying the SAME report is a retry, not a conflict.
+        let replay = handle
+            .mark_applied(&admitted.command_id)
+            .expect("an applier replaying its report must not be punished");
+        assert_eq!(replay.application_state, APPLICATION_STATE_APPLIED);
+
+        // Changing a terminal outcome is refused.
+        let contradiction = handle.mark_rejected(&admitted.command_id);
+        assert!(
+            contradiction.is_err(),
+            "an applied command was quietly re-reported as rejected"
+        );
+        assert_eq!(
+            handle
+                .command_status(&admitted.command_id)
+                .expect("lookup")
+                .expect("known")
+                .application_state,
+            APPLICATION_STATE_APPLIED,
+            "the refused write must not have changed the stored outcome"
+        );
     }
 
     /// A keyed retry returns the original receipt and enqueues nothing.
