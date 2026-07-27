@@ -252,6 +252,223 @@ fn assert_test_backend_buffer_evidence(report: &HeadlessReportDto) {
     }
 }
 
+/// Minimal HTTP/1.1 GET over a real socket.
+///
+/// Deliberately hand-rolled rather than adding an HTTP client dependency: the
+/// request under test is a bare GET, and a new third-party dev-dependency is an
+/// operator decision this proof does not need. Returns `(status, headers, body)`.
+fn http_get(
+    addr: std::net::SocketAddr,
+    path: &str,
+) -> Result<(u16, Vec<(String, String)>, String)> {
+    use std::io::{Read, Write};
+
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response: {text:?}"))?;
+    let mut lines = head.lines();
+    let status_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty HTTP response"))?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("no status code in {status_line:?}"))?
+        .parse()?;
+    let headers = lines
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        })
+        .collect();
+    Ok((status, headers, body.to_string()))
+}
+
+/// MOCK-FREE HEADLESS + REST EVIDENCE, end to end.
+///
+/// Nothing here is stubbed: a real world, the real terminal renderer driving real
+/// frames, the real control runtime with a real bound REST listener, and a real
+/// HTTP request over a real socket. The single structured evidence line it prints
+/// is what `scripts/e2e_tui_evidence.sh` gates on.
+///
+/// WHAT THIS PROVES THAT THE UNIT SUITE CANNOT: that the frame the renderer
+/// PUBLISHED is the frame the SERVER SERVED, across a process-internal boundary
+/// that the unit tests reach around. The unit test for the handler feeds it a
+/// buffer directly; this one never touches the slot — the renderer fills it as a
+/// side effect of drawing, and the bytes come back off a socket.
+///
+/// THE NEGATIVE CONTROL IS DELIBERATELY NOT HERE, and the reason is recorded rather
+/// than glossed: "a deliberately broken widget must fail only its expected region"
+/// needs a widget that draws wrongly, and nothing outside the binary can cause that
+/// — every external lever (theme, palette, capability, reduced motion, viewport)
+/// changes the frame LEGITIMATELY. Faking it would require a test-only breakage
+/// hook in production paint code. The localization property is proven at the buffer
+/// level instead, by `a_broken_widget_fails_its_own_region_and_no_others`, which
+/// blanks one panel's rectangle and requires exactly one region hash to move. The
+/// script runs that test as part of this gate so the two halves are executed
+/// together even though they live at different levels.
+#[test]
+#[serial]
+fn tui_evidence_e2e_serves_the_frame_the_renderer_published() -> Result<()> {
+    let _env_guard = ENV_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env guard");
+
+    let frames = 8usize;
+    let seed: u64 = 0x5C81_B075;
+    let report_dir = tempdir()?;
+    let report_path = report_dir.path().join("tui_evidence_report.json");
+
+    let mut env = EnvCleanup::new();
+    env.set("SCRIPTBOTS_TERMINAL_HEADLESS", "1");
+    let frames_env = frames.to_string();
+    env.set("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", &frames_env);
+    let report_env = report_path.to_string_lossy().into_owned();
+    env.set("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT", &report_env);
+
+    let world = WorldState::new(ScriptBotsConfig {
+        // 160/32 and 96/32 both divide: the config refuses a world whose extent is
+        // not a whole number of food cells.
+        food_cell_size: 32,
+        world_width: 160,
+        world_height: 96,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        rng_seed: Some(seed),
+        persistence_interval: 0,
+        ..ScriptBotsConfig::default()
+    })?;
+    let shared_world = Arc::new(Mutex::new(world));
+
+    // Port 0: the OS picks, and the reservation reports what it bound. A fixed port
+    // would collide with whatever else is running on a shared machine.
+    let control_config = ControlServerConfig {
+        rest_enabled: true,
+        rest_address: "127.0.0.1:0".parse()?,
+        mcp_transport: McpTransportConfig::Disabled,
+        ..ControlServerConfig::default()
+    };
+    let reservation = scriptbots_app::ControlServerReservation::prepare(control_config)?;
+    let rest_addr = reservation
+        .rest_address()
+        .ok_or_else(|| anyhow::anyhow!("REST listener was not bound"))?;
+    let (control_runtime, command_drain, command_submit) =
+        reservation.launch(Arc::clone(&shared_world), empty_latest_summary())?;
+
+    let renderer = TerminalRenderer::default();
+    {
+        let context = RendererContext {
+            world: Arc::clone(&shared_world),
+            simulation_step: disabled_step_driver(&shared_world),
+            analytics: AnalyticsSnapshotProvider::empty(),
+            control_runtime: &control_runtime,
+            command_drain,
+            command_submit,
+            scenario: Arc::new(ScenarioIdentityV0::caller_seeded("tui-evidence-e2e")),
+        };
+        renderer.run(context)?;
+    }
+
+    // The runtime is still up: the headless run has finished and published its last
+    // frame, so there is no race between drawing and fetching.
+    let (status, headers, body) = http_get(rest_addr, "/api/screenshot/ascii")?;
+    assert_eq!(
+        status, 200,
+        "the endpoint must serve the presented frame, got {status} with body {body:?}"
+    );
+
+    let report_contents = std::fs::read_to_string(&report_path)?;
+    let report: HeadlessReportDto = serde_json::from_str(&report_contents)?;
+    let last = report
+        .frames
+        .last()
+        .and_then(|frame| frame.buffer.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("headless report retained no buffer evidence"))?;
+
+    let served_size = headers
+        .iter()
+        .find(|(key, _)| key == "x-scriptbots-frame-size")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        served_size,
+        format!("{}x{}", last.viewport_width, last.viewport_height),
+        "the served frame must have the same geometry the report recorded"
+    );
+    // Non-vacuity: an empty body would match an empty expectation.
+    let served_lines = body.lines().count();
+    assert_eq!(
+        served_lines,
+        usize::from(last.viewport_height),
+        "the served text must carry one line per buffer row"
+    );
+    assert!(
+        body.contains("ScriptBots"),
+        "the served frame must contain the HUD header it was drawn with"
+    );
+
+    control_runtime.shutdown()?;
+
+    // The structured evidence line the script gates on. Every field the acceptance
+    // criterion names, so a reviewer can audit the run without re-running it.
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let regions: Vec<String> = last
+        .regions
+        .iter()
+        .map(|region| {
+            format!(
+                "{{\"name\":\"{}\",\"rect\":\"{}x{}+{}+{}\",\"room\":{},\"marker\":{},\"nonblank\":{},\"hash\":\"{}\"}}",
+                region.name,
+                region.width,
+                region.height,
+                region.x,
+                region.y,
+                region.has_room,
+                region.marker_present,
+                region.non_blank_cells,
+                region.fnv1a64
+            )
+        })
+        .collect();
+    println!(
+        "{{\"schema\":\"scriptbots.tui-evidence.v1\",\"seed\":{seed},\"frames\":{frames},\
+         \"viewport\":\"{}x{}\",\"capability_profile\":\"{}\",\"backend\":\"{}\",\
+         \"endpoint\":\"/api/screenshot/ascii\",\"endpoint_status\":{status},\
+         \"report_path\":\"{}\",\"served_bytes\":{},\"served_lines\":{served_lines},\
+         \"full_cell_fnv1a64\":\"{}\",\"region_count\":{},\"regions\":[{}],\
+         \"source_commit\":\"{commit}\"}}",
+        last.viewport_width,
+        last.viewport_height,
+        last.capability_profile,
+        last.backend,
+        report_path.display(),
+        body.len(),
+        last.full_cell_fnv1a64,
+        regions.len(),
+        regions.join(","),
+    );
+
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
