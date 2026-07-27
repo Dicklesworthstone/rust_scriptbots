@@ -287,9 +287,7 @@ pub fn halves_separation(samples: &[(AgentUid, Vec<f32>)]) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archipelago::{
-        ArchipelagoConfig, ArchipelagoMigration, IslandSpec, StepTopology, Topology,
-    };
+    use crate::archipelago::{ArchipelagoConfig, ArchipelagoMigration, IslandSpec, Topology};
     use crate::host_core::HostCoreOptions;
     use crate::migrator::EmigrantSelectionRule;
     use scriptbots_core::{
