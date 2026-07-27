@@ -231,7 +231,8 @@ mod tests {
         writer.write_provenance(&prov).unwrap();
         writer.write_metric_row(9, "population", 12.5).unwrap();
 
-        let mut lines = String::from_utf8(buf).unwrap().lines();
+        let output = String::from_utf8(buf).unwrap();
+        let mut lines = output.lines();
         let envelope: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         let exported = &envelope["provenance"];
         assert_eq!(exported["run_id"], "run-round-trip");
@@ -269,7 +270,8 @@ mod tests {
             .write_event_row("evt-1", 4, "combat", "unicode: π")
             .unwrap();
 
-        let mut lines = String::from_utf8(buf).unwrap().lines();
+        let output = String::from_utf8(buf).unwrap();
+        let mut lines = output.lines();
         let envelope: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(envelope["provenance"]["run_id"], "run-events");
         assert_eq!(
@@ -318,7 +320,8 @@ mod tests {
             )
             .unwrap();
 
-        let mut lines = String::from_utf8(buf).unwrap().lines();
+        let output = String::from_utf8(buf).unwrap();
+        let mut lines = output.lines();
         let provenance: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(
             provenance["provenance"]["source_tree_digest"],
