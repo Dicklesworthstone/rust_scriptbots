@@ -214,9 +214,18 @@ const SCRIPTBOTS_SCHEMA_V10_VERSION: i64 = 10;
 const SCRIPTBOTS_SCHEMA_V11_VERSION: i64 = 11;
 const SCRIPTBOTS_SCHEMA_V12_VERSION: i64 = 12;
 const SCRIPTBOTS_SCHEMA_V13_VERSION: i64 = 13;
+const SCRIPTBOTS_SCHEMA_V14_VERSION: i64 = 14;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 14;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 15;
+
+/// Inclusive upper bound enforced on every `island_id` column by the V15 schema.
+///
+/// `IslandId` is a `u16` in memory, so this is the exact widest value the in-memory type can
+/// present. The database bound is stated in terms of that type rather than as a round number:
+/// a wider value in SQLite could only arrive from a corrupted file or a non-ScriptBots writer,
+/// and it must be refused at the storage boundary rather than truncated on readback.
+pub const SCRIPTBOTS_MAX_ISLAND_ID: i64 = u16::MAX as i64;
 
 /// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
 ///
@@ -1151,7 +1160,304 @@ const SCRIPTBOTS_SCHEMA_V14: &str = r#"
     PRAGMA user_version = 14;
 "#;
 
-const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 9] = [
+/// V15 migration: partition every per-tick table by `island_id`.
+///
+/// WHY THIS IS A REBUILD AND NOT SEVEN `ALTER TABLE ... ADD COLUMN` STATEMENTS. SQLite cannot
+/// alter a primary key. Adding the column alone would leave `tick_summaries` keyed on
+/// `(run_id, tick)`, so a second island closing the same tick still collides — the column
+/// would be present, populated, and useless. Each table is therefore rebuilt, preserving every
+/// CHECK constraint and foreign key exactly. A dropped CHECK here is a silent durability
+/// change, which is why the constraints are transcribed in full rather than abbreviated.
+///
+/// THE REBUILD RENAMES THE OLD TABLE ASIDE AND CREATES THE NEW ONE UNDER THE FINAL NAME, rather
+/// than the more usual create-copy-drop-rename. The order matters and is not cosmetic:
+/// `ALTER TABLE ... RENAME TO` REWRITES the table's stored SQL text, and the rewritten form is
+/// not byte-identical to the statement as written. `storage.recovery_schema` compares schema
+/// objects by a BLAKE3 digest of that text, so a rename-terminated rebuild produces a database
+/// that is structurally correct and refuses its own fingerprint check. Creating under the final
+/// name means the stored text is exactly the text below, and the canonical schema and a real
+/// database agree by construction.
+///
+/// `island_id` IS APPENDED AS THE LAST COLUMN OF EVERY TABLE, deliberately. The V6 scientific
+/// column ORDER is frozen and may only ever be extended —
+/// `v6_scientific_schema_is_only_ever_extended_by_later_migrations` fails the build otherwise,
+/// on the grounds that already-written rows would change meaning. Primary-key column order is
+/// declared independently of physical column order, so the key can still lead with
+/// `(run_id, island_id, ...)` while the column itself sits last. Those are two different
+/// orderings and only one of them is frozen.
+///
+/// ONE SCHEMA, ONE CODE PATH. A single-world run is an archipelago of one at `island_id = 0`,
+/// which is what the `DEFAULT 0` and the `SELECT ..., 0` backfill encode. There is deliberately
+/// no parallel set of `island_*` tables: that would double every analytics query forever.
+///
+/// THE UNIQUE INDEXES MATTER AS MUCH AS THE PRIMARY KEYS, and they are the part a
+/// tick-collision test cannot see. Every island mints `AgentUid`, `spawn_ordinal` and
+/// `birth_ordinal` from its own private counter (bd-8jlj), so island 1's agent 1 is refused by
+/// `births_run_agent_uid_unique` at a DIFFERENT tick from island 0's agent 1. All four
+/// run-scoped unique indexes on `births` and `deaths` are lifted to include `island_id`;
+/// `crates/scriptbots-storage/src/lib.rs` tests pin both failure modes.
+///
+/// NON-UNIQUE INDEXES ARE PRESERVED VERBATIM. They are lookup accelerators, not correctness
+/// constraints, and rewriting their column order would change query plans across the analytics
+/// surface for no correctness gain. Per-island locality for those is a measured decision that
+/// belongs with the reporting work in bd-16g.5.5, not smuggled into a durability migration.
+///
+/// TABLES DELIBERATELY OUT OF SCOPE, recorded so their absence is a decision rather than an
+/// oversight: `run_events` is per-tick and keyed `(run_id, tick, kind, metric)`, so it has the
+/// same latent collision, but it backs the `run_events_fts` external-content search index whose
+/// `content_rowid` binding does not survive a table rebuild — retiring and rebuilding that FTS
+/// table is its own migration (see the V11/V12 split, which exists for exactly this reason).
+/// `interactions` and `domain_events` are likewise per-tick. None of the three is reachable by
+/// an archipelago write path today. They are tracked on bd-16g.5.5 rather than fixed blind here.
+const SCRIPTBOTS_SCHEMA_V15: &str = r#"
+    ALTER TABLE tick_summaries RENAME TO tick_summaries_pre_v15;
+    CREATE TABLE tick_summaries (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        epoch INTEGER NOT NULL CHECK (epoch >= 0),
+        closed INTEGER NOT NULL CHECK (closed IN (0, 1)),
+        agent_count INTEGER NOT NULL CHECK (agent_count >= 0),
+        births INTEGER NOT NULL CHECK (births >= 0),
+        deaths INTEGER NOT NULL CHECK (deaths >= 0),
+        total_energy REAL NOT NULL,
+        average_energy REAL NOT NULL,
+        average_health REAL NOT NULL,
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 65535),
+        PRIMARY KEY (run_id, island_id, tick),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO tick_summaries (
+        run_id, tick, epoch, closed, agent_count, births, deaths,
+        total_energy, average_energy, average_health, island_id
+    )
+    SELECT run_id, tick, epoch, closed, agent_count, births, deaths,
+           total_energy, average_energy, average_health, 0
+    FROM tick_summaries_pre_v15;
+    DROP TABLE tick_summaries_pre_v15;
+
+    ALTER TABLE metrics RENAME TO metrics_pre_v15;
+    CREATE TABLE metrics (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        name TEXT NOT NULL CHECK (name <> ''),
+        value REAL NOT NULL,
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 65535),
+        PRIMARY KEY (run_id, island_id, tick, name),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO metrics (run_id, tick, name, value, island_id)
+    SELECT run_id, tick, name, value, 0 FROM metrics_pre_v15;
+    DROP TABLE metrics_pre_v15;
+    CREATE INDEX metrics_run_name_tick_index ON metrics (run_id, name, tick);
+
+    ALTER TABLE events RENAME TO events_pre_v15;
+    CREATE TABLE events (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        kind TEXT NOT NULL CHECK (kind <> ''),
+        count INTEGER NOT NULL CHECK (count >= 0),
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 65535),
+        PRIMARY KEY (run_id, island_id, tick, kind),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO events (run_id, tick, kind, count, island_id)
+    SELECT run_id, tick, kind, count, 0 FROM events_pre_v15;
+    DROP TABLE events_pre_v15;
+    CREATE INDEX events_run_kind_tick_index ON events (run_id, kind, tick);
+
+    ALTER TABLE replay_events RENAME TO replay_events_pre_v15;
+    CREATE TABLE replay_events (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        agent_uid INTEGER CHECK (agent_uid IS NULL OR agent_uid >= 0),
+        scope TEXT NOT NULL CHECK (scope <> ''),
+        event_type TEXT NOT NULL CHECK (event_type <> ''),
+        payload TEXT NOT NULL,
+        position_x REAL,
+        position_y REAL,
+        counterpart_uid INTEGER,
+        counterpart_position_x REAL,
+        counterpart_position_y REAL,
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 65535),
+        PRIMARY KEY (run_id, island_id, tick, seq),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO replay_events (
+        run_id, tick, seq, agent_uid, scope, event_type, payload,
+        position_x, position_y, counterpart_uid,
+        counterpart_position_x, counterpart_position_y, island_id
+    )
+    SELECT run_id, tick, seq, agent_uid, scope, event_type, payload,
+           position_x, position_y, counterpart_uid,
+           counterpart_position_x, counterpart_position_y, 0
+    FROM replay_events_pre_v15;
+    DROP TABLE replay_events_pre_v15;
+    CREATE INDEX replay_events_run_agent_tick_index
+        ON replay_events (run_id, agent_uid, tick, seq);
+
+    ALTER TABLE agents RENAME TO agents_pre_v15;
+    CREATE TABLE agents (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        age INTEGER NOT NULL CHECK (age >= 0),
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        velocity_x REAL NOT NULL,
+        velocity_y REAL NOT NULL,
+        heading REAL NOT NULL,
+        health REAL NOT NULL,
+        energy REAL NOT NULL,
+        color_r REAL NOT NULL,
+        color_g REAL NOT NULL,
+        color_b REAL NOT NULL,
+        spike_length REAL NOT NULL,
+        boost INTEGER NOT NULL CHECK (boost IN (0, 1)),
+        herbivore_tendency REAL NOT NULL,
+        sound_multiplier REAL NOT NULL,
+        reproduction_counter REAL NOT NULL,
+        mutation_rate_primary REAL NOT NULL,
+        mutation_rate_secondary REAL NOT NULL,
+        trait_smell REAL NOT NULL,
+        trait_sound REAL NOT NULL,
+        trait_hearing REAL NOT NULL,
+        trait_eye REAL NOT NULL,
+        trait_blood REAL NOT NULL,
+        give_intent REAL NOT NULL,
+        brain_binding TEXT NOT NULL,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        food_delta REAL NOT NULL,
+        spiked INTEGER NOT NULL CHECK (spiked IN (0, 1)),
+        hybrid INTEGER NOT NULL CHECK (hybrid IN (0, 1)),
+        sound_output REAL NOT NULL,
+        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
+        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
+        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
+        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
+        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
+        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 65535),
+        PRIMARY KEY (run_id, island_id, tick, agent_uid),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO agents (
+        run_id, tick, agent_uid, generation, age, position_x, position_y,
+        velocity_x, velocity_y, heading, health, energy, color_r, color_g, color_b,
+        spike_length, boost, herbivore_tendency, sound_multiplier, reproduction_counter,
+        mutation_rate_primary, mutation_rate_secondary, trait_smell, trait_sound,
+        trait_hearing, trait_eye, trait_blood, give_intent, brain_binding, brain_key,
+        food_delta, spiked, hybrid, sound_output, spike_attacker, spike_victim,
+        hit_carnivore, hit_herbivore, hit_by_carnivore, hit_by_herbivore, island_id
+    )
+    SELECT run_id, tick, agent_uid, generation, age, position_x, position_y,
+           velocity_x, velocity_y, heading, health, energy, color_r, color_g, color_b,
+           spike_length, boost, herbivore_tendency, sound_multiplier, reproduction_counter,
+           mutation_rate_primary, mutation_rate_secondary, trait_smell, trait_sound,
+           trait_hearing, trait_eye, trait_blood, give_intent, brain_binding, brain_key,
+           food_delta, spiked, hybrid, sound_output, spike_attacker, spike_victim,
+           hit_carnivore, hit_herbivore, hit_by_carnivore, hit_by_herbivore, 0
+    FROM agents_pre_v15;
+    DROP TABLE agents_pre_v15;
+    CREATE INDEX agents_run_agent_tick_index ON agents (run_id, agent_uid, tick);
+
+    ALTER TABLE births RENAME TO births_pre_v15;
+    CREATE TABLE births (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
+        birth_ordinal INTEGER CHECK (birth_ordinal IS NULL OR birth_ordinal >= 0),
+        parent_a INTEGER CHECK (parent_a IS NULL OR parent_a >= 0),
+        parent_b INTEGER CHECK (parent_b IS NULL OR parent_b >= 0),
+        brain_kind TEXT,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        herbivore_tendency REAL NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
+        origin TEXT NOT NULL CHECK (origin IN ('born', 'seeded', 'injected')),
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 65535),
+        CHECK (origin <> 'seeded' OR tick = 0),
+        CHECK (
+            (origin = 'born' AND birth_ordinal IS NOT NULL)
+            OR (origin IN ('seeded', 'injected') AND birth_ordinal IS NULL)
+        ),
+        PRIMARY KEY (run_id, island_id, tick, agent_uid),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO births (
+        run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+        parent_a, parent_b, brain_kind, brain_key, herbivore_tendency, generation,
+        position_x, position_y, is_hybrid, origin, island_id
+    )
+    SELECT run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+           parent_a, parent_b, brain_kind, brain_key, herbivore_tendency, generation,
+           position_x, position_y, is_hybrid, origin, 0
+    FROM births_pre_v15;
+    DROP TABLE births_pre_v15;
+    CREATE UNIQUE INDEX births_run_agent_uid_unique
+        ON births (run_id, island_id, agent_uid);
+    CREATE UNIQUE INDEX births_run_spawn_ordinal_unique
+        ON births (run_id, island_id, spawn_ordinal);
+    CREATE UNIQUE INDEX births_run_birth_ordinal_unique
+        ON births (run_id, island_id, birth_ordinal);
+    CREATE INDEX births_run_parent_a_tick_index ON births (run_id, parent_a, tick);
+    CREATE INDEX births_run_parent_b_tick_index ON births (run_id, parent_b, tick);
+
+    ALTER TABLE deaths RENAME TO deaths_pre_v15;
+    CREATE TABLE deaths (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        age INTEGER NOT NULL CHECK (age >= 0),
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        herbivore_tendency REAL NOT NULL,
+        brain_kind TEXT,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        energy REAL NOT NULL,
+        food_balance_total REAL NOT NULL,
+        cause TEXT NOT NULL CHECK (cause <> ''),
+        was_hybrid INTEGER NOT NULL CHECK (was_hybrid IN (0, 1)),
+        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
+        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
+        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
+        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
+        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
+        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 65535),
+        PRIMARY KEY (run_id, island_id, tick, agent_uid),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO deaths (
+        run_id, tick, agent_uid, age, generation, herbivore_tendency,
+        brain_kind, brain_key, energy, food_balance_total, cause, was_hybrid,
+        spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
+        hit_by_carnivore, hit_by_herbivore, island_id
+    )
+    SELECT run_id, tick, agent_uid, age, generation, herbivore_tendency,
+           brain_kind, brain_key, energy, food_balance_total, cause, was_hybrid,
+           spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
+           hit_by_carnivore, hit_by_herbivore, 0
+    FROM deaths_pre_v15;
+    DROP TABLE deaths_pre_v15;
+    CREATE UNIQUE INDEX deaths_run_agent_uid_unique
+        ON deaths (run_id, island_id, agent_uid);
+    CREATE INDEX deaths_run_cause_tick_index ON deaths (run_id, cause, tick);
+
+    PRAGMA user_version = 15;
+"#;
+
+const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 10] = [
     (
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         "create_multi_run_schema",
@@ -1193,9 +1499,14 @@ const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 9] = [
         SCRIPTBOTS_SCHEMA_V13,
     ),
     (
-        SCRIPTBOTS_SCHEMA_VERSION,
+        SCRIPTBOTS_SCHEMA_V14_VERSION,
         "add_narrative_input_replay_contract",
         SCRIPTBOTS_SCHEMA_V14,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_VERSION,
+        "partition_per_tick_tables_by_island",
+        SCRIPTBOTS_SCHEMA_V15,
     ),
 ];
 
@@ -1335,7 +1646,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
     // Every suffix of the chain is a legal lineage: a database joins at whatever version it
     // was left at and runs forward from there. Enumerated rather than computed so that adding
     // a migration without extending this list fails loudly instead of accepting a gap.
-    const LINEAGE: [i64; 9] = [
+    const LINEAGE: [i64; 10] = [
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         SCRIPTBOTS_SCHEMA_V7_VERSION,
         SCRIPTBOTS_SCHEMA_V8_VERSION,
@@ -1344,6 +1655,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
         SCRIPTBOTS_SCHEMA_V11_VERSION,
         SCRIPTBOTS_SCHEMA_V12_VERSION,
         SCRIPTBOTS_SCHEMA_V13_VERSION,
+        SCRIPTBOTS_SCHEMA_V14_VERSION,
         SCRIPTBOTS_SCHEMA_VERSION,
     ];
     let applied_is_valid = result.applied.is_empty()
@@ -23424,8 +23736,12 @@ mod tests {
             ),
             (SCRIPTBOTS_SCHEMA_V13_VERSION, "add_durable_command_claims"),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V14_VERSION,
                 "add_narrative_input_replay_contract",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "partition_per_tick_tables_by_island",
             ),
         ];
         assert_eq!(migrations.len(), expected.len());
@@ -23487,11 +23803,7 @@ mod tests {
             decode(&record, 2, "host_command_records.host_session_id")?;
         let expected_envelope: String =
             decode(&record, 3, "host_command_records.envelope_postcard_hex")?;
-        connection.execute_batch(
-            "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version >= 13;
-             PRAGMA user_version = 12;",
-        )?;
+        downgrade_to_exact_v12(&connection)?;
         assert_eq!(
             read_schema_objects(&connection)?,
             canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?,
@@ -23573,11 +23885,7 @@ mod tests {
         );
 
         let connection = Connection::open(&path_string)?;
-        connection.execute_batch(
-            "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version >= 13;
-             PRAGMA user_version = 12;",
-        )?;
+        downgrade_to_exact_v12(&connection)?;
         assert_eq!(
             read_schema_objects(&connection)?,
             canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?
@@ -23625,11 +23933,7 @@ mod tests {
         );
 
         let connection = Connection::open(&path_string)?;
-        connection.execute_batch(
-            "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version >= 13;
-             PRAGMA user_version = 12;",
-        )?;
+        downgrade_to_exact_v12(&connection)?;
         assert_eq!(
             read_schema_objects(&connection)?,
             canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?,
@@ -23663,12 +23967,9 @@ mod tests {
         drop_fault_host(pipeline, core, frontend);
 
         let connection = Connection::open(&path_string)?;
-        connection.execute_batch(
-            "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version >= 13;
-             PRAGMA user_version = 12;
-             UPDATE host_command_records SET envelope_postcard_hex = '00';",
-        )?;
+        connection
+            .execute_batch("UPDATE host_command_records SET envelope_postcard_hex = '00';")?;
+        downgrade_to_exact_v12(&connection)?;
         assert_eq!(
             read_schema_objects(&connection)?,
             canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?,
@@ -23703,10 +24004,7 @@ mod tests {
 
         let connection = Connection::open(&path_string)?;
         connection.execute_batch(
-            "DROP TABLE host_command_claims;
-             DELETE FROM _schema_migrations WHERE version >= 13;
-             PRAGMA user_version = 12;
-             PRAGMA foreign_keys = OFF;
+            "PRAGMA foreign_keys = OFF;
              INSERT INTO host_command_records
              SELECT
                  run_id, '0000000000000514', command_id,
@@ -23721,6 +24019,7 @@ mod tests {
              FROM host_command_records
              LIMIT 1;",
         )?;
+        downgrade_to_exact_v12(&connection)?;
         assert_eq!(
             read_schema_objects(&connection)?,
             canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?,
@@ -24474,7 +24773,7 @@ mod tests {
 
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 9);
+        assert_eq!(migrations.len(), 10);
         for (index, (expected_version, expected_name)) in [
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
@@ -24499,8 +24798,12 @@ mod tests {
             ),
             (SCRIPTBOTS_SCHEMA_V13_VERSION, "add_durable_command_claims"),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V14_VERSION,
                 "add_narrative_input_replay_contract",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "partition_per_tick_tables_by_island",
             ),
         ]
         .into_iter()
@@ -25034,6 +25337,219 @@ mod tests {
         Ok(())
     }
 
+    /// The per-tick tables V15 partitions by `island_id`, in migration order.
+    const V15_PARTITIONED_TABLES: [&str; 7] = [
+        "tick_summaries",
+        "metrics",
+        "events",
+        "replay_events",
+        "agents",
+        "births",
+        "deaths",
+    ];
+
+    /// Restores the seven V15-partitioned tables to their exact pre-V15 shape.
+    ///
+    /// The command-authority recovery fixtures build a V12 database by taking a current-schema
+    /// database and removing what V13 added. That shortcut was only ever valid because V13 and
+    /// V14 were additive — V13 added one table and V14 was a no-op version bump — so "current
+    /// minus host_command_claims" really was V12. V15 is the first STRUCTURAL migration since
+    /// V12, and it invalidates the shortcut: the seven per-tick tables keep their lifted primary
+    /// keys and their `island_id` column, so the result is not a V12 database and must not be
+    /// asserted to be one.
+    ///
+    /// Rather than hand-transcribe seven pre-V15 table definitions — which would be a second
+    /// copy of the DDL, free to drift from the real one — this replays the canonical V12 objects
+    /// themselves. The fixture is therefore byte-exact by construction and stays correct through
+    /// any later migration, because it is derived from the same migration chain it is compared
+    /// against.
+    ///
+    /// Rows are CARRIED DOWN, not discarded. An earlier version of this helper asserted the
+    /// seven tables were empty on the reasoning that these fixtures exercise command authority;
+    /// the assertion fired, because a driven `Step` command does close a tick and write a
+    /// `tick_summaries` row. The assertion is what turned a wrong assumption into a failure
+    /// instead of a silently truncated fixture, and the helper now preserves the rows.
+    ///
+    /// `island_id` is the LAST column of every V15 table — the V6 scientific column order is
+    /// frozen and only ever appended to, which `v6_scientific_schema_is_only_ever_extended_by_
+    /// later_migrations` enforces — so the pre-V15 column list is exactly the current list with
+    /// `island_id` removed. It is read back from the database rather than transcribed, so this
+    /// cannot drift from the real schema.
+    fn downgrade_per_tick_tables_to_v12(
+        connection: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V12_VERSION)?;
+        for table in V15_PARTITIONED_TABLES {
+            let carried = connection
+                .query(&format!(
+                    "SELECT name FROM pragma_table_info('{table}')
+                     WHERE name <> 'island_id' ORDER BY cid ASC"
+                ))?
+                .iter()
+                .map(|row| decode::<String>(row, 0, "pragma_table_info.name"))
+                .collect::<Result<Vec<String>, StorageError>>()?
+                .join(", ");
+            let aside = format!("{table}_pre_v12");
+            connection.execute(&format!("ALTER TABLE {table} RENAME TO {aside}"))?;
+            if table == "replay_events" {
+                // replay_events is the one table whose canonical V12 text is not the text of a
+                // CREATE: V10 added five columns by ALTER, and the engine's ALTER rewrite is not
+                // byte-identical to re-executing the resulting statement. Replaying the stored
+                // text would therefore leave a table that is structurally right and textually
+                // different, which the schema fingerprint compares and refuses. So the
+                // CONSTRUCTION is replayed rather than the text: the pre-V10 shape, then the
+                // same five ALTERs.
+                for object in canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V9_VERSION)? {
+                    if object.table_name == table
+                        && object.object_type == "table"
+                        && let Some(sql) = object.sql.as_deref()
+                    {
+                        connection.execute(sql)?;
+                    }
+                }
+                for column in [
+                    "position_x REAL",
+                    "position_y REAL",
+                    "counterpart_uid INTEGER",
+                    "counterpart_position_x REAL",
+                    "counterpart_position_y REAL",
+                ] {
+                    connection
+                        .execute(&format!("ALTER TABLE replay_events ADD COLUMN {column}"))?;
+                }
+            } else {
+                for object in &canonical {
+                    if object.table_name == table
+                        && object.object_type == "table"
+                        && let Some(sql) = object.sql.as_deref()
+                    {
+                        connection.execute(sql)?;
+                    }
+                }
+            }
+            connection.execute(&format!(
+                "INSERT INTO {table} ({carried}) SELECT {carried} FROM {aside}"
+            ))?;
+            // Dropped before the indexes are recreated: the renamed table still owns the V15
+            // index names, and creating the V12 ones first would collide.
+            connection.execute(&format!("DROP TABLE {aside}"))?;
+            for object in &canonical {
+                if object.table_name == table
+                    && object.object_type == "index"
+                    && let Some(sql) = object.sql.as_deref()
+                {
+                    connection.execute(sql)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes everything V13 and V15 added, leaving an exact V12 database.
+    fn downgrade_to_exact_v12(connection: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+        connection.execute_batch(
+            "DROP TABLE host_command_claims;
+             DELETE FROM _schema_migrations WHERE version >= 13;
+             PRAGMA user_version = 12;",
+        )?;
+        downgrade_per_tick_tables_to_v12(connection)
+    }
+
+    /// Writes one row into every V15-partitioned table for a single island at a single tick.
+    ///
+    /// The payload values are keyed off `island` so that a migration or write path which
+    /// collapsed the partition would show up as colliding data rather than as rows that merely
+    /// happen to be indistinguishable.
+    fn insert_island_row_set(
+        connection: &Connection,
+        run_id: RunId,
+        island: i64,
+        tick: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let run = sqlite_run_id(run_id);
+        connection.execute_with_params(
+            "INSERT INTO tick_summaries (
+                run_id, island_id, tick, epoch, closed, agent_count, births, deaths,
+                total_energy, average_energy, average_health
+             ) VALUES (?1, ?2, ?3, 0, 1, ?4, 0, 0, 0.0, 0.0, 0.0)",
+            &[run.clone(), island.into(), tick.into(), (island + 1).into()],
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO metrics (run_id, island_id, tick, name, value)
+             VALUES (?1, ?2, ?3, 'population', ?4)",
+            &[
+                run.clone(),
+                island.into(),
+                tick.into(),
+                f64::from(i32::try_from(island)?).into(),
+            ],
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO events (run_id, island_id, tick, kind, count)
+             VALUES (?1, ?2, ?3, 'birth', ?4)",
+            &[run.clone(), island.into(), tick.into(), (island + 1).into()],
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO replay_events (
+                run_id, island_id, tick, seq, agent_uid, scope, event_type, payload
+             ) VALUES (?1, ?2, ?3, 0, 1, 'world', 'digest', '{}')",
+            &[run.clone(), island.into(), tick.into()],
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO agents (
+                run_id, island_id, tick, agent_uid, generation, age,
+                position_x, position_y, velocity_x, velocity_y, heading, health, energy,
+                color_r, color_g, color_b, spike_length, boost, herbivore_tendency,
+                sound_multiplier, reproduction_counter, mutation_rate_primary,
+                mutation_rate_secondary, trait_smell, trait_sound, trait_hearing, trait_eye,
+                trait_blood, give_intent, brain_binding, brain_key, food_delta, spiked,
+                hybrid, sound_output, spike_attacker, spike_victim, hit_carnivore,
+                hit_herbivore, hit_by_carnivore, hit_by_herbivore
+             ) VALUES (
+                ?1, ?2, ?3, 1, 0, 0,
+                ?4, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0,
+                0.0, 0.0, 0.0, 0.0, 0, 0.5,
+                1.0, 0.0, 0.1,
+                0.1, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 'legacy', NULL, 0.0, 0,
+                0, 0.0, 0, 0, 0,
+                0, 0, 0
+             )",
+            &[
+                run.clone(),
+                island.into(),
+                tick.into(),
+                f64::from(i32::try_from(island)?).into(),
+            ],
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO births (
+                run_id, island_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+                herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+             ) VALUES (?1, ?2, ?3, 1, 0, 0, 0.5, 0, ?4, 0.0, 0, 'born')",
+            &[
+                run.clone(),
+                island.into(),
+                tick.into(),
+                f64::from(i32::try_from(island)?).into(),
+            ],
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO deaths (
+                run_id, island_id, tick, agent_uid, age, generation, herbivore_tendency,
+                energy, food_balance_total, cause, was_hybrid, spike_attacker, spike_victim,
+                hit_carnivore, hit_herbivore, hit_by_carnivore, hit_by_herbivore
+             ) VALUES (?1, ?2, ?3, 2, 1, 0, 0.5, ?4, 0.0, 'starved', 0, 0, 0, 0, 0, 0, 0)",
+            &[
+                run,
+                island.into(),
+                tick.into(),
+                f64::from(i32::try_from(island)?).into(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Registers a minimal run row so per-tick tables satisfy their `run_id` foreign key.
     fn register_bare_run(
         connection: &Connection,
@@ -25059,97 +25575,202 @@ mod tests {
         Ok(())
     }
 
-    /// Characterizes the V14 schema's single-world assumption at `tick_summaries`.
+    /// Every V15-partitioned table accepts all eight islands at one tick.
     ///
-    /// bd-8djh: an archipelago closes the same tick once per island, and the V14 primary
-    /// key `(run_id, tick)` has no room for that. This pins the exact before-state and is
-    /// expected to go RED the moment the V15 island_id lift lands, which is what forces it
-    /// to be rewritten into the post-migration assertion rather than silently left behind.
+    /// bd-8djh. This is the test that fails on the V14 schema and is the reason V15 exists:
+    /// an archipelago closes the same tick once per island, and `PRIMARY KEY (run_id, tick)`
+    /// had no room for that, so eight islands collided at the very first tick rather than at
+    /// the first barrier.
+    ///
+    /// The assertions deliberately go past "the column exists and is populated". A write path
+    /// that stored ONE island for every row would satisfy that, and would certify against the
+    /// exact bug the column was added to catch. So each table must show
+    /// `COUNT(DISTINCT island_id)` equal to the island count — not `>= 1` — and the shared tick
+    /// must carry a row for EVERY island, which is what proves the primary-key lift rather
+    /// than that islands happened to write at different ticks.
     #[test]
-    fn v14_tick_summaries_cannot_hold_two_islands_at_one_tick()
+    fn v15_every_partitioned_table_holds_all_islands_at_one_tick()
     -> Result<(), Box<dyn std::error::Error>> {
+        const ISLANDS: i64 = 8;
+        const SHARED_TICK: i64 = 1;
+
         let connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&connection)?;
         connection.execute("PRAGMA foreign_keys = ON")?;
         let run = RunId::new(21);
         register_bare_run(&connection, run)?;
 
-        // The root cause, asserted rather than narrated: there is no column in which a
-        // tick summary could record which island it describes.
-        let island_id_columns: i64 = connection
+        for island in 0..ISLANDS {
+            insert_island_row_set(&connection, run, island, SHARED_TICK)?;
+        }
+
+        for table in V15_PARTITIONED_TABLES {
+            let distinct_islands: i64 = connection
+                .query_row_with_params(
+                    &format!("SELECT COUNT(DISTINCT island_id) FROM {table} WHERE run_id = ?1"),
+                    &[sqlite_run_id(run)],
+                )?
+                .get_typed(0)?;
+            assert_eq!(
+                distinct_islands, ISLANDS,
+                "{table} must distinguish all {ISLANDS} islands; a table that stored one \
+                 island for every row would still be 'present and populated' and would \
+                 certify against the collision island_id exists to prevent"
+            );
+
+            let islands_at_shared_tick: i64 = connection
+                .query_row_with_params(
+                    &format!(
+                        "SELECT COUNT(DISTINCT island_id) FROM {table}
+                         WHERE run_id = ?1 AND tick = ?2"
+                    ),
+                    &[sqlite_run_id(run), SHARED_TICK.into()],
+                )?
+                .get_typed(0)?;
+            assert_eq!(
+                islands_at_shared_tick, ISLANDS,
+                "{table} must carry every island at the SAME tick; islands writing at \
+                 different ticks would pass a weaker check without the primary key ever \
+                 having been lifted"
+            );
+        }
+
+        connection.close()?;
+        Ok(())
+    }
+
+    /// A pre-V15 single-world database reads back as an archipelago of one.
+    ///
+    /// bd-8djh requires that the migration be non-destructive for existing rows and that a
+    /// single-world run simply BE island 0 — one schema, one code path, rather than an
+    /// "archipelago mode" fork of the storage layer.
+    #[test]
+    fn v15_migration_lands_pre_existing_single_world_rows_on_island_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        // Stop at V14 so the rows below are written by the genuine pre-migration schema
+        // rather than into an already-partitioned table.
+        scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_V14_VERSION).run(&connection)?;
+        let run = RunId::new(23);
+        register_bare_run(&connection, run)?;
+
+        let pre_migration_columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('tick_summaries')
                  WHERE name = 'island_id'",
             )?
             .get_typed(0)?;
         assert_eq!(
-            island_id_columns, 0,
-            "tick_summaries already carries island_id; \
-             this characterization is stale and the V15 assertions should replace it"
+            pre_migration_columns, 0,
+            "the fixture must be written against a genuinely pre-V15 tick_summaries"
         );
 
-        let summary_sql = "INSERT INTO tick_summaries (
+        connection.execute_with_params(
+            "INSERT INTO tick_summaries (
                 run_id, tick, epoch, closed, agent_count, births, deaths,
                 total_energy, average_energy, average_health
-             ) VALUES (?1, ?2, 0, 1, ?3, 0, 0, 0.0, 0.0, 0.0)";
-
-        // Island 0 closes tick 1 carrying 10 agents.
-        connection.execute_with_params(
-            summary_sql,
-            &[sqlite_run_id(run), 1_i64.into(), 10_i64.into()],
+             ) VALUES (?1, 7, 0, 1, 42, 0, 0, 1.5, 0.5, 0.25)",
+            &[sqlite_run_id(run)],
         )?;
 
-        // Island 1 closes the SAME tick carrying a different population. Under an
-        // island-aware schema this is an ordinary second row; under V14 it is a
-        // primary-key collision at the very first tick, not at the first barrier.
-        let collision = connection
-            .execute_with_params(
-                summary_sql,
-                &[sqlite_run_id(run), 1_i64.into(), 20_i64.into()],
-            )
-            .expect_err("V14 tick_summaries accepted two islands at one tick");
-        let message = collision.to_string();
-        assert!(
-            message.contains("UNIQUE constraint failed: tick_summaries.run_id, tick"),
-            "the refusal must be attributable to the (run_id, tick) primary key itself, \
-             not merely to some uniqueness failure, got: {message}"
-        );
+        install_scriptbots_schema(&connection)?;
 
-        // CONTROL, so the refusal above is attributed to the tick collision and not merely
-        // to the row being second: the identical island-1 payload at a different tick is
-        // accepted. Without this, a schema that rejected every second insert for any
-        // reason would satisfy the assertion above.
-        connection.execute_with_params(
-            summary_sql,
-            &[sqlite_run_id(run), 2_i64.into(), 20_i64.into()],
+        let row = connection.query_row_with_params(
+            "SELECT island_id, agent_count, total_energy FROM tick_summaries
+             WHERE run_id = ?1 AND tick = 7",
+            &[sqlite_run_id(run)],
         )?;
-
-        // What survives is island 0's summary alone: island 1's tick-1 population has
-        // nowhere in this schema to live.
-        let stored_at_tick_one: i64 = connection
-            .query_row_with_params(
-                "SELECT agent_count FROM tick_summaries WHERE run_id = ?1 AND tick = 1",
-                &[sqlite_run_id(run)],
-            )?
-            .get_typed(0)?;
         assert_eq!(
-            stored_at_tick_one, 10,
-            "island 1's tick-1 summary displaced island 0's instead of being refused"
+            decode::<i64>(&row, 0, "tick_summaries.island_id")?,
+            0,
+            "a pre-existing single-world row must migrate onto island 0"
+        );
+        // The payload is asserted alongside the island, so a migration that silently
+        // dropped or defaulted the row's science would fail here rather than pass on the
+        // strength of the island_id alone.
+        assert_eq!(decode::<i64>(&row, 1, "tick_summaries.agent_count")?, 42);
+        assert!(
+            (decode::<f64>(&row, 2, "tick_summaries.total_energy")? - 1.5).abs() < f64::EPSILON,
+            "the migration must carry the original measurement across the table rebuild"
         );
 
         connection.close()?;
         Ok(())
     }
 
-    /// Characterizes the V14 `births` unique indexes against per-island UID counters.
-    ///
-    /// bd-8djh: every island mints `AgentUid` from its own private counter (bd-8jlj), so
-    /// island 0 and island 1 both hold `AgentUid(1)` for different organisms. Because the
-    /// three `births` unique indexes are scoped to `run_id` ALONE, the second island is
-    /// refused at a DIFFERENT tick — which means lifting the primary keys alone does not
-    /// make eight islands writable, and a tick-collision test cannot see this at all.
+    /// `island_id` round-trips the full `u16` domain and refuses anything outside it.
     #[test]
-    fn v14_births_unique_indexes_reject_a_second_island_at_a_different_tick()
+    fn v15_island_id_round_trips_the_u16_domain_and_bounds_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        install_scriptbots_schema(&connection)?;
+        connection.execute("PRAGMA foreign_keys = ON")?;
+        let run = RunId::new(24);
+        register_bare_run(&connection, run)?;
+
+        let summary_sql = "INSERT INTO tick_summaries (
+                run_id, island_id, tick, epoch, closed, agent_count, births, deaths,
+                total_energy, average_energy, average_health
+             ) VALUES (?1, ?2, ?3, 0, 1, 0, 0, 0, 0.0, 0.0, 0.0)";
+
+        // The widest island an in-memory u16 can present must survive the SQLite boundary
+        // exactly, with no truncation and no panic on readback.
+        connection.execute_with_params(
+            summary_sql,
+            &[
+                sqlite_run_id(run),
+                SCRIPTBOTS_MAX_ISLAND_ID.into(),
+                1_i64.into(),
+            ],
+        )?;
+        let stored: i64 = connection
+            .query_row_with_params(
+                "SELECT island_id FROM tick_summaries WHERE run_id = ?1 AND tick = 1",
+                &[sqlite_run_id(run)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(stored, SCRIPTBOTS_MAX_ISLAND_ID);
+        assert_eq!(
+            u16::try_from(stored)?,
+            u16::MAX,
+            "the stored bound must narrow back to the in-memory IslandId type exactly"
+        );
+
+        for rejected in [-1_i64, SCRIPTBOTS_MAX_ISLAND_ID + 1] {
+            let refusal = connection
+                .execute_with_params(
+                    summary_sql,
+                    &[sqlite_run_id(run), rejected.into(), 2_i64.into()],
+                )
+                .expect_err("an island_id outside the u16 domain was accepted");
+            assert!(
+                refusal.to_string().contains("CHECK constraint failed"),
+                "island_id {rejected} must be refused by the CHECK constraint at the \
+                 database boundary rather than truncated on readback, got: {refusal}"
+            );
+        }
+
+        connection.close()?;
+        Ok(())
+    }
+
+    /// Per-island `births`/`deaths` counters coexist, and stay unique WITHIN an island.
+    ///
+    /// bd-8djh. This is the obstacle a primary-key test structurally cannot see. Every island
+    /// mints `AgentUid`, `spawn_ordinal` and `birth_ordinal` from its own private counter
+    /// (bd-8jlj), so island 0 and island 1 both hold `AgentUid(1)` for different organisms.
+    /// Under V14 all four unique indexes on `births` and `deaths` were scoped to `run_id`
+    /// ALONE, so island 1's agent 1 was refused at a DIFFERENT tick from island 0's — meaning
+    /// lifting the primary keys alone would not have made eight islands writable, and a
+    /// tick-collision test would have reported success anyway.
+    ///
+    /// BOTH DIRECTIONS ARE ASSERTED, because only one of them is about the fix. That the
+    /// cross-island insert is now accepted shows the indexes were lifted; that the SAME-island
+    /// reuse is still refused shows they were lifted rather than weakened into uselessness.
+    /// Widening a uniqueness constraint until the test passes is its own way of claiming more
+    /// than was observed, and the second half is what refuses it.
+    #[test]
+    fn v15_births_and_deaths_scope_their_unique_counters_per_island()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&connection)?;
@@ -25158,15 +25779,21 @@ mod tests {
         register_bare_run(&connection, run)?;
 
         let born_sql = "INSERT INTO births (
-                run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+                run_id, island_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
                 herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 0.5, 0, 1.0, 2.0, 0, 'born')";
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0.5, 0, 1.0, 2.0, 0, 'born')";
+        let died_sql = "INSERT INTO deaths (
+                run_id, island_id, tick, agent_uid, age, generation, herbivore_tendency,
+                energy, food_balance_total, cause, was_hybrid, spike_attacker, spike_victim,
+                hit_carnivore, hit_herbivore, hit_by_carnivore, hit_by_herbivore
+             ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0.5, 1.0, 0.0, 'starved', 0, 0, 0, 0, 0, 0, 0)";
 
         // Island 0's first native birth: uid 1, spawn 0, birth 0, at tick 5.
         connection.execute_with_params(
             born_sql,
             &[
                 sqlite_run_id(run),
+                0_i64.into(),
                 5_i64.into(),
                 1_i64.into(),
                 0_i64.into(),
@@ -25174,96 +25801,109 @@ mod tests {
             ],
         )?;
 
-        // Island 1's first native birth lands at a DIFFERENT tick, so the primary key
-        // (run_id, tick, agent_uid) is distinct and cannot be what refuses it. Its spawn
-        // and birth ordinals are deliberately unique here so that agent_uid is the ONLY
-        // constraint left to fire, and the failure is attributable to one index.
-        let uid_collision = connection
-            .execute_with_params(
-                born_sql,
-                &[
-                    sqlite_run_id(run),
-                    9_i64.into(),
-                    1_i64.into(),
-                    7_i64.into(),
-                    7_i64.into(),
-                ],
-            )
-            .expect_err("V14 births accepted the same agent_uid from a second island");
-        let uid_message = uid_collision.to_string();
-        assert!(
-            uid_message.contains("UNIQUE constraint failed: births.run_id, agent_uid"),
-            "the refusal must name agent_uid, so it is attributable to \
-             births_run_agent_uid_unique rather than to any other index, got: {uid_message}"
-        );
-
-        // The same holds for the per-island spawn counter, on its own index: a distinct
-        // uid at a distinct tick is still refused when spawn_ordinal repeats.
-        let spawn_collision = connection
-            .execute_with_params(
-                born_sql,
-                &[
-                    sqlite_run_id(run),
-                    9_i64.into(),
-                    2_i64.into(),
-                    0_i64.into(),
-                    8_i64.into(),
-                ],
-            )
-            .expect_err("V14 births accepted a repeated spawn_ordinal from a second island");
-        assert!(
-            spawn_collision
-                .to_string()
-                .contains("UNIQUE constraint failed: births.run_id, spawn_ordinal"),
-            "the refusal must name spawn_ordinal, so it is attributable to \
-             births_run_spawn_ordinal_unique, got: {spawn_collision}"
-        );
-
-        // And for the demographic birth counter.
-        let birth_collision = connection
-            .execute_with_params(
-                born_sql,
-                &[
-                    sqlite_run_id(run),
-                    9_i64.into(),
-                    3_i64.into(),
-                    9_i64.into(),
-                    0_i64.into(),
-                ],
-            )
-            .expect_err("V14 births accepted a repeated birth_ordinal from a second island");
-        assert!(
-            birth_collision
-                .to_string()
-                .contains("UNIQUE constraint failed: births.run_id, birth_ordinal"),
-            "the refusal must name birth_ordinal, so it is attributable to \
-             births_run_birth_ordinal_unique, got: {birth_collision}"
-        );
-
-        // CONTROL: island 1's birth is accepted once every run-scoped counter is distinct.
-        // This is what makes the three refusals above evidence about the COUNTERS rather
-        // than about the row being second, and it is the assertion that fails first if a
-        // future change makes births reject inserts for some unrelated reason.
+        // Island 1's first native birth reuses EVERY per-island counter value and lands at a
+        // DIFFERENT tick, so the lifted primary key is provably not what admits it — only the
+        // lifted unique indexes can.
         connection.execute_with_params(
             born_sql,
             &[
                 sqlite_run_id(run),
+                1_i64.into(),
                 9_i64.into(),
-                4_i64.into(),
-                4_i64.into(),
-                4_i64.into(),
+                1_i64.into(),
+                0_i64.into(),
+                0_i64.into(),
             ],
         )?;
-        let stored: i64 = connection
-            .query_row_with_params(
-                "SELECT COUNT(*) FROM births WHERE run_id = ?1",
-                &[sqlite_run_id(run)],
-            )?
-            .get_typed(0)?;
-        assert_eq!(
-            stored, 2,
-            "exactly island 0's birth and the distinct-counter control should have landed"
+
+        // The same organism identity dying on each island.
+        connection.execute_with_params(
+            died_sql,
+            &[sqlite_run_id(run), 0_i64.into(), 6_i64.into(), 1_i64.into()],
+        )?;
+        connection.execute_with_params(
+            died_sql,
+            &[
+                sqlite_run_id(run),
+                1_i64.into(),
+                11_i64.into(),
+                1_i64.into(),
+            ],
+        )?;
+
+        // The indexes still enforce uniqueness WITHIN an island. Each of these repeats one
+        // counter on island 0 at a fresh tick, so the primary key is distinct and the named
+        // index is the only thing that can refuse it.
+        for (label, params, expected) in [
+            (
+                "agent_uid",
+                [2_i64, 1, 90, 91],
+                "UNIQUE constraint failed: births.run_id, island_id, agent_uid",
+            ),
+            (
+                "spawn_ordinal",
+                [3, 92, 0, 93],
+                "UNIQUE constraint failed: births.run_id, island_id, spawn_ordinal",
+            ),
+            (
+                "birth_ordinal",
+                [4, 94, 95, 0],
+                "UNIQUE constraint failed: births.run_id, island_id, birth_ordinal",
+            ),
+        ] {
+            let refusal = connection
+                .execute_with_params(
+                    born_sql,
+                    &[
+                        sqlite_run_id(run),
+                        0_i64.into(),
+                        params[0].into(),
+                        params[1].into(),
+                        params[2].into(),
+                        params[3].into(),
+                    ],
+                )
+                .expect_err(&format!(
+                    "island 0 accepted a repeated {label}; the unique index was widened \
+                     into uselessness rather than scoped per island"
+                ));
+            assert!(
+                refusal.to_string().contains(expected),
+                "the {label} refusal must be attributable to its own lifted index, \
+                 got: {refusal}"
+            );
+        }
+
+        let death_refusal = connection
+            .execute_with_params(
+                died_sql,
+                &[
+                    sqlite_run_id(run),
+                    0_i64.into(),
+                    96_i64.into(),
+                    1_i64.into(),
+                ],
+            )
+            .expect_err("island 0 accepted a repeated death agent_uid");
+        assert!(
+            death_refusal
+                .to_string()
+                .contains("UNIQUE constraint failed: deaths.run_id, island_id, agent_uid"),
+            "got: {death_refusal}"
         );
+
+        for (table, expected) in [("births", 2_i64), ("deaths", 2)] {
+            let stored: i64 = connection
+                .query_row_with_params(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1"),
+                    &[sqlite_run_id(run)],
+                )?
+                .get_typed(0)?;
+            assert_eq!(
+                stored, expected,
+                "{table} must hold exactly one row per island and no refused row"
+            );
+        }
 
         connection.close()?;
         Ok(())
@@ -25356,7 +25996,8 @@ mod tests {
                 (11, 'drop_external_content_narrative_search', 'forged'),
                 (12, 'create_plain_content_narrative_search', 'forged'),
                 (13, 'add_durable_command_claims', 'forged'),
-                (14, 'add_narrative_input_replay_contract', 'forged');
+                (14, 'add_narrative_input_replay_contract', 'forged'),
+                (15, 'partition_per_tick_tables_by_island', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -25366,7 +26007,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 14;",
+             PRAGMA user_version = 15;",
         )?;
         connection.close()?;
 
