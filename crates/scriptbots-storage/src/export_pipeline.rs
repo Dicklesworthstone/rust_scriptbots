@@ -44,6 +44,29 @@ pub struct EventExportWriter<W: Write> {
     format: ExportFormat,
 }
 
+/// Shared bounded JSONL writer for the remaining identity-oriented core tables.
+pub struct CoreTableExportWriter<W: Write> {
+    writer: W,
+}
+
+impl<W: Write> CoreTableExportWriter<W> {
+    pub fn new(writer: W) -> Self {
+        Self { writer }
+    }
+
+    pub fn write_provenance(&mut self, prov: &ExportProvenance) -> std::io::Result<()> {
+        let json = serde_json::to_string(prov).unwrap_or_default();
+        writeln!(self.writer, "{{\"provenance\":{json}}}")
+    }
+
+    pub fn write_row(&mut self, table: &str, row: &serde_json::Value) -> std::io::Result<()> {
+        let mut envelope = serde_json::Map::new();
+        envelope.insert("table".into(), serde_json::Value::String(table.into()));
+        envelope.insert("row".into(), row.clone());
+        writeln!(self.writer, "{}", serde_json::Value::Object(envelope))
+    }
+}
+
 impl<W: Write> EventExportWriter<W> {
     pub fn new(writer: W, format: ExportFormat) -> Self {
         Self { writer, format }
@@ -261,5 +284,54 @@ mod tests {
         assert_eq!(row["event_id"], "evt-1");
         assert_eq!(row["kind"], "combat");
         assert_eq!(row["payload"], "unicode: π");
+    }
+
+    #[test]
+    fn jsonl_core_tables_round_trip_shared_provenance_envelope() {
+        let mut buf = Vec::new();
+        let mut writer = CoreTableExportWriter::new(&mut buf);
+        let prov = ExportProvenance {
+            run_id: "run-core".into(),
+            seed: 19,
+            config_digest: "blake3:core-config".into(),
+            source_revision: "git:core".into(),
+            source_tree_digest: "blake3:core-tree".into(),
+            authority_decisions: vec!["durable_watermark:12".into()],
+            conservation_tolerances: None,
+            schema_version: 1,
+            exported_at_utc: "2026-07-27T00:00:00Z".into(),
+        };
+        writer.write_provenance(&prov).unwrap();
+        writer
+            .write_row("run", &serde_json::json!({"run_id":"run-core","tick":12}))
+            .unwrap();
+        writer
+            .write_row(
+                "agent",
+                &serde_json::json!({"agent_id":"a-1","run_id":"run-core"}),
+            )
+            .unwrap();
+        writer
+            .write_row(
+                "lineage",
+                &serde_json::json!({"child":"a-1","parent":"a-0"}),
+            )
+            .unwrap();
+
+        let mut lines = String::from_utf8(buf).unwrap().lines();
+        let provenance: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(
+            provenance["provenance"]["source_tree_digest"],
+            "blake3:core-tree"
+        );
+        for (table, key, value) in [
+            ("run", "run_id", "run-core"),
+            ("agent", "agent_id", "a-1"),
+            ("lineage", "child", "a-1"),
+        ] {
+            let exported: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+            assert_eq!(exported["table"], table);
+            assert_eq!(exported["row"][key], value);
+        }
     }
 }
