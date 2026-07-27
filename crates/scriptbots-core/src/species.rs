@@ -797,6 +797,208 @@ fn compare_cohort_pairs(
     comparisons
 }
 
+// ---------------------------------------------------------------------------
+// bd-16g.3: speciation / extinction / radiation events, and the hint gate.
+//
+// Segmentation already produces a deterministic SpeciesTable per sample. What was
+// missing is the TIMELINE: which species appeared, which vanished, and which
+// exploded -- the three things a reader of an evolution run actually asks about.
+//
+// The events are derived from two adjacent tables rather than recorded as a side
+// effect of clustering, so they cannot drift from the tables they describe. Same
+// two tables in, same events out, always.
+// ---------------------------------------------------------------------------
+
+/// What happened to a species between two segmentation samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhylogenyEventKind {
+    /// A species ID appeared that was not present in the previous sample.
+    Speciation,
+    /// A species ID present in the previous sample is gone.
+    Extinction,
+    /// A surviving species grew by at least [`RADIATION_GROWTH_FACTOR`].
+    Radiation,
+}
+
+/// Growth multiple that counts as a radiation.
+///
+/// Deliberately coarse. A radiation is meant to mark "this clade took over", not
+/// every upward wobble; a threshold low enough to fire on noise would bury the
+/// genuine events, which is the same alarm-fatigue argument the detector family
+/// makes elsewhere.
+pub const RADIATION_GROWTH_FACTOR: f64 = 3.0;
+
+/// Minimum membership before growth can be called a radiation.
+///
+/// Without a floor, one member becoming three is a 3x "radiation". Small-number
+/// ratios are the classic way a threshold on growth turns into noise.
+pub const RADIATION_MIN_MEMBERS: usize = 4;
+
+/// One entry in the phylogeny timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhylogenyEvent {
+    /// Tick of the sample in which the change was observed.
+    pub tick: Tick,
+    /// What happened.
+    pub kind: PhylogenyEventKind,
+    /// Which species.
+    pub species: SpeciesId,
+    /// The species' deterministic name, carried so a consumer need not re-join.
+    pub name: String,
+    /// Founder UIDs, so a reader can jump straight to the ancestry DAG.
+    pub founders: Vec<AgentUid>,
+    /// Members in the previous sample; zero for a speciation.
+    pub members_before: usize,
+    /// Members in this sample; zero for an extinction.
+    pub members_after: usize,
+}
+
+/// Derive the phylogeny timeline between two adjacent segmentation samples.
+///
+/// Ordering is by `(kind, species id)`, total and independent of table iteration,
+/// so the same pair of samples always yields byte-identical events. The parent
+/// bead requires a byte-identical species/event list for a given seed, and an
+/// unstable order would defeat that before any of the science mattered.
+#[must_use]
+pub fn diff_species_tables(before: &SpeciesTable, after: &SpeciesTable) -> Vec<PhylogenyEvent> {
+    let mut events = Vec::new();
+
+    for species in &after.species {
+        let previous = before.species.iter().find(|s| s.id == species.id);
+        match previous {
+            None => events.push(PhylogenyEvent {
+                tick: after.tick,
+                kind: PhylogenyEventKind::Speciation,
+                species: species.id,
+                name: species.name.clone(),
+                founders: species.founders.clone(),
+                members_before: 0,
+                members_after: species.members.len(),
+            }),
+            Some(prev) => {
+                let grew = species.members.len() >= RADIATION_MIN_MEMBERS
+                    && prev.members.len() >= 1
+                    && species.members.len() as f64
+                        >= prev.members.len() as f64 * RADIATION_GROWTH_FACTOR;
+                if grew {
+                    events.push(PhylogenyEvent {
+                        tick: after.tick,
+                        kind: PhylogenyEventKind::Radiation,
+                        species: species.id,
+                        name: species.name.clone(),
+                        founders: species.founders.clone(),
+                        members_before: prev.members.len(),
+                        members_after: species.members.len(),
+                    });
+                }
+            }
+        }
+    }
+
+    for species in &before.species {
+        if !after.species.iter().any(|s| s.id == species.id) {
+            events.push(PhylogenyEvent {
+                tick: after.tick,
+                kind: PhylogenyEventKind::Extinction,
+                species: species.id,
+                name: species.name.clone(),
+                founders: species.founders.clone(),
+                members_before: species.members.len(),
+                members_after: 0,
+            });
+        }
+    }
+
+    events.sort_by(|a, b| {
+        (a.kind as u8)
+            .cmp(&(b.kind as u8))
+            .then(a.species.0.cmp(&b.species.0))
+    });
+    events
+}
+
+/// A bimodality hint from the detector kernel, reduced to what this gate needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeciationHint {
+    /// Tick the hint was observed at.
+    pub tick: Tick,
+}
+
+/// The outcome of reconciling speciation events against detector hints.
+///
+/// Every hint lands in exactly one bucket. That total accounting is the point:
+/// the parent bead requires each hint to be "either confirmed or explicitly
+/// rejected", and a reconciliation that silently dropped unmatched hints would
+/// report perfect agreement by discarding its own counter-evidence.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HintReconciliation {
+    /// Speciations that had a hint inside the window.
+    pub confirmed: Vec<SpeciesId>,
+    /// Speciations with NO preceding hint. The detector missed these.
+    pub unhinted: Vec<SpeciesId>,
+    /// Hints that no speciation followed. Explicitly rejected, never dropped.
+    pub rejected_hints: Vec<Tick>,
+}
+
+impl HintReconciliation {
+    /// Every hint is accounted for exactly once.
+    #[must_use]
+    pub fn accounts_for_all_hints(&self, hint_count: usize) -> bool {
+        self.confirmed.len() + self.rejected_hints.len() == hint_count
+    }
+}
+
+/// Cross-validate speciation events against preceding bimodality hints.
+///
+/// A hint confirms a speciation when it falls in `(event_tick - window, event_tick]`
+/// -- strictly BEFORE or at the event, never after. A hint that follows the split it
+/// supposedly predicted is not evidence for it, and accepting one would let the gate
+/// congratulate itself on hindsight.
+///
+/// Each hint is consumed by at most one speciation, so two speciations cannot both
+/// claim the same piece of evidence.
+#[must_use]
+pub fn reconcile_speciation_with_hints(
+    events: &[PhylogenyEvent],
+    hints: &[SpeciationHint],
+    window: u64,
+) -> HintReconciliation {
+    let mut out = HintReconciliation::default();
+    let mut used = vec![false; hints.len()];
+
+    let mut speciations: Vec<&PhylogenyEvent> = events
+        .iter()
+        .filter(|e| e.kind == PhylogenyEventKind::Speciation)
+        .collect();
+    speciations.sort_by_key(|e| (e.tick.0, e.species.0));
+
+    for event in speciations {
+        let matched = hints.iter().enumerate().position(|(index, hint)| {
+            !used[index]
+                && hint.tick.0 <= event.tick.0
+                && event.tick.0.saturating_sub(hint.tick.0) <= window
+        });
+        match matched {
+            Some(index) => {
+                used[index] = true;
+                out.confirmed.push(event.species);
+            }
+            None => out.unhinted.push(event.species),
+        }
+    }
+
+    for (index, hint) in hints.iter().enumerate() {
+        if !used[index] {
+            out.rejected_hints.push(hint.tick);
+        }
+    }
+
+    out.confirmed.sort_by_key(|id| id.0);
+    out.unhinted.sort_by_key(|id| id.0);
+    out.rejected_hints.sort_by_key(|tick| tick.0);
+    out
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1262,5 +1464,220 @@ mod tests {
             ],
             "effect-size keys must be emitted in a fixed order"
         );
+    }
+
+    // ---- bd-16g.3: phylogeny events and the hint gate ----
+
+    fn sp(id: u64, name: &str, members: usize, tick: u64) -> Species {
+        Species {
+            id: SpeciesId(id),
+            name: name.to_owned(),
+            founders: vec![AgentUid(id * 100)],
+            members: (0..members)
+                .map(|i| AgentUid(id * 1000 + i as u64))
+                .collect(),
+            centroid: vec![0.0],
+            spread: 0.0,
+            first_tick: Tick(tick),
+            last_seen_tick: Tick(tick),
+        }
+    }
+
+    fn table(tick: u64, species: Vec<Species>) -> SpeciesTable {
+        SpeciesTable {
+            tick: Tick(tick),
+            next_id: SpeciesId(species.len() as u64 + 1),
+            species,
+        }
+    }
+
+    /// The three event kinds must be derived from adjacent tables, not guessed.
+    #[test]
+    fn bd_16g_3_diff_emits_speciation_extinction_and_radiation() {
+        let before = table(10, vec![sp(1, "Alpha-1", 10, 0), sp(2, "Beta-2", 6, 0)]);
+        // 1 survives unchanged, 2 vanishes, 3 appears, 4 appears then would radiate.
+        let after = table(20, vec![sp(1, "Alpha-1", 10, 0), sp(3, "Gamma-3", 5, 20)]);
+        let events = diff_species_tables(&before, &after);
+
+        let kinds: Vec<_> = events.iter().map(|e| (e.kind, e.species.0)).collect();
+        assert!(
+            kinds.contains(&(PhylogenyEventKind::Speciation, 3)),
+            "a new species id must emit a speciation: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(PhylogenyEventKind::Extinction, 2)),
+            "a vanished species id must emit an extinction: {kinds:?}"
+        );
+        assert!(
+            !kinds
+                .iter()
+                .any(|(k, id)| *id == 1 && *k != PhylogenyEventKind::Radiation),
+            "an unchanged species must not emit speciation or extinction: {kinds:?}"
+        );
+
+        let extinction = events
+            .iter()
+            .find(|e| e.kind == PhylogenyEventKind::Extinction)
+            .expect("extinction present");
+        assert_eq!(
+            extinction.members_before, 6,
+            "extinction must carry the last size"
+        );
+        assert_eq!(extinction.members_after, 0);
+        assert_eq!(
+            extinction.tick,
+            Tick(20),
+            "events are stamped with the observing sample"
+        );
+        assert!(
+            !extinction.founders.is_empty(),
+            "founders let a reader reach the DAG"
+        );
+    }
+
+    /// Radiation needs both a growth multiple AND a floor.
+    ///
+    /// Without the floor, one member becoming three is a "3x radiation" -- the classic
+    /// way a ratio threshold turns into noise on small numbers.
+    #[test]
+    fn bd_16g_3_radiation_requires_a_size_floor_not_just_a_ratio() {
+        // 1 -> 3 is 3x but below the floor: not a radiation.
+        let small_before = table(0, vec![sp(1, "Alpha-1", 1, 0)]);
+        let small_after = table(1, vec![sp(1, "Alpha-1", 3, 0)]);
+        assert!(
+            diff_species_tables(&small_before, &small_after).is_empty(),
+            "a 1 -> 3 wobble is not a radiation"
+        );
+
+        // 5 -> 20 clears both.
+        let big_before = table(0, vec![sp(1, "Alpha-1", 5, 0)]);
+        let big_after = table(1, vec![sp(1, "Alpha-1", 20, 0)]);
+        let events = diff_species_tables(&big_before, &big_after);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, PhylogenyEventKind::Radiation);
+        assert_eq!(events[0].members_before, 5);
+        assert_eq!(events[0].members_after, 20);
+    }
+
+    /// Same tables in, byte-identical events out, regardless of table ordering.
+    #[test]
+    fn bd_16g_3_event_emission_is_deterministic() {
+        let before = table(0, vec![sp(1, "Alpha-1", 4, 0), sp(2, "Beta-2", 4, 0)]);
+        let after = table(5, vec![sp(3, "Gamma-3", 4, 5), sp(4, "Delta-4", 4, 5)]);
+        let first = diff_species_tables(&before, &after);
+
+        let mut reordered_before = before.clone();
+        reordered_before.species.reverse();
+        let mut reordered_after = after.clone();
+        reordered_after.species.reverse();
+        let second = diff_species_tables(&reordered_before, &reordered_after);
+
+        assert_eq!(
+            first, second,
+            "event order must not depend on table iteration order"
+        );
+        assert!(!first.is_empty());
+    }
+
+    /// THE GATE: every hint is confirmed or explicitly rejected, never dropped.
+    ///
+    /// bd-16g.3's acceptance requires each speciation to have a preceding hint and each
+    /// hint to be resolved either way. A reconciliation that silently discarded unmatched
+    /// hints would report perfect agreement by throwing away its own counter-evidence,
+    /// which is the failure this gate exists to make impossible.
+    #[test]
+    fn bd_16g_3_hint_reconciliation_accounts_for_every_hint() {
+        let events = vec![
+            PhylogenyEvent {
+                tick: Tick(100),
+                kind: PhylogenyEventKind::Speciation,
+                species: SpeciesId(1),
+                name: "Alpha-1".to_owned(),
+                founders: vec![AgentUid(1)],
+                members_before: 0,
+                members_after: 5,
+            },
+            PhylogenyEvent {
+                tick: Tick(200),
+                kind: PhylogenyEventKind::Speciation,
+                species: SpeciesId(2),
+                name: "Beta-2".to_owned(),
+                founders: vec![AgentUid(2)],
+                members_before: 0,
+                members_after: 5,
+            },
+        ];
+        let hints = vec![
+            SpeciationHint { tick: Tick(90) },  // confirms species 1
+            SpeciationHint { tick: Tick(500) }, // follows nothing -> rejected
+        ];
+
+        let out = reconcile_speciation_with_hints(&events, &hints, 50);
+        assert_eq!(
+            out.confirmed,
+            vec![SpeciesId(1)],
+            "hint at 90 confirms the split at 100"
+        );
+        assert_eq!(
+            out.unhinted,
+            vec![SpeciesId(2)],
+            "the split at 200 had no hint and must be named"
+        );
+        assert_eq!(
+            out.rejected_hints,
+            vec![Tick(500)],
+            "an unmatched hint is rejected, not dropped"
+        );
+        assert!(
+            out.accounts_for_all_hints(hints.len()),
+            "every hint must land in exactly one bucket"
+        );
+    }
+
+    /// A hint AFTER the split is not evidence for it.
+    ///
+    /// Accepting one would let the gate congratulate itself on hindsight: the detector
+    /// would get credit for predicting something it only noticed afterwards.
+    #[test]
+    fn bd_16g_3_a_hint_after_the_split_does_not_confirm_it() {
+        let events = vec![PhylogenyEvent {
+            tick: Tick(100),
+            kind: PhylogenyEventKind::Speciation,
+            species: SpeciesId(1),
+            name: "Alpha-1".to_owned(),
+            founders: vec![AgentUid(1)],
+            members_before: 0,
+            members_after: 5,
+        }];
+        let hints = vec![SpeciationHint { tick: Tick(120) }];
+        let out = reconcile_speciation_with_hints(&events, &hints, 50);
+        assert!(out.confirmed.is_empty(), "hindsight is not prediction");
+        assert_eq!(out.unhinted, vec![SpeciesId(1)]);
+        assert_eq!(out.rejected_hints, vec![Tick(120)]);
+        assert!(out.accounts_for_all_hints(hints.len()));
+    }
+
+    /// One hint cannot confirm two speciations.
+    #[test]
+    fn bd_16g_3_a_hint_is_consumed_by_at_most_one_speciation() {
+        let mk = |tick: u64, id: u64| PhylogenyEvent {
+            tick: Tick(tick),
+            kind: PhylogenyEventKind::Speciation,
+            species: SpeciesId(id),
+            name: format!("S-{id}"),
+            founders: vec![AgentUid(id)],
+            members_before: 0,
+            members_after: 5,
+        };
+        let events = vec![mk(100, 1), mk(101, 2)];
+        let hints = vec![SpeciationHint { tick: Tick(95) }];
+        let out = reconcile_speciation_with_hints(&events, &hints, 50);
+        assert_eq!(out.confirmed.len(), 1, "one hint, one confirmation");
+        assert_eq!(
+            out.unhinted.len(),
+            1,
+            "the second split is unhinted, not co-credited"
+        );
+        assert!(out.accounts_for_all_hints(hints.len()));
     }
 }
