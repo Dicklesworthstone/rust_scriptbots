@@ -123,10 +123,10 @@ impl CommandPalette {
         let filtered = self.filtered_entries();
         if let Some(entry) = filtered.get(self.selected_index) {
             match entry.command {
-                ControlCommand::Pause => Some(handle.pause()),
-                ControlCommand::Resume => Some(handle.resume()),
+                ControlCommand::Pause => Some(handle.pause(None)),
+                ControlCommand::Resume => Some(handle.resume(None)),
                 ControlCommand::Step => Some(handle.step()),
-                ControlCommand::SetSpeed(s) => Some(handle.set_speed(s)),
+                ControlCommand::SetSpeed(s) => Some(handle.set_speed(s, None)),
                 ControlCommand::Shutdown => Some(handle.shutdown()),
                 _ => None,
             }

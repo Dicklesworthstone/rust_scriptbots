@@ -368,8 +368,12 @@ impl ControlHandle {
     pub fn update_selection(
         &self,
         update: SelectionUpdate,
+        idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
-        self.submit_control_command(ControlCommand::UpdateSelection(update))
+        self.submit_control_command_with_key(
+            ControlCommand::UpdateSelection(update),
+            idempotency_key,
+        )
     }
 
     /// Enqueue step commands for the simulation driver to advance `count` ticks.
@@ -679,13 +683,13 @@ impl ControlHandle {
     }
 
     /// Pause simulation ticks.
-    pub fn pause(&self) -> Result<CommandStatusDto, ControlError> {
-        self.submit_control_command(ControlCommand::Pause)
+    pub fn pause(&self, idempotency_key: Option<&str>) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command_with_key(ControlCommand::Pause, idempotency_key)
     }
 
     /// Resume simulation ticks.
-    pub fn resume(&self) -> Result<CommandStatusDto, ControlError> {
-        self.submit_control_command(ControlCommand::Resume)
+    pub fn resume(&self, idempotency_key: Option<&str>) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command_with_key(ControlCommand::Resume, idempotency_key)
     }
 
     /// Step simulation by one tick.
@@ -694,13 +698,17 @@ impl ControlHandle {
     }
 
     /// Set simulation playback speed multiplier.
-    pub fn set_speed(&self, speed: f32) -> Result<CommandStatusDto, ControlError> {
+    pub fn set_speed(
+        &self,
+        speed: f32,
+        idempotency_key: Option<&str>,
+    ) -> Result<CommandStatusDto, ControlError> {
         if !speed.is_finite() || speed < 0.0 {
             return Err(ControlError::InvalidPatch(
                 "invalid speed multiplier".into(),
             ));
         }
-        self.submit_control_command(ControlCommand::SetSpeed(speed))
+        self.submit_control_command_with_key(ControlCommand::SetSpeed(speed), idempotency_key)
     }
 
     /// Issue graceful shutdown command.
@@ -1260,7 +1268,7 @@ mod tests {
 
         let before = handle.list_knobs().expect("knobs list before poisoning");
         assert!(!before.is_empty(), "config must flatten to some knobs");
-        let issued = handle.pause().expect("pause command accepted");
+        let issued = handle.pause(None).expect("pause command accepted");
 
         let knobs_poisoner = Arc::clone(&handle.knobs_cache);
         let _ = std::thread::spawn(move || {
@@ -1292,7 +1300,7 @@ mod tests {
             .expect("the issued command is cached");
         assert_eq!(looked_up.command_id, issued.command_id);
         // Writes recover too: a later command must still land in the status cache.
-        let next = handle.resume().expect("resume command accepted");
+        let next = handle.resume(None).expect("resume command accepted");
         assert!(
             handle
                 .command_status(&next.command_id)
@@ -1690,11 +1698,14 @@ mod tests {
         let (handle, receiver) = handle();
         for _ in 0..4 {
             handle
-                .update_selection(SelectionUpdate {
-                    mode: SelectionMode::Clear,
-                    agent_ids: Vec::new(),
-                    state: SelectionState::None,
-                })
+                .update_selection(
+                    SelectionUpdate {
+                        mode: SelectionMode::Clear,
+                        agent_ids: Vec::new(),
+                        state: SelectionState::None,
+                    },
+                    None,
+                )
                 .expect("fill bounded command queue");
         }
 
@@ -1825,8 +1836,12 @@ mod tests {
             state: SelectionState::None,
         };
 
-        let first = handle.update_selection(update()).expect("first selection");
-        let second = handle.update_selection(update()).expect("second selection");
+        let first = handle
+            .update_selection(update(), None)
+            .expect("first selection");
+        let second = handle
+            .update_selection(update(), None)
+            .expect("second selection");
 
         assert_ne!(
             first.command_id, second.command_id,
@@ -1896,11 +1911,14 @@ mod tests {
             id.data().as_ffi()
         };
         handle
-            .update_selection(SelectionUpdate {
-                mode: SelectionMode::Replace,
-                agent_ids: vec![raw_id],
-                state: SelectionState::Selected,
-            })
+            .update_selection(
+                SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![raw_id],
+                    state: SelectionState::Selected,
+                },
+                None,
+            )
             .expect("enqueue selection command");
 
         let mut world = handle.lock_world().expect("world lock");
@@ -1914,20 +1932,20 @@ mod tests {
     fn control_commands_generate_status_dtos_and_lookup() {
         let (handle, receiver) = handle();
 
-        let status_pause = handle.pause().expect("pause command");
+        let status_pause = handle.pause(None).expect("pause command");
         // Enqueueing proves admission order, nothing more: the driver has not drained
         // this command and the legacy bus journals nothing (bd-f65w).
         assert_eq!(status_pause.application_state, APPLICATION_STATE_ADMITTED);
         assert_eq!(status_pause.journal_state, JOURNAL_STATE_NOT_REQUIRED);
         assert!(status_pause.command_id.starts_with("cmd-"));
 
-        let status_resume = handle.resume().expect("resume command");
+        let status_resume = handle.resume(None).expect("resume command");
         assert_ne!(status_pause.command_id, status_resume.command_id);
 
         let status_step = handle.step().expect("step command");
         assert_eq!(status_step.application_state, APPLICATION_STATE_ADMITTED);
 
-        let status_speed = handle.set_speed(2.5).expect("speed command");
+        let status_speed = handle.set_speed(2.5, None).expect("speed command");
         assert_eq!(status_speed.application_state, APPLICATION_STATE_ADMITTED);
 
         while receiver.try_recv().is_ok() {}
@@ -1948,7 +1966,7 @@ mod tests {
         assert!(non_existent.is_none());
 
         let err = handle
-            .set_speed(-1.0)
+            .set_speed(-1.0, None)
             .expect_err("negative speed must fail");
         assert!(matches!(err, ControlError::InvalidPatch(_)));
     }

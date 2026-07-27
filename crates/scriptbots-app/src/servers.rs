@@ -14,7 +14,7 @@ use axum::response::sse::{Event, Sse};
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -1286,19 +1286,40 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         let text_str = text.trim();
-                        if text_str.eq_ignore_ascii_case("pause") {
-                            let _ = handle.pause();
+                        // Every branch REPORTS its receipt. These four used to
+                        // discard it with `let _ =`, so a websocket client sent
+                        // "pause" and received nothing at all - no receipt, no
+                        // error, no acknowledgement of any kind. It is the same
+                        // class the other transports were cleared of, on a
+                        // surface that is not even listed in the migration
+                        // acceptance criteria alongside CLI/REST/MCP/SSE/NDJSON
+                        // (bd-k7nq).
+                        let outcome = if text_str.eq_ignore_ascii_case("pause") {
+                            Some(handle.pause(None))
                         } else if text_str.eq_ignore_ascii_case("resume") {
-                            let _ = handle.resume();
+                            Some(handle.resume(None))
                         } else if text_str.eq_ignore_ascii_case("step") {
-                            let _ = handle.step();
+                            Some(handle.step())
                         } else if let Ok(json) = serde_json::from_str::<Value>(text_str) {
-                            if let Some(cmd) = json.get("command").and_then(|c| c.as_str()) {
-                                if cmd == "speed" {
-                                    if let Some(speed) = json.get("speed").and_then(|s| s.as_f64()) {
-                                        let _ = handle.set_speed(speed as f32);
-                                    }
-                                }
+                            match json.get("command").and_then(|c| c.as_str()) {
+                                Some("speed") => json
+                                    .get("speed")
+                                    .and_then(|s| s.as_f64())
+                                    .map(|speed| handle.set_speed(speed as f32, None)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(result) = outcome {
+                            let payload = match result {
+                                Ok(status) => serde_json::json!({"receipt": status}),
+                                Err(error) => serde_json::json!({"error": error.to_string()}),
+                            };
+                            if let Ok(text) = serde_json::to_string(&payload)
+                                && socket.send(WsMessage::Text(text.into())).await.is_err()
+                            {
+                                break;
                             }
                         }
                     }
@@ -1531,8 +1552,10 @@ async fn get_agents_debug(
 )]
 async fn post_selection(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(body): Json<SelectionUpdateRequestBody>,
 ) -> Result<(StatusCode, Json<CommandStatusDto>), AppError> {
+    let key = idempotency_key(&headers);
     let update: SelectionUpdate = body.into();
     // Report the receipt the command actually produced. This used to discard
     // the call's result and answer with a hardcoded `queued: true` — a literal,
@@ -1543,7 +1566,7 @@ async fn post_selection(
     // 202 is still correct and is now honest rather than incidental: the body
     // says `admitted`, not `applied`, so the status code and the payload agree
     // that this command has been accepted and not yet applied.
-    let status = run_control(move || state.handle.update_selection(update)).await?;
+    let status = run_control(move || state.handle.update_selection(update, key.as_deref())).await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -1664,8 +1687,10 @@ async fn apply_preset(
 )]
 async fn post_control_pause(
     State(state): State<ApiState>,
+    headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
-    let status = run_control(move || state.handle.pause()).await?;
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.pause(key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -1677,8 +1702,10 @@ async fn post_control_pause(
 )]
 async fn post_control_resume(
     State(state): State<ApiState>,
+    headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
-    let status = run_control(move || state.handle.resume()).await?;
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.resume(key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -1704,9 +1731,11 @@ async fn post_control_step(
 )]
 async fn post_control_speed(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(payload): Json<SpeedRequest>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
-    let status = run_control(move || state.handle.set_speed(payload.speed)).await?;
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.set_speed(payload.speed, key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -1744,15 +1773,36 @@ async fn get_control_status(
     tag = "control",
     responses((status = 200, body = CommandStatusDto))
 )]
-async fn post_pause(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
-    // The receipt was already built and then thrown away here, and the client
-    // was handed `success: true` plus a prose string instead — a claim with no
-    // command id, no admission order and no revisions, so nothing could be
-    // polled or correlated (bd-2z0.4.9). The parallel /api/control/* endpoint
-    // kept its receipt; this one did not, which made observability depend on
-    // which URL the caller happened to use.
-    let status = run_control(move || state.handle.pause()).await?;
+async fn post_pause(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<CommandStatusDto>, AppError> {
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.pause(key.as_deref())).await?;
     Ok(Json(status))
+}
+
+/// The client-supplied idempotency key from an MCP tool call, if any.
+///
+/// Same absent-is-absent rule as the HTTP header: a blank string is not a key.
+/// MCP carries it as a tool argument because there is no header to hang it on,
+/// but the guarantee is identical, which is the point of wiring all the
+/// transports in one change rather than one at a time (bd-k7nq).
+fn mcp_idempotency_key(arguments: &serde_json::Map<String, Value>) -> Option<String> {
+    let value = arguments.get("idempotency_key")?.as_str()?.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// The client-supplied idempotency key, if any.
+///
+/// `Idempotency-Key` is the conventional HTTP spelling, so clients and proxies
+/// already understand it. A blank or non-ASCII value is treated as absent
+/// rather than as a key: keying on an empty string would make every unkeyed
+/// retry collide with every other one, which is worse than not keying at all
+/// (bd-k7nq).
+fn idempotency_key(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("Idempotency-Key")?.to_str().ok()?.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 #[utoipa::path(
@@ -1761,8 +1811,12 @@ async fn post_pause(State(state): State<ApiState>) -> Result<Json<CommandStatusD
     tag = "control",
     responses((status = 200, body = CommandStatusDto))
 )]
-async fn post_resume(State(state): State<ApiState>) -> Result<Json<CommandStatusDto>, AppError> {
-    let status = run_control(move || state.handle.resume()).await?;
+async fn post_resume(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<CommandStatusDto>, AppError> {
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.resume(key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -1795,9 +1849,11 @@ async fn post_step(
 )]
 async fn post_speed(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(body): Json<SpeedRequestBody>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
-    let status = run_control(move || state.handle.set_speed(body.speed)).await?;
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.set_speed(body.speed, key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -2319,13 +2375,15 @@ impl ToolHandler for ControlTool {
             // left the GetCommandStatus tool below able to look up ids that no
             // other tool ever handed out.
             ControlToolKind::Pause => {
+                let key = mcp_idempotency_key(&arguments);
                 let handle = self.handle.clone();
-                let status = run_control_mcp_sync(move || handle.pause())?;
+                let status = run_control_mcp_sync(move || handle.pause(key.as_deref()))?;
                 make_tool_result(status)
             }
             ControlToolKind::Resume => {
+                let key = mcp_idempotency_key(&arguments);
                 let handle = self.handle.clone();
-                let status = run_control_mcp_sync(move || handle.resume())?;
+                let status = run_control_mcp_sync(move || handle.resume(key.as_deref()))?;
                 make_tool_result(status)
             }
             ControlToolKind::Step => {
@@ -2341,8 +2399,9 @@ impl ToolHandler for ControlTool {
                     .ok_or_else(|| {
                         McpError::new(McpErrorCode::InvalidParams, "missing 'speed' parameter")
                     })? as f32;
+                let key = mcp_idempotency_key(&arguments);
                 let handle = self.handle.clone();
-                let status = run_control_mcp_sync(move || handle.set_speed(speed))?;
+                let status = run_control_mcp_sync(move || handle.set_speed(speed, key.as_deref()))?;
                 make_tool_result(status)
             }
             ControlToolKind::GetStatus => {
@@ -2496,6 +2555,53 @@ mod tests {
             source.contains("let status = run_control(move || state.handle.pause())"),
             "the receipt-bearing form is missing; this guard is checking nothing"
         );
+    }
+
+    /// Both transports must read a key, and both must treat blank as absent.
+    ///
+    /// The header and the MCP argument are separate extractors, so nothing but
+    /// a test stops them drifting apart — and a key wired on one transport but
+    /// not another is the which-control-did-you-use inconsistency this work
+    /// keeps removing (bd-k7nq).
+    #[test]
+    fn every_transport_reads_an_idempotency_key_the_same_way() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(idempotency_key(&headers), None, "no header is no key");
+
+        headers.insert("Idempotency-Key", "  ".parse().expect("blank header"));
+        assert_eq!(
+            idempotency_key(&headers),
+            None,
+            "a blank key must be absent, not an empty-string key that every unkeyed retry \
+             would collide on"
+        );
+
+        headers.insert("Idempotency-Key", " abc-123 ".parse().expect("header"));
+        assert_eq!(
+            idempotency_key(&headers).as_deref(),
+            Some("abc-123"),
+            "surrounding whitespace must be trimmed, or the same key sent twice would not match"
+        );
+
+        let mut args = serde_json::Map::new();
+        assert_eq!(mcp_idempotency_key(&args), None);
+        args.insert("idempotency_key".into(), Value::from("   "));
+        assert_eq!(
+            mcp_idempotency_key(&args),
+            None,
+            "MCP must apply the same blank-is-absent rule as HTTP"
+        );
+        args.insert("idempotency_key".into(), Value::from(" abc-123 "));
+        assert_eq!(
+            mcp_idempotency_key(&args).as_deref(),
+            Some("abc-123"),
+            "MCP and HTTP must derive the SAME key from the same client intent"
+        );
+
+        // Non-string values are absent, not coerced: a numeric key silently
+        // stringified would collide across clients that never agreed on a type.
+        args.insert("idempotency_key".into(), Value::from(7));
+        assert_eq!(mcp_idempotency_key(&args), None);
     }
 
     fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
@@ -3167,7 +3273,7 @@ mod tests {
 
         // `AppError` is deliberately not `Debug` (it carries a client-facing message),
         // so surface `message` explicitly rather than reaching for `expect`.
-        let pause = match post_control_pause(State(state.clone())).await {
+        let pause = match post_control_pause(State(state.clone()), HeaderMap::new()).await {
             Ok(Json(status)) => status,
             Err(error) => panic!("pause must be accepted: {}", error.message),
         };

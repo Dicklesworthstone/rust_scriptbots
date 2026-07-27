@@ -50,6 +50,14 @@ struct Cli {
     )]
     base_url: String,
 
+    /// Stable key making a retry of this command safe.
+    ///
+    /// Sent as the `Idempotency-Key` header. Re-running the same command with
+    /// the same key returns the ORIGINAL receipt and submits nothing, so a
+    /// retry after a timeout cannot double-apply (bd-k7nq).
+    #[arg(long, global = true)]
+    idempotency_key: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -160,6 +168,7 @@ async fn main() -> Result<()> {
             let client = Client::builder()
                 .build()
                 .context("failed to build HTTP client")?;
+            let key = cli.idempotency_key.as_deref();
             match other {
                 Command::List => list_command(&client, &cli.base_url).await?,
                 Command::Get => get_command(&client, &cli.base_url).await?,
@@ -186,10 +195,12 @@ async fn main() -> Result<()> {
                     screenshot_request(&client, &cli.base_url, out, png).await?
                 }
                 Command::Hydrology => hydrology_command(&client, &cli.base_url).await?,
-                Command::Pause => pause_command(&client, &cli.base_url).await?,
-                Command::Resume => resume_command(&client, &cli.base_url).await?,
-                Command::Step { count } => step_command(&client, &cli.base_url, count).await?,
-                Command::Speed { value } => speed_command(&client, &cli.base_url, value).await?,
+                Command::Pause => pause_command(&client, &cli.base_url, key).await?,
+                Command::Resume => resume_command(&client, &cli.base_url, key).await?,
+                Command::Step { count } => step_command(&client, &cli.base_url, count, key).await?,
+                Command::Speed { value } => {
+                    speed_command(&client, &cli.base_url, value, key).await?
+                }
                 Command::Status => status_command(&client, &cli.base_url).await?,
                 Command::Shutdown => shutdown_command(&client, &cli.base_url).await?,
                 Command::LookupStatus { id } => {
@@ -896,11 +907,16 @@ async fn issue_control_command(
     path: &str,
     label: &str,
     payload: Option<serde_json::Value>,
+    idempotency_key: Option<&str>,
 ) -> Result<()> {
     let url = join_url(base_url, path);
     let request = client.post(url);
     let request = match payload.as_ref() {
         Some(body) => request.json(body),
+        None => request,
+    };
+    let request = match idempotency_key {
+        Some(key) => request.header("Idempotency-Key", key),
         None => request,
     };
     let response = request.send().await?;
@@ -922,32 +938,68 @@ async fn issue_control_command(
     Ok(())
 }
 
-async fn pause_command(client: &Client, base_url: &str) -> Result<()> {
-    issue_control_command(client, base_url, "/api/pause", "pause", None).await
+async fn pause_command(
+    client: &Client,
+    base_url: &str,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
+    issue_control_command(
+        client,
+        base_url,
+        "/api/pause",
+        "pause",
+        None,
+        idempotency_key,
+    )
+    .await
 }
 
-async fn resume_command(client: &Client, base_url: &str) -> Result<()> {
-    issue_control_command(client, base_url, "/api/resume", "resume", None).await
+async fn resume_command(
+    client: &Client,
+    base_url: &str,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
+    issue_control_command(
+        client,
+        base_url,
+        "/api/resume",
+        "resume",
+        None,
+        idempotency_key,
+    )
+    .await
 }
 
-async fn step_command(client: &Client, base_url: &str, count: u64) -> Result<()> {
+async fn step_command(
+    client: &Client,
+    base_url: &str,
+    count: u64,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
     issue_control_command(
         client,
         base_url,
         "/api/step",
         "step",
         Some(serde_json::json!({ "count": count })),
+        idempotency_key,
     )
     .await
 }
 
-async fn speed_command(client: &Client, base_url: &str, value: f32) -> Result<()> {
+async fn speed_command(
+    client: &Client,
+    base_url: &str,
+    value: f32,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
     issue_control_command(
         client,
         base_url,
         "/api/speed",
         "speed",
         Some(serde_json::json!({ "speed": value })),
+        idempotency_key,
     )
     .await
 }
