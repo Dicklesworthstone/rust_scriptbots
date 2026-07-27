@@ -254,6 +254,25 @@ pub struct CommandStatusDto {
     pub scientific_revision: u64,
 }
 
+/// What the applier observed when it applied a drained command.
+///
+/// Deliberately only the two outcomes an applier can actually witness. It knows
+/// whether the world took the command; it does not know whether a journal
+/// commit will follow, so it is given no way to claim one (bd-k7nq).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// The world accepted the command.
+    Applied,
+    /// The world refused it at application time.
+    Rejected,
+}
+
+/// Records an applied command's outcome against the identity it travelled with.
+///
+/// Held by whatever drains and applies, so the report comes FROM the applier
+/// rather than from the submitter guessing.
+pub type CommandReporter = std::sync::Arc<dyn Fn(&str, CommandOutcome) + Send + Sync>;
+
 /// The two-axis record of what has happened to each submitted command.
 ///
 /// Eight instances of one defect were fixed across five surfaces by teaching
@@ -924,6 +943,33 @@ impl ControlHandle {
         cmd: ControlCommand,
     ) -> Result<CommandStatusDto, ControlError> {
         self.submit_control_command_with_key(cmd, None)
+    }
+
+    /// A reporter the applier can hold without holding the whole handle.
+    ///
+    /// This is the seam. The ledger can record an outcome and the bus now
+    /// carries an identity, but neither matters until the thing that actually
+    /// applies commands says what happened. That thing lives behind a
+    /// `CommandDrain` - in the renderer, in the terminal frontend - and it
+    /// should not need a `ControlHandle`, a world lock, or any knowledge of
+    /// REST to report. It needs exactly this: an id and an outcome (bd-k7nq).
+    ///
+    /// A failed report is logged rather than propagated: the applier has
+    /// already applied the command, and refusing to continue draining because
+    /// the bookkeeping disagreed would turn a reporting problem into a
+    /// simulation stall.
+    #[must_use]
+    pub fn command_reporter(&self) -> CommandReporter {
+        let ledger = std::sync::Arc::clone(&self.status_cache);
+        std::sync::Arc::new(move |command_id: &str, outcome: CommandOutcome| {
+            let state = match outcome {
+                CommandOutcome::Applied => APPLICATION_STATE_APPLIED,
+                CommandOutcome::Rejected => APPLICATION_STATE_REJECTED,
+            };
+            if let Err(error) = lock_cache(&ledger).resolve(command_id, state) {
+                tracing::warn!(%command_id, %error, "could not record the outcome of an applied command");
+            }
+        })
     }
 
     /// Report that a submitted command reached the world.
@@ -1881,6 +1927,85 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, 4, "invalid optimistic config command reached queue");
+    }
+
+    /// END TO END: a real submission becomes `applied` because the applier said so.
+    ///
+    /// Every earlier test in this file proved a piece. This proves the
+    /// behaviour, which is the only thing that was ever claimed to be missing:
+    ///
+    ///   1. a surface submits through the real ControlHandle path,
+    ///   2. the identity travels on the real bounded bus inside `BusCommand`,
+    ///   3. the real `scriptbots_core::apply_control_command` applies it,
+    ///   4. the APPLIER - not the submitter - reports the outcome through the
+    ///      reporter seam, using the id that arrived with the command,
+    ///   5. polling the receipt shows `applied`.
+    ///
+    /// Nothing here simulates a step. The submitter never touches the ledger
+    /// after admission, which is the distinction this whole line of work rests
+    /// on: an outcome is observed, not assumed (bd-k7nq).
+    #[test]
+    fn an_applied_command_is_reported_by_the_applier_and_visible_to_the_submitter() {
+        let (handle, receiver) = handle();
+        let reporter = handle.command_reporter();
+
+        let admitted = handle.pause(None).expect("pause admitted");
+        assert_eq!(admitted.application_state, APPLICATION_STATE_ADMITTED);
+
+        // The applier: drains the real bus and applies through core. It holds a
+        // reporter and the id, and nothing else from the control plane.
+        let mut applied_ids = Vec::new();
+        {
+            let mut world = handle.lock_world().expect("world lock");
+            for bus in crate::command::drain_pending_commands(&receiver) {
+                let outcome = match scriptbots_core::apply_control_command(&mut world, bus.command)
+                {
+                    Ok(_) => CommandOutcome::Applied,
+                    Err(_) => CommandOutcome::Rejected,
+                };
+                reporter(&bus.id, outcome);
+                applied_ids.push(bus.id);
+            }
+        }
+
+        assert_eq!(
+            applied_ids,
+            vec![admitted.command_id.clone()],
+            "the id the applier saw must be the id the submitter was given, or the report \
+             cannot be correlated with the submission"
+        );
+
+        let polled = handle
+            .command_status(&admitted.command_id)
+            .expect("lookup")
+            .expect("the command is known");
+        assert_eq!(
+            polled.application_state, APPLICATION_STATE_APPLIED,
+            "the receipt did not advance, so `admitted` is still the end of the road"
+        );
+    }
+
+    /// The same seam records a refusal, and the refusal is the applier's.
+    ///
+    /// Positive control for the test above: without it, a reporter that wrote
+    /// `applied` unconditionally would pass, which would be the submitter
+    /// guessing wearing the applier's clothes.
+    #[test]
+    fn a_rejected_command_is_reported_as_rejected_not_applied() {
+        let (handle, _receiver) = handle();
+        let reporter = handle.command_reporter();
+        let admitted = handle.resume(None).expect("resume admitted");
+
+        reporter(&admitted.command_id, CommandOutcome::Rejected);
+
+        assert_eq!(
+            handle
+                .command_status(&admitted.command_id)
+                .expect("lookup")
+                .expect("known")
+                .application_state,
+            APPLICATION_STATE_REJECTED
+        );
     }
 
     /// A receipt can advance from admitted to applied.
