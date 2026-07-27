@@ -94,6 +94,25 @@ struct HeadlessBufferEvidenceDto {
     empty_symbol_cells: usize,
     full_cell_fnv1a64: String,
     semantic_regions: Vec<String>,
+    /// Per-panel evidence added by bd-2z0.14.2.6. Additive to `semantic_regions`,
+    /// which still names the regions; this proves each one separately so a broken
+    /// chart is distinguishable from a broken map.
+    regions: Vec<RegionEvidenceDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegionEvidenceDto {
+    name: String,
+    #[allow(dead_code)]
+    x: u16,
+    #[allow(dead_code)]
+    y: u16,
+    width: u16,
+    height: u16,
+    has_room: bool,
+    marker_present: bool,
+    non_blank_cells: usize,
+    fnv1a64: String,
 }
 
 #[allow(dead_code)]
@@ -163,11 +182,73 @@ fn assert_test_backend_buffer_evidence(report: &HeadlessReportDto) {
             16,
             "buffer evidence must include the full deterministic FNV-1a digest"
         );
+        // SCHEMA CHANGE, bd-2z0.14.2.6. This was the four whole-frame needles the
+        // inspector searched for (terminal_hud, current_tick, world_map,
+        // vital_stats). It is now the panel set derived from the frame's own
+        // layout. `current_tick` left the list because it was never a panel — it is
+        // a frame-wide string and the inspector still asserts it as one.
         assert_eq!(
             buffer.semantic_regions,
-            ["terminal_hud", "current_tick", "world_map", "vital_stats"],
+            [
+                "header",
+                "rail",
+                "world_map",
+                "vital_stats",
+                "trends",
+                "leaderboard",
+                "oldest",
+                "insights",
+                "brains",
+                "events",
+            ],
             "buffer evidence must come from the expected terminal HUD regions"
         );
+        assert_eq!(
+            buffer.regions.len(),
+            buffer.semantic_regions.len(),
+            "every named region must carry its own evidence: {:?}",
+            buffer.regions
+        );
+
+        let mut region_hashes = std::collections::HashSet::new();
+        for region in &buffer.regions {
+            assert_eq!(
+                region.fnv1a64.len(),
+                16,
+                "region {} must carry a full FNV-1a digest",
+                region.name
+            );
+            assert!(
+                region.width > 0 && region.height > 0,
+                "region {} must report the rectangle it was hashed over",
+                region.name
+            );
+            // At the 80x36 evidence viewport every panel fits, so every region must
+            // both have room and have shown its marker. A report where a panel
+            // quietly went absent at this size is a layout regression, and without
+            // this assertion it would be recorded rather than caught.
+            assert!(
+                region.has_room,
+                "region {} must have room at 80x36: {region:?}",
+                region.name
+            );
+            assert!(
+                region.marker_present,
+                "region {} had room and must have drawn its marker: {region:?}",
+                region.name
+            );
+            assert!(
+                region.non_blank_cells > 0,
+                "region {} must have painted something: {region:?}",
+                region.name
+            );
+            assert!(
+                region_hashes.insert(region.fnv1a64.clone()),
+                "region hashes must be distinct, or they are not per-region: {} \
+                 duplicates an earlier digest",
+                region.name
+            );
+        }
     }
 }
 

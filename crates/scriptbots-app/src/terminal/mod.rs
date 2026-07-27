@@ -368,8 +368,12 @@ impl TerminalRenderer {
             }
             app.step_once();
             terminal.draw(|frame| app.draw(frame))?;
+            let backend_buffer = terminal.backend().buffer();
+            // The layout is read back from the app AFTER the draw, so the regions
+            // hashed below are the rectangles the widgets actually painted into.
+            let layout = app.frame_layout(backend_buffer.area);
             let buffer =
-                HeadlessBufferEvidence::inspect(terminal.backend().buffer(), app.snapshot().tick)?;
+                HeadlessBufferEvidence::inspect(backend_buffer, app.snapshot().tick, &layout)?;
             report.record(app.snapshot(), buffer);
         }
 
@@ -1099,7 +1103,10 @@ impl<'a> TerminalApp<'a> {
         // Ensure we start from a clean buffer every frame to avoid ghosting artifacts
         frame.render_widget(Clear, frame.area());
 
-        let outer = if self.rail_visible {
+        // Auto-expand advanced panels on wide terminals unless the user has
+        // overridden. Resolved BEFORE the layout because the layout depends on it,
+        // and `FrameLayout` deliberately does not re-derive it.
+        let body_width = if self.rail_visible {
             Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -1107,91 +1114,45 @@ impl<'a> TerminalApp<'a> {
                     Constraint::Length(RAIL_HEIGHT),
                     Constraint::Min(0),
                 ])
-                .split(frame.area())
+                .split(frame.area())[2]
+                .width
         } else {
             Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(3), Constraint::Min(0)])
-                .split(frame.area())
+                .split(frame.area())[1]
+                .width
         };
-
-        self.draw_header(frame, outer[0], &self.snapshot);
-        let body_anchor = if self.rail_visible {
-            self.draw_rail(frame, outer[1], &self.snapshot);
-            outer[2]
-        } else {
-            outer[1]
-        };
-
-        // Auto-expand advanced panels on wide terminals unless the user has overridden
-        let area = body_anchor;
-        let wide = area.width >= 120;
         if !self.expanded_user_override {
-            self.expanded = wide;
+            self.expanded = body_width >= AUTO_EXPAND_MIN_WIDTH;
         }
 
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(if self.expanded {
-                [Constraint::Percentage(58), Constraint::Percentage(42)]
-            } else {
-                [Constraint::Percentage(62), Constraint::Percentage(38)]
-            })
-            .split(body_anchor);
+        let layout = self.frame_layout(frame.area());
+
+        self.draw_header(frame, layout.header, &self.snapshot);
+        if let Some(rail) = layout.rail {
+            self.draw_rail(frame, rail, &self.snapshot);
+        }
 
         // Draw the map while avoiding holding an external borrow across &mut self
         let world_size = self.snapshot.world_size;
-        if self.probe_enabled {
-            let map_column = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(8), Constraint::Length(PROBE_PANEL_HEIGHT)])
-                .split(body[0]);
-            self.draw_map(frame, map_column[0], world_size);
-            self.draw_probe(frame, map_column[1], &self.snapshot);
-        } else {
-            self.draw_map(frame, body[0], world_size);
+        self.draw_map(frame, layout.map, world_size);
+        if let Some(probe) = layout.probe {
+            self.draw_probe(frame, probe, &self.snapshot);
         }
 
-        let sidebar = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if self.expanded {
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(7),
-                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                    Constraint::Length(7),
-                    Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
-                    Constraint::Length(6),
-                    Constraint::Min(3),
-                ]
-            } else {
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(5),
-                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                    Constraint::Length(7),
-                    Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
-                    Constraint::Min(3),
-                ]
-            })
-            .split(body[1]);
-
-        self.draw_stats(frame, sidebar[0], &self.snapshot);
-        self.draw_trends(frame, sidebar[1], &self.snapshot);
-        self.draw_leaderboard(frame, sidebar[2], &self.snapshot);
-        self.draw_oldest(frame, sidebar[3], &self.snapshot);
+        self.draw_stats(frame, layout.stats, &self.snapshot);
+        self.draw_trends(frame, layout.trends, &self.snapshot);
+        self.draw_leaderboard(frame, layout.leaderboard, &self.snapshot);
+        self.draw_oldest(frame, layout.oldest, &self.snapshot);
         // Refresh analytics opportunistically before drawing insights/brains
         self.maybe_refresh_analytics();
-        self.draw_insights(frame, sidebar[4], &self.snapshot);
-        self.draw_brains(frame, sidebar[5], &self.snapshot);
-        if self.expanded {
-            self.draw_mortality(frame, sidebar[6], &self.snapshot);
-            self.draw_events(frame, sidebar[7], &self.snapshot);
-        } else {
-            self.draw_events(frame, sidebar[6], &self.snapshot);
+        self.draw_insights(frame, layout.insights, &self.snapshot);
+        self.draw_brains(frame, layout.brains, &self.snapshot);
+        if let Some(mortality) = layout.mortality {
+            self.draw_mortality(frame, mortality, &self.snapshot);
         }
+        self.draw_events(frame, layout.events, &self.snapshot);
 
         if self.help_visible {
             // Draw a full-screen dimmed backdrop, then the help panel on top
@@ -1214,6 +1175,15 @@ impl<'a> TerminalApp<'a> {
         if let Some(tooltip) = &self.hover_tooltip {
             self.draw_hover_tooltip(frame, tooltip, frame.area());
         }
+    }
+
+    /// The panel rectangles for `area` under this app's current view flags.
+    ///
+    /// The evidence path calls this AFTER a draw, so `self.expanded` already holds
+    /// the value that frame was laid out with and the inspector hashes the same
+    /// rectangles the widgets painted into.
+    fn frame_layout(&self, area: Rect) -> FrameLayout {
+        FrameLayout::compute(area, self.rail_visible, self.expanded, self.probe_enabled)
     }
 
     fn maybe_refresh_analytics(&mut self) {
@@ -3443,8 +3413,20 @@ impl<'a> TerminalApp<'a> {
         File::create(&ansi_path)?.write_all(ansi.as_bytes())?;
         File::create(&text_path)?.write_all(plain.as_bytes())?;
 
-        let evidence = HeadlessBufferEvidence::inspect(buffer, tick)?;
+        let layout = self.frame_layout(buffer.area);
+        let evidence = HeadlessBufferEvidence::inspect(buffer, tick, &layout)?;
         let hash = evidence.full_cell_fnv1a64.clone();
+        // Region hashes at debug! per the bead's logging contract, so an exported
+        // frame can be attributed to the panel that changed without re-rendering.
+        for region in &evidence.regions {
+            debug!(
+                region = region.name,
+                hash = %region.fnv1a64,
+                has_room = region.has_room,
+                non_blank = region.non_blank_cells,
+                "exported frame region"
+            );
+        }
         info!(
             ansi = %ansi_path.display(),
             text = %text_path.display(),
@@ -3453,6 +3435,7 @@ impl<'a> TerminalApp<'a> {
             width = buffer.area.width,
             height = buffer.area.height,
             hash = %hash,
+            regions = evidence.regions.len(),
             "exported the displayed terminal frame"
         );
         Ok((ansi_path, text_path, hash))
@@ -4768,10 +4751,194 @@ impl FrameStats {
     }
 }
 
+/// Every named panel rectangle for one frame, from the SOLE layout authority.
+///
+/// This exists so the evidence layer can hash a panel's own cells instead of
+/// searching the whole frame for a marker string. The old contract asked "does
+/// the text 'Vital Stats' appear ANYWHERE in this buffer", which passes when the
+/// stats panel is blank and the words happen to live in another panel, and fails
+/// at 40x12 where the panel legitimately does not fit. Both halves of that are
+/// wrong, and localizing to a rectangle fixes both at once (bd-2z0.14.2.6).
+///
+/// It is computed ONCE and consumed by both `draw` and the inspector. A second
+/// function that re-derived these rects would be a duplicate layout engine that
+/// agrees with the renderer only until someone edits one of them — the defect
+/// bd-c1z8 converged in this same directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameLayout {
+    header: Rect,
+    /// `None` when the narrative rail is hidden.
+    rail: Option<Rect>,
+    map: Rect,
+    /// `None` unless the sensor probe panel is enabled.
+    probe: Option<Rect>,
+    stats: Rect,
+    trends: Rect,
+    leaderboard: Rect,
+    oldest: Rect,
+    insights: Rect,
+    brains: Rect,
+    /// `None` outside the expanded (wide-terminal) sidebar.
+    mortality: Option<Rect>,
+    events: Rect,
+}
+
+/// Terminal width at or above which the advanced sidebar auto-expands.
+const AUTO_EXPAND_MIN_WIDTH: u16 = 120;
+
+impl FrameLayout {
+    /// Split `area` exactly the way [`TerminalApp::draw`] does.
+    ///
+    /// `expanded` is taken already-resolved rather than re-derived here: the user
+    /// override in `draw` is part of that decision, and duplicating the override
+    /// rule is how the two copies start disagreeing.
+    fn compute(area: Rect, rail_visible: bool, expanded: bool, probe_enabled: bool) -> Self {
+        let outer = if rail_visible {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(RAIL_HEIGHT),
+                    Constraint::Min(0),
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(0)])
+                .split(area)
+        };
+
+        let header = outer[0];
+        let (rail, body_anchor) = if rail_visible {
+            (Some(outer[1]), outer[2])
+        } else {
+            (None, outer[1])
+        };
+
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(if expanded {
+                [Constraint::Percentage(58), Constraint::Percentage(42)]
+            } else {
+                [Constraint::Percentage(62), Constraint::Percentage(38)]
+            })
+            .split(body_anchor);
+
+        let (map, probe) = if probe_enabled {
+            let map_column = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(PROBE_PANEL_HEIGHT)])
+                .split(body[0]);
+            (map_column[0], Some(map_column[1]))
+        } else {
+            (body[0], None)
+        };
+
+        let sidebar = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if expanded {
+                vec![
+                    Constraint::Length(7),
+                    Constraint::Length(7),
+                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                    Constraint::Length(7),
+                    Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
+                    Constraint::Length(6),
+                    Constraint::Min(3),
+                ]
+            } else {
+                vec![
+                    Constraint::Length(7),
+                    Constraint::Length(5),
+                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                    Constraint::Length(7),
+                    Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
+                    Constraint::Min(3),
+                ]
+            })
+            .split(body[1]);
+
+        let (mortality, events) = if expanded {
+            (Some(sidebar[6]), sidebar[7])
+        } else {
+            (None, sidebar[6])
+        };
+
+        Self {
+            header,
+            rail,
+            map,
+            probe,
+            stats: sidebar[0],
+            trends: sidebar[1],
+            leaderboard: sidebar[2],
+            oldest: sidebar[3],
+            insights: sidebar[4],
+            brains: sidebar[5],
+            mortality,
+            events,
+        }
+    }
+
+    /// The regions to hash, paired with the marker each one must show when it has
+    /// the room to draw itself.
+    ///
+    /// Markers are LEADING substrings of the real panel titles, not the whole
+    /// title, because ratatui clips a title to the block's inner width: the trends
+    /// panel is titled "Population, Energy, Births/Deaths" and renders in a 30-wide
+    /// column, so requiring the full string would fail a panel that drew perfectly.
+    /// A prefix found inside the panel's OWN rectangle is what makes the check
+    /// local — the same string found anywhere in the frame proves only that some
+    /// panel drew it, which is the contract this replaced.
+    fn regions(&self) -> Vec<(&'static str, Rect, &'static str)> {
+        let mut regions = vec![("header", self.header, "ScriptBots")];
+        if let Some(rail) = self.rail {
+            regions.push(("rail", rail, "Timeline"));
+        }
+        regions.push(("world_map", self.map, "World Map"));
+        if let Some(probe) = self.probe {
+            regions.push(("probe", probe, "Sense Probe"));
+        }
+        regions.push(("vital_stats", self.stats, "Vital Stats"));
+        regions.push(("trends", self.trends, "Population"));
+        regions.push(("leaderboard", self.leaderboard, "Top Pred"));
+        regions.push(("oldest", self.oldest, "Oldest"));
+        regions.push(("insights", self.insights, "Insights"));
+        regions.push(("brains", self.brains, "Brains"));
+        if let Some(mortality) = self.mortality {
+            regions.push(("mortality", mortality, "Mortality"));
+        }
+        regions.push(("events", self.events, "Recent"));
+        regions
+    }
+}
+
+/// One panel's own evidence: where it was, whether it had room, and a hash over
+/// ITS cells alone so a broken chart fails distinctly from a broken map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RegionEvidence {
+    name: &'static str,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    /// Whether the rectangle is big enough for a bordered panel to render its
+    /// title at all. A region that is too small is ABSENT BY LAYOUT, which is a
+    /// legitimate frame at the emergency breakpoint and not a defect.
+    has_room: bool,
+    /// Whether the panel's own marker was found inside its own rectangle.
+    marker_present: bool,
+    non_blank_cells: usize,
+    fnv1a64: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct HeadlessBufferEvidence {
     backend: &'static str,
-    capability_profile: &'static str,
+    capability_profile: String,
     viewport_width: u16,
     viewport_height: u16,
     current_tick: u64,
@@ -4782,10 +4949,91 @@ struct HeadlessBufferEvidence {
     empty_symbol_cells: usize,
     full_cell_fnv1a64: String,
     semantic_regions: Vec<&'static str>,
+    /// Per-panel evidence. Additive to `semantic_regions`, which stays for the
+    /// documented report schema; that field names the regions, this one proves
+    /// them.
+    regions: Vec<RegionEvidence>,
+}
+
+/// Minimum height a bordered panel needs before its title can appear: the top and
+/// bottom rows are the border itself, so two rows leave nothing to draw into.
+const REGION_MIN_HEIGHT: u16 = 3;
+
+/// Whether `rect` is big enough for a bordered panel to render `marker`.
+///
+/// The width test is against THIS marker rather than a fixed constant, because
+/// "had room" is only meaningful relative to the string being looked for: a
+/// 15-column sidebar has room for "Brains" and not for "Vital Stats", and a single
+/// threshold would either fail the second or stop checking the first. Both border
+/// columns are excluded since a title renders inside them.
+fn region_has_room(rect: Rect, marker: &str) -> bool {
+    rect.height >= REGION_MIN_HEIGHT
+        && usize::from(rect.width) >= marker.chars().count().saturating_add(2)
 }
 
 impl HeadlessBufferEvidence {
-    fn inspect(buffer: &Buffer, current_tick: u64) -> Result<Self> {
+    /// FNV-1a64 over one rectangle's cells, in the same field order and with the
+    /// same length-prefixing the full-frame hash uses.
+    ///
+    /// Shares [`Self::hash_cells`] with the full-frame pass rather than
+    /// reimplementing the walk, so a region hash and the frame hash can never
+    /// disagree about what a cell IS.
+    fn hash_cells(buffer: &Buffer, area: Rect) -> (String, usize) {
+        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = OFFSET_BASIS;
+        let mut non_blank = 0usize;
+        let hash_bytes = |bytes: &[u8], hash: &mut u64| {
+            for byte in (bytes.len() as u64).to_le_bytes() {
+                *hash ^= u64::from(byte);
+                *hash = hash.wrapping_mul(PRIME);
+            }
+            for byte in bytes {
+                *hash ^= u64::from(*byte);
+                *hash = hash.wrapping_mul(PRIME);
+            }
+        };
+
+        hash_bytes(&area.width.to_le_bytes(), &mut hash);
+        hash_bytes(&area.height.to_le_bytes(), &mut hash);
+
+        let clipped = area.intersection(buffer.area);
+        for y in clipped.y..clipped.bottom() {
+            for x in clipped.x..clipped.right() {
+                let cell = &buffer[(x, y)];
+                let symbol = cell.symbol();
+                if !symbol.trim().is_empty() {
+                    non_blank += 1;
+                }
+                hash_bytes(&x.to_le_bytes(), &mut hash);
+                hash_bytes(&y.to_le_bytes(), &mut hash);
+                hash_bytes(symbol.as_bytes(), &mut hash);
+                hash_bytes(format!("{:?}", cell.fg).as_bytes(), &mut hash);
+                hash_bytes(format!("{:?}", cell.bg).as_bytes(), &mut hash);
+                hash_bytes(format!("{:?}", cell.underline_color).as_bytes(), &mut hash);
+                hash_bytes(format!("{:?}", cell.modifier).as_bytes(), &mut hash);
+                hash_bytes(format!("{:?}", cell.diff_option).as_bytes(), &mut hash);
+            }
+        }
+        (format!("{hash:016x}"), non_blank)
+    }
+
+    /// The text inside one rectangle, so a marker check cannot be satisfied by
+    /// another panel's content.
+    fn region_text(buffer: &Buffer, area: Rect) -> String {
+        let clipped = area.intersection(buffer.area);
+        let mut text = String::new();
+        for y in clipped.y..clipped.bottom() {
+            for x in clipped.x..clipped.right() {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn inspect(buffer: &Buffer, current_tick: u64, layout: &FrameLayout) -> Result<Self> {
         const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
         const PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -4848,29 +5096,76 @@ impl HeadlessBufferEvidence {
             text.push('\n');
         }
 
-        let tick_label = format!("Tick {current_tick:>6}");
-        let required_regions = [
-            ("terminal_hud", "ScriptBots Terminal HUD"),
-            ("current_tick", tick_label.as_str()),
-            ("world_map", "World Map"),
-            ("vital_stats", "Vital Stats"),
-        ];
-        for (region, needle) in required_regions {
+        // Per-panel evidence, each hashed and checked inside its OWN rectangle.
+        //
+        // Absence is split into two cases that used to be one error, and keeping
+        // them apart is the whole point. A region with no room is absent BY
+        // LAYOUT: at the 40x12 emergency tier the sidebar panels genuinely do not
+        // fit, and the previous whole-frame contract rejected those frames even
+        // though the renderer drew them correctly. A region that HAS room and
+        // still shows no marker is a real defect and still fails.
+        let mut regions = Vec::new();
+        for (name, rect, marker) in layout.regions() {
+            let has_room = region_has_room(rect, marker);
+            let (region_hash, region_non_blank) = Self::hash_cells(buffer, rect);
+            let marker_present = Self::region_text(buffer, rect).contains(marker);
             ensure!(
-                text.contains(needle),
-                "headless TestBackend frame at tick {current_tick} omitted required {region} content {needle:?} from its {}x{} buffer",
+                !has_room || marker_present,
+                "headless frame at tick {current_tick} drew region {name:?} at \
+                 {}x{} ({}x{} buffer) with room for its {marker:?} title but the \
+                 title is absent from that region",
+                rect.width,
+                rect.height,
                 area.width,
                 area.height
             );
+            regions.push(RegionEvidence {
+                name,
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                has_room,
+                marker_present,
+                non_blank_cells: region_non_blank,
+                fnv1a64: region_hash,
+            });
         }
+
+        // A frame where nothing fits proves nothing, so the contract still needs
+        // at least one region to have been checkable. Without this the emergency
+        // tier could pass with every region absent-by-layout, which is exactly the
+        // "relaxed contract that accepts anything" failure: it would look like
+        // coverage while asserting nothing.
+        ensure!(
+            regions.iter().any(|region| region.has_room),
+            "headless frame at tick {current_tick} had no region with room to draw \
+             in its {}x{} buffer, so no panel could be verified",
+            area.width,
+            area.height
+        );
         ensure!(
             non_blank_cells > 0,
             "headless TestBackend frame at tick {current_tick} produced an empty buffer"
         );
 
+        // The tick label is frame-wide rather than panel-local: the header renders
+        // it, but which panel carries it is not this contract's business.
+        let tick_label = format!("Tick {current_tick:>6}");
+        ensure!(
+            text.contains(tick_label.as_str()),
+            "headless TestBackend frame at tick {current_tick} omitted required current_tick content {tick_label:?} from its {}x{} buffer",
+            area.width,
+            area.height
+        );
+
         Ok(Self {
             backend: "ratatui_test_backend",
-            capability_profile: "ascii_natural_fixed_80x36",
+            // Reports what was OBSERVED rather than a hardcoded string. This field
+            // read "ascii_natural_fixed_80x36" for every frame at every size, so a
+            // 40x12 report claimed to be a fixed 80x36 profile -- a value that
+            // described the frame it was written for and no other (bd-0oro).
+            capability_profile: format!("ascii_natural_fixed_{}x{}", area.width, area.height),
             viewport_width: area.width,
             viewport_height: area.height,
             current_tick,
@@ -4880,10 +5175,8 @@ impl HeadlessBufferEvidence {
             forced_width_cells,
             empty_symbol_cells,
             full_cell_fnv1a64: format!("{hash:016x}"),
-            semantic_regions: required_regions
-                .into_iter()
-                .map(|(region, _)| region)
-                .collect(),
+            semantic_regions: regions.iter().map(|region| region.name).collect(),
+            regions,
         })
     }
 }
@@ -10875,8 +11168,43 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|frame| app.draw(frame)).expect("draw frame");
-        HeadlessBufferEvidence::inspect(terminal.backend().buffer(), app.snapshot().tick)
+        let backend_buffer = terminal.backend().buffer();
+        let layout = app.frame_layout(backend_buffer.area);
+        HeadlessBufferEvidence::inspect(backend_buffer, app.snapshot().tick, &layout)
             .expect("buffer evidence")
+    }
+
+    /// Render one production frame and hand back the raw buffer, the layout it was
+    /// drawn with, and its tick.
+    ///
+    /// Region tests need the BUFFER, not just the evidence summary, because they
+    /// have to break a panel and re-inspect. The layout comes from the app after
+    /// the draw for the same reason the production path reads it there: it is the
+    /// one the widgets painted into, not a second guess at it.
+    fn matrix_frame_buffer(width: u16, height: u16) -> (Buffer, FrameLayout, u64) {
+        let world = command_characterization_world();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            crate::renderer::RendererContext {
+                simulation_step: disabled_persistence_step_driver(&world),
+                world: Arc::clone(&world),
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: &runtime,
+                command_drain: drain,
+                command_submit: submit,
+                scenario: test_scenario(),
+            },
+        );
+        app.palette = Palette::test_backend_evidence();
+
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| app.draw(frame)).expect("draw frame");
+        let buffer = terminal.backend().buffer().clone();
+        let layout = app.frame_layout(buffer.area);
+        (buffer, layout, app.snapshot().tick)
     }
 
     /// GOLDEN SPOT MATRIX: a theme may repaint the HUD but must never re-lay it out.
@@ -11135,9 +11463,46 @@ mod tests {
             evidence.full_cell_fnv1a64, "4ab177bfc13b0371",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
+        // SCHEMA CHANGE, bd-2z0.14.2.6: `semantic_regions` used to be the four
+        // hand-listed needles the inspector searched the WHOLE FRAME for
+        // (terminal_hud, current_tick, world_map, vital_stats). It is now the panel
+        // set derived from the frame's own layout, each verified inside its own
+        // rectangle and hashed separately in `regions`.
+        //
+        // `current_tick` is deliberately GONE from this list rather than renamed:
+        // it was never a panel, it is a frame-wide string, and it is still asserted
+        // as such by the inspector. Listing it as a region implied a rectangle that
+        // did not exist.
         assert_eq!(
             evidence.semantic_regions,
-            ["terminal_hud", "current_tick", "world_map", "vital_stats"]
+            [
+                "header",
+                "rail",
+                "world_map",
+                "vital_stats",
+                "trends",
+                "leaderboard",
+                "oldest",
+                "insights",
+                "brains",
+                "events",
+            ]
+        );
+        // Every listed region must carry its own hash, or the list is a promise the
+        // report does not keep.
+        assert_eq!(
+            evidence.regions.len(),
+            evidence.semantic_regions.len(),
+            "each named region must have region evidence: {:?}",
+            evidence.regions
+        );
+        assert!(
+            evidence
+                .regions
+                .iter()
+                .all(|region| !region.fnv1a64.is_empty() && region.marker_present),
+            "every region in a healthy 80x36 frame must be hashed and present: {:?}",
+            evidence.regions
         );
         assert_eq!(
             world.lock().expect("world lock").tick().0,
@@ -11165,6 +11530,206 @@ mod tests {
         );
     }
 
+    /// A broken widget must fail ITS region and leave every other region's hash
+    /// untouched. This is the acceptance criterion's negative control, and it is
+    /// the whole reason per-panel hashes exist: the full-frame hash already
+    /// detected that *something* changed, and could never say what.
+    ///
+    /// The break is applied by blanking one panel's rectangle in a real rendered
+    /// frame, so the "broken widget" is an actual absence of drawn content rather
+    /// than a mutated hash string.
+    #[test]
+    fn a_broken_widget_fails_its_own_region_and_no_others() {
+        let (buffer, layout, tick) = matrix_frame_buffer(80, 36);
+        let healthy = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
+            .expect("the unmodified frame must be accepted");
+
+        // Positive anchor first: without this, a scan that silently matched
+        // nothing would make every assertion below vacuously true.
+        assert!(
+            healthy.regions.len() >= 8,
+            "the 80x36 frame must expose the full panel set, got {:?}",
+            healthy
+                .regions
+                .iter()
+                .map(|region| region.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            healthy.regions.iter().all(|region| region.has_room),
+            "every region must have room at 80x36: {:?}",
+            healthy
+                .regions
+                .iter()
+                .filter(|region| !region.has_room)
+                .map(|region| region.name)
+                .collect::<Vec<_>>()
+        );
+        // Distinct hashes prove the hash reads each region's own cells. If it
+        // hashed the whole frame, or nothing, every region would agree.
+        let distinct: std::collections::HashSet<&str> = healthy
+            .regions
+            .iter()
+            .map(|region| region.fnv1a64.as_str())
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            healthy.regions.len(),
+            "region hashes must differ from each other, or they are not per-region"
+        );
+
+        // Break the leaderboard alone and prove the blast radius is exactly one.
+        let target = layout.leaderboard;
+        let mut broken = buffer.clone();
+        for y in target.y..target.bottom() {
+            for x in target.x..target.right() {
+                broken[(x, y)].reset();
+            }
+        }
+
+        let error = HeadlessBufferEvidence::inspect(&broken, tick, &layout).expect_err(
+            "a frame whose leaderboard panel drew nothing must be rejected, not \
+             recorded as evidence",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("region \"leaderboard\""),
+            "the failure must name the broken panel: {error:#}"
+        );
+
+        // And the localization claim itself: recompute every region hash over the
+        // broken frame and require that exactly the leaderboard moved. inspect()
+        // refuses the frame, so the hashes are taken directly.
+        let mut moved = Vec::new();
+        for (name, rect, _) in layout.regions() {
+            let (before, _) = HeadlessBufferEvidence::hash_cells(&buffer, rect);
+            let (after, _) = HeadlessBufferEvidence::hash_cells(&broken, rect);
+            if before != after {
+                moved.push(name);
+            }
+        }
+        assert_eq!(
+            moved,
+            vec!["leaderboard"],
+            "blanking one panel must move exactly that panel's hash; moved: {moved:?}"
+        );
+
+        let (full_before, _) = HeadlessBufferEvidence::hash_cells(&buffer, buffer.area);
+        let (full_after, _) = HeadlessBufferEvidence::hash_cells(&broken, buffer.area);
+        assert_ne!(
+            full_before, full_after,
+            "the full-frame hash must also move, so region evidence supplements it \
+             rather than replacing it"
+        );
+    }
+
+    /// The 40x12 emergency tier must be ACCEPTED without becoming unfalsifiable.
+    ///
+    /// This is the exact frame the previous whole-frame contract rejected: panels
+    /// like "Vital Stats" legitimately do not fit, and requiring their titles
+    /// anywhere in the buffer failed a frame the renderer had drawn correctly. The
+    /// fix must not swing to the opposite error — a contract that accepts a small
+    /// frame no matter what it contains would look like coverage while asserting
+    /// nothing, which is bd-0oro's shape in the evidence layer. So this asserts
+    /// BOTH halves: the good frame passes, and a broken one at the same size still
+    /// fails.
+    #[test]
+    fn the_emergency_tier_is_accepted_but_still_falsifiable() {
+        let (buffer, layout, tick) = matrix_frame_buffer(40, 12);
+        let evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout).expect(
+            "a correctly drawn 40x12 emergency-tier frame must be accepted; \
+             rejecting it was the defect this contract replaced",
+        );
+
+        // Something must have been checkable, or "accepted" means nothing.
+        let with_room: Vec<&str> = evidence
+            .regions
+            .iter()
+            .filter(|region| region.has_room)
+            .map(|region| region.name)
+            .collect();
+        assert!(
+            !with_room.is_empty(),
+            "the emergency tier must still verify at least one region, otherwise \
+             the contract accepts anything at this size"
+        );
+        assert!(
+            evidence
+                .regions
+                .iter()
+                .filter(|region| region.has_room)
+                .all(|region| region.marker_present),
+            "every region with room at 40x12 must have shown its title"
+        );
+        // The tier is genuinely constrained: if every panel fit at 40x12 this test
+        // would be exercising the 80x36 path under a smaller name.
+        assert!(
+            evidence.regions.iter().any(|region| !region.has_room),
+            "at 40x12 some panel is expected to be absent by layout; if all fit, \
+             this test is not covering the emergency tier at all"
+        );
+
+        // PROOF that the contract this replaced really did reject this frame, rather
+        // than my say-so. The old inspector searched the WHOLE FRAME for the literal
+        // "Vital Stats" and errored when absent. Show it is genuinely absent here,
+        // so "the emergency tier used to fail" is demonstrated against the actual
+        // rendered frame instead of being asserted in a comment.
+        let whole_frame = HeadlessBufferEvidence::region_text(&buffer, buffer.area);
+        assert!(
+            !whole_frame.contains("Vital Stats"),
+            "the old whole-frame contract is only worth replacing if its needle is \
+             really missing at 40x12; if this fires, the emergency tier no longer \
+             reproduces the defect and this test needs a different size"
+        );
+
+        // Now the falsifiability half: break a region that DOES have room here.
+        let broken_name = with_room[0];
+        let target = layout
+            .regions()
+            .into_iter()
+            .find(|(name, _, _)| *name == broken_name)
+            .map(|(_, rect, _)| rect)
+            .expect("the region reported with room must be in the layout");
+        let mut broken = buffer.clone();
+        for y in target.y..target.bottom() {
+            for x in target.x..target.right() {
+                broken[(x, y)].reset();
+            }
+        }
+        let error = HeadlessBufferEvidence::inspect(&broken, tick, &layout).expect_err(
+            "the emergency tier must still reject a panel that had room and drew \
+             nothing, or the relaxation went too far",
+        );
+        assert!(
+            error.to_string().contains(broken_name),
+            "the emergency-tier failure must name the region that broke: {error:#}"
+        );
+    }
+
+    /// `capability_profile` must describe the frame it was computed from.
+    ///
+    /// It was the literal "ascii_natural_fixed_80x36" for every frame at every
+    /// size, so a 40x12 report asserted a profile it had not observed — the
+    /// bd-0oro shape, in a field whose entire job is to say what was measured.
+    #[test]
+    fn the_reported_capability_profile_matches_the_frame_it_describes() {
+        for (width, height) in [(80_u16, 36_u16), (40, 12)] {
+            let (buffer, layout, tick) = matrix_frame_buffer(width, height);
+            let evidence =
+                HeadlessBufferEvidence::inspect(&buffer, tick, &layout).expect("frame evidence");
+            assert_eq!(
+                evidence.capability_profile,
+                format!("ascii_natural_fixed_{width}x{height}"),
+                "the profile must name the observed viewport"
+            );
+            assert_eq!(
+                (evidence.viewport_width, evidence.viewport_height),
+                (width, height),
+                "and the recorded viewport must agree with it"
+            );
+        }
+    }
+
     #[test]
     fn the_blank_buffer_detector_would_catch_a_frame_that_painted_nothing() {
         // The same discipline as any alarm: an evidence check nobody has watched
@@ -11181,11 +11746,17 @@ mod tests {
             "an untouched buffer must read as zero painted cells, or the assertion \
              above proves nothing"
         );
-        let error = HeadlessBufferEvidence::inspect(&blank, 1)
+        // An 80x36 frame gives every region room, so a blank one must be rejected
+        // for a LOCALIZED reason rather than a frame-wide one. This is what the
+        // per-region contract buys: the message names the panel and its rectangle.
+        let layout = FrameLayout::compute(blank.area, true, false, false);
+        let error = HeadlessBufferEvidence::inspect(&blank, 1, &layout)
             .expect_err("the production TestBackend evidence inspector must reject a blank frame");
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("omitted required terminal_hud"),
-            "blank-frame rejection must identify the first missing semantic region: {error:#}"
+            message.contains("region \"header\"") && message.contains("ScriptBots"),
+            "blank-frame rejection must name the region that failed and the title it \
+             wanted, not just report a frame-wide miss: {error:#}"
         );
     }
 
