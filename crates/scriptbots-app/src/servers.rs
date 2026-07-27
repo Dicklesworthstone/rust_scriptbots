@@ -1553,16 +1553,20 @@ async fn post_selection(
     tag = "control",
     request_body = ConfigPatchRequest,
     responses(
-        (status = 200, body = ConfigSnapshot),
+        (status = 202, body = CommandStatusDto),
         (status = 400, body = ErrorResponse)
     )
 )]
 async fn patch_config(
     State(state): State<ApiState>,
     Json(payload): Json<ConfigPatchRequest>,
-) -> Result<Json<ConfigSnapshot>, AppError> {
-    let snapshot = run_control(move || state.handle.apply_patch(payload.patch)).await?;
-    Ok(Json(snapshot))
+) -> Result<(StatusCode, Json<CommandStatusDto>), AppError> {
+    // 202 with a receipt, not 200 with the requested config echoed back as
+    // though it were current. The old response projected future config: it was
+    // built from the REQUESTED values and stamped with the tick at which those
+    // values were NOT in effect (bd-k7nq). Read /api/config for applied truth.
+    let status = run_control(move || state.handle.apply_patch(payload.patch)).await?;
+    Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
 #[utoipa::path(
@@ -1571,19 +1575,19 @@ async fn patch_config(
     tag = "control",
     request_body = KnobApplyRequest,
     responses(
-        (status = 200, body = ConfigSnapshot),
+        (status = 202, body = CommandStatusDto),
         (status = 400, body = ErrorResponse)
     )
 )]
 async fn apply_updates(
     State(state): State<ApiState>,
     Json(payload): Json<KnobApplyRequest>,
-) -> Result<Json<ConfigSnapshot>, AppError> {
+) -> Result<(StatusCode, Json<CommandStatusDto>), AppError> {
     if payload.updates.is_empty() {
         return Err(AppError::bad_request("updates cannot be empty"));
     }
-    let snapshot = run_control(move || state.handle.apply_updates(&payload.updates)).await?;
-    Ok(Json(snapshot))
+    let status = run_control(move || state.handle.apply_updates(&payload.updates)).await?;
+    Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
 #[utoipa::path(
@@ -1636,20 +1640,20 @@ async fn list_presets() -> Result<Json<PresetList>, AppError> {
     path = "/api/presets/apply",
     tag = "control",
     request_body = PresetApplyRequest,
-    responses((status = 200, body = ConfigSnapshot), (status = 400, body = ErrorResponse))
+    responses((status = 202, body = CommandStatusDto), (status = 400, body = ErrorResponse))
 )]
 async fn apply_preset(
     State(state): State<ApiState>,
     Json(payload): Json<PresetApplyRequest>,
-) -> Result<Json<ConfigSnapshot>, AppError> {
+) -> Result<(StatusCode, Json<CommandStatusDto>), AppError> {
     let Some(kind) = PresetKind::from_name(&payload.name) else {
         return Err(AppError::bad_request(format!(
             "unknown preset: {}",
             payload.name
         )));
     };
-    let snapshot = run_control(move || state.handle.apply_patch(kind.patch())).await?;
-    Ok(Json(snapshot))
+    let status = run_control(move || state.handle.apply_patch(kind.patch())).await?;
+    Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
 #[utoipa::path(
@@ -2258,8 +2262,8 @@ impl ToolHandler for ControlTool {
                     )
                 })?;
                 let handle = self.handle.clone();
-                let snapshot = run_control_mcp_sync(move || handle.apply_patch(kind.patch()))?;
-                make_tool_result(snapshot)
+                let status = run_control_mcp_sync(move || handle.apply_patch(kind.patch()))?;
+                make_tool_result(status)
             }
             ControlToolKind::ListKnobs => {
                 let handle = self.handle.clone();
@@ -2289,8 +2293,8 @@ impl ToolHandler for ControlTool {
                     ));
                 }
                 let handle = self.handle.clone();
-                let snapshot = run_control_mcp_sync(move || handle.apply_updates(&updates))?;
-                make_tool_result(snapshot)
+                let status = run_control_mcp_sync(move || handle.apply_updates(&updates))?;
+                make_tool_result(status)
             }
             ControlToolKind::ApplyPatch => {
                 let patch_value = arguments.get("patch").cloned().ok_or_else(|| {
@@ -2303,8 +2307,8 @@ impl ToolHandler for ControlTool {
                     ));
                 }
                 let handle = self.handle.clone();
-                let snapshot = run_control_mcp_sync(move || handle.apply_patch(patch_value))?;
-                make_tool_result(snapshot)
+                let status = run_control_mcp_sync(move || handle.apply_patch(patch_value))?;
+                make_tool_result(status)
             }
             // These four returned the REQUEST echoed back as though it were the
             // result: `{"paused": true}` restated what was asked for, and

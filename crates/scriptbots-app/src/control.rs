@@ -38,14 +38,6 @@ impl ConfigSnapshot {
             config: config_value,
         })
     }
-
-    fn from_config(config: ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
-        let config_value = serde_json::to_value(config).map_err(ControlError::serialization)?;
-        Ok(Self {
-            tick: tick.0,
-            config: config_value,
-        })
-    }
 }
 
 /// Status summary of the running simulation for control clients.
@@ -602,7 +594,7 @@ impl ControlHandle {
     }
 
     /// Apply a structured JSON patch object onto the configuration.
-    pub fn apply_patch(&self, patch: Value) -> Result<ConfigSnapshot, ControlError> {
+    pub fn apply_patch(&self, patch: Value) -> Result<CommandStatusDto, ControlError> {
         if !patch.is_object() {
             return Err(ControlError::InvalidPatch(
                 "configuration patch must be a JSON object".into(),
@@ -610,7 +602,6 @@ impl ControlHandle {
         }
 
         let world = self.lock_world()?;
-        let current_tick = world.tick();
         let mut config_value =
             serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
         // Range-check the REQUESTED knobs before merging them. `validate()`
@@ -655,15 +646,31 @@ impl ControlHandle {
                     .into(),
             ));
         }
-        let snapshot = ConfigSnapshot::from_config(new_config.clone(), current_tick)?;
+        // The world lock is released BEFORE submitting, because
+        // `submit_control_command` reads tick and revision under the same
+        // non-reentrant mutex.
         drop(world);
-        self.enqueue(ControlCommand::UpdateConfig(Box::new(new_config)))?;
+        // Return the receipt, not a projection. This used to build a
+        // ConfigSnapshot from the REQUESTED config and hand it back as though
+        // it were current, so a client was told the new configuration was in
+        // effect when the command had only been admitted to a bounded queue. It
+        // was worse than a plain projection: the requested config was stamped
+        // with `current_tick`, the tick at which those values were NOT in
+        // effect, making the response a chimera of a config that had not been
+        // applied and a tick at which it had not been applied (bd-k7nq).
+        //
+        // Acceptance criterion 4 of the migration is explicit that reads use
+        // immutable snapshots and never project future config, so the caller
+        // now gets a command id it can poll and reads the configuration back
+        // through /api/config when it wants the applied truth.
+        let status =
+            self.submit_control_command(ControlCommand::UpdateConfig(Box::new(new_config)))?;
         *lock_cache(&self.knobs_cache) = None;
-        Ok(snapshot)
+        Ok(status)
     }
 
     /// Apply a list of knob updates by path.
-    pub fn apply_updates(&self, updates: &[KnobUpdate]) -> Result<ConfigSnapshot, ControlError> {
+    pub fn apply_updates(&self, updates: &[KnobUpdate]) -> Result<CommandStatusDto, ControlError> {
         let mut patch_map = Map::new();
         for update in updates {
             insert_path(&mut patch_map, &update.path, update.value.clone())?;
@@ -1244,21 +1251,35 @@ mod tests {
             path: "food_max".to_string(),
             value: Value::from(0.6),
         }];
-        let snapshot = handle.apply_updates(&updates).expect("patch");
-        let value = snapshot
-            .config
-            .get("food_max")
-            .and_then(Value::as_f64)
-            .expect("food_max");
+        let receipt = handle.apply_updates(&updates).expect("patch");
+
+        // A receipt, not a projection. This test used to read food_max ≈ 0.6
+        // out of the RETURNED value and call that success, which encoded the
+        // defect as the contract: the response was built from the requested
+        // config and stamped with the tick at which it was not yet in effect
+        // (bd-k7nq).
         assert!(
-            (value - 0.6).abs() < 1e-6,
-            "expected food_max ≈ 0.6 in snapshot, got {value}"
+            receipt.admission_sequence.is_some(),
+            "a config update must report the order it took on the bus"
         );
 
-        // ensure queue drained for consistency
+        // The world has NOT changed yet. This is the assertion the old shape
+        // could not make, because it was handed the requested config and had
+        // nothing to compare against.
+        {
+            let world = handle.lock_world().expect("world lock");
+            assert!(
+                (world.config().food_max - 0.5).abs() < f32::EPSILON,
+                "config changed before the command was drained; the update was only admitted"
+            );
+        }
+
         let mut world = handle.lock_world().expect("world lock");
         drain_and_apply(&receiver, &mut world);
-        assert!((world.config().food_max - 0.6).abs() < f32::EPSILON);
+        assert!(
+            (world.config().food_max - 0.6).abs() < f32::EPSILON,
+            "draining the admitted command must actually apply it"
+        );
     }
 
     #[test]
@@ -1278,8 +1299,21 @@ mod tests {
                 }
             }))
             .expect("render patch applies");
+        assert!(
+            snapshot.admission_sequence.is_some(),
+            "the render patch must report its admission order"
+        );
 
-        let render = &snapshot.config["render"];
+        // Read the round trip back from the world AFTER draining, rather than
+        // from the response. The response no longer echoes the requested config
+        // (bd-k7nq), and reading it back through the authoritative path is what
+        // actually proves the patch survived serialization.
+        {
+            let mut world = handle.lock_world().expect("world lock");
+            drain_and_apply(&receiver, &mut world);
+        }
+        let applied = handle.snapshot().expect("config after drain");
+        let render = &applied.config["render"];
         assert_eq!(render["quality"], serde_json::json!("high"));
         assert_eq!(render["theme"], serde_json::json!("nordic_frost"));
         assert_eq!(render["palette"], serde_json::json!("tritanopia"));
@@ -1342,31 +1376,59 @@ mod tests {
         );
     }
 
+    /// The config response reports only applied state.
+    ///
+    /// This was a `#[should_panic]` target test carrying "KNOWN DEFECT
+    /// bd-2z0.4.1: config response projects unapplied future state". The defect
+    /// is fixed under bd-k7nq, so the target is now asserted directly rather
+    /// than pinned as known-failing — a should_panic marker that no longer
+    /// panics is worse than no test, because it fails for the right reason and
+    /// reads like a regression.
+    ///
+    /// The response can no longer project, structurally: it is a receipt and
+    /// carries no config field at all. What is left to prove is that the
+    /// authoritative read still shows the OLD value while the command is merely
+    /// admitted.
     #[test]
-    #[should_panic(
-        expected = "KNOWN DEFECT bd-2z0.4.1: config response projects unapplied future state"
-    )]
-    fn target_config_response_reports_only_applied_state() {
-        let (handle, _receiver) = handle();
-        let projected = handle
+    fn config_response_reports_only_applied_state() {
+        let (handle, receiver) = handle();
+        let before = handle.snapshot().expect("config before");
+        let baseline = before.config["food_max"].as_f64().expect("food_max");
+
+        let receipt = handle
             .apply_updates(&[KnobUpdate {
                 path: "food_max".to_owned(),
                 value: Value::from(0.6),
             }])
             .expect("accepted config patch");
-        let observed = handle.snapshot().expect("current config snapshot");
-        let projected_food_max = projected.config["food_max"]
-            .as_f64()
-            .expect("projected food_max");
-        let observed_food_max = observed.config["food_max"]
-            .as_f64()
-            .expect("observed food_max");
+        assert!(
+            receipt.admission_sequence.is_some(),
+            "an accepted config patch must report its admission order"
+        );
 
-        assert!((projected_food_max - 0.6).abs() < 1.0e-6);
-        assert!((observed_food_max - 0.6).abs() > 1.0e-6);
-        assert_eq!(
-            projected_food_max, observed_food_max,
-            "KNOWN DEFECT bd-2z0.4.1: config response projects unapplied future state"
+        let observed = handle.snapshot().expect("current config snapshot");
+        let observed_food_max = observed.config["food_max"].as_f64().expect("food_max");
+        assert!(
+            (observed_food_max - baseline).abs() < 1.0e-6,
+            "the authoritative read moved on an admitted-but-undrained command: {baseline} -> \
+             {observed_food_max}"
+        );
+        assert!(
+            (observed_food_max - 0.6).abs() > 1.0e-6,
+            "the read reports the REQUESTED value, which is the projection this fix removed"
+        );
+
+        // Positive control: the command is real and does apply once drained, so
+        // the assertions above describe timing rather than a dropped command.
+        {
+            let mut world = handle.lock_world().expect("world lock");
+            drain_and_apply(&receiver, &mut world);
+        }
+        let applied = handle.snapshot().expect("config after drain");
+        let applied_food_max = applied.config["food_max"].as_f64().expect("food_max");
+        assert!(
+            (applied_food_max - 0.6).abs() < 1.0e-6,
+            "the admitted command never applied, got {applied_food_max}"
         );
     }
 
