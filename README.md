@@ -41,7 +41,7 @@ rust_scriptbots/
 │   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
 │   ├── scriptbots-index      # Uniform-grid index; alternate backends are not implemented
 │   ├── scriptbots-storage    # FrankenSQLite persistence worker & analytics snapshots
-│   ├── scriptbots-render     # GPUI integration and visual layer (HUD, canvas renderer)
+│   ├── scriptbots-render     # GPUI integration and visual layer (World + tabbed Lab)
 │   ├── scriptbots-app        # Binary crate wiring everything together
 │   └── scriptbots-web        # Sibling WebAssembly harness (wasm-bindgen bindings; experimental)
 └── docs/
@@ -110,7 +110,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - Startup is fail-closed and transactional. Renderer selection and control-environment validation happen first, then every enabled REST/MCP socket is prebound and held before configuration output, auto-tuning, process-priority changes, world construction, or storage reservation. Launch consumes those exact listeners, so a bind failure cannot leave config, tuning, or run-database artifacts behind and cannot race a later rebind.
 - REST and MCP run as supervised sibling tasks. An unexpected error or clean task exit stops the sibling, preserves the original failure as the root cause, and publishes failed runtime health; the TUI, GPUI, and Bevy frontends observe that health and terminate with the same root failure. Graceful shutdown joins both tasks and releases both listeners.
 - That supervision guarantee covers ordinary returned errors and task exits. Debug/test builds use unwinding boundaries to exercise panic reporting, while the shipped `panic = "abort"` release profile intentionally cannot recover from a panic or promise destructor-based cleanup after one.
-- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. GPUI now has exactly one session-level simulation driver, independent of either window's repaint cadence, that owns scientific stepping, command draining, and shared pause/speed state; both the HUD and world window are presentation-only projections. This closes the characterized GPUI double-drive and per-view control defects. `HostCore` and its native lifecycle are implemented, but TUI/GPUI/Bevy and the live server transports remain on their interim adapters until the dedicated migration beads move that ownership into the renderer-neutral host.
+- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. GPUI has exactly one session-level simulation driver, independent of either window's repaint cadence, that owns scientific stepping, command draining, and shared pause/speed state; both the Lab and World windows are presentation-only projections. This closes the characterized GPUI double-drive defect. `HostCore` and its native lifecycle are implemented, but TUI/GPUI/Bevy and the live server transports remain on their interim adapters until the dedicated migration beads move that ownership into the renderer-neutral host.
 - `scriptbots-runtime` owns the renderer-neutral command, two-axis status, snapshot, event-cursor, and manual-drive contracts plus the exact sole-owner `HostCore`. Command lifecycle schema v1 retains the exact envelope, client namespace/sequence, optional admission order, typed control/scientific/config guards, and contiguous application transitions; every terminal runtime outcome has a journal obligation. Its optional `native-asupersync` feature drives that same `!Send` host as one current-thread root future at absolute deadlines. Commands and journal-ready signals wake the owner, catch-up is bounded and reported, quiescent paused worlds have no periodic timer, and ordered shutdown retains its exact host and journal obligations without spawning or detaching a simulation task. The lifecycle persistence source is committed under `bd-2z0.5.2`; centralized DSR proof is pending.
 - Brain introspection is an explicit read-only projection, never a per-tick side effect. A client issues a revisioned request for up to eight stable `AgentUid` values; core and each brain family enforce independent bounds for layers, names, values, edges, source scalars, and retained payload. Responses carry the exact source tick and typed unavailable/clipped status, while TUI and GPUI cache by client, stable identity, and source tick. With no request, no brain is inspected and NeuroFlow performs no inspection JSON serialization; digest-neutrality and next-output purity are tested across the supported families.
 - Control surfaces are transport-agnostic; both REST and MCP use the same safe `ControlHandle` and enqueue commands with back-pressure.
@@ -123,7 +123,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
 - **`scriptbots-index`**: Production uniform-grid neighborhood index. Alternate backends are not advertised until they have real implementations and conformance coverage.
 - **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
-- **`scriptbots-render`**: GPUI UI layer with a window shell, HUD, canvas renderer for agents/food, selection highlights, and diagnostics overlay.
+- **`scriptbots-render`**: GPUI UI layer with a tiled World + Lab shell, canvas renderer for agents/food, selection highlights, tabbed inspection/analytics, and scrollable diagnostics.
 - **`scriptbots-app`**: Binary shell. Wires tracing/logging, config/env, storage pipeline, installs brains, seeds agents, and launches the GPUI shell.
 - **`scriptbots-web`**: WebAssembly harness exposing bindings to init/tick/reset and snapshot the simulation; consumes `scriptbots-core` with `default-features = false` (sequential fallback; Rayon disabled on wasm).
 
@@ -131,7 +131,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - Workspace scaffolding, shared lints, and profiles are in place.
 - `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
 - `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, schema-v1 lifecycle evidence, opaque client ports, cursors, manual-drive contract, sole-owner `HostCore`, pure fixed-deadline driver, and optional current-thread Asupersync lifecycle are implemented. The `bd-2z0.5.2` lifecycle source is centralized-DSR-pending; legacy frontend and transport migration remains pending.
-- `scriptbots-render`: GPUI window + HUD + canvas renderer with camera controls, selection highlights, and diagnostics overlay; audio is optional via `kira` feature.
+- `scriptbots-render`: GPUI World + tabbed Lab windows with camera controls, selection highlights, scrollable diagnostics, and optional `kira` audio.
 - `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The full cross-feature/platform startup matrix remains a Phase 0.4 acceptance gate.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
 - `scriptbots-brain-neuro`: NeuroFlow-backed brain available behind the `neuro` feature (runtime toggles below).
@@ -485,8 +485,9 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - `SCRIPTBOTS_RECOVER_STORAGE` — existing file-backed run to repair and finalize, equivalent to `--recover-storage FILE`. Recovery exits after persistence repair; it does not resume the simulation. The core science checkpoint is a separate persistence-disabled API, while application run-bundle discovery and resume remain roadmap work.
 
 ### Dual-window mode (GUI)
-- ScriptBots opens two GPUI windows as one transactional launch: a canvas window rendering the world and a HUD window with controls, charts, and inspector. If either window cannot be created (for example because of window-manager or remote-session limits), ScriptBots terminates the partial application lifetime and returns an actionable error; it never silently changes the requested layout. GPUI uses `QuitMode::LastWindowClosed`, and closing either member of the paired session closes the application rather than leaving one orphaned window or a hidden process alive.
-- The paired session has one GPUI simulation driver that runs independently of painting; neither window advances the world from its render path, and pause/speed changes from either window update the same shared state. This fixes GPUI's double-drive and per-view control defects. The remaining `HostCore` migration is architectural rather than a second GPUI driver fix: it must move scientific-time and command-drain ownership out of the renderer-local adapter and into the renderer-neutral host shared by every frontend and live transport.
+- ScriptBots opens two GPUI windows as one transactional launch and tiles them inside the primary display's visible frame: a flexible World window and a narrow `ScriptBots Lab` companion. The Lab does not duplicate the canvas; its Overview, Inspect, Analytics, and Timeline tabs keep one task-focused surface visible at a time, with dense diagnostics closed by default and the active section vertically scrollable. On narrow displays the pair stacks without overlap.
+- Display-local controls—agents, food, outlines, follow, camera fit, zoom, pan, debug overlays, palette, narration, and settings—stay in the World window they affect. Shared run controls—pause, step, speed, spawning, environment, and presets—live in the Lab. If either window cannot be created (for example because of window-manager or remote-session limits), ScriptBots terminates the partial application lifetime and returns an actionable error; it never silently changes the requested layout. GPUI uses `QuitMode::LastWindowClosed`, and closing either member of the pair closes the application rather than leaving an orphaned window or hidden process.
+- The paired session has one GPUI simulation driver that runs independently of painting; neither window advances the world from its render path, and shared run commands target that one driver. The remaining `HostCore` migration is architectural: it must move scientific-time and command-drain ownership out of the renderer-local adapter and into the renderer-neutral host shared by every frontend and live transport.
 
 ## Simulation overview
 Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; explicit staged ordering):
@@ -564,9 +565,9 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - **Analytics**: attacker/victim flags (carnivore/herbivore), births/deaths, hybrid markers, age/boost tracking, and per-tick summaries feed FrankenSQLite plus the immutable HUD analytics snapshot.
 
 ## Rendering & UX
-- GPUI window, HUD, and canvas renderer for food tiles and agents (circles/spikes). The dual-window HUD and simulation canvas launch transactionally under `QuitMode::LastWindowClosed`; closing either paired window ends the session, so a launch/close failure cannot leave a degraded or orphaned UI. The world window is read-only while the HUD temporarily remains the sole driver pending `HostCore`.
-- Camera controls: pan/zoom; keyboard bindings for pause, draw toggle, speed ±.
-- Overlays: selection highlights, diagnostics panel; charts and advanced overlays are staged in the plan.
+- GPUI renders food tiles and agents (circles/spikes) in a dedicated World window beside a compact tabbed Lab. The pair launches transactionally under `QuitMode::LastWindowClosed`; closing either window ends the session, so a launch/close failure cannot leave a degraded or orphaned UI.
+- Camera controls: scroll to zoom, middle-drag to pan, `0` or the World toolbar to fit; display toggles live beside the canvas.
+- Lab tabs separate overview/run controls, agent inspection, analytics/history, and the narrative timeline. Optional diagnostic cards are keyboard disclosures (`1`, `2`, `3`) in the scrollable Overview.
 - Functional search: the settings panel includes a live search bar that filters parameters across all categories via a centralized filter, making it fast to find and tweak knobs.
 - Inspector: per-agent stats and genome/brain views (scoped to plan milestones); mutation-rate adjusters (±) for primary/secondary let you tweak an agent’s evolution parameters live.
 - Optional audio via `kira` (feature `audio`).
@@ -577,15 +578,15 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 
 ### Accessibility & input
 - **Colorblind-safe palettes** (deuteranopia/protanopia/tritanopia) and a high-contrast mode; UI elements and overlays respect palette transforms.
-- **Keyboard remapping** with conflict resolution and capture mode; discoverable bindings in the HUD.
-- **Narration hooks** prepared for future screen-reader integration; toggles surfaced in the inspector.
+- **Window-scoped keyboard controls** keep canvas presentation commands in World and retained-history/diagnostic commands in Lab, while simulation commands work from either window.
+- **Narration hooks** prepared for future screen-reader integration; the toggle stays beside the World presentation controls.
 
 ### Renderer abstraction
 - The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features). Every frontend consumes the same world and immutable analytics snapshots.
 
 ### Keyboard shortcuts (GUI)
 
-Simulation controls and retained-history playback are separate. The unmodified `S` shortcut returns the invoking view to live and queues one scientific step; when that isolated step succeeds, it advances exactly once and leaves the simulation paused. `space` only toggles timeline playback. `0` restores the geometric fit-to-world view after panning or zooming. These are the defaults shown by the in-app binding registry and can be rebound in settings.
+Simulation controls and retained-history playback are separate. The unmodified `S` shortcut returns the invoking view to live and queues one scientific step; when that isolated step succeeds, it advances exactly once and leaves the simulation paused. `space`, `G`, and `1`/`2`/`3` apply in Lab. Canvas presentation shortcuts (`N`, `Ctrl+P`, `D`, `F`, `Ctrl+Shift+O`, `Shift+S`, `O`, `Shift+F`, `0`, and `,`) apply in World. Simulation and canonical selection commands work from either window.
 
 <!-- BEGIN GENERATED GPUI DEFAULT SHORTCUTS -->
 
@@ -593,7 +594,6 @@ Simulation controls and retained-history playback are separate. The unmodified `
 | --- | --- |
 | Toggle playback | `space` |
 | Jump to live | `G` |
-| Toggle brush | `B` |
 | Toggle narration | `N` |
 | Cycle palette | `Ctrl + P` |
 | Toggle simulation pause | `P` |
@@ -758,7 +758,7 @@ result.
 - CPU profiling (Linux/macOS): run with `RUSTFLAGS='-g'` and use `perf record`/`perf report` or `dtrace`/Instruments; annotate hot paths in sense/actuation.
 - Tracy (optional): integrate client in dev builds to visualize frame times and background worker activity.
 - Threading: tune `RAYON_NUM_THREADS` to match physical cores; verify determinism with seeded runs.
-- Rendering: measure HUD/canvas frame times; avoid per-frame allocations; prefer batched path building.
+- Rendering: measure Lab/canvas frame times; avoid per-frame allocations; prefer batched path building.
  - Built-in tools:
    - `--profile-steps N` and `--profile-storage-steps N` to run headless micro-benchmarks
    - `--profile-sweep N` and `--auto-tune N` to explore and auto-pick thread/flush settings
@@ -1040,7 +1040,7 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
 4. Storage: durable outbox, exact identity/schema recovery, direct-write/root-cause unification, V6/V7 base/archive lineage, indexed pairwise interaction edges, and run bundles are integrated. V8/V9 command/domain projections are code-first and centralized-DSR-pending; remaining work includes strict-run host policy and product checkpoint/replay integration.
 5. Runtime: renderer-neutral protocol, sole-owner `HostCore`, and fixed-deadline native lifecycle landed; next publish canonical multi-subscriber projections and migrate every frontend and transport adapter off the legacy app-owned drivers.
-6. Rendering: HUD/overlays/inspector polish; performance diagnostics.
+6. Rendering: Lab/overlays/inspector polish; performance diagnostics.
 7. DSR packaging and verification: release builds, binaries, and WASM/browser evidence from the pinned repository profile.
 
 ### Mixed brain families (default)

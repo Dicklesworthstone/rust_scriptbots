@@ -543,6 +543,43 @@ jobs:
           printf '%s\n' "$output"
           grep -Fq -- 'replay verification refused a vacuous nonzero run' <<< "$output"
 
+  storage_lab_chaos:
+    name: Storage LabRuntime Chaos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: storage-lab-chaos-linux
+
+      - name: Run bounded deterministic persistence chaos corpus
+        env:
+          SCRIPTBOTS_LAB_TRACE_DIR: target/lab-runtime-chaos/${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash scripts/e2e_storage_lab_chaos.sh
+
+      - name: Retain deterministic traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: storage-lab-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/lab-runtime-chaos/${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          retention-days: 14
+
   render_regression:
     name: Render Regression (${{ matrix.os }})
     needs: [golden_assets, clippy, test]
