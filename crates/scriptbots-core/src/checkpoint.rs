@@ -10,10 +10,13 @@
 //! Keeping that boundary explicit prevents a core round trip from being advertised as a storage
 //! or application recovery feature.
 
-// Exact floating-point equality is used only by checkpoint conformance checks.
 // Numeric conversions are justified at the restore boundary so new casts stay
 // lint-visible throughout the rest of this module.
-#![allow(clippy::float_cmp)]
+//
+// float_cmp is NOT permitted module-wide (bd-p5vu). Every exact
+// floating-point comparison here carries its own narrowly attached allowance
+// naming the invariant that makes exactness correct, so a NEW accidental
+// exact comparison is a lint error rather than an invisible one.
 #![allow(clippy::too_many_lines)]
 
 use crate::rng_domains::{
@@ -3863,6 +3866,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the record boundary clamps herbivore_tendency to the exact bound 1.0; the claim \
+                  is that the clamp landed on the bound, so a tolerance would accept a value that \
+                  escaped it"
+    )]
     fn customized_root_origin_round_trips_without_fabricating_host_metrics() {
         let mut original =
             WorldState::new(checkpoint_config()).expect("custom root checkpoint world");

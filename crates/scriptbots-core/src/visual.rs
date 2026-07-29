@@ -20,10 +20,13 @@
 //! [`apply_accessibility_palette`] as the FINAL stage before display so every
 //! surface (3D PBR, terminal truecolor, ASCII fallback) transforms identically.
 
-// Exact floating-point equality is used only where the visual contract defines
-// an exact identity value; deterministic arithmetic and casts are justified at
-// their narrow call sites so new numerical operations remain lint-visible.
-#![allow(clippy::float_cmp)]
+// Deterministic arithmetic and casts are justified at their narrow call sites
+// so new numerical operations remain lint-visible.
+//
+// float_cmp is NOT permitted module-wide (bd-p5vu). Every exact
+// floating-point comparison here carries its own narrowly attached allowance
+// naming the visual-contract identity that makes exactness correct, so a NEW
+// accidental exact comparison is a lint error rather than an invisible one.
 #![allow(clippy::too_many_lines)]
 
 use crate::{AccessibilityPalette, BirthOrigin, DeathCause, TerrainKind};
@@ -981,6 +984,14 @@ pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
         TerrainKind::Rock => (0.85 + slope * 0.3).clamp(0.6, 1.2),
         TerrainKind::DeepWater | TerrainKind::ShallowWater => 1.0,
     };
+    // Exact by construction: the water arms above return the literal `1.0`,
+    // and multiplying by exactly one is the identity for every finite value.
+    // The comparison is a skip test against a sentinel this same `match`
+    // produced, not an approximate equality between two computed quantities.
+    #[allow(
+        clippy::float_cmp,
+        reason = "sentinel identity: the water arms return literal 1.0 and x * 1.0 == x exactly"
+    )]
     if factor != 1.0 {
         rgb = [rgb[0] * factor, rgb[1] * factor, rgb[2] * factor];
     }
@@ -2296,6 +2307,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "Natural is DEFINED as the identity transform and the clamp lands on the exact \
+                  bounds 0.0 and 1.0; a tolerance would let a palette that perturbs every channel \
+                  pass as the identity"
+    )]
     fn natural_palette_is_identity_and_clamps() {
         let rgb = [0.2, 0.5, 0.9];
         assert_eq!(
@@ -2432,6 +2449,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "boost_emissive_gain is copied verbatim out of BIOLUMINESCENT_DARK_FIELD_V1, so \
+                  this is constant identity rather than agreement between two computations"
+    )]
     fn agent_params_selection_ramp_and_clamps() {
         let base = AgentVisualInput {
             genome_color: [0.5, 0.6, 0.7],
@@ -2566,6 +2588,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "these colors are ALIASES into the style table, not derived values; the whole \
+                  claim of the test is that the accessor returns the same bytes the table holds"
+    )]
     fn terrain_base_colors_are_aliases_into_the_style() {
         assert_eq!(
             terrain_kind_base_color(TerrainKind::DeepWater),
@@ -2626,6 +2653,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the exact comparisons here are the wrap-around determinism claim (tick 1250 and \
+                  tick 250 are the same phase and must produce bit-identical light) and the \
+                  start_phase distinctness claim; magnitude checks nearby already use EPS"
+    )]
     fn daylight_curve_static_and_cyclic() {
         assert!((daylight_factor(999, 0, 0.0) - DAYLIGHT_STATIC).abs() < EPS);
         // Cycle: noon brightest, midnight at floor.
@@ -2654,6 +2687,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "'density must not change hue' is an exact invariance claim: the core color is \
+                  carried through unmodified, so any drift at all is the defect being tested for"
+    )]
     fn food_keeps_one_hue_while_visibility_and_energy_rise() {
         assert_rgb_close(food_density_color(0.0), FOOD_SPARSE_RGB, "sparse");
         assert_rgb_close(food_density_color(1.0), FOOD_DENSE_RGB, "dense");
@@ -2723,6 +2761,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "determinism and period-wrap are bit-identity claims — a tolerance would let a \
+                  shimmer that drifts between identical calls pass as deterministic — and the \
+                  cell-specific assert_ne is a distinctness claim over two exact values"
+    )]
     fn shimmer_is_deterministic_bounded_and_cell_specific() {
         let a = shimmer(42, 3, 7);
         let b = shimmer(42, 3, 7);
@@ -2906,6 +2950,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "determinism is a bit-identity claim: the same seed and coordinates must return \
+                  the same bits, and an approximate check would pass a noise field that is not \
+                  reproducible across renderers"
+    )]
     fn noise_is_bounded_and_deterministic() {
         for seed in [0_u64, 1, 42, u64::MAX] {
             for i in 0..64 {
@@ -2977,6 +3027,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "distinctness between three fixed palette entries; assert_ne on exact values is \
+                  the strongest form of the claim, and a tolerance would weaken it"
+    )]
     fn birth_origins_are_visually_distinct() {
         let born = visual_cue_for_event(&WorldVisualEvent::Birth {
             origin: BirthOrigin::Born,

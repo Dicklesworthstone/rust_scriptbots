@@ -10081,6 +10081,7 @@ dependencies = [
 name = "scriptbots-analytics"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "libc",
  "scriptbots-core",
@@ -10114,6 +10115,7 @@ dependencies = [
  "postcard",
  "rand 0.9.5",
  "ratatui",
+ "rayon",
  "reqwest",
  "ron 0.8.1",
  "scriptbots-bevy",
@@ -10254,6 +10256,8 @@ dependencies = [
  "scriptbots-core",
  "scriptbots-storage",
  "scriptbots-world-gfx",
+ "serde",
+ "serde_json",
  "tracing",
  "wgpu 27.0.1",
 ]
@@ -10279,6 +10283,7 @@ name = "scriptbots-storage"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "asupersync",
  "blake3",
  "crossbeam-channel",
  "fsqlite",
@@ -10318,6 +10323,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "image",
+ "naga 27.0.3",
  "pollster 0.4.0",
  "scriptbots-core",
  "tracing",

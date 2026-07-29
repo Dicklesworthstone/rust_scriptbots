@@ -9,7 +9,6 @@ const INITIAL_AGENT_DIAMETERS_ACROSS: f32 = 120.0;
 pub struct CameraConfig {
     pub min_zoom: f32,
     pub max_zoom: f32,
-    pub legacy_scale: f32,
 }
 
 impl Default for CameraConfig {
@@ -17,7 +16,6 @@ impl Default for CameraConfig {
         Self {
             min_zoom: 0.4,
             max_zoom: 2.5,
-            legacy_scale: 0.2,
         }
     }
 }
@@ -143,9 +141,7 @@ impl Camera {
         if self.state.zoom_initialized || base_scale <= 0.0 {
             return;
         }
-        let desired = (self.config.legacy_scale / base_scale)
-            .clamp(self.config.min_zoom, self.config.max_zoom);
-        self.state.zoom = desired;
+        self.state.zoom = 1.0_f32.clamp(self.config.min_zoom, self.config.max_zoom);
         self.state.zoom_initialized = true;
     }
 
@@ -153,10 +149,11 @@ impl Camera {
         if self.state.last_base_scale <= f32::EPSILON {
             return;
         }
-        let base_scale = self.state.last_base_scale;
-        let zoom = (self.config.legacy_scale / base_scale)
-            .clamp(self.config.min_zoom, self.config.max_zoom);
-        self.state.zoom = zoom;
+        // `last_base_scale` is already the exact aspect-preserving scale that fits the
+        // whole world inside the current canvas. Applying the historical 0.2 world-unit
+        // scale a second time turned "Fit World" into "shrink world", commonly hitting
+        // the 0.4× clamp and surrounding the simulation with dead space.
+        self.state.zoom = 1.0_f32.clamp(self.config.min_zoom, self.config.max_zoom);
         self.state.offset_px = (0.0, 0.0);
         self.state.centered_once = true;
         self.state.zoom_initialized = true;
@@ -695,13 +692,7 @@ mod tests {
             "one precise pixel line and one wheel line must have the same zoom factor"
         );
         assert!(
-            approx_eq(
-                line_camera.zoom(),
-                CameraConfig::default().legacy_scale
-                    / (VIEWPORT.0 / WORLD.0).min(VIEWPORT.1 / WORLD.1)
-                    * ZOOM_PER_SCROLL_LINE,
-                1e-6,
-            ),
+            approx_eq(line_camera.zoom(), ZOOM_PER_SCROLL_LINE, 1e-6,),
             "one positive line must multiply zoom by the documented exponential step"
         );
     }
@@ -1059,13 +1050,17 @@ mod tests {
             after_input.offset_px.1.to_bits()
         );
         assert!(
-            approx_eq(layout.scale, CameraConfig::default().legacy_scale, 1e-6),
-            "user camera input must preserve the legacy wide scale instead of being overwritten"
+            approx_eq(
+                layout.scale,
+                (VIEWPORT.0 / WORLD.0).min(VIEWPORT.1 / WORLD.1),
+                1e-6
+            ),
+            "user camera input must preserve the fitted scale instead of being overwritten"
         );
     }
 
     #[test]
-    fn fit_world_restores_the_legacy_geometric_view_after_population_frame() {
+    fn fit_world_restores_the_geometric_fit_after_population_frame() {
         let agent_radius = ScriptBotsConfig::default().bot_radius;
 
         for viewport in [(1280.0, 720.0), (1600.0, 900.0)] {
@@ -1087,7 +1082,7 @@ mod tests {
 
             assert!(approx_eq(
                 layout.scale,
-                CameraConfig::default().legacy_scale,
+                (viewport.0 / WORLD.0).min(viewport.1 / WORLD.1),
                 1e-6
             ));
             assert_eq!(snapshot.offset_px.0.to_bits(), 0.0_f32.to_bits());

@@ -18,5 +18,6 @@ scriptbots-runtime = { path = "../scriptbots-runtime" }
 crossbeam-channel = "0.5"
 
 [dev-dependencies]
+asupersync = { workspace = true }
 tempfile = "3.8"
 tracing-subscriber = { workspace = true }

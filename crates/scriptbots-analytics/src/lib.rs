@@ -20,11 +20,15 @@
 //! name, parameter set, row counts, and wall time, so detailed logging is a
 //! property of the framework rather than a per-report afterthought.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use scriptbots_storage::{PersistedMetric, PersistenceBatchId, StorageError, StorageReader};
+use scriptbots_core::AgentUid;
+use scriptbots_storage::{
+    PersistedAgentObservation, PersistedInteraction, PersistedInteractionCapture, PersistedMetric,
+    PersistenceBatchId, StorageError, StorageReader,
+};
 use serde::Serialize;
 
 /// Native, dependency-free statistics for offline detector certification (bd-2z0.11.6).
@@ -90,6 +94,333 @@ const NARRATIVE_TIMELINE_DEFAULT_LIMIT: usize = 1_024;
 /// Hard ceiling for a caller-selected `narrative-timeline` SQL page.
 const NARRATIVE_TIMELINE_MAX_LIMIT: usize = 4_096;
 
+/// Stable schema identifier shared by reports and downstream behavior consumers.
+pub const PHENOTYPE_FEATURE_SCHEMA_ID_V1: &str = "scriptbots.phenotype-features.v1";
+/// Stable schema identifier for the directed interaction graph.
+pub const INTERACTION_GRAPH_SCHEMA_ID_V1: &str = "scriptbots.interaction-graph.v1";
+/// Number and order of canonical phenotype axes.
+pub const PHENOTYPE_AXIS_COUNT_V1: usize = 6;
+
+/// Provenance class of one phenotype feature.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureEvidenceV1 {
+    /// Directly measured from persisted state snapshots.
+    PersistedObservation,
+    /// A persisted heritable trait used explicitly as a proxy, not realized behavior.
+    PersistedTraitProxy,
+    /// A completed directed interaction persisted by core.
+    PersistedInteraction,
+    /// A parent edge from the persisted arrival ledger.
+    PersistedArrival,
+}
+
+/// Immutable definition of one ordered phenotype axis.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PhenotypeAxisV1 {
+    /// Stable machine identifier.
+    pub id: &'static str,
+    /// Human-readable unit.
+    pub unit: &'static str,
+    /// Declared value domain.
+    pub domain: &'static str,
+    /// Exact aggregation rule.
+    pub aggregation: &'static str,
+    /// What happens when evidence is absent.
+    pub missingness: &'static str,
+    /// Whether this is direct behavior, a trait proxy, an interaction, or lineage evidence.
+    pub evidence: FeatureEvidenceV1,
+}
+
+/// Canonical six-axis phenotype schema.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PhenotypeFeatureSchemaV1 {
+    /// Stable schema identifier.
+    pub schema_id: &'static str,
+    /// Version within the identifier family.
+    pub version: u16,
+    /// Ordered axes; array position is part of the schema.
+    pub axes: [PhenotypeAxisV1; PHENOTYPE_AXIS_COUNT_V1],
+}
+
+/// The canonical schema value used by every v1 extractor.
+pub const PHENOTYPE_FEATURE_SCHEMA_V1: PhenotypeFeatureSchemaV1 = PhenotypeFeatureSchemaV1 {
+    schema_id: PHENOTYPE_FEATURE_SCHEMA_ID_V1,
+    version: 1,
+    axes: [
+        PhenotypeAxisV1 {
+            id: "movement.speed.mean",
+            unit: "world_unit_per_tick",
+            domain: "finite_nonnegative",
+            aggregation: "mean_hypot_velocity_over_persisted_observations",
+            missingness: "reject_agent_without_observation",
+            evidence: FeatureEvidenceV1::PersistedObservation,
+        },
+        PhenotypeAxisV1 {
+            id: "diet.herbivore_trait.mean",
+            unit: "ratio",
+            domain: "finite",
+            aggregation: "mean_persisted_herbivore_tendency",
+            missingness: "reject_agent_without_observation",
+            evidence: FeatureEvidenceV1::PersistedTraitProxy,
+        },
+        PhenotypeAxisV1 {
+            id: "sensing.trait_modifier.mean",
+            unit: "trait_multiplier",
+            domain: "finite",
+            aggregation: "mean_of_smell_sound_hearing_eye_blood_traits_over_observations",
+            missingness: "reject_agent_without_observation",
+            evidence: FeatureEvidenceV1::PersistedTraitProxy,
+        },
+        PhenotypeAxisV1 {
+            id: "interaction.combat.actor_rate",
+            unit: "event_per_tick",
+            domain: "finite_nonnegative",
+            aggregation: "completed_combat_events_as_actor_divided_by_window_ticks",
+            missingness: "zero_only_when_run_wide_capture_is_complete",
+            evidence: FeatureEvidenceV1::PersistedInteraction,
+        },
+        PhenotypeAxisV1 {
+            id: "interaction.food_share.actor_rate",
+            unit: "event_per_tick",
+            domain: "finite_nonnegative",
+            aggregation: "completed_food_share_events_as_actor_divided_by_window_ticks",
+            missingness: "zero_only_when_run_wide_capture_is_complete",
+            evidence: FeatureEvidenceV1::PersistedInteraction,
+        },
+        PhenotypeAxisV1 {
+            id: "reproduction.parent_rate",
+            unit: "offspring_per_tick",
+            domain: "finite_nonnegative",
+            aggregation: "distinct_parent_edges_divided_by_window_ticks",
+            missingness: "zero_when_no_persisted_child_edge",
+            evidence: FeatureEvidenceV1::PersistedArrival,
+        },
+    ],
+};
+
+impl PhenotypeFeatureSchemaV1 {
+    /// BLAKE3 digest of the canonical JSON schema bytes.
+    pub fn digest(self) -> Result<String, PhenotypeExtractionError> {
+        canonical_json_digest(&self)
+    }
+}
+
+/// Half-open simulation tick window.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PhenotypeTickWindowV1 {
+    pub start_tick: u64,
+    pub end_tick: u64,
+}
+
+impl PhenotypeTickWindowV1 {
+    fn validate(self) -> Result<(), PhenotypeExtractionError> {
+        if self.start_tick >= self.end_tick {
+            return Err(PhenotypeExtractionError::InvalidWindow {
+                start_tick: self.start_tick,
+                end_tick: self.end_tick,
+            });
+        }
+        Ok(())
+    }
+
+    fn duration(self) -> u64 {
+        self.end_tick - self.start_tick
+    }
+
+    fn contains(self, tick: u64) -> bool {
+        (self.start_tick..self.end_tick).contains(&tick)
+    }
+}
+
+/// Typed refusal from the canonical phenotype/interaction extractor.
+#[derive(Debug, thiserror::Error)]
+pub enum PhenotypeExtractionError {
+    #[error("invalid empty or reversed tick window [{start_tick}, {end_tick})")]
+    InvalidWindow { start_tick: u64, end_tick: u64 },
+    #[error("schema id mismatch: expected {expected}, found {found}")]
+    SchemaIdMismatch { expected: String, found: String },
+    #[error("schema digest mismatch: expected {expected}, found {found}")]
+    SchemaDigestMismatch { expected: String, found: String },
+    #[error("{source} row {index} belongs to run {found}, expected {expected}")]
+    CrossRunSource {
+        source: &'static str,
+        index: usize,
+        expected: String,
+        found: String,
+    },
+    #[error("duplicate observation for uid {agent_uid:?} at tick {tick}")]
+    DuplicateObservation { agent_uid: AgentUid, tick: u64 },
+    #[error("duplicate interaction source key at tick {tick}, seq {seq}")]
+    DuplicateInteraction { tick: u64, seq: u64 },
+    #[error("duplicate arrival identity {agent_uid:?}")]
+    DuplicateArrival { agent_uid: AgentUid },
+    #[error("{source} references unknown agent identity {agent_uid:?}")]
+    MissingAgentIdentity {
+        source: &'static str,
+        agent_uid: AgentUid,
+    },
+    #[error("non-finite {field} for uid {agent_uid:?} at tick {tick}")]
+    NonFinite {
+        field: &'static str,
+        agent_uid: AgentUid,
+        tick: u64,
+    },
+    #[error("interaction at tick {tick}, seq {seq} has no finite positive magnitude")]
+    InvalidInteractionMagnitude { tick: u64, seq: u64 },
+    #[error("interaction at tick {tick}, seq {seq} targets its actor {agent_uid:?}")]
+    SelfInteraction {
+        tick: u64,
+        seq: u64,
+        agent_uid: AgentUid,
+    },
+    #[error("unsupported interaction kind {kind:?} at tick {tick}, seq {seq}")]
+    UnsupportedInteractionKind { tick: u64, seq: u64, kind: String },
+    #[error("{source} tick {tick} is outside [{start_tick}, {end_tick})")]
+    TickOutsideWindow {
+        source: &'static str,
+        tick: u64,
+        start_tick: u64,
+        end_tick: u64,
+    },
+    #[error(
+        "interaction evidence is incomplete: observed={observed}, persisted={persisted}, sampled_out={sampled_out}, truncated={truncated}"
+    )]
+    IncompleteInteractionEvidence {
+        observed: u64,
+        persisted: u64,
+        sampled_out: u64,
+        truncated: u64,
+    },
+    #[error("interaction row count {rows} does not match certified persisted count {persisted}")]
+    InteractionCountMismatch { rows: usize, persisted: u64 },
+    #[error("no agent observations exist in [{start_tick}, {end_tick})")]
+    InsufficientWindow { start_tick: u64, end_tick: u64 },
+    #[error("canonical JSON serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("counter overflow while accumulating {0}")]
+    CounterOverflow(&'static str),
+}
+
+/// One run-tagged persisted state observation.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RunScopedAgentObservationV1 {
+    pub run_id: String,
+    pub tick: u64,
+    pub agent_uid: AgentUid,
+    pub velocity_x: f64,
+    pub velocity_y: f64,
+    /// Trait proxy, not realized diet.
+    pub herbivore_tendency: f64,
+    /// Trait proxies, not realized sensor readings.
+    pub trait_smell: f64,
+    pub trait_sound: f64,
+    pub trait_hearing: f64,
+    pub trait_eye: f64,
+    pub trait_blood: f64,
+}
+
+/// One run-tagged canonical directed interaction.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RunScopedInteractionV1 {
+    pub run_id: String,
+    pub tick: u64,
+    pub seq: u64,
+    pub kind: String,
+    pub actor: AgentUid,
+    pub target: AgentUid,
+    pub magnitude: Option<f64>,
+}
+
+/// One run-tagged stable-identity arrival/parent record.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RunScopedArrivalV1 {
+    pub run_id: String,
+    pub tick: u64,
+    pub agent_uid: AgentUid,
+    pub parent_a: Option<AgentUid>,
+    pub parent_b: Option<AgentUid>,
+}
+
+/// Run-tagged interaction-capture accounting.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RunScopedInteractionCaptureV1 {
+    pub run_id: String,
+    pub observed: u64,
+    pub persisted: u64,
+    pub sampled_out: u64,
+    pub truncated: u64,
+}
+
+/// Immutable source ledger consumed by the pure extractor.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PhenotypeLedgerV1 {
+    pub schema_id: String,
+    pub schema_digest: String,
+    pub config_digest: String,
+    pub run_id: String,
+    pub window: PhenotypeTickWindowV1,
+    pub observations: Vec<RunScopedAgentObservationV1>,
+    pub interactions: Vec<RunScopedInteractionV1>,
+    pub arrivals: Vec<RunScopedArrivalV1>,
+    pub interaction_capture: RunScopedInteractionCaptureV1,
+}
+
+/// Directed interaction category retained by the v1 graph.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionEdgeKindV1 {
+    Combat,
+    FoodShare,
+}
+
+/// Canonical aggregate of directed source events.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DirectedInteractionEdgeV1 {
+    pub actor: AgentUid,
+    pub target: AgentUid,
+    pub kind: InteractionEdgeKindV1,
+    pub event_count: u64,
+    pub magnitude_sum: f64,
+    pub first_tick: u64,
+    pub last_tick: u64,
+}
+
+/// Permutation-invariant directed graph for one run and window.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DirectedInteractionGraphV1 {
+    pub schema_id: &'static str,
+    pub run_id: String,
+    pub window: PhenotypeTickWindowV1,
+    pub capture: RunScopedInteractionCaptureV1,
+    pub nodes: Vec<AgentUid>,
+    pub edges: Vec<DirectedInteractionEdgeV1>,
+    pub canonical_digest: String,
+}
+
+/// One canonical ordered phenotype vector.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PhenotypeFeatureRowV1 {
+    pub run_id: String,
+    pub agent_uid: AgentUid,
+    pub observed_tick_count: u64,
+    /// Values follow [`PHENOTYPE_FEATURE_SCHEMA_V1`] exactly.
+    pub values: [f64; PHENOTYPE_AXIS_COUNT_V1],
+}
+
+/// Production analysis read model derived from persisted run facts.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PhenotypeInteractionAnalysisV1 {
+    pub schema: PhenotypeFeatureSchemaV1,
+    pub schema_digest: String,
+    pub config_digest: String,
+    pub run_id: String,
+    pub window: PhenotypeTickWindowV1,
+    pub features: Vec<PhenotypeFeatureRowV1>,
+    pub interaction_graph: DirectedInteractionGraphV1,
+    pub canonical_digest: String,
+}
+
 /// Errors surfaced by the analytics layer.
 #[derive(Debug, thiserror::Error)]
 pub enum AnalyticsError {
@@ -113,6 +444,9 @@ pub enum AnalyticsError {
     /// Writing a requested report artifact failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Canonical phenotype extraction refused invalid or censored evidence.
+    #[error("phenotype extraction error: {0}")]
+    Phenotype(#[from] PhenotypeExtractionError),
 }
 
 /// Read-only context handed to every report.
@@ -136,6 +470,529 @@ impl ReaderCtx {
             db_path: db_path.to_owned(),
         })
     }
+}
+
+/// Load the complete immutable run ledger needed by the v1 extractor.
+///
+/// The production adapter intentionally selects the whole persisted run. Core
+/// records interaction-completeness counters at enclosing persistence
+/// boundaries while edges retain their source ticks, so a sub-window cannot be
+/// certified from the current schema without fabricating precision.
+pub fn load_persisted_phenotype_ledger(
+    reader: &StorageReader,
+) -> Result<PhenotypeLedgerV1, AnalyticsError> {
+    let max_tick = reader
+        .max_tick()?
+        .ok_or(PhenotypeExtractionError::InsufficientWindow {
+            start_tick: 0,
+            end_tick: 0,
+        })?;
+    let end_tick = max_tick
+        .checked_add(1)
+        .ok_or(PhenotypeExtractionError::CounterOverflow(
+            "analysis end tick",
+        ))?;
+    let window = PhenotypeTickWindowV1 {
+        start_tick: 0,
+        end_tick,
+    };
+    let run_id = reader.run_id().to_string();
+    let manifest = reader.run_manifest()?;
+    let schema_digest = PHENOTYPE_FEATURE_SCHEMA_V1.digest()?;
+
+    let observations = reader
+        .load_agent_observations(window.start_tick, window.end_tick)?
+        .into_iter()
+        .map(|observation| run_scoped_observation(&run_id, observation))
+        .collect();
+    let interactions = reader
+        .load_interactions_window(window.start_tick, window.end_tick)?
+        .into_iter()
+        .map(|interaction| run_scoped_interaction(&run_id, interaction))
+        .collect();
+    let arrivals = reader
+        .load_ancestry_births()?
+        .into_iter()
+        .filter(|arrival| arrival.tick.0 < window.end_tick)
+        .map(|arrival| RunScopedArrivalV1 {
+            run_id: run_id.clone(),
+            tick: arrival.tick.0,
+            agent_uid: arrival.agent_uid,
+            parent_a: arrival.parent_a,
+            parent_b: arrival.parent_b,
+        })
+        .collect();
+    let PersistedInteractionCapture {
+        observed,
+        persisted,
+        sampled_out,
+        truncated,
+    } = reader.load_interaction_capture()?;
+
+    Ok(PhenotypeLedgerV1 {
+        schema_id: PHENOTYPE_FEATURE_SCHEMA_ID_V1.to_owned(),
+        schema_digest,
+        config_digest: manifest.config_digest,
+        run_id: run_id.clone(),
+        window,
+        observations,
+        interactions,
+        arrivals,
+        interaction_capture: RunScopedInteractionCaptureV1 {
+            run_id,
+            observed,
+            persisted,
+            sampled_out,
+            truncated,
+        },
+    })
+}
+
+fn run_scoped_observation(
+    run_id: &str,
+    observation: PersistedAgentObservation,
+) -> RunScopedAgentObservationV1 {
+    RunScopedAgentObservationV1 {
+        run_id: run_id.to_owned(),
+        tick: observation.tick,
+        agent_uid: observation.agent_uid,
+        velocity_x: observation.velocity_x,
+        velocity_y: observation.velocity_y,
+        herbivore_tendency: observation.herbivore_tendency,
+        trait_smell: observation.trait_smell,
+        trait_sound: observation.trait_sound,
+        trait_hearing: observation.trait_hearing,
+        trait_eye: observation.trait_eye,
+        trait_blood: observation.trait_blood,
+    }
+}
+
+fn run_scoped_interaction(
+    run_id: &str,
+    interaction: PersistedInteraction,
+) -> RunScopedInteractionV1 {
+    RunScopedInteractionV1 {
+        run_id: run_id.to_owned(),
+        tick: interaction.tick,
+        seq: interaction.seq,
+        kind: interaction.kind,
+        actor: interaction.actor,
+        target: interaction.target,
+        magnitude: interaction.value,
+    }
+}
+
+#[derive(Debug, Default)]
+struct FeatureAccumulator {
+    observations: u64,
+    movement_sum: f64,
+    herbivore_trait_sum: f64,
+    sensing_trait_sum: f64,
+    combat_events: u64,
+    food_share_events: u64,
+    offspring_edges: u64,
+}
+
+#[derive(Debug)]
+struct EdgeAccumulator {
+    event_count: u64,
+    magnitude_sum: f64,
+    first_tick: u64,
+    last_tick: u64,
+}
+
+fn validate_row_run(
+    expected: &str,
+    found: &str,
+    source: &'static str,
+    index: usize,
+) -> Result<(), PhenotypeExtractionError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(PhenotypeExtractionError::CrossRunSource {
+            source,
+            index,
+            expected: expected.to_owned(),
+            found: found.to_owned(),
+        })
+    }
+}
+
+fn require_finite(
+    value: f64,
+    field: &'static str,
+    observation: &RunScopedAgentObservationV1,
+) -> Result<f64, PhenotypeExtractionError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(PhenotypeExtractionError::NonFinite {
+            field,
+            agent_uid: observation.agent_uid,
+            tick: observation.tick,
+        })
+    }
+}
+
+fn interaction_kind(
+    interaction: &RunScopedInteractionV1,
+) -> Result<InteractionEdgeKindV1, PhenotypeExtractionError> {
+    match interaction.kind.as_str() {
+        "combat" => Ok(InteractionEdgeKindV1::Combat),
+        "food_share" => Ok(InteractionEdgeKindV1::FoodShare),
+        _ => Err(PhenotypeExtractionError::UnsupportedInteractionKind {
+            tick: interaction.tick,
+            seq: interaction.seq,
+            kind: interaction.kind.clone(),
+        }),
+    }
+}
+
+fn checked_increment(
+    value: &mut u64,
+    context: &'static str,
+) -> Result<(), PhenotypeExtractionError> {
+    *value = value
+        .checked_add(1)
+        .ok_or(PhenotypeExtractionError::CounterOverflow(context))?;
+    Ok(())
+}
+
+fn canonical_json_digest<T: Serialize>(value: &T) -> Result<String, PhenotypeExtractionError> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// Derive canonical finite feature rows and a directed interaction graph.
+///
+/// This function is pure: callers may use hand-audited fixtures, while
+/// [`load_persisted_phenotype_ledger`] is the production storage adapter.
+#[allow(clippy::cast_precision_loss)]
+pub fn extract_phenotype_interactions(
+    ledger: &PhenotypeLedgerV1,
+) -> Result<PhenotypeInteractionAnalysisV1, PhenotypeExtractionError> {
+    ledger.window.validate()?;
+    if ledger.schema_id != PHENOTYPE_FEATURE_SCHEMA_ID_V1 {
+        return Err(PhenotypeExtractionError::SchemaIdMismatch {
+            expected: PHENOTYPE_FEATURE_SCHEMA_ID_V1.to_owned(),
+            found: ledger.schema_id.clone(),
+        });
+    }
+    let expected_schema_digest = PHENOTYPE_FEATURE_SCHEMA_V1.digest()?;
+    if ledger.schema_digest != expected_schema_digest {
+        return Err(PhenotypeExtractionError::SchemaDigestMismatch {
+            expected: expected_schema_digest,
+            found: ledger.schema_digest.clone(),
+        });
+    }
+
+    validate_row_run(
+        &ledger.run_id,
+        &ledger.interaction_capture.run_id,
+        "interaction_capture",
+        0,
+    )?;
+    let capture = &ledger.interaction_capture;
+    let accounted = capture
+        .persisted
+        .checked_add(capture.sampled_out)
+        .and_then(|value| value.checked_add(capture.truncated))
+        .ok_or(PhenotypeExtractionError::CounterOverflow(
+            "interaction capture",
+        ))?;
+    if capture.observed != accounted || capture.sampled_out != 0 || capture.truncated != 0 {
+        return Err(PhenotypeExtractionError::IncompleteInteractionEvidence {
+            observed: capture.observed,
+            persisted: capture.persisted,
+            sampled_out: capture.sampled_out,
+            truncated: capture.truncated,
+        });
+    }
+    let interaction_rows = u64::try_from(ledger.interactions.len())
+        .map_err(|_| PhenotypeExtractionError::CounterOverflow("interaction row count"))?;
+    if interaction_rows != capture.persisted {
+        return Err(PhenotypeExtractionError::InteractionCountMismatch {
+            rows: ledger.interactions.len(),
+            persisted: capture.persisted,
+        });
+    }
+
+    let mut arrivals = ledger.arrivals.clone();
+    arrivals.sort_by_key(|arrival| (arrival.tick, arrival.agent_uid));
+    let mut known_agents = BTreeSet::new();
+    for (index, arrival) in arrivals.iter().enumerate() {
+        validate_row_run(&ledger.run_id, &arrival.run_id, "arrival", index)?;
+        if arrival.tick >= ledger.window.end_tick {
+            return Err(PhenotypeExtractionError::TickOutsideWindow {
+                source: "arrival",
+                tick: arrival.tick,
+                start_tick: 0,
+                end_tick: ledger.window.end_tick,
+            });
+        }
+        if !known_agents.insert(arrival.agent_uid) {
+            return Err(PhenotypeExtractionError::DuplicateArrival {
+                agent_uid: arrival.agent_uid,
+            });
+        }
+    }
+
+    let mut observations = ledger.observations.clone();
+    observations.sort_by_key(|observation| (observation.agent_uid, observation.tick));
+    let mut previous_observation = None;
+    let mut feature_accumulators = BTreeMap::<AgentUid, FeatureAccumulator>::new();
+    for (index, observation) in observations.iter().enumerate() {
+        validate_row_run(&ledger.run_id, &observation.run_id, "observation", index)?;
+        if !ledger.window.contains(observation.tick) {
+            return Err(PhenotypeExtractionError::TickOutsideWindow {
+                source: "observation",
+                tick: observation.tick,
+                start_tick: ledger.window.start_tick,
+                end_tick: ledger.window.end_tick,
+            });
+        }
+        if previous_observation == Some((observation.agent_uid, observation.tick)) {
+            return Err(PhenotypeExtractionError::DuplicateObservation {
+                agent_uid: observation.agent_uid,
+                tick: observation.tick,
+            });
+        }
+        previous_observation = Some((observation.agent_uid, observation.tick));
+        if !known_agents.contains(&observation.agent_uid) {
+            return Err(PhenotypeExtractionError::MissingAgentIdentity {
+                source: "observation",
+                agent_uid: observation.agent_uid,
+            });
+        }
+
+        let velocity_x = require_finite(observation.velocity_x, "velocity_x", observation)?;
+        let velocity_y = require_finite(observation.velocity_y, "velocity_y", observation)?;
+        let movement = velocity_x.hypot(velocity_y);
+        let herbivore = require_finite(
+            observation.herbivore_tendency,
+            "herbivore_tendency",
+            observation,
+        )?;
+        let sensing = [
+            ("trait_smell", observation.trait_smell),
+            ("trait_sound", observation.trait_sound),
+            ("trait_hearing", observation.trait_hearing),
+            ("trait_eye", observation.trait_eye),
+            ("trait_blood", observation.trait_blood),
+        ]
+        .into_iter()
+        .try_fold(0.0, |sum, (field, value)| {
+            require_finite(value, field, observation).map(|value| sum + value)
+        })? / 5.0;
+        if !movement.is_finite() || !sensing.is_finite() {
+            return Err(PhenotypeExtractionError::NonFinite {
+                field: "derived_observation",
+                agent_uid: observation.agent_uid,
+                tick: observation.tick,
+            });
+        }
+        let accumulator = feature_accumulators
+            .entry(observation.agent_uid)
+            .or_default();
+        checked_increment(&mut accumulator.observations, "observation count")?;
+        accumulator.movement_sum += movement;
+        accumulator.herbivore_trait_sum += herbivore;
+        accumulator.sensing_trait_sum += sensing;
+    }
+    if feature_accumulators.is_empty() {
+        return Err(PhenotypeExtractionError::InsufficientWindow {
+            start_tick: ledger.window.start_tick,
+            end_tick: ledger.window.end_tick,
+        });
+    }
+
+    let mut interactions = ledger.interactions.clone();
+    interactions.sort_by_key(|interaction| (interaction.tick, interaction.seq));
+    let mut previous_interaction = None;
+    let mut graph_edges =
+        BTreeMap::<(AgentUid, AgentUid, InteractionEdgeKindV1), EdgeAccumulator>::new();
+    for (index, interaction) in interactions.iter().enumerate() {
+        validate_row_run(&ledger.run_id, &interaction.run_id, "interaction", index)?;
+        if !ledger.window.contains(interaction.tick) {
+            return Err(PhenotypeExtractionError::TickOutsideWindow {
+                source: "interaction",
+                tick: interaction.tick,
+                start_tick: ledger.window.start_tick,
+                end_tick: ledger.window.end_tick,
+            });
+        }
+        if previous_interaction == Some((interaction.tick, interaction.seq)) {
+            return Err(PhenotypeExtractionError::DuplicateInteraction {
+                tick: interaction.tick,
+                seq: interaction.seq,
+            });
+        }
+        previous_interaction = Some((interaction.tick, interaction.seq));
+        if interaction.actor == interaction.target {
+            return Err(PhenotypeExtractionError::SelfInteraction {
+                tick: interaction.tick,
+                seq: interaction.seq,
+                agent_uid: interaction.actor,
+            });
+        }
+        for (source, agent_uid) in [
+            ("interaction.actor", interaction.actor),
+            ("interaction.target", interaction.target),
+        ] {
+            if !known_agents.contains(&agent_uid) {
+                return Err(PhenotypeExtractionError::MissingAgentIdentity { source, agent_uid });
+            }
+        }
+        let magnitude = interaction
+            .magnitude
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or(PhenotypeExtractionError::InvalidInteractionMagnitude {
+                tick: interaction.tick,
+                seq: interaction.seq,
+            })?;
+        let kind = interaction_kind(interaction)?;
+        if let Some(accumulator) = feature_accumulators.get_mut(&interaction.actor) {
+            match kind {
+                InteractionEdgeKindV1::Combat => {
+                    checked_increment(&mut accumulator.combat_events, "combat event count")?;
+                }
+                InteractionEdgeKindV1::FoodShare => {
+                    checked_increment(
+                        &mut accumulator.food_share_events,
+                        "food-share event count",
+                    )?;
+                }
+            }
+        }
+        let edge = graph_edges
+            .entry((interaction.actor, interaction.target, kind))
+            .or_insert(EdgeAccumulator {
+                event_count: 0,
+                magnitude_sum: 0.0,
+                first_tick: interaction.tick,
+                last_tick: interaction.tick,
+            });
+        checked_increment(&mut edge.event_count, "graph edge event count")?;
+        edge.magnitude_sum += magnitude;
+        if !edge.magnitude_sum.is_finite() {
+            return Err(PhenotypeExtractionError::InvalidInteractionMagnitude {
+                tick: interaction.tick,
+                seq: interaction.seq,
+            });
+        }
+        edge.first_tick = edge.first_tick.min(interaction.tick);
+        edge.last_tick = edge.last_tick.max(interaction.tick);
+    }
+
+    for arrival in arrivals
+        .iter()
+        .filter(|arrival| ledger.window.contains(arrival.tick))
+    {
+        let mut parents = BTreeSet::new();
+        parents.extend(arrival.parent_a);
+        parents.extend(arrival.parent_b);
+        for parent in parents {
+            if !known_agents.contains(&parent) {
+                return Err(PhenotypeExtractionError::MissingAgentIdentity {
+                    source: "arrival.parent",
+                    agent_uid: parent,
+                });
+            }
+            if let Some(accumulator) = feature_accumulators.get_mut(&parent) {
+                checked_increment(&mut accumulator.offspring_edges, "offspring edge count")?;
+            }
+        }
+    }
+
+    let window_ticks = ledger.window.duration() as f64;
+    let mut features = Vec::with_capacity(feature_accumulators.len());
+    for (agent_uid, accumulator) in feature_accumulators {
+        let observations = accumulator.observations as f64;
+        let values = [
+            accumulator.movement_sum / observations,
+            accumulator.herbivore_trait_sum / observations,
+            accumulator.sensing_trait_sum / observations,
+            accumulator.combat_events as f64 / window_ticks,
+            accumulator.food_share_events as f64 / window_ticks,
+            accumulator.offspring_edges as f64 / window_ticks,
+        ];
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(PhenotypeExtractionError::NonFinite {
+                field: "feature_vector",
+                agent_uid,
+                tick: ledger.window.end_tick - 1,
+            });
+        }
+        features.push(PhenotypeFeatureRowV1 {
+            run_id: ledger.run_id.clone(),
+            agent_uid,
+            observed_tick_count: accumulator.observations,
+            values,
+        });
+    }
+
+    let edges = graph_edges
+        .into_iter()
+        .map(
+            |((actor, target, kind), accumulator)| DirectedInteractionEdgeV1 {
+                actor,
+                target,
+                kind,
+                event_count: accumulator.event_count,
+                magnitude_sum: accumulator.magnitude_sum,
+                first_tick: accumulator.first_tick,
+                last_tick: accumulator.last_tick,
+            },
+        )
+        .collect::<Vec<_>>();
+    let nodes = known_agents.into_iter().collect::<Vec<_>>();
+    let graph_capture = ledger.interaction_capture.clone();
+    let graph_digest = canonical_json_digest(&(
+        INTERACTION_GRAPH_SCHEMA_ID_V1,
+        &ledger.run_id,
+        ledger.window,
+        &graph_capture,
+        &nodes,
+        &edges,
+    ))?;
+    let interaction_graph = DirectedInteractionGraphV1 {
+        schema_id: INTERACTION_GRAPH_SCHEMA_ID_V1,
+        run_id: ledger.run_id.clone(),
+        window: ledger.window,
+        capture: graph_capture,
+        nodes,
+        edges,
+        canonical_digest: graph_digest,
+    };
+    let canonical_digest = canonical_json_digest(&(
+        PHENOTYPE_FEATURE_SCHEMA_ID_V1,
+        &ledger.schema_digest,
+        &ledger.config_digest,
+        &ledger.run_id,
+        ledger.window,
+        &features,
+        &interaction_graph,
+    ))?;
+
+    Ok(PhenotypeInteractionAnalysisV1 {
+        schema: PHENOTYPE_FEATURE_SCHEMA_V1,
+        schema_digest: ledger.schema_digest.clone(),
+        config_digest: ledger.config_digest.clone(),
+        run_id: ledger.run_id.clone(),
+        window: ledger.window,
+        features,
+        interaction_graph,
+        canonical_digest,
+    })
+}
+
+/// Load and extract canonical phenotype/interaction analysis from a finished run.
+pub fn analyze_persisted_phenotypes(
+    reader: &StorageReader,
+) -> Result<PhenotypeInteractionAnalysisV1, AnalyticsError> {
+    let ledger = load_persisted_phenotype_ledger(reader)?;
+    Ok(extract_phenotype_interactions(&ledger)?)
 }
 
 /// String-keyed report parameters with typed accessors.
@@ -244,6 +1101,7 @@ impl Registry {
                 Box::new(MetricChangepoints),
                 Box::new(RunComparison),
                 Box::new(MetricDistribution),
+                Box::new(PhenotypeInteractions),
             ],
         }
     }
@@ -1107,6 +1965,91 @@ fn base_output(
     })
 }
 
+/// `phenotype-interactions`: canonical run-wide phenotype and interaction analysis.
+struct PhenotypeInteractions;
+
+impl Report for PhenotypeInteractions {
+    fn name(&self) -> &'static str {
+        "phenotype-interactions"
+    }
+
+    fn description(&self) -> &'static str {
+        "Versioned phenotype features and directed interaction graph from persisted AgentUid histories"
+    }
+
+    fn run(&self, cx: &ReaderCtx, _params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
+        let read_started = Instant::now();
+        let analysis = analyze_persisted_phenotypes(&cx.reader)?;
+        log_report_stage("read_and_extract", &read_started, analysis.features.len());
+        tracing::info!(
+            run_id = %analysis.run_id,
+            start_tick = analysis.window.start_tick,
+            end_tick = analysis.window.end_tick,
+            schema_id = analysis.schema.schema_id,
+            schema_digest = %analysis.schema_digest,
+            config_digest = %analysis.config_digest,
+            accepted_agents = analysis.features.len(),
+            graph_nodes = analysis.interaction_graph.nodes.len(),
+            graph_edges = analysis.interaction_graph.edges.len(),
+            canonical_digest = %analysis.canonical_digest,
+            "canonical phenotype and interaction analysis completed"
+        );
+
+        let render_started = Instant::now();
+        let mut md = String::new();
+        let _ = writeln!(md, "# Phenotype and interaction analysis\n");
+        let _ = writeln!(md, "- run: `{}`", analysis.run_id);
+        let _ = writeln!(
+            md,
+            "- window: `[{}, {})`",
+            analysis.window.start_tick, analysis.window.end_tick
+        );
+        let _ = writeln!(
+            md,
+            "- feature schema: `{}` (`{}`)",
+            analysis.schema.schema_id, analysis.schema_digest
+        );
+        let _ = writeln!(md, "- config digest: `{}`", analysis.config_digest);
+        let _ = writeln!(md, "- canonical digest: `{}`", analysis.canonical_digest);
+        let _ = writeln!(
+            md,
+            "- agents / graph nodes / graph edges: {} / {} / {}\n",
+            analysis.features.len(),
+            analysis.interaction_graph.nodes.len(),
+            analysis.interaction_graph.edges.len()
+        );
+        let _ = writeln!(
+            md,
+            "| uid | observations | speed | herbivore trait proxy | sensing trait proxy | combat/tick | share/tick | offspring/tick |"
+        );
+        let _ = writeln!(md, "|---:|---:|---:|---:|---:|---:|---:|---:|");
+        for row in &analysis.features {
+            let _ = writeln!(
+                md,
+                "| {} | {} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} |",
+                row.agent_uid.0,
+                row.observed_tick_count,
+                row.values[0],
+                row.values[1],
+                row.values[2],
+                row.values[3],
+                row.values[4],
+                row.values[5],
+            );
+        }
+
+        let output = base_output(
+            self.name(),
+            cx,
+            analysis.features.len(),
+            serde_json::to_value(&analysis)?,
+            md,
+        )?;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
+    }
+}
+
 /// `run-summary`: lifecycle totals and bounded recent population trajectory statistics.
 struct RunSummary;
 
@@ -1332,4 +2275,349 @@ fn narrative_timeline_limit(params: &ReportParams) -> Result<usize, AnalyticsErr
         });
     }
     Ok(limit)
+}
+
+#[cfg(test)]
+mod phenotype_tests {
+    use super::*;
+
+    const RUN_A: &str = "0000000000000000000000000000000a";
+    const RUN_B: &str = "0000000000000000000000000000000b";
+
+    fn observation(
+        uid: u64,
+        tick: u64,
+        velocity: (f64, f64),
+        herbivore: f64,
+        sensing: f64,
+    ) -> RunScopedAgentObservationV1 {
+        RunScopedAgentObservationV1 {
+            run_id: RUN_A.to_owned(),
+            tick,
+            agent_uid: AgentUid(uid),
+            velocity_x: velocity.0,
+            velocity_y: velocity.1,
+            herbivore_tendency: herbivore,
+            trait_smell: sensing,
+            trait_sound: sensing,
+            trait_hearing: sensing,
+            trait_eye: sensing,
+            trait_blood: sensing,
+        }
+    }
+
+    fn arrival(
+        uid: u64,
+        tick: u64,
+        parent_a: Option<u64>,
+        parent_b: Option<u64>,
+    ) -> RunScopedArrivalV1 {
+        RunScopedArrivalV1 {
+            run_id: RUN_A.to_owned(),
+            tick,
+            agent_uid: AgentUid(uid),
+            parent_a: parent_a.map(AgentUid),
+            parent_b: parent_b.map(AgentUid),
+        }
+    }
+
+    fn interaction(
+        tick: u64,
+        seq: u64,
+        kind: &str,
+        actor: u64,
+        target: u64,
+        magnitude: f64,
+    ) -> RunScopedInteractionV1 {
+        RunScopedInteractionV1 {
+            run_id: RUN_A.to_owned(),
+            tick,
+            seq,
+            kind: kind.to_owned(),
+            actor: AgentUid(actor),
+            target: AgentUid(target),
+            magnitude: Some(magnitude),
+        }
+    }
+
+    fn fixture() -> PhenotypeLedgerV1 {
+        PhenotypeLedgerV1 {
+            schema_id: PHENOTYPE_FEATURE_SCHEMA_ID_V1.to_owned(),
+            schema_digest: PHENOTYPE_FEATURE_SCHEMA_V1.digest().expect("schema digest"),
+            config_digest: "config-a".to_owned(),
+            run_id: RUN_A.to_owned(),
+            window: PhenotypeTickWindowV1 {
+                start_tick: 0,
+                end_tick: 4,
+            },
+            observations: vec![
+                observation(1, 0, (3.0, 4.0), 0.25, 1.0),
+                observation(1, 1, (0.0, 0.0), 0.5, 3.0),
+                observation(2, 1, (0.0, 2.0), 0.8, 2.0),
+                observation(3, 2, (1.0, 0.0), 0.5, 1.5),
+            ],
+            interactions: vec![
+                interaction(1, 100, "combat", 1, 2, 2.0),
+                interaction(2, 101, "food_share", 1, 2, 3.0),
+                interaction(3, 102, "combat", 2, 1, 1.0),
+            ],
+            arrivals: vec![
+                arrival(1, 0, None, None),
+                arrival(2, 0, None, None),
+                arrival(3, 2, Some(1), Some(2)),
+            ],
+            interaction_capture: RunScopedInteractionCaptureV1 {
+                run_id: RUN_A.to_owned(),
+                observed: 3,
+                persisted: 3,
+                sampled_out: 0,
+                truncated: 0,
+            },
+        }
+    }
+
+    fn row(analysis: &PhenotypeInteractionAnalysisV1, uid: u64) -> &PhenotypeFeatureRowV1 {
+        analysis
+            .features
+            .iter()
+            .find(|row| row.agent_uid == AgentUid(uid))
+            .expect("feature row")
+    }
+
+    #[test]
+    fn schema_axes_pin_ids_units_evidence_and_order() {
+        let axes = PHENOTYPE_FEATURE_SCHEMA_V1.axes;
+        assert_eq!(
+            axes.map(|axis| axis.id),
+            [
+                "movement.speed.mean",
+                "diet.herbivore_trait.mean",
+                "sensing.trait_modifier.mean",
+                "interaction.combat.actor_rate",
+                "interaction.food_share.actor_rate",
+                "reproduction.parent_rate",
+            ]
+        );
+        assert_eq!(axes[0].unit, "world_unit_per_tick");
+        assert_eq!(axes[1].unit, "ratio");
+        assert_eq!(axes[2].unit, "trait_multiplier");
+        assert_eq!(axes[3].unit, "event_per_tick");
+        assert_eq!(axes[4].unit, "event_per_tick");
+        assert_eq!(axes[5].unit, "offspring_per_tick");
+        assert_eq!(axes[1].evidence, FeatureEvidenceV1::PersistedTraitProxy);
+        assert_eq!(axes[2].evidence, FeatureEvidenceV1::PersistedTraitProxy);
+    }
+
+    #[test]
+    fn derives_every_axis_and_directed_edge_from_audited_ledger() {
+        let analysis = extract_phenotype_interactions(&fixture()).expect("extract");
+
+        assert_eq!(analysis.features.len(), 3);
+        assert_eq!(row(&analysis, 1).observed_tick_count, 2);
+        assert_eq!(
+            row(&analysis, 1).values,
+            [2.5, 0.375, 2.0, 0.25, 0.25, 0.25]
+        );
+        assert_eq!(row(&analysis, 2).values, [2.0, 0.8, 2.0, 0.25, 0.0, 0.25]);
+        assert_eq!(row(&analysis, 3).values, [1.0, 0.5, 1.5, 0.0, 0.0, 0.0]);
+        assert!(analysis.features.iter().all(|row| {
+            row.values
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        }));
+
+        let graph = &analysis.interaction_graph;
+        assert_eq!(graph.nodes, vec![AgentUid(1), AgentUid(2), AgentUid(3)]);
+        assert_eq!(graph.edges.len(), 3);
+        assert_eq!(
+            (
+                graph.edges[0].actor,
+                graph.edges[0].target,
+                graph.edges[0].kind,
+                graph.edges[0].magnitude_sum,
+            ),
+            (AgentUid(1), AgentUid(2), InteractionEdgeKindV1::Combat, 2.0,)
+        );
+        assert_eq!(
+            (
+                graph.edges[2].actor,
+                graph.edges[2].target,
+                graph.edges[2].kind,
+            ),
+            (AgentUid(2), AgentUid(1), InteractionEdgeKindV1::Combat,)
+        );
+        assert_ne!(graph.canonical_digest, analysis.canonical_digest);
+    }
+
+    #[test]
+    fn shuffled_sources_produce_byte_identical_analysis() {
+        let baseline = fixture();
+        let expected =
+            serde_json::to_vec(&extract_phenotype_interactions(&baseline).expect("baseline"))
+                .expect("serialize baseline");
+        let mut shuffled = baseline;
+        shuffled.observations.reverse();
+        shuffled.interactions.reverse();
+        shuffled.arrivals.reverse();
+        let actual =
+            serde_json::to_vec(&extract_phenotype_interactions(&shuffled).expect("shuffled"))
+                .expect("serialize shuffled");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn complete_absence_is_zero_but_censored_absence_is_rejected() {
+        let mut no_events = fixture();
+        no_events.interactions.clear();
+        no_events.interaction_capture.observed = 0;
+        no_events.interaction_capture.persisted = 0;
+        let analysis = extract_phenotype_interactions(&no_events).expect("complete empty graph");
+        assert!(analysis.interaction_graph.edges.is_empty());
+        assert_eq!(row(&analysis, 1).values[3], 0.0);
+        assert_eq!(row(&analysis, 1).values[4], 0.0);
+
+        no_events.interaction_capture.observed = 1;
+        no_events.interaction_capture.sampled_out = 1;
+        assert!(matches!(
+            extract_phenotype_interactions(&no_events),
+            Err(PhenotypeExtractionError::IncompleteInteractionEvidence {
+                observed: 1,
+                persisted: 0,
+                sampled_out: 1,
+                truncated: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_run_identity_and_window_drift_fail_typed() {
+        let mut bad_schema = fixture();
+        bad_schema.schema_digest = "drift".to_owned();
+        assert!(matches!(
+            extract_phenotype_interactions(&bad_schema),
+            Err(PhenotypeExtractionError::SchemaDigestMismatch { .. })
+        ));
+
+        let mut cross_run = fixture();
+        cross_run.observations[0].run_id = RUN_B.to_owned();
+        assert!(matches!(
+            extract_phenotype_interactions(&cross_run),
+            Err(PhenotypeExtractionError::CrossRunSource {
+                source: "observation",
+                ..
+            })
+        ));
+
+        let mut outside = fixture();
+        outside.observations[0].tick = outside.window.end_tick;
+        assert!(matches!(
+            extract_phenotype_interactions(&outside),
+            Err(PhenotypeExtractionError::TickOutsideWindow {
+                source: "observation",
+                ..
+            })
+        ));
+
+        let mut empty = fixture();
+        empty.window.end_tick = empty.window.start_tick;
+        assert!(matches!(
+            extract_phenotype_interactions(&empty),
+            Err(PhenotypeExtractionError::InvalidWindow { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_and_missing_identities_fail_typed() {
+        let mut duplicate_observation = fixture();
+        duplicate_observation
+            .observations
+            .push(duplicate_observation.observations[0].clone());
+        assert!(matches!(
+            extract_phenotype_interactions(&duplicate_observation),
+            Err(PhenotypeExtractionError::DuplicateObservation { .. })
+        ));
+
+        let mut duplicate_interaction = fixture();
+        duplicate_interaction
+            .interactions
+            .push(duplicate_interaction.interactions[0].clone());
+        duplicate_interaction.interaction_capture.observed += 1;
+        duplicate_interaction.interaction_capture.persisted += 1;
+        assert!(matches!(
+            extract_phenotype_interactions(&duplicate_interaction),
+            Err(PhenotypeExtractionError::DuplicateInteraction { .. })
+        ));
+
+        let mut duplicate_arrival = fixture();
+        duplicate_arrival
+            .arrivals
+            .push(duplicate_arrival.arrivals[0].clone());
+        assert!(matches!(
+            extract_phenotype_interactions(&duplicate_arrival),
+            Err(PhenotypeExtractionError::DuplicateArrival { .. })
+        ));
+
+        let mut missing = fixture();
+        missing
+            .arrivals
+            .retain(|arrival| arrival.agent_uid != AgentUid(2));
+        assert!(matches!(
+            extract_phenotype_interactions(&missing),
+            Err(PhenotypeExtractionError::MissingAgentIdentity {
+                source: "observation",
+                agent_uid: AgentUid(2),
+            })
+        ));
+    }
+
+    #[test]
+    fn nonfinite_and_invalid_interactions_fail_typed() {
+        for nonfinite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut ledger = fixture();
+            ledger.observations[0].velocity_x = nonfinite;
+            assert!(matches!(
+                extract_phenotype_interactions(&ledger),
+                Err(PhenotypeExtractionError::NonFinite {
+                    field: "velocity_x",
+                    ..
+                })
+            ));
+        }
+
+        for magnitude in [None, Some(0.0), Some(-1.0), Some(f64::NAN)] {
+            let mut ledger = fixture();
+            ledger.interactions[0].magnitude = magnitude;
+            assert!(matches!(
+                extract_phenotype_interactions(&ledger),
+                Err(PhenotypeExtractionError::InvalidInteractionMagnitude { .. })
+            ));
+        }
+
+        let mut self_edge = fixture();
+        self_edge.interactions[0].target = self_edge.interactions[0].actor;
+        assert!(matches!(
+            extract_phenotype_interactions(&self_edge),
+            Err(PhenotypeExtractionError::SelfInteraction { .. })
+        ));
+
+        let mut unknown_kind = fixture();
+        unknown_kind.interactions[0].kind = "courtship".to_owned();
+        assert!(matches!(
+            extract_phenotype_interactions(&unknown_kind),
+            Err(PhenotypeExtractionError::UnsupportedInteractionKind { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_observation_window_is_insufficient_not_a_nan_report() {
+        let mut ledger = fixture();
+        ledger.observations.clear();
+        assert!(matches!(
+            extract_phenotype_interactions(&ledger),
+            Err(PhenotypeExtractionError::InsufficientWindow {
+                start_tick: 0,
+                end_tick: 4,
+            })
+        ));
+    }
 }

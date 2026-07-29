@@ -6,6 +6,7 @@ license.workspace = true
 description = "Offline science layer for ScriptBots: read-only reports over finished run databases (bd-2z0.11.5). Never a dependency of the app binaries; never built for wasm."
 
 [dependencies]
+blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

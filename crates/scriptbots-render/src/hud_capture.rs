@@ -29,14 +29,9 @@ use scriptbots_core::{
 };
 
 use crate::{
-    AnalyticsSnapshotProvider, CameraSnapshot, ControlCommand, GuiSession, GuiViewRole,
-    WorldStepDriver,
+    AnalyticsSnapshotProvider, CameraSnapshot, ControlCommand, GuiCommandDrain, GuiCommandOutcome,
+    GuiCommandReporter, GuiSession, GuiViewRole, WorldStepDriver,
 };
-
-// Only the real-pixel rail-band assertions read this, and those are macOS-only for the
-// reason recorded at `REAL_PIXEL_CAPTURE_IS_MACOS_ONLY` (bd-h9ca).
-#[cfg(target_os = "macos")]
-use crate::HUD_RAIL_WIDTH;
 
 // GPUI's test window reports a fixed 2× device scale. `HeadlessAppContext::open_window`
 // accepts logical pixels, while `capture_screenshot` returns device pixels, so divide
@@ -160,14 +155,16 @@ fn capture_view_with_overrides_and_camera(
             .expect("world mutex poisoned during offscreen capture")
             .step()
     });
-    let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
-    let command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync> = Arc::new(|_| true);
+    let command_drain: GuiCommandDrain = Arc::new(Vec::new);
+    let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
+        Arc::new(|_| Some("hud-capture".to_owned()));
 
     let session = Arc::new(GuiSession::new(
         world,
         simulation_step,
         AnalyticsSnapshotProvider::empty(),
         command_drain,
+        Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
         command_submit,
     ));
 
@@ -279,29 +276,10 @@ mod tests {
     /// aarch64-apple-darwin, which is precisely where these still run.
     const REAL_PIXEL_CAPTURE_IS_MACOS_ONLY: () = ();
 
-    /// Panel background of the history card (`render_history_chart`). Deliberately NOT
-    /// the stats card's `0x0b1120`, which is also the root container background and so
-    /// cannot distinguish chrome from backdrop.
-    const HISTORY_PANEL_BG: [u8; 3] = [0x0a, 0x16, 0x29];
-
-    /// Border drawn by every docked panel, read from the chrome system itself rather
-    /// than hardcoded.
-    ///
-    /// It WAS hardcoded to 0x1e293b, and bd-f4x0 repointed the panels to a
-    /// substrate-derived colour — so the marker silently stopped describing the thing
-    /// it names. Worse than a plain failure: 0x1e293b is used by 51 other elements, so
-    /// at 1280x720 it still scraped 6 stray hits inside the rail band and the test
-    /// PASSED for the wrong reason, while 1600x900 got zero and failed. Deriving it
-    /// from chrome::border() means a future palette change moves the marker with it.
-    fn panel_border() -> [u8; 3] {
-        let rgba: gpui::Rgba = crate::chrome::border().into();
-        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-        [byte(rgba.r), byte(rgba.g), byte(rgba.b)]
-    }
-
-    /// The two viewports the production windows actually open at
-    /// (`GuiViewRole::window_options`).
-    const VIEWPORTS: [(f32, f32); 2] = [(1280.0, 720.0), (1600.0, 900.0)];
+    /// Representative logical sizes from the production horizontal split. The World
+    /// owns the flexible remainder; the Lab stays within its 380–480 px clamp.
+    const WORLD_VIEWPORT: (f32, f32) = (1400.0, 768.0);
+    const LAB_VIEWPORTS: [(f32, f32); 2] = [(460.0, 768.0), (380.0, 600.0)];
 
     fn capture_world() -> Arc<Mutex<WorldState>> {
         let config = ScriptBotsConfig {
@@ -700,9 +678,19 @@ mod tests {
         (changed, (absolute_luma_delta / pixels as f64) as f32)
     }
 
-    fn probe_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/rendering_reference/live_probes/bd-v9cz")
+    /// Pixel tests are side-effect free by default. An explicit external directory
+    /// turns on PNG retention for a human visual pass without rewriting checked-in
+    /// historical probes during ordinary `cargo test`.
+    fn probe_dir() -> Option<PathBuf> {
+        std::env::var_os("SCRIPTBOTS_HUD_PROBE_DIR").map(PathBuf::from)
+    }
+
+    fn save_probe(image: &RgbaImage, name: &str) -> Option<PathBuf> {
+        let directory = probe_dir()?;
+        std::fs::create_dir_all(&directory).expect("probe output directory");
+        let path = directory.join(name);
+        image.save(&path).expect("write GUI probe png");
+        Some(path)
     }
 
     /// Column span of the world canvas, found by colour diversity.
@@ -746,35 +734,6 @@ mod tests {
             best = (s, w);
         }
         best
-    }
-
-    /// Pixels in a column range that are not the app's root background — i.e. actual
-    /// rendered content of any kind.
-    fn count_non_background(image: &RgbaImage, x0: u32, x1: u32) -> u32 {
-        const ROOT_BG: [u8; 3] = [0x0f, 0x17, 0x2a];
-        let mut hits = 0;
-        for y in 0..image.height() {
-            for x in x0..x1.min(image.width()) {
-                let p = image.get_pixel(x, y).0;
-                if [p[0], p[1], p[2]] != ROOT_BG {
-                    hits += 1;
-                }
-            }
-        }
-        hits
-    }
-
-    fn count_color(image: &RgbaImage, rgb: [u8; 3], x0: u32, x1: u32) -> u32 {
-        let mut hits = 0;
-        for y in 0..image.height() {
-            for x in x0..x1.min(image.width()) {
-                let p = image.get_pixel(x, y).0;
-                if p[0] == rgb[0] && p[1] == rgb[1] && p[2] == rgb[2] {
-                    hits += 1;
-                }
-            }
-        }
-        hits
     }
 
     /// Every perf field frozen. Any unpinned float here reaches rendered text and
@@ -939,34 +898,37 @@ mod tests {
     #[test]
     #[ignore = "bd-bacf audit instrument; run explicitly with --ignored"]
     fn audit_every_advertised_shortcut_changes_something() {
-        const SHORTCUTS: [(&str, &str); 27] = [
-            ("space", "Toggle playback"),
-            ("g", "Jump to live"),
-            ("b", "Toggle brush"),
-            ("n", "Toggle narration"),
-            ("ctrl-p", "Cycle palette"),
-            ("p", "Toggle simulation pause"),
-            ("s", "Step simulation once"),
-            ("d", "Toggle agent drawing"),
-            ("f", "Toggle food overlay"),
-            ("ctrl-shift-o", "Toggle agent outline"),
-            ("shift-=", "Increase speed"),
-            ("-", "Decrease speed"),
-            ("a", "Spawn crossover"),
-            ("q", "Spawn carnivore"),
-            ("h", "Spawn herbivore"),
-            ("c", "Toggle closed environment"),
-            ("shift-s", "Follow selected"),
-            ("o", "Follow oldest"),
-            ("shift-f", "Toggle debug overlay"),
-            ("escape", "Clear selection"),
-            ("ctrl-a", "Select all"),
-            ("ctrl-f", "Focus first selected"),
-            ("0", "Fit world"),
-            (",", "Toggle settings panel"),
-            ("1", "Toggle stats panel"),
-            ("2", "Toggle history panel"),
-            ("3", "Toggle performance panel"),
+        const SHORTCUTS: [(&str, &str, GuiViewRole); 26] = [
+            ("space", "Toggle playback", GuiViewRole::Hud),
+            ("g", "Jump to live", GuiViewRole::Hud),
+            ("n", "Toggle narration", GuiViewRole::WorldCanvas),
+            ("ctrl-p", "Cycle palette", GuiViewRole::WorldCanvas),
+            ("p", "Toggle simulation pause", GuiViewRole::Hud),
+            ("s", "Step simulation once", GuiViewRole::Hud),
+            ("d", "Toggle agent drawing", GuiViewRole::WorldCanvas),
+            ("f", "Toggle food overlay", GuiViewRole::WorldCanvas),
+            (
+                "ctrl-shift-o",
+                "Toggle agent outline",
+                GuiViewRole::WorldCanvas,
+            ),
+            ("shift-=", "Increase speed", GuiViewRole::Hud),
+            ("-", "Decrease speed", GuiViewRole::Hud),
+            ("a", "Spawn crossover", GuiViewRole::Hud),
+            ("q", "Spawn carnivore", GuiViewRole::Hud),
+            ("h", "Spawn herbivore", GuiViewRole::Hud),
+            ("c", "Toggle closed environment", GuiViewRole::Hud),
+            ("shift-s", "Follow selected", GuiViewRole::WorldCanvas),
+            ("o", "Follow oldest", GuiViewRole::WorldCanvas),
+            ("shift-f", "Toggle debug overlay", GuiViewRole::WorldCanvas),
+            ("escape", "Clear selection", GuiViewRole::Hud),
+            ("ctrl-a", "Select all", GuiViewRole::Hud),
+            ("ctrl-f", "Focus first selected", GuiViewRole::Hud),
+            ("0", "Fit world", GuiViewRole::WorldCanvas),
+            (",", "Toggle settings panel", GuiViewRole::WorldCanvas),
+            ("1", "Toggle stats panel", GuiViewRole::Hud),
+            ("2", "Toggle history panel", GuiViewRole::Hud),
+            ("3", "Toggle performance panel", GuiViewRole::Hud),
         ];
         let (w, h) = (
             1280.0 * HEADLESS_DEVICE_SCALE,
@@ -991,24 +953,37 @@ mod tests {
         // world per capture left world construction as an uncontrolled variable, so a
         // residual could not be attributed to the render path.
         let world = capture_world();
-        let base =
+        let base_lab =
             capture_view_with_overrides(Arc::clone(&world), GuiViewRole::Hud, w, h, stable())
-                .expect("baseline");
+                .expect("Lab baseline");
+        let base_world = capture_view_with_overrides(
+            Arc::clone(&world),
+            GuiViewRole::WorldCanvas,
+            w,
+            h,
+            stable(),
+        )
+        .expect("World baseline");
 
         let mut inert = Vec::new();
-        for (stroke, label) in SHORTCUTS {
+        for (stroke, label, role) in SHORTCUTS {
             let leaked: &'static [&'static str] = Box::leak(vec![stroke].into_boxed_slice());
             let after = capture_view_with_overrides(
                 Arc::clone(&world),
-                GuiViewRole::Hud,
+                role,
                 w,
                 h,
                 CaptureOverrides {
+                    forced_perf: Some(pinned_perf()),
                     keystrokes: leaked,
                     ..CaptureOverrides::default()
                 },
             )
             .unwrap_or_else(|e| panic!("capture after {stroke:?} failed: {e:#}"));
+            let base = match role {
+                GuiViewRole::Hud => &base_lab,
+                GuiViewRole::WorldCanvas => &base_world,
+            };
             let delta = base
                 .pixels()
                 .zip(after.pixels())
@@ -1025,191 +1000,153 @@ mod tests {
         }
     }
 
-    /// DIFFERENTIAL layout proof (bd-v9cz / bd-f4x0).
-    ///
-    /// A single capture shows one arrangement and proves nothing about the policy. This
-    /// captures the SAME scene twice — rail open, then rail closed — and diffs them.
-    ///
-    /// Both states are reached by dispatching the production keystrokes 1/2/3, so the
-    /// closed state is the one a user actually gets; nothing here pokes HudLayout.
-    ///
-    /// The pair is self-calibrating. Requiring chrome to be confined to the rail band
-    /// would pass trivially if the rail never drew, so the closed capture must show the
-    /// rail band LOSING that chrome. One assertion cannot be satisfied vacuously while
-    /// the other holds.
-    ///
-    /// macOS-gated for the reason given at [`REAL_PIXEL_CAPTURE_IS_MACOS_ONLY`]
-    /// (bd-h9ca).
+    /// The production pair is complementary: the wide World contains the simulation
+    /// raster, while the narrow Lab contains controls and telemetry instead of a second
+    /// copy of that raster.
     #[cfg(target_os = "macos")]
     #[test]
-    fn toggling_the_rail_changes_only_the_rail_column() {
-        std::fs::create_dir_all(probe_dir()).expect("probe output directory");
-        let border = panel_border();
+    fn world_and_lab_are_complementary_surfaces_not_duplicate_canvases() {
+        let (world_logical_w, world_logical_h) = WORLD_VIEWPORT;
+        let (lab_logical_w, lab_logical_h) = LAB_VIEWPORTS[0];
+        let overrides = CaptureOverrides {
+            forced_perf: Some(pinned_perf()),
+            ..CaptureOverrides::default()
+        };
+        let world = capture_world();
+        let world_image = capture_view_with_overrides(
+            Arc::clone(&world),
+            GuiViewRole::WorldCanvas,
+            world_logical_w * HEADLESS_DEVICE_SCALE,
+            world_logical_h * HEADLESS_DEVICE_SCALE,
+            overrides,
+        )
+        .expect("World capture");
+        let lab_image = capture_view_with_overrides(
+            world,
+            GuiViewRole::Hud,
+            lab_logical_w * HEADLESS_DEVICE_SCALE,
+            lab_logical_h * HEADLESS_DEVICE_SCALE,
+            overrides,
+        )
+        .expect("Lab capture");
 
-        for (logical_w, logical_h) in VIEWPORTS {
+        let (world_lo, world_hi) = world_canvas_columns(&world_image);
+        let (lab_lo, lab_hi) = world_canvas_columns(&lab_image);
+        let world_span = world_hi.saturating_sub(world_lo);
+        let lab_span = lab_hi.saturating_sub(lab_lo);
+        assert!(
+            world_span >= world_image.width() * 3 / 5,
+            "World raster occupies only {world_span}/{} device px; the visual subject \
+             must own most of its dedicated window",
+            world_image.width()
+        );
+        assert!(
+            lab_span <= lab_image.width() / 3,
+            "Lab contains a raster-like span of {lab_span}/{} device px; the companion \
+             utility window must not duplicate the World canvas",
+            lab_image.width()
+        );
+
+        let _ = save_probe(
+            &world_image,
+            &format!(
+                "world_{}x{}.png",
+                world_logical_w as u32, world_logical_h as u32
+            ),
+        );
+        let _ = save_probe(
+            &lab_image,
+            &format!(
+                "lab_overview_{}x{}.png",
+                lab_logical_w as u32, lab_logical_h as u32
+            ),
+        );
+    }
+
+    /// Diagnostic disclosures begin closed, but the production 1/2/3 input path still
+    /// mounts them in the scrollable Overview without forcing the Lab back to a desktop
+    /// dashboard width.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn narrow_lab_disclosures_are_reachable_without_reintroducing_a_canvas() {
+        for (logical_w, logical_h) in LAB_VIEWPORTS {
             let width = logical_w * HEADLESS_DEVICE_SCALE;
             let height = logical_h * HEADLESS_DEVICE_SCALE;
-
-            let open = capture_view(capture_world(), GuiViewRole::Hud, width, height)
-                .unwrap_or_else(|e| {
-                    panic!("open capture failed at {logical_w}x{logical_h}: {e:#}")
-                });
-            // 1 = stats, 2 = history. Perf is collapsed by default, so these two empty
-            // the rail and HudLayout::resolve then reports show_rail = false.
-            let closed = capture_view_with_overrides(
-                capture_world(),
+            let world = capture_world();
+            let neutral = capture_view_with_overrides(
+                Arc::clone(&world),
                 GuiViewRole::Hud,
                 width,
                 height,
                 CaptureOverrides {
-                    keystrokes: &["1", "2"],
+                    forced_perf: Some(pinned_perf()),
+                    keystrokes: &["z"],
                     ..CaptureOverrides::default()
                 },
             )
-            .unwrap_or_else(|e| panic!("closed capture failed at {logical_w}x{logical_h}: {e:#}"));
+            .expect("neutral-dispatch Lab capture");
+            let neutral_repeat = capture_view_with_overrides(
+                Arc::clone(&world),
+                GuiViewRole::Hud,
+                width,
+                height,
+                CaptureOverrides {
+                    forced_perf: Some(pinned_perf()),
+                    keystrokes: &["z"],
+                    ..CaptureOverrides::default()
+                },
+            )
+            .expect("repeated neutral-dispatch Lab capture");
+            let (negative_changed, negative_luma_delta) =
+                whole_frame_delta(&neutral, &neutral_repeat);
 
-            let w = open.width();
-            let rail_band = (HUD_RAIL_WIDTH * HEADLESS_DEVICE_SCALE) as u32;
-            let rail_lo = w.saturating_sub(rail_band);
-
-            let open_rail = count_color(&open, border, rail_lo, w);
-            let closed_rail = count_color(&closed, border, rail_lo, w);
-            let open_left = count_color(&open, border, 0, rail_lo);
-
-            closed
-                .save(probe_dir().join(format!(
-                    "hud_rail_closed_{}x{}.png",
-                    logical_w as u32, logical_h as u32
-                )))
-                .expect("write closed probe");
-
-            assert!(
-                open_rail > 0,
-                "rail chrome absent at {logical_w}x{logical_h}; the open state did not \
-                 render a rail, so the comparison below would be vacuous"
-            );
-            assert!(
-                closed_rail < open_rail,
-                "pressing 1 and 2 did not remove rail chrome at {logical_w}x{logical_h} \
-                 (open {open_rail}, closed {closed_rail}); either the production toggle \
-                 is broken or the capture is not reaching it"
-            );
-            // The world must RECLAIM the rail's column when the rail closes. That is
-            // what "reserved space" means: chrome and world trade the column, they never
-            // share it. Together with the two assertions above this is the docking
-            // property, proven rather than assumed.
-            //
-            // NOT asserting "zero chrome left of the rail". chrome::border() is now
-            // shared with the sibling history and inspector panels, which legitimately
-            // sit beside the world in their own columns, so border pixels outside the
-            // rail cannot be attributed to the rail. That check counted 1688 of them at
-            // 1600x900 and none at 1280x720 — a marker problem, not a layout one.
-            let closed_rail_content = count_non_background(&closed, rail_lo, w);
-            assert!(
-                closed_rail_content > 0,
-                "closing the rail at {logical_w}x{logical_h} left its column empty \
-                 ({closed_rail_content} non-background px); the world did not reclaim \
-                 the reserved space, so the column is dead area rather than shared"
-            );
-            let _ = open_left;
-        }
-    }
-
-    /// Captures the docked HUD at both production viewports and asserts the owner's
-    /// non-negotiable from bd-v9cz on actual pixels: chrome lives in the rail on the
-    /// right, and NOTHING sits over the world centre by default.
-    ///
-    /// The pair of assertions is what makes this non-vacuous. Requiring the panel colour
-    /// to be absent from the centre would pass trivially if the panel failed to render at
-    /// all, so the same colour must also be PRESENT in the right-hand band.
-    ///
-    /// macOS-gated for the reason given at [`REAL_PIXEL_CAPTURE_IS_MACOS_ONLY`]
-    /// (bd-h9ca).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn docked_hud_never_covers_the_world_centre_at_either_viewport() {
-        std::fs::create_dir_all(probe_dir()).expect("probe output directory");
-
-        for (logical_w, logical_h) in VIEWPORTS {
-            // VIEWPORTS are the LOGICAL sizes the production windows open at, and the
-            // layout must be exercised at those. `capture_view` takes DEVICE pixels and
-            // divides by HEADLESS_DEVICE_SCALE, so ask for the scaled size or the app
-            // sees a half-size window.
-            //
-            // This is not a detail. Requesting 1280 device px opens a 640-logical window,
-            // and HUD_RAIL_COLLAPSE_WIDTH is 960 (WORLD_MIN_WIDTH 640 + HUD_RAIL_WIDTH
-            // 320), so the resize rule correctly force-collapses the rail and the capture
-            // shows a HUD with no chrome at all. The first real run of this test failed
-            // exactly that way.
-            let width = logical_w * HEADLESS_DEVICE_SCALE;
-            let height = logical_h * HEADLESS_DEVICE_SCALE;
-            let image = capture_view(capture_world(), GuiViewRole::Hud, width, height)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "headless HUD capture failed at {logical_w}x{logical_h} logical \
-                         ({width}x{height} device): {error:#}"
-                    )
-                });
-
-            let w = image.width();
-            let h = image.height();
             assert_eq!(
-                (w, h),
+                neutral.dimensions(),
                 (width as u32, height as u32),
-                "capture must match the requested viewport"
+                "Lab capture must preserve its requested companion-window size"
             );
 
-            // Marker is the PANEL BORDER, not the history-panel background.
-            //
-            // The history background was the original marker and it was the wrong
-            // choice: it encoded an assumption — that stats AND history are both
-            // visible by default — which the first real captures disproved. At 720
-            // logical the HUD's canvas row is only ~207 logical px tall, so the rail
-            // fits one panel and the history chart legitimately does not appear. A
-            // marker that can never be satisfied does not test the policy, it just
-            // fails. The border is what every docked panel actually draws.
-            // Scope the "clear" assertion to the WORLD CANVAS, not the whole frame.
-            //
-            // The middle third of the frame was the wrong rectangle. The frame contains
-            // chrome margin by design — header, summary, analytics and history all stack
-            // above and beside the world — so a frame-wide check both over-reports
-            // (counting stacked chrome that overlaps nothing) and could under-report
-            // (a panel sitting over a world that is not centred in the frame).
-            //
-            // The canvas is located empirically rather than assumed: it is the only
-            // element that paints a raster, so it is the widest contiguous column span
-            // whose columns carry many distinct colours. Chrome is flat fill plus text.
-            let (centre_lo, centre_hi) = world_canvas_columns(&image);
-            let centre_hits = count_color(&image, panel_border(), centre_lo, centre_hi);
+            for (shortcut, label) in [("1", "stats"), ("2", "history"), ("3", "performance")] {
+                let keystrokes: &'static [&'static str] = match shortcut {
+                    "1" => &["1"],
+                    "2" => &["2"],
+                    "3" => &["3"],
+                    _ => unreachable!("fixed diagnostic shortcut table"),
+                };
+                let opened = capture_view_with_overrides(
+                    Arc::clone(&world),
+                    GuiViewRole::Hud,
+                    width,
+                    height,
+                    CaptureOverrides {
+                        forced_perf: Some(pinned_perf()),
+                        keystrokes,
+                        ..CaptureOverrides::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("open-{label} Lab capture failed: {error:#}"));
+                let (changed, mean_luma_delta) = whole_frame_delta(&neutral, &opened);
+                assert!(
+                    changed > negative_changed.saturating_add(500)
+                        && mean_luma_delta > negative_luma_delta + 0.01,
+                    "pressing {shortcut} at {logical_w}x{logical_h} changed {changed} pixels \
+                     (mean luma delta {mean_luma_delta:.4}), while the equal-dispatch no-op \
+                     control changed {negative_changed} pixels (mean luma delta \
+                     {negative_luma_delta:.4}); the {label} disclosure is not causally \
+                     visible through the production input path"
+                );
+                let (lab_lo, lab_hi) = world_canvas_columns(&opened);
+                assert!(
+                    lab_hi.saturating_sub(lab_lo) <= opened.width() / 3,
+                    "opening {label} at {logical_w}x{logical_h} reintroduced a \
+                     world-raster-like span into the Lab"
+                );
 
-            // Right band: the rightmost rail-width strip, where the docked rail lives.
-            let rail_band = (HUD_RAIL_WIDTH * HEADLESS_DEVICE_SCALE) as u32;
-            let right_hits = count_color(&image, panel_border(), w.saturating_sub(rail_band), w);
-
-            // Named by LOGICAL viewport so the evidence matches the window size a user
-            // actually has; the file itself is a 2x HiDPI buffer, as a Retina screenshot
-            // of that window would be.
-            let path = probe_dir().join(format!(
-                "hud_docked_{}x{}.png",
-                logical_w as u32, logical_h as u32
-            ));
-            image.save(&path).expect("write HUD probe png");
-
-            assert!(
-                right_hits > 0,
-                "no docked-panel border found in the rightmost rail band at {w}x{h}; the rail \
-                 did not render, so the centre assertion below would be vacuous. Probe: {}",
-                path.display()
-            );
-            assert_eq!(
-                centre_hits,
-                0,
-                "HUD chrome is covering the world centre at {w}x{h}: {centre_hits} \
-                 docked-panel border pixels inside the world canvas span x={centre_lo}..{centre_hi}. bd-v9cz's \
-                 one non-negotiable is that nothing sits over the world centre by \
-                 default. Probe: {}",
-                path.display()
-            );
+                let _ = save_probe(
+                    &opened,
+                    &format!("lab_{label}_{}x{}.png", logical_w as u32, logical_h as u32),
+                );
+            }
         }
     }
 
