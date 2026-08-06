@@ -34,3 +34,13 @@ crates/scriptbots-render/frames_render_test/*.png
 # bv (beads viewer) local config and caches
 .bv/
 beads_compliance_audit/
+
+# === multi-repo ephemeral hygiene 2026-08-06 ===
+# Beads runtime / history (JSONL source of truth is issues.jsonl when used)
+.beads/.br_history/
+.beads/.br_recovery/
+.beads/.write.lock
+.beads/.sync.lock
+.beads/.bv.lock
+.beads/daemon.lock
+.beads/last-touched
