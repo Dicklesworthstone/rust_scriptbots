@@ -1,0 +1,531 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Avoid cargo home pollution across jobs
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Fast format check runs first to fail early
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # Keep the approved semantic references present, reviewable, and immutable in CI.
+  golden_assets:
+    name: Golden Asset Policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Verify approved assets and checksums
+        shell: bash
+        env:
+          RUST_REGEN_GOLDEN: "0"
+          BEVY_REGEN_GOLDEN: "0"
+        run: |
+          set -euo pipefail
+          cd docs/rendering_reference
+
+          if [[ "$RUST_REGEN_GOLDEN" != "0" || "$BEVY_REGEN_GOLDEN" != "0" ]]; then
+            echo "::error::CI must never regenerate or bless golden assets."
+            exit 1
+          fi
+
+          missing=0
+          if [[ ! -f golden/rust_default.png ]]; then
+            echo "::error file=docs/rendering_reference/golden/rust_default.png::Missing approved scriptbots-render CPU-surrogate semantic golden; this is not a live GPUI/wgpu capture. Generate a candidate locally with: RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-render --test snapshot scriptbots_render_cpu_surrogate_raster_matches_semantic_golden -- --exact --nocapture; then review the image and Git diff before committing it."
+            missing=1
+          fi
+          if [[ ! -f golden/bevy_default.png ]]; then
+            echo "::error file=docs/rendering_reference/golden/bevy_default.png::Missing approved Bevy-scene CPU-surrogate semantic golden; this is not a Bevy App/GPU framebuffer capture. Generate a candidate locally with: BEVY_REGEN_GOLDEN=1 cargo test -p scriptbots-bevy --test snapshot bevy_scene_cpu_surrogate_raster_matches_semantic_golden -- --exact --nocapture; then review the image and Git diff before committing it."
+            missing=1
+          fi
+          if (( missing != 0 )); then
+            exit 1
+          fi
+
+          expected_paths=$'golden/rust_default.png\ngolden/bevy_default.png'
+          actual_paths="$(awk 'NF && $1 !~ /^#/ { print $2 }' checksums.txt)"
+          if [[ "$actual_paths" != "$expected_paths" ]]; then
+            echo "::error file=docs/rendering_reference/checksums.txt::The active manifest must list exactly the two approved, tracked semantic references."
+            printf 'Expected paths:\n%s\nActual paths:\n%s\n' "$expected_paths" "$actual_paths"
+            exit 1
+          fi
+
+          grep -Ev '^[[:space:]]*(#|$)' checksums.txt | sha256sum --check --strict -
+
+  # Clippy runs on all platforms to catch platform-specific lint issues
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            cargo_target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            cargo_target: aarch64-apple-darwin
+          - os: windows-2022
+            cargo_target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install mold linker and system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: clippy-${{ matrix.os }}-${{ matrix.cargo_target }}
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
+      # Note: We don't use --all-features because the 'tch' feature requires
+      # libtorch to be installed manually, which isn't available in CI.
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
+  # Build and test on all platforms
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            cargo_target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            cargo_target: aarch64-apple-darwin
+          - os: windows-2022
+            cargo_target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install mold linker and system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: test-${{ matrix.os }}-${{ matrix.cargo_target }}
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
+      - name: Run tests
+        run: cargo test --workspace
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
+      - name: Run scriptbots-app unit tests (terminal HUD)
+        run: cargo test -p scriptbots-app --lib -- --nocapture
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
+      - name: Prove actual Windows User32 session selection
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test -p scriptbots-app --bin scriptbots-app
+          windows_auto_mode_queries_the_actual_process_window_station
+          -- --exact --nocapture
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
+  # Security audit for dependencies
+  security:
+    name: Security Audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145
+        with:
+          tool: cargo-audit@0.22.2
+
+      - name: Run security audit
+        # Temporary bd-2z0.8.14 exception: latest stable wayland-scanner 0.31.10
+        # reaches RUSTSEC-2026-0194 only while compiling trusted, vendored XML;
+        # its code does not use the NsReader API affected by RUSTSEC-2026-0195.
+        # Upstream has the 0.41 fix but no compatible stable family release yet.
+        # The inverse-path guard prevents either ignore hiding a future consumer.
+        run: |
+          set -euo pipefail
+          EXPECTED=$'quick-xml v0.39.4\nwayland-scanner v0.31.10 (proc-macro)'
+          ACTUAL="$(cargo tree --workspace --all-features --target all --locked --invert quick-xml@0.39.4 --depth 1 --prefix none --format '{p}')"
+          if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+            echo "::error::The temporary quick-xml advisory exception no longer has its reviewed dependency path."
+            printf 'Expected:\n%s\nActual:\n%s\n' "$EXPECTED" "$ACTUAL"
+            exit 1
+          fi
+          cargo audit \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195
+
+      - name: Franken family license audit guard (bd-2z0.8.15)
+        run: |
+          bash ci/check_franken_licenses.sh --self-test
+          bash ci/check_franken_licenses.sh
+
+      - name: Asupersync single-version-universe guard (bd-2z0.8.17)
+        run: |
+          bash ci/check_asupersync_universe.sh --self-test
+          bash ci/check_asupersync_universe.sh asupersync
+
+      - name: FrankenSQLite pin-consistency guard (bd-2z0.8.9.14)
+        run: |
+          bash ci/check_fsqlite_pin.sh --self-test
+          bash ci/check_fsqlite_pin.sh
+
+  wasm:
+    name: Wasm (ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install mold linker and system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+
+      - name: Install pinned Chrome for Testing
+        id: chrome
+        shell: bash
+        env:
+          CHROME_VERSION: "148.0.7778.167"
+          CHROME_SHA256: "7096879de995091dff2eb3f4b5e7d36ca3395c07fb552a9a391887cb5def574a"
+          CHROMEDRIVER_SHA256: "f730a232329f133f3f6f992a9fb8b25745328b43b7b6244bd8168d95bc727c7e"
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/chrome-for-testing-$CHROME_VERSION"
+          CHROME_ZIP="$ROOT/chrome-linux64.zip"
+          CHROMEDRIVER_ZIP="$ROOT/chromedriver-linux64.zip"
+          mkdir -p "$ROOT"
+          curl --fail --location --retry 3 --output "$CHROME_ZIP" \
+            "https://storage.googleapis.com/chrome-for-testing-public/$CHROME_VERSION/linux64/chrome-linux64.zip"
+          curl --fail --location --retry 3 --output "$CHROMEDRIVER_ZIP" \
+            "https://storage.googleapis.com/chrome-for-testing-public/$CHROME_VERSION/linux64/chromedriver-linux64.zip"
+          printf '%s  %s\n' "$CHROME_SHA256" "$CHROME_ZIP" | sha256sum --check -
+          printf '%s  %s\n' "$CHROMEDRIVER_SHA256" "$CHROMEDRIVER_ZIP" | sha256sum --check -
+          unzip -q "$CHROME_ZIP" -d "$ROOT"
+          unzip -q "$CHROMEDRIVER_ZIP" -d "$ROOT"
+          CHROME_PATH="$ROOT/chrome-linux64/chrome"
+          CHROMEDRIVER_PATH="$ROOT/chromedriver-linux64/chromedriver"
+          WEBDRIVER_JSON="$ROOT/webdriver.json"
+          test -x "$CHROME_PATH"
+          test -x "$CHROMEDRIVER_PATH"
+          printf '{"goog:chromeOptions":{"binary":"%s"}}\n' "$CHROME_PATH" > "$WEBDRIVER_JSON"
+          printf 'chromedriver=%s\n' "$CHROMEDRIVER_PATH" >> "$GITHUB_OUTPUT"
+          printf 'webdriver_json=%s\n' "$WEBDRIVER_JSON" >> "$GITHUB_OUTPUT"
+
+      - name: wasm-pack build (web target)
+        run: wasm-pack build crates/scriptbots-web --target web --out-dir web/pkg -- --locked
+
+      - name: wasm-pack test (headless Chrome)
+        env:
+          CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver }}
+          WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ steps.chrome.outputs.webdriver_json }}
+        run: wasm-pack test --headless --chrome --chromedriver "$CHROMEDRIVER" crates/scriptbots-web
+
+  replay:
+    name: Replay Contract (ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Configure unique replay paths
+        shell: bash
+        run: |
+          printf 'SCRIPTBOTS_BASELINE_DB=%s/scriptbots-%s-%s-baseline.sqlite\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          printf 'SCRIPTBOTS_CANDIDATE_DB=%s/scriptbots-%s-%s-candidate.sqlite\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: replay-linux
+
+      - name: Build scriptbots-app (release)
+        run: cargo build --release -p scriptbots-app
+
+      - name: Generate baseline replay database
+        env:
+          SCRIPTBOTS_MODE: terminal
+          SCRIPTBOTS_TERMINAL_HEADLESS: "1"
+          SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES: "16"
+        run: SCRIPTBOTS_STORAGE_PATH="$SCRIPTBOTS_BASELINE_DB" cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
+
+      - name: Generate candidate replay database
+        env:
+          SCRIPTBOTS_MODE: terminal
+          SCRIPTBOTS_TERMINAL_HEADLESS: "1"
+          SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES: "16"
+        run: SCRIPTBOTS_STORAGE_PATH="$SCRIPTBOTS_CANDIDATE_DB" cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
+
+      - name: Verify replay fails closed without production event instrumentation
+        run: |
+          if output="$(cargo run --release -p scriptbots-app --bin scriptbots-app -- \
+              --config ci/configs/replay_ci.toml \
+              --replay-db "$SCRIPTBOTS_BASELINE_DB" \
+              --tick-limit 128 2>&1)"; then
+            printf '%s\n' "$output"
+            printf '%s\n' 'replay unexpectedly accepted empty production event streams' >&2
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep -Fq -- 'replay verification refused a vacuous nonzero run' <<< "$output"
+
+      - name: Verify comparison also fails closed without production events
+        run: |
+          if output="$(cargo run --release -p scriptbots-app --bin scriptbots-app -- \
+              --config ci/configs/replay_ci.toml \
+              --replay-db "$SCRIPTBOTS_BASELINE_DB" \
+              --compare-db "$SCRIPTBOTS_CANDIDATE_DB" \
+              --tick-limit 128 2>&1)"; then
+            printf '%s\n' "$output"
+            printf '%s\n' 'comparison unexpectedly accepted empty production event streams' >&2
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep -Fq -- 'replay verification refused a vacuous nonzero run' <<< "$output"
+
+  render_regression:
+    name: Render Regression (${{ matrix.os }})
+    needs: [golden_assets, clippy, test]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Detect render-related changes
+        id: changes
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
+        with:
+          filters: |
+            render:
+              - 'crates/scriptbots-render/**'
+              - 'crates/scriptbots-bevy/**'
+              - 'docs/rendering_reference/**'
+              - 'PLAN_TO_FIX_RENDERING_ISSUES.md'
+              - '.github/workflows/ci.yml'
+
+      - name: Skip render regression (no relevant changes)
+        if: ${{ github.event_name == 'pull_request' && steps.changes.outputs.render != 'true' }}
+        run: echo "No renderer changes detected; skipping snapshot harness."
+
+      - name: Install mold linker and system deps (Linux)
+        if: ${{ matrix.os == 'ubuntu-24.04' && (github.event_name != 'pull_request' || steps.changes.outputs.render == 'true') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        if: ${{ github.event_name != 'pull_request' || steps.changes.outputs.render == 'true' }}
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+
+      - name: Cache cargo artifacts
+        if: ${{ github.event_name != 'pull_request' || steps.changes.outputs.render == 'true' }}
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: render-${{ matrix.os }}
+
+      - name: Run snapshot + camera invariants (Linux)
+        if: ${{ matrix.os == 'ubuntu-24.04' && (github.event_name != 'pull_request' || steps.changes.outputs.render == 'true') }}
+        shell: bash
+        env:
+          WGPU_BACKEND: gl
+          WGPU_POWER_PREFERENCE: low_power
+          WGPU_ALLOW_SOFTWARE: "1"
+          BEVY_ASSET_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          cargo test -p scriptbots-render -- --nocapture
+          cargo test -p scriptbots-bevy -- --nocapture
+
+      - name: Run snapshot + camera invariants (Windows)
+        if: ${{ matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || steps.changes.outputs.render == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p scriptbots-render -- --nocapture
+
+      - name: Upload snapshot diffs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: render-diffs-${{ matrix.os }}
+          path: target/snapshot-failures/
+          retention-days: 14
+
+  bevy_exhaustive:
+    name: Bevy Exhaustive (manual)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install mold linker and system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: bevy-exhaustive-linux
+
+      - name: Bevy exhaustive tests
+        env:
+          WGPU_BACKEND: gl
+          WGPU_POWER_PREFERENCE: low_power
+          WGPU_ALLOW_SOFTWARE: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p scriptbots-bevy -- --include-ignored --nocapture
