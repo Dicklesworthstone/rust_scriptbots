@@ -1,0 +1,305 @@
+tool_name: rust_scriptbots_bd_2cd1_perf_compare
+repo: Dicklesworthstone/rust_scriptbots
+local_path: /Users/jemanuel/projects/rust_scriptbots
+
+language: rust
+binary_name: scriptbots-rng-domain-perf-compare.tar.gz
+build_profile: release
+
+targets:
+  - darwin/arm64
+
+act_job_map:
+  darwin/arm64: null
+
+cross_compile:
+  darwin/arm64:
+    method: native
+    host: trj
+
+build_cmd: |-
+  set -euo pipefail
+  test "$(uname -s)" = "Darwin"
+  test "$(uname -m)" = "arm64"
+
+  baseline_source_commit="a54720134b767a115b48f04287cb9d586a71a86b"
+  promoted_baseline="ci/fixtures/perf_baseline.json"
+  retained_baseline="/Volumes/USBNVME16TB/temp_agent_space/rust_scriptbots_dsr_rng_domain_perf_baseline-bd-2cd1-perf-baseline-2/baseline/perf_baseline.json"
+  justification="Establish the reviewed exact-class full performance golden for bd-2cd1 after the six-domain RNG cutover, WorldDigest V1.3, RunManifest V3, and semantic-render rebaseline. This candidate remains unapproved until its raw repetitions, fingerprints, absolute budgets, deterministic digests, and same-class readback are reviewed and it is promoted byte-for-byte."
+
+  test "$SCRIPTBOTS_DSR_EXPECTED_COMMIT" != "__EXPECTED_PROMOTION_COMMIT__"
+  test "$SCRIPTBOTS_DSR_PROMOTED_BASELINE_SHA256" != "__PROMOTED_BASELINE_SHA256__"
+  test "$(git branch --show-current)" = "main"
+  test "$(git rev-parse HEAD)" = "$SCRIPTBOTS_DSR_EXPECTED_COMMIT"
+  test "$(git rev-parse refs/heads/main)" = "$SCRIPTBOTS_DSR_EXPECTED_COMMIT"
+  test -z "$(git status --porcelain)"
+  git diff --check
+  git merge-base --is-ancestor "$baseline_source_commit" "$SCRIPTBOTS_DSR_EXPECTED_COMMIT"
+  test "$(git diff --name-status "$baseline_source_commit" "$SCRIPTBOTS_DSR_EXPECTED_COMMIT")" = "$(printf 'M\t%s' "$promoted_baseline")"
+  git diff --check "$baseline_source_commit" "$SCRIPTBOTS_DSR_EXPECTED_COMMIT"
+
+  baseline_lock_blob="$(git rev-parse "$baseline_source_commit:Cargo.lock")"
+  cargo_lock_blob="$(git rev-parse "$SCRIPTBOTS_DSR_EXPECTED_COMMIT:Cargo.lock")"
+  test "$cargo_lock_blob" = "$baseline_lock_blob"
+  test -s "$retained_baseline"
+  test -s "$promoted_baseline"
+  retained_sha="$(shasum -a 256 "$retained_baseline" | awk '{print $1}')"
+  promoted_sha="$(shasum -a 256 "$promoted_baseline" | awk '{print $1}')"
+  test "$retained_sha" = "$SCRIPTBOTS_DSR_PROMOTED_BASELINE_SHA256"
+  test "$promoted_sha" = "$SCRIPTBOTS_DSR_PROMOTED_BASELINE_SHA256"
+  cmp -s "$retained_baseline" "$promoted_baseline"
+
+  actual_justification="$(
+    git show -s --format=%B "$SCRIPTBOTS_DSR_EXPECTED_COMMIT" \
+      | git interpret-trailers --parse \
+      | awk -F': ' '$1 == "Perf-Baseline-Justification" { print substr($0, index($0, ": ") + 2) }'
+  )"
+  test "$actual_justification" = "$justification"
+  jq -e \
+    --arg source "$baseline_source_commit" \
+    --arg lock "$baseline_lock_blob" \
+    --arg justification "$justification" '
+      .schema == "scriptbots.perf-gate.v3"
+      and .artifact_kind == "baseline"
+      and .scenario_contract == "scriptbots.perf-scenario.v3"
+      and .dynamic_snapshot_schema == "scriptbots.dynamic-world-snapshot.v2"
+      and .world_step_profile_schema == "scriptbots.world-step-profile.v2"
+      and .mode == "full"
+      and .synthetic_sleep_us == 0
+      and .source_commit == $source
+      and .baseline_justification == $justification
+      and .fingerprint.git_commit == $source
+      and .fingerprint.git_dirty == false
+      and .fingerprint.cargo_lock_git_blob == $lock
+      and .policy.warmup_repetitions == 3
+      and .policy.measured_repetitions == 5
+      and .policy.ticks_per_repetition == 200
+      and .policy.snapshot_samples_per_tick == 5
+      and .policy.snapshot_samples_per_repetition == 1000
+      and ([.scenarios[].id] == [
+        "agents-1000__brain-mlp-baseline__ticks-200__snapshot-dynamic-v2",
+        "agents-1000__brain-ml-neuroflow__ticks-200__snapshot-dynamic-v2",
+        "agents-5000__brain-mlp-baseline__ticks-200__snapshot-dynamic-v2",
+        "agents-5000__brain-ml-neuroflow__ticks-200__snapshot-dynamic-v2"
+      ])
+      and all(.scenarios[];
+        (.warmups | length) == 3
+        and (.measurements | length) == 5
+        and .ticks_per_repetition == 200
+        and .run_tps_cv_pct <= 5
+        and .snapshot_p95_cv_pct <= 5
+        and all((.warmups + .measurements)[]; (.snapshot_ns | length) == 1000)
+        and ([
+          (.warmups[] | .final_digest),
+          (.measurements[] | .final_digest)
+        ] | unique | length) == 1
+      )
+      and all(.scenarios[] | select(.agents == 1000);
+        .median_of_run_total_tps >= 60
+        and .median_of_run_snapshot_p95_ns < 4000000
+      )
+    ' "$promoted_baseline"
+
+  proof_root="/Volumes/USBNVME16TB/temp_agent_space/rust_scriptbots_dsr_rng_domain_perf_compare-${version}"
+  test ! -e "$proof_root"
+  artifact_root="$CARGO_TARGET_DIR/aarch64-apple-darwin/release"
+  perf_target="$CARGO_TARGET_DIR/perf-bd-2cd1"
+  mkdir -p "$proof_root" "$artifact_root" "$perf_target" "$TMPDIR"
+
+  CARGO_TARGET_DIR="$perf_target" \
+    scripts/perf_gate.sh --self-test \
+      --output-dir "$proof_root/self-test" \
+    2>&1 | tee "$proof_root/self-test.log"
+
+  comparison_status=0
+  CARGO_TARGET_DIR="$perf_target" \
+    scripts/perf_gate.sh --mode full \
+      --baseline "$promoted_baseline" \
+      --output-dir "$proof_root/comparison" \
+    2>&1 | tee "$proof_root/comparison.log" || comparison_status=$?
+  test "$comparison_status" -eq 0
+  comparison_dir="$proof_root/comparison"
+  comparison_state="$(jq -er '.status' "$comparison_dir/perf_verdict.json")"
+  case "$comparison_state" in
+    pass)
+      ;;
+    advisory)
+      jq -e '
+        .exit_code == 0
+        and ([.scenarios[] | select(
+          .would_fail_tps_regression
+          or .would_fail_absolute_tps
+          or .would_fail_snapshot_budget
+        )] | length) == 0
+      ' "$comparison_dir/perf_verdict.json"
+      retry_status=0
+      CARGO_TARGET_DIR="$perf_target" \
+        scripts/perf_gate.sh --mode full \
+          --baseline "$promoted_baseline" \
+          --output-dir "$proof_root/comparison-retry" \
+        2>&1 | tee "$proof_root/comparison-retry.log" || retry_status=$?
+      test "$retry_status" -eq 0
+      comparison_dir="$proof_root/comparison-retry"
+      ;;
+    *)
+      false
+      ;;
+  esac
+
+  for artifact in \
+    perf_result.json \
+    fingerprint.json \
+    perf_verdict.json \
+    perf_summary.md
+  do
+    test -s "$comparison_dir/$artifact"
+  done
+  jq -e --slurpfile result "$comparison_dir/perf_result.json" \
+    '. == $result[0].fingerprint' "$comparison_dir/fingerprint.json"
+  jq -e '
+    .status == "pass"
+    and .exit_code == 0
+    and (.scenarios | length) == 4
+    and ([.scenarios[] | select(
+      .noisy
+      or .would_fail_tps_regression
+      or .would_fail_absolute_tps
+      or .would_fail_snapshot_budget
+    )] | length) == 0
+  ' "$comparison_dir/perf_verdict.json"
+  jq -e \
+    --arg commit "$SCRIPTBOTS_DSR_EXPECTED_COMMIT" \
+    --arg lock "$cargo_lock_blob" \
+    --slurpfile baseline "$promoted_baseline" '
+      .schema == "scriptbots.perf-gate.v3"
+      and .artifact_kind == "candidate"
+      and .scenario_contract == $baseline[0].scenario_contract
+      and .dynamic_snapshot_schema == $baseline[0].dynamic_snapshot_schema
+      and .world_step_profile_schema == $baseline[0].world_step_profile_schema
+      and .policy == $baseline[0].policy
+      and .mode == "full"
+      and .synthetic_sleep_us == 0
+      and .source_commit == $commit
+      and .fingerprint.git_commit == $commit
+      and .fingerprint.git_dirty == false
+      and .fingerprint.cargo_lock_git_blob == $lock
+      and .fingerprint.machine_class_id == $baseline[0].fingerprint.machine_class_id
+      and .fingerprint.class == $baseline[0].fingerprint.class
+      and ([.scenarios[].id] == [
+        "agents-1000__brain-mlp-baseline__ticks-200__snapshot-dynamic-v2",
+        "agents-1000__brain-ml-neuroflow__ticks-200__snapshot-dynamic-v2",
+        "agents-5000__brain-mlp-baseline__ticks-200__snapshot-dynamic-v2",
+        "agents-5000__brain-ml-neuroflow__ticks-200__snapshot-dynamic-v2"
+      ])
+      and all(.scenarios[];
+        (.warmups | length) == 3
+        and (.measurements | length) == 5
+        and .ticks_per_repetition == 200
+        and all((.warmups + .measurements)[]; (.snapshot_ns | length) == 1000)
+        and ([
+          (.warmups[] | .final_digest),
+          (.measurements[] | .final_digest)
+        ] | unique | length) == 1
+      )
+      and ([.scenarios[] | {
+        id,
+        seed,
+        agents,
+        brain_family,
+        feature_set,
+        scenario_config_hash,
+        ticks_per_repetition,
+        initial_agent_count,
+        final_digest: .measurements[0].final_digest
+      }] == [$baseline[0].scenarios[] | {
+        id,
+        seed,
+        agents,
+        brain_family,
+        feature_set,
+        scenario_config_hash,
+        ticks_per_repetition,
+        initial_agent_count,
+        final_digest: .measurements[0].final_digest
+      }])
+    ' "$comparison_dir/perf_result.json"
+
+  test -z "$(git status --porcelain)"
+  test "$(shasum -a 256 "$promoted_baseline" | awk '{print $1}')" = "$SCRIPTBOTS_DSR_PROMOTED_BASELINE_SHA256"
+  cmp -s "$retained_baseline" "$promoted_baseline"
+  jq -n \
+    --arg dsr_version "${version}" \
+    --arg promotion_commit "$SCRIPTBOTS_DSR_EXPECTED_COMMIT" \
+    --arg baseline_source_commit "$baseline_source_commit" \
+    --arg justification "$justification" \
+    --arg cargo_lock_blob "$cargo_lock_blob" \
+    --arg baseline_sha256 "$SCRIPTBOTS_DSR_PROMOTED_BASELINE_SHA256" \
+    --arg retained_baseline "$retained_baseline" \
+    --arg promoted_baseline "$promoted_baseline" \
+    --arg comparison_dir "$comparison_dir" \
+    --slurpfile baseline "$promoted_baseline" \
+    --slurpfile comparison "$comparison_dir/perf_result.json" \
+    --slurpfile verdict "$comparison_dir/perf_verdict.json" '
+      {
+        schema: "scriptbots.bd-2cd1-perf-compare-proof.v1",
+        approval_state: "final_comparison_pass",
+        dsr_version: $dsr_version,
+        promotion_commit: $promotion_commit,
+        baseline_source_commit: $baseline_source_commit,
+        justification: $justification,
+        cargo_lock_git_blob: $cargo_lock_blob,
+        baseline_sha256: $baseline_sha256,
+        retained_baseline: $retained_baseline,
+        promoted_baseline: $promoted_baseline,
+        comparison_dir: $comparison_dir,
+        machine_class_id: $baseline[0].fingerprint.machine_class_id,
+        verdict: $verdict[0],
+        scenarios: [$comparison[0].scenarios[] | {
+          id,
+          run_tps_cv_pct,
+          snapshot_p95_cv_pct,
+          median_of_run_total_tps,
+          median_of_run_snapshot_p95_ns,
+          final_digest: .measurements[0].final_digest
+        }]
+      }
+    ' > "$proof_root/proof.json"
+  jq -e '
+    .approval_state == "final_comparison_pass"
+    and .verdict.status == "pass"
+    and .verdict.exit_code == 0
+    and (.scenarios | length) == 4
+  ' "$proof_root/proof.json"
+  (
+    cd "$proof_root"
+    find . -type f ! -name SHA256SUMS -print0 \
+      | sort -z \
+      | xargs -0 shasum -a 256 > SHA256SUMS
+  )
+  test -s "$proof_root/SHA256SUMS"
+  tar -czf "$artifact_root/scriptbots-rng-domain-perf-compare.tar.gz" \
+    -C "$proof_root" .
+  test -s "$artifact_root/scriptbots-rng-domain-perf-compare.tar.gz"
+
+env:
+  CARGO_BUILD_TARGET: aarch64-apple-darwin
+  CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_DIR: /Volumes/USBNVME16TB/temp_agent_space/rust_scriptbots_bd_2z0_3_14_verify_fresh_target
+  CARGO_TERM_COLOR: never
+  PATH: /Users/jemanuel/.cargo/bin:/Users/jemanuel/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+  RAYON_NUM_THREADS: "4"
+  RUST_BACKTRACE: "1"
+  RUSTFLAGS: ""
+  SCRIPTBOTS_MAX_THREADS: "4"
+  SCRIPTBOTS_PAR_MIN_SPLIT: "1024"
+  SCRIPTBOTS_PERF_BUILD_TARGET: aarch64-apple-darwin
+  SCRIPTBOTS_DSR_EXPECTED_COMMIT: __EXPECTED_PROMOTION_COMMIT__
+  SCRIPTBOTS_DSR_PROMOTED_BASELINE_SHA256: __PROMOTED_BASELINE_SHA256__
+  TMPDIR: /Volumes/USBNVME16TB/temp_agent_space/tmp
+
+artifact_naming: "${name}-${version}-${os}-${arch}"
+
+archive_format:
+  darwin: none
+
+include_files: []
