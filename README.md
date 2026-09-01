@@ -454,6 +454,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
    - `--auto-pause-below COUNT` (or `SCRIPTBOTS_AUTO_PAUSE_BELOW`) pauses when population ≤ COUNT
    - `--auto-pause-age-above AGE` (or `SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE`) pauses when any agent’s age ≥ AGE
    - `--auto-pause-on-spike` (or `SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE=true`) pauses on first spike hit event
+- `--brain {mixed|mlp|dwraon|assembly|ft}`: select which brain family(ies) to install for the run (default `mixed`). `mixed` registers MLP, DWRAON, and Assembly unconditionally; it additionally registers Frankentorch `FtBrain` only when the binary is built with `--features brain-ft`, and registers the optional NeuroFlow brain only when built with `--features neuro` (see `SCRIPTBOTS_NEUROFLOW_*` below for runtime toggles). `mlp`, `dwraon`, and `assembly` install only that single family. `ft` installs only the Frankentorch family and **fails closed** with a typed error when the `brain-ft` feature is not enabled — it never silently substitutes another family. The flag is an application-layer CLI choice and is NOT a `ScriptBotsConfig` field, so `--config` files and `SCRIPTBOTS_CONFIG_OVERRIDES` cannot override it; precedence is `default → SCRIPTBOTS_BRAIN env var → --brain CLI flag`.
 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
@@ -472,6 +473,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - Legacy render knobs `SB_WGPU_TONEMAP|EXPOSURE|BLOOM|BLOOM_THRESH|BLOOM_INTENSITY|VIGNETTE|FOG|FOG_COLOR|FXAA` and `SCRIPTBOTS_TERMINAL_PALETTE` are mapped onto the typed `render.*` schema at startup with one INFO log per applied mapping; the canonical typed `SCRIPTBOTS_RENDER_*` variables and CLI flags outrank them.
 - `SCRIPTBOTS_CONFIG_OVERRIDES` — inline TOML document merged as the most-general environment configuration layer (e.g., `world_width = 1000`). Beats `--config` files, loses to the typed `SCRIPTBOTS_*` variables and to every CLI flag; malformed content fails startup closed. Each applied layer appends a kind-tagged digest to the manifest, and cross-layer displacements land in the manifest's `config_overrides`.
 - `SCRIPTBOTS_RNG_SEED` — environment-layer RNG seed; `--rng-seed` outranks it as a distinct CLI layer with its own provenance.
+- `SCRIPTBOTS_BRAIN` — environment-layer brain preset (`mixed|mlp|dwraon|assembly|ft`, default `mixed`); `--brain` outranks it as a distinct CLI layer. Selecting `ft` without the `brain-ft` build feature fails closed at startup; selecting an unknown string fails clap parsing before any storage is reserved.
 - `SCRIPTBOTS_NEUROFLOW_ENABLED` — `true|false`.
 - `SCRIPTBOTS_NEUROFLOW_HIDDEN` — comma-separated hidden sizes (e.g., `64,32,16`).
 - `SCRIPTBOTS_NEUROFLOW_ACTIVATION` — `tanh|sigmoid|relu`.
