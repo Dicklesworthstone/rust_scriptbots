@@ -239,6 +239,31 @@ def normalize_paths(repo: Repo, raw_paths: Sequence[str]) -> list[str]:
 
     return sorted(normalized)
 
+# bd-mdoc: git commit normalizes the message in ways that a naive byte-equal
+# comparison misses. This canonical form captures what git actually stores and
+# returns through `%B`, so the approved message and the committed message can
+# be compared on equal footing. Without it, git's own normalization trips the
+# guard on otherwise correct commits.
+def canonicalize_commit_message(text: str) -> str:
+    """Normalize a commit message to the form git commits and `%B` reads back.
+
+    Git's `commit -m` (and `commit -F`) coalesce trailing whitespace on every
+    line, convert CRLF/CR line endings to LF, and drop leading/trailing blank
+    lines before storing. `%B` then appends one extra trailing newline that
+    callers must rstrip before comparing. Treating any of those differences as
+    commit-message corruption produces false positives (bd-mdoc).
+    """
+    # Git's commit -m only normalizes CRLF -> LF (Unix line-ending canonical),
+    # so lone CR stays as CR; mirror that exact conversion.
+    text = text.replace("\r\n", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
 
 @contextmanager
 def commit_mutex(
@@ -448,7 +473,11 @@ def review_candidate(args: argparse.Namespace) -> int:
     agent = require_agent()
     reject_in_progress_git_operation(repo)
     paths = normalize_paths(repo, args.paths)
-    message = args.message.strip()
+    # bd-mdoc: canonicalize so trailing whitespace, CRLF/CR line endings, and
+    # leading/trailing blank lines are normalized to the form git actually
+    # stores; otherwise the byte-equal comparison at commit time fires on
+    # git's own normalization (see canonicalize_commit_message).
+    message = canonicalize_commit_message(args.message)
     if not message:
         fail("commit message must not be empty", 64)
 
@@ -605,7 +634,13 @@ def commit_review(args: argparse.Namespace) -> int:
                 f"stop and inspect {new_head}."
             )
         committed_message = git(repo, ["show", "-s", "--format=%B", new_head]).stdout
-        if committed_message.decode("utf-8", "strict").rstrip("\n") != message:
+        # bd-mdoc: compare canonical forms so git's own normalization of
+        # line endings, trailing whitespace, and trailing blank lines does
+        # not trip the guard on otherwise correct commits.
+        if (
+            canonicalize_commit_message(committed_message.decode("utf-8", "strict"))
+            != message
+        ):
             fail(
                 "commit landed with a message different from approval; "
                 f"stop and inspect {new_head}."
