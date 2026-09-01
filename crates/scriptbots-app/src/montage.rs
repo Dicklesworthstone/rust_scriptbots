@@ -1,13 +1,13 @@
 //! Headless montage encoder for highlight reels (`bd-16g.9.2`).
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use scriptbots_core::WorldState;
 use scriptbots_core::narrative::EventRecord;
-use scriptbots_core::reel::{Clip, SelectionConfig, select_clips};
+use scriptbots_core::reel::{SelectionConfig, select_clips};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::info;
 
 /// Supported export formats for highlight reels.

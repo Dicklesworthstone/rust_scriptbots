@@ -12,6 +12,43 @@ pub enum ToroidalRegion {
 }
 
 impl ToroidalRegion {
+    /// Reject the malformed forms that would silently produce wrong behaviour
+    /// in [`Self::contains`].
+    ///
+    /// In particular a negative or non-finite `Disc` radius computes
+    /// `radius * radius` as a positive value, so `contains` would treat
+    /// `-5.0` as if the operator had asked for a radius-5 disc. Catching
+    /// it here is cheaper than diagnosing a mysterious region membership
+    /// at apply-time.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::All => Ok(()),
+            Self::Disc { radius, .. } => {
+                if !radius.is_finite() || *radius <= 0.0 {
+                    return Err("disc radius must be finite and > 0".into());
+                }
+                Ok(())
+            }
+            Self::Rect { min, max } => {
+                if !min.x.is_finite()
+                    || !min.y.is_finite()
+                    || !max.x.is_finite()
+                    || !max.y.is_finite()
+                {
+                    return Err("rect bounds must be finite".into());
+                }
+                if min.x > max.x || min.y > max.y {
+                    return Err(
+                        "rect bounds must be ordered (min.x <= max.x and min.y <= max.y); \
+                         toroidal wraparound is not supported by this region type"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn contains(&self, point: Vec2, world_size: Vec2) -> bool {
         match self {
             Self::All => true,
@@ -59,10 +96,14 @@ pub struct InterventionRecord {
 impl InterventionRecord {
     pub fn validate(&self) -> Result<(), String> {
         match &self.action {
-            InterventionAction::Drought { duration_ticks, .. } => {
+            InterventionAction::Drought {
+                region,
+                duration_ticks,
+            } => {
                 if *duration_ticks == 0 {
                     return Err("drought duration must be > 0".into());
                 }
+                region.validate()?;
             }
             InterventionAction::Meteor { radius, .. } => {
                 if *radius <= 0.0 || !radius.is_finite() {
@@ -74,7 +115,9 @@ impl InterventionRecord {
                     return Err("predator injection count must be between 1 and 1000".into());
                 }
             }
-            InterventionAction::TerrainPaint { .. } => {}
+            InterventionAction::TerrainPaint { region, .. } => {
+                region.validate()?;
+            }
             InterventionAction::FoodEmbargo { duration_ticks } => {
                 if *duration_ticks == 0 {
                     return Err("food embargo duration must be > 0".into());
@@ -143,5 +186,86 @@ mod tests {
             issued_by: "REST".into(),
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn test_negative_disc_radius_is_rejected() {
+        // A negative radius computes `radius * radius` as a positive value, so
+        // `contains` would silently treat `-5.0` as if the operator had asked
+        // for a radius-5 disc. Validation must reject it up-front.
+        let record = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::Drought {
+                region: ToroidalRegion::Disc {
+                    center: Vec2::new(100.0, 100.0),
+                    radius: -5.0,
+                },
+                duration_ticks: 10,
+            },
+            issued_by: "REST".into(),
+        };
+        let error = record
+            .validate()
+            .expect_err("negative disc radius must be rejected");
+        assert!(
+            error.contains("disc radius"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn test_non_finite_disc_radius_is_rejected() {
+        let record = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::TerrainPaint {
+                region: ToroidalRegion::Disc {
+                    center: Vec2::new(0.0, 0.0),
+                    radius: f32::NAN,
+                },
+                terrain_kind: 1,
+            },
+            issued_by: "REST".into(),
+        };
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn test_inverted_rect_bounds_are_rejected() {
+        // `min > max` silently turns the rect into the empty set, which would
+        // be indistinguishable from "no terrain paint target" downstream.
+        let record = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::TerrainPaint {
+                region: ToroidalRegion::Rect {
+                    min: Vec2::new(900.0, 500.0),
+                    max: Vec2::new(100.0, 500.0),
+                },
+                terrain_kind: 1,
+            },
+            issued_by: "REST".into(),
+        };
+        let error = record
+            .validate()
+            .expect_err("inverted rect must be rejected");
+        assert!(
+            error.contains("rect bounds"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn test_well_formed_regions_pass_validation() {
+        let ok = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::Drought {
+                region: ToroidalRegion::Disc {
+                    center: Vec2::new(500.0, 500.0),
+                    radius: 200.0,
+                },
+                duration_ticks: 50,
+            },
+            issued_by: "REST".into(),
+        };
+        assert!(ok.validate().is_ok());
     }
 }
