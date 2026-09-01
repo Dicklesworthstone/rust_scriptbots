@@ -378,26 +378,31 @@ mod validation_tests {
     fn finite_speed_is_admitted_and_clamped_when_applied() {
         let (sender, receiver) = create_command_bus(1);
         let submit = make_command_submit(sender);
+        // bd-k7nq: admitted commands now return Some(identity) (the carried
+        // BusCommand id the applier will report against); only refused
+        // submissions return None. The previous `is_none()` assertion
+        // encoded the pre-identity contract and failed once `make_command_submit`
+        // began carrying identity through.
+        let admitted_id = (submit)(ControlCommand::UpdateSimulation(SimulationCommand {
+            paused: Some(false),
+            speed_multiplier: Some(128.0),
+            step_once: false,
+        }))
+        .expect("finite speed is admitted; refusal reserved for validation failures");
         assert!(
-            (submit)(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: Some(false),
-                speed_multiplier: Some(128.0),
-                step_once: false,
-            }))
-            .is_none()
+            admitted_id.starts_with("gui-"),
+            "admitted ids carry provenance prefix; got {admitted_id:?}"
         );
 
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let pending = drain_pending_commands(&receiver);
         assert_eq!(pending.len(), 1);
-        let disposition = apply_control_command(
-            &mut world,
-            pending
-                .into_iter()
-                .next()
-                .expect("one playback command")
-                .command,
-        )
+        let drained = pending.into_iter().next().expect("one playback command");
+        assert_eq!(
+            drained.id, admitted_id,
+            "submit's returned id must equal the drained BusCommand's id",
+        );
+        let disposition = apply_control_command(&mut world, drained.command)
         .expect("normalized playback disposition");
         assert_eq!(
             disposition,
@@ -410,7 +415,6 @@ mod validation_tests {
     }
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
     use scriptbots_core::{
