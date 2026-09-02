@@ -4406,6 +4406,7 @@ impl EventKind {
     }
 
     /// Every kind, for tests that must see them as a set.
+    #[cfg(test)]
     const fn all() -> [Self; 4] {
         [Self::Birth, Self::Death, Self::Population, Self::Info]
     }
@@ -4447,6 +4448,7 @@ const TREND_BIRTHS: &str = "brt";
 const TREND_DEATHS: &str = "dth";
 
 /// Every trend label, for tests that must see them as a set.
+#[cfg(test)]
 const TREND_LABELS: [&str; 4] = [TREND_POPULATION, TREND_ENERGY, TREND_BIRTHS, TREND_DEATHS];
 
 /// Why an agent died, as the mortality panel breaks it down.
@@ -5848,6 +5850,7 @@ fn srgb_lifted(srgb: scriptbots_core::visual::Srgb, lift: f32) -> Color {
 /// is the usual shortcut — inflates the luminance of dark colours and makes
 /// failing pairs look passable, so it is exactly the shortcut a contrast gate
 /// must not take.
+#[cfg(test)]
 fn relative_luminance(color: Color) -> f32 {
     let linear = |c: f32| {
         if c <= 0.039_28 {
@@ -5865,6 +5868,7 @@ fn relative_luminance(color: Color) -> f32 {
 /// Order-independent by construction: the lighter colour is always the
 /// numerator, so a caller cannot get a misleadingly small ratio by passing
 /// foreground and background the wrong way round.
+#[cfg(test)]
 fn contrast_ratio(a: Color, b: Color) -> f32 {
     let (la, lb) = (relative_luminance(a), relative_luminance(b));
     let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
@@ -5872,6 +5876,7 @@ fn contrast_ratio(a: Color, b: Color) -> f32 {
 }
 
 /// WCAG AA threshold for normal-size text.
+#[cfg(test)]
 const WCAG_AA_NORMAL_TEXT: f32 = 4.5;
 
 fn rgb(hex: u32) -> Color {

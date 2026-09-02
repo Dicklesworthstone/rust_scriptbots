@@ -2329,6 +2329,7 @@ async fn handle_mcp_http_request(
     )))
 }
 
+#[allow(dead_code)]
 fn normalize_mcp_http_response(response: JsonRpcResponse) -> JsonRpcMessage {
     let protocol_error = response.result.as_ref().and_then(|result| {
         let result = result.as_object()?;
@@ -2594,6 +2595,7 @@ where
 
 /// MCP twin of [`run_control`]: a contended world mutex parks a blocking-pool
 /// thread instead of the MCP server's async worker (bd-134).
+#[allow(dead_code)]
 async fn run_control_mcp<T, F>(operation: F) -> Result<T, McpError>
 where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
