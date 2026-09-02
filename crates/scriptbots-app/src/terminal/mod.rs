@@ -5916,6 +5916,7 @@ fn color_channels(color: Color) -> [f32; 3] {
 }
 
 /// Pack unit-range RGB back into a terminal color.
+#[cfg(test)]
 fn channels_color(rgb: [f32; 3]) -> Color {
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     Color::Rgb(byte(rgb[0]), byte(rgb[1]), byte(rgb[2]))
