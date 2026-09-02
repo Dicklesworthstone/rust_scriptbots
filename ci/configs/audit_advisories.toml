@@ -32,32 +32,7 @@
 #     owning bead.
 #
 # RESIDUAL-RISK TRACKING:
-#   Each live entry below IS the residual-risk record: reviewed path, why the
-#   risk is bounded, who reviewed it, and when. Re-review happens whenever the
-#   gate fails (package/version drift) or when the removal trigger fires.
-#   The 2026-07-17 locked-graph audit (GoldenPanther, DSR static analysis of
-#   Cargo.lock @ 2dd7449) verified both entries below: the flagged packages
-#   are present, the sole consumer paths are as documented, and quick-xml
-#   0.41.0 (fixed) is already viable in-tree via the xcb path.
+#   Currently no active advisory suppressions. All previous quick-xml
+#   exceptions were retired under bd-2oov after wayland-scanner 0.31.11.
 
 schema = 1
-
-[[advisory]]
-id = "RUSTSEC-2026-0194"
-package = "quick-xml"
-locked_version = "0.39.4"
-owning_bead = "bd-2z0.8.14"
-justification = "Sole in-tree consumer is wayland-scanner 0.31.10 (proc-macro), which reaches the flagged XML reader only while compiling trusted, vendored Wayland protocol XML at build time; no untrusted input crosses the vulnerable path."
-removal_trigger = "A stable wayland-scanner family release that moves its build to quick-xml >= 0.41 (quick-xml 0.41.0 is already in-tree and unflagged via the xcb path, proving viability). Replace this exception in the same dependency-lane change that lands the bump."
-reviewed_at = "2026-07-17"
-reviewed_by = "GoldenPanther locked-graph audit of Cargo.lock @ 2dd7449 (DSR static analysis)"
-
-[[advisory]]
-id = "RUSTSEC-2026-0195"
-package = "quick-xml"
-locked_version = "0.39.4"
-owning_bead = "bd-2z0.8.14"
-justification = "The advisory affects quick-xml's NsReader API; wayland-scanner 0.31.10, the sole consumer of quick-xml 0.39.4, does not use the NsReader API at all, so the flagged surface is unreachable."
-removal_trigger = "Same as RUSTSEC-2026-0194: a stable wayland-scanner family release on quick-xml >= 0.41, landed through the bd-2z0.8 dependency lane."
-reviewed_at = "2026-07-17"
-reviewed_by = "GoldenPanther locked-graph audit of Cargo.lock @ 2dd7449 (DSR static analysis)"

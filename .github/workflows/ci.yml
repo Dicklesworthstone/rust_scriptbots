@@ -289,22 +289,10 @@ jobs:
 
       - name: Run security audit
         # Suppressions are governed by ci/configs/audit_advisories.toml
-        # (bd-2z0.8.14): every --ignore below requires a complete documented
-        # entry there, and the suppression gate in this job fails on drift in
-        # either direction. The inverse-path guard prevents either ignore
-        # hiding a future consumer of the flagged quick-xml.
+        # (bd-2z0.8.14): every --ignore requires a complete documented entry
+        # there, and the suppression gate in this job fails on drift in either direction.
         run: |
-          set -euo pipefail
-          EXPECTED=$'quick-xml v0.39.4\nwayland-scanner v0.31.10 (proc-macro)'
-          ACTUAL="$(cargo tree --workspace --all-features --target all --locked --invert quick-xml@0.39.4 --depth 1 --prefix none --format '{p}')"
-          if [[ "$ACTUAL" != "$EXPECTED" ]]; then
-            echo "::error::The temporary quick-xml advisory exception no longer has its reviewed dependency path."
-            printf 'Expected:\n%s\nActual:\n%s\n' "$EXPECTED" "$ACTUAL"
-            exit 1
-          fi
-          cargo audit \
-            --ignore RUSTSEC-2026-0194 \
-            --ignore RUSTSEC-2026-0195
+          cargo audit
 
       - name: Advisory-suppression documentation gate (bd-2z0.8.14)
         run: |
