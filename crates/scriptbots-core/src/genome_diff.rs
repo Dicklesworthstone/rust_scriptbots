@@ -311,13 +311,43 @@ pub enum GenomeDiffError {
         /// Schema version of the child genome.
         b: u32,
     },
-    /// The decoded locus lists differ in length or type alignment.
+    /// The decoded locus lists differ in length.
     #[error("genome shape mismatch: {a_loci} loci vs {b_loci} loci")]
     ShapeMismatch {
         /// Locus count of the parent genome.
         a_loci: usize,
         /// Locus count of the child genome.
         b_loci: usize,
+    },
+    /// The decoded locus address sequences disagree at an index.
+    #[error(
+        "locus address mismatch at index {index}: parent has {parent_human} ({parent:?}) vs child has {child_human} ({child:?})"
+    )]
+    LocusMismatch {
+        /// Index of the first mismatched locus address.
+        index: usize,
+        /// Parent locus address.
+        parent: Locus,
+        /// Child locus address.
+        child: Locus,
+        /// Human-readable parent locus description.
+        parent_human: String,
+        /// Human-readable child locus description.
+        child_human: String,
+    },
+    /// The value kinds disagree at a shared locus address.
+    #[error(
+        "locus value type mismatch at index {index} ({locus:?}): parent is {parent_type} vs child is {child_type}"
+    )]
+    ValueTypeMismatch {
+        /// Index of the locus with mismatched value kinds.
+        index: usize,
+        /// The locus address.
+        locus: Locus,
+        /// Parent value kind name.
+        parent_type: &'static str,
+        /// Child value kind name.
+        child_type: &'static str,
     },
     /// The family codec could not expose typed loci.
     #[error("family {family} cannot expose typed loci: {reason}")]
@@ -327,6 +357,14 @@ pub enum GenomeDiffError {
         /// Codec-reported failure detail.
         reason: String,
     },
+}
+
+const fn locus_value_type_name(val: &LocusValue) -> &'static str {
+    match val {
+        LocusValue::Scalar(_) => "scalar",
+        LocusValue::Target(_) => "target",
+        LocusValue::Kind(_) => "kind",
+    }
 }
 
 /// Compute the typed structural diff between two genomes of the same family and schema.
@@ -376,11 +414,18 @@ pub fn diff_genomes(
     let mut l1 = 0.0_f64;
     let mut linf = 0.0_f64;
     let mut by_kind: BTreeMap<DeltaKind, usize> = BTreeMap::new();
-    for ((locus, before), (child_locus, after)) in parent_loci.iter().zip(child_loci.iter()) {
-        debug_assert_eq!(
-            locus, child_locus,
-            "family codec must emit loci in canonical order"
-        );
+    for (index, ((locus, before), (child_locus, after))) in
+        parent_loci.iter().zip(child_loci.iter()).enumerate()
+    {
+        if locus != child_locus {
+            return Err(GenomeDiffError::LocusMismatch {
+                index,
+                parent: *locus,
+                child: *child_locus,
+                parent_human: locus.human(),
+                child_human: child_locus.human(),
+            });
+        }
         match (before, after) {
             (LocusValue::Scalar(before), LocusValue::Scalar(after)) => {
                 if before.to_bits() != after.to_bits() {
@@ -416,9 +461,11 @@ pub fn diff_genomes(
                 }
             }
             _ => {
-                return Err(GenomeDiffError::ShapeMismatch {
-                    a_loci: parent_loci.len(),
-                    b_loci: child_loci.len(),
+                return Err(GenomeDiffError::ValueTypeMismatch {
+                    index,
+                    locus: *locus,
+                    parent_type: locus_value_type_name(before),
+                    child_type: locus_value_type_name(after),
                 });
             }
         }

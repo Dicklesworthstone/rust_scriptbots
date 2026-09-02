@@ -5612,6 +5612,7 @@ struct PopulationSpawnReceipt {
     inserted: Vec<AgentId>,
     arena_checkpoint: (SlotMap<AgentId, usize>, usize),
     pending_birth_records_before: usize,
+    pending_genomes_before: usize,
     rng_before: DomainStreams,
     next_agent_uid_before: u64,
     next_spawn_ordinal_before: u64,
@@ -8193,6 +8194,17 @@ struct PendingReplayInteraction {
     magnitude: f32,
 }
 
+/// One heritable genome record admitted for persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedGenome {
+    /// Stable logical identity of the agent owning this genome.
+    pub agent_uid: AgentUid,
+    /// Simulation tick when this genome was created / admitted.
+    pub created_at_tick: Tick,
+    /// Exact versioned genome envelope.
+    pub envelope: BrainGenomeEnvelope,
+}
+
 /// Aggregate payload forwarded to persistence sinks.
 #[derive(Debug, Clone)]
 pub struct PersistenceBatch {
@@ -8221,6 +8233,8 @@ pub struct PersistenceBatch {
     pub replay_events: Vec<ReplayEvent>,
     /// Narrative events detected at this boundary.
     pub narrative_events: Vec<narrative::EventRecord>,
+    /// Versioned genome envelopes admitted at this boundary.
+    pub genomes: Vec<PersistedGenome>,
 }
 
 /// Result of evaluating persistence policy at a completed simulation boundary.
@@ -18017,6 +18031,7 @@ pub struct WorldState {
     #[allow(dead_code)]
     pending_spawns: Vec<SpawnOrder>,
     pending_birth_records: Vec<BirthRecord>,
+    pending_genomes: Vec<PersistedGenome>,
     /// How many pending birth/death records have already been reported on a
     /// scientific boundary (bd-it29).
     ///
@@ -18283,6 +18298,7 @@ struct BoundaryReady {
     agents: Vec<AgentState>,
     birth_records: Vec<BirthRecord>,
     death_records: Vec<DeathRecord>,
+    genomes: Vec<PersistedGenome>,
     replay_events: Vec<ReplayEvent>,
     narrative_events: Vec<narrative::EventRecord>,
 }
@@ -18796,6 +18812,7 @@ fn project_persistence_batch(drain: BoundaryDrain) -> PersistenceProjection {
         deaths: ready.death_records,
         replay_events: ready.replay_events,
         narrative_events: ready.narrative_events,
+        genomes: ready.genomes,
     })
 }
 
@@ -18887,6 +18904,7 @@ impl WorldState {
             pending_deaths: Vec::new(),
             pending_spawns: Vec::new(),
             pending_birth_records: Vec::new(),
+            pending_genomes: Vec::new(),
             reported_lifecycle_records: (0, 0),
             pending_death_records: Vec::new(),
             pending_lifecycle_birth_metrics: Vec::new(),
@@ -20363,6 +20381,17 @@ impl WorldState {
                 first_error = job.error;
             }
         }
+
+        let probed_agent = self.active_activation_probe();
+        let selected_total = usize::from(probed_agent.is_some());
+        let max_agents = self.capture_budget.max_agents;
+        let captured = if selected_total > 0 && max_agents > 0 {
+            1
+        } else {
+            0
+        };
+        self.update_probe_stats(captured, selected_total);
+
         first_error.map_or(Ok(()), Err)
     }
 
@@ -22561,6 +22590,8 @@ impl WorldState {
             .restore_append_checkpoint(receipt.arena_checkpoint);
         self.pending_birth_records
             .truncate(receipt.pending_birth_records_before);
+        self.pending_genomes
+            .truncate(receipt.pending_genomes_before);
         // A rollback can shorten the vector below the watermark; clamping keeps
         // the slice in `step_outcome_observed` in bounds (bd-it29).
         self.reported_lifecycle_records.0 = self
@@ -22597,6 +22628,7 @@ impl WorldState {
             inserted: Vec::new(),
             arena_checkpoint: self.agents.append_checkpoint(),
             pending_birth_records_before: self.pending_birth_records.len(),
+            pending_genomes_before: self.pending_genomes.len(),
             rng_before: self.rng.clone(),
             next_agent_uid_before: self.next_agent_uid,
             next_spawn_ordinal_before: self.next_spawn_ordinal,
@@ -22797,6 +22829,13 @@ impl WorldState {
             position: data.position,
             is_hybrid: runtime.hybrid,
         };
+        if let Some(genome) = runtime.brain.genome() {
+            self.pending_genomes.push(PersistedGenome {
+                agent_uid: identity.uid,
+                created_at_tick: record_tick,
+                envelope: genome.clone(),
+            });
+        }
         let id = self.agents.insert(data);
         self.identities.insert(id, identity);
         self.agent_rng_counters.insert(id, rng_counters);
@@ -24612,6 +24651,7 @@ impl WorldState {
                 self.persistence_discarded_records_at = Some(next_tick);
             }
             self.pending_birth_records.clear();
+            self.pending_genomes.clear();
             self.pending_death_records.clear();
             self.reported_lifecycle_records = (0, 0);
             self.pending_lifecycle_birth_metrics.clear();
@@ -24915,6 +24955,7 @@ impl WorldState {
 
         let birth_records = std::mem::take(&mut self.pending_birth_records);
         let death_records = std::mem::take(&mut self.pending_death_records);
+        let genomes = std::mem::take(&mut self.pending_genomes);
         // The vectors are now empty, so nothing is "already reported" (bd-it29).
         self.reported_lifecycle_records = (0, 0);
         if lifecycle_enabled || analytics.lifecycle_events == 0 {
@@ -24953,6 +24994,7 @@ impl WorldState {
             agents,
             birth_records,
             death_records,
+            genomes,
             replay_events: std::mem::take(&mut self.replay_events),
             narrative_events: self.narrative.drain_pending_persistence(),
         };
@@ -27469,6 +27511,23 @@ impl WorldState {
             return Ok(false);
         };
         runtime.brain = binding;
+        if let Some(genome) = runtime.brain.genome() {
+            if let Some(existing) = self
+                .pending_genomes
+                .iter_mut()
+                .rev()
+                .find(|g| g.agent_uid == uid)
+            {
+                existing.envelope = genome.clone();
+                existing.created_at_tick = self.tick;
+            } else {
+                self.pending_genomes.push(PersistedGenome {
+                    agent_uid: uid,
+                    created_at_tick: self.tick,
+                    envelope: genome.clone(),
+                });
+            }
+        }
         self.refresh_current_tick_origin_record(id);
         Ok(true)
     }
@@ -40172,6 +40231,7 @@ mod tests {
         assert_eq!(left.births, right.births);
         assert_eq!(left.deaths, right.deaths);
         assert_eq!(left.replay_events, right.replay_events);
+        assert_eq!(left.genomes, right.genomes);
         assert_eq!(
             postcard::to_allocvec(&left.agents).expect("encode left agents"),
             postcard::to_allocvec(&right.agents).expect("encode right agents")
@@ -49915,6 +49975,7 @@ mod tests {
     fn test_activation_probe_budget_and_observational_neutrality() {
         let config = ScriptBotsConfig::default();
         let mut world = WorldState::new(config).expect("world init");
+        world.spawn_agent(sample_agent(1));
 
         // Assert default capture budget
         assert_eq!(world.capture_budget().max_agents, 4);
@@ -49928,11 +49989,43 @@ mod tests {
         world.set_activation_probe(Some(invalid_id));
         assert_eq!(world.active_activation_probe(), None);
 
-        // Test update_probe_stats
+        // Without an active probe, a simulation step records 0 captured and 0 dropped.
+        world.step().expect("step without probe");
+        let stats_no_probe = world.probe_stats();
+        assert_eq!(stats_no_probe.captured, 0);
+        assert_eq!(stats_no_probe.dropped, 0);
+        assert_eq!(stats_no_probe.budget, 8);
+        assert_eq!(stats_no_probe.explain_calls, 0);
+
+        // Set probe on a live agent and step: live tick updates probe stats to captured: 1.
+        let live_agent = world
+            .agents
+            .iter_handles()
+            .next()
+            .expect("live agent exists");
+        world.set_activation_probe(Some(live_agent));
+        assert_eq!(world.active_activation_probe(), Some(live_agent));
+
+        world.step().expect("step with active probe");
+        let stats_with_probe = world.probe_stats();
+        assert_eq!(stats_with_probe.captured, 1);
+        assert_eq!(stats_with_probe.dropped, 0);
+        assert_eq!(stats_with_probe.budget, 8);
+        assert_eq!(stats_with_probe.explain_calls, 1);
+
+        // Zero budget drops the selected probe.
+        world.set_capture_budget(CaptureBudget { max_agents: 0 });
+        world.step().expect("step with zero budget");
+        let stats_zero_budget = world.probe_stats();
+        assert_eq!(stats_zero_budget.captured, 0);
+        assert_eq!(stats_zero_budget.dropped, 1);
+        assert_eq!(stats_zero_budget.budget, 0);
+
+        // Test manual update_probe_stats helper.
         world.update_probe_stats(4, 500);
         let stats = world.probe_stats();
         assert_eq!(stats.captured, 4);
-        assert_eq!(stats.budget, 8);
+        assert_eq!(stats.budget, 0);
         assert_eq!(stats.dropped, 496);
     }
 

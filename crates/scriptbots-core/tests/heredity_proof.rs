@@ -29,19 +29,16 @@
 //! family that stops inheriting correctly fails CI the day it is added.
 
 use scriptbots_brain::assembly::{AssemblyBrain, AssemblyFamilyAdapter};
-use scriptbots_brain::dwraon::DwraonFamilyAdapter;
-use scriptbots_brain::mlp::MlpBrainFamily;
+use scriptbots_brain::dwraon::{DwraonBrain, DwraonFamilyAdapter};
+use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::genome_diff::{LocusValue, diff_genomes};
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BirthOrigin, BrainAdapterIdentityV1, BrainEvaluator,
-    BrainEvaluatorStateEnvelope, BrainFamilyAdapter, BrainFamilyCodec, BrainGenomeDerivation,
-    BrainGenomeEnvelope, BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainProtocolError,
-    MutationRates, OffspringStatePolicy, Position, RandomStream, ScriptBotsConfig, WorldState,
+    BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainGenomeDerivation, BrainGenomeEnvelope,
+    BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainLocusSchemaIdentityV1,
+    BrainMutationTrialGroupV1, BrainProtocolError, MutationRates, OffspringStatePolicy, Position,
+    RandomStream, ScriptBotsConfig, WorldState,
 };
-
-const ASSEMBLY_KIND: &str = AssemblyBrain::KIND.as_str();
-const DWRAON_KIND: &str = "dwraon-baseline";
-const MLP_KIND: &str = "mlp-baseline";
 
 fn reproduction_config(partner_chance: f32) -> ScriptBotsConfig {
     ScriptBotsConfig {
@@ -79,29 +76,73 @@ fn reproduction_config(partner_chance: f32) -> ScriptBotsConfig {
     }
 }
 
-fn register_family(world: &mut WorldState, family: &str) -> u64 {
-    let adapter: Box<dyn BrainFamilyAdapter> = match family {
-        MLP_KIND => Box::new(MlpBrainFamily::new()),
-        DWRAON_KIND => Box::new(DwraonFamilyAdapter::default()),
-        ASSEMBLY_KIND => {
-            Box::new(AssemblyFamilyAdapter::new().expect("canonical Assembly adapter"))
-        }
-        other => panic!("no adapter fixture for {other}"),
-    };
+/// Construct a live simulation world populated with every compiled, canonical
+/// production brain protocol adapter.
+fn production_world(config: ScriptBotsConfig) -> WorldState {
+    let mut world = WorldState::new(config).expect("world");
     world
-        .register_brain_family(family.to_owned(), adapter)
-        .expect("register brain family")
+        .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+        .expect("register MLP");
+    world
+        .register_brain_family(
+            DwraonBrain::KIND.as_str(),
+            Box::new(DwraonFamilyAdapter::default()),
+        )
+        .expect("register DWRAON");
+    let assembly = AssemblyFamilyAdapter::new().expect("canonical Assembly adapter");
+    world
+        .register_brain_family(AssemblyBrain::KIND.as_str(), Box::new(assembly))
+        .expect("register Assembly");
+    world
 }
 
-fn dyn_codec_for(family: &str) -> Box<dyn BrainFamilyCodec> {
-    match family {
-        MLP_KIND => Box::new(MlpBrainFamily::new()),
-        DWRAON_KIND => Box::new(DwraonFamilyAdapter::default()),
-        ASSEMBLY_KIND => {
-            Box::new(AssemblyFamilyAdapter::new().expect("canonical Assembly adapter"))
+/// A target family discovered dynamically from the live world's typed heredity capabilities.
+#[derive(Debug, Clone)]
+struct LocusCapableTarget {
+    key: u64,
+    kind: String,
+    #[allow(dead_code)]
+    schema: BrainLocusSchemaIdentityV1,
+    trials: Vec<BrainMutationTrialGroupV1>,
+}
+
+/// Enumerate every locus-capable brain family registered in the world.
+fn locus_capable_targets(world: &WorldState) -> Vec<LocusCapableTarget> {
+    let snapshot = world
+        .brain_registry()
+        .heredity_capabilities()
+        .expect("heredity capability discovery");
+    assert!(
+        !snapshot.descriptors.is_empty(),
+        "production registry must register at least one brain family"
+    );
+    let mut targets = Vec::new();
+    for descriptor in &snapshot.descriptors {
+        if let BrainHeredityCapabilityV1::LocusCapable {
+            locus_schema,
+            mutation_trials,
+        } = &descriptor.capability
+        {
+            targets.push(LocusCapableTarget {
+                key: descriptor.registry_key,
+                kind: descriptor.kind.clone(),
+                schema: locus_schema.clone(),
+                trials: mutation_trials.clone(),
+            });
         }
-        other => panic!("no codec fixture for {other}"),
     }
+    assert!(
+        !targets.is_empty(),
+        "at least one locus-capable family must be registered for heredity proof"
+    );
+    targets
+}
+
+fn codec_for(world: &WorldState, key: u64) -> &dyn BrainFamilyCodec {
+    world
+        .brain_registry()
+        .family(key)
+        .expect("registered family adapter")
 }
 
 fn spawn_parent(world: &mut WorldState, key: u64, x: f32, y: f32, rates: MutationRates) -> AgentId {
@@ -202,20 +243,15 @@ fn assert_bit_identical(
     );
 }
 
-fn for_each_family(test: fn(&str)) {
-    test(MLP_KIND);
-    test(DWRAON_KIND);
-    test(ASSEMBLY_KIND);
-}
-
 #[test]
 fn asexual_child_at_zero_mutation_is_bit_identical_to_parent() {
-    fn case(family: &str) {
-        let mut world = WorldState::new(reproduction_config(0.0)).expect("world");
-        let key = register_family(&mut world, family);
+    let world_template = production_world(reproduction_config(0.0));
+    let targets = locus_capable_targets(&world_template);
+    for target in targets {
+        let mut world = production_world(reproduction_config(0.0));
         let parent = spawn_parent(
             &mut world,
-            key,
+            target.key,
             100.0,
             100.0,
             MutationRates {
@@ -228,45 +264,52 @@ fn asexual_child_at_zero_mutation_is_bit_identical_to_parent() {
         let child = &children[0];
         assert!(
             child.parent_b.is_none(),
-            "heredity_proof: family={family} partner_chance=0.0 produced a crossover child"
+            "heredity_proof: family={} partner_chance=0.0 produced a crossover child",
+            target.kind
         );
         assert_bit_identical(
-            &*dyn_codec_for(family),
+            codec_for(&world, target.key),
             &genome_of(&world, parent),
             &genome_of(&world, child.id),
-            family,
+            &target.kind,
         );
     }
-    for_each_family(case);
 }
 
 #[test]
 fn identical_parent_crossover_at_zero_mutation_is_bit_identical() {
-    fn case(family: &str) {
-        let mut world = WorldState::new(reproduction_config(1.0)).expect("world");
-        let key = register_family(&mut world, family);
+    let world_template = production_world(reproduction_config(1.0));
+    let targets = locus_capable_targets(&world_template);
+    for target in targets {
+        let mut world = production_world(reproduction_config(1.0));
         let rates = MutationRates {
             primary: 0.0,
             secondary: 0.0,
         };
-        let parent = spawn_parent(&mut world, key, 100.0, 100.0, rates);
+        let parent = spawn_parent(&mut world, target.key, 100.0, 100.0, rates);
         let parent_uid = uid_of(&world, parent);
         let first_birth = drive_until_children(&mut world, &[parent_uid], 1, 64)
             .pop()
             .expect("one first-generation child");
         assert!(
             first_birth.parent_b.is_none(),
-            "heredity_proof: family={family} lone founder unexpectedly found a crossover partner"
+            "heredity_proof: family={} lone founder unexpectedly found a crossover partner",
+            target.kind
         );
 
-        let codec = dyn_codec_for(family);
         let parent_genome = genome_of(&world, parent);
         let clone_genome = genome_of(&world, first_birth.id);
-        assert_bit_identical(&*codec, &parent_genome, &clone_genome, family);
+        assert_bit_identical(
+            codec_for(&world, target.key),
+            &parent_genome,
+            &clone_genome,
+            &target.kind,
+        );
         assert_eq!(
             clone_genome.provenance().derivation,
             BrainGenomeDerivation::Clone,
-            "heredity_proof: family={family} first zero-rate child must record an asexual clone"
+            "heredity_proof: family={} first zero-rate child must record an asexual clone",
+            target.kind
         );
 
         world
@@ -284,26 +327,30 @@ fn identical_parent_crossover_at_zero_mutation_is_bit_identical() {
         } else {
             assert_eq!(
                 crossover.parent_a, clone_uid,
-                "heredity_proof: family={family} crossover descended from an untracked agent"
+                "heredity_proof: family={} crossover descended from an untracked agent",
+                target.kind
             );
             parent_uid
         };
         assert_eq!(
             crossover.parent_b,
             Some(expected_partner),
-            "heredity_proof: family={family} two identical parents must exercise crossover"
+            "heredity_proof: family={} two identical parents must exercise crossover",
+            target.kind
         );
 
         let child_genome = genome_of(&world, crossover.id);
         assert_eq!(
             child_genome.provenance().derivation,
             BrainGenomeDerivation::Crossover,
-            "heredity_proof: family={family} identical-parent birth must record a real crossover"
+            "heredity_proof: family={} identical-parent birth must record a real crossover",
+            target.kind
         );
         assert_eq!(
             child_genome.provenance().parents,
             [Some(crossover.parent_a), crossover.parent_b],
-            "heredity_proof: family={family} crossover provenance must record both actual parents"
+            "heredity_proof: family={} crossover provenance must record both actual parents",
+            target.kind
         );
         assert_eq!(
             child_genome.provenance().parent_genome_hashes,
@@ -311,27 +358,37 @@ fn identical_parent_crossover_at_zero_mutation_is_bit_identical() {
                 Some(parent_genome.material_hash()),
                 Some(parent_genome.material_hash()),
             ],
-            "heredity_proof: family={family} crossover provenance must identify both identical \
-             source genomes"
+            "heredity_proof: family={} crossover provenance must identify both identical \
+             source genomes",
+            target.kind
         );
-        assert_bit_identical(&*codec, &parent_genome, &child_genome, family);
-        assert_bit_identical(&*codec, &clone_genome, &child_genome, family);
+        assert_bit_identical(
+            codec_for(&world, target.key),
+            &parent_genome,
+            &child_genome,
+            &target.kind,
+        );
+        assert_bit_identical(
+            codec_for(&world, target.key),
+            &clone_genome,
+            &child_genome,
+            &target.kind,
+        );
     }
-
-    for_each_family(case);
 }
 
 #[test]
 fn sexual_child_at_zero_mutation_is_a_per_locus_bitwise_mix() {
-    fn case(family: &str) {
-        let mut world = WorldState::new(reproduction_config(1.0)).expect("world");
-        let key = register_family(&mut world, family);
+    let world_template = production_world(reproduction_config(1.0));
+    let targets = locus_capable_targets(&world_template);
+    for target in targets {
+        let mut world = production_world(reproduction_config(1.0));
         let rates = MutationRates {
             primary: 0.0,
             secondary: 0.0,
         };
-        let parent_a = spawn_parent(&mut world, key, 60.0, 100.0, rates);
-        let parent_b = spawn_parent(&mut world, key, 140.0, 100.0, rates);
+        let parent_a = spawn_parent(&mut world, target.key, 60.0, 100.0, rates);
+        let parent_b = spawn_parent(&mut world, target.key, 140.0, 100.0, rates);
         let uid_a = uid_of(&world, parent_a);
         let uid_b = uid_of(&world, parent_b);
         let children = drive_until_children(&mut world, &[uid_a, uid_b], 1, 64);
@@ -343,10 +400,11 @@ fn sexual_child_at_zero_mutation_is_a_per_locus_bitwise_mix() {
             } else {
                 uid_a
             }),
-            "heredity_proof: family={family} partner_chance=1.0 child must carry both parents"
+            "heredity_proof: family={} partner_chance=1.0 child must carry both parents",
+            target.kind
         );
 
-        let codec = dyn_codec_for(family);
+        let codec = codec_for(&world, target.key);
         let a_loci = codec
             .genome_loci(&genome_of(&world, parent_a))
             .expect("parent A loci");
@@ -368,9 +426,10 @@ fn sexual_child_at_zero_mutation_is_a_per_locus_bitwise_mix() {
             let matches_b = locus_value_bit_eq(*child_value, *b_value);
             assert!(
                 matches_a || matches_b,
-                "heredity_proof: family={family} locus {} of child came from NEITHER parent \
+                "heredity_proof: family={} locus {} of child came from NEITHER parent \
                  (child={child_value:?}, A={a_value:?}, B={b_value:?}) — crossover must be a \
                  per-locus bitwise mix, never a blend and never a fresh locus",
+                target.kind,
                 locus.human()
             );
             if matches_a && !matches_b {
@@ -381,13 +440,15 @@ fn sexual_child_at_zero_mutation_is_a_per_locus_bitwise_mix() {
         }
         assert!(
             from_a > 0,
-            "heredity_proof: family={family} crossover child took NOTHING uniquely from parent \
-             A — this 'crossover' is just cloning and nobody would notice"
+            "heredity_proof: family={} crossover child took NOTHING uniquely from parent \
+             A — this 'crossover' is just cloning and nobody would notice",
+            target.kind
         );
         assert!(
             from_b > 0,
-            "heredity_proof: family={family} crossover child took NOTHING uniquely from parent \
-             B — this 'crossover' is just cloning and nobody would notice"
+            "heredity_proof: family={} crossover child took NOTHING uniquely from parent \
+             B — this 'crossover' is just cloning and nobody would notice",
+            target.kind
         );
 
         // Evaluator state is reset, never inherited: the child's state must differ from the
@@ -403,11 +464,11 @@ fn sexual_child_at_zero_mutation_is_a_per_locus_bitwise_mix() {
         assert_ne!(
             child_state.payload(),
             parent_state.payload(),
-            "heredity_proof: family={family} child inherited the parent's accumulated evaluator \
-             state — offspring state must reset (bd-2z0.3.2's heritable/non-heritable split)"
+            "heredity_proof: family={} child inherited the parent's accumulated evaluator \
+             state — offspring state must reset (bd-2z0.3.2's heritable/non-heritable split)",
+            target.kind
         );
     }
-    for_each_family(case);
 }
 
 const fn locus_value_bit_eq(left: LocusValue, right: LocusValue) -> bool {
@@ -421,61 +482,65 @@ const fn locus_value_bit_eq(left: LocusValue, right: LocusValue) -> bool {
 
 #[test]
 fn mixed_kind_mating_falls_back_to_same_kind_clone() {
-    let mut world = WorldState::new(reproduction_config(1.0)).expect("world");
-    let mlp_key = register_family(&mut world, MLP_KIND);
-    let dwraon_key = register_family(&mut world, DWRAON_KIND);
+    let mut world = production_world(reproduction_config(1.0));
+    let targets = locus_capable_targets(&world);
+    assert!(
+        targets.len() >= 2,
+        "mixed kind mating requires at least 2 distinct locus capable targets"
+    );
+    let target_a = &targets[0];
+    let target_b = &targets[1];
     let rates = MutationRates {
         primary: 0.0,
         secondary: 0.0,
     };
-    let mlp_parent = spawn_parent(&mut world, mlp_key, 60.0, 100.0, rates);
-    let dwraon_parent = spawn_parent(&mut world, dwraon_key, 140.0, 100.0, rates);
-    let uid_mlp = uid_of(&world, mlp_parent);
-    let uid_dwraon = uid_of(&world, dwraon_parent);
+    let parent_a = spawn_parent(&mut world, target_a.key, 60.0, 100.0, rates);
+    let parent_b = spawn_parent(&mut world, target_b.key, 140.0, 100.0, rates);
+    let uid_a = uid_of(&world, parent_a);
+    let uid_b = uid_of(&world, parent_b);
 
-    let children = drive_until_children(&mut world, &[uid_mlp, uid_dwraon], 1, 64);
+    let children = drive_until_children(&mut world, &[uid_a, uid_b], 1, 64);
     let child = &children[0];
-    let (parent_kind, parent_id) = if child.parent_a == uid_mlp {
-        (MLP_KIND, mlp_parent)
+    let (parent_target, parent_id) = if child.parent_a == uid_a {
+        (target_a, parent_a)
     } else {
         assert_eq!(
-            child.parent_a, uid_dwraon,
+            child.parent_a, uid_b,
             "heredity_proof: the barrier child must descend from one of the two parents"
         );
-        (DWRAON_KIND, dwraon_parent)
+        (target_b, parent_b)
     };
+    let parent_genome = genome_of(&world, parent_id);
     let child_genome = genome_of(&world, child.id);
     let child_family = child_genome.family_id().clone();
     assert_eq!(
-        child_family.as_str(),
-        parent_kind,
+        child_family,
+        *parent_genome.family_id(),
         "heredity_proof: mixed-kind pairing produced a child of family {child_family} — the \
          species barrier must preserve the reproducing parent's family, never a hybrid"
     );
-    // The barrier is brain-scoped by design (see the in-crate
-    // `incompatible_body_partner_does_not_fabricate_a_brain_crossover` test): a cross-kind
-    // body partner may blend runtime physiology and appear in the lineage record, but the
-    // child's brain must come from `clone_runner` — the genome provenance must never claim
-    // a crossover that did not happen.
     assert!(
         !matches!(
             child_genome.provenance().derivation,
             BrainGenomeDerivation::Crossover | BrainGenomeDerivation::CrossoverThenMutation
         ),
-        "heredity_proof: family={parent_kind} barrier child's genome provenance claims a \
-         crossover with a different brain family — `clone_runner` semantics broken"
+        "heredity_proof: family={} barrier child's genome provenance claims a \
+         crossover with a different brain family — `clone_runner` semantics broken",
+        parent_target.kind
     );
     assert_eq!(
         child_genome.provenance().parents[1],
         None,
-        "heredity_proof: family={parent_kind} barrier child's genome records a second brain \
-         parent — a cross-kind partner must never enter the genome lineage"
+        "heredity_proof: family={} barrier child's genome records a second brain \
+         parent — a cross-kind partner must never enter the genome lineage",
+        parent_target.kind
     );
     assert_eq!(
         child_genome.provenance().parent_genome_hashes[0],
-        Some(genome_of(&world, parent_id).material_hash()),
-        "heredity_proof: family={parent_kind} barrier child does not derive from the \
-         reproducing parent's genome — the spawn path substituted a fresh brain"
+        Some(parent_genome.material_hash()),
+        "heredity_proof: family={} barrier child does not derive from the \
+         reproducing parent's genome — the spawn path substituted a fresh brain",
+        parent_target.kind
     );
 }
 
@@ -489,15 +554,14 @@ fn scheduled_cross_kind_crossover_falls_back_to_a_fresh_random_registry_founder(
         config.population_crossover_chance = crossover_chance;
         config.reproduction_energy_threshold = 0.0;
 
-        let mut world = WorldState::new(config).expect("scheduled population world");
-        let mlp_key = register_family(&mut world, MLP_KIND);
-        let dwraon_key = register_family(&mut world, DWRAON_KIND);
+        let mut world = production_world(config);
+        let targets = locus_capable_targets(&world);
         let rates = MutationRates {
             primary: 0.0,
             secondary: 0.0,
         };
-        spawn_parent(&mut world, mlp_key, 60.0, 100.0, rates);
-        spawn_parent(&mut world, dwraon_key, 140.0, 100.0, rates);
+        spawn_parent(&mut world, targets[0].key, 60.0, 100.0, rates);
+        spawn_parent(&mut world, targets[1].key, 140.0, 100.0, rates);
         world
     }
 
@@ -666,29 +730,25 @@ fn support_cdf((start, weights): &(u64, Vec<f64>), x: u64) -> f64 {
     mass
 }
 
-/// The exact distribution of changed-locus counts across `children` offspring for a
-/// family: every mutation draw is an independent Bernoulli, so each field family is
-/// binomial and the total is their convolution.
-fn changed_locus_distribution(family: &str, children: usize, rate: f32) -> (u64, Vec<f64>) {
+/// Exact distribution of aggregate mutation-gate trial outcomes across `children` offspring
+/// for a locus-capable family, derived from its declared `BrainMutationTrialGroupV1` entries.
+fn mutation_trial_distribution(
+    trials: &[BrainMutationTrialGroupV1],
+    children: usize,
+    rate: f32,
+) -> (u64, Vec<f64>) {
     let c = children as u64;
-    let p = f64::from(rate);
-    match family {
-        // MLP: 6 Bernoulli(rate) draws per node × 200 nodes.
-        MLP_KIND => ExactBinomial { n: 1200 * c, p }.pmf_support(),
-        // DWRAON: 2 draws at 3×rate (bias, one weight) + 3 draws at rate (source,
-        // inverted, kind) per node × 200 nodes.
-        DWRAON_KIND => convolve(
-            &ExactBinomial {
-                n: 400 * c,
-                p: 3.0 * p,
-            }
-            .pmf_support(),
-            &ExactBinomial { n: 600 * c, p }.pmf_support(),
-        ),
-        // Assembly: one Bernoulli(rate) replacement draw per cell × 200 cells.
-        ASSEMBLY_KIND => ExactBinomial { n: 200 * c, p }.pmf_support(),
-        other => panic!("no band model for {other}"),
+    let mut acc: Option<(u64, Vec<f64>)> = None;
+    for group in trials {
+        let n = u64::from(group.trials_per_offspring()) * c;
+        let p = group.effective_probability(rate);
+        let dist = ExactBinomial { n, p }.pmf_support();
+        acc = Some(match acc {
+            None => dist,
+            Some(prev) => convolve(&prev, &dist),
+        });
     }
+    acc.expect("at least one mutation trial group in locus-capable capability")
 }
 
 #[test]
@@ -699,12 +759,13 @@ fn changed_locus_counts_land_inside_the_exact_binomial_band() {
     // or total mutation path lands in the far tails with probability ≈ 1.
     const ALPHA: f64 = 0.0005;
 
-    fn case(family: &str) {
-        let mut world = WorldState::new(reproduction_config(0.0)).expect("world");
-        let key = register_family(&mut world, family);
+    let world_template = production_world(reproduction_config(0.0));
+    let targets = locus_capable_targets(&world_template);
+    for target in targets {
+        let mut world = production_world(reproduction_config(0.0));
         let parent = spawn_parent(
             &mut world,
-            key,
+            target.key,
             100.0,
             100.0,
             MutationRates {
@@ -714,32 +775,33 @@ fn changed_locus_counts_land_inside_the_exact_binomial_band() {
         );
         let parent_uid = uid_of(&world, parent);
         let children = drive_until_children(&mut world, &[parent_uid], CHILDREN, 256);
-        let codec = dyn_codec_for(family);
+        let codec = codec_for(&world, target.key);
         let parent_genome = genome_of(&world, parent);
         let mut observed = 0_u64;
         for child in &children {
-            let diff = diff_genomes(&*codec, &parent_genome, &genome_of(&world, child.id))
+            let diff = diff_genomes(codec, &parent_genome, &genome_of(&world, child.id))
                 .expect("band diff");
             observed += diff.summary.changed_loci as u64;
         }
 
-        let support = changed_locus_distribution(family, CHILDREN, RATE);
+        let support = mutation_trial_distribution(&target.trials, CHILDREN, RATE);
         let lower_tail = support_cdf(&support, observed);
         assert!(
             lower_tail > ALPHA,
-            "heredity_proof: family={family} offspring={CHILDREN} changed_loci={observed} \
+            "heredity_proof: family={} offspring={CHILDREN} changed_loci={observed} \
              lower_tail={lower_tail:.6} — far too few changed loci at rate {RATE}; mutation \
-             is silently dead (a frozen gene pool that still looks alive)"
+             is silently dead (a frozen gene pool that still looks alive)",
+            target.kind
         );
         assert!(
             lower_tail < 1.0 - ALPHA,
-            "heredity_proof: family={family} offspring={CHILDREN} changed_loci={observed} \
+            "heredity_proof: family={} offspring={CHILDREN} changed_loci={observed} \
              upper_tail={:.6} — far too many changed loci at rate {RATE}; children are \
              unrelated to parents (search, not evolution)",
+            target.kind,
             1.0 - lower_tail
         );
     }
-    for_each_family(case);
 }
 
 /// FAULT INJECTION for the negative control: an exact MLP delegate except that
@@ -851,9 +913,9 @@ fn the_proof_detects_the_restored_e2d9aaa_bug() {
     let parent_uid = uid_of(&world, parent);
     let children = drive_until_children(&mut world, &[parent_uid], 1, 64);
 
-    let codec = dyn_codec_for(MLP_KIND);
+    let codec = codec_for(&world, key);
     let diff = diff_genomes(
-        &*codec,
+        codec,
         &genome_of(&world, parent),
         &genome_of(&world, children[0].id),
     )
@@ -871,14 +933,13 @@ fn the_proof_detects_the_restored_e2d9aaa_bug() {
 /// above the reproduction threshold, so the population grows linearly instead of
 /// exploding exponentially.
 fn drive_lineage_chain(
-    family: &str,
+    key: u64,
     rates: MutationRates,
     generations: usize,
 ) -> Vec<(BrainGenomeEnvelope, BrainGenomeEnvelope)> {
     let mut config = reproduction_config(0.0);
     config.reproduction_child_energy = 0.4; // below the 0.5 threshold: no uncontrolled growth
-    let mut world = WorldState::new(config).expect("world");
-    let key = register_family(&mut world, family);
+    let mut world = production_world(config);
     let founder = spawn_parent(&mut world, key, 100.0, 100.0, rates);
     let mut chain_parent = uid_of(&world, founder);
 
@@ -911,9 +972,11 @@ fn e2e_mutation_total_changed_loci_is_in_band() {
     const RATE: f32 = 0.05;
     const ALPHA: f64 = 0.0005;
 
-    fn case(family: &str) {
+    let world_template = production_world(reproduction_config(0.0));
+    let targets = locus_capable_targets(&world_template);
+    for target in targets {
         let pairs = drive_lineage_chain(
-            family,
+            target.key,
             MutationRates {
                 primary: RATE,
                 secondary: RATE,
@@ -921,31 +984,33 @@ fn e2e_mutation_total_changed_loci_is_in_band() {
             GENERATIONS,
         );
         assert_eq!(pairs.len(), GENERATIONS);
-        let codec = dyn_codec_for(family);
+        let codec = codec_for(&world_template, target.key);
         let mut total_changed = 0_u64;
         for (parent, child) in &pairs {
-            let diff = diff_genomes(&*codec, parent, child).expect("e2e diff");
+            let diff = diff_genomes(codec, parent, child).expect("e2e diff");
             total_changed += diff.summary.changed_loci as u64;
         }
-        let support = changed_locus_distribution(family, GENERATIONS, RATE);
+        let support = mutation_trial_distribution(&target.trials, GENERATIONS, RATE);
         let lower_tail = support_cdf(&support, total_changed);
         assert!(
             lower_tail > ALPHA && lower_tail < 1.0 - ALPHA,
-            "heredity_proof: family={family} {GENERATIONS} consecutive diffs changed \
+            "heredity_proof: family={} {GENERATIONS} consecutive diffs changed \
              {total_changed} loci total (lower_tail={lower_tail:.6}) — outside the exact \
-             binomial band at rate {RATE}"
+             binomial band at rate {RATE}",
+            target.kind
         );
     }
-    for_each_family(case);
 }
 
 #[test]
 fn e2e_zero_rate_every_consecutive_diff_is_empty() {
     const GENERATIONS: usize = 20;
 
-    fn case(family: &str) {
+    let world_template = production_world(reproduction_config(0.0));
+    let targets = locus_capable_targets(&world_template);
+    for target in targets {
         let pairs = drive_lineage_chain(
-            family,
+            target.key,
             MutationRates {
                 primary: 0.0,
                 secondary: 0.0,
@@ -953,30 +1018,33 @@ fn e2e_zero_rate_every_consecutive_diff_is_empty() {
             GENERATIONS,
         );
         assert_eq!(pairs.len(), GENERATIONS);
-        let codec = dyn_codec_for(family);
+        let codec = codec_for(&world_template, target.key);
         for (index, (parent, child)) in pairs.iter().enumerate() {
-            let diff = diff_genomes(&*codec, parent, child).expect("mirror diff");
+            let diff = diff_genomes(codec, parent, child).expect("mirror diff");
             assert!(
                 diff.deltas.is_empty(),
-                "heredity_proof: family={family} generation {index}: zero-rate lineage \
+                "heredity_proof: family={} generation {index}: zero-rate lineage \
                  changed {} loci — either heredity is broken or something re-randomizes \
                  brains on the spawn path (both catastrophic and previously undetectable)",
+                target.kind,
                 diff.summary.changed_loci
             );
         }
     }
-    for_each_family(case);
 }
 
 #[test]
 fn spawn_determinism_is_schedule_independent() {
-    fn case(family: &str) {
-        let run_once = || {
-            let mut world = WorldState::new(reproduction_config(0.0)).expect("world");
-            let key = register_family(&mut world, family);
+    let world_template = production_world(reproduction_config(0.0));
+    let targets = locus_capable_targets(&world_template);
+    for target in targets {
+        let target_key = target.key;
+        let target_kind = target.kind.clone();
+        let run_once = move || {
+            let mut world = production_world(reproduction_config(0.0));
             let parent = spawn_parent(
                 &mut world,
-                key,
+                target_key,
                 100.0,
                 100.0,
                 MutationRates {
@@ -1006,7 +1074,7 @@ fn spawn_determinism_is_schedule_independent() {
             let threaded = pool.install(run_once);
             assert_eq!(
                 single, threaded,
-                "heredity_proof: family={family} spawn determinism changed between 1 and 8 \
+                "heredity_proof: family={target_kind} spawn determinism changed between 1 and 8 \
                  threads — the spawn path's RNG consumption must not depend on the Rayon \
                  schedule"
             );
@@ -1016,5 +1084,4 @@ fn spawn_determinism_is_schedule_independent() {
             let _ = single;
         }
     }
-    for_each_family(case);
 }

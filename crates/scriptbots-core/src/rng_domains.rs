@@ -182,12 +182,6 @@ impl StableSeedHash {
     }
 }
 
-/// Derivation identity for the per-island axis (bd-16g.5.3).
-///
-/// Separate from [`RNG_DOMAIN_DERIVATION_V1`] so a single-world run and an island run can never
-/// collide on a seed, and so the island axis can be versioned without touching the existing one.
-pub const ISLAND_RNG_DERIVATION_V1: &str = "scriptbots.island-rng-domains.v1";
-
 /// Derivation identity for the migration stream (bd-16g.5.3).
 pub const MIGRATION_RNG_DERIVATION_V1: &str = "scriptbots.island-migration-rng.v1";
 
@@ -269,38 +263,6 @@ impl std::fmt::Display for OrganismId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}/agent-{}", self.island, self.uid.get())
     }
-}
-
-/// Seed for one island's stream in one domain (bd-16g.5.3).
-///
-/// `kdf(root_seed, ISLAND_TAG, domain_tag, island_id)`, length-prefixed FNV-1a in the same
-/// discipline as [`derive_domain_seed`].
-///
-/// # The property this buys, and why addition would not
-///
-/// The seed is a pure function of `(root_seed, island, domain)` AND NOTHING ELSE. Not the island
-/// COUNT, not thread count, not scheduling, not whether a neighbour went extinct. So **adding a
-/// ninth island cannot perturb islands 0-8 by one bit** -- that holds by construction here, not by
-/// convention, and [`island_seed_is_independent_of_island_count`] proves it.
-///
-/// Deriving by addition (`root_seed + island_id`) is the obvious alternative and it is wrong:
-/// generators seeded with adjacent integers can emit correlated early output, and islands that are
-/// supposed to be independent replicates but whose food and mutation streams correlate produce
-/// results that are plausible, publishable, and false. The KDF diffuses; addition does not.
-#[must_use]
-pub fn derive_island_domain_seed(root_seed: u64, island: IslandId, domain: RngDomain) -> u64 {
-    let mut hash = StableSeedHash::new();
-    hash.absorb_field(ISLAND_RNG_DERIVATION_V1.as_bytes());
-    hash.absorb_field(domain.tag().as_bytes());
-    hash.absorb_u64(u64::from(island.0));
-    hash.absorb_u64(root_seed);
-    hash.finish()
-}
-
-/// A ready-to-use stream for one island's domain (bd-16g.5.3).
-#[must_use]
-pub fn island_domain_stream(root_seed: u64, island: IslandId, domain: RngDomain) -> SmallRngStream {
-    SmallRngStream::seed_from_u64(derive_island_domain_seed(root_seed, island, domain))
 }
 
 /// Seed for the migration stream at one barrier (bd-16g.5.3).
@@ -1830,88 +1792,35 @@ mod tests {
         ));
     }
 
-    // ---- bd-16g.5.3: the island axis ----
+    // ---- bd-16g.5.3, bd-ys96: migration domain and island streams ----
 
-    /// Frozen island-seed golden: `derive_island_domain_seed(0xDEAD_BEEF, IslandId(3), Food)`.
-    ///
-    /// MEASURED, not chosen. Read out of a run of `island_seed_derivation_is_frozen`, which prints
-    /// every sampled seed under `--nocapture`. It is pinned here so a derivation change goes red
-    /// and has to be argued for: moving it invalidates the reproducibility of every island run
-    /// that came before.
-    const ISLAND_SEED_GOLDEN_DEADBEEF_ISLAND3_FOOD: u64 = 0xaef9_04bc_0dc4_6abb;
-
-    /// THE MARQUEE PROPERTY: an island's seed is a function of `(root, island, domain)` and
-    /// nothing else, so island COUNT cannot perturb it.
-    ///
-    /// The bead states the acceptance criterion as "adding a 9th island must not perturb islands
-    /// 0-7 by one bit". Because the derivation never observes the count, that holds by
-    /// construction -- this pins it so a future refactor that threads a count or an index-within-
-    /// a-live-vector into the KDF fails here instead of silently coupling the islands.
-    #[test]
-    fn island_seed_is_independent_of_island_count() {
-        for count in [2_u32, 4, 8, 9, 64] {
-            for island in 0..count.min(8) {
-                for domain in RngDomain::ALL {
-                    assert_eq!(
-                        derive_island_domain_seed(0xDEAD_BEEF, IslandId(island), domain),
-                        derive_island_domain_seed(0xDEAD_BEEF, IslandId(island), domain),
-                        "island {island} domain {domain:?} must not depend on a count of {count}"
-                    );
-                }
-            }
+    /// Helper mirroring `archipelago::derive_island_value` to compute an island's root seed.
+    fn derive_test_island_root_seed(master_seed: u64, island: IslandId) -> u64 {
+        const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV1A64_OFFSET_BASIS;
+        for &b in b"ISLAND_RNG_SEED" {
+            hash = (hash ^ u64::from(b)).wrapping_mul(FNV1A64_PRIME);
         }
-    }
-
-    /// THE MOST LIKELY WAY THIS SHIPS BROKEN: forgetting to mix in the island id.
-    ///
-    /// That bug yields islands that are perfectly deterministic and perfectly identical -- a
-    /// beautiful green determinism gate and zero science, because eight copies of one world is not
-    /// an island model. This asserts every island differs from every other in every domain.
-    #[test]
-    fn distinct_islands_never_share_a_stream() {
-        let mut seen = std::collections::BTreeSet::new();
-        for island in 0..16_u32 {
-            for domain in RngDomain::ALL {
-                let seed = derive_island_domain_seed(0x5EED_5EED, IslandId(island), domain);
-                assert!(
-                    seen.insert(seed),
-                    "island {island} domain {domain:?} collided with an earlier stream; if the \
-                     island id is not entering the KDF, every island is a copy of island 0"
-                );
-            }
+        for &b in &master_seed.to_le_bytes() {
+            hash = (hash ^ u64::from(b)).wrapping_mul(FNV1A64_PRIME);
         }
+        for &b in &island.0.to_le_bytes() {
+            hash = (hash ^ u64::from(b)).wrapping_mul(FNV1A64_PRIME);
+        }
+        hash
     }
 
-    /// Permuting island order must not change any island's stream.
-    ///
-    /// The count test above misses order-dependent seeding: a derivation keyed on position within
-    /// a live collection would pass it and fail this.
-    #[test]
-    fn island_seed_is_independent_of_configuration_order() {
-        let forward: Vec<u64> = (0..8_u32)
-            .map(|i| derive_island_domain_seed(77, IslandId(i), RngDomain::Food))
-            .collect();
-        let reversed: Vec<u64> = (0..8_u32)
-            .rev()
-            .map(|i| derive_island_domain_seed(77, IslandId(i), RngDomain::Food))
-            .collect();
-        let mut reversed_back = reversed;
-        reversed_back.reverse();
-        assert_eq!(
-            forward, reversed_back,
-            "an island's seed must not depend on the order its siblings were derived in"
-        );
-    }
-
-    /// Migration is its own domain and never aliases an island's stream (bd-16g.5.3).
+    /// Migration is its own domain and never aliases an island's stream (bd-16g.5.3, bd-ys96).
     #[test]
     fn migration_stream_is_disjoint_from_every_island_stream() {
         let root = 0xA11C_E5EE_D000_1234;
         let island_seeds: std::collections::BTreeSet<u64> = (0..32_u32)
             .flat_map(|i| {
+                let island_root = derive_test_island_root_seed(root, IslandId(i));
                 RngDomain::ALL
                     .into_iter()
-                    .map(move |d| derive_island_domain_seed(root, IslandId(i), d))
+                    .map(move |d| derive_domain_seed(island_root, d))
             })
             .collect();
         for barrier in 0..32_u64 {
@@ -1936,55 +1845,16 @@ mod tests {
         }
     }
 
-    /// CROSS-PLATFORM STABILITY GOLDEN (bd-16g.5.3).
-    ///
-    /// Hard-coded expectations for a fixed root seed. If a refactor changes the derivation these
-    /// go red, and moving them requires a deliberate decision -- which is exactly the friction
-    /// wanted, because that change invalidates every prior island run's reproducibility.
+    /// Migration derivation never collides with the plain domain derivation.
     #[test]
-    fn island_seed_derivation_is_frozen() {
-        // Measured, not invented: the expectations below were read out of a run of this fixture
-        // and pinned. Never hand-write a golden here -- a fabricated constant that happens to
-        // pass is indistinguishable from a correct one until the day it matters.
-        let observed: Vec<(u32, &str, u64)> = [0_u32, 1, 3, 7]
-            .into_iter()
-            .flat_map(|island| {
-                RngDomain::ALL.into_iter().map(move |domain| {
-                    (
-                        island,
-                        domain.tag(),
-                        derive_island_domain_seed(0xDEAD_BEEF, IslandId(island), domain),
-                    )
-                })
-            })
-            .collect();
-        for (island, tag, seed) in &observed {
-            println!("bd-16g.5.3 island={island} domain={tag} seed={seed:#018x}");
-        }
-        assert_eq!(
-            observed.len(),
-            4 * RngDomain::ALL.len(),
-            "the golden must cover every domain for every sampled island"
-        );
-        assert_eq!(
-            derive_island_domain_seed(0xDEAD_BEEF, IslandId(3), RngDomain::Food),
-            ISLAND_SEED_GOLDEN_DEADBEEF_ISLAND3_FOOD,
-            "island seed derivation moved. This invalidates every prior island run's \
-             reproducibility, so re-pin only as a deliberate decision with a version bump, never \
-             to make a red test green."
-        );
-    }
-
-    /// The island axis must not collide with the single-world axis for the same domain.
-    #[test]
-    fn island_derivation_never_collides_with_the_plain_domain_derivation() {
+    fn migration_derivation_never_collides_with_plain_domain_derivation() {
         for domain in RngDomain::ALL {
             let plain = derive_domain_seed(0xC0FF_EE, domain);
-            for island in 0..64_u32 {
+            for barrier in 0..64_u64 {
                 assert_ne!(
                     plain,
-                    derive_island_domain_seed(0xC0FF_EE, IslandId(island), domain),
-                    "island {island} domain {domain:?} aliased the single-world stream"
+                    derive_migration_seed(0xC0FF_EE, barrier),
+                    "barrier {barrier} aliased the single-world stream for domain {domain:?}"
                 );
             }
         }
