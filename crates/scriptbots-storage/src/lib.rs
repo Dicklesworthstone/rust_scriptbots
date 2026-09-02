@@ -39,12 +39,12 @@ use journal::{
     encode_host_command_postcard_hex, encode_journal_u64, prepare_host_journal_archive,
 };
 use scriptbots_core::{
-    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, DeathCause,
-    DeathRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND, INTERACTION_EVENTS_PERSISTED_KIND,
-    INTERACTION_EVENTS_SAMPLED_OUT_KIND, INTERACTION_EVENTS_TRUNCATED_KIND,
-    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
-    Position, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayInteractionKind,
-    ReplayRngScope, Tick, WorldPersistence,
+    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainGenomeEnvelope,
+    DeathCause, DeathRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
+    INTERACTION_EVENTS_PERSISTED_KIND, INTERACTION_EVENTS_SAMPLED_OUT_KIND,
+    INTERACTION_EVENTS_TRUNCATED_KIND, PersistedGenome, PersistenceAdmissionError,
+    PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase,
+    ReplayEvent, ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
     narrative::{
         EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord,
@@ -3776,6 +3776,40 @@ pub enum StorageError {
     Worker(#[from] StorageWorkerError),
     #[error("invalid replay event at tick {tick}, seq {seq}: {reason}")]
     ReplayParse { tick: i64, seq: i64, reason: String },
+    /// Genome persistence and readback errors.
+    #[error(transparent)]
+    Genome(#[from] GenomeStorageError),
+}
+
+/// Versioned genome persistence and readback errors.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum GenomeStorageError {
+    #[error("genome not found for agent {agent_uid:?} at tick {tick:?}")]
+    NotFound {
+        agent_uid: Option<AgentUid>,
+        tick: Option<Tick>,
+    },
+    #[error("corrupt genome payload for genome {genome_id}: {reason}")]
+    CorruptPayload {
+        genome_id: String,
+        reason: String,
+    },
+    #[error("unsupported genome schema version {version} for genome {genome_id}")]
+    UnsupportedSchema {
+        genome_id: String,
+        version: u32,
+    },
+    #[error("genome digest mismatch for genome {genome_id}: expected {expected}, computed {computed}")]
+    DigestMismatch {
+        genome_id: String,
+        expected: String,
+        computed: String,
+    },
+    #[error("genome belongs to run {found} instead of expected run {expected}")]
+    RunMismatch {
+        expected: String,
+        found: String,
+    },
 }
 
 /// Version-1 narrative-event fields named by strict decoder errors.
@@ -5185,6 +5219,17 @@ struct ReplayEventRow {
     island_id: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GenomeRow {
+    genome_id: String,
+    agent_uid: Option<i64>,
+    created_at_tick: i64,
+    brain_kind: String,
+    genome_json: String,
+    genome_digest: String,
+    provenance_json: String,
+}
+
 /// Aggregate event count grouped by replay event type.
 #[derive(Debug, Clone)]
 pub struct ReplayEventCount {
@@ -5561,6 +5606,7 @@ where
         payload.births.len(),
         payload.deaths.len(),
         payload.replay_events.len(),
+        payload.genomes.len(),
         interaction_rows,
     ]
     .into_iter()
@@ -5574,6 +5620,7 @@ where
     const AGENT_BYTES: usize = 512;
     const BIRTH_BYTES: usize = 192;
     const DEATH_BYTES: usize = 192;
+    const GENOME_BYTES: usize = 512;
     // Re-examined when V10 widened the record by an optional counterpart uid and two optional
     // positions (about 40 bytes). 512 still covers the fixed part with room to spare, so the
     // constant is unchanged -- but the check is the point. bd-erff was an estimator that had
@@ -5600,6 +5647,7 @@ where
         (payload.births.len(), BIRTH_BYTES),
         (payload.deaths.len(), DEATH_BYTES),
         (payload.replay_events.len(), REPLAY_BYTES),
+        (payload.genomes.len(), GENOME_BYTES),
         (interaction_rows, INTERACTION_BYTES),
     ] {
         bytes = bytes.saturating_add(count.saturating_mul(row_bytes));
@@ -5673,6 +5721,17 @@ where
             progress.scientific_bytes = bytes;
         }
     }
+    for (index, genome) in payload.genomes.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            observer.checkpoint(PreparationStage::Measure, *progress)?;
+        }
+        let kind_bytes = genome.envelope.family_id().as_str().len();
+        let payload_bytes = genome.envelope.payload().len();
+        bytes = bytes
+            .saturating_add(kind_bytes.saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER))
+            .saturating_add(payload_bytes.saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER));
+        progress.scientific_bytes = bytes;
+    }
     observer.checkpoint(PreparationStage::Measure, *progress)?;
     Ok((bytes, events))
 }
@@ -5742,6 +5801,8 @@ struct StorageBuffer {
     replay_events: Vec<ReplayEventRow>,
     #[serde(default)]
     run_events: Vec<RunEventRow>,
+    #[serde(default)]
+    genomes: Vec<GenomeRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -6378,6 +6439,7 @@ impl StorageBuffer {
             && self.deaths.is_empty()
             && self.replay_events.is_empty()
             && self.run_events.is_empty()
+            && self.genomes.is_empty()
     }
 
     /// Total buffered rows across every table, for degraded-close reporting.
@@ -6395,6 +6457,7 @@ impl StorageBuffer {
                 .filter(|event| event.agent_uid.is_some() && event.counterpart.is_some())
                 .count()
             + self.run_events.len()
+            + self.genomes.len()
     }
 
     fn clear(&mut self) {
@@ -6406,6 +6469,7 @@ impl StorageBuffer {
         self.deaths.clear();
         self.replay_events.clear();
         self.run_events.clear();
+        self.genomes.clear();
     }
 
     fn append(&mut self, mut other: Self) {
@@ -6417,6 +6481,7 @@ impl StorageBuffer {
         self.deaths.append(&mut other.deaths);
         self.replay_events.append(&mut other.replay_events);
         self.run_events.append(&mut other.run_events);
+        self.genomes.append(&mut other.genomes);
     }
 
     fn validate_contents(&self, enclosing_tick: u64) -> Result<(), StorageError> {
@@ -9957,6 +10022,313 @@ impl StorageReader {
         Ok(deaths)
     }
 
+    /// Read the exact versioned genome envelope for a specific agent in this run.
+    ///
+    /// If `tick` is `Some(t)`, returns the genome envelope recorded at that exact tick.
+    /// If `tick` is `None`, returns the latest genome envelope recorded for the agent.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Genome(GenomeStorageError::NotFound)`] if no genome row matches the query.
+    /// - [`StorageError::Genome(GenomeStorageError::CorruptPayload)`] if the JSON cannot be parsed.
+    /// - [`StorageError::Genome(GenomeStorageError::DigestMismatch)`] if the envelope digest does not match the stored hash.
+    /// - [`StorageError::Genome(GenomeStorageError::RunMismatch)`] if the stored run_id does not match this reader.
+    pub fn read_agent_genome(
+        &self,
+        agent_uid: AgentUid,
+        tick: Option<Tick>,
+    ) -> Result<BrainGenomeEnvelope, StorageError> {
+        let start = Instant::now();
+        let conn = self.connection()?;
+        let row = match tick {
+            Some(t) => {
+                let mut rows = conn.query_with_params(
+                    "SELECT genome_id, run_id, brain_kind, genome_json, genome_digest, provenance_json
+                     FROM genomes
+                     WHERE run_id = ?1 AND agent_uid = ?2 AND created_at_tick = ?3",
+                    &[
+                        sqlite_run_id(self.run_id),
+                        sqlite_optional_i64(Some(encode_u64("genomes.agent_uid", agent_uid.get())?)),
+                        encode_u64("genomes.created_at_tick", t.0)?.into(),
+                    ],
+                )?;
+                if rows.is_empty() {
+                    return Err(StorageError::Genome(GenomeStorageError::NotFound {
+                        agent_uid: Some(agent_uid),
+                        tick,
+                    }));
+                }
+                rows.remove(0)
+            }
+            None => {
+                let mut rows = conn.query_with_params(
+                    "SELECT genome_id, run_id, brain_kind, genome_json, genome_digest, provenance_json
+                     FROM genomes
+                     WHERE run_id = ?1 AND agent_uid = ?2
+                     ORDER BY created_at_tick DESC
+                     LIMIT 1",
+                    &[
+                        sqlite_run_id(self.run_id),
+                        sqlite_optional_i64(Some(encode_u64("genomes.agent_uid", agent_uid.get())?)),
+                    ],
+                )?;
+                if rows.is_empty() {
+                    return Err(StorageError::Genome(GenomeStorageError::NotFound {
+                        agent_uid: Some(agent_uid),
+                        tick: None,
+                    }));
+                }
+                rows.remove(0)
+            }
+        };
+
+        let genome_id: String = decode(&row, 0, "genomes.genome_id")?;
+        let row_run_id: String = decode(&row, 1, "genomes.run_id")?;
+        if row_run_id != self.run_id.to_string() {
+            return Err(StorageError::Genome(GenomeStorageError::RunMismatch {
+                expected: self.run_id.to_string(),
+                found: row_run_id,
+            }));
+        }
+        let genome_json: String = decode(&row, 3, "genomes.genome_json")?;
+        let genome_digest: String = decode(&row, 4, "genomes.genome_digest")?;
+
+        let envelope: BrainGenomeEnvelope =
+            serde_json::from_str(&genome_json).map_err(|error| {
+                StorageError::Genome(GenomeStorageError::CorruptPayload {
+                    genome_id: genome_id.clone(),
+                    reason: error.to_string(),
+                })
+            })?;
+
+        let computed_digest = envelope.material_hash().to_string();
+        if computed_digest != genome_digest {
+            return Err(StorageError::Genome(GenomeStorageError::DigestMismatch {
+                genome_id,
+                expected: genome_digest,
+                computed: computed_digest,
+            }));
+        }
+
+        debug!(
+            run_id = self.run_id.get(),
+            agent_uid = agent_uid.get(),
+            tick = ?tick,
+            elapsed_us = start.elapsed().as_micros(),
+            "read agent genome envelope"
+        );
+        Ok(envelope)
+    }
+
+    /// Read the exact versioned genome envelope by its unique `genome_id`.
+    pub fn read_genome_by_id(
+        &self,
+        genome_id: &str,
+    ) -> Result<BrainGenomeEnvelope, StorageError> {
+        let start = Instant::now();
+        let conn = self.connection()?;
+        let mut rows = conn.query_with_params(
+            "SELECT genome_id, run_id, brain_kind, genome_json, genome_digest, provenance_json
+             FROM genomes
+             WHERE run_id = ?1 AND genome_id = ?2",
+            &[
+                sqlite_run_id(self.run_id),
+                genome_id.into(),
+            ],
+        )?;
+        if rows.is_empty() {
+            return Err(StorageError::Genome(GenomeStorageError::NotFound {
+                agent_uid: None,
+                tick: None,
+            }));
+        }
+        let row = rows.remove(0);
+        let row_run_id: String = decode(&row, 1, "genomes.run_id")?;
+        if row_run_id != self.run_id.to_string() {
+            return Err(StorageError::Genome(GenomeStorageError::RunMismatch {
+                expected: self.run_id.to_string(),
+                found: row_run_id,
+            }));
+        }
+        let genome_json: String = decode(&row, 3, "genomes.genome_json")?;
+        let genome_digest: String = decode(&row, 4, "genomes.genome_digest")?;
+
+        let envelope: BrainGenomeEnvelope =
+            serde_json::from_str(&genome_json).map_err(|error| {
+                StorageError::Genome(GenomeStorageError::CorruptPayload {
+                    genome_id: genome_id.to_owned(),
+                    reason: error.to_string(),
+                })
+            })?;
+
+        let computed_digest = envelope.material_hash().to_string();
+        if computed_digest != genome_digest {
+            return Err(StorageError::Genome(GenomeStorageError::DigestMismatch {
+                genome_id: genome_id.to_owned(),
+                expected: genome_digest,
+                computed: computed_digest,
+            }));
+        }
+
+        debug!(
+            run_id = self.run_id.get(),
+            genome_id,
+            elapsed_us = start.elapsed().as_micros(),
+            "read genome by id"
+        );
+        Ok(envelope)
+    }
+
+    /// Read genomes for an ordered list of lineage agent UIDs.
+    ///
+    /// Preserves the input order of UIDs, returning all recorded genomes for each agent in
+    /// chronological order (`created_at_tick` ascending).
+    pub fn read_lineage_genomes(
+        &self,
+        lineage_uids: &[AgentUid],
+    ) -> Result<Vec<(AgentUid, Tick, BrainGenomeEnvelope)>, StorageError> {
+        if lineage_uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = Instant::now();
+        let conn = self.connection()?;
+        let mut results = Vec::new();
+        for &uid in lineage_uids {
+            let rows = conn.query_with_params(
+                "SELECT genome_id, run_id, created_at_tick, genome_json, genome_digest
+                 FROM genomes
+                 WHERE run_id = ?1 AND agent_uid = ?2
+                 ORDER BY created_at_tick ASC",
+                &[
+                    sqlite_run_id(self.run_id),
+                    sqlite_optional_i64(Some(encode_u64("genomes.agent_uid", uid.get())?)),
+                ],
+            )?;
+            for row in rows {
+                let genome_id: String = decode(&row, 0, "genomes.genome_id")?;
+                let row_run_id: String = decode(&row, 1, "genomes.run_id")?;
+                if row_run_id != self.run_id.to_string() {
+                    return Err(StorageError::Genome(GenomeStorageError::RunMismatch {
+                        expected: self.run_id.to_string(),
+                        found: row_run_id,
+                    }));
+                }
+                let tick_i64: i64 = decode(&row, 2, "genomes.created_at_tick")?;
+                let tick = Tick(checked_u64("genomes.created_at_tick", tick_i64)?);
+                let genome_json: String = decode(&row, 3, "genomes.genome_json")?;
+                let genome_digest: String = decode(&row, 4, "genomes.genome_digest")?;
+
+                let envelope: BrainGenomeEnvelope =
+                    serde_json::from_str(&genome_json).map_err(|error| {
+                        StorageError::Genome(GenomeStorageError::CorruptPayload {
+                            genome_id: genome_id.clone(),
+                            reason: error.to_string(),
+                        })
+                    })?;
+
+                let computed_digest = envelope.material_hash().to_string();
+                if computed_digest != genome_digest {
+                    return Err(StorageError::Genome(GenomeStorageError::DigestMismatch {
+                        genome_id,
+                        expected: genome_digest,
+                        computed: computed_digest,
+                    }));
+                }
+
+                results.push((uid, tick, envelope));
+            }
+        }
+
+        debug!(
+            run_id = self.run_id.get(),
+            lineage_uids_count = lineage_uids.len(),
+            genomes_found = results.len(),
+            elapsed_us = start.elapsed().as_micros(),
+            "read lineage genomes"
+        );
+        Ok(results)
+    }
+
+    /// Read a result-bounded page of recorded genomes for this run.
+    pub fn read_genomes_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<(AgentUid, Tick, BrainGenomeEnvelope)>, StorageError> {
+        let start = Instant::now();
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = checked_query_limit("genomes.limit", limit)?;
+        let offset = i64::try_from(offset).map_err(|error| StorageError::InvalidData {
+            context: "genomes.offset",
+            reason: error.to_string(),
+        })?;
+        let conn = self.connection()?;
+        let rows = conn.query_with_params(
+            "SELECT genome_id, run_id, agent_uid, created_at_tick, genome_json, genome_digest
+             FROM genomes
+             WHERE run_id = ?1
+             ORDER BY created_at_tick ASC, agent_uid ASC
+             LIMIT ?2 OFFSET ?3",
+            &[
+                sqlite_run_id(self.run_id),
+                limit.into(),
+                offset.into(),
+            ],
+        )?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let genome_id: String = decode(&row, 0, "genomes.genome_id")?;
+            let row_run_id: String = decode(&row, 1, "genomes.run_id")?;
+            if row_run_id != self.run_id.to_string() {
+                return Err(StorageError::Genome(GenomeStorageError::RunMismatch {
+                    expected: self.run_id.to_string(),
+                    found: row_run_id,
+                }));
+            }
+            let agent_uid_opt: Option<i64> = decode(&row, 2, "genomes.agent_uid")?;
+            let agent_uid = match agent_uid_opt {
+                Some(raw) => AgentUid(checked_u64("genomes.agent_uid", raw)?),
+                None => AgentUid(0),
+            };
+            let tick_i64: i64 = decode(&row, 3, "genomes.created_at_tick")?;
+            let tick = Tick(checked_u64("genomes.created_at_tick", tick_i64)?);
+            let genome_json: String = decode(&row, 4, "genomes.genome_json")?;
+            let genome_digest: String = decode(&row, 5, "genomes.genome_digest")?;
+
+            let envelope: BrainGenomeEnvelope =
+                serde_json::from_str(&genome_json).map_err(|error| {
+                    StorageError::Genome(GenomeStorageError::CorruptPayload {
+                        genome_id: genome_id.clone(),
+                        reason: error.to_string(),
+                    })
+                })?;
+
+            let computed_digest = envelope.material_hash().to_string();
+            if computed_digest != genome_digest {
+                return Err(StorageError::Genome(GenomeStorageError::DigestMismatch {
+                    genome_id,
+                    expected: genome_digest,
+                    computed: computed_digest,
+                }));
+            }
+
+            results.push((agent_uid, tick, envelope));
+        }
+
+        debug!(
+            run_id = self.run_id.get(),
+            offset,
+            limit,
+            results_count = results.len(),
+            elapsed_us = start.elapsed().as_micros(),
+            "read genomes page"
+        );
+        Ok(results)
+    }
+
     /// Return replay-event counts grouped by stable event type.
     pub fn replay_event_counts(&self) -> Result<Vec<ReplayEventCount>, StorageError> {
         let rows = self.connection()?.query_with_params(
@@ -13443,6 +13815,11 @@ impl Storage {
         )
     }
 
+    /// Return whether the underlying SQLite connection is currently inside an active transaction.
+    pub fn in_transaction(&self) -> Result<bool, StorageError> {
+        Ok(self.connection()?.in_transaction())
+    }
+
     /// Query one compact batch-ledger entry without exposing the outbox payload.
     pub fn batch_status(
         &self,
@@ -16328,6 +16705,7 @@ impl Storage {
             deaths: Vec::with_capacity(payload.deaths.len()),
             replay_events: Vec::with_capacity(payload.replay_events.len()),
             run_events: Vec::with_capacity(payload.narrative_events.len()),
+            genomes: Vec::with_capacity(payload.genomes.len()),
         };
         observer.checkpoint(PreparationStage::Materialize, progress)?;
 
@@ -16411,6 +16789,13 @@ impl Storage {
             observer.checkpoint(PreparationStage::Materialize, progress)?;
             prepared.run_events.push(run_event_row_from_record_observed(
                 event, observer, progress,
+            )?);
+        }
+
+        for genome in &payload.genomes {
+            observer.checkpoint(PreparationStage::Materialize, progress)?;
+            prepared.genomes.push(genome_row_from_persisted_observed(
+                genome, observer, progress,
             )?);
         }
 
@@ -16846,6 +17231,37 @@ impl Storage {
         Ok(())
     }
 
+    fn insert_genomes(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[GenomeRow],
+    ) -> Result<(), FrankenError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sql = "insert into genomes (
+                run_id, genome_id, agent_uid, created_at_tick,
+                brain_kind, genome_json, genome_digest, provenance_json
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            on conflict (run_id, genome_id) do nothing";
+        for row in rows {
+            tx.execute_with_params(
+                sql,
+                &[
+                    sqlite_run_id(run_id),
+                    row.genome_id.as_str().into(),
+                    sqlite_optional_i64(row.agent_uid),
+                    row.created_at_tick.into(),
+                    row.brain_kind.as_str().into(),
+                    row.genome_json.as_str().into(),
+                    row.genome_digest.as_str().into(),
+                    row.provenance_json.as_str().into(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn insert_replay_events(
         tx: &Transaction<'_>,
         run_id: RunId,
@@ -17005,6 +17421,7 @@ impl Storage {
             // never be committed without the event it was derived from, nor the reverse.
             interaction_rows = Self::insert_interactions(&tx, run_id, &buffer.replay_events)?;
             Self::insert_run_events(&tx, run_id, &buffer.run_events)?;
+            Self::insert_genomes(&tx, run_id, &buffer.genomes)?;
             #[cfg(test)]
             fail_at_host_journal_transaction_fault(
                 path,
@@ -20393,6 +20810,41 @@ where
     Ok(row)
 }
 
+fn genome_row_from_persisted_observed<Observer>(
+    genome: &PersistedGenome,
+    observer: &mut Observer,
+    progress: PreparationProgress,
+) -> Result<GenomeRow, StorageError>
+where
+    Observer: PreparationObserver,
+{
+    observer.checkpoint(PreparationStage::Materialize, progress)?;
+    let genome_id = format!("agent:{}:tick:{}", genome.agent_uid.0, genome.created_at_tick.0);
+    let agent_uid = Some(encode_u64("genomes.agent_uid", genome.agent_uid.0)?);
+    let created_at_tick = encode_u64("genomes.created_at_tick", genome.created_at_tick.0)?;
+    let brain_kind = genome.envelope.family_id().as_str().to_owned();
+    let genome_json = serde_json::to_string(&genome.envelope).map_err(|e| StorageError::InvalidData {
+        context: "genomes.genome_json",
+        reason: e.to_string(),
+    })?;
+    let genome_digest = genome.envelope.material_hash().to_string();
+    let provenance_json =
+        serde_json::to_string(genome.envelope.provenance()).map_err(|e| StorageError::InvalidData {
+            context: "genomes.provenance_json",
+            reason: e.to_string(),
+        })?;
+
+    Ok(GenomeRow {
+        genome_id,
+        agent_uid,
+        created_at_tick,
+        brain_kind,
+        genome_json,
+        genome_digest,
+        provenance_json,
+    })
+}
+
 #[cfg(test)]
 fn replay_row_from_event(
     event: &ReplayEvent,
@@ -23086,6 +23538,7 @@ mod tests {
             deaths: Vec::new(),
             replay_events: Vec::new(),
             narrative_events: Vec::new(),
+            genomes: Vec::new(),
         }
     }
 

@@ -146,6 +146,7 @@ fn sample_batch(tick: u64, metric_value: f64) -> PersistenceBatch {
         deaths: Vec::new(),
         replay_events: Vec::new(),
         narrative_events: Vec::new(),
+        genomes: Vec::new(),
     }
 }
 
@@ -477,9 +478,17 @@ fn forced_constraint_failure_rolls_back_entire_batch_and_survives_reopen() {
         )
         .expect("pre-existing committed row");
 
+    assert!(
+        !connection.in_transaction(),
+        "clean connection starts outside any transaction"
+    );
     connection
         .begin_transaction()
         .expect("doomed batch transaction begins");
+    assert!(
+        connection.in_transaction(),
+        "connection must be in transaction after begin_transaction"
+    );
     connection
         .execute_with_params(
             "INSERT INTO batch_a (id, val) VALUES (?1, ?2)",
@@ -501,17 +510,30 @@ fn forced_constraint_failure_rolls_back_entire_batch_and_survives_reopen() {
         !violation.is_transient(),
         "constraint violation is a permanent error, got {violation}"
     );
-    // A statement error must not implicitly commit or abort the transaction: another
-    // statement still stages, and the explicit rollback decides the outcome.
+    // A statement error must not implicitly commit or abort the transaction:
+    // the in_transaction observable must remain true, another statement still
+    // stages, and the explicit rollback decides the outcome.
+    assert!(
+        connection.in_transaction(),
+        "connection remains in transaction after non-fatal statement error"
+    );
     connection
         .execute_with_params(
             "INSERT INTO batch_b (id, note) VALUES (?1, ?2)",
             &[4_i64.into(), "also-staged".into()],
         )
         .expect("transaction stays live after a statement error");
+    assert!(
+        connection.in_transaction(),
+        "transaction remains active before explicit rollback"
+    );
     connection
         .rollback_transaction()
         .expect("the failed batch remains explicitly rollbackable");
+    assert!(
+        !connection.in_transaction(),
+        "connection must be transaction-free after rollback"
+    );
 
     assert_eq!(
         read_only_count(&path_string, "SELECT COUNT(*) FROM batch_a", &[]),
@@ -1195,6 +1217,12 @@ fn watermarks_stay_ordered_and_never_regress_across_refusal_and_recovery() {
 
     // The refusal must not have left the writer inside an open transaction, and the
     // same writer must still be usable for a fresh admit -> apply cycle.
+    assert!(
+        !storage
+            .in_transaction()
+            .expect("query storage transaction state"),
+        "a refused conflicting payload must leave the internal connection transaction-free"
+    );
     assert_no_writer_transaction_is_open(&path_string, "refusal-probe");
     storage
         .persist(&sample_batch(4, 4.0))
@@ -1380,5 +1408,160 @@ fn repeated_recovery_is_a_fixed_point_and_never_duplicates_rows() {
         assert_integrity_ok(&path_string);
     }
 
+    cleanup(&path);
+}
+
+// ---------------------------------------------------------------------------
+// Direct FrankenSQLite transaction-state observable proofs (bd-2z0.5.15).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn direct_frankensqlite_transaction_state_observable_after_failed_statements() {
+    if !engine_capable_temp_dir() {
+        return;
+    }
+    let path = test_path("direct-tx-state");
+    let path_string = path.to_string_lossy().to_string();
+
+    let connection = Connection::open(&path_string).expect("direct state test database opens");
+    connection
+        .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
+        .expect("table created");
+
+    // 1. Clean connection starts with in_transaction() == false.
+    assert!(
+        !connection.in_transaction(),
+        "clean connection must report in_transaction() == false"
+    );
+
+    // 2. Statement failures in autocommit mode must leave in_transaction() == false.
+    let syntax_err = connection.execute("SELECT * FROM missing_table_1234");
+    assert!(syntax_err.is_err(), "query on missing table must fail");
+    assert!(
+        !connection.in_transaction(),
+        "syntax error in autocommit mode must leave in_transaction() == false"
+    );
+
+    let null_err = connection.execute("INSERT INTO items (id, name) VALUES (1, NULL)");
+    assert!(null_err.is_err(), "NULL constraint violation must fail");
+    assert!(
+        !connection.in_transaction(),
+        "constraint violation in autocommit mode must leave in_transaction() == false"
+    );
+
+    // 3. Begin transaction transitions in_transaction() to true.
+    connection
+        .begin_transaction()
+        .expect("begin_transaction succeeds");
+    assert!(
+        connection.in_transaction(),
+        "in_transaction() must be true after begin_transaction"
+    );
+
+    // 4. Statement failure inside transaction keeps in_transaction() == true until explicit rollback.
+    let dup_err = connection.execute("INSERT INTO items (id, name) VALUES (1, 'alpha')");
+    assert!(dup_err.is_ok(), "first insert in transaction succeeds");
+    assert!(connection.in_transaction());
+
+    let failed_stmt = connection.execute("INSERT INTO items (id, name) VALUES (1, 'alpha')");
+    assert!(failed_stmt.is_err(), "duplicate PK insert must fail");
+    assert!(
+        connection.in_transaction(),
+        "in_transaction() must remain true after failed statement in active transaction"
+    );
+
+    connection
+        .rollback_transaction()
+        .expect("rollback succeeds");
+    assert!(
+        !connection.in_transaction(),
+        "in_transaction() must be false after rollback_transaction"
+    );
+
+    // 5. Successful transaction lifecycle: begin -> execute -> commit -> false.
+    connection
+        .begin_transaction()
+        .expect("second begin_transaction succeeds");
+    assert!(connection.in_transaction());
+    connection
+        .execute("INSERT INTO items (id, name) VALUES (2, 'beta')")
+        .expect("insert in second tx succeeds");
+    connection.commit_transaction().expect("commit succeeds");
+    assert!(
+        !connection.in_transaction(),
+        "in_transaction() must be false after commit_transaction"
+    );
+
+    connection.close().expect("connection closes cleanly");
+
+    // 6. Direct Storage facade in_transaction() observable.
+    let storage_path = test_path("direct-storage-tx-state");
+    let storage_path_string = storage_path.to_string_lossy().to_string();
+
+    let mut storage = Storage::create_unattributed_file_with_thresholds(
+        &storage_path_string,
+        1_000,
+        1_000,
+        1_000,
+        1_000,
+    )
+    .expect("storage creates cleanly");
+
+    assert!(
+        !storage
+            .in_transaction()
+            .expect("query storage transaction state"),
+        "fresh storage must report in_transaction() == false"
+    );
+
+    // Persist valid batch -> in_transaction() remains false before and after flush.
+    storage
+        .persist(&sample_batch(1, 10.0))
+        .expect("persist batch stages");
+    assert!(
+        !storage
+            .in_transaction()
+            .expect("query storage transaction state"),
+        "after persist admission, in_transaction() must be false"
+    );
+
+    storage.flush().expect("flush succeeds");
+    assert!(
+        !storage
+            .in_transaction()
+            .expect("query storage transaction state"),
+        "after flush, in_transaction() must be false"
+    );
+
+    // Conflicting duplicate persist fails -> in_transaction() must stay false.
+    let conflict_err = storage.persist(&sample_batch(1, 99.0));
+    assert!(conflict_err.is_err(), "conflicting batch must be rejected");
+    assert!(
+        !storage
+            .in_transaction()
+            .expect("query storage transaction state"),
+        "after rejected batch, in_transaction() must remain false"
+    );
+
+    // Subsequent valid operations still succeed on the same Storage instance.
+    storage
+        .persist(&sample_batch(2, 20.0))
+        .expect("subsequent persist after failure must succeed");
+    storage.flush().expect("subsequent flush must succeed");
+    assert!(
+        !storage
+            .in_transaction()
+            .expect("query storage transaction state"),
+        "in_transaction() remains false after subsequent successful cycle"
+    );
+
+    // Independent writer probe verifies no dangling locks or open transactions.
+    assert_no_writer_transaction_is_open(&storage_path_string, "direct-tx-state-probe");
+
+    storage.close().expect("storage closes cleanly");
+    assert_integrity_ok(&storage_path_string);
+    assert_integrity_ok(&path_string);
+
+    cleanup(&storage_path);
     cleanup(&path);
 }

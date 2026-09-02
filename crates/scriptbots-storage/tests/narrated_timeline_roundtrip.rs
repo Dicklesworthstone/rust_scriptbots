@@ -97,6 +97,7 @@ fn batch(events: Vec<EventRecord>) -> PersistenceBatch {
         deaths: Vec::new(),
         replay_events: Vec::new(),
         narrative_events: events,
+        genomes: Vec::new(),
     }
 }
 

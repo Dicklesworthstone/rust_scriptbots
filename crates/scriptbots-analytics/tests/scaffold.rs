@@ -47,6 +47,7 @@ fn batch(tick: u64, agent_count: usize, energy: f32) -> PersistenceBatch {
         deaths: Vec::new(),
         replay_events: Vec::new(),
         narrative_events: Vec::new(),
+        genomes: Vec::new(),
     }
 }
 

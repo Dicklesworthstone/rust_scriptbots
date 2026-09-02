@@ -69,6 +69,7 @@ fn storage_persists_metrics_roundtrip() {
                 },
             }],
             narrative_events: Vec::new(),
+            genomes: Vec::new(),
         })
         .expect("explicit replay fixture should enter the bounded queue");
 
@@ -277,6 +278,7 @@ fn narrative_batch(events: Vec<EventRecord>) -> PersistenceBatch {
         deaths: Vec::new(),
         replay_events: Vec::new(),
         narrative_events: events,
+        genomes: Vec::new(),
     }
 }
 
@@ -952,6 +954,7 @@ fn batch_with_replay_events(tick: u64, replay_events: Vec<ReplayEvent>) -> Persi
         deaths: Vec::new(),
         replay_events,
         narrative_events: Vec::new(),
+        genomes: Vec::new(),
     }
 }
 

@@ -6038,6 +6038,7 @@ mod tests {
                 },
             }],
             narrative_events: Vec::new(),
+            genomes: Vec::new(),
         })
     }
 

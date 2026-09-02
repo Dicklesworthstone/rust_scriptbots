@@ -4503,6 +4503,7 @@ mod tests {
             deaths: Vec::new(),
             replay_events: Vec::new(),
             narrative_events: Vec::new(),
+            genomes: Vec::new(),
         };
         let persistence = Storage::prepare_batch(&persistence).expect("prepare exact f64 metric");
         let run_id = RunId::new(1);
