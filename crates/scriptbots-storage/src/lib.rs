@@ -1977,6 +1977,7 @@ fn canonical_schema_objects_at(version: i64) -> Result<Vec<SchemaObject>, Storag
     Ok(objects)
 }
 
+#[cfg(test)]
 fn canonical_schema_objects() -> Result<Vec<SchemaObject>, StorageError> {
     canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_VERSION)
 }

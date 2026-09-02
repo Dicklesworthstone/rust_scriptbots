@@ -505,6 +505,7 @@ impl LlmClient for ScriptedClient {
 
 /// Belt and braces: strip the key from any string that is about to be
 /// surfaced in an error, a log line, or a notebook (bd-wqnk).
+#[allow(dead_code)]
 pub(crate) fn redact(message: &str, api_key: &str) -> String {
     if api_key.is_empty() {
         return message.to_owned();

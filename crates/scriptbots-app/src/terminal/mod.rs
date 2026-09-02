@@ -17,7 +17,7 @@ use subcell::{ColorDepth, Layer, SubCellBuffer, SubCellMode, quantize};
 use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,

@@ -2,6 +2,7 @@
 name = "scriptbots-app"
 version = "0.1.0"
 edition = "2024"
+default-run = "scriptbots-app"
 
 [dependencies]
 anyhow = { workspace = true }

@@ -1,6 +1,6 @@
 //! FrankenTUI Model shell, command receipts, and simulator harness (bd-2z0.6.3).
 
-use crate::control::{CommandStatusDto, ControlError, ControlHandle};
+use crate::control::CommandStatusDto;
 use scriptbots_core::ControlCommand;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;

@@ -29,6 +29,7 @@ pub enum BrainPreset {
     Dwraon,
     Assembly,
     Ft,
+    Neuro,
 }
 
 impl BrainPreset {
@@ -41,6 +42,7 @@ impl BrainPreset {
             Self::Dwraon => "dwraon",
             Self::Assembly => "assembly",
             Self::Ft => "ft",
+            Self::Neuro => "neuro",
         }
     }
 }
@@ -183,6 +185,22 @@ pub fn install_brains(world: &mut WorldState, preset: BrainPreset) -> Result<Ins
                 "brain preset `ft` requires a scriptbots-app build with the non-default \
                  `brain-ft` feature"
             );
+        }
+        BrainPreset::Neuro => {
+            #[cfg(feature = "neuro")]
+            {
+                let mut neuro_settings = world.config().neuroflow.clone();
+                neuro_settings.enabled = true;
+                let adapter = NeuroflowBrainConfig::from_settings(&neuro_settings);
+                adapter
+                    .validate()
+                    .context("failed to validate configured NeuroFlow brain")?;
+                let key = NeuroflowBrain::register(world, adapter)
+                    .context("failed to register configured NeuroFlow brain")?;
+                population.push(key);
+            }
+            #[cfg(not(feature = "neuro"))]
+            bail!("brain preset `neuro` requires a scriptbots-app build with the `neuro` feature");
         }
     }
 

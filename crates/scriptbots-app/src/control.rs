@@ -11,7 +11,7 @@ use thiserror::Error;
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
     HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate,
-    SimulationCommand, TerrainKind, Tick, WorldState,
+    TerrainKind, Tick, WorldState,
 };
 
 use crate::SharedWorld;

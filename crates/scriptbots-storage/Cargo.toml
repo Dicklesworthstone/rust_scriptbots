@@ -19,5 +19,6 @@ crossbeam-channel = "0.5"
 
 [dev-dependencies]
 asupersync = { workspace = true }
+scriptbots-brain = { path = "../scriptbots-brain" }
 tempfile = "3.8"
 tracing-subscriber = { workspace = true }

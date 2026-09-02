@@ -10289,6 +10289,7 @@ dependencies = [
  "fsqlite",
  "libc",
  "postcard",
+ "scriptbots-brain",
  "scriptbots-core",
  "scriptbots-runtime",
  "serde",

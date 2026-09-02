@@ -415,6 +415,7 @@ mod validation_tests {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use scriptbots_core::{

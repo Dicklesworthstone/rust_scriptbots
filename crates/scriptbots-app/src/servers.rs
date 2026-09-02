@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, mpsc},
@@ -8,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::sse::{Event, Sse};
 use axum::{

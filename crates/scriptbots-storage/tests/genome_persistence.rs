@@ -10,6 +10,7 @@
 //! - Fixed-seed multi-generation E2E comparing live envelopes with reopened DB readback.
 
 use fsqlite::compat::{open_with_flags, OpenFlags, RowExt};
+use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BirthOrigin, BirthRecord, BrainFamilyId, BrainGenomeDerivation,
     BrainGenomeEnvelope, BrainGenomeHash, BrainProvenance, Generation, MetricSample,
@@ -532,10 +533,20 @@ fn test_live_simulation_multigen_e2e_reopened_db() -> Result<(), Box<dyn std::er
         WorldState::with_persistence(config, Box::new(pipeline.sink()))
             .expect("world with storage pipeline");
 
+    let family_key = world
+        .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+        .expect("register mlp brain family");
+
     for _ in 0..4 {
-        world
+        let agent_id = world
             .try_spawn_agent(AgentData::default())
             .expect("seed agent");
+        assert!(
+            world
+                .bind_agent_brain(agent_id, family_key)
+                .expect("bind brain"),
+            "agent accepts brain binding"
+        );
     }
 
     // Run simulation for 10 ticks
