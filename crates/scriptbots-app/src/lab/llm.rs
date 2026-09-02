@@ -191,6 +191,28 @@ pub trait LlmClient: Send + Sync {
     fn model_id(&self) -> &str;
 }
 
+/// Read at most `cap + 1` bytes from a reader into a `Vec<u8>` without buffering an unbounded stream (bd-wqnk).
+///
+/// # Errors
+///
+/// Returns [`LlmError::ResponseTooLarge`] if `reader` yields more than `cap` bytes,
+/// or [`LlmError::Transport`] if an I/O error occurs.
+pub fn read_bounded_bytes<R: std::io::Read>(reader: R, cap: usize) -> Result<Vec<u8>, LlmError> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let mut limited = reader.take((cap + 1) as u64);
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|err| LlmError::Transport(err.to_string()))?;
+    if bytes.len() > cap {
+        return Err(LlmError::ResponseTooLarge {
+            bytes: bytes.len(),
+            cap,
+        });
+    }
+    Ok(bytes)
+}
+
 /// Parse a provider response body into an [`LlmResponse`].
 ///
 /// Deliberately separate from any HTTP client and NOT feature-gated: this is
@@ -481,6 +503,15 @@ impl LlmClient for ScriptedClient {
     }
 }
 
+/// Belt and braces: strip the key from any string that is about to be
+/// surfaced in an error, a log line, or a notebook (bd-wqnk).
+pub(crate) fn redact(message: &str, api_key: &str) -> String {
+    if api_key.is_empty() {
+        return message.to_owned();
+    }
+    message.replace(api_key, "<redacted>")
+}
+
 #[cfg(feature = "llm-anthropic")]
 pub use anthropic::AnthropicClient;
 
@@ -488,7 +519,7 @@ pub use anthropic::AnthropicClient;
 mod anthropic {
     use super::{
         LlmClient, LlmError, LlmRequest, LlmResponse, MAX_RESPONSE_BYTES, RetryPolicy,
-        parse_response, parse_retry_after,
+        parse_response, parse_retry_after, read_bounded_bytes, redact,
     };
     use rand::rngs::SmallRng;
     use std::sync::Mutex;
@@ -593,17 +624,13 @@ mod anthropic {
                 return Err(LlmError::Overloaded);
             }
 
-            // Read into a bounded buffer: past the cap we stop, rather than
-            // letting a pathological body grow until the process dies.
-            let bytes = response
-                .bytes()
-                .map_err(|err| LlmError::Transport(redact(&err.to_string(), &self.api_key)))?;
-            if bytes.len() > MAX_RESPONSE_BYTES {
-                return Err(LlmError::ResponseTooLarge {
-                    bytes: bytes.len(),
-                    cap: MAX_RESPONSE_BYTES,
-                });
-            }
+            // Read incrementally into a bounded buffer: past the cap we stop, rather than
+            // letting a pathological body grow until the process dies (bd-wqnk).
+            let bytes =
+                read_bounded_bytes(response, MAX_RESPONSE_BYTES).map_err(|err| match err {
+                    LlmError::Transport(msg) => LlmError::Transport(redact(&msg, &self.api_key)),
+                    other => other,
+                })?;
             if !status.is_success() {
                 return Err(LlmError::Transport(format!(
                     "provider returned HTTP {status}"
@@ -611,15 +638,6 @@ mod anthropic {
             }
             parse_response(request, &bytes)
         }
-    }
-
-    /// Belt and braces: strip the key from any string that is about to be
-    /// surfaced in an error, a log line, or a notebook.
-    fn redact(message: &str, api_key: &str) -> String {
-        if api_key.is_empty() {
-            return message.to_owned();
-        }
-        message.replace(api_key, "<redacted>")
     }
 
     impl LlmClient for AnthropicClient {
@@ -964,5 +982,46 @@ mod tests {
              test` gains the ability to reach the network and spend real tokens; \
              found: {default_features}"
         );
+    }
+
+    #[test]
+    fn read_bounded_bytes_enforces_cap_without_buffering_unbounded_streams() {
+        use std::io::Cursor;
+
+        // Cap - 1: exact read succeeds
+        let data = vec![b'a'; 10];
+        let res = read_bounded_bytes(Cursor::new(data.clone()), 11).expect("cap - 1 succeeds");
+        assert_eq!(res, data);
+
+        // Cap exact: exact read succeeds
+        let res = read_bounded_bytes(Cursor::new(data.clone()), 10).expect("cap exact succeeds");
+        assert_eq!(res, data);
+
+        // Cap + 1: fails with ResponseTooLarge and buffers at most cap + 1
+        let res = read_bounded_bytes(Cursor::new(vec![b'b'; 11]), 10);
+        assert_eq!(res, Err(LlmError::ResponseTooLarge { bytes: 11, cap: 10 }));
+
+        // Infinite stream: stops reading at cap + 1 and does not OOM
+        let infinite = std::io::repeat(b'z');
+        let res = read_bounded_bytes(infinite, 100);
+        assert_eq!(
+            res,
+            Err(LlmError::ResponseTooLarge {
+                bytes: 101,
+                cap: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn api_key_redaction_replaces_secrets_and_handles_empty_keys() {
+        let key = "sk-ant-api03-secretkey12345";
+        let err_msg = format!("request to https://api.anthropic.com failed with key {key}");
+        let redacted = super::redact(&err_msg, key);
+        assert!(!redacted.contains(key));
+        assert!(redacted.contains("<redacted>"));
+
+        let empty_redacted = super::redact("some error", "");
+        assert_eq!(empty_redacted, "some error");
     }
 }

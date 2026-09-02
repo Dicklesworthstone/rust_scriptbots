@@ -403,7 +403,7 @@ mod validation_tests {
             "submit's returned id must equal the drained BusCommand's id",
         );
         let disposition = apply_control_command(&mut world, drained.command)
-        .expect("normalized playback disposition");
+            .expect("normalized playback disposition");
         assert_eq!(
             disposition,
             ControlDisposition::Playback(SimulationCommand {

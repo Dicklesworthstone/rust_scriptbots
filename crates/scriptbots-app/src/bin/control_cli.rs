@@ -1481,6 +1481,7 @@ mod tests {
             deaths: death_records,
             replay_events: Vec::new(),
             narrative_events: Vec::new(),
+            genomes: Vec::new(),
         }
     }
 

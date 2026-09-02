@@ -334,3 +334,29 @@ fn a_world_with_only_non_heritable_families_has_no_eligible_founders() {
          population that is not evolving"
     );
 }
+
+#[test]
+fn production_install_brains_exposes_canonical_heredity_capabilities() {
+    let mut world = world();
+    let installed = scriptbots_app::install_brains(&mut world, scriptbots_app::BrainPreset::Mixed)
+        .expect("canonical production install succeeds");
+    assert!(!installed.is_empty(), "installed brains must not be empty");
+    assert!(
+        installed.registered() >= 3,
+        "at least 3 protocol families registered"
+    );
+
+    let snapshot = installed
+        .heredity_capabilities(&world)
+        .expect("heredity capability projection succeeds");
+    assert_eq!(
+        snapshot.descriptors.len(),
+        installed.registered(),
+        "capability descriptors count must match registered families"
+    );
+    assert_ne!(
+        snapshot.capability_digest.as_bytes(),
+        &[0u8; 32],
+        "capability digest must be computed"
+    );
+}

@@ -81,12 +81,13 @@ pub trait ExperimentExecutor: Send + Sync {
 }
 
 #[derive(Debug)]
-struct MatchedSeedExecutor {
+pub struct MatchedSeedExecutor {
     output_root: PathBuf,
 }
 
 impl MatchedSeedExecutor {
-    fn new(output_root: impl Into<PathBuf>) -> Self {
+    #[must_use]
+    pub fn new(output_root: impl Into<PathBuf>) -> Self {
         Self {
             output_root: output_root.into(),
         }
@@ -893,6 +894,20 @@ impl LabStateMachine {
             self.budget.max_iterations,
             self.failure_reason.as_deref().unwrap_or("none recorded")
         )
+    }
+
+    /// Return the written notebook path, if one was persisted.
+    #[must_use]
+    pub fn notebook_path(&self) -> Option<&PathBuf> {
+        self.notebook_path.as_ref()
+    }
+
+    /// Advance the state machine repeatedly until reaching Finished or an unrecoverable error.
+    pub fn run_to_completion(&mut self) -> Result<LabPhase, LabError> {
+        while self.phase != LabPhase::Finished {
+            self.step()?;
+        }
+        Ok(self.phase)
     }
 }
 

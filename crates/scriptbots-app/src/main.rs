@@ -3,10 +3,12 @@ use asupersync::types::{Budget, Outcome};
 use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
+#[cfg(feature = "neuro")]
+use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
-    BootstrapEvidenceV0, CharacterizationTraceV2, ControlServerConfig, ControlServerReservation,
-    RunIdentityV1, RunManifestV3, ScenarioDocumentV1, ScenarioIdentityV0, SharedAnalytics,
-    SharedWorld, ThreadPolicyV0, WorldStepDriver,
+    BootstrapEvidenceV0, BrainPreset, CharacterizationTraceV2, ControlServerConfig,
+    ControlServerReservation, RunIdentityV1, RunManifestV3, ScenarioDocumentV1, ScenarioIdentityV0,
+    SharedAnalytics, SharedWorld, ThreadPolicyV0, WorldStepDriver, install_brains,
     precedence::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
@@ -17,12 +19,8 @@ use scriptbots_app::{
 };
 #[cfg(feature = "bevy_render")]
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
-use scriptbots_brain::{
-    AssemblyBrain, DwraonBrain, MlpBrain, assembly::AssemblyFamilyAdapter,
-    dwraon::DwraonFamilyAdapter, mlp::MlpBrainFamily,
-};
-#[cfg(feature = "brain-ft")]
-use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
+#[cfg(test)]
+use scriptbots_brain::{AssemblyBrain, DwraonBrain, MlpBrain};
 use scriptbots_core::{
     LEGACY_RENDER_ENV_NAMES, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
     PersistenceSessionError, RenderQuality, RenderTonemapMode, ReplayEventKind,
@@ -226,6 +224,11 @@ fn main() -> Result<()> {
 
     if let Some(ref bundle_path) = cli.verify_bundle {
         run_verify_bundle_cli(bundle_path)?;
+        return Ok(());
+    }
+
+    if let Some(ref goal) = cli.lab_goal {
+        run_lab_cli(&cli, goal)?;
         return Ok(());
     }
 
@@ -959,6 +962,69 @@ fn run_det_child(
     };
     let json = serde_json::to_string(&out)?;
     println!("{}", json);
+    Ok(())
+}
+
+fn run_lab_cli(cli: &AppCli, goal: &str) -> Result<()> {
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+    #[cfg(feature = "llm-anthropic")]
+    use scriptbots_app::lab::llm::AnthropicClient;
+    use scriptbots_app::lab::llm::{LlmClient, ScriptedClient};
+    use scriptbots_app::lab_assistant::{LabBudget, LabStateMachine};
+
+    let output_root = cli
+        .lab_out
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("runs/lab"));
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("create lab output directory: {}", output_root.display()))?;
+
+    let budget = LabBudget {
+        max_runs: cli.lab_runs,
+        max_ticks: cli.lab_ticks,
+        max_tokens: 100_000,
+        max_iterations: 20,
+    };
+
+    let rng_seed = cli.rng_seed.unwrap_or(42);
+    let rng = SmallRng::seed_from_u64(rng_seed);
+
+    let client: Box<dyn LlmClient> = if let Some(ref fixture_path) = cli.lab_fixture {
+        let bytes = fs::read(fixture_path)
+            .with_context(|| format!("read lab fixture from {}", fixture_path.display()))?;
+        let fixture_client = ScriptedClient::from_fixture("offline-fixture", &bytes)
+            .map_err(|err| anyhow!("invalid lab fixture: {err}"))?;
+        Box::new(fixture_client)
+    } else {
+        #[cfg(feature = "llm-anthropic")]
+        {
+            let anthropic = AnthropicClient::from_env("claude-3-5-sonnet-20241022", rng)
+                .map_err(|err| anyhow!("could not initialize Anthropic client: {err}"))?;
+            Box::new(anthropic)
+        }
+        #[cfg(not(feature = "llm-anthropic"))]
+        {
+            let _ = rng;
+            bail!(
+                "Autonomous lab assistant requires either an offline scripted fixture (--lab-fixture <FILE>) \
+                 or the binary compiled with --features llm-anthropic and ANTHROPIC_API_KEY exported."
+            );
+        }
+    };
+
+    let mut state_machine = LabStateMachine::new(client, budget, output_root);
+
+    info!(goal = %goal, "starting autonomous lab assistant loop");
+    let phase = state_machine
+        .run_to_completion()
+        .map_err(|err| anyhow!("lab assistant execution failure: {err}"))?;
+
+    println!("Autonomous Lab Assistant completed with final phase: {phase:?}");
+    if let Some(path) = state_machine.notebook_path() {
+        println!("Rendered lab notebook: {}", path.display());
+    }
+
     Ok(())
 }
 
@@ -2502,27 +2568,21 @@ struct AppCli {
     /// Auto-tune: quick sweep to pick threads/thresholds for current storage, then continue.
     #[arg(long = "auto-tune", value_name = "TICKS")]
     auto_tune: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
-enum BrainPreset {
-    Mixed,
-    Mlp,
-    Dwraon,
-    Assembly,
-    Ft,
-}
-
-impl BrainPreset {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Mixed => "mixed",
-            Self::Mlp => "mlp",
-            Self::Dwraon => "dwraon",
-            Self::Assembly => "assembly",
-            Self::Ft => "ft",
-        }
-    }
+    /// Autonomous LLM lab goal: run an automated hypothesis-driven scientific sweep (bd-16g.1).
+    #[arg(long = "lab-goal", value_name = "GOAL")]
+    lab_goal: Option<String>,
+    /// Offline scripted fixture JSON path for autonomous lab testing.
+    #[arg(long = "lab-fixture", value_name = "FILE")]
+    lab_fixture: Option<PathBuf>,
+    /// Maximum number of experiment runs budgeted for the lab assistant.
+    #[arg(long = "lab-runs", value_name = "N", default_value_t = 10)]
+    lab_runs: usize,
+    /// Maximum simulation ticks per experiment run budgeted for the lab assistant.
+    #[arg(long = "lab-ticks", value_name = "TICKS", default_value_t = 10_000)]
+    lab_ticks: u64,
+    /// Output directory for the lab notebook and reproduction scripts.
+    #[arg(long = "lab-out", value_name = "DIR")]
+    lab_out: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -4406,168 +4466,6 @@ fn print_event_counts(
     }
 }
 
-#[cfg(feature = "neuro")]
-fn validated_neuroflow_config(
-    config: &ScriptBotsConfig,
-) -> Result<Option<scriptbots_brain_neuro::NeuroflowBrainConfig>> {
-    use scriptbots_brain_neuro::NeuroflowBrainConfig;
-
-    if !config.neuroflow.enabled {
-        return Ok(None);
-    }
-    let adapter = NeuroflowBrainConfig::from_settings(&config.neuroflow);
-    adapter
-        .validate()
-        .context("failed to validate configured NeuroFlow brain")?;
-    Ok(Some(adapter))
-}
-
-impl InstalledBrains {
-    /// How many families are REGISTERED — eligible plus withheld.
-    ///
-    /// Registration and population-eligibility are now different questions, and conflating them
-    /// is what this bead is about. A withheld family is still registered: it can be bound
-    /// explicitly by an experiment that genuinely wants it. It simply may not found a
-    /// population until it implements the versioned genome and evaluator-state protocol.
-    fn registered(&self) -> usize {
-        self.population.len() + self.withheld.len()
-    }
-}
-
-/// Registered brain families, split by whether they may found a population.
-#[derive(Debug)]
-struct InstalledBrains {
-    /// Versioned protocol families admitted to seed the founding population.
-    population: Vec<u64>,
-    /// Families registered for explicit selection but withheld from default populations,
-    /// with the reason, so the exclusion is inspectable rather than folklore.
-    withheld: Vec<(String, u64)>,
-}
-
-fn install_brains(world: &mut WorldState, preset: BrainPreset) -> Result<InstalledBrains> {
-    #[cfg(feature = "neuro")]
-    let neuro_config = if preset == BrainPreset::Mixed {
-        validated_neuroflow_config(world.config())?
-    } else {
-        None
-    };
-
-    #[cfg(feature = "neuro")]
-    let mut withheld = Vec::new();
-    #[cfg(not(feature = "neuro"))]
-    let withheld = Vec::new();
-    let mut population = Vec::new();
-
-    // Founding-population admission is structural: every eligible entry must own a versioned
-    // genome codec, evaluator-state codec, offspring-state policy, and evaluator constructor.
-    // There is no legacy runner beside these entries that could become a second hereditary truth.
-    let register_mlp = |world: &mut WorldState| {
-        world
-            .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
-            .context("failed to register the versioned MLP brain family")
-    };
-    let register_dwraon = |world: &mut WorldState| {
-        world
-            .register_brain_family(
-                DwraonBrain::KIND.as_str(),
-                Box::new(DwraonFamilyAdapter::default()),
-            )
-            .context("failed to register the versioned DWRAON brain family")
-    };
-    let register_assembly = |world: &mut WorldState| {
-        let assembly = AssemblyFamilyAdapter::new()
-            .context("failed to construct the versioned Assembly brain family")?;
-        world
-            .register_brain_family(AssemblyBrain::KIND.as_str(), Box::new(assembly))
-            .context("failed to register the versioned Assembly brain family")
-    };
-    #[cfg(feature = "brain-ft")]
-    let register_ft = |world: &mut WorldState| {
-        world
-            .register_brain_family(FT_BRAIN_KIND, Box::new(FtBrainFamily::default()))
-            .context("failed to register the versioned Frankentorch brain family")
-    };
-
-    match preset {
-        BrainPreset::Mixed => {
-            population.push(register_mlp(world)?);
-            population.push(register_dwraon(world)?);
-            population.push(register_assembly(world)?);
-            #[cfg(feature = "brain-ft")]
-            population.push(register_ft(world)?);
-        }
-        BrainPreset::Mlp => population.push(register_mlp(world)?),
-        BrainPreset::Dwraon => population.push(register_dwraon(world)?),
-        BrainPreset::Assembly => population.push(register_assembly(world)?),
-        BrainPreset::Ft => {
-            #[cfg(feature = "brain-ft")]
-            population.push(register_ft(world)?);
-            #[cfg(not(feature = "brain-ft"))]
-            bail!(
-                "brain preset `ft` requires a scriptbots-app build with the non-default \
-                 `brain-ft` feature"
-            );
-        }
-    }
-
-    #[cfg(feature = "neuro")]
-    if preset == BrainPreset::Mixed {
-        use scriptbots_brain_neuro::NeuroflowBrain;
-        if let Some(config) = neuro_config {
-            let key = NeuroflowBrain::register(world, config)
-                .context("failed to register configured NeuroFlow brain")?;
-            let label = world
-                .brain_registry()
-                .kind(key)
-                .unwrap_or("neuroflow")
-                .to_owned();
-            warn!(
-                brain = %label,
-                key,
-                "NeuroFlow remains available as an explicitly selected legacy runner, but it \
-                 has no versioned genome/evaluator-state protocol codec and is WITHHELD from \
-                 the founding population. Admitting it would reintroduce an opaque hereditary \
-                 state beside the canonical protocol families."
-            );
-            withheld.push((label, key));
-        }
-    }
-
-    let installed = InstalledBrains {
-        population,
-        withheld,
-    };
-
-    // One consolidated line, so the composition of the founding population is a matter of
-    // record rather than something a reader has to reconstruct from scattered warnings.
-    // A run whose brain roster differs from what the operator assumed is a run whose
-    // results mean something other than what they think.
-    if installed.withheld.is_empty() {
-        info!(
-            registered = installed.registered(),
-            eligible = installed.population.len(),
-            "every registered brain family implements the versioned genome/evaluator protocol; all are eligible to found the population"
-        );
-    } else {
-        let withheld_labels: Vec<&str> = installed
-            .withheld
-            .iter()
-            .map(|(label, _)| label.as_str())
-            .collect();
-        warn!(
-            registered = installed.registered(),
-            eligible = installed.population.len(),
-            withheld = ?withheld_labels,
-            "SOME BRAIN FAMILIES ARE WITHHELD FROM THE FOUNDING POPULATION because they do \
-             not implement the versioned genome/evaluator-state protocol. They remain registered \
-             and can still be selected explicitly, but no founder will be seeded with an opaque \
-             legacy hereditary state."
-        );
-    }
-
-    Ok(installed)
-}
-
 fn parse_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -5307,6 +5205,7 @@ mod tests {
             deaths: Vec::new(),
             replay_events: Vec::new(),
             narrative_events: Vec::new(),
+            genomes: Vec::new(),
         }
     }
 
@@ -5536,6 +5435,7 @@ mod tests {
                 deaths: Vec::new(),
                 replay_events: Vec::new(),
                 narrative_events: Vec::new(),
+                genomes: Vec::new(),
             })
             .expect("admit recovery fixture");
         pipeline.shutdown().expect("finalize recovery fixture");
