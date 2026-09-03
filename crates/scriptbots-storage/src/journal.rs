@@ -2853,6 +2853,7 @@ impl StorageCommandAuthorityReader {
 }
 
 impl CommandAuthorityReader for StorageCommandAuthorityReader {
+    #[allow(clippy::result_large_err)]
     fn resolve_for_submit(
         &self,
         envelope: &CommandEnvelope,
@@ -2924,6 +2925,7 @@ impl CommandAuthorityReader for StorageCommandAuthorityReader {
         )
     }
 
+    #[allow(clippy::result_large_err)]
     fn resolve_status(&self, command_id: CommandId) -> CommandAuthorityLookup {
         self.resolve(
             CommandAuthorityLookupKey::Status(command_id),

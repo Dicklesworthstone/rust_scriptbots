@@ -11,8 +11,9 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    NarrativeQueryError, RunEventDecodeError, RunEventField, RunEventIdentity, RunManifestRecord,
-    Storage, StorageDeadlines, StorageError, StoragePipeline, StorageReader,
+    ExportFormat, ExportTable, NarrativeQueryError, RunEventDecodeError, RunEventField,
+    RunEventIdentity, RunManifestRecord, Storage, StorageDeadlines, StorageError, StoragePipeline,
+    StorageReader, export_storage_table, verify_export_receipt,
 };
 use std::{
     fs,
@@ -1438,4 +1439,112 @@ fn events_without_a_counterpart_produce_no_interaction_edges() {
     );
     storage.close().expect("close storage reader");
     let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn test_bd_2z0_5_6_e2e_real_db_export_roundtrip() {
+    let start_time = Instant::now();
+    let path = temp_run_path("export_contracts_e2e");
+    let path_str = path.to_str().expect("utf8 path");
+
+    let mut pipeline =
+        StoragePipeline::create_unattributed_file_with_thresholds(path_str, 1, 1, 1, 1)
+            .expect("pipeline");
+
+    let config = ScriptBotsConfig {
+        world_width: 128,
+        world_height: 128,
+        food_cell_size: 16,
+        initial_food: 0.25,
+        food_max: 1.0,
+        persistence_interval: 1,
+        history_capacity: 32,
+        ..ScriptBotsConfig::default()
+    };
+
+    {
+        let (mut world, mut persistence) =
+            WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
+        world
+            .try_spawn_agent(AgentData::default())
+            .expect("spawn default agent");
+
+        for _ in 0..5 {
+            persistence.step(&mut world).expect("persistence step");
+        }
+    }
+
+    let shutdown = pipeline.shutdown().expect("durable pipeline shutdown");
+    assert!(shutdown.committed_tick.is_some());
+
+    let storage = StorageReader::open(path_str).expect("open storage after shutdown");
+    let manifest = storage.run_manifest().expect("load run manifest");
+
+    eprintln!(
+        "[bd-2z0.5.6] Exporting real database: run_id={}, manifest_schema={}, root_seed={}, started_at_unix_ms={}",
+        manifest.run_id,
+        manifest.manifest_schema_version,
+        manifest.root_seed,
+        manifest.started_at_unix_ms
+    );
+
+    for table in ExportTable::ALL {
+        // Export to CSV
+        let mut csv_buf = Vec::new();
+        let csv_receipt = export_storage_table(&storage, table, ExportFormat::Csv, &mut csv_buf)
+            .expect("export table to csv");
+        let csv_str = String::from_utf8(csv_buf).expect("valid utf-8 csv");
+        let csv_verified =
+            verify_export_receipt(&csv_str, table).expect("csv receipt verification");
+        assert_eq!(csv_verified.row_count, csv_receipt.row_count);
+        assert_eq!(csv_verified.checksum_blake3, csv_receipt.checksum_blake3);
+
+        // Export to JSONLines
+        let mut jsonl_buf = Vec::new();
+        let jsonl_receipt =
+            export_storage_table(&storage, table, ExportFormat::JsonLines, &mut jsonl_buf)
+                .expect("export table to jsonl");
+        let jsonl_str = String::from_utf8(jsonl_buf).expect("valid utf-8 jsonl");
+        let jsonl_verified =
+            verify_export_receipt(&jsonl_str, table).expect("jsonl receipt verification");
+        assert_eq!(jsonl_verified.row_count, jsonl_receipt.row_count);
+        assert_eq!(
+            jsonl_verified.checksum_blake3,
+            jsonl_receipt.checksum_blake3
+        );
+
+        // Cross-format row count invariant
+        assert_eq!(
+            csv_receipt.row_count, jsonl_receipt.row_count,
+            "row counts must match between CSV and JSONL for table {:?}",
+            table
+        );
+
+        // Assert expected table occupancy from 5-step simulation
+        match table {
+            ExportTable::Run => assert_eq!(csv_receipt.row_count, 1),
+            ExportTable::Agent => {
+                assert!(csv_receipt.row_count >= 1, "at least one agent persisted")
+            }
+            ExportTable::Metric => {
+                assert!(csv_receipt.row_count >= 1, "at least one metric persisted")
+            }
+            ExportTable::Lineage | ExportTable::Event => {} // Allowed to be 0 or more
+        }
+
+        eprintln!(
+            "[bd-2z0.5.6] Table {:<8} -> {} rows, CSV blake3: {}, JSONL blake3: {}",
+            table.as_str(),
+            csv_receipt.row_count,
+            csv_receipt.checksum_blake3,
+            jsonl_receipt.checksum_blake3
+        );
+    }
+
+    storage.close().expect("close storage reader");
+    let _ = fs::remove_file(&path);
+    eprintln!(
+        "[bd-2z0.5.6] End-to-end real DB export verified in {:?}",
+        start_time.elapsed()
+    );
 }

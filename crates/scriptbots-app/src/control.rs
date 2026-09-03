@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
-    HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate,
-    TerrainKind, Tick, WorldState,
+    HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind,
+    Tick, WorldState,
 };
 
 use crate::SharedWorld;

@@ -14,6 +14,12 @@ pub use bundle::{
     verify_run_bundle,
 };
 
+pub use export_pipeline::{
+    AgentExportRow, ArrowColumnSpec, ArrowDataType, CoreTableExportWriter, EventExportRow,
+    ExportFormat, ExportProvenance, ExportReceipt, ExportTable, ExportVerificationError,
+    LineageExportRow, MetricExportRow, RunExportRow, export_storage_table, verify_export_receipt,
+};
+
 pub use journal::{
     CommandJournalCursor, CommandJournalEvidence, CommandJournalPage, CommandJournalRecord,
     CommandStorageTransition, CommandStorageTransitionKind, DomainEventCursor, DomainEventEvidence,
@@ -3791,26 +3797,19 @@ pub enum GenomeStorageError {
         tick: Option<Tick>,
     },
     #[error("corrupt genome payload for genome {genome_id}: {reason}")]
-    CorruptPayload {
-        genome_id: String,
-        reason: String,
-    },
+    CorruptPayload { genome_id: String, reason: String },
     #[error("unsupported genome schema version {version} for genome {genome_id}")]
-    UnsupportedSchema {
-        genome_id: String,
-        version: u32,
-    },
-    #[error("genome digest mismatch for genome {genome_id}: expected {expected}, computed {computed}")]
+    UnsupportedSchema { genome_id: String, version: u32 },
+    #[error(
+        "genome digest mismatch for genome {genome_id}: expected {expected}, computed {computed}"
+    )]
     DigestMismatch {
         genome_id: String,
         expected: String,
         computed: String,
     },
     #[error("genome belongs to run {found} instead of expected run {expected}")]
-    RunMismatch {
-        expected: String,
-        found: String,
-    },
+    RunMismatch { expected: String, found: String },
 }
 
 /// Version-1 narrative-event fields named by strict decoder errors.
@@ -7108,7 +7107,7 @@ fn sqlite_bool(value: bool) -> SqliteValue {
     SqliteValue::Integer(i64::from(value))
 }
 
-fn sqlite_run_id(run_id: RunId) -> SqliteValue {
+pub(crate) fn sqlite_run_id(run_id: RunId) -> SqliteValue {
     SqliteValue::from(run_id.to_string())
 }
 
@@ -7243,7 +7242,7 @@ fn validate_lifecycle_record_tick(
     Ok(())
 }
 
-fn checked_u64(context: &'static str, value: i64) -> Result<u64, StorageError> {
+pub(crate) fn checked_u64(context: &'static str, value: i64) -> Result<u64, StorageError> {
     u64::try_from(value).map_err(|error| StorageError::InvalidData {
         context,
         reason: error.to_string(),
@@ -7388,7 +7387,7 @@ fn encode_u64(context: &'static str, value: u64) -> Result<i64, StorageError> {
     })
 }
 
-fn decode<T: FromSqliteValue>(
+pub(crate) fn decode<T: FromSqliteValue>(
     row: &Row,
     index: usize,
     context: &'static str,
@@ -8009,7 +8008,7 @@ impl StorageReader {
         load_run_manifest(self.connection()?, self.run_id)
     }
 
-    fn connection(&self) -> Result<&Connection, StorageError> {
+    pub(crate) fn connection(&self) -> Result<&Connection, StorageError> {
         self.conn.as_ref().ok_or(StorageError::Closed)
     }
 
@@ -10122,20 +10121,14 @@ impl StorageReader {
     }
 
     /// Read the exact versioned genome envelope by its unique `genome_id`.
-    pub fn read_genome_by_id(
-        &self,
-        genome_id: &str,
-    ) -> Result<BrainGenomeEnvelope, StorageError> {
+    pub fn read_genome_by_id(&self, genome_id: &str) -> Result<BrainGenomeEnvelope, StorageError> {
         let start = Instant::now();
         let conn = self.connection()?;
         let mut rows = conn.query_with_params(
             "SELECT genome_id, run_id, brain_kind, genome_json, genome_digest, provenance_json
              FROM genomes
              WHERE run_id = ?1 AND genome_id = ?2",
-            &[
-                sqlite_run_id(self.run_id),
-                genome_id.into(),
-            ],
+            &[sqlite_run_id(self.run_id), genome_id.into()],
         )?;
         if rows.is_empty() {
             return Err(StorageError::Genome(GenomeStorageError::NotFound {
@@ -10272,11 +10265,7 @@ impl StorageReader {
              WHERE run_id = ?1
              ORDER BY created_at_tick ASC, agent_uid ASC
              LIMIT ?2 OFFSET ?3",
-            &[
-                sqlite_run_id(self.run_id),
-                limit.into(),
-                offset.into(),
-            ],
+            &[sqlite_run_id(self.run_id), limit.into(), offset.into()],
         )?;
 
         let mut results = Vec::with_capacity(rows.len());
@@ -11729,6 +11718,7 @@ pub struct Storage {
 
 impl Storage {
     /// Save a checkpoint record to the checkpoints table.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint(
         &mut self,
         checkpoint_id: &str,
@@ -20820,20 +20810,25 @@ where
     Observer: PreparationObserver,
 {
     observer.checkpoint(PreparationStage::Materialize, progress)?;
-    let genome_id = format!("agent:{}:tick:{}", genome.agent_uid.0, genome.created_at_tick.0);
+    let genome_id = format!(
+        "agent:{}:tick:{}",
+        genome.agent_uid.0, genome.created_at_tick.0
+    );
     let agent_uid = Some(encode_u64("genomes.agent_uid", genome.agent_uid.0)?);
     let created_at_tick = encode_u64("genomes.created_at_tick", genome.created_at_tick.0)?;
     let brain_kind = genome.envelope.family_id().as_str().to_owned();
-    let genome_json = serde_json::to_string(&genome.envelope).map_err(|e| StorageError::InvalidData {
-        context: "genomes.genome_json",
-        reason: e.to_string(),
-    })?;
-    let genome_digest = genome.envelope.material_hash().to_string();
-    let provenance_json =
-        serde_json::to_string(genome.envelope.provenance()).map_err(|e| StorageError::InvalidData {
-            context: "genomes.provenance_json",
+    let genome_json =
+        serde_json::to_string(&genome.envelope).map_err(|e| StorageError::InvalidData {
+            context: "genomes.genome_json",
             reason: e.to_string(),
         })?;
+    let genome_digest = genome.envelope.material_hash().to_string();
+    let provenance_json = serde_json::to_string(genome.envelope.provenance()).map_err(|e| {
+        StorageError::InvalidData {
+            context: "genomes.provenance_json",
+            reason: e.to_string(),
+        }
+    })?;
 
     Ok(GenomeRow {
         genome_id,

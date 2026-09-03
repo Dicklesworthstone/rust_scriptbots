@@ -17,8 +17,8 @@ use subcell::{ColorDepth, Layer, SubCellBuffer, SubCellMode, quantize};
 use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},

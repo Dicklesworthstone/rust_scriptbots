@@ -9,7 +9,7 @@
 //! - Ordered lineage batch readback and bounded pagination.
 //! - Fixed-seed multi-generation E2E comparing live envelopes with reopened DB readback.
 
-use fsqlite::compat::{open_with_flags, OpenFlags, RowExt};
+use fsqlite::compat::{OpenFlags, RowExt, open_with_flags};
 use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BirthOrigin, BirthRecord, BrainFamilyId, BrainGenomeDerivation,
@@ -51,7 +51,10 @@ fn sample_batch_with_genomes(
         .filter(|b| matches!(b.origin, BirthOrigin::Born))
         .count();
     let events = if born_count > 0 {
-        vec![PersistenceEvent::new(PersistenceEventKind::Births, born_count)]
+        vec![PersistenceEvent::new(
+            PersistenceEventKind::Births,
+            born_count,
+        )]
     } else {
         Vec::new()
     };
@@ -88,8 +91,7 @@ fn create_founder_envelope(family: &str, payload: Vec<u8>) -> BrainGenomeEnvelop
         created_at: Tick(0),
         derivation: BrainGenomeDerivation::Founder,
     };
-    BrainGenomeEnvelope::new(family_id, 1, 1, payload, provenance)
-        .expect("create founder envelope")
+    BrainGenomeEnvelope::new(family_id, 1, 1, payload, provenance).expect("create founder envelope")
 }
 
 fn create_offspring_envelope(
@@ -199,7 +201,10 @@ fn test_founder_and_offspring_admission_and_readback() -> Result<(), Box<dyn std
     let read_founder = reader.read_agent_genome(AgentUid(1), Some(Tick(0)))?;
     assert_eq!(read_founder.payload(), &founder_payload);
     assert_eq!(read_founder.material_hash(), founder_hash);
-    assert_eq!(read_founder.provenance().derivation, BrainGenomeDerivation::Founder);
+    assert_eq!(
+        read_founder.provenance().derivation,
+        BrainGenomeDerivation::Founder
+    );
 
     // 2. Read founder by agent UID latest (tick = None)
     let read_founder_latest = reader.read_agent_genome(AgentUid(1), None)?;
@@ -208,9 +213,15 @@ fn test_founder_and_offspring_admission_and_readback() -> Result<(), Box<dyn std
     // 3. Read asexual offspring
     let read_asexual = reader.read_agent_genome(AgentUid(2), Some(Tick(5)))?;
     assert_eq!(read_asexual.payload(), &asexual_payload);
-    assert_eq!(read_asexual.provenance().derivation, BrainGenomeDerivation::MutationOnly);
+    assert_eq!(
+        read_asexual.provenance().derivation,
+        BrainGenomeDerivation::MutationOnly
+    );
     assert_eq!(read_asexual.provenance().parents[0], Some(AgentUid(1)));
-    assert_eq!(read_asexual.provenance().parent_genome_hashes[0], Some(founder_hash));
+    assert_eq!(
+        read_asexual.provenance().parent_genome_hashes[0],
+        Some(founder_hash)
+    );
 
     // 4. Read by genome ID
     let read_by_id = reader.read_genome_by_id("agent:1:tick:0")?;
@@ -220,7 +231,8 @@ fn test_founder_and_offspring_admission_and_readback() -> Result<(), Box<dyn std
 }
 
 #[test]
-fn test_bit_exact_float_and_subnormal_payload_preservation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_bit_exact_float_and_subnormal_payload_preservation()
+-> Result<(), Box<dyn std::error::Error>> {
     let path = temp_db_path("float_bit_exact");
     let mut pipeline = StoragePipeline::create_unattributed_file(&path)?;
 
@@ -306,7 +318,10 @@ fn test_duplicate_and_retry_idempotence() -> Result<(), Box<dyn std::error::Erro
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM genomes WHERE agent_uid = 7")?
         .get_typed(0)?;
-    assert_eq!(count, 1, "Duplicate submission must not create duplicate rows");
+    assert_eq!(
+        count, 1,
+        "Duplicate submission must not create duplicate rows"
+    );
 
     Ok(())
 }
@@ -410,9 +425,7 @@ fn test_error_conditions_and_tamper_detection() -> Result<(), Box<dyn std::error
     let conn = open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
 
     // 2. Corrupt Payload JSON
-    conn.execute(
-        "UPDATE genomes SET genome_json = 'INVALID_NOT_JSON{' WHERE agent_uid = 1",
-    )?;
+    conn.execute("UPDATE genomes SET genome_json = 'INVALID_NOT_JSON{' WHERE agent_uid = 1")?;
 
     // 3. Digest Mismatch
     conn.execute(
@@ -426,14 +439,18 @@ fn test_error_conditions_and_tamper_detection() -> Result<(), Box<dyn std::error
     let err_corrupt = reader_tampered.read_agent_genome(AgentUid(1), Some(Tick(1)));
     assert!(matches!(
         err_corrupt,
-        Err(StorageError::Genome(GenomeStorageError::CorruptPayload { .. }))
+        Err(StorageError::Genome(
+            GenomeStorageError::CorruptPayload { .. }
+        ))
     ));
 
     // Test DigestMismatch detection
     let err_digest = reader_tampered.read_agent_genome(AgentUid(2), Some(Tick(1)));
     assert!(matches!(
         err_digest,
-        Err(StorageError::Genome(GenomeStorageError::DigestMismatch { .. }))
+        Err(StorageError::Genome(
+            GenomeStorageError::DigestMismatch { .. }
+        ))
     ));
 
     Ok(())
@@ -565,7 +582,10 @@ fn test_live_simulation_multigen_e2e_reopened_db() -> Result<(), Box<dyn std::er
             live_genomes.push((uid, envelope.clone()));
         }
     }
-    assert!(!live_genomes.is_empty(), "Active agents should have brain genomes");
+    assert!(
+        !live_genomes.is_empty(),
+        "Active agents should have brain genomes"
+    );
 
     // Shutdown persistence pipeline
     pipeline.shutdown()?;
