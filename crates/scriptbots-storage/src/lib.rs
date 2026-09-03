@@ -6822,10 +6822,11 @@ impl StorageBuffer {
             }
         }
         let mut replay_keys = BTreeSet::new();
-        let mut previous_narrative_tick: Option<u64> = None;
-        let mut narrative_contract: Option<(u32, u32, u64, NarrativeInputPolicyV1)> = None;
-        let mut narrative_rows = 0_u64;
-        let mut minimum_narrative_tick = None;
+        let mut previous_narrative_tick: BTreeMap<i64, u64> = BTreeMap::new();
+        let mut narrative_contract: BTreeMap<i64, (u32, u32, u64, NarrativeInputPolicyV1)> =
+            BTreeMap::new();
+        let mut narrative_rows: BTreeMap<i64, u64> = BTreeMap::new();
+        let mut minimum_narrative_tick: BTreeMap<i64, u64> = BTreeMap::new();
         for row in &self.replay_events {
             observer.checkpoint(PreparationStage::Validate, progress)?;
             let row_tick = checked_u64("replay_events.tick", row.tick)?;
@@ -6881,9 +6882,11 @@ impl StorageBuffer {
             }
             if row.event_type == NARRATIVE_INPUT_EVENT_TYPE {
                 let record = narrative_input_record_from_row(row, false)?;
-                narrative_rows = narrative_rows.saturating_add(1);
-                minimum_narrative_tick.get_or_insert(record.input.tick.0);
-                if let Some(previous) = previous_narrative_tick {
+                *narrative_rows.entry(row.island_id).or_default() += 1;
+                minimum_narrative_tick
+                    .entry(row.island_id)
+                    .or_insert(record.input.tick.0);
+                if let Some(&previous) = previous_narrative_tick.get(&row.island_id) {
                     let expected =
                         previous
                             .checked_add(1)
@@ -6918,7 +6921,7 @@ impl StorageBuffer {
                     record.config_revision,
                     NarrativeInputPolicyV1::from(record),
                 );
-                if let Some(expected) = narrative_contract {
+                if let Some(expected) = narrative_contract.get(&row.island_id) {
                     if (contract.0, contract.1) != (expected.0, expected.1) {
                         return Err(NarrativeInputStreamError::MixedVersion {
                             tick: record.input.tick.0,
@@ -6959,9 +6962,9 @@ impl StorageBuffer {
                         }
                         .into());
                     }
-                    narrative_contract = Some(contract);
+                    narrative_contract.insert(row.island_id, contract);
                 }
-                previous_narrative_tick = Some(record.input.tick.0);
+                previous_narrative_tick.insert(row.island_id, record.input.tick.0);
             }
             if let Some(value) = row.interaction_value
                 && (!value.is_finite() || value <= 0.0)
@@ -6986,17 +6989,17 @@ impl StorageBuffer {
                 });
             }
         }
-        if let Some(last_tick) = previous_narrative_tick
-            && last_tick != enclosing_tick
-        {
-            return Err(NarrativeInputStreamError::Truncated {
-                first_offending_tick: last_tick.saturating_add(1),
-                terminal_tick: enclosing_tick,
-                rows: narrative_rows,
-                minimum_tick: minimum_narrative_tick,
-                maximum_tick: Some(last_tick),
+        for (&island_id, &last_tick) in &previous_narrative_tick {
+            if last_tick != enclosing_tick {
+                return Err(NarrativeInputStreamError::Truncated {
+                    first_offending_tick: last_tick.saturating_add(1),
+                    terminal_tick: enclosing_tick,
+                    rows: narrative_rows.get(&island_id).copied().unwrap_or(0),
+                    minimum_tick: minimum_narrative_tick.get(&island_id).copied(),
+                    maximum_tick: Some(last_tick),
+                }
+                .into());
             }
-            .into());
         }
         observer.checkpoint(PreparationStage::Validate, progress)?;
         for event in
@@ -13501,6 +13504,7 @@ impl Storage {
             }
         }
         Self::validate_run_event_search_index(connection, run_id)?;
+        Self::validate_narrative_input_reserved_identities(connection, run_id)?;
         Ok(())
     }
 
@@ -21953,6 +21957,7 @@ mod tests {
     ) -> CommandStatus {
         let mut attempts = 0;
         loop {
+            let _ = core.retry_retained_journal();
             frontend
                 .drive_at(core, ManualInstant::from_nanos(*next_nanos))
                 .expect("fault test drives its matching host");
@@ -21973,7 +21978,7 @@ mod tests {
             attempts += 1;
             assert!(
                 attempts < JOURNAL_WORKER_RETRY_LIMIT,
-                "journal command {command_id:?} did not reach a terminal state"
+                "journal command {command_id:?} did not reach a terminal state; last status: {status:?}"
             );
         }
     }
@@ -22597,9 +22602,15 @@ mod tests {
         let mut next_nanos = 0;
         let command =
             submit_fault_command(&mut frontend, &mut core, HostCommand::Step, &mut next_nanos);
+        let command_status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            command.command_id(),
+            &mut next_nanos,
+        );
         assert_journal_fault_status(
             &pipeline,
-            &command,
+            &command_status,
             HostJournalFaultPoint::AdmissionBeforeCommit,
             FailureCommitState::RolledBack,
         );
@@ -22616,7 +22627,13 @@ mod tests {
             HostCommand::Step,
             &mut next_nanos,
         );
-        assert_eq!(retry.journal(), &JournalState::Durable);
+        let retry_status = drive_journal_command_to_terminal(
+            &mut recovered_frontend,
+            &mut recovered_core,
+            retry.command_id(),
+            &mut next_nanos,
+        );
+        assert_eq!(retry_status.journal(), &JournalState::Durable);
         drop_fault_host(recovered_pipeline, recovered_core, recovered_frontend);
 
         let recovered = journal_database_snapshot(&path);
@@ -28899,14 +28916,14 @@ mod tests {
     /// WHAT THE ATTEMPT DID EARN. It found a real defect that review had missed: the in-batch
     /// `replay_keys` uniqueness set was still run-scoped after the island-aware validator pass,
     /// so four islands each numbering their replay stream from seq 0 collided. That is fixed in
-    /// the same commit, and nothing but a real archipelago would have surfaced it.
+    /// A real archipelago stepped through real barriers is recorded into storage end to end.
     ///
-    /// Written as a characterization of the CURRENT boundary: it goes RED when the narrative
-    /// stream question is settled, which forces it to be rewritten into the recorded-archipelago
-    /// assertion it was meant to be rather than left behind asserting a limitation that no
-    /// longer exists.
+    /// bd-16g.5.5.6. The narrative-input replay stream is partitioned per island (bd-yap3 Option A),
+    /// allowing a real multi-island archipelago to persist its barriers cleanly.
+    /// Asserts that COUNT(DISTINCT island_id) equals ISLANDS on every per-tick table and at
+    /// every barrier tick.
     #[test]
-    fn a_real_archipelago_barrier_is_refused_by_the_run_scoped_narrative_input_stream()
+    fn a_real_archipelago_is_recorded_into_storage_end_to_end()
     -> Result<(), Box<dyn std::error::Error>> {
         use scriptbots_runtime::{Archipelago, ArchipelagoConfig, IslandSpec, Topology};
 
@@ -28928,12 +28945,7 @@ mod tests {
             rng_seed: Some(0x0151_a4d0),
             closed: true,
             history_capacity: 8,
-            // Every tick emits a persistence batch, so a barrier always has something to record.
             persistence_interval: 1,
-            // narrative_interval = 0 does NOT suppress the narrative-input replay record --
-            // WorldState records it unconditionally. Left at 0 anyway so the fixture is not
-            // asking for narrative work it does not need; the refusal below comes from the
-            // record being emitted regardless.
             narrative_interval: 0,
             ..ScriptBotsConfig::default()
         };
@@ -29006,44 +29018,67 @@ mod tests {
             }
         }
 
-        // The archipelago really did produce complete barriers: the refusal below is about what
-        // storage does with one, not about the harness never assembling one.
+        assert!(
+            refusal.is_none(),
+            "expected barrier persistence to succeed, got: {:?}",
+            refusal
+        );
         assert!(
             complete_barriers > 0,
-            "the archipelago produced no complete barrier, so this test would be asserting a \
-             refusal that was never actually attempted"
+            "the archipelago produced no complete barrier"
         );
 
-        let refusal = refusal.expect(
-            "a fused archipelago barrier was ACCEPTED; the narrative-input stream is no longer \
-             run-scoped, so this characterization is stale and must be rewritten into the \
-             recorded-archipelago assertion it was always meant to be",
-        );
-        assert!(
-            matches!(
-                refusal,
-                StorageError::NarrativeInputStream(NarrativeInputStreamError::DuplicateTick { .. })
-            ),
-            "the refusal must be the run-scoped narrative-input contract, which is the one \
-             remaining blocker between a real archipelago and a recorded one, got: {refusal}"
-        );
-
-        // NOTHING WAS RECORDED, asserted rather than assumed. A partially-applied barrier would
-        // be worse than none: it would put a tick that only some islands closed into the
-        // durable record, which is the state the archipelago contract says storage must never
-        // observe.
         storage.flush()?;
-        let recorded: i64 = storage
-            .connection()?
+        let conn = storage.connection()?;
+
+        // 1. tick_summaries: distinct islands must equal ISLANDS
+        let distinct_islands: i64 = conn
             .query_row_with_params(
-                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                "SELECT COUNT(DISTINCT island_id) FROM tick_summaries WHERE run_id = ?1",
                 &[sqlite_run_id(storage.run_id)],
             )?
             .get_typed(0)?;
         assert_eq!(
-            recorded, 0,
-            "a refused barrier left {recorded} tick summaries behind; the refusal must be \
-             atomic or it has durably recorded a partial archipelago"
+            distinct_islands, ISLANDS as i64,
+            "tick_summaries must record all {ISLANDS} islands"
+        );
+
+        // Every island must be present at every completed barrier tick
+        for tick in 1..=i64::from(BARRIERS) {
+            let count_at_tick: i64 = conn
+                .query_row_with_params(
+                    "SELECT COUNT(DISTINCT island_id) FROM tick_summaries WHERE run_id = ?1 AND tick = ?2",
+                    &[sqlite_run_id(storage.run_id), tick.into()],
+                )?
+                .get_typed(0)?;
+            assert_eq!(
+                count_at_tick, ISLANDS as i64,
+                "at tick {tick}, exactly {ISLANDS} islands must be recorded"
+            );
+        }
+
+        // 2. replay_events: distinct islands must equal ISLANDS
+        let replay_distinct_islands: i64 = conn
+            .query_row_with_params(
+                "SELECT COUNT(DISTINCT island_id) FROM replay_events WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            replay_distinct_islands, ISLANDS as i64,
+            "replay_events must record all {ISLANDS} islands"
+        );
+
+        // 3. narrative_input_v1 events: each island must have recorded its own narrative input
+        let narrative_distinct_islands: i64 = conn
+            .query_row_with_params(
+                "SELECT COUNT(DISTINCT island_id) FROM replay_events WHERE run_id = ?1 AND event_type = ?2",
+                &[sqlite_run_id(storage.run_id), NARRATIVE_INPUT_EVENT_TYPE.into()],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            narrative_distinct_islands, ISLANDS as i64,
+            "every island must record its own narrative input stream"
         );
 
         storage.close()?;
