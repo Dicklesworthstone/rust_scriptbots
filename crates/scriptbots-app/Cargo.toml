@@ -83,6 +83,7 @@ fast-alloc = ["dep:mimalloc"]
 bevy_render = ["dep:scriptbots-bevy"]
 
 [dev-dependencies]
+fsqlite = { workspace = true }
 rand = { workspace = true }
 tempfile = "3.13"
 serial_test = "3.0"

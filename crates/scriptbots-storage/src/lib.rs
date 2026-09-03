@@ -5359,6 +5359,17 @@ pub struct ArchipelagoConservationAudit {
     pub breaches: Vec<IslandConservationBreach>,
 }
 
+/// Weighted directed migration edge in an archipelago migration graph (bd-16g.5.5.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationEdgeSummary {
+    /// Origin island.
+    pub from: u32,
+    /// Destination island.
+    pub to: u32,
+    /// Number of emigrants that traversed this edge.
+    pub count: u64,
+}
+
 /// Complete offline reconstruction of an archipelago simulation run from the DB alone (bd-16g.5.5.5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArchipelagoReport {
@@ -5369,7 +5380,7 @@ pub struct ArchipelagoReport {
     /// Per-island population and energy histories.
     pub histories: BTreeMap<u32, IslandHistory>,
     /// Directed multigraph weighted by emigrant counts: (from, to) -> count.
-    pub migration_graph: BTreeMap<(u32, u32), u64>,
+    pub migration_graph: Vec<MigrationEdgeSummary>,
     /// Complete migration move stream in canonical (tick, seq) order.
     pub migrations: Vec<ArchipelagoMigrationRecord>,
     /// Rigorous per-island population conservation audit.
@@ -10867,7 +10878,11 @@ impl StorageReader {
             let hist = self.island_history(island.island_id)?;
             histories.insert(island.island_id, hist);
         }
-        let migration_graph = self.migration_graph()?;
+        let migration_map = self.migration_graph()?;
+        let migration_graph: Vec<MigrationEdgeSummary> = migration_map
+            .into_iter()
+            .map(|((from, to), count)| MigrationEdgeSummary { from, to, count })
+            .collect();
         let migrations = self.migrations()?;
         let conservation_audit = self.audit_archipelago_conservation()?;
 

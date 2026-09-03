@@ -10108,6 +10108,7 @@ dependencies = [
  "crossterm 0.27.0",
  "csv",
  "fastmcp-rust",
+ "fsqlite",
  "futures-util",
  "libc",
  "mimalloc",
