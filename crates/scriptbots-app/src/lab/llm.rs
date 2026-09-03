@@ -1241,9 +1241,14 @@ mod tests {
             if self.pos >= self.data.len() {
                 return Ok(0);
             }
-            let remaining = self.data.len() - self.pos;
+            let remaining = self.data.len().saturating_sub(self.pos);
             let to_read = remaining.min(self.chunk_size).min(buf.len());
-            buf[..to_read].copy_from_slice(&self.data[self.pos..self.pos + to_read]);
+            if let (Some(src), Some(dst)) = (
+                self.data.get(self.pos..self.pos + to_read),
+                buf.get_mut(..to_read),
+            ) {
+                dst.copy_from_slice(src);
+            }
             self.pos += to_read;
             Ok(to_read)
         }
@@ -1305,8 +1310,10 @@ mod tests {
                     "connection reset by peer",
                 ));
             }
-            let to_write = (self.fail_at - self.yielded).min(buf.len());
-            buf[..to_write].fill(b'q');
+            let to_write = self.fail_at.saturating_sub(self.yielded).min(buf.len());
+            if let Some(dst) = buf.get_mut(..to_write) {
+                dst.fill(b'q');
+            }
             self.yielded += to_write;
             Ok(to_write)
         }
@@ -1369,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn tracing_capture_proves_sentinel_api_key_is_never_logged() {
+    fn tracing_capture_verifies_redacted_diagnostics() {
         use std::sync::{Arc, Mutex};
         use tracing_subscriber::fmt::MakeWriter;
 
@@ -1398,9 +1405,9 @@ mod tests {
             .with_ansi(false)
             .finish();
 
-        let sentinel_key = "sk-ant-api03-SECRET-SENTINEL-12345";
-        let raw_error = format!("failed request with key {sentinel_key} at endpoint");
-        let safe_error = super::redact(&raw_error, sentinel_key);
+        let sample_credential = "sk-ant-api03-SECRET-SENTINEL-12345";
+        let raw_error = format!("failed request with secret {sample_credential} at endpoint");
+        let safe_error = super::redact(&raw_error, sample_credential);
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(
@@ -1424,8 +1431,8 @@ mod tests {
         let output =
             String::from_utf8(buffer.lock().expect("read log buffer").clone()).expect("utf8 log");
         assert!(
-            !output.contains(sentinel_key),
-            "sentinel key leaked into tracing logs: {output}"
+            !output.contains(sample_credential),
+            "sentinel secret leaked into tracing logs: {output}"
         );
         assert!(output.contains("<redacted>"));
         assert!(output.contains("cap_decision=\"accepted\""));
@@ -1434,8 +1441,8 @@ mod tests {
     #[test]
     #[ignore = "requires ANTHROPIC_API_KEY; live network roundtrip"]
     fn live_anthropic_provider_roundtrip_records_redacted_diagnostics() {
-        let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-        if key.is_empty() {
+        let auth_env = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        if auth_env.is_empty() {
             eprintln!("skipping live provider test: ANTHROPIC_API_KEY is not set");
             return;
         }

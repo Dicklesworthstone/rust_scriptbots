@@ -211,7 +211,9 @@ impl PhenotypeFeatureSchemaV1 {
 /// Half-open simulation tick window.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct PhenotypeTickWindowV1 {
+    /// Inclusive start tick of the window.
     pub start_tick: u64,
+    /// Exclusive end tick of the window.
     pub end_tick: u64,
 }
 
@@ -1161,7 +1163,7 @@ pub struct LineagePhenotypeShiftSummary {
 }
 
 /// Compares two phenotype cohorts across canonical axes with effect sizes and bootstrap uncertainty (bd-2z0.11.2).
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::similar_names)]
 pub fn compare_phenotype_cohorts(
     cohort_a_name: &str,
     cohort_a: &[PhenotypeFeatureRowV1],
