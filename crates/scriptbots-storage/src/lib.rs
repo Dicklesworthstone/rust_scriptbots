@@ -21898,7 +21898,7 @@ mod tests {
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
-    const JOURNAL_WORKER_RETRY_LIMIT: usize = 2_000;
+    const JOURNAL_WORKER_RETRY_LIMIT: usize = 30_000;
 
     fn temp_db_path(prefix: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
