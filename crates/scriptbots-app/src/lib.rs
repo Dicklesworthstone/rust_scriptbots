@@ -2836,26 +2836,150 @@ mod characterization_tests {
                 // interventions. The trajectory itself was unchanged: no intervention is active.
                 // Re-pinned in bd-300o when production sensing moved to the shared Q20 fixed-point
                 // accumulator and poly-acos geometry. Tick zero deliberately remains unchanged.
+                // Re-pinned in bd-dypt / bd-271o: commit 7555ae3 (bd-drhs) restored C++ clock-channel
+                // parity for sensors 16/17 (modcounter++ before setInputs in World.cpp:36), presenting
+                // modcounter=1 on tick 1 instead of modcounter=0, intentionally moving brain outputs
+                // and world trajectory across stepping ticks 1..4 while preserving tick 0.
                 [
                     "9170abeee25b6132",
-                    "876c3009186f8816",
-                    "330430a05939febd",
-                    "8ff3e794cc4b5444",
-                    "006b041f86137fe7",
+                    "4a78d644bb987ef5",
+                    "886804ce0a6822b3",
+                    "e4e5c0ffdc445fef",
+                    "c9eaa690d8e7f587",
                 ]
                 .map(str::to_owned),
                 // Re-pinned after sensory bearings moved from the host C math library to
                 // deterministic pure-Rust `libm::atan2f`.
                 // Re-pinned again in bd-300o for the reviewed fixed-point sensing cutover;
                 // this seed's tick-zero boundary is likewise byte-identical to the old golden.
+                // Re-pinned in bd-dypt / bd-271o for C++ clock-channel parity (bd-drhs).
                 [
                     "67db1d378a2a6d53",
-                    "32ff710f669b9d3c",
-                    "7af95113c73ed23d",
-                    "1c73dcad44c88561",
-                    "228925dabed18267",
+                    "49b17b840bbf433a",
+                    "cd73560c3d16369e",
+                    "ff18e78bdfeedba7",
+                    "f4cc9dfccf064653",
                 ]
                 .map(str::to_owned),
+            ]
+        );
+
+        // bd-271o: pin per-lane digests so any future divergence immediately names its subsystem
+        // rather than collapsing into an opaque `overall` mismatch.
+        #[derive(Debug, PartialEq, Eq)]
+        struct DigestLanes {
+            overall: String,
+            agents: String,
+            food: String,
+            terrain: String,
+            rng_probe: String,
+            brain_registry: String,
+        }
+
+        let lanes_for = |trace: &CharacterizationTraceV2| -> Vec<DigestLanes> {
+            trace
+                .points
+                .iter()
+                .map(|point| DigestLanes {
+                    overall: point.digest.overall.clone(),
+                    agents: point.digest.agents.clone(),
+                    food: point.digest.food.clone(),
+                    terrain: point.digest.terrain.clone(),
+                    rng_probe: point.digest.rng_probe.clone(),
+                    brain_registry: point.digest.brain_registry.clone(),
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            lanes_for(&trace_a),
+            vec![
+                DigestLanes {
+                    overall: "9170abeee25b6132".into(),
+                    agents: "2b20b39b4fe3cf4b".into(),
+                    food: "8fab4ec8e3336b00".into(),
+                    terrain: "2d2b619501dda938".into(),
+                    rng_probe: "0ed260a44e6a9352".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+                DigestLanes {
+                    overall: "4a78d644bb987ef5".into(),
+                    agents: "5ff98438b2511628".into(),
+                    food: "d6e6c768f774c96a".into(),
+                    terrain: "2d2b619501dda938".into(),
+                    rng_probe: "0ed260a44e6a9352".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+                DigestLanes {
+                    overall: "886804ce0a6822b3".into(),
+                    agents: "ed77f29818d6d52f".into(),
+                    food: "dc7e281a5806f54d".into(),
+                    terrain: "2d2b619501dda938".into(),
+                    rng_probe: "0ed260a44e6a9352".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+                DigestLanes {
+                    overall: "e4e5c0ffdc445fef".into(),
+                    agents: "fe168f39d57a6504".into(),
+                    food: "1eafcd0df42eaeaf".into(),
+                    terrain: "2d2b619501dda938".into(),
+                    rng_probe: "0ed260a44e6a9352".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+                DigestLanes {
+                    overall: "c9eaa690d8e7f587".into(),
+                    agents: "39534dd16a48687c".into(),
+                    food: "6e39ece1674eea04".into(),
+                    terrain: "2d2b619501dda938".into(),
+                    rng_probe: "0ed260a44e6a9352".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+            ]
+        );
+
+        assert_eq!(
+            lanes_for(&trace_c),
+            vec![
+                DigestLanes {
+                    overall: "67db1d378a2a6d53".into(),
+                    agents: "a337b8e7eca8d2dc".into(),
+                    food: "8fab4ec8e3336b00".into(),
+                    terrain: "c5196626e6027979".into(),
+                    rng_probe: "1c420e84860e3132".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+                DigestLanes {
+                    overall: "49b17b840bbf433a".into(),
+                    agents: "055f77bf8b81b5bf".into(),
+                    food: "f08fee5c4a8c7e4a".into(),
+                    terrain: "c5196626e6027979".into(),
+                    rng_probe: "1c420e84860e3132".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+                DigestLanes {
+                    overall: "cd73560c3d16369e".into(),
+                    agents: "3019c11db944b4de".into(),
+                    food: "ebc83ee3b06d6514".into(),
+                    terrain: "c5196626e6027979".into(),
+                    rng_probe: "1c420e84860e3132".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+                DigestLanes {
+                    overall: "ff18e78bdfeedba7".into(),
+                    agents: "77eed45e267cc8d7".into(),
+                    food: "106368541f976c5b".into(),
+                    terrain: "c5196626e6027979".into(),
+                    rng_probe: "1c420e84860e3132".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
+                DigestLanes {
+                    overall: "f4cc9dfccf064653".into(),
+                    agents: "fb8b6b62d6e88f22".into(),
+                    food: "2ec3802128e88fbe".into(),
+                    terrain: "c5196626e6027979".into(),
+                    rng_probe: "1c420e84860e3132".into(),
+                    brain_registry: "2ca5c266a0392036".into(),
+                },
             ]
         );
 
