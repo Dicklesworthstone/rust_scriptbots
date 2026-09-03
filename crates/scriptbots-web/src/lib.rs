@@ -641,6 +641,84 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn browser_demo_executes_stats_refresh_through_real_dom() {
+        // Execute the real-browser DOM stats refresh regression proof (bd-2z0.12.6).
+        // If bun is available, it launches headless Chromium via Playwright, exercises
+        // main.js inside index.html, and verifies the camelCase contract, TPS delta
+        // derivation across >= 2 windows, snake_case rejection, and scheduling guards.
+        let bun_candidate = std::env::var("BUN_PATH")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let p = std::path::PathBuf::from("/home/ubuntu/.bun/bin/bun");
+                if p.exists() { Some(p) } else { None }
+            })
+            .or_else(|| {
+                let home = std::env::var("HOME").ok()?;
+                let p = std::path::PathBuf::from(home).join(".bun/bin/bun");
+                if p.exists() { Some(p) } else { None }
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("bun"));
+
+        let probe = std::process::Command::new(&bun_candidate)
+            .arg("--version")
+            .output();
+
+        if probe.is_err() || !probe.unwrap().status.success() {
+            eprintln!(
+                "skipping browser DOM execution test: bun runtime is not available in test environment"
+            );
+            return;
+        }
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let test_script = manifest_dir.join("web/tests/stats_dom.test.js");
+        let output = std::process::Command::new(&bun_candidate)
+            .arg(&test_script)
+            .output()
+            .expect("execute stats_dom.test.js via bun");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success()
+            && (stderr.contains("Executable doesn't exist")
+                || stderr.contains("Looks like Playwright was just installed")
+                || stderr.contains("playwright install"))
+        {
+            eprintln!(
+                "skipping browser DOM execution test: playwright browser executable is not installed on this worker"
+            );
+            return;
+        }
+
+        assert!(
+            output.status.success(),
+            "real browser DOM execution failed (exit code {:?}):\nSTDOUT:\n{}\nSTDERR:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        );
+
+        assert!(
+            stdout.contains("\"schema\":\"scriptbots.browser-stats-dom.v1\""),
+            "DOM test must emit structured scriptbots.browser-stats-dom.v1 evidence: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("\"status\":\"pass\""),
+            "DOM test must report passing status: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("\"cases_passed\":3"),
+            "DOM test must pass all 3 cases (camelCase, snake_case negative control, scheduling negative control): {}",
+            stdout
+        );
+    }
+
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn seeded_birth_records_capture_registry_and_runtime_brains_after_binding() {
