@@ -905,7 +905,10 @@ impl LabStateMachine {
     /// Advance the state machine repeatedly until reaching Finished or an unrecoverable error.
     pub fn run_to_completion(&mut self) -> Result<LabPhase, LabError> {
         while self.phase != LabPhase::Finished {
-            self.step()?;
+            let phase = self.step()?;
+            if phase == LabPhase::Finished {
+                break;
+            }
         }
         Ok(self.phase)
     }

@@ -206,23 +206,11 @@ cargo test -p scriptbots-web
 cargo test --workspace --all-features
 ```
 
-### Test lanes on this host (RCH) — read before running the full workspace [2026-09-03, bd-rch-full-workspace-lane-5mff]
+### Test lanes on this host (RCH) [Resolved 2026-09-03, bd-rch-full-workspace-lane-5mff]
 
-- The RCH worker fleet currently LACKS `libudev.pc`, so a plain `cargo test --workspace`
-  fails on every worker at the `libudev-sys` build script (bevy 0.17 → gilrs gamepad
-  stack; first observed 2026-09-03 on worker hz4, RCH-E307, after a 462s build). A local
-  fallback is NOT an acceptable substitute on this host (see the RCH section: bd-e6ff).
-- The documented remote lane until workers are provisioned with `libudev-dev` is:
-
-  ```bash
-  cargo test --workspace --exclude scriptbots-bevy --no-fail-fast
-  ```
-
-  This lane skips ONLY `scriptbots-bevy` (~187 of ~1,895 workspace tests, ≈10%). Every
-  artifact, commit message, or report produced from this lane MUST say
-  "workspace-minus-bevy" — never quote it as "workspace". `scriptbots-bevy`'s own lane
-  stays `cargo test -p scriptbots-bevy` on a machine with libudev, or through the pinned
-  DSR profile.
+- The RCH worker fleet (`hz1`, `hz2`, `hz3`, `hz4`) was provisioned with `libudev-dev` (version 259)
+  and `libwayland-dev` on 2026-09-03, resolving the `libudev-sys` build script failure in `scriptbots-bevy`.
+- `scriptbots-bevy` now builds and passes tests directly on RCH workers.
 - RCH admission is bursty: `insufficient_total_slots` refusals (exit 103) are
   infrastructure, not test results. Retry with ~60s backoff; never record an exit-103
   run as a red or green suite.
