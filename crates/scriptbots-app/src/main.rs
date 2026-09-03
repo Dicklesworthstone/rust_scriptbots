@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use asupersync::types::{Budget, Outcome};
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
+use scriptbots_app::economy_audit::{self, EconomyAuditArgs};
 #[cfg(feature = "neuro")]
 use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
@@ -152,6 +153,15 @@ fn main() -> Result<()> {
     let _launch_environment = scriptbots_app::LaunchEnvironmentV0::pin();
     let cli = AppCli::parse();
     init_tracing();
+
+    if let Some(AppSubcommand::EconomyAudit(ref audit_args)) = cli.subcommand {
+        let pass = economy_audit::run_economy_audit(audit_args)?;
+        if pass {
+            std::process::exit(0);
+        } else {
+            std::process::exit(1);
+        }
+    }
 
     if let Some(path) = cli.recover_storage.as_deref() {
         recover_storage(path)?;
@@ -2418,13 +2428,24 @@ fn maybe_emit_config(cli: &AppCli, config: &ScriptBotsConfig) -> Result<Option<C
     Ok(Some(outcome))
 }
 
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum AppSubcommand {
+    /// Economy conservation audit (bd-9sg6 / bd-16g.11.2)
+    EconomyAudit(EconomyAuditArgs),
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "scriptbots-app",
     version,
-    about = "ScriptBots simulation shell"
+    about = "ScriptBots simulation shell",
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
 )]
 struct AppCli {
+    #[command(subcommand)]
+    subcommand: Option<AppSubcommand>,
+
     /// Rendering mode (auto selects only compiled backends and otherwise uses the terminal).
     #[arg(
         long,
