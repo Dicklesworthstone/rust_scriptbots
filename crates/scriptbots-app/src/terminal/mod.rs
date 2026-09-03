@@ -6775,6 +6775,15 @@ impl Palette {
         };
 
         let mut style = base.fg(self.diet_color(class));
+        match class {
+            DietClass::Carnivore => {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            DietClass::Herbivore => {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            DietClass::Omnivore => {}
+        }
         if occupancy.boosted || total > 1 {
             style = style.add_modifier(Modifier::BOLD);
         }
@@ -9348,45 +9357,63 @@ mod tests {
     /// KNOWN GAP, pinned so it cannot be quietly forgotten or wrongly assumed
     /// fixed.
     ///
-    /// `agent_symbol` varies its glyph by diet — but only as a FALLBACK. For a
-    /// cell holding one agent it prefers a HEADING character, and heading is
-    /// almost always available, so the common case renders an arrow whose diet is
-    /// carried by colour alone. In monochrome a herbivore and a carnivore are the
-    /// same arrow.
+    /// Every lone agent conveys diet by non-colour style modifier channel (bd-q2w9).
     ///
-    /// This is a genuine TRADE rather than an omission: one cell can show heading
-    /// or diet, not both. Removing heading would regress sighted readers, and a
-    /// combined vocabulary (headings x diet classes, across the emoji/narrow/ascii
-    /// tiers) is an art-direction decision under bd-9pqz. Recorded here with a
-    /// failure message that says what to do rather than leaving the next reader to
-    /// rediscover the trade.
+    /// Formerly `a_lone_agent_conveys_diet_by_colour_alone_bd_xg82_known_gap`, which
+    /// verified that heading arrows were the same glyph across diet classes.
+    /// Under bd-q2w9, diet is also conveyed via style modifiers (BOLD for carnivore,
+    /// UNDERLINED for herbivore, normal for omnivore) so that monochrome and low-contrast
+    /// environments can distinguish them without relying on hue alone.
     #[test]
-    fn a_lone_agent_conveys_diet_by_colour_alone_bd_xg82_known_gap() {
+    fn a_lone_agent_conveys_diet_via_non_colour_modifier_channel() {
         let mut palette = Palette::test_backend_evidence();
         palette.emoji = false;
 
         let base = Style::default();
         let mut glyphs: Vec<char> = Vec::new();
+        let mut styles: Vec<Style> = Vec::new();
         for class in [
             DietClass::Herbivore,
             DietClass::Omnivore,
             DietClass::Carnivore,
         ] {
             let mut occupancy = CellOccupancy::default();
-            // One agent, with a heading — the ordinary case, which is exactly
-            // where the glyph channel is unavailable.
+            // One agent, with a heading — the ordinary case, where the glyph conveys heading.
             occupancy.add(class, false, 1.0, 0.0, 0.0, 0.5, 1);
-            let (glyph, _) = palette.agent_symbol(&occupancy, base);
+            let (glyph, style) = palette.agent_symbol(&occupancy, base);
             glyphs.push(glyph);
+            styles.push(style);
         }
 
+        // Heading glyphs remain uniform so orientation is preserved.
         let all_same = glyphs.iter().all(|g| *g == glyphs[0]);
         assert!(
             all_same,
-            "a lone agent now renders diet-distinct glyphs {glyphs:?} — the known \
-             gap this test records has been CLOSED. Update or delete this test and \
-             note it on bd-xg82; do not simply relax it"
+            "heading arrows must remain identical across diet classes"
         );
+
+        // Style modifiers must be distinct across all three diet classes!
+        assert!(
+            styles[0].add_modifier.contains(Modifier::UNDERLINED),
+            "herbivore must convey diet with UNDERLINED modifier, got {:?}",
+            styles[0].add_modifier
+        );
+        assert_eq!(
+            styles[1].add_modifier,
+            Modifier::empty(),
+            "omnivore must convey diet with normal/unmodified style, got {:?}",
+            styles[1].add_modifier
+        );
+        assert!(
+            styles[2].add_modifier.contains(Modifier::BOLD),
+            "carnivore must convey diet with BOLD modifier, got {:?}",
+            styles[2].add_modifier
+        );
+
+        // Mutually distinct modifiers
+        assert_ne!(styles[0].add_modifier, styles[1].add_modifier);
+        assert_ne!(styles[1].add_modifier, styles[2].add_modifier);
+        assert_ne!(styles[0].add_modifier, styles[2].add_modifier);
     }
 
     /// Every event kind must be distinguishable with no colour at all.

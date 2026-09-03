@@ -3,6 +3,7 @@
 //! Provides a real, trainable and evolvable neural network for agent decision-making
 //! using the `candle-core` tensor execution framework.
 
+use candle_core::{Device, Result as CandleResult, Tensor};
 use rand::Rng;
 use scriptbots_brain::{Brain, BrainCloneError, BrainKind, BrainMutationError};
 use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
@@ -98,9 +99,9 @@ impl CandleBrain {
         &self.b2
     }
 
-    /// Evaluate the neural network forward pass from inputs to outputs.
+    /// Evaluate the neural network forward pass using a reference scalar loop.
     #[must_use]
-    pub fn forward(&self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+    pub fn forward_scalar(&self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
         let mut hidden = vec![0.0f32; self.hidden_dim];
         for (h, h_val) in hidden.iter_mut().enumerate() {
             let mut sum = self.b1[h];
@@ -119,6 +120,62 @@ impl CandleBrain {
             *out_val = 1.0 / (1.0 + (-sum).exp());
         }
         outputs
+    }
+
+    /// Evaluate the neural network forward pass using real `candle_core::Tensor` operations on the given device.
+    pub fn forward_tensor(
+        &self,
+        inputs: &[f32; INPUT_SIZE],
+        device: &Device,
+    ) -> CandleResult<[f32; OUTPUT_SIZE]> {
+        let batch = self.forward_batch_tensor(std::slice::from_ref(inputs), device)?;
+        Ok(batch[0])
+    }
+
+    /// Evaluate a cohort batch of agent inputs concurrently using a single batch matmul on the given device.
+    pub fn forward_batch_tensor(
+        &self,
+        batch_inputs: &[[f32; INPUT_SIZE]],
+        device: &Device,
+    ) -> CandleResult<Vec<[f32; OUTPUT_SIZE]>> {
+        let batch_size = batch_inputs.len();
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut flat_inputs = Vec::with_capacity(batch_size * INPUT_SIZE);
+        for item in batch_inputs {
+            flat_inputs.extend_from_slice(item);
+        }
+
+        let x = Tensor::from_vec(flat_inputs, (batch_size, INPUT_SIZE), device)?;
+        let w1 = Tensor::from_slice(&self.w1, (INPUT_SIZE, self.hidden_dim), device)?;
+        let b1 = Tensor::from_slice(&self.b1, (1, self.hidden_dim), device)?;
+
+        let hidden = x.matmul(&w1)?.broadcast_add(&b1)?.tanh()?;
+
+        let w2 = Tensor::from_slice(&self.w2, (self.hidden_dim, OUTPUT_SIZE), device)?;
+        let b2 = Tensor::from_slice(&self.b2, (1, OUTPUT_SIZE), device)?;
+
+        let logits = hidden.matmul(&w2)?.broadcast_add(&b2)?;
+        let sigmoid_out = candle_nn::ops::sigmoid(&logits)?;
+
+        let flat_outputs: Vec<f32> = sigmoid_out.flatten_all()?.to_vec1()?;
+        let mut result = Vec::with_capacity(batch_size);
+        for chunk in flat_outputs.chunks_exact(OUTPUT_SIZE) {
+            let mut out = [0.0f32; OUTPUT_SIZE];
+            out.copy_from_slice(chunk);
+            result.push(out);
+        }
+
+        Ok(result)
+    }
+
+    /// Evaluate the neural network forward pass from inputs to outputs using candle tensors on CPU.
+    #[must_use]
+    pub fn forward(&self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        self.forward_tensor(inputs, &Device::Cpu)
+            .unwrap_or_else(|_| self.forward_scalar(inputs))
     }
 }
 
@@ -243,8 +300,7 @@ pub fn candle_runner() -> Box<dyn BrainRunner> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
-    use rand::rngs::SmallRng;
+    use scriptbots_core::SmallRngStream;
 
     #[test]
     fn candle_brain_evaluates_forward_pass_and_produces_finite_outputs() {
@@ -264,7 +320,7 @@ mod tests {
         let mut brain = CandleBrain::new();
         let initial_digest = brain.state_digest().expect("state digest");
 
-        let mut rng = SmallRng::seed_from_u64(42);
+        let mut rng = SmallRngStream::seed_from_u64(42);
         brain.mutate(&mut rng, 0.5, 0.2).expect("mutation succeeds");
         let mutated_digest = brain.state_digest().expect("state digest");
 
@@ -275,7 +331,7 @@ mod tests {
     fn candle_brain_crossover_produces_heritable_hybrid() {
         let mut parent_a = CandleBrain::new();
         let mut parent_b = CandleBrain::new();
-        let mut rng = SmallRng::seed_from_u64(99);
+        let mut rng = SmallRngStream::seed_from_u64(99);
 
         parent_a.mutate(&mut rng, 1.0, 1.0).unwrap();
         parent_b.mutate(&mut rng, 1.0, 1.0).unwrap();
@@ -290,5 +346,80 @@ mod tests {
 
         assert_eq!(child.hidden_dim(), parent_a.hidden_dim());
         assert_eq!(child.kind(), BrainKind::new(CANDLE_BRAIN_KIND));
+    }
+
+    #[test]
+    fn candle_brain_tensor_and_scalar_forward_numerical_parity() {
+        let brain = CandleBrain::new();
+        let test_inputs = [
+            [0.0f32; INPUT_SIZE],
+            [1.0f32; INPUT_SIZE],
+            [-0.5f32; INPUT_SIZE],
+            {
+                let mut inp = [0.0f32; INPUT_SIZE];
+                for (i, val) in inp.iter_mut().enumerate() {
+                    *val = ((i as f32) * 0.1).sin();
+                }
+                inp
+            },
+        ];
+
+        let device = Device::Cpu;
+        for inputs in &test_inputs {
+            let scalar_out = brain.forward_scalar(inputs);
+            let tensor_out = brain
+                .forward_tensor(inputs, &device)
+                .expect("tensor forward succeeds");
+
+            assert_eq!(scalar_out.len(), OUTPUT_SIZE);
+            assert_eq!(tensor_out.len(), OUTPUT_SIZE);
+            for i in 0..OUTPUT_SIZE {
+                let diff = (scalar_out[i] - tensor_out[i]).abs();
+                assert!(
+                    diff < 1e-5,
+                    "Output {i} diverged: scalar={}, tensor={}, diff={diff}",
+                    scalar_out[i],
+                    tensor_out[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn candle_brain_cohort_batch_forward_numerical_parity() {
+        let mut brain = CandleBrain::with_hidden_dim(16);
+        let mut rng = SmallRngStream::seed_from_u64(12345);
+        brain.mutate(&mut rng, 0.8, 0.3).unwrap();
+
+        let batch_size = 12;
+        let mut batch_inputs = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let mut inp = [0.0f32; INPUT_SIZE];
+            for (i, val) in inp.iter_mut().enumerate() {
+                *val = ((b * 100 + i) as f32 * 0.05).cos();
+            }
+            batch_inputs.push(inp);
+        }
+
+        let device = Device::Cpu;
+        let batch_outputs = brain
+            .forward_batch_tensor(&batch_inputs, &device)
+            .expect("batch forward succeeds");
+
+        assert_eq!(batch_outputs.len(), batch_size);
+        for (b, inputs) in batch_inputs.iter().enumerate() {
+            let scalar_out = brain.forward_scalar(inputs);
+            let batch_out = batch_outputs[b];
+
+            for i in 0..OUTPUT_SIZE {
+                let diff = (scalar_out[i] - batch_out[i]).abs();
+                assert!(
+                    diff < 1e-5,
+                    "Batch item {b} output {i} diverged: scalar={}, batch={}, diff={diff}",
+                    scalar_out[i],
+                    batch_out[i]
+                );
+            }
+        }
     }
 }
