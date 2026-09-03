@@ -15,8 +15,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scriptbots_app::{
-    CHARACTERIZATION_TRACE_V2_SCHEMA, CharacterizationTraceV2, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA,
-    RUN_MANIFEST_V3_SCHEMA, RunManifestV3,
+    CHARACTERIZATION_TRACE_V2_SCHEMA, CharacterizationTraceV2, ManifestMaskError,
+    NON_REPRODUCIBLE_MANIFEST_BLOCK, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA, RUN_MANIFEST_V3_SCHEMA,
+    RunManifestV3, canonical_json_value_bytes, mask_canonical_manifest_bytes,
 };
 use scriptbots_core::{Tick, rng_domains::AgentSubstreamProtocolV1, world_counters_digest_v1};
 use scriptbots_runtime::RunId;
@@ -712,23 +713,54 @@ fn two_identical_runs_produce_the_same_provenance() {
         "both runs must complete"
     );
 
-    let read = |dir: &Path| -> serde_json::Value {
-        let bytes = std::fs::read(dir.join("run.manifest.json")).expect("manifest exists");
-        serde_json::from_slice(&bytes).expect("valid JSON")
-    };
-    let a = read(&first);
-    let b = read(&second);
+    let raw_a = std::fs::read(first.join("run.manifest.json")).expect("manifest A exists");
+    let raw_b = std::fs::read(second.join("run.manifest.json")).expect("manifest B exists");
 
-    // The CONFIG DIGEST and the seed are the parts that must match. Timestamps,
-    // host, and durations are legitimately non-reproducible and are not compared —
-    // but they must not be allowed to hide a real difference, which is why the
-    // digest is compared rather than the whole document.
-    assert_eq!(
-        a["config_digest"], b["config_digest"],
-        "two runs of the same config disagree about their own config digest"
+    let a: serde_json::Value = serde_json::from_slice(&raw_a).expect("valid JSON A");
+    let b: serde_json::Value = serde_json::from_slice(&raw_b).expect("valid JSON B");
+
+    // The individual runs legitimately carry unique allocation identities and start timestamps.
+    assert_ne!(
+        a["identity"]["run_id"], b["identity"]["run_id"],
+        "each real run must allocate its own unique run_id"
     );
-    assert_eq!(a["root_seed"], b["root_seed"]);
-    assert_eq!(a["normalized_config"], b["normalized_config"]);
+
+    // Masking the authorized non-reproducible block yields 100% byte-identical whole documents!
+    let masked_a = mask_canonical_manifest_bytes(&raw_a, &[NON_REPRODUCIBLE_MANIFEST_BLOCK])
+        .expect("mask manifest A");
+    let masked_b = mask_canonical_manifest_bytes(&raw_b, &[NON_REPRODUCIBLE_MANIFEST_BLOCK])
+        .expect("mask manifest B");
+
+    assert_eq!(
+        masked_a, masked_b,
+        "two runs of the same build, seed, and config must produce byte-identical canonical JSON \
+         after removing only the non-reproducible block (bd-38us)"
+    );
+
+    // Injected negative 1: tampering a supposedly reproducible field (root_seed) breaks equality
+    let mut tampered: serde_json::Value = serde_json::from_slice(&raw_b).expect("parse JSON");
+    tampered["root_seed"] = serde_json::json!(9999);
+    let tampered_raw = canonical_json_value_bytes(&tampered).expect("canonical JSON");
+    let tampered_masked =
+        mask_canonical_manifest_bytes(&tampered_raw, &[NON_REPRODUCIBLE_MANIFEST_BLOCK])
+            .expect("mask tampered");
+    assert_ne!(
+        masked_a, tampered_masked,
+        "tampering a supposedly reproducible field (root_seed) must make comparison fail"
+    );
+
+    // Injected negative 2: expanding the mask beyond the authorized block must be refused
+    let expanded_err = mask_canonical_manifest_bytes(
+        &raw_a,
+        &[NON_REPRODUCIBLE_MANIFEST_BLOCK, "config_digest"],
+    );
+    assert!(
+        matches!(
+            expanded_err,
+            Err(ManifestMaskError::UnauthorizedExclusion { ref found }) if found == "config_digest"
+        ),
+        "expanding the mask must be refused with UnauthorizedExclusion, got {expanded_err:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&first);
     let _ = std::fs::remove_dir_all(&second);
@@ -982,6 +1014,84 @@ fn an_invalid_scenario_document_fails_before_any_run_artifacts_exist() {
     assert!(
         !dir.join("run.manifest.json").exists(),
         "an invalid scenario wrote a manifest"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn interrupted_run_leaves_initial_manifest_sidecar() {
+    let dir = run_dir("interrupted");
+    let db = dir.join("run.sqlite");
+    let manifest_path = dir.join("run.manifest.json");
+
+    // Launch headless with a large bootstrap count, then interrupt it once the initial sidecar is written
+    let mut command = Command::new(binary());
+    command
+        .env_remove("SCRIPTBOTS_MAX_THREADS")
+        .env("SCRIPTBOTS_STORAGE_PATH", &db)
+        .env("SCRIPTBOTS_RNG_SEED", "4242")
+        .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
+        .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_CONTROL_MCP", "http")
+        .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", "100")
+        .env("SCRIPTBOTS_TERMINAL_HEADLESS", "1")
+        .args(["--mode", "terminal", "--bootstrap-ticks", "1000"]);
+
+    let mut child = command.spawn().expect("spawn binary");
+
+    // Wait until the initial sidecar is written before bootstrap completes
+    let start = std::time::Instant::now();
+    let mut sidecar_found = false;
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        if manifest_path.is_file() {
+            sidecar_found = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        sidecar_found,
+        "initial sidecar must appear before long bootstrap completes"
+    );
+
+    // Forcefully kill the process mid-bootstrap
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // The initial sidecar must exist and be valid JSON
+    assert!(
+        manifest_path.is_file(),
+        "interrupted run must retain its initial manifest sidecar"
+    );
+    let bytes = std::fs::read(&manifest_path).expect("read manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parse manifest JSON");
+
+    // The schema is the pre-bootstrap V3 schema
+    assert_eq!(
+        manifest["schema"], RUN_MANIFEST_V3_SCHEMA,
+        "interrupted run must carry the initial launch manifest schema"
+    );
+    assert_eq!(manifest["root_seed"], 4242);
+    assert!(
+        manifest["bootstrap_evidence"].is_null(),
+        "interrupted run has no finalized bootstrap evidence"
+    );
+
+    // The database must exist and match the manifest's run_id
+    assert!(db.is_file(), "run database must exist on disk");
+    let reader =
+        StorageReader::open(db.to_str().expect("utf-8 path")).expect("open database reader");
+    let db_manifest = reader.run_manifest().expect("read database manifest");
+    let sidecar_run_id = manifest["identity"]["run_id"]
+        .as_str()
+        .expect("sidecar run_id string");
+    assert_eq!(
+        format!("{:032x}", db_manifest.run_id.get()),
+        sidecar_run_id,
+        "database run_id and manifest sidecar run_id must match"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

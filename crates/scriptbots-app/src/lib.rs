@@ -1,5 +1,6 @@
 //! Shared application plumbing for ScriptBots control surfaces.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use scriptbots_core::{
@@ -1841,11 +1842,169 @@ fn canonical_json_text<T: Serialize>(value: &T) -> Result<String, serde_json::Er
     canonical_json_bytes(value).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
-#[cfg(test)]
-fn canonical_json_value_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+/// Canonical serialization of an arbitrary JSON value.
+pub fn canonical_json_value_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
     let mut value = value.clone();
     normalize_json_value(&mut value);
     serde_json::to_vec(&value)
+}
+
+/// The explicitly named non-reproducible execution block in a run manifest.
+///
+/// Holds the legitimately variable run-scoped execution fields:
+/// allocation identity (`run_id`), timestamp (`started_at_unix_ms`),
+/// duration budget (`requested_tick_budget`), and terminal-state policy (`live_run_policy`).
+pub const NON_REPRODUCIBLE_MANIFEST_BLOCK: &str = "identity";
+
+/// Errors returned when masking non-reproducible blocks from a manifest.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ManifestMaskError {
+    /// An exclusion path was requested that is not the blessed non-reproducible block.
+    #[error(
+        "unknown or unauthorized mask exclusion: `{found}`; only `{NON_REPRODUCIBLE_MANIFEST_BLOCK}` may be masked"
+    )]
+    UnauthorizedExclusion {
+        /// The unauthorized exclusion path.
+        found: String,
+    },
+    /// The manifest JSON is missing the required non-reproducible block.
+    #[error("manifest JSON is missing required non-reproducible block `{expected}`")]
+    MissingBlock {
+        /// Expected block name.
+        expected: &'static str,
+    },
+    /// The input bytes could not be parsed as valid JSON.
+    #[error("manifest JSON parse error: {0}")]
+    Parse(String),
+    /// The canonical masked document could not be serialized.
+    #[error("manifest JSON canonical serialization error: {0}")]
+    Serialization(String),
+}
+
+/// Mask the explicitly named non-reproducible block (`identity`) from canonical manifest JSON bytes.
+///
+/// Refuses any exclusion other than [`NON_REPRODUCIBLE_MANIFEST_BLOCK`].
+pub fn mask_canonical_manifest_bytes(
+    manifest_bytes: &[u8],
+    exclusions: &[&str],
+) -> Result<Vec<u8>, ManifestMaskError> {
+    for &exclusion in exclusions {
+        if exclusion != NON_REPRODUCIBLE_MANIFEST_BLOCK {
+            return Err(ManifestMaskError::UnauthorizedExclusion {
+                found: exclusion.to_owned(),
+            });
+        }
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(manifest_bytes)
+        .map_err(|e| ManifestMaskError::Parse(e.to_string()))?;
+
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ManifestMaskError::Parse("manifest root must be a JSON object".to_owned()))?;
+
+    if object.remove(NON_REPRODUCIBLE_MANIFEST_BLOCK).is_none() {
+        return Err(ManifestMaskError::MissingBlock {
+            expected: NON_REPRODUCIBLE_MANIFEST_BLOCK,
+        });
+    }
+
+    canonical_json_value_bytes(&value).map_err(|e| ManifestMaskError::Serialization(e.to_string()))
+}
+
+/// Errors returned while writing a manifest sidecar atomically to disk.
+#[derive(Debug, Error)]
+pub enum ManifestSidecarWriteError {
+    /// Failed to create the destination's parent directory.
+    #[error("failed to create parent directory for {path}: {source}")]
+    CreateParentDirectory {
+        /// Parent directory path.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// Failed to write data to the temporary file.
+    #[error("failed to write temporary manifest file {path}: {source}")]
+    WriteTemp {
+        /// Temporary file path.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// Failed to fsync data to durable storage before renaming.
+    #[error("failed to sync temporary manifest file {path}: {source}")]
+    SyncTemp {
+        /// Temporary file path.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// Failed to atomically rename the temporary file over the target path.
+    #[error("failed to atomically rename temporary manifest {temp} to {target}: {source}")]
+    AtomicRename {
+        /// Temporary source file path.
+        temp: PathBuf,
+        /// Target destination file path.
+        target: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+}
+
+/// Atomically write manifest bytes to `target_path`.
+///
+/// Ensures the parent directory exists, writes to a sibling temporary file,
+/// flushes and fsyncs the file data, and atomically renames it to `target_path`.
+/// If any step fails, cleans up the temporary file (if possible) and returns a typed error.
+pub fn write_atomic_manifest_sidecar(
+    target_path: &Path,
+    encoded: &[u8],
+) -> Result<(), ManifestSidecarWriteError> {
+    let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent).map_err(|source| {
+            ManifestSidecarWriteError::CreateParentDirectory {
+                path: parent.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_path = parent.join(format!(
+        ".run.manifest.json.tmp-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+
+    let write_res = (|| -> Result<(), std::io::Error> {
+        let mut file = std::fs::File::create(&temp_path)?;
+        use std::io::Write;
+        file.write_all(encoded)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(source) = write_res {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(ManifestSidecarWriteError::WriteTemp {
+            path: temp_path,
+            source,
+        });
+    }
+
+    std::fs::rename(&temp_path, target_path).map_err(|source| {
+        let _ = std::fs::remove_file(&temp_path);
+        ManifestSidecarWriteError::AtomicRename {
+            temp: temp_path,
+            target: target_path.to_path_buf(),
+            source,
+        }
+    })?;
+
+    Ok(())
 }
 
 fn parse_compile_time_bool(value: &str) -> Option<bool> {
@@ -3061,6 +3220,168 @@ mod characterization_tests {
         );
         assert!(!persistence.has_pending_batch());
         assert!(persistence.fault().is_none());
+    }
+
+    #[test]
+    fn mask_canonical_manifest_scope_and_rejections() {
+        let manifest_obj = serde_json::json!({
+            "schema": "scriptbots.run-manifest.v3.5",
+            "schema_version": 3,
+            "root_seed": 4242,
+            "config_digest": "blake3:abc123",
+            "identity": {
+                "run_id": "0123456789abcdef0123456789abcdef",
+                "started_at_unix_ms": 1780000000000_u64,
+                "requested_tick_budget": 100,
+                "live_run_policy": null
+            }
+        });
+        let raw_bytes = canonical_json_value_bytes(&manifest_obj).expect("canonical json");
+
+        // Masking the authorized non-reproducible block succeeds and removes `identity`
+        let masked = mask_canonical_manifest_bytes(&raw_bytes, &[NON_REPRODUCIBLE_MANIFEST_BLOCK])
+            .expect("mask identity");
+        let masked_val: serde_json::Value = serde_json::from_slice(&masked).expect("parse masked");
+        assert!(masked_val.get("identity").is_none());
+        assert_eq!(masked_val["root_seed"], 4242);
+        assert_eq!(masked_val["config_digest"], "blake3:abc123");
+
+        // Unauthorized exclusions are refused
+        for bad in ["config_digest", "root_seed", "schema", "unknown_block"] {
+            let err = mask_canonical_manifest_bytes(
+                &raw_bytes,
+                &[NON_REPRODUCIBLE_MANIFEST_BLOCK, bad],
+            );
+            assert!(
+                matches!(err, Err(ManifestMaskError::UnauthorizedExclusion { ref found }) if found == bad),
+                "must refuse unauthorized exclusion `{bad}`"
+            );
+        }
+
+        // Missing required block is refused
+        let without_identity = serde_json::json!({
+            "schema": "scriptbots.run-manifest.v3.5",
+            "root_seed": 4242
+        });
+        let without_identity_bytes =
+            canonical_json_value_bytes(&without_identity).expect("canonical json");
+        let err = mask_canonical_manifest_bytes(
+            &without_identity_bytes,
+            &[NON_REPRODUCIBLE_MANIFEST_BLOCK],
+        );
+        assert!(
+            matches!(err, Err(ManifestMaskError::MissingBlock { expected }) if expected == NON_REPRODUCIBLE_MANIFEST_BLOCK)
+        );
+
+        // Malformed JSON is refused
+        let err = mask_canonical_manifest_bytes(b"not json", &[NON_REPRODUCIBLE_MANIFEST_BLOCK]);
+        assert!(matches!(err, Err(ManifestMaskError::Parse(_))));
+    }
+
+    #[test]
+    fn write_atomic_manifest_sidecar_behavior() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "scriptbots_sidecar_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let target_path = temp_dir.join("sub").join("run.manifest.json");
+        let initial_bytes = b"{\"initial\": true}\n";
+        write_atomic_manifest_sidecar(&target_path, initial_bytes)
+            .expect("initial atomic write");
+        assert_eq!(
+            std::fs::read(&target_path).expect("read initial"),
+            initial_bytes
+        );
+
+        // Atomic replacement
+        let finalized_bytes = b"{\"finalized\": true}\n";
+        write_atomic_manifest_sidecar(&target_path, finalized_bytes)
+            .expect("atomic replacement");
+        assert_eq!(
+            std::fs::read(&target_path).expect("read finalized"),
+            finalized_bytes
+        );
+
+        // Verify no temporary files were left behind
+        let parent = target_path.parent().expect("parent dir");
+        let entries = std::fs::read_dir(parent)
+            .expect("read dir")
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_name(), "run.manifest.json");
+
+        // Unwritable destination returns typed error
+        #[cfg(unix)]
+        {
+            let unwritable_path = PathBuf::from("/proc/sys/fs/not_writable_manifest.json");
+            let err = write_atomic_manifest_sidecar(&unwritable_path, b"{}");
+            assert!(err.is_err(), "unwritable destination must return Err");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn manifest_bootstrap_completion_mismatch_and_double_finalization() {
+        let world = test_world(Some(42));
+        let digest_0 = world.world_digest_v1().expect("digest 0");
+
+        let mut scenario = ScenarioIdentityV0::caller_seeded("bootstrap-test");
+        scenario.bootstrap_ticks = 5;
+
+        let manifest = RunManifestV3::from_world_with_provenance(
+            test_run_identity(42),
+            scenario,
+            &world,
+            complete_test_build(),
+        )
+        .expect("manifest");
+
+        // Partial completion (completed=2 < requested=5) must fail
+        let mut digest_2 = digest_0.clone();
+        digest_2.tick = scriptbots_core::Tick(2);
+        let partial_evidence = BootstrapEvidenceV0 {
+            requested: 5,
+            completed: 2,
+            start: digest_0.clone(),
+            end: digest_2,
+        };
+        let err = manifest.clone().with_bootstrap_evidence(partial_evidence);
+        assert!(
+            matches!(
+                err,
+                Err(RunManifestError::BootstrapCompletionMismatch {
+                    requested: 5,
+                    completed: 2
+                })
+            ),
+            "completed < requested must return BootstrapCompletionMismatch, got {err:?}"
+        );
+
+        // Exactly completed (completed=5 == requested=5) succeeds
+        let mut digest_5 = digest_0.clone();
+        digest_5.tick = scriptbots_core::Tick(5);
+        let valid_evidence = BootstrapEvidenceV0 {
+            requested: 5,
+            completed: 5,
+            start: digest_0.clone(),
+            end: digest_5.clone(),
+        };
+        let finalized = manifest
+            .clone()
+            .with_bootstrap_evidence(valid_evidence.clone())
+            .expect("valid evidence attaches");
+        assert_eq!(finalized.schema, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA);
+
+        // Double finalization must fail
+        let double_err = finalized.with_bootstrap_evidence(valid_evidence);
+        assert!(
+            matches!(double_err, Err(RunManifestError::BootstrapEvidenceAlreadyAttached)),
+            "double finalization must return BootstrapEvidenceAlreadyAttached, got {double_err:?}"
+        );
     }
 }
 

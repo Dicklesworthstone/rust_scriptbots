@@ -16,6 +16,7 @@ use scriptbots_app::{
     regions::{AppRoot, RegionOutcome, ServiceRegion},
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
+    write_atomic_manifest_sidecar,
 };
 #[cfg(feature = "bevy_render")]
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
@@ -1496,6 +1497,37 @@ fn prepare_run_manifest(
         }
     };
 
+    // Emit the initial canonical sidecar BEFORE scientific advancement.
+    // If the run is interrupted, fails during bootstrap, or process is killed,
+    // this initial parseable sidecar remains next to the run database.
+    match manifest.canonical_json_bytes() {
+        Ok(encoded) => {
+            if let Err(error) = write_atomic_manifest_sidecar(&manifest_path, &encoded) {
+                warn!(
+                    error = %error,
+                    path = %manifest_path.display(),
+                    "could not write initial run-manifest sidecar; database provenance remains durable"
+                );
+            } else {
+                info!(
+                    path = %manifest_path.display(),
+                    config_digest = %manifest.config_digest,
+                    root_seed = manifest.root_seed,
+                    reproducible = manifest.reproducible,
+                    warnings = manifest.warnings.len(),
+                    "wrote initial run manifest sidecar"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %manifest_path.display(),
+                "could not serialize initial run-manifest sidecar; database provenance remains durable"
+            );
+        }
+    }
+
     Some(PendingRunManifest {
         path: manifest_path,
         manifest,
@@ -1551,7 +1583,7 @@ fn emit_run_manifest(world: &WorldState, pending: Option<PendingRunManifest>, co
 
     match manifest.canonical_json_bytes() {
         Ok(encoded) => {
-            if let Err(error) = std::fs::write(&path, &encoded) {
+            if let Err(error) = write_atomic_manifest_sidecar(&path, &encoded) {
                 warn!(
                     error = %error,
                     path = %path.display(),
