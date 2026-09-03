@@ -113,6 +113,7 @@ pub fn create_audit_world(seed: u64) -> Result<WorldState> {
         closed: false,
         population_minimum: 8,
         population_spawn_interval: 5,
+        max_agents: 32,
         aging_tick_interval: 1,
         aging_health_decay_rate: 0.005,
         aging_health_decay_max: 0.05,

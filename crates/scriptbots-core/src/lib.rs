@@ -46711,18 +46711,141 @@ mod tests {
                 !verdict.pass,
                 "fault {fault:?} was not detected within 64 ticks"
             );
-            let first_breach = verdict.seeds[0].breaches.first().or_else(|| {
-                // Cumulative-only detections have no per-tick breach rows.
-                None
-            });
-            if let Some(breach) = first_breach {
-                assert!(
-                    breach.tick.0 <= 64,
-                    "fault {fault:?} detected too late (tick {})",
-                    breach.tick.0
-                );
+            let first_breach = verdict.seeds[0]
+                .breaches
+                .first()
+                .expect("every fault must record at least one per-tick breach");
+            assert!(
+                first_breach.tick.0 <= 20,
+                "fault {fault:?} detected too late (tick {})",
+                first_breach.tick.0
+            );
+
+            // Per bd-16g.11.2 & QuietBeaver: table typed by fault shape.
+            // Distortion faults assert the corrupt flow category when direct.
+            // Omission faults assert stock and first-breach bound only (omitted flows cannot rank highest).
+            match fault {
+                LedgerFault::DoubleCreditIntake => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentEnergy);
+                }
+                LedgerFault::DropActuationPosting => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentHealth);
+                }
+                LedgerFault::DropTemperaturePosting => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentHealth);
+                }
+                LedgerFault::HalveWasteDebit => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::GridFood);
+                }
+                LedgerFault::MislabelSunlightAsTransfer => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::GridFood);
+                }
+                LedgerFault::MislabelCarcassAsTransfer => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentHealth);
+                }
+                LedgerFault::SkipDeathResidue => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentEnergy);
+                }
+                LedgerFault::ForgetEnergyCapSpill => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentEnergy);
+                    assert_eq!(
+                        first_breach.worst_category,
+                        Some(ResourceFlowKind::GroundFoodConversion)
+                    );
+                }
+                LedgerFault::ScaleMetabolismDrainBy10 => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentHealth);
+                }
+                LedgerFault::CreditIntakeWithoutHealthGate => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::GridFood);
+                }
+                LedgerFault::ForgetHealthCapSpill => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentEnergy);
+                }
+                LedgerFault::DropAgingPosting => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentHealth);
+                }
+                LedgerFault::DropCombatPosting => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentHealth);
+                }
+                LedgerFault::DropReproductionPosting => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentHealth);
+                }
+                LedgerFault::DropPopulationPosting => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentEnergy);
+                }
+                LedgerFault::DropInterventionPosting => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::GridFood);
+                }
+                LedgerFault::CorruptGiveTransfer => {
+                    assert_eq!(first_breach.stock, economy::EconomyStock::AgentEnergy);
+                    assert_eq!(
+                        first_breach.worst_category,
+                        Some(ResourceFlowKind::EnergySharing)
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn extreme_legal_parameters_stay_green() {
+        // Anti-alarm-fatigue negative (bd-16g.11.2): a scenario with EXTREME but legal
+        // parameters (food_growth_rate high, boost active, heavy turnover) must still
+        // pass the conservation gate. A gate that fires on a legal-but-weird config gets
+        // muted, and a muted gate is a lie in a green checkmark.
+        let config = ScriptBotsConfig {
+            food_growth_rate: 0.25,
+            boost_multiplier: 3.0,
+            reproduction_attempt_chance: 0.5,
+            reproduction_attempt_interval: 4,
+            reproduction_cooldown: 4,
+            rng_seed: Some(0xCAFE_BABE),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("extreme world");
+        for index in 0..6_u32 {
+            let agent = world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(40.0 + f32::from(index as u16) * 8.0, 60.0),
+                    health: 1.9,
+                    ..AgentData::default()
+                })
+                .expect("spawn agent");
+            world
+                .try_update_agent_runtime(agent, |runtime| {
+                    runtime.energy = 1.8;
+                    runtime.herbivore_tendency = if index % 2 == 0 { 0.1 } else { 0.9 };
+                })
+                .expect("update runtime");
+        }
+        let verdict = run_gate(&mut world, 0xCAFE_BABE, 64);
+        assert!(
+            verdict.pass,
+            "extreme legal parameters must remain green: {:?}",
+            verdict.failures
+        );
+    }
+
+    #[cfg(feature = "economy-faults")]
+    #[test]
+    fn mislabeled_sunlight_fails_with_expected_name() {
+        // NEGATIVE (bd-16g.11.2): run the gate against a ledger with a deliberately
+        // mislabeled sunlight input (external -> internal transfer) and assert the
+        // failure occurs on GridFood, proving the labeling requirement is enforced.
+        let seed = 0x5011_0001;
+        let mut world = mutation_suite_world_with_growth(seed, 0.5);
+        world.inject_ledger_fault(LedgerFault::MislabelSunlightAsTransfer);
+        let verdict = run_gate(&mut world, seed, 32);
+        assert!(
+            !verdict.pass,
+            "mislabeled sunlight must fail the conservation gate"
+        );
+        let breach = verdict.seeds[0]
+            .breaches
+            .first()
+            .expect("must record a breach");
+        assert_eq!(breach.stock, economy::EconomyStock::GridFood);
     }
 
     #[test]

@@ -255,8 +255,10 @@ pub fn select_emigrants(
         ranked_candidates.insert(island_id, scored);
     }
 
-    // Two-Phase Selection: claim candidates without double-emigration
-    let mut claimed_uids: BTreeSet<u64> = BTreeSet::new();
+    // Two-Phase Selection: claim candidates without double-emigration.
+    // Candidate organisms are scoped to their home island (IslandId, AgentUid),
+    // so claiming must be keyed on (IslandId, u64) rather than raw UID alone (bd-16g.5.5.1).
+    let mut claimed_uids: BTreeSet<(IslandId, u64)> = BTreeSet::new();
     let mut moves: Vec<EmigrantRecord> = Vec::new();
 
     for &(from_island, to_island) in &edges {
@@ -266,7 +268,7 @@ pub fn select_emigrants(
                 if selected_for_edge >= config.emigrants_per_edge {
                     break;
                 }
-                if claimed_uids.insert(candidate.uid) {
+                if claimed_uids.insert((from_island, candidate.uid)) {
                     moves.push(EmigrantRecord {
                         from_island,
                         to_island,

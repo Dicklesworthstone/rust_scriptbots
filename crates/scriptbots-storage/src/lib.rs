@@ -251,6 +251,7 @@ pub struct ArchipelagoBarrierSink {
     expected: BTreeSet<IslandId>,
     pending: BTreeMap<IslandId, PersistenceBatch>,
     tick: Option<u64>,
+    migrations: Vec<scriptbots_runtime::AppliedMigration>,
 }
 
 impl ArchipelagoBarrierSink {
@@ -272,6 +273,7 @@ impl ArchipelagoBarrierSink {
             expected,
             pending: BTreeMap::new(),
             tick: None,
+            migrations: Vec::new(),
         })
     }
 
@@ -316,6 +318,20 @@ impl ArchipelagoBarrierSink {
         Ok(())
     }
 
+    /// Record migrations that occurred during this barrier.
+    pub fn admit_migrations(
+        &mut self,
+        migrations: impl IntoIterator<Item = scriptbots_runtime::AppliedMigration>,
+    ) {
+        self.migrations.extend(migrations);
+    }
+
+    /// The migrations admitted for this barrier in application order.
+    #[must_use]
+    pub fn migrations(&self) -> &[scriptbots_runtime::AppliedMigration] {
+        &self.migrations
+    }
+
     /// Whether every expected island has reported for the barrier in progress.
     #[must_use]
     pub fn is_complete(&self) -> bool {
@@ -358,6 +374,7 @@ impl ArchipelagoBarrierSink {
     /// contract promises.
     pub fn clear(&mut self) {
         self.pending.clear();
+        self.migrations.clear();
         self.tick = None;
     }
 }
@@ -5230,11 +5247,60 @@ struct GenomeRow {
     provenance_json: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MigrationRow {
+    tick: i64,
+    seq: i64,
+    island_id_from: i64,
+    island_id_to: i64,
+    agent_uid: i64,
+    agent_uid_to: i64,
+    rule: String,
+    key_value: f64,
+    rank: i64,
+}
+
 /// Aggregate event count grouped by replay event type.
 #[derive(Debug, Clone)]
 pub struct ReplayEventCount {
     pub event_type: String,
     pub count: u64,
+}
+
+/// One configured archipelago island record read from the run database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchipelagoIslandRecord {
+    /// Stable island identity.
+    pub island_id: u32,
+    /// Human-readable scenario label.
+    pub label: String,
+    /// Pinned FNV-1a64 hash of the canonical JSON of `effective_config`.
+    pub config_hash: u64,
+    /// Serialized effective configuration JSON.
+    pub config_json: String,
+}
+
+/// One recorded organism migration read from the run database.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchipelagoMigrationRecord {
+    /// Common barrier tick at which migration ran.
+    pub tick: u64,
+    /// Zero-based application order of the migration within the barrier.
+    pub seq: u64,
+    /// Island the organism departed.
+    pub island_id_from: u32,
+    /// Island the organism arrived at.
+    pub island_id_to: u32,
+    /// Agent UID under the origin island.
+    pub agent_uid: u64,
+    /// Freshly minted Agent UID under the destination island.
+    pub agent_uid_to: u64,
+    /// Selection rule that selected the emigrant.
+    pub rule: String,
+    /// The selection key value that got the organism selected.
+    pub key_value: f64,
+    /// Rank within its origin island under the selection rule.
+    pub rank: usize,
 }
 
 /// One agent-arrival ancestry edge, read back out of the run database.
@@ -5803,6 +5869,8 @@ struct StorageBuffer {
     run_events: Vec<RunEventRow>,
     #[serde(default)]
     genomes: Vec<GenomeRow>,
+    #[serde(default)]
+    migrations: Vec<MigrationRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -6440,6 +6508,7 @@ impl StorageBuffer {
             && self.replay_events.is_empty()
             && self.run_events.is_empty()
             && self.genomes.is_empty()
+            && self.migrations.is_empty()
     }
 
     /// Total buffered rows across every table, for degraded-close reporting.
@@ -6458,6 +6527,7 @@ impl StorageBuffer {
                 .count()
             + self.run_events.len()
             + self.genomes.len()
+            + self.migrations.len()
     }
 
     fn clear(&mut self) {
@@ -6470,6 +6540,7 @@ impl StorageBuffer {
         self.replay_events.clear();
         self.run_events.clear();
         self.genomes.clear();
+        self.migrations.clear();
     }
 
     fn append(&mut self, mut other: Self) {
@@ -6482,6 +6553,7 @@ impl StorageBuffer {
         self.replay_events.append(&mut other.replay_events);
         self.run_events.append(&mut other.run_events);
         self.genomes.append(&mut other.genomes);
+        self.migrations.append(&mut other.migrations);
     }
 
     fn validate_contents(&self, enclosing_tick: u64) -> Result<(), StorageError> {
@@ -7014,6 +7086,36 @@ impl StorageBuffer {
                         event.tick
                     ),
                 ));
+            }
+        }
+        for (expected_seq, migration) in self.migrations.iter().enumerate() {
+            let migration_tick = checked_u64("migrations.tick", migration.tick)?;
+            if migration_tick != enclosing_tick {
+                return Err(StorageError::InvalidData {
+                    context: "migrations.tick",
+                    reason: format!(
+                        "migration tick {migration_tick} does not match enclosing batch tick {enclosing_tick}"
+                    ),
+                });
+            }
+            let seq = checked_u64("migrations.seq", migration.seq)?;
+            if seq != expected_seq as u64 {
+                return Err(StorageError::InvalidData {
+                    context: "migrations.seq",
+                    reason: format!("migration seq {seq} out of order, expected {expected_seq}"),
+                });
+            }
+            if migration.island_id_from == migration.island_id_to {
+                return Err(StorageError::InvalidData {
+                    context: "migrations.island_id",
+                    reason: format!(
+                        "migration cannot have identical origin and destination island {}",
+                        migration.island_id_from
+                    ),
+                });
+            }
+            if !migration.key_value.is_finite() {
+                return Err(invalid("migrations.key_value", migration.key_value));
             }
         }
         observer.checkpoint(PreparationStage::Validate, progress)?;
@@ -10422,6 +10524,97 @@ impl StorageReader {
             }
         }
         Ok(events)
+    }
+
+    /// Read all configured archipelago islands recorded for this run.
+    pub fn archipelago_islands(&self) -> Result<Vec<ArchipelagoIslandRecord>, StorageError> {
+        let connection = self.connection()?;
+        let rows = connection.query_with_params(
+            "SELECT island_id, label, config_hash, config_json
+             FROM islands
+             WHERE run_id = ?1
+             ORDER BY island_id ASC",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let mut islands = Vec::with_capacity(rows.len());
+        for row in rows {
+            let raw_id: i64 = decode(&row, 0, "islands.island_id")?;
+            let island_id = checked_u32("islands.island_id", raw_id)?;
+            let label: String = decode(&row, 1, "islands.label")?;
+            let hash_bytes: Vec<u8> = decode(&row, 2, "islands.config_hash")?;
+            let config_hash = if hash_bytes.len() == 8 {
+                u64::from_be_bytes(hash_bytes.try_into().unwrap_or_default())
+            } else {
+                0
+            };
+            let config_json: String = decode(&row, 3, "islands.config_json")?;
+            islands.push(ArchipelagoIslandRecord {
+                island_id,
+                label,
+                config_hash,
+                config_json,
+            });
+        }
+        Ok(islands)
+    }
+
+    /// Read all recorded migrations for this run in canonical (tick, seq) order.
+    pub fn migrations(&self) -> Result<Vec<ArchipelagoMigrationRecord>, StorageError> {
+        let connection = self.connection()?;
+        let rows = connection.query_with_params(
+            "SELECT tick, seq, island_id_from, island_id_to, agent_uid, agent_uid_to,
+                    rule, key_value, rank
+             FROM migrations
+             WHERE run_id = ?1
+             ORDER BY tick ASC, seq ASC",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tick = checked_u64("migrations.tick", decode(&row, 0, "migrations.tick")?)?;
+            let seq = checked_u64("migrations.seq", decode(&row, 1, "migrations.seq")?)?;
+            let from_raw: i64 = decode(&row, 2, "migrations.island_id_from")?;
+            let to_raw: i64 = decode(&row, 3, "migrations.island_id_to")?;
+            let island_id_from = checked_u32("migrations.island_id_from", from_raw)?;
+            let island_id_to = checked_u32("migrations.island_id_to", to_raw)?;
+            let agent_uid = checked_u64(
+                "migrations.agent_uid",
+                decode(&row, 4, "migrations.agent_uid")?,
+            )?;
+            let agent_uid_to = checked_u64(
+                "migrations.agent_uid_to",
+                decode(&row, 5, "migrations.agent_uid_to")?,
+            )?;
+            let rule: String = decode(&row, 6, "migrations.rule")?;
+            let key_value: f64 = decode(&row, 7, "migrations.key_value")?;
+            let rank_raw: i64 = decode(&row, 8, "migrations.rank")?;
+            let rank = usize::try_from(rank_raw).map_err(|e| StorageError::InvalidData {
+                context: "migrations.rank",
+                reason: e.to_string(),
+            })?;
+            records.push(ArchipelagoMigrationRecord {
+                tick,
+                seq,
+                island_id_from,
+                island_id_to,
+                agent_uid,
+                agent_uid_to,
+                rule,
+                key_value,
+                rank,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Reconstruct the directed migration multigraph weighted by emigrant counts.
+    pub fn migration_graph(&self) -> Result<BTreeMap<(u32, u32), u64>, StorageError> {
+        let migrations = self.migrations()?;
+        let mut graph = BTreeMap::new();
+        for m in migrations {
+            *graph.entry((m.island_id_from, m.island_id_to)).or_default() += 1;
+        }
+        Ok(graph)
     }
 
     /// Search this run's narrative text as one literal FTS5 phrase.
@@ -16701,6 +16894,7 @@ impl Storage {
             replay_events: Vec::with_capacity(payload.replay_events.len()),
             run_events: Vec::with_capacity(payload.narrative_events.len()),
             genomes: Vec::with_capacity(payload.genomes.len()),
+            migrations: Vec::new(),
         };
         observer.checkpoint(PreparationStage::Materialize, progress)?;
 
@@ -16840,37 +17034,31 @@ impl Storage {
     /// Persist a completed barrier accumulated by an [`ArchipelagoBarrierSink`].
     ///
     /// The sink owns the batches, so this takes them by reference through its accessor rather
-    /// than forcing the caller to rebuild the pair slice.
+    /// than forcing the caller to rebuild the pair slice. Admitted migrations are forwarded
+    /// into the barrier batch.
     pub fn persist_barrier_from(
         &mut self,
         sink: &ArchipelagoBarrierSink,
     ) -> Result<(), StorageError> {
         let pairs = sink.completed_barrier()?;
-        self.persist_barrier(&pairs)
+        self.persist_barrier_with_migrations(&pairs, sink.migrations())
     }
 
     /// Admit one archipelago barrier: every island's rows for a single tick, as ONE batch.
-    ///
-    /// bd-16g.5.5. This exists because the outbox batch ledger admits a single batch per
-    /// `(run_id, tick)`. Submitting each island separately through [`Self::persist_for_island`]
-    /// is refused at the SECOND island with a payload-digest conflict, no matter what order
-    /// the submissions arrive in — `same_tick_multi_island_submission_is_refused_by_the_batch_
-    /// ledger` pins that. Fusing is therefore not an optimisation; it is the only shape in
-    /// which an archipelago can persist a tick at all.
-    ///
-    /// THE ISLANDS ARE SORTED HERE RATHER THAN TRUSTED IN CALLER ORDER. The fused buffer is
-    /// hashed into the batch's identity, so two callers presenting the same barrier in
-    /// different island orders would otherwise mint two different batch ids for identical
-    /// science. The outbox retry contract requires an identical payload to reproduce an
-    /// identical batch id; sorting by `island_id` makes that true by construction instead of
-    /// by asking every caller to remember. This is the same reasoning that rules out N
-    /// concurrent submissions, applied to the fused form.
-    ///
-    /// A barrier is one tick by definition, so a batch whose tick disagrees is refused rather
-    /// than silently fused into the wrong boundary.
     pub fn persist_barrier(
         &mut self,
         islands: &[(IslandId, &PersistenceBatch)],
+    ) -> Result<(), StorageError> {
+        self.persist_barrier_with_migrations(islands, &[])
+    }
+
+    /// Admit one archipelago barrier with migrations: every island's rows and migration moves for a single tick, as ONE batch.
+    ///
+    /// bd-16g.5.5.1. Fuses all islands and all migration records for `tick` into a single atomic batch.
+    pub fn persist_barrier_with_migrations(
+        &mut self,
+        islands: &[(IslandId, &PersistenceBatch)],
+        migrations: &[scriptbots_runtime::AppliedMigration],
     ) -> Result<(), StorageError> {
         if self.terminally_failed {
             return Err(StorageError::TerminallyFailed);
@@ -16913,10 +17101,54 @@ impl Storage {
             fused.append(Self::prepare_batch_for_island(payload, *island)?);
         }
 
+        for (seq, migration) in migrations.iter().enumerate() {
+            fused.migrations.push(MigrationRow {
+                tick: encode_u64("migrations.tick", tick)?,
+                seq: checked_i64("migrations.seq", seq)?,
+                island_id_from: i64::from(migration.from.island.0),
+                island_id_to: i64::from(migration.to.island.0),
+                agent_uid: encode_u64("migrations.agent_uid", migration.from.uid.0)?,
+                agent_uid_to: encode_u64("migrations.agent_uid_to", migration.to.uid.0)?,
+                rule: format!("{:?}", migration.rule),
+                key_value: migration.key_value,
+                rank: checked_i64("migrations.rank", migration.rank)?,
+            });
+        }
+
         let (receipt, newly_admitted) = self.stage_outbox(tick, &fused)?;
         if newly_admitted {
             self.enqueue_staged(receipt.batch_id, fused)?;
         }
+        Ok(())
+    }
+
+    /// Record the static metadata of all configured archipelago islands.
+    pub fn persist_islands(
+        &mut self,
+        islands: &[scriptbots_runtime::IslandMeta],
+    ) -> Result<(), StorageError> {
+        let mut tx = self.connection()?.transaction()?;
+        for island in islands {
+            let config_json = serde_json::to_string(&island.effective_config).map_err(|e| {
+                StorageError::InvalidData {
+                    context: "islands.config_json",
+                    reason: e.to_string(),
+                }
+            })?;
+            tx.execute_with_params(
+                "INSERT OR REPLACE INTO islands (
+                    run_id, island_id, label, config_hash, config_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    sqlite_run_id(self.run_id),
+                    (i64::from(island.id.0)).into(),
+                    island.label.as_str().into(),
+                    island.config_hash.to_be_bytes().as_slice().into(),
+                    config_json.as_str().into(),
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -17353,6 +17585,38 @@ impl Storage {
         Ok(inserted)
     }
 
+    fn insert_migrations(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[MigrationRow],
+    ) -> Result<(), FrankenError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sql = "insert or replace into migrations (
+                run_id, tick, seq, island_id_from, island_id_to,
+                agent_uid, agent_uid_to, rule, key_value, rank
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+        for row in rows {
+            tx.execute_with_params(
+                sql,
+                &[
+                    sqlite_run_id(run_id),
+                    row.tick.into(),
+                    row.seq.into(),
+                    row.island_id_from.into(),
+                    row.island_id_to.into(),
+                    row.agent_uid.into(),
+                    row.agent_uid_to.into(),
+                    row.rule.as_str().into(),
+                    row.key_value.into(),
+                    row.rank.into(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn flush_attempt(
         connection: &Connection,
         path: &str,
@@ -17417,6 +17681,7 @@ impl Storage {
             interaction_rows = Self::insert_interactions(&tx, run_id, &buffer.replay_events)?;
             Self::insert_run_events(&tx, run_id, &buffer.run_events)?;
             Self::insert_genomes(&tx, run_id, &buffer.genomes)?;
+            Self::insert_migrations(&tx, run_id, &buffer.migrations)?;
             #[cfg(test)]
             fail_at_host_journal_transaction_fault(
                 path,
@@ -29082,6 +29347,230 @@ mod tests {
         );
 
         storage.close()?;
+        Ok(())
+    }
+
+    /// bd-16g.5.5.1: archipelago islands and migrations are written to the database and
+    /// reconstructed from the database alone.
+    ///
+    /// Proves:
+    /// - `islands` table records static metadata for every configured island.
+    /// - `migrations` table records every applied migration move in canonical (tick, seq) order.
+    /// - FROM THE DB ALONE:
+    ///   1. Directed multigraph edges match the configured migration topology.
+    ///   2. At least one migration row has island_id_from <> island_id_to.
+    ///   3. Per-island population conservation identity closes across (births, deaths, migrations, tick_summaries).
+    #[test]
+    fn archipelago_islands_and_migrations_are_recorded_and_reconstructed_from_db_alone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_runtime::migrator::EmigrantSelectionRule;
+        use scriptbots_runtime::{
+            Archipelago, ArchipelagoConfig, ArchipelagoMigration, IslandSpec, Topology,
+        };
+
+        const ISLANDS: u32 = 4;
+        const BARRIERS: u32 = 2;
+
+        let path = temp_db_path("storage-archipelago-migrations");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let captured: Rc<RefCell<Vec<(IslandId, PersistenceBatch)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+
+        let base = ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(0x0151_a4d0),
+            closed: true,
+            history_capacity: 8,
+            persistence_interval: 1,
+            narrative_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+
+        let specs: Vec<IslandSpec> = (0..ISLANDS)
+            .map(|id| IslandSpec {
+                id: IslandId(id),
+                label: format!("island-{id}"),
+                config: base.clone(),
+            })
+            .collect();
+
+        let capture_handle = Rc::clone(&captured);
+        let mut archipelago = Archipelago::with_factories(
+            ArchipelagoConfig {
+                islands: specs,
+                topology: Topology::Ring,
+                barrier_interval: std::num::NonZeroU64::new(1).expect("nonzero"),
+                master_seed: 0x00c0_ffee,
+                host_options: HostCoreOptions::default(),
+                migration: Some(ArchipelagoMigration {
+                    interval_ticks: 1,
+                    emigrants_per_edge: 1,
+                    selection_rule: EmigrantSelectionRule::Fittest,
+                }),
+            },
+            |meta| {
+                let mut world = WorldState::new(meta.effective_config.clone())?;
+                for _ in 0..5 {
+                    world
+                        .try_spawn_agent(AgentData::default())
+                        .expect("deterministic founding agent is finite");
+                }
+                Ok(world)
+            },
+            |meta| {
+                Some(Box::new(HarnessIslandJournal {
+                    island: meta.id,
+                    captured: Rc::clone(&capture_handle),
+                    pending: Rc::new(RefCell::new(VecDeque::new())),
+                })
+                    as Box<dyn scriptbots_runtime::JournalPort>)
+            },
+        )?;
+
+        // Persist static island metadata once at construction
+        let metas: Vec<scriptbots_runtime::IslandMeta> = archipelago.islands().cloned().collect();
+        storage.persist_islands(&metas)?;
+
+        for _ in 0..BARRIERS {
+            let report = archipelago.step_to_barrier()?;
+
+            let drained: Vec<(IslandId, PersistenceBatch)> =
+                captured.borrow_mut().drain(..).collect();
+            let mut by_tick: BTreeMap<u64, Vec<(IslandId, PersistenceBatch)>> = BTreeMap::new();
+            for (island, batch) in drained {
+                by_tick
+                    .entry(batch.summary.tick.0)
+                    .or_default()
+                    .push((island, batch));
+            }
+
+            for (_tick, island_batches) in by_tick {
+                if u32::try_from(island_batches.len())? != ISLANDS {
+                    continue;
+                }
+                let mut sink = ArchipelagoBarrierSink::new((0..ISLANDS).map(IslandId))?;
+                for (island, batch) in island_batches {
+                    sink.admit(island, batch)?;
+                }
+                if let Some(migration_report) = &report.migration {
+                    sink.admit_migrations(migration_report.moves.clone());
+                }
+                storage.persist_barrier_from(&sink)?;
+            }
+        }
+
+        storage.flush()?;
+        storage.close()?;
+
+        // ===================================================================
+        // RECONSTRUCTION FROM DB ALONE
+        // ===================================================================
+        let reader = StorageReader::open(&path_string)?;
+
+        // 1. Reconstruct islands
+        let islands = reader.archipelago_islands()?;
+        assert_eq!(islands.len(), ISLANDS as usize);
+        for (i, island) in islands.iter().enumerate() {
+            assert_eq!(island.island_id, i as u32);
+            assert_eq!(island.label, format!("island-{i}"));
+            assert_ne!(island.config_hash, 0);
+            assert!(!island.config_json.is_empty());
+        }
+
+        // 2. Reconstruct migrations
+        let migrations = reader.migrations()?;
+        assert!(
+            !migrations.is_empty(),
+            "migrations table must not be empty after running with migration config"
+        );
+        for m in &migrations {
+            // bd-16g.5.5.1 acceptance: island_id_from <> island_id_to
+            assert_ne!(
+                m.island_id_from, m.island_id_to,
+                "migration must have distinct from and to islands"
+            );
+            assert_ne!(
+                m.agent_uid, m.agent_uid_to,
+                "migrated agent must change local identity between islands"
+            );
+        }
+
+        // 3. Reconstruct directed multigraph and assert edges match configured ring topology
+        let graph = reader.migration_graph()?;
+        let distinct_edges: BTreeSet<(u32, u32)> = graph.keys().copied().collect();
+        let expected_edges: BTreeSet<(u32, u32)> = [
+            (0, 1),
+            (1, 0),
+            (1, 2),
+            (2, 1),
+            (2, 3),
+            (3, 2),
+            (3, 0),
+            (0, 3),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            distinct_edges, expected_edges,
+            "reconstructed migration graph edges must equal Ring topology directed edges"
+        );
+
+        // 4. Reconstruct per-island population conservation from records alone
+        // For each island at each barrier tick:
+        // pop[t] = pop[t-1] + births[t] - deaths[t] + immigrations[t] - emigrations[t]
+        // must equal tick_summaries.agent_count.
+        let conn = reader.connection()?;
+        for island in 0..ISLANDS {
+            let mut expected_pop = 5_i64; // initial founding count
+            for tick in 1..=i64::from(BARRIERS) {
+                let recorded_born: i64 = conn
+                    .query_row_with_params(
+                        "SELECT COUNT(*) FROM births WHERE run_id = ?1 AND island_id = ?2 AND tick = ?3 AND origin = 'born'",
+                        &[sqlite_run_id(reader.run_id), (island as i64).into(), tick.into()],
+                    )?
+                    .get_typed(0)?;
+                let recorded_deaths: i64 = conn
+                    .query_row_with_params(
+                        "SELECT COUNT(*) FROM deaths WHERE run_id = ?1 AND island_id = ?2 AND tick = ?3",
+                        &[sqlite_run_id(reader.run_id), (island as i64).into(), tick.into()],
+                    )?
+                    .get_typed(0)?;
+                let immigrations: i64 = conn
+                    .query_row_with_params(
+                        "SELECT COUNT(*) FROM migrations WHERE run_id = ?1 AND island_id_to = ?2 AND tick = ?3",
+                        &[sqlite_run_id(reader.run_id), (island as i64).into(), tick.into()],
+                    )?
+                    .get_typed(0)?;
+                let emigrations: i64 = conn
+                    .query_row_with_params(
+                        "SELECT COUNT(*) FROM migrations WHERE run_id = ?1 AND island_id_from = ?2 AND tick = ?3",
+                        &[sqlite_run_id(reader.run_id), (island as i64).into(), tick.into()],
+                    )?
+                    .get_typed(0)?;
+
+                expected_pop =
+                    expected_pop + recorded_born - recorded_deaths + immigrations - emigrations;
+
+                let recorded_pop: i64 = conn
+                    .query_row_with_params(
+                        "SELECT agent_count FROM tick_summaries WHERE run_id = ?1 AND island_id = ?2 AND tick = ?3",
+                        &[sqlite_run_id(reader.run_id), (island as i64).into(), tick.into()],
+                    )?
+                    .get_typed(0)?;
+
+                assert_eq!(
+                    expected_pop, recorded_pop,
+                    "reconstructed population for island {island} at tick {tick} ({expected_pop}) does not equal recorded agent_count ({recorded_pop})"
+                );
+            }
+        }
+
+        reader.close()?;
         Ok(())
     }
 

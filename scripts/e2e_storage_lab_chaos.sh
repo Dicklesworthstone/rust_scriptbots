@@ -25,13 +25,39 @@ fi
 
 printf 'storage-lab-chaos: trace_dir=%s max_steps=512 dpor_runs=8 fixed_seeds=2 repetitions=50\n' \
   "$trace_dir"
+mkdir -p "$trace_dir"
+test_log="$(mktemp)"
 "${cargo_runner[@]}" test \
   --locked \
   -p scriptbots-storage \
   tests::lab_runtime_chaos:: \
   -- \
   --nocapture \
-  --test-threads=1
+  --test-threads=1 | tee "$test_log"
+
+# Materialize emitted traces if run was remote
+python3 -c '
+import json, re, sys, os
+trace_dir = sys.argv[1]
+log_path = sys.argv[2]
+os.makedirs(trace_dir, exist_ok=True)
+with open(log_path) as f:
+    for line in f:
+        m = re.search(r"\{\"trace\":.*\}", line)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                trace = data.get("trace", {})
+                seed = trace.get("seed", 0)
+                checkpoint = trace.get("checkpoint", "trace")
+                digest = data.get("digest", "0000000000000000")
+                fname = f"{checkpoint}-seed-{seed:016x}-{digest[:16]}.json"
+                with open(os.path.join(trace_dir, fname), "w") as out:
+                    out.write(m.group(0) + "\n")
+            except Exception:
+                pass
+' "$trace_dir" "$test_log"
+rm -f "$test_log"
 
 artifact_glob="$trace_dir"/*.json
 compgen -G "$artifact_glob" >/dev/null ||

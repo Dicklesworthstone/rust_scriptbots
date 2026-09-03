@@ -151,3 +151,73 @@ fn legacy_flag_based_invocations_continue_working() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("characterization-trace"));
 }
+
+#[test]
+fn economy_audit_cli_multi_seed_run_emits_residuals_for_each_seed() {
+    let nonce = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_dir = std::env::temp_dir().join(format!(
+        "economy_audit_multi_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let output = app_binary()
+        .arg("economy-audit")
+        .arg("--seeds")
+        .arg("3")
+        .arg("--ticks")
+        .arg("16")
+        .arg("--out")
+        .arg(&temp_dir)
+        .output()
+        .expect("spawn multi-seed economy-audit");
+
+    assert!(
+        output.status.success(),
+        "multi-seed run failed: stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(temp_dir.join("verdict.json").exists());
+    assert!(temp_dir.join("residual_1786642433.csv").exists());
+    assert!(temp_dir.join("residual_1786642434.csv").exists());
+    assert!(temp_dir.join("residual_1786642435.csv").exists());
+
+    let verdict_bytes = std::fs::read(temp_dir.join("verdict.json")).expect("read verdict");
+    let val: serde_json::Value =
+        serde_json::from_slice(&verdict_bytes).expect("parse verdict JSON");
+    assert_eq!(val["pass"], true);
+    assert_eq!(val["seeds"].as_array().unwrap().len(), 3);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn economy_audit_cli_invalid_seeds_fails_cleanly() {
+    let nonce = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_dir = std::env::temp_dir().join(format!(
+        "economy_audit_err_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let output = app_binary()
+        .arg("economy-audit")
+        .arg("--seeds")
+        .arg("not-a-number")
+        .arg("--ticks")
+        .arg("16")
+        .arg("--out")
+        .arg(&temp_dir)
+        .output()
+        .expect("spawn invalid-seeds economy-audit");
+
+    assert!(
+        !output.status.success(),
+        "invalid seeds spec must fail with non-zero exit code"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
