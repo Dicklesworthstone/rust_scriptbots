@@ -822,6 +822,30 @@ impl ChannelHostDriver {
             }
         }
     }
+
+    /// Immutable access to the driver-owned host.
+    #[must_use]
+    pub const fn host(&self) -> &FixedDeadlineHost {
+        &self.host
+    }
+
+    /// Mutable access to the driver-owned host.
+    pub fn host_mut(&mut self) -> &mut FixedDeadlineHost {
+        &mut self.host
+    }
+
+    /// Retry the exact retained journal allocation once.
+    pub fn retry_retained_journal(
+        &mut self,
+    ) -> Result<Option<crate::JournalAdmission>, HostAccessError> {
+        self.host.retry_retained_journal()
+    }
+
+    /// Consume the driver and return the retained owner-pinned host.
+    #[must_use]
+    pub fn into_host(self) -> FixedDeadlineHost {
+        self.host
+    }
 }
 
 #[cfg(test)]
