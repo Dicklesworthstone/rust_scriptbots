@@ -1898,9 +1898,9 @@ pub fn mask_canonical_manifest_bytes(
     let mut value: serde_json::Value = serde_json::from_slice(manifest_bytes)
         .map_err(|e| ManifestMaskError::Parse(e.to_string()))?;
 
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| ManifestMaskError::Parse("manifest root must be a JSON object".to_owned()))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        ManifestMaskError::Parse("manifest root must be a JSON object".to_owned())
+    })?;
 
     if object.remove(NON_REPRODUCIBLE_MANIFEST_BLOCK).is_none() {
         return Err(ManifestMaskError::MissingBlock {
@@ -3248,10 +3248,8 @@ mod characterization_tests {
 
         // Unauthorized exclusions are refused
         for bad in ["config_digest", "root_seed", "schema", "unknown_block"] {
-            let err = mask_canonical_manifest_bytes(
-                &raw_bytes,
-                &[NON_REPRODUCIBLE_MANIFEST_BLOCK, bad],
-            );
+            let err =
+                mask_canonical_manifest_bytes(&raw_bytes, &[NON_REPRODUCIBLE_MANIFEST_BLOCK, bad]);
             assert!(
                 matches!(err, Err(ManifestMaskError::UnauthorizedExclusion { ref found }) if found == bad),
                 "must refuse unauthorized exclusion `{bad}`"
@@ -3280,16 +3278,13 @@ mod characterization_tests {
 
     #[test]
     fn write_atomic_manifest_sidecar_behavior() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "scriptbots_sidecar_test_{}",
-            std::process::id()
-        ));
+        let temp_dir =
+            std::env::temp_dir().join(format!("scriptbots_sidecar_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         let target_path = temp_dir.join("sub").join("run.manifest.json");
         let initial_bytes = b"{\"initial\": true}\n";
-        write_atomic_manifest_sidecar(&target_path, initial_bytes)
-            .expect("initial atomic write");
+        write_atomic_manifest_sidecar(&target_path, initial_bytes).expect("initial atomic write");
         assert_eq!(
             std::fs::read(&target_path).expect("read initial"),
             initial_bytes
@@ -3297,8 +3292,7 @@ mod characterization_tests {
 
         // Atomic replacement
         let finalized_bytes = b"{\"finalized\": true}\n";
-        write_atomic_manifest_sidecar(&target_path, finalized_bytes)
-            .expect("atomic replacement");
+        write_atomic_manifest_sidecar(&target_path, finalized_bytes).expect("atomic replacement");
         assert_eq!(
             std::fs::read(&target_path).expect("read finalized"),
             finalized_bytes
@@ -3326,7 +3320,7 @@ mod characterization_tests {
 
     #[test]
     fn manifest_bootstrap_completion_mismatch_and_double_finalization() {
-        let world = test_world(Some(42));
+        let mut world = test_world(Some(42));
         let digest_0 = world.world_digest_v1().expect("digest 0");
 
         let mut scenario = ScenarioIdentityV0::caller_seeded("bootstrap-test");
@@ -3340,9 +3334,11 @@ mod characterization_tests {
         )
         .expect("manifest");
 
-        // Partial completion (completed=2 < requested=5) must fail
-        let mut digest_2 = digest_0.clone();
-        digest_2.tick = scriptbots_core::Tick(2);
+        // Advance 2 steps for genuine partial digest
+        for _ in 0..2 {
+            world.step().expect("step world");
+        }
+        let digest_2 = world.world_digest_v1().expect("digest 2");
         let partial_evidence = BootstrapEvidenceV0 {
             requested: 5,
             completed: 2,
@@ -3361,14 +3357,16 @@ mod characterization_tests {
             "completed < requested must return BootstrapCompletionMismatch, got {err:?}"
         );
 
-        // Exactly completed (completed=5 == requested=5) succeeds
-        let mut digest_5 = digest_0.clone();
-        digest_5.tick = scriptbots_core::Tick(5);
+        // Advance 3 more steps to reach tick 5 for genuine full completion digest
+        for _ in 0..3 {
+            world.step().expect("step world");
+        }
+        let digest_5 = world.world_digest_v1().expect("digest 5");
         let valid_evidence = BootstrapEvidenceV0 {
             requested: 5,
             completed: 5,
-            start: digest_0.clone(),
-            end: digest_5.clone(),
+            start: digest_0,
+            end: digest_5,
         };
         let finalized = manifest
             .clone()
@@ -3379,7 +3377,10 @@ mod characterization_tests {
         // Double finalization must fail
         let double_err = finalized.with_bootstrap_evidence(valid_evidence);
         assert!(
-            matches!(double_err, Err(RunManifestError::BootstrapEvidenceAlreadyAttached)),
+            matches!(
+                double_err,
+                Err(RunManifestError::BootstrapEvidenceAlreadyAttached)
+            ),
             "double finalization must return BootstrapEvidenceAlreadyAttached, got {double_err:?}"
         );
     }

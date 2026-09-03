@@ -750,16 +750,47 @@ fn two_identical_runs_produce_the_same_provenance() {
     );
 
     // Injected negative 2: expanding the mask beyond the authorized block must be refused
-    let expanded_err = mask_canonical_manifest_bytes(
-        &raw_a,
-        &[NON_REPRODUCIBLE_MANIFEST_BLOCK, "config_digest"],
-    );
+    let expanded_err =
+        mask_canonical_manifest_bytes(&raw_a, &[NON_REPRODUCIBLE_MANIFEST_BLOCK, "config_digest"]);
     assert!(
         matches!(
             expanded_err,
             Err(ManifestMaskError::UnauthorizedExclusion { ref found }) if found == "config_digest"
         ),
         "expanding the mask must be refused with UnauthorizedExclusion, got {expanded_err:?}"
+    );
+
+    let db_bytes_a = std::fs::read(first.join("run.sqlite")).expect("read db a");
+    let db_bytes_b = std::fs::read(second.join("run.sqlite")).expect("read db b");
+    let db_hash_a = blake3::hash(&db_bytes_a).to_hex().to_string();
+    let db_hash_b = blake3::hash(&db_bytes_b).to_hex().to_string();
+    let sidecar_hash_a = blake3::hash(&raw_a).to_hex().to_string();
+    let sidecar_hash_b = blake3::hash(&raw_b).to_hex().to_string();
+    let masked_hash_a = blake3::hash(&masked_a).to_hex().to_string();
+    let masked_hash_b = blake3::hash(&masked_b).to_hex().to_string();
+
+    println!(
+        "E2E_EVIDENCE: {}",
+        serde_json::json!({
+            "schema": "scriptbots.run-manifest.e2e-evidence.v1",
+            "phase": "finalized_pair",
+            "run_id_a": a["identity"]["run_id"],
+            "run_id_b": b["identity"]["run_id"],
+            "path_a": first.join("run.manifest.json").display().to_string(),
+            "path_b": second.join("run.manifest.json").display().to_string(),
+            "database_hash_a": db_hash_a,
+            "database_hash_b": db_hash_b,
+            "sidecar_hash_a": sidecar_hash_a,
+            "sidecar_hash_b": sidecar_hash_b,
+            "masked_hash_a": masked_hash_a,
+            "masked_hash_b": masked_hash_b,
+            "digest": a["config_digest"],
+            "reproducible": a["reproducible"],
+            "warning_count": a["warnings"].as_array().map_or(0, |w| w.len()),
+            "completion_count": a["bootstrap_evidence"]["completed"],
+            "first_failure": null,
+            "masked_bytes_identical": true,
+        })
     );
 
     let _ = std::fs::remove_dir_all(&first);
@@ -1066,8 +1097,7 @@ fn interrupted_run_leaves_initial_manifest_sidecar() {
         "interrupted run must retain its initial manifest sidecar"
     );
     let bytes = std::fs::read(&manifest_path).expect("read manifest");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&bytes).expect("parse manifest JSON");
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).expect("parse manifest JSON");
 
     // The schema is the pre-bootstrap V3 schema
     assert_eq!(
@@ -1092,6 +1122,28 @@ fn interrupted_run_leaves_initial_manifest_sidecar() {
         format!("{:032x}", db_manifest.run_id.get()),
         sidecar_run_id,
         "database run_id and manifest sidecar run_id must match"
+    );
+
+    let db_bytes = std::fs::read(&db).expect("read db");
+    let db_hash = blake3::hash(&db_bytes).to_hex().to_string();
+    let sidecar_hash = blake3::hash(&bytes).to_hex().to_string();
+
+    println!(
+        "E2E_EVIDENCE: {}",
+        serde_json::json!({
+            "schema": "scriptbots.run-manifest.e2e-evidence.v1",
+            "phase": "interrupted",
+            "run_id": sidecar_run_id,
+            "path": manifest_path.display().to_string(),
+            "database_hash": db_hash,
+            "sidecar_hash": sidecar_hash,
+            "digest": manifest["config_digest"],
+            "reproducible": manifest["reproducible"],
+            "warning_count": manifest["warnings"].as_array().map_or(0, |w| w.len()),
+            "completion_count": 0,
+            "first_failure": "SIGKILL/SIGTERM simulated interruption mid-bootstrap",
+            "database_matches_sidecar": true,
+        })
     );
 
     let _ = std::fs::remove_dir_all(&dir);
