@@ -44,3 +44,5 @@ beads_compliance_audit/
 .beads/.bv.lock
 .beads/daemon.lock
 .beads/last-touched
+.rch-tmp/
+.doctor/

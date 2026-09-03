@@ -540,7 +540,7 @@ pub struct AgentPhenotypeVector {
 impl AgentPhenotypeVector {
     /// Extracts canonical 6-axis feature slice.
     #[must_use]
-    pub fn features(&self) -> [f32; 6] {
+    pub const fn features(&self) -> [f32; 6] {
         [
             self.movement_speed_mean,
             self.diet_herbivore_ratio,
@@ -555,9 +555,13 @@ impl AgentPhenotypeVector {
 /// Statistical comparison between two phenotype clusters (bd-2z0.11.2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PhenotypeClusterComparison {
+    /// Human-readable label for first cluster.
     pub cluster_a_name: String,
+    /// Human-readable label for second cluster.
     pub cluster_b_name: String,
+    /// Sample size of first cluster.
     pub sample_size_a: usize,
+    /// Sample size of second cluster.
     pub sample_size_b: usize,
     /// Per-feature Cohen's d, keyed by feature name.
     ///
@@ -604,11 +608,17 @@ pub enum MahalanobisUnavailable {
 /// Comprehensive phenotype shift and interaction analysis report (bd-2z0.11.2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PhenotypeAnalysisReport {
+    /// Simulation run identity.
     pub run_id: String,
+    /// Simulation tick at which analysis was computed.
     pub tick: Tick,
+    /// Total count of living agents analyzed.
     pub total_agents_analyzed: usize,
+    /// Mean phenotype vector across all analyzed agents.
     pub mean_phenotype: Vec<f32>,
+    /// Variance per phenotype feature across all analyzed agents.
     pub phenotype_variance: Vec<f32>,
+    /// Pairwise cohort comparisons.
     pub comparisons: Vec<PhenotypeClusterComparison>,
 }
 
