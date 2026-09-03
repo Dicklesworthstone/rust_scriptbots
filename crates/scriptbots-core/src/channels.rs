@@ -93,8 +93,21 @@ impl OutputChannel {
     }
 }
 
+/// What physical or internal subsystem produces this sensory input (bd-16g.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SensorSource {
+    /// Neighbor agents perceived in the local spatial neighborhood (eyes, sound, smell, hearing, blood).
+    Neighbors,
+    /// The food grid underfoot.
+    FoodGrid,
+    /// Internal agent state (health, clocks).
+    SelfState,
+    /// External abiotic environment (temperature).
+    Environment,
+}
+
 /// What a sensor slot is actually measuring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SensorKind {
     /// How much agent-matter this eye can see.
     EyeDensity,
@@ -122,8 +135,8 @@ pub enum SensorKind {
     Clock,
 }
 
-/// One slot in a brain's sensor vector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One slot in a brain's sensor vector (bd-16g.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SensorChannel {
     /// Index in the sensor vector.
     pub index: usize,
@@ -131,28 +144,112 @@ pub struct SensorChannel {
     pub kind: SensorKind,
     /// Which eye, for the per-eye channels.
     pub eye: Option<usize>,
+    /// Which oscillator, for clock channels (0 or 1).
+    pub clock: Option<usize>,
+    /// Subsystem originating this signal.
+    pub source: SensorSource,
+    /// Normalized dynamic range (min, max). All inputs are clamped to [0.0, 1.0].
+    pub range: (f32, f32),
     /// Stable identifier for logs, analytics, and UI labels.
     pub name: &'static str,
+    /// Terse abbreviation for dense HUDs and TUI column headers.
+    pub short: &'static str,
+}
+
+/// Type alias aligning with the bead design specification (bd-16g.4.1).
+pub type SensorField = SensorChannel;
+
+impl Eq for SensorChannel {}
+
+impl std::hash::Hash for SensorChannel {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.index.hash(state);
+        self.kind.hash(state);
+        self.eye.hash(state);
+        self.clock.hash(state);
+        self.source.hash(state);
+        self.range.0.to_bits().hash(state);
+        self.range.1.to_bits().hash(state);
+        self.name.hash(state);
+        self.short.hash(state);
+    }
 }
 
 impl SensorChannel {
-    const fn eye(index: usize, kind: SensorKind, eye: usize, name: &'static str) -> Self {
+    const fn eye(
+        index: usize,
+        kind: SensorKind,
+        eye: usize,
+        name: &'static str,
+        short: &'static str,
+    ) -> Self {
         Self {
             index,
             kind,
             eye: Some(eye),
+            clock: None,
+            source: SensorSource::Neighbors,
+            range: (0.0, 1.0),
             name,
+            short,
         }
     }
 
-    const fn plain(index: usize, kind: SensorKind, name: &'static str) -> Self {
+    const fn plain(
+        index: usize,
+        kind: SensorKind,
+        source: SensorSource,
+        clock: Option<usize>,
+        name: &'static str,
+        short: &'static str,
+    ) -> Self {
         Self {
             index,
             kind,
             eye: None,
+            clock,
+            source,
+            range: (0.0, 1.0),
             name,
+            short,
         }
     }
+
+    /// Subsystem originating this channel.
+    #[must_use]
+    pub const fn source(&self) -> SensorSource {
+        self.source
+    }
+
+    /// Normalized range for this channel.
+    #[must_use]
+    pub const fn range(&self) -> (f32, f32) {
+        self.range
+    }
+
+    /// Short label abbreviation.
+    #[must_use]
+    pub const fn short(&self) -> &'static str {
+        self.short
+    }
+
+    /// Eye index if this is an eye channel.
+    #[must_use]
+    pub const fn eye_index(&self) -> Option<usize> {
+        self.eye
+    }
+
+    /// Clock index if this is an internal clock channel.
+    #[must_use]
+    pub const fn clock_index(&self) -> Option<usize> {
+        self.clock
+    }
+}
+
+/// Returns the canonical compile-time exhaustive sensor layout table (bd-16g.4.1).
+#[must_use]
+pub const fn sensor_layout() -> &'static [SensorChannel; INPUT_SIZE] {
+    &SENSOR_LAYOUT
 }
 
 /// The canonical sensor layout, in wire order.
@@ -165,32 +262,146 @@ impl SensorChannel {
 /// the scalar channels. Anyone re-deriving this layout from intuition rather
 /// than from this table will get it wrong.
 pub const SENSOR_LAYOUT: [SensorChannel; INPUT_SIZE] = [
-    SensorChannel::eye(0, SensorKind::EyeDensity, 0, "eye0_density"),
-    SensorChannel::eye(1, SensorKind::EyeRed, 0, "eye0_red"),
-    SensorChannel::eye(2, SensorKind::EyeGreen, 0, "eye0_green"),
-    SensorChannel::eye(3, SensorKind::EyeBlue, 0, "eye0_blue"),
-    SensorChannel::plain(4, SensorKind::Food, "food"),
-    SensorChannel::eye(5, SensorKind::EyeDensity, 1, "eye1_density"),
-    SensorChannel::eye(6, SensorKind::EyeRed, 1, "eye1_red"),
-    SensorChannel::eye(7, SensorKind::EyeGreen, 1, "eye1_green"),
-    SensorChannel::eye(8, SensorKind::EyeBlue, 1, "eye1_blue"),
-    SensorChannel::plain(9, SensorKind::Sound, "sound"),
-    SensorChannel::plain(10, SensorKind::Smell, "smell"),
-    SensorChannel::plain(11, SensorKind::Health, "health"),
-    SensorChannel::eye(12, SensorKind::EyeDensity, 2, "eye2_density"),
-    SensorChannel::eye(13, SensorKind::EyeRed, 2, "eye2_red"),
-    SensorChannel::eye(14, SensorKind::EyeGreen, 2, "eye2_green"),
-    SensorChannel::eye(15, SensorKind::EyeBlue, 2, "eye2_blue"),
-    SensorChannel::plain(16, SensorKind::Clock, "clock1"),
-    SensorChannel::plain(17, SensorKind::Clock, "clock2"),
-    SensorChannel::plain(18, SensorKind::Hearing, "hearing"),
-    SensorChannel::plain(19, SensorKind::Blood, "blood"),
-    SensorChannel::plain(20, SensorKind::Temperature, "temperature"),
-    SensorChannel::eye(21, SensorKind::EyeDensity, 3, "eye3_density"),
-    SensorChannel::eye(22, SensorKind::EyeRed, 3, "eye3_red"),
-    SensorChannel::eye(23, SensorKind::EyeGreen, 3, "eye3_green"),
-    SensorChannel::eye(24, SensorKind::EyeBlue, 3, "eye3_blue"),
+    SensorChannel::eye(0, SensorKind::EyeDensity, 0, "eye0_density", "e0_d"),
+    SensorChannel::eye(1, SensorKind::EyeRed, 0, "eye0_red", "e0_r"),
+    SensorChannel::eye(2, SensorKind::EyeGreen, 0, "eye0_green", "e0_g"),
+    SensorChannel::eye(3, SensorKind::EyeBlue, 0, "eye0_blue", "e0_b"),
+    SensorChannel::plain(
+        4,
+        SensorKind::Food,
+        SensorSource::FoodGrid,
+        None,
+        "food",
+        "food",
+    ),
+    SensorChannel::eye(5, SensorKind::EyeDensity, 1, "eye1_density", "e1_d"),
+    SensorChannel::eye(6, SensorKind::EyeRed, 1, "eye1_red", "e1_r"),
+    SensorChannel::eye(7, SensorKind::EyeGreen, 1, "eye1_green", "e1_g"),
+    SensorChannel::eye(8, SensorKind::EyeBlue, 1, "eye1_blue", "e1_b"),
+    SensorChannel::plain(
+        9,
+        SensorKind::Sound,
+        SensorSource::Neighbors,
+        None,
+        "sound",
+        "snd",
+    ),
+    SensorChannel::plain(
+        10,
+        SensorKind::Smell,
+        SensorSource::Neighbors,
+        None,
+        "smell",
+        "sml",
+    ),
+    SensorChannel::plain(
+        11,
+        SensorKind::Health,
+        SensorSource::SelfState,
+        None,
+        "health",
+        "hp",
+    ),
+    SensorChannel::eye(12, SensorKind::EyeDensity, 2, "eye2_density", "e2_d"),
+    SensorChannel::eye(13, SensorKind::EyeRed, 2, "eye2_red", "e2_r"),
+    SensorChannel::eye(14, SensorKind::EyeGreen, 2, "eye2_green", "e2_g"),
+    SensorChannel::eye(15, SensorKind::EyeBlue, 2, "eye2_blue", "e2_b"),
+    SensorChannel::plain(
+        16,
+        SensorKind::Clock,
+        SensorSource::SelfState,
+        Some(0),
+        "clock1",
+        "clk1",
+    ),
+    SensorChannel::plain(
+        17,
+        SensorKind::Clock,
+        SensorSource::SelfState,
+        Some(1),
+        "clock2",
+        "clk2",
+    ),
+    SensorChannel::plain(
+        18,
+        SensorKind::Hearing,
+        SensorSource::Neighbors,
+        None,
+        "hearing",
+        "hear",
+    ),
+    SensorChannel::plain(
+        19,
+        SensorKind::Blood,
+        SensorSource::Neighbors,
+        None,
+        "blood",
+        "bld",
+    ),
+    SensorChannel::plain(
+        20,
+        SensorKind::Temperature,
+        SensorSource::Environment,
+        None,
+        "temperature",
+        "temp",
+    ),
+    SensorChannel::eye(21, SensorKind::EyeDensity, 3, "eye3_density", "e3_d"),
+    SensorChannel::eye(22, SensorKind::EyeRed, 3, "eye3_red", "e3_r"),
+    SensorChannel::eye(23, SensorKind::EyeGreen, 3, "eye3_green", "e3_g"),
+    SensorChannel::eye(24, SensorKind::EyeBlue, 3, "eye3_blue", "e3_b"),
 ];
+
+/// Computes the cryptographic BLAKE3 digest of the canonical sensor layout specification (bd-16g.4.1).
+#[must_use]
+pub fn compute_sensor_layout_digest() -> String {
+    let mut hasher = blake3::Hasher::new();
+    for c in &SENSOR_LAYOUT {
+        hasher.update(c.index.to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(c.name.as_bytes());
+        hasher.update(b":");
+        hasher.update(c.short.as_bytes());
+        hasher.update(b":");
+        let kind_str = match c.kind {
+            SensorKind::EyeDensity => "EyeDensity",
+            SensorKind::EyeRed => "EyeRed",
+            SensorKind::EyeGreen => "EyeGreen",
+            SensorKind::EyeBlue => "EyeBlue",
+            SensorKind::Food => "Food",
+            SensorKind::Sound => "Sound",
+            SensorKind::Smell => "Smell",
+            SensorKind::Health => "Health",
+            SensorKind::Hearing => "Hearing",
+            SensorKind::Blood => "Blood",
+            SensorKind::Temperature => "Temperature",
+            SensorKind::Clock => "Clock",
+        };
+        hasher.update(kind_str.as_bytes());
+        hasher.update(b":");
+        let source_str = match c.source {
+            SensorSource::Neighbors => "Neighbors",
+            SensorSource::FoodGrid => "FoodGrid",
+            SensorSource::SelfState => "SelfState",
+            SensorSource::Environment => "Environment",
+        };
+        hasher.update(source_str.as_bytes());
+        hasher.update(b":eye=");
+        if let Some(e) = c.eye {
+            hasher.update(e.to_string().as_bytes());
+        }
+        hasher.update(b":clk=");
+        if let Some(clk) = c.clock {
+            hasher.update(clk.to_string().as_bytes());
+        }
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Pinned BLAKE3 digest of the canonical sensor layout specification (bd-16g.4.1).
+pub const SENSOR_LAYOUT_DIGEST: &str =
+    "ea6f6bbe9c72ad52395b73ae7acdec532af8ff20c5cfeeaeabe7d80126869083";
 
 // ---------------------------------------------------------------------------
 // Compile-time proofs. These are the whole point of the module: a mislabelled
@@ -215,6 +426,10 @@ const _: () = {
             SENSOR_LAYOUT[i].index == i,
             "sensor layout is out of order or has a duplicate index"
         );
+        assert!(
+            SENSOR_LAYOUT[i].range.0 == 0.0 && SENSOR_LAYOUT[i].range.1 == 1.0,
+            "sensor range must be normalized [0.0, 1.0]"
+        );
         i += 1;
     }
 
@@ -228,6 +443,10 @@ const _: () = {
             if let Some(owner) = SENSOR_LAYOUT[i].eye
                 && owner == eye
             {
+                assert!(
+                    matches!(SENSOR_LAYOUT[i].source, SensorSource::Neighbors),
+                    "eye sensor must have Neighbors source"
+                );
                 count += 1;
             }
             i += 1;
@@ -235,6 +454,25 @@ const _: () = {
         assert!(count == 4, "every eye needs exactly density+R+G+B");
         eye += 1;
     }
+
+    // Exactly 2 clocks with SelfState source.
+    let mut clock_count = 0;
+    let mut i = 0;
+    while i < INPUT_SIZE {
+        if let Some(clk) = SENSOR_LAYOUT[i].clock {
+            assert!(
+                clk == clock_count,
+                "clock index must match appearance order"
+            );
+            assert!(
+                matches!(SENSOR_LAYOUT[i].source, SensorSource::SelfState),
+                "clock sensor must have SelfState source"
+            );
+            clock_count += 1;
+        }
+        i += 1;
+    }
+    assert!(clock_count == 2, "exactly 2 clock channels required");
 
     // The historical bug, pinned forever: boost is 6, green is 3.
     assert!(OutputChannel::Boost.index() == 6);
@@ -408,6 +646,35 @@ mod tests {
                 assert_ne!(a.name(), b.name(), "duplicate output name {}", a.name());
             }
         }
+    }
+
+    #[test]
+    fn sensor_short_names_are_unique() {
+        for (i, a) in SENSOR_LAYOUT.iter().enumerate() {
+            for b in &SENSOR_LAYOUT[i + 1..] {
+                assert_ne!(a.short, b.short, "duplicate sensor short name {}", a.short);
+            }
+        }
+    }
+
+    #[test]
+    fn sensor_layout_accessors_and_properties() {
+        assert_eq!(sensor_layout().len(), INPUT_SIZE);
+        for (i, c) in sensor_layout().iter().enumerate() {
+            assert_eq!(c.index, i);
+            assert_eq!(c.range(), (0.0, 1.0));
+            assert!(!c.short().is_empty());
+            assert_eq!(c.short(), c.short);
+            assert_eq!(c.source(), c.source);
+            assert_eq!(c.eye_index(), c.eye);
+            assert_eq!(c.clock_index(), c.clock);
+        }
+    }
+
+    #[test]
+    fn sensor_layout_blake3_digest_matches_pinned() {
+        let digest = compute_sensor_layout_digest();
+        assert_eq!(digest, SENSOR_LAYOUT_DIGEST);
     }
 
     #[test]

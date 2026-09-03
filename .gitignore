@@ -39,10 +39,10 @@ beads_compliance_audit/
 # Beads runtime / history (JSONL source of truth is issues.jsonl when used)
 .beads/.br_history/
 .beads/.br_recovery/
-.beads/.write.lock
-.beads/.sync.lock
-.beads/.bv.lock
-.beads/daemon.lock
+.beads/*.lock
+.beads/.*.lock
+.beads/beads.db-wal*
+.beads/*.fsqlite-migration-state
 .beads/last-touched
 .rch-tmp/
 .doctor/

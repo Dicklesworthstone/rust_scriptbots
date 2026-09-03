@@ -17731,6 +17731,40 @@ impl Storage {
                     row.island_id.into(),
                 ],
             )?;
+            if let Some(parent_a) = row.parent_a {
+                let rel = if row.parent_b.is_some() {
+                    "sexual_parent_a"
+                } else {
+                    "asexual"
+                };
+                let edge_sql = "insert or ignore into lineage_edges (
+                        run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship, birth_tick
+                    ) values (?1, ?2, ?3, 0, ?4, ?5)";
+                tx.execute_with_params(
+                    edge_sql,
+                    &[
+                        sqlite_run_id(run_id),
+                        row.agent_uid.into(),
+                        parent_a.into(),
+                        rel.into(),
+                        row.tick.into(),
+                    ],
+                )?;
+            }
+            if let Some(parent_b) = row.parent_b {
+                let edge_sql = "insert or ignore into lineage_edges (
+                        run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship, birth_tick
+                    ) values (?1, ?2, ?3, 1, 'sexual_parent_b', ?4)";
+                tx.execute_with_params(
+                    edge_sql,
+                    &[
+                        sqlite_run_id(run_id),
+                        row.agent_uid.into(),
+                        parent_b.into(),
+                        row.tick.into(),
+                    ],
+                )?;
+            }
         }
         Ok(())
     }

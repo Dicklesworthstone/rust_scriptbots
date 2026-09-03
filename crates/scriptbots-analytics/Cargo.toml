@@ -17,8 +17,11 @@ scriptbots-storage = { path = "../scriptbots-storage" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 fp-frame = "0.2.0"
 fp-groupby = "0.2.0"
-parquet = { version = "58.3.0", default-features = false, features = ["flate2"] }
-arrow = { version = "58.3.0", default-features = false }
+fp-columnar = "0.2.0"
+fp-types = "0.2.0"
+fp-index = "0.2.0"
+parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }
+arrow = { version = "58.4.0", default-features = false, features = ["ipc"] }
 
 [dev-dependencies]
 libc = { workspace = true }

@@ -1232,6 +1232,25 @@ impl<W: Write> CoreTableExportWriter<W> {
 
         match self.format {
             ExportFormat::Csv => {
+                if !self.header_written {
+                    let header = match table {
+                        ExportTable::Run => {
+                            "run_id,manifest_schema_version,scenario_id,scenario_version,config_digest,root_seed_hex,source_revision,source_tree_digest,started_at_unix_ms,reproducible"
+                        }
+                        ExportTable::Agent => {
+                            "run_id,tick,agent_uid,generation,age,pos_x,pos_y,vel_x,vel_y,heading,health,energy,herbivore_tendency,brain_binding"
+                        }
+                        ExportTable::Lineage => {
+                            "run_id,child_agent_uid,parent_agent_uid,parent_ordinal,relationship,birth_tick"
+                        }
+                        ExportTable::Event => "run_id,tick,seq,kind,agent_uid,value,payload_json",
+                        ExportTable::Metric => "run_id,tick,metric_name,value",
+                    };
+                    writeln!(self.writer, "{header}")?;
+                    self.hasher.update(header.as_bytes());
+                    self.hasher.update(b"\n");
+                    self.header_written = true;
+                }
                 writeln!(
                     self.writer,
                     "# RECEIPT: table={},format=csv,row_count={},checksum_blake3={},completed_at_utc={}",
@@ -1475,50 +1494,14 @@ pub fn export_storage_table<W: Write>(
             }
         }
         ExportTable::Lineage => {
-            let limit = 1024;
-            let mut offset = 0;
-            loop {
-                let rows = reader.connection()?.query_with_params(
-                    "SELECT run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship, birth_tick
-                     FROM lineage_edges
-                     WHERE run_id = ?1
-                     ORDER BY birth_tick ASC, child_agent_uid ASC, parent_ordinal ASC
-                     LIMIT ?2 OFFSET ?3",
-                    &[sqlite_run_id(run_id), (limit as i64).into(), (offset as i64).into()],
-                )?;
-                if rows.is_empty() {
-                    break;
-                }
-                for r in &rows {
-                    let row = LineageExportRow {
-                        run_id: decode_column(r, 0, "lineage_edges.run_id")?,
-                        child_agent_uid: checked_u64(
-                            "lineage_edges.child_agent_uid",
-                            decode_column(r, 1, "lineage_edges.child_agent_uid")?,
-                        )?,
-                        parent_agent_uid: checked_u64(
-                            "lineage_edges.parent_agent_uid",
-                            decode_column(r, 2, "lineage_edges.parent_agent_uid")?,
-                        )?,
-                        parent_ordinal: decode_column::<i64>(r, 3, "lineage_edges.parent_ordinal")?
-                            as u32,
-                        relationship: decode_column(r, 4, "lineage_edges.relationship")?,
-                        birth_tick: checked_u64(
-                            "lineage_edges.birth_tick",
-                            decode_column(r, 5, "lineage_edges.birth_tick")?,
-                        )?,
-                    };
-                    export_writer.write_lineage_row(&row).map_err(|e| {
-                        StorageError::InvalidData {
-                            context: "export_storage_table.write_lineage_row",
-                            reason: e.to_string(),
-                        }
+            let rows = reader.load_lineage_export_rows()?;
+            for row in &rows {
+                export_writer
+                    .write_lineage_row(row)
+                    .map_err(|e| StorageError::InvalidData {
+                        context: "export_storage_table.write_lineage_row",
+                        reason: e.to_string(),
                     })?;
-                }
-                offset += rows.len();
-                if rows.len() < limit {
-                    break;
-                }
             }
         }
         ExportTable::Event => {
@@ -1617,6 +1600,239 @@ pub fn export_storage_table<W: Write>(
         })?;
 
     Ok(receipt)
+}
+
+impl StorageReader {
+    /// Load the canonical [`RunExportRow`] for this run.
+    pub fn load_run_export_row(&self) -> Result<RunExportRow, StorageError> {
+        let manifest = self.run_manifest()?;
+        Ok(RunExportRow {
+            run_id: manifest.run_id.to_string(),
+            manifest_schema_version: manifest.manifest_schema_version as u32,
+            scenario_id: manifest.scenario_id,
+            scenario_version: manifest.scenario_version as u32,
+            config_digest: manifest.config_digest,
+            root_seed_hex: format!("{:016x}", manifest.root_seed),
+            source_revision: manifest.source_revision,
+            source_tree_digest: manifest.source_tree_digest,
+            started_at_unix_ms: manifest.started_at_unix_ms,
+            reproducible: manifest.reproducible,
+        })
+    }
+
+    /// Load all canonical [`AgentExportRow`] records for this run.
+    pub fn load_agent_export_rows(&self) -> Result<Vec<AgentExportRow>, StorageError> {
+        let run_id = self.run_id();
+        let limit = 1024;
+        let mut offset = 0;
+        let mut rows_out = Vec::new();
+        loop {
+            let rows = self.connection()?.query_with_params(
+                "SELECT run_id, tick, agent_uid, generation, age, position_x, position_y, velocity_x, velocity_y, heading, health, energy, herbivore_tendency, brain_binding
+                 FROM agents
+                 WHERE run_id = ?1
+                 ORDER BY tick ASC, agent_uid ASC
+                 LIMIT ?2 OFFSET ?3",
+                &[sqlite_run_id(run_id), (limit as i64).into(), (offset as i64).into()],
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                let row = AgentExportRow {
+                    run_id: decode_column(r, 0, "agents.run_id")?,
+                    tick: checked_u64("agents.tick", decode_column(r, 1, "agents.tick")?)?,
+                    agent_uid: checked_u64(
+                        "agents.agent_uid",
+                        decode_column(r, 2, "agents.agent_uid")?,
+                    )?,
+                    generation: decode_column::<i64>(r, 3, "agents.generation")? as u32,
+                    age: decode_column::<i64>(r, 4, "agents.age")? as u32,
+                    pos_x: decode_column::<f64>(r, 5, "agents.position_x")? as f32,
+                    pos_y: decode_column::<f64>(r, 6, "agents.position_y")? as f32,
+                    vel_x: decode_column::<f64>(r, 7, "agents.velocity_x")? as f32,
+                    vel_y: decode_column::<f64>(r, 8, "agents.velocity_y")? as f32,
+                    heading: decode_column::<f64>(r, 9, "agents.heading")? as f32,
+                    health: decode_column::<f64>(r, 10, "agents.health")? as f32,
+                    energy: decode_column::<f64>(r, 11, "agents.energy")? as f32,
+                    herbivore_tendency: decode_column::<f64>(r, 12, "agents.herbivore_tendency")?
+                        as f32,
+                    brain_binding: decode_column(r, 13, "agents.brain_binding")?,
+                };
+                rows_out.push(row);
+            }
+            offset += rows.len();
+            if rows.len() < limit {
+                break;
+            }
+        }
+        Ok(rows_out)
+    }
+
+    /// Load all canonical [`LineageExportRow`] records for this run.
+    pub fn load_lineage_export_rows(&self) -> Result<Vec<LineageExportRow>, StorageError> {
+        let run_id = self.run_id();
+        let limit = 1024;
+        let mut offset = 0;
+        let mut rows_out = Vec::new();
+        loop {
+            let rows = self.connection()?.query_with_params(
+                "SELECT run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship, birth_tick
+                 FROM lineage_edges
+                 WHERE run_id = ?1
+                 ORDER BY birth_tick ASC, child_agent_uid ASC, parent_ordinal ASC
+                 LIMIT ?2 OFFSET ?3",
+                &[sqlite_run_id(run_id), (limit as i64).into(), (offset as i64).into()],
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                let row = LineageExportRow {
+                    run_id: decode_column(r, 0, "lineage_edges.run_id")?,
+                    child_agent_uid: checked_u64(
+                        "lineage_edges.child_agent_uid",
+                        decode_column(r, 1, "lineage_edges.child_agent_uid")?,
+                    )?,
+                    parent_agent_uid: checked_u64(
+                        "lineage_edges.parent_agent_uid",
+                        decode_column(r, 2, "lineage_edges.parent_agent_uid")?,
+                    )?,
+                    parent_ordinal: decode_column::<i64>(r, 3, "lineage_edges.parent_ordinal")?
+                        as u32,
+                    relationship: decode_column(r, 4, "lineage_edges.relationship")?,
+                    birth_tick: checked_u64(
+                        "lineage_edges.birth_tick",
+                        decode_column(r, 5, "lineage_edges.birth_tick")?,
+                    )?,
+                };
+                rows_out.push(row);
+            }
+            offset += rows.len();
+            if rows.len() < limit {
+                break;
+            }
+        }
+        if rows_out.is_empty() {
+            let birth_edges = self.connection()?.query_with_params(
+                "SELECT run_id, agent_uid, parent_a, 0,
+                        CASE WHEN parent_b IS NOT NULL THEN 'sexual_parent_a' ELSE 'asexual' END,
+                        tick
+                 FROM births
+                 WHERE run_id = ?1 AND parent_a IS NOT NULL
+                 UNION ALL
+                 SELECT run_id, agent_uid, parent_b, 1, 'sexual_parent_b', tick
+                 FROM births
+                 WHERE run_id = ?1 AND parent_b IS NOT NULL
+                 ORDER BY tick ASC, agent_uid ASC",
+                &[sqlite_run_id(run_id)],
+            )?;
+            for r in &birth_edges {
+                let row = LineageExportRow {
+                    run_id: decode_column(r, 0, "births.run_id")?,
+                    child_agent_uid: checked_u64(
+                        "births.agent_uid",
+                        decode_column(r, 1, "births.agent_uid")?,
+                    )?,
+                    parent_agent_uid: checked_u64(
+                        "births.parent",
+                        decode_column(r, 2, "births.parent")?,
+                    )?,
+                    parent_ordinal: decode_column::<i64>(r, 3, "births.parent_ordinal")? as u32,
+                    relationship: decode_column(r, 4, "births.relationship")?,
+                    birth_tick: checked_u64("births.tick", decode_column(r, 5, "births.tick")?)?,
+                };
+                rows_out.push(row);
+            }
+        }
+        Ok(rows_out)
+    }
+
+    /// Load all canonical [`EventExportRow`] records for this run.
+    pub fn load_event_export_rows(&self) -> Result<Vec<EventExportRow>, StorageError> {
+        let run_id = self.run_id();
+        let limit = 1024;
+        let mut offset = 0;
+        let mut rows_out = Vec::new();
+        loop {
+            let rows = self.connection()?.query_with_params(
+                "SELECT run_id, tick, seq, scope, event_type, payload
+                 FROM replay_events
+                 WHERE run_id = ?1
+                 ORDER BY tick ASC, seq ASC
+                 LIMIT ?2 OFFSET ?3",
+                &[
+                    sqlite_run_id(run_id),
+                    (limit as i64).into(),
+                    (offset as i64).into(),
+                ],
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                let seq: i64 = decode_column(r, 2, "replay_events.seq")?;
+                let scope: String = decode_column(r, 3, "replay_events.scope")?;
+                let event_type: String = decode_column(r, 4, "replay_events.event_type")?;
+                let row = EventExportRow {
+                    run_id: decode_column(r, 0, "replay_events.run_id")?,
+                    tick: checked_u64(
+                        "replay_events.tick",
+                        decode_column(r, 1, "replay_events.tick")?,
+                    )?,
+                    seq: checked_u64("replay_events.seq", seq)?,
+                    event_id: format!("evt-{seq}"),
+                    kind: format!("{scope}:{event_type}"),
+                    payload: decode_column(r, 5, "replay_events.payload")?,
+                };
+                rows_out.push(row);
+            }
+            offset += rows.len();
+            if rows.len() < limit {
+                break;
+            }
+        }
+        Ok(rows_out)
+    }
+
+    /// Load all canonical [`MetricExportRow`] records for this run.
+    pub fn load_metric_export_rows(&self) -> Result<Vec<MetricExportRow>, StorageError> {
+        let run_id = self.run_id();
+        let limit = 1024;
+        let mut offset = 0;
+        let mut rows_out = Vec::new();
+        loop {
+            let rows = self.connection()?.query_with_params(
+                "SELECT run_id, tick, name, value
+                 FROM metrics
+                 WHERE run_id = ?1
+                 ORDER BY tick ASC, name ASC
+                 LIMIT ?2 OFFSET ?3",
+                &[
+                    sqlite_run_id(run_id),
+                    (limit as i64).into(),
+                    (offset as i64).into(),
+                ],
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                let row = MetricExportRow {
+                    run_id: decode_column(r, 0, "metrics.run_id")?,
+                    tick: checked_u64("metrics.tick", decode_column(r, 1, "metrics.tick")?)?,
+                    name: decode_column(r, 2, "metrics.name")?,
+                    value: decode_column::<f64>(r, 3, "metrics.value")?,
+                };
+                rows_out.push(row);
+            }
+            offset += rows.len();
+            if rows.len() < limit {
+                break;
+            }
+        }
+        Ok(rows_out)
+    }
 }
 
 #[cfg(test)]

@@ -78,6 +78,10 @@ pub mod distribution;
 /// Run-scoped lineage fitness, uncertainty, and evolutionary explanations (bd-2z0.11.10).
 pub mod lineage;
 
+/// FrankenPandas export and summary layer (bd-2z0.11.8).
+pub mod dataframe;
+pub use dataframe::*;
+
 pub use lineage::{
     EvolutionaryChangeExplanation, FounderLineageRecord, GenerationMetricRow,
     LINEAGE_FITNESS_SCHEMA_ID_V1, LineageFitness, LineageFitnessMachine, LineageLifespanSummary,
@@ -557,6 +561,9 @@ pub enum AnalyticsError {
     /// Rebuilding or querying the ancestry graph failed.
     #[error("ancestry error: {0}")]
     Ancestry(#[from] scriptbots_core::ancestry::AncestryError),
+    /// Dataframe export or summary error.
+    #[error("dataframe error: {0}")]
+    DataFrame(#[from] crate::dataframe::DataFrameError),
 }
 
 /// Read-only context handed to every report.

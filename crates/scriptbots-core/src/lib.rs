@@ -103,8 +103,9 @@ pub use checkpoint::{
 };
 
 pub use channels::{
-    BOOST_THRESHOLD, IoLayoutError, OutputChannel, OutputsExt, SENSOR_LAYOUT, SensorChannel,
-    SensorKind, SensorsExt, WorldIoLayout,
+    BOOST_THRESHOLD, IoLayoutError, OutputChannel, OutputsExt, SENSOR_LAYOUT, SENSOR_LAYOUT_DIGEST,
+    SensorChannel, SensorField, SensorKind, SensorSource, SensorsExt, WorldIoLayout,
+    compute_sensor_layout_digest, sensor_layout,
 };
 use rng_domains::{
     AgentRngCounterError, AgentRngCountersV1, AgentRngOperationV1, AgentSubstreamProtocolV1,
@@ -44881,7 +44882,7 @@ mod tests {
                 > world.agents.index_of(higher_uid_recipient),
             "fixture must oppose stable UID order and physical dense order"
         );
-        world.canonicalize_agent_execution_order();
+        let _ = world.canonicalize_agent_execution_order();
 
         world.stage_food();
 
