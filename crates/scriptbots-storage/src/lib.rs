@@ -5303,6 +5303,79 @@ pub struct ArchipelagoMigrationRecord {
     pub rank: usize,
 }
 
+/// A point in an island's recorded population and energy history (bd-16g.5.5.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IslandHistoryPoint {
+    /// Simulation tick.
+    pub tick: u64,
+    /// Number of active agents at this tick.
+    pub agent_count: i64,
+    /// Average energy across active agents at this tick.
+    pub average_energy: f64,
+    /// Total energy across active agents at this tick.
+    pub total_energy: f64,
+}
+
+/// Recorded population and energy history for one archipelago island (bd-16g.5.5.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IslandHistory {
+    /// Island identifier.
+    pub island_id: u32,
+    /// Series of history points ordered by ascending tick.
+    pub points: Vec<IslandHistoryPoint>,
+}
+
+/// Details of a per-island population conservation failure (bd-16g.5.5.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IslandConservationBreach {
+    /// Island where conservation failed.
+    pub island_id: u32,
+    /// Simulation tick where conservation failed.
+    pub tick: u64,
+    /// Reconstructed expected population.
+    pub expected_population: i64,
+    /// Actual agent count recorded in tick_summaries.
+    pub recorded_population: i64,
+    /// Biological births recorded at this tick (origin = 'born').
+    pub births: i64,
+    /// Deaths recorded at this tick.
+    pub deaths: i64,
+    /// Immigrations arriving at this island before this tick.
+    pub immigrations: i64,
+    /// Emigrations departing from this island before this tick.
+    pub emigrations: i64,
+}
+
+/// Result of auditing population conservation across every island and barrier (bd-16g.5.5.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchipelagoConservationAudit {
+    /// True if conservation held for all islands across all checked ticks.
+    pub passed: bool,
+    /// Total distinct islands verified.
+    pub total_islands_checked: usize,
+    /// Total barrier / summary steps verified.
+    pub total_ticks_checked: usize,
+    /// Any conservation breaches detected.
+    pub breaches: Vec<IslandConservationBreach>,
+}
+
+/// Complete offline reconstruction of an archipelago simulation run from the DB alone (bd-16g.5.5.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArchipelagoReport {
+    /// Run identifier.
+    pub run_id: RunId,
+    /// Static metadata for all configured islands.
+    pub islands: Vec<ArchipelagoIslandRecord>,
+    /// Per-island population and energy histories.
+    pub histories: BTreeMap<u32, IslandHistory>,
+    /// Directed multigraph weighted by emigrant counts: (from, to) -> count.
+    pub migration_graph: BTreeMap<(u32, u32), u64>,
+    /// Complete migration move stream in canonical (tick, seq) order.
+    pub migrations: Vec<ArchipelagoMigrationRecord>,
+    /// Rigorous per-island population conservation audit.
+    pub conservation_audit: ArchipelagoConservationAudit,
+}
+
 /// One agent-arrival ancestry edge, read back out of the run database.
 ///
 /// The physical `births` row is the edge for every origin: the arriving agent,
@@ -10615,6 +10688,197 @@ impl StorageReader {
             *graph.entry((m.island_id_from, m.island_id_to)).or_default() += 1;
         }
         Ok(graph)
+    }
+
+    /// Read the population and energy history of a specific island (bd-16g.5.5.5).
+    pub fn island_history(&self, island_id: u32) -> Result<IslandHistory, StorageError> {
+        let connection = self.connection()?;
+        let rows = connection.query_with_params(
+            "SELECT tick, agent_count, average_energy, total_energy
+             FROM tick_summaries
+             WHERE run_id = ?1 AND island_id = ?2
+             ORDER BY tick ASC",
+            &[sqlite_run_id(self.run_id), (island_id as i64).into()],
+        )?;
+        let mut points = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tick = checked_u64(
+                "tick_summaries.tick",
+                decode(&row, 0, "tick_summaries.tick")?,
+            )?;
+            let agent_count: i64 = decode(&row, 1, "tick_summaries.agent_count")?;
+            let average_energy: f64 = decode(&row, 2, "tick_summaries.average_energy")?;
+            let total_energy: f64 = decode(&row, 3, "tick_summaries.total_energy")?;
+            points.push(IslandHistoryPoint {
+                tick,
+                agent_count,
+                average_energy,
+                total_energy,
+            });
+        }
+        Ok(IslandHistory { island_id, points })
+    }
+
+    /// Audit population conservation for every island at every recorded barrier/tick (bd-16g.5.5.5).
+    ///
+    /// The conservation identity:
+    ///   pop[t] = pop[prev] + births - deaths + immigrations - emigrations
+    /// must hold PER ISLAND across all recorded simulation boundaries from the DB alone.
+    pub fn audit_archipelago_conservation(
+        &self,
+    ) -> Result<ArchipelagoConservationAudit, StorageError> {
+        let connection = self.connection()?;
+        let island_rows = connection.query_with_params(
+            "SELECT DISTINCT island_id FROM tick_summaries WHERE run_id = ?1 ORDER BY island_id ASC",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let mut breaches = Vec::new();
+        let mut total_ticks_checked = 0usize;
+        let total_islands_checked = island_rows.len();
+
+        for i_row in island_rows {
+            let island_id_raw: i64 = decode(&i_row, 0, "tick_summaries.island_id")?;
+            let island_id = checked_u32("tick_summaries.island_id", island_id_raw)?;
+
+            let summary_rows = connection.query_with_params(
+                "SELECT tick, agent_count FROM tick_summaries
+                 WHERE run_id = ?1 AND island_id = ?2
+                 ORDER BY tick ASC",
+                &[sqlite_run_id(self.run_id), island_id_raw.into()],
+            )?;
+            if summary_rows.is_empty() {
+                continue;
+            }
+
+            let mut prev_tick: u64 = checked_u64(
+                "tick_summaries.tick",
+                decode(&summary_rows[0], 0, "tick_summaries.tick")?,
+            )?;
+            let mut expected_pop: i64 = decode(&summary_rows[0], 1, "tick_summaries.agent_count")?;
+
+            for row in summary_rows.iter().skip(1) {
+                total_ticks_checked += 1;
+                let cur_tick = checked_u64(
+                    "tick_summaries.tick",
+                    decode(row, 0, "tick_summaries.tick")?,
+                )?;
+                let recorded_pop: i64 = decode(row, 1, "tick_summaries.agent_count")?;
+
+                let births: i64 = connection
+                    .query_row_with_params(
+                        "SELECT COUNT(*) FROM births
+                         WHERE run_id = ?1 AND island_id = ?2 AND tick > ?3 AND tick <= ?4 AND origin = 'born'",
+                        &[
+                            sqlite_run_id(self.run_id),
+                            island_id_raw.into(),
+                            (prev_tick as i64).into(),
+                            (cur_tick as i64).into(),
+                        ],
+                    )?
+                    .get_typed(0)?;
+
+                let deaths: i64 = connection
+                    .query_row_with_params(
+                        "SELECT COUNT(*) FROM deaths
+                         WHERE run_id = ?1 AND island_id = ?2 AND tick > ?3 AND tick <= ?4",
+                        &[
+                            sqlite_run_id(self.run_id),
+                            island_id_raw.into(),
+                            (prev_tick as i64).into(),
+                            (cur_tick as i64).into(),
+                        ],
+                    )?
+                    .get_typed(0)?;
+
+                let immigrations: i64 = connection
+                    .query_row_with_params(
+                        "SELECT COUNT(*) FROM migrations
+                         WHERE run_id = ?1 AND island_id_to = ?2 AND tick >= ?3 AND tick < ?4",
+                        &[
+                            sqlite_run_id(self.run_id),
+                            island_id_raw.into(),
+                            (prev_tick as i64).into(),
+                            (cur_tick as i64).into(),
+                        ],
+                    )?
+                    .get_typed(0)?;
+
+                let emigrations: i64 = connection
+                    .query_row_with_params(
+                        "SELECT COUNT(*) FROM migrations
+                         WHERE run_id = ?1 AND island_id_from = ?2 AND tick >= ?3 AND tick < ?4",
+                        &[
+                            sqlite_run_id(self.run_id),
+                            island_id_raw.into(),
+                            (prev_tick as i64).into(),
+                            (cur_tick as i64).into(),
+                        ],
+                    )?
+                    .get_typed(0)?;
+
+                expected_pop = expected_pop + births - deaths + immigrations - emigrations;
+                if expected_pop != recorded_pop {
+                    breaches.push(IslandConservationBreach {
+                        island_id,
+                        tick: cur_tick,
+                        expected_population: expected_pop,
+                        recorded_population: recorded_pop,
+                        births,
+                        deaths,
+                        immigrations,
+                        emigrations,
+                    });
+                    expected_pop = recorded_pop;
+                }
+                prev_tick = cur_tick;
+            }
+        }
+
+        Ok(ArchipelagoConservationAudit {
+            passed: breaches.is_empty(),
+            total_islands_checked,
+            total_ticks_checked,
+            breaches,
+        })
+    }
+
+    /// Complete offline reconstruction of an archipelago simulation run from the DB alone (bd-16g.5.5.5).
+    pub fn archipelago_report(&self) -> Result<ArchipelagoReport, StorageError> {
+        let mut islands = self.archipelago_islands()?;
+        if islands.is_empty() {
+            let connection = self.connection()?;
+            let rows = connection.query_with_params(
+                "SELECT DISTINCT island_id FROM tick_summaries WHERE run_id = ?1 ORDER BY island_id ASC",
+                &[sqlite_run_id(self.run_id)],
+            )?;
+            for row in rows {
+                let raw_id: i64 = decode(&row, 0, "tick_summaries.island_id")?;
+                let island_id = checked_u32("tick_summaries.island_id", raw_id)?;
+                islands.push(ArchipelagoIslandRecord {
+                    island_id,
+                    label: format!("island-{island_id}"),
+                    config_hash: 0,
+                    config_json: String::new(),
+                });
+            }
+        }
+        let mut histories = BTreeMap::new();
+        for island in &islands {
+            let hist = self.island_history(island.island_id)?;
+            histories.insert(island.island_id, hist);
+        }
+        let migration_graph = self.migration_graph()?;
+        let migrations = self.migrations()?;
+        let conservation_audit = self.audit_archipelago_conservation()?;
+
+        Ok(ArchipelagoReport {
+            run_id: self.run_id,
+            islands,
+            histories,
+            migration_graph,
+            migrations,
+            conservation_audit,
+        })
     }
 
     /// Search this run's narrative text as one literal FTS5 phrase.

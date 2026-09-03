@@ -19,6 +19,7 @@ use thiserror::Error;
 pub type SharedWorld = Arc<Mutex<WorldState>>;
 pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
+pub mod archipelago_report;
 pub mod brains;
 pub mod economy_audit;
 pub mod experiment_runner;
@@ -26,6 +27,8 @@ pub mod host_thread;
 pub mod lab_assistant;
 pub mod montage;
 pub mod tournament;
+
+pub use archipelago_report::{ReportArchipelagoArgs, run_archipelago_report};
 
 #[cfg(feature = "neuro")]
 pub use brains::validated_neuroflow_config;

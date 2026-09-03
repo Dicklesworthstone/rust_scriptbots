@@ -3,6 +3,7 @@ use asupersync::types::{Budget, Outcome};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
+use scriptbots_app::archipelago_report::{self, ReportArchipelagoArgs};
 use scriptbots_app::economy_audit::{self, EconomyAuditArgs};
 #[cfg(feature = "neuro")]
 use scriptbots_app::validated_neuroflow_config;
@@ -156,6 +157,29 @@ fn main() -> Result<()> {
 
     if let Some(AppSubcommand::EconomyAudit(ref audit_args)) = cli.subcommand {
         let pass = economy_audit::run_economy_audit(audit_args)?;
+        if pass {
+            std::process::exit(0);
+        } else {
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(AppSubcommand::ReportArchipelago(ref report_args)) = cli.subcommand {
+        let pass = archipelago_report::run_archipelago_report(report_args)?;
+        if pass {
+            std::process::exit(0);
+        } else {
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(ref db_path) = cli.report_archipelago {
+        let report_args = ReportArchipelagoArgs {
+            db: db_path.clone(),
+            json: None,
+            verify_conservation: false,
+        };
+        let pass = archipelago_report::run_archipelago_report(&report_args)?;
         if pass {
             std::process::exit(0);
         } else {
@@ -2432,6 +2456,8 @@ fn maybe_emit_config(cli: &AppCli, config: &ScriptBotsConfig) -> Result<Option<C
 enum AppSubcommand {
     /// Economy conservation audit (bd-9sg6 / bd-16g.11.2)
     EconomyAudit(EconomyAuditArgs),
+    /// Offline archipelago reconstruction report and population conservation audit (bd-16g.5.5.5)
+    ReportArchipelago(ReportArchipelagoArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -2445,6 +2471,10 @@ enum AppSubcommand {
 struct AppCli {
     #[command(subcommand)]
     subcommand: Option<AppSubcommand>,
+
+    /// Generate an archipelago report and run population conservation audit from a DB (bd-16g.5.5.5).
+    #[arg(long = "report-archipelago", value_name = "DB")]
+    report_archipelago: Option<PathBuf>,
 
     /// Rendering mode (auto selects only compiled backends and otherwise uses the terminal).
     #[arg(
