@@ -242,9 +242,9 @@ pub enum PhenotypeExtractionError {
     SchemaIdMismatch { expected: String, found: String },
     #[error("schema digest mismatch: expected {expected}, found {found}")]
     SchemaDigestMismatch { expected: String, found: String },
-    #[error("{source} row {index} belongs to run {found}, expected {expected}")]
+    #[error("{source_name} row {index} belongs to run {found}, expected {expected}")]
     CrossRunSource {
-        source: &'static str,
+        source_name: &'static str,
         index: usize,
         expected: String,
         found: String,
@@ -255,9 +255,9 @@ pub enum PhenotypeExtractionError {
     DuplicateInteraction { tick: u64, seq: u64 },
     #[error("duplicate arrival identity {agent_uid:?}")]
     DuplicateArrival { agent_uid: AgentUid },
-    #[error("{source} references unknown agent identity {agent_uid:?}")]
+    #[error("{source_name} references unknown agent identity {agent_uid:?}")]
     MissingAgentIdentity {
-        source: &'static str,
+        source_name: &'static str,
         agent_uid: AgentUid,
     },
     #[error("non-finite {field} for uid {agent_uid:?} at tick {tick}")]
@@ -276,9 +276,9 @@ pub enum PhenotypeExtractionError {
     },
     #[error("unsupported interaction kind {kind:?} at tick {tick}, seq {seq}")]
     UnsupportedInteractionKind { tick: u64, seq: u64, kind: String },
-    #[error("{source} tick {tick} is outside [{start_tick}, {end_tick})")]
+    #[error("{source_name} tick {tick} is outside [{start_tick}, {end_tick})")]
     TickOutsideWindow {
-        source: &'static str,
+        source_name: &'static str,
         tick: u64,
         start_tick: u64,
         end_tick: u64,
@@ -604,14 +604,14 @@ struct EdgeAccumulator {
 fn validate_row_run(
     expected: &str,
     found: &str,
-    source: &'static str,
+    source_name: &'static str,
     index: usize,
 ) -> Result<(), PhenotypeExtractionError> {
     if found == expected {
         Ok(())
     } else {
         Err(PhenotypeExtractionError::CrossRunSource {
-            source,
+            source_name,
             index,
             expected: expected.to_owned(),
             found: found.to_owned(),
@@ -725,7 +725,7 @@ pub fn extract_phenotype_interactions(
         validate_row_run(&ledger.run_id, &arrival.run_id, "arrival", index)?;
         if arrival.tick >= ledger.window.end_tick {
             return Err(PhenotypeExtractionError::TickOutsideWindow {
-                source: "arrival",
+                source_name: "arrival",
                 tick: arrival.tick,
                 start_tick: 0,
                 end_tick: ledger.window.end_tick,
@@ -746,7 +746,7 @@ pub fn extract_phenotype_interactions(
         validate_row_run(&ledger.run_id, &observation.run_id, "observation", index)?;
         if !ledger.window.contains(observation.tick) {
             return Err(PhenotypeExtractionError::TickOutsideWindow {
-                source: "observation",
+                source_name: "observation",
                 tick: observation.tick,
                 start_tick: ledger.window.start_tick,
                 end_tick: ledger.window.end_tick,
@@ -761,7 +761,7 @@ pub fn extract_phenotype_interactions(
         previous_observation = Some((observation.agent_uid, observation.tick));
         if !known_agents.contains(&observation.agent_uid) {
             return Err(PhenotypeExtractionError::MissingAgentIdentity {
-                source: "observation",
+                source_name: "observation",
                 agent_uid: observation.agent_uid,
             });
         }
@@ -816,7 +816,7 @@ pub fn extract_phenotype_interactions(
         validate_row_run(&ledger.run_id, &interaction.run_id, "interaction", index)?;
         if !ledger.window.contains(interaction.tick) {
             return Err(PhenotypeExtractionError::TickOutsideWindow {
-                source: "interaction",
+                source_name: "interaction",
                 tick: interaction.tick,
                 start_tick: ledger.window.start_tick,
                 end_tick: ledger.window.end_tick,
@@ -836,12 +836,15 @@ pub fn extract_phenotype_interactions(
                 agent_uid: interaction.actor,
             });
         }
-        for (source, agent_uid) in [
+        for (source_name, agent_uid) in [
             ("interaction.actor", interaction.actor),
             ("interaction.target", interaction.target),
         ] {
             if !known_agents.contains(&agent_uid) {
-                return Err(PhenotypeExtractionError::MissingAgentIdentity { source, agent_uid });
+                return Err(PhenotypeExtractionError::MissingAgentIdentity {
+                    source_name,
+                    agent_uid,
+                });
             }
         }
         let magnitude = interaction
@@ -895,7 +898,7 @@ pub fn extract_phenotype_interactions(
         for parent in parents {
             if !known_agents.contains(&parent) {
                 return Err(PhenotypeExtractionError::MissingAgentIdentity {
-                    source: "arrival.parent",
+                    source_name: "arrival.parent",
                     agent_uid: parent,
                 });
             }
@@ -2503,7 +2506,7 @@ mod phenotype_tests {
         assert!(matches!(
             extract_phenotype_interactions(&cross_run),
             Err(PhenotypeExtractionError::CrossRunSource {
-                source: "observation",
+                source_name: "observation",
                 ..
             })
         ));
@@ -2513,7 +2516,7 @@ mod phenotype_tests {
         assert!(matches!(
             extract_phenotype_interactions(&outside),
             Err(PhenotypeExtractionError::TickOutsideWindow {
-                source: "observation",
+                source_name: "observation",
                 ..
             })
         ));
@@ -2564,7 +2567,7 @@ mod phenotype_tests {
         assert!(matches!(
             extract_phenotype_interactions(&missing),
             Err(PhenotypeExtractionError::MissingAgentIdentity {
-                source: "observation",
+                source_name: "observation",
                 agent_uid: AgentUid(2),
             })
         ));

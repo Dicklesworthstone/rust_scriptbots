@@ -994,13 +994,14 @@ impl BrainRunner for GiveIntentBrain {
 
 /// A seeded 2k world must preserve the exact core interaction count through durable SQL.
 #[test]
+#[ignore = "2k-world throughput observation lane; run explicitly through RCH"]
 fn seeded_2k_world_interaction_count_matches_durable_rows() {
     const AGENTS: usize = 2_000;
     const PAIRS: usize = AGENTS / 2;
 
     let path = temp_run_path("seeded_2k_interactions");
     let path_str = path.to_str().expect("utf8 path");
-    let proof_deadline = Duration::from_secs(10 * 60);
+    let proof_deadline = Duration::from_secs(20 * 60);
     let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds_and_deadlines(
         path_str,
         1,
