@@ -1,0 +1,18 @@
+# bd-l51j — TUI viewport resize storm golden
+# Regenerate deliberately, never in CI:
+#   RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-app --lib -- terminal::tests::the_resize_storm_matches_its_committed_golden
+# THIS FILE IS THE DOCUMENTATION OF VIEWPORT RESIZE STORM BEHAVIOUR.
+# Each row records one viewport step in the resize storm: requested dimensions,
+# drawn area, cell statistics (nonblank and styled), and full-cell FNV-1a64 buffer digest.
+storm step=01 viewport=20x8 area=x=0,y=0,w=20,h=8 nonblank=110 styled=36 hash=6e472abd1fd33fe1
+storm step=02 viewport=40x12 area=x=0,y=0,w=40,h=12 nonblank=351 styled=165 hash=3b5a988d88cbaa0b
+storm step=03 viewport=80x36 area=x=0,y=0,w=80,h=36 nonblank=2361 styled=1524 hash=8a43964b12ef8455
+storm step=04 viewport=200x60 area=x=0,y=0,w=200,h=60 nonblank=8664 styled=6118 hash=23597d48be4c0e4b
+storm step=05 viewport=80x6 area=x=0,y=0,w=80,h=6 nonblank=352 styled=139 hash=fe90f132c24bfe72
+storm step=06 viewport=24x60 area=x=0,y=0,w=24,h=60 nonblank=1157 styled=792 hash=450e32d0d92cae9b
+storm step=07 viewport=81x37 area=x=0,y=0,w=81,h=37 nonblank=2434 styled=1574 hash=5c0e5ab97e875ad3
+storm step=08 viewport=1x1 area=x=0,y=0,w=1,h=1 nonblank=1 styled=0 hash=7069061e2a191c44
+storm step=09 viewport=2x40 area=x=0,y=0,w=2,h=40 nonblank=80 styled=0 hash=6aaa5db5030182b7
+storm step=10 viewport=120x3 area=x=0,y=0,w=120,h=3 nonblank=345 styled=62 hash=a6dacd7542738227
+storm step=11 viewport=80x36 area=x=0,y=0,w=80,h=36 nonblank=2361 styled=1524 hash=8a43964b12ef8455
+storm step=12 viewport=300x100 area=x=0,y=0,w=300,h=100 nonblank=19792 styled=15898 hash=ed2475c6dff5bc92

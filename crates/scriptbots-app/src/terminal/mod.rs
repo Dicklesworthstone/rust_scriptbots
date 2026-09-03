@@ -5964,6 +5964,7 @@ fn color_channels(color: Color) -> [f32; 3] {
 
 /// Pack unit-range RGB back into a terminal color.
 #[cfg(test)]
+#[allow(dead_code)]
 fn channels_color(rgb: [f32; 3]) -> Color {
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     Color::Rgb(byte(rgb[0]), byte(rgb[1]), byte(rgb[2]))
@@ -10041,10 +10042,6 @@ mod tests {
         );
     }
 
-    /// Selecting a cone must not touch the world: the probe is a read-only
-    /// projection, and a panel that advanced the simulation would corrupt the
-    /// run an experimenter is observing.
-    #[test]
     /// AN EXPLICIT MOTION REQUEST MUST NOT OVERTURN A SAFETY OR CAPABILITY
     /// REDUCTION.
     ///
@@ -11421,12 +11418,12 @@ mod tests {
     /// panels legitimately do not fit, and demanding them would assert something
     /// the product never promised. Learned by writing the storm the other way
     /// first and watching it reject a frame the renderer had drawn correctly.
-    fn draw_at_viewport(
+    fn draw_at_viewport_buffer(
         theme: CuratedThemeId,
         mode: TerminalPaletteMode,
         width: u16,
         height: u16,
-    ) -> Rect {
+    ) -> Buffer {
         let world = command_characterization_world();
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
@@ -11449,8 +11446,35 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|frame| app.draw(frame)).expect("draw frame");
-        terminal.backend().buffer().area
+        terminal.backend().buffer().clone()
     }
+
+    fn draw_at_viewport(
+        theme: CuratedThemeId,
+        mode: TerminalPaletteMode,
+        width: u16,
+        height: u16,
+    ) -> Rect {
+        draw_at_viewport_buffer(theme, mode, width, height).area
+    }
+
+    /// Viewports tested in the resize storm.
+    /// Ordered small-to-large and back through awkward shapes: tall-thin and
+    /// short-wide stress different constraint paths than a square.
+    const RESIZE_STORM_VIEWPORTS: [(u16, u16); 12] = [
+        (20, 8),
+        (40, 12),
+        (80, 36),
+        (200, 60),
+        (80, 6),
+        (24, 60),
+        (81, 37),
+        (1, 1),
+        (2, 40),
+        (120, 3),
+        (80, 36),
+        (300, 100),
+    ];
 
     /// RESIZE STORM: the HUD must survive a spread of viewports without panicking
     /// or producing a buffer that disagrees with the terminal it was drawn into.
@@ -11463,24 +11487,7 @@ mod tests {
     /// rect would take the test down rather than return a wrong number.
     #[test]
     fn the_hud_survives_a_viewport_resize_storm() {
-        // Ordered small-to-large and back through awkward shapes: tall-thin and
-        // short-wide stress different constraint paths than a square.
-        let viewports: [(u16, u16); 12] = [
-            (20, 8),
-            (40, 12),
-            (80, 36),
-            (200, 60),
-            (80, 6),
-            (24, 60),
-            (81, 37),
-            (1, 1),
-            (2, 40),
-            (120, 3),
-            (80, 36),
-            (300, 100),
-        ];
-
-        for (width, height) in viewports {
+        for &(width, height) in &RESIZE_STORM_VIEWPORTS {
             let area = draw_at_viewport(
                 CuratedThemeId::default(),
                 TerminalPaletteMode::Natural,
@@ -11532,7 +11539,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn headless_test_backend_frame_proves_buffer_semantics_and_current_tick() {
         let world = command_characterization_world();
@@ -11839,6 +11845,172 @@ mod tests {
             &candidate,
             "tier ",
             "terminal::tests::the_resize_ladder_matches_its_committed_golden",
+        );
+    }
+
+    /// Path to the committed resize storm golden.
+    fn resize_storm_golden_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/terminal/goldens/resize_storm.txt")
+    }
+
+    /// Serialize the viewport resize storm into the reviewable golden form.
+    fn render_resize_storm() -> String {
+        let mut out = String::new();
+        out.push_str("# bd-l51j — TUI viewport resize storm golden\n");
+        out.push_str(
+            "# Regenerate deliberately, never in CI:\n\
+             #   RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-app --lib -- \
+             terminal::tests::the_resize_storm_matches_its_committed_golden\n",
+        );
+        out.push_str(
+            "# THIS FILE IS THE DOCUMENTATION OF VIEWPORT RESIZE STORM BEHAVIOUR.\n\
+             # Each row records one viewport step in the resize storm: requested dimensions,\n\
+             # drawn area, cell statistics (nonblank and styled), and full-cell FNV-1a64 buffer digest.\n",
+        );
+
+        for (step, &(width, height)) in RESIZE_STORM_VIEWPORTS.iter().enumerate() {
+            let buffer = draw_at_viewport_buffer(
+                CuratedThemeId::default(),
+                TerminalPaletteMode::Natural,
+                width,
+                height,
+            );
+            let area = buffer.area;
+            let (hash, non_blank) = HeadlessBufferEvidence::hash_cells(&buffer, area);
+            let mut styled = 0usize;
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    let cell = &buffer[(x, y)];
+                    if cell.fg != Color::Reset
+                        || cell.bg != Color::Reset
+                        || cell.underline_color != Color::Reset
+                        || !cell.modifier.is_empty()
+                    {
+                        styled += 1;
+                    }
+                }
+            }
+            out.push_str(&format!(
+                "storm step={:02} viewport={}x{} area=x={},y={},w={},h={} nonblank={} styled={} hash={}\n",
+                step + 1,
+                width,
+                height,
+                area.x,
+                area.y,
+                area.width,
+                area.height,
+                non_blank,
+                styled,
+                hash,
+            ));
+        }
+        out
+    }
+
+    /// The committed resize storm golden must match.
+    #[test]
+    fn the_resize_storm_matches_its_committed_golden() {
+        let candidate = render_resize_storm();
+
+        for (step, &(width, height)) in RESIZE_STORM_VIEWPORTS.iter().enumerate() {
+            let prefix = format!("storm step={:02} viewport={}x{}", step + 1, width, height);
+            assert!(
+                candidate.contains(&prefix),
+                "resize storm must include step {:02} ({}x{})",
+                step + 1,
+                width,
+                height
+            );
+        }
+
+        compare_golden(
+            &resize_storm_golden_path(),
+            &candidate,
+            "storm ",
+            "terminal::tests::the_resize_storm_matches_its_committed_golden",
+        );
+    }
+
+    /// Path to the committed theme x palette matrix golden.
+    fn theme_matrix_golden_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/terminal/goldens/theme_matrix.txt")
+    }
+
+    /// Serialize the theme x palette matrix and WCAG AA contrast measurements into the reviewable golden form.
+    fn render_theme_palette_matrix() -> String {
+        let mut out = String::new();
+        out.push_str("# bd-l51j — TUI theme x palette contrast matrix golden\n");
+        out.push_str(
+            "# Regenerate deliberately, never in CI:\n\
+             #   RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-app --lib -- \
+             terminal::tests::the_theme_palette_matrix_matches_its_committed_golden\n",
+        );
+        out.push_str(
+            "# THIS FILE IS THE DOCUMENTATION OF THEME REPAINT AND CONTRAST BEHAVIOUR.\n\
+             # Each row records one theme x palette combination: frame digest at standard\n\
+             # 80x36, cell statistics, and WCAG AA contrast ratios for status labels.\n",
+        );
+
+        let modes = [
+            TerminalPaletteMode::Natural,
+            TerminalPaletteMode::Deuteranopia,
+            TerminalPaletteMode::Protanopia,
+            TerminalPaletteMode::Tritanopia,
+            TerminalPaletteMode::HighContrast,
+        ];
+
+        let mut themes = vec![CuratedThemeId::default()];
+        let mut current = CuratedThemeId::default().next();
+        while current != CuratedThemeId::default() {
+            themes.push(current);
+            current = current.next();
+        }
+
+        for mode in modes {
+            for theme in &themes {
+                let evidence = render_matrix_frame(*theme, mode, 80, 36);
+
+                let mut p = Palette::test_backend_evidence();
+                p.theme_id = *theme;
+                p.mode = mode;
+                let t = p.theme();
+                let paused_contrast = contrast_ratio(t.paused_fg, t.paused_bg);
+                let running_contrast = contrast_ratio(t.running_fg, t.running_bg);
+
+                let header = format!(
+                    "theme {theme:?}/{mode:?} paused_contrast={paused_contrast:.2}:1 running_contrast={running_contrast:.2}:1"
+                );
+                append_frame_evidence(&mut out, &header, &evidence);
+            }
+        }
+        out
+    }
+
+    /// The committed theme x palette matrix golden must match.
+    #[test]
+    fn the_theme_palette_matrix_matches_its_committed_golden() {
+        let candidate = render_theme_palette_matrix();
+
+        assert_eq!(
+            candidate
+                .lines()
+                .filter(|l| l.starts_with("theme "))
+                .count(),
+            30,
+            "theme matrix must cover all 30 theme x palette pairs"
+        );
+        assert!(
+            candidate.matches("room=yes").count() >= 30,
+            "every theme frame must verify regions with room"
+        );
+
+        compare_golden(
+            &theme_matrix_golden_path(),
+            &candidate,
+            "theme ",
+            "terminal::tests::the_theme_palette_matrix_matches_its_committed_golden",
         );
     }
 

@@ -1,0 +1,366 @@
+# bd-l51j — TUI theme x palette contrast matrix golden
+# Regenerate deliberately, never in CI:
+#   RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-app --lib -- terminal::tests::the_theme_palette_matrix_matches_its_committed_golden
+# THIS FILE IS THE DOCUMENTATION OF THEME REPAINT AND CONTRAST BEHAVIOUR.
+# Each row records one theme x palette combination: frame digest at standard
+# 80x36, cell statistics, and WCAG AA contrast ratios for status labels.
+
+theme BioluminescentDarkField/Natural paused_contrast=10.79:1 running_contrast=17.00:1 frame=8a43964b12ef8455 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=0fde968231526c92
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=f4c07975c5508612
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=47c66e56ee216dc1
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=2967141dcc208edc
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=fc310c20876e2014
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=35056761cd811add
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=2b07d455e96c687d
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=11ee8eab9d52ee91
+
+theme CyberpunkAurora/Natural paused_contrast=6.37:1 running_contrast=7.83:1 frame=7a664c6de1b375e7 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=96245824130a414e
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=57787a9187d8dbf8
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=04809bf140150027
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=37998886e82aeeb5
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=4a4e9cc8abe6da48
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=f3412268cbc149ae
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=00f1798267aa6a03
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d8390d87637e79a1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=7c07c351c5b9eee9
+
+theme Darcula/Natural paused_contrast=6.37:1 running_contrast=7.83:1 frame=7a664c6de1b375e7 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=96245824130a414e
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=57787a9187d8dbf8
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=04809bf140150027
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=37998886e82aeeb5
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=4a4e9cc8abe6da48
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=f3412268cbc149ae
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=00f1798267aa6a03
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d8390d87637e79a1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=7c07c351c5b9eee9
+
+theme LumenLight/Natural paused_contrast=6.37:1 running_contrast=7.83:1 frame=7a664c6de1b375e7 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=96245824130a414e
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=57787a9187d8dbf8
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=04809bf140150027
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=37998886e82aeeb5
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=4a4e9cc8abe6da48
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=f3412268cbc149ae
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=00f1798267aa6a03
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d8390d87637e79a1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=7c07c351c5b9eee9
+
+theme NordicFrost/Natural paused_contrast=6.37:1 running_contrast=7.83:1 frame=7a664c6de1b375e7 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=96245824130a414e
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=57787a9187d8dbf8
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=04809bf140150027
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=37998886e82aeeb5
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=4a4e9cc8abe6da48
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=f3412268cbc149ae
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=00f1798267aa6a03
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d8390d87637e79a1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=7c07c351c5b9eee9
+
+theme HighContrast/Natural paused_contrast=6.37:1 running_contrast=7.83:1 frame=7a664c6de1b375e7 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=96245824130a414e
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=57787a9187d8dbf8
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=04809bf140150027
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=37998886e82aeeb5
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=4a4e9cc8abe6da48
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=f3412268cbc149ae
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=00f1798267aa6a03
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d8390d87637e79a1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=7c07c351c5b9eee9
+
+theme BioluminescentDarkField/Deuteranopia paused_contrast=10.79:1 running_contrast=17.00:1 frame=8a43964b12ef8455 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=0fde968231526c92
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=f4c07975c5508612
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=47c66e56ee216dc1
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=2967141dcc208edc
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=fc310c20876e2014
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=35056761cd811add
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=2b07d455e96c687d
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=11ee8eab9d52ee91
+
+theme CyberpunkAurora/Deuteranopia paused_contrast=8.31:1 running_contrast=7.46:1 frame=509fa39d6005827d regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=eb1d6fd46c119c91
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=bef13e50c6c2b499
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=7daa59e2ebe18b08
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=a3c503ce31f8cadd
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=9ffcf1f259d72ca3
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=426d90ebdde3b5b5
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=91ee17a3a5337d5f
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d64e2b74ebda2997
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=ecf49b7ee2583002
+
+theme Darcula/Deuteranopia paused_contrast=8.31:1 running_contrast=7.46:1 frame=509fa39d6005827d regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=eb1d6fd46c119c91
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=bef13e50c6c2b499
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=7daa59e2ebe18b08
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=a3c503ce31f8cadd
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=9ffcf1f259d72ca3
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=426d90ebdde3b5b5
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=91ee17a3a5337d5f
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d64e2b74ebda2997
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=ecf49b7ee2583002
+
+theme LumenLight/Deuteranopia paused_contrast=8.31:1 running_contrast=7.46:1 frame=509fa39d6005827d regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=eb1d6fd46c119c91
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=bef13e50c6c2b499
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=7daa59e2ebe18b08
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=a3c503ce31f8cadd
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=9ffcf1f259d72ca3
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=426d90ebdde3b5b5
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=91ee17a3a5337d5f
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d64e2b74ebda2997
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=ecf49b7ee2583002
+
+theme NordicFrost/Deuteranopia paused_contrast=8.31:1 running_contrast=7.46:1 frame=509fa39d6005827d regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=eb1d6fd46c119c91
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=bef13e50c6c2b499
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=7daa59e2ebe18b08
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=a3c503ce31f8cadd
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=9ffcf1f259d72ca3
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=426d90ebdde3b5b5
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=91ee17a3a5337d5f
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d64e2b74ebda2997
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=ecf49b7ee2583002
+
+theme HighContrast/Deuteranopia paused_contrast=8.31:1 running_contrast=7.46:1 frame=509fa39d6005827d regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=eb1d6fd46c119c91
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=bef13e50c6c2b499
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=7daa59e2ebe18b08
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=a3c503ce31f8cadd
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=9ffcf1f259d72ca3
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=426d90ebdde3b5b5
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=91ee17a3a5337d5f
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=d64e2b74ebda2997
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=ecf49b7ee2583002
+
+theme BioluminescentDarkField/Protanopia paused_contrast=10.79:1 running_contrast=17.00:1 frame=8a43964b12ef8455 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=0fde968231526c92
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=f4c07975c5508612
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=47c66e56ee216dc1
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=2967141dcc208edc
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=fc310c20876e2014
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=35056761cd811add
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=2b07d455e96c687d
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=11ee8eab9d52ee91
+
+theme CyberpunkAurora/Protanopia paused_contrast=8.31:1 running_contrast=6.48:1 frame=6253cddb487f4417 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=95c00366dddad732
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=1b4612df414686e0
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=df3fc1444c1a7237
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=447bf69ac00e0b9d
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=12328c3829ea2740
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a664d6aa5cf8e6d2
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=7b86965a3fa1d79b
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=baa6756252f507d1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=f1614717ce385609
+
+theme Darcula/Protanopia paused_contrast=8.31:1 running_contrast=6.48:1 frame=6253cddb487f4417 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=95c00366dddad732
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=1b4612df414686e0
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=df3fc1444c1a7237
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=447bf69ac00e0b9d
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=12328c3829ea2740
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a664d6aa5cf8e6d2
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=7b86965a3fa1d79b
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=baa6756252f507d1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=f1614717ce385609
+
+theme LumenLight/Protanopia paused_contrast=8.31:1 running_contrast=6.48:1 frame=6253cddb487f4417 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=95c00366dddad732
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=1b4612df414686e0
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=df3fc1444c1a7237
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=447bf69ac00e0b9d
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=12328c3829ea2740
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a664d6aa5cf8e6d2
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=7b86965a3fa1d79b
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=baa6756252f507d1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=f1614717ce385609
+
+theme NordicFrost/Protanopia paused_contrast=8.31:1 running_contrast=6.48:1 frame=6253cddb487f4417 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=95c00366dddad732
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=1b4612df414686e0
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=df3fc1444c1a7237
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=447bf69ac00e0b9d
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=12328c3829ea2740
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a664d6aa5cf8e6d2
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=7b86965a3fa1d79b
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=baa6756252f507d1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=f1614717ce385609
+
+theme HighContrast/Protanopia paused_contrast=8.31:1 running_contrast=6.48:1 frame=6253cddb487f4417 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=95c00366dddad732
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=1b4612df414686e0
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=df3fc1444c1a7237
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=447bf69ac00e0b9d
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=12328c3829ea2740
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a664d6aa5cf8e6d2
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=7b86965a3fa1d79b
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=baa6756252f507d1
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=f1614717ce385609
+
+theme BioluminescentDarkField/Tritanopia paused_contrast=10.79:1 running_contrast=17.00:1 frame=8a43964b12ef8455 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=0fde968231526c92
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=f4c07975c5508612
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=47c66e56ee216dc1
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=2967141dcc208edc
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=fc310c20876e2014
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=35056761cd811add
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=2b07d455e96c687d
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=11ee8eab9d52ee91
+
+theme CyberpunkAurora/Tritanopia paused_contrast=8.26:1 running_contrast=6.72:1 frame=0570c675035a3a1f regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=c81b94b5b08e28dd
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=999a9dcd17d27f45
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=a3c672655434e6ae
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=4e80f1440d2725e1
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=1f833ce62b548c53
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a36afd35f8958739
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=6a7abfb6b220d7c3
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=8b2a88a97c9b259b
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=25316755494e3702
+
+theme Darcula/Tritanopia paused_contrast=8.26:1 running_contrast=6.72:1 frame=0570c675035a3a1f regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=c81b94b5b08e28dd
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=999a9dcd17d27f45
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=a3c672655434e6ae
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=4e80f1440d2725e1
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=1f833ce62b548c53
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a36afd35f8958739
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=6a7abfb6b220d7c3
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=8b2a88a97c9b259b
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=25316755494e3702
+
+theme LumenLight/Tritanopia paused_contrast=8.26:1 running_contrast=6.72:1 frame=0570c675035a3a1f regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=c81b94b5b08e28dd
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=999a9dcd17d27f45
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=a3c672655434e6ae
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=4e80f1440d2725e1
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=1f833ce62b548c53
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a36afd35f8958739
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=6a7abfb6b220d7c3
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=8b2a88a97c9b259b
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=25316755494e3702
+
+theme NordicFrost/Tritanopia paused_contrast=8.26:1 running_contrast=6.72:1 frame=0570c675035a3a1f regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=c81b94b5b08e28dd
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=999a9dcd17d27f45
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=a3c672655434e6ae
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=4e80f1440d2725e1
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=1f833ce62b548c53
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a36afd35f8958739
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=6a7abfb6b220d7c3
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=8b2a88a97c9b259b
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=25316755494e3702
+
+theme HighContrast/Tritanopia paused_contrast=8.26:1 running_contrast=6.72:1 frame=0570c675035a3a1f regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=c81b94b5b08e28dd
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=999a9dcd17d27f45
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=a3c672655434e6ae
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=4e80f1440d2725e1
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=1f833ce62b548c53
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=a36afd35f8958739
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=6a7abfb6b220d7c3
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=8b2a88a97c9b259b
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=25316755494e3702
+
+theme BioluminescentDarkField/HighContrast paused_contrast=10.79:1 running_contrast=17.00:1 frame=8a43964b12ef8455 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=0fde968231526c92
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=f4c07975c5508612
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=47c66e56ee216dc1
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=2967141dcc208edc
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=fc310c20876e2014
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=35056761cd811add
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=2b07d455e96c687d
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=11ee8eab9d52ee91
+
+theme CyberpunkAurora/HighContrast paused_contrast=13.71:1 running_contrast=7.49:1 frame=fbccb3200f562b87 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=9ccd1c219fc0a2d3
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=58472d8a3c50ad1b
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=37264df2fcabe540
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=24889b3f90a02b45
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=7644480c7815d5b9
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=ac5aca83bfa046d3
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=687e3914d9d4bd57
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=7160409d586a0ad3
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=db4df6b2ba60ac24
+
+theme Darcula/HighContrast paused_contrast=13.71:1 running_contrast=7.49:1 frame=fbccb3200f562b87 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=9ccd1c219fc0a2d3
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=58472d8a3c50ad1b
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=37264df2fcabe540
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=24889b3f90a02b45
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=7644480c7815d5b9
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=ac5aca83bfa046d3
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=687e3914d9d4bd57
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=7160409d586a0ad3
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=db4df6b2ba60ac24
+
+theme LumenLight/HighContrast paused_contrast=13.71:1 running_contrast=7.49:1 frame=fbccb3200f562b87 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=9ccd1c219fc0a2d3
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=58472d8a3c50ad1b
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=37264df2fcabe540
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=24889b3f90a02b45
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=7644480c7815d5b9
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=ac5aca83bfa046d3
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=687e3914d9d4bd57
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=7160409d586a0ad3
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=db4df6b2ba60ac24
+
+theme NordicFrost/HighContrast paused_contrast=13.71:1 running_contrast=7.49:1 frame=fbccb3200f562b87 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=9ccd1c219fc0a2d3
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=58472d8a3c50ad1b
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=37264df2fcabe540
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=24889b3f90a02b45
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=7644480c7815d5b9
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=ac5aca83bfa046d3
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=687e3914d9d4bd57
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=7160409d586a0ad3
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=db4df6b2ba60ac24
+
+theme HighContrast/HighContrast paused_contrast=13.71:1 running_contrast=7.49:1 frame=fbccb3200f562b87 regions=10
+  header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=9ccd1c219fc0a2d3
+  rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=58472d8a3c50ad1b
+  vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=99    hash=37264df2fcabe540
+  trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=24889b3f90a02b45
+  leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=65    hash=7644480c7815d5b9
+  oldest       x=50  y=21  w=30  h=4   room=yes marker=yes nonblank=63    hash=ac5aca83bfa046d3
+  insights     x=50  y=25  w=30  h=4   room=yes marker=yes nonblank=112   hash=687e3914d9d4bd57
+  brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=7160409d586a0ad3
+  events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=db4df6b2ba60ac24
