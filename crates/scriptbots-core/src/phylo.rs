@@ -2031,7 +2031,7 @@ pub fn step_phylo_events(
             };
             emitted_events.push((event_id, speciation));
 
-            if let Some(hid) = tracking.matched_hint {
+            if let Some(_hid) = tracking.matched_hint {
                 verdicts.push(HintVerdict::Confirmed(event_id));
             } else {
                 unhinted_this_step += 1;

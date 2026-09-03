@@ -353,6 +353,7 @@ fn registry_lists_builtin_reports_with_descriptions() {
             "compare-runs",
             "metric-distribution",
             "phenotype-interactions",
+            "lineage-fitness",
         ]
     );
     assert!(listed.iter().all(|(_, d)| !d.is_empty()));

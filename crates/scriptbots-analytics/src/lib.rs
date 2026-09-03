@@ -75,6 +75,15 @@ pub mod changepoint;
 /// KS) is left for the adapter decision (bd-2z0.11.3). Pure functions over a slice.
 pub mod distribution;
 
+/// Run-scoped lineage fitness, uncertainty, and evolutionary explanations (bd-2z0.11.10).
+pub mod lineage;
+
+pub use lineage::{
+    EvolutionaryChangeExplanation, FounderLineageRecord, GenerationMetricRow,
+    LINEAGE_FITNESS_SCHEMA_ID_V1, LineageFitness, LineageFitnessMachine, LineageLifespanSummary,
+    LineageRunReconciliation,
+};
+
 /// Schema version stamped into every machine-readable report payload.
 ///
 /// Bump ONLY with a migration note in the owning Bead/release evidence. Full
@@ -545,6 +554,9 @@ pub enum AnalyticsError {
     /// Canonical phenotype extraction refused invalid or censored evidence.
     #[error("phenotype extraction error: {0}")]
     Phenotype(#[from] PhenotypeExtractionError),
+    /// Rebuilding or querying the ancestry graph failed.
+    #[error("ancestry error: {0}")]
+    Ancestry(#[from] scriptbots_core::ancestry::AncestryError),
 }
 
 /// Read-only context handed to every report.
@@ -1435,6 +1447,30 @@ impl ReportParams {
             .transpose()
     }
 
+    /// Parses an optional `u64` parameter.
+    pub fn get_u64(&self, key: &str) -> Result<Option<u64>, AnalyticsError> {
+        self.get(key)
+            .map(|raw| {
+                raw.parse::<u64>().map_err(|e| AnalyticsError::BadParam {
+                    name: key.to_owned(),
+                    reason: e.to_string(),
+                })
+            })
+            .transpose()
+    }
+
+    /// Parses an optional `f64` parameter.
+    pub fn get_f64(&self, key: &str) -> Result<Option<f64>, AnalyticsError> {
+        self.get(key)
+            .map(|raw| {
+                raw.parse::<f64>().map_err(|e| AnalyticsError::BadParam {
+                    name: key.to_owned(),
+                    reason: e.to_string(),
+                })
+            })
+            .transpose()
+    }
+
     /// Iterates the raw pairs (stable order) for logging.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1492,6 +1528,7 @@ impl Registry {
                 Box::new(RunComparison),
                 Box::new(MetricDistribution),
                 Box::new(PhenotypeInteractions),
+                Box::new(lineage::LineageFitness),
             ],
         }
     }

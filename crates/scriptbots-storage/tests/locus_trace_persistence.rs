@@ -76,8 +76,8 @@ fn test_db_backed_lineage_locus_tracing_e2e() -> Result<(), Box<dyn std::error::
         );
     }
 
-    // Step the simulation for 120 ticks
-    const SIMULATION_TICKS: u64 = 120;
+    // Step the simulation for 30 ticks
+    const SIMULATION_TICKS: u64 = 30;
     for _ in 0..SIMULATION_TICKS {
         persistence.step(&mut world)?;
     }

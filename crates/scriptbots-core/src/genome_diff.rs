@@ -167,8 +167,8 @@ pub struct LocusSample {
 
 /// Trace a specific locus value across a sequence of lineage ancestor envelopes.
 #[must_use]
-pub fn trace_lineage_locus<C: BrainFamilyCodec>(
-    codec: &C,
+pub fn trace_lineage_locus(
+    codec: &dyn BrainFamilyCodec,
     lineage_samples: &[(u32, AgentUid, Tick, BrainGenomeEnvelope)],
     locus: Locus,
 ) -> Vec<LocusSample> {

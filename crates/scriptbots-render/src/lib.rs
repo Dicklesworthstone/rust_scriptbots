@@ -7518,6 +7518,161 @@ impl SimulationView {
             .child(self.render_diet_gauges())
             .child(render_brain_card(detail))
             .child(self.render_mutation_controls(detail, cx))
+            .when_some(detail.genome_browser.as_ref(), |this, browser| {
+                this.child(self.render_genome_browser(browser, cx))
+            })
+    }
+
+    fn render_genome_browser(
+        &self,
+        browser: &scriptbots_core::genome_browser::GenomeBrowserViewModel,
+        _cx: &mut Context<Self>,
+    ) -> Div {
+        use scriptbots_core::genome_browser::MutationDiffStatus;
+
+        let header = div()
+            .flex()
+            .justify_between()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x38bdf8))
+                    .child(format!("Genome Browser · {}", browser.family_id.as_str())),
+            )
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                "v{} · hash {:.8}",
+                browser.schema_version, browser.genome_digest
+            )));
+
+        // Topology / Node summary
+        let paging_text = if browser.paging.is_truncated {
+            format!(
+                "Nodes {}..{} of {} (LOD capped · {} total loci)",
+                browser.paging.page_offset,
+                browser.paging.page_offset + browser.nodes.len(),
+                browser.paging.total_nodes,
+                browser.paging.total_loci,
+            )
+        } else {
+            format!(
+                "{} nodes · {} loci",
+                browser.paging.total_nodes, browser.paging.total_loci
+            )
+        };
+
+        let topology_info = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_xs().text_color(rgb(0x64748b)).child(paging_text));
+
+        // Mutation diff block
+        let diff_block = match &browser.mutation_diff {
+            MutationDiffStatus::FounderNoParent => div()
+                .text_xs()
+                .text_color(rgb(0x94a3b8))
+                .child("Founder / Injected (no parent diff)"),
+            MutationDiffStatus::Computed {
+                parent_uid,
+                total_deltas,
+                summary,
+            } => {
+                let mut d_div = div().flex().flex_col().gap_1().child(
+                    div().text_xs().text_color(rgb(0xa3e635)).child(format!(
+                        "Parent Agent {} · {} mutations · L1 {:.3} · Linf {:.3}",
+                        parent_uid.get(),
+                        total_deltas,
+                        summary.l1,
+                        summary.linf,
+                    )),
+                );
+
+                // Show up to 4 preview deltas
+                for delta in browser.deltas.iter().take(4) {
+                    let desc = match delta {
+                        scriptbots_core::genome_diff::GenomeDelta::Scalar {
+                            locus,
+                            before,
+                            after,
+                        } => {
+                            format!("{}: {:.2} → {:.2}", locus.human(), before, after)
+                        }
+                        scriptbots_core::genome_diff::GenomeDelta::Retarget {
+                            locus,
+                            before,
+                            after,
+                        } => {
+                            format!("{}: node {} → node {}", locus.human(), before, after)
+                        }
+                        scriptbots_core::genome_diff::GenomeDelta::KindFlip {
+                            locus,
+                            before,
+                            after,
+                        } => {
+                            format!("{}: kind {} → kind {}", locus.human(), before, after)
+                        }
+                    };
+                    d_div = d_div.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5f5))
+                            .child(format!("  • {desc}")),
+                    );
+                }
+                d_div
+            }
+            MutationDiffStatus::SexualPrimary {
+                parent_uids,
+                total_deltas,
+                ..
+            } => {
+                let p_str = parent_uids
+                    .iter()
+                    .map(|u| u.get().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                div().text_xs().text_color(rgb(0xa3e635)).child(format!(
+                    "Sexual crossover parents [{}] · {} deltas",
+                    p_str, total_deltas
+                ))
+            }
+            MutationDiffStatus::Unavailable { reason } => div()
+                .text_xs()
+                .text_color(rgb(0xf87171))
+                .child(format!("Diff unavailable: {reason}")),
+        };
+
+        // Render preview of first few nodes and connections
+        let mut node_list = div().flex().flex_col().gap_1();
+        for node in browser.nodes.iter().take(4) {
+            let bias_str = node
+                .bias
+                .map_or(String::new(), |b| format!("bias {b:+.2} "));
+            let damp_str = node
+                .damping
+                .map_or(String::new(), |d| format!("damp {d:.2} "));
+            let conn_count = node.connections.len();
+            node_list = node_list.child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                "• Node {}: {bias_str}{damp_str}({conn_count} conns)",
+                node.node_index
+            )));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e3a8a))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(header)
+            .child(topology_info)
+            .child(diff_block)
+            .child(node_list)
     }
 
     fn render_diet_gauges(&self) -> Div {
@@ -12541,59 +12696,61 @@ impl AgentListEntry {
     }
 }
 
-#[derive(Clone)]
-struct AgentInspectorDetails {
-    agent_id: AgentId,
-    label: String,
-    color: [f32; 3],
-    position: Position,
-    energy: f32,
-    health: f32,
-    age: u32,
-    generation: Generation,
-    brain_descriptor: String,
-    mutation_rates: MutationRates,
-    trait_modifiers: TraitModifiers,
-    spike_length: f32,
-    sensors: Vec<f32>,
-    outputs: Vec<f32>,
+#[derive(Clone, Debug)]
+pub struct AgentInspectorDetails {
+    pub agent_id: AgentId,
+    pub label: String,
+    pub color: [f32; 3],
+    pub position: Position,
+    pub energy: f32,
+    pub health: f32,
+    pub age: u32,
+    pub generation: Generation,
+    pub brain_descriptor: String,
+    pub mutation_rates: MutationRates,
+    pub trait_modifiers: TraitModifiers,
+    pub spike_length: f32,
+    pub sensors: Vec<f32>,
+    pub outputs: Vec<f32>,
     /// Whether the agent's brain binding has a runner; an unbound agent's
     /// outputs are an identity copy of sensors and must not be "explained"
     /// (bd-16g.4.3).
-    brain_bound: bool,
-    brain_activations: Option<BrainActivations>,
-    brain_source_tick: Option<u64>,
-    brain_request_revision: Option<u64>,
-    brain_payload_bytes: Option<usize>,
-    brain_inspection_status: Option<String>,
+    pub brain_bound: bool,
+    pub brain_activations: Option<BrainActivations>,
+    pub brain_source_tick: Option<u64>,
+    pub brain_request_revision: Option<u64>,
+    pub brain_payload_bytes: Option<usize>,
+    pub brain_inspection_status: Option<String>,
     /// Per-neighbour attribution of what this agent perceives (bd-16g.4.2),
     /// computed in core and rendered verbatim — never re-derived by the UI.
-    sense_attribution: Option<SensorAttribution>,
+    pub sense_attribution: Option<SensorAttribution>,
     /// Eye directions relative to the heading, radians; pairs with
     /// `sense_attribution` so cones can be labeled at their true angles.
-    eye_directions: [f32; NUM_EYES],
+    pub eye_directions: [f32; NUM_EYES],
     /// Clamped per-eye fields of view, radians.
-    eye_fovs: [f32; NUM_EYES],
+    pub eye_fovs: [f32; NUM_EYES],
+    /// Bounded genome browser view model (bd-16g.13.3).
+    pub genome_browser: Option<scriptbots_core::genome_browser::GenomeBrowserViewModel>,
 }
 
 #[derive(Clone)]
-struct BrainInspectorCapture {
-    agent_uid: AgentUid,
-    source_tick: u64,
-    request_revision: u64,
-    retained_payload_bytes: usize,
-    status: BrainInspectorCaptureStatus,
+pub struct BrainInspectorCapture {
+    pub agent_uid: AgentUid,
+    pub source_tick: u64,
+    pub request_revision: u64,
+    pub retained_payload_bytes: usize,
+    pub status: BrainInspectorCaptureStatus,
 }
 
 #[derive(Clone)]
-enum BrainInspectorCaptureStatus {
+pub enum BrainInspectorCaptureStatus {
     Ready(BrainActivations),
     Unavailable(BrainInspectionUnavailable),
     Refused(String),
 }
 
 impl AgentInspectorDetails {
-    fn from_world(
+    pub fn from_world(
         world: &WorldState,
         agent_id: AgentId,
         brain_capture: Option<BrainInspectorCapture>,
@@ -12652,6 +12809,47 @@ impl AgentInspectorDetails {
         let eye_directions = agent_runtime.eye_direction;
         let eye_fovs = agent_runtime.eye_fov;
 
+        let genome_browser = if let Some(envelope) = world.agent_brain_genome(agent_id) {
+            let codec_opt = world.brain_registry().family_by_id(envelope.family_id());
+            let uid = world.agent_uid(agent_id).unwrap_or(AgentUid(0));
+            let parent_uids: Vec<AgentUid> = envelope
+                .provenance()
+                .parents
+                .iter()
+                .filter_map(|p| *p)
+                .collect();
+            let parent_envelope = parent_uids.first().and_then(|p_uid| {
+                world.agents().iter_handles().find_map(|h| {
+                    if world.agent_uid(h) == Some(*p_uid) {
+                        world.agent_brain_genome(h)
+                    } else {
+                        None
+                    }
+                })
+            });
+
+            if let Some(codec) = codec_opt {
+                scriptbots_core::genome_browser::GenomeBrowserViewModel::build(
+                    codec,
+                    uid,
+                    generation.0,
+                    world.tick(),
+                    envelope,
+                    parent_envelope,
+                    parent_uids,
+                    None,
+                    None,
+                    0,
+                    20,
+                )
+                .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Some(Self {
             agent_id,
             label,
@@ -12676,6 +12874,7 @@ impl AgentInspectorDetails {
             sense_attribution,
             eye_directions,
             eye_fovs,
+            genome_browser,
         })
     }
 }
@@ -18646,7 +18845,7 @@ mod command_characterization_tests {
                 simulation_step,
                 AnalyticsSnapshotProvider::empty(),
                 identified(command_drain),
-                Arc::new(|_, _| {}) as GuiCommandReporter,
+                Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
                 command_submit,
             ));
             let mut app = gpui::TestApp::new();
@@ -19417,7 +19616,7 @@ mod command_characterization_tests {
             simulation_step,
             AnalyticsSnapshotProvider::empty(),
             identified(command_drain),
-            Arc::new(|_, _| {}) as GuiCommandReporter,
+            Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -19537,7 +19736,7 @@ mod command_characterization_tests {
             disabled_persistence_step_driver(&world),
             AnalyticsSnapshotProvider::empty(),
             identified(command_drain),
-            Arc::new(|_, _| {}) as GuiCommandReporter,
+            Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -19622,7 +19821,7 @@ mod command_characterization_tests {
             disabled_persistence_step_driver(&world),
             AnalyticsSnapshotProvider::empty(),
             identified(command_drain),
-            Arc::new(|_, _| {}) as GuiCommandReporter,
+            Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -20078,7 +20277,7 @@ mod command_characterization_tests {
             simulation_step,
             AnalyticsSnapshotProvider::empty(),
             identified(command_drain),
-            Arc::new(|_, _| {}) as GuiCommandReporter,
+            Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
             command_submit,
         ));
 

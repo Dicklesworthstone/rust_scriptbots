@@ -68,6 +68,7 @@ mod checkpoint;
 pub mod detect;
 pub mod economy;
 pub mod gallery;
+pub mod genome_browser;
 pub mod genome_diff;
 pub mod infotheory;
 pub mod interventions;
@@ -84,6 +85,10 @@ pub mod sense_fixed;
 pub mod species;
 pub mod visual;
 
+pub use genome_browser::{
+    BrowserConnectionView, BrowserLineagePlotView, BrowserNodeView, BrowserPagingMeta,
+    GenomeBrowserError, GenomeBrowserViewModel, MutationDiffStatus,
+};
 pub use migration::{MigratingAgent, MigrationTransferError};
 
 pub use checkpoint::{
@@ -2901,6 +2906,17 @@ impl BrainRegistry {
         self.entries
             .get(&key)
             .and_then(|entry| entry.protocol_adapter.as_deref())
+    }
+
+    /// Look up an admitted protocol adapter by family ID.
+    #[must_use]
+    pub fn family_by_id(&self, family_id: &BrainFamilyId) -> Option<&dyn BrainFamilyAdapter> {
+        self.entries.values().find_map(|entry| {
+            entry
+                .protocol_adapter
+                .as_deref()
+                .filter(|a| a.family_id() == family_id)
+        })
     }
 
     /// Stable family-owned semantic identity captured when the protocol adapter was admitted.
