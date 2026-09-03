@@ -112,7 +112,6 @@ The runtime control surface (`crates/scriptbots-runtime/src/lib.rs`):
 Source of truth: `crates/scriptbots-runtime/src/lib.rs` (`HostCore`, `HostCommand`, `HostEventKind`,
 `CommandEnvelope`, `CommandId`); `crates/scriptbots-app/src/lib.rs` (`SharedWorld`);
 `crates/scriptbots-app/src/control.rs` (`ControlHandle`); transitional receipt fixes under `bd-2z0.4.9`;
-`crates/scriptbots-app/src/control.rs` (`ControlHandle`); transitional receipt fixes under `bd-2z0.4.9`;
 HostClient migration: ControlHandle slice closed in `bd-k7nq`; remaining transfer under `bd-pcfj`/`bd-88yj`
 (corrected 2026-09-03, `bd-docs-status-truth-sweep-v2iw`).
 
@@ -311,7 +310,6 @@ reconstruction envelope for the core science state whose equality those digests 
   `0.1.0-bd2i1-perf-compare-quiet1.20260716T160817Z`. `bd-hiv1` is CLOSED ("Restore legacy
   wheel-output semantics for movement noise and spike speed"; status corrected 2026-09-03 —
   `bd-docs-status-truth-sweep-v2iw`). Hosted workflow
-  correction for movement-noise and spike-speed consumers of wheel effort. Hosted workflow
   results are not accepted for these contracts.
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`characterization_digest_v0`,

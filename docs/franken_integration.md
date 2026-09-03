@@ -170,22 +170,24 @@ and review log). Status at last reconcile:
   bd-2z0.5.9 (sampled pairwise interaction-edge persistence), bd-91lr
   (async SQL lane disabled; hard bounds refused before path access, with
   snapshots and the synchronous read-only reader documented as alternatives).
-- **OPEN, currently in progress**: bd-2z0.5.2 **[Currently In Progress]**
-  (schema-v1 runtime lifecycle evidence at `211bfa2`; V8 domain and V9 command
-  projections at `ae8cea3`; centralized DSR union still pending), and
-  bd-2z0.3.12.3 **[Currently In Progress]**
+- **OPEN, currently in progress**: bd-2z0.3.12.3 **[Currently In Progress]**
   (real code-first FtBrain source exists; pinned DSR compile, determinism, and
   benchmark proof plus the F32 `vector_to_parameters` disposition remain
   pending).
+  [Correction 2026-09-03 — `bd-docs-status-truth-sweep-v2iw`: bd-2z0.5.2 is
+  removed from this list; it is CLOSED ("Persist sequenced command status and
+  domain event journals"), superseding the "centralized DSR union still
+  pending" note above it.]
 - **OPEN, ready**: bd-2z0.12.4 (BrowserRuntime evaluation).
   [Correction 2026-09-03 — `bd-docs-status-truth-sweep-v2iw`: bd-2z0.4.14 was
   removed from this list; it is CLOSED as REJECTED per
   `docs/scoped_cpu_cancellation_spike_decision.md` (2026-07-22), and its retained
-  completion-proof debt is `bd-2z0.4.15` (open).]
-- **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.13
-  (MVCC decision), bd-2z0.4.13 + bd-2z0.8.9.15 (structured-shutdown chain),
-  bd-2z0.11.6/.7/.8/.9 (analytics implementations), and
+- **OPEN, gated**: bd-16g.2.7 (narrative search surfaces; bd-16g.2.6 closed),
+  bd-2z0.11.6/.7/.8/.9 (analytics implementations; .8 in progress), and
   bd-2z0.3.12.4–.6 (FtBrain chain).
+  [Correction 2026-09-03 — `bd-docs-status-truth-sweep-v2iw`: bd-2z0.8.9.13,
+  bd-2z0.8.9.15, and bd-2z0.4.13 were removed from this list — all three are
+  CLOSED (verified via `br show`); bd-16g.2.6 also closed.]
 
 The pinned local DSR verification profile is the only acceptance lane. GitHub
 Actions and direct Cargo invocations are not accepted as verification. DSR runs

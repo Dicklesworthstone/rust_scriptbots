@@ -24,6 +24,7 @@ Repository: <https://github.com/Dicklesworthstone/rust_scriptbots>
 | [8. Bevy 3D Renderer](#8-bevy-3d-renderer-2025-10-30--31) | 2025-10-30 -- 31 | Bevy 0.17 integration, 3D terrain heightfields, agent avatars, tonemapping |
 | [9. Maintenance & Licensing](#9-maintenance--licensing-2025-11--2026-03) | 2025-11 -- 2026-03 | CI hardening, WASM compat, MIT + AI rider license, documentation |
 | [10. Recovery Architecture](#10-recovery-architecture-2026-07) | 2026-07 | Evidence-led rearchitecture, FrankenSQLite migration, truthful GUI/TUI persistence |
+| [11. Evolution Lab Programs](#11-evolution-lab-programs-2026-08--09) | 2026-08 -- 09 | Economy gates, archipelago E2E, lineage science, genome browser, experiment-runner proof |
 
 ---
 
@@ -61,6 +62,42 @@ The recovery program replaced the former DuckDB stack with exact-revision Franke
 The current WASM build has no SQL engine and remains memory-only. If browser persistence is added, FrankenSQLite is the sole permitted SQL backend; durable storage still requires a dedicated Worker, SQLite-image checkpoints, an idempotent IndexedDB journal, and real recovery tests for an OPFS/IndexedDB VFS.
 
 ---
+
+## 11. Evolution Lab Programs (2026-08 -- 09)
+
+After the recovery architecture landed, work shifted to the Evolution Lab science
+programs (`bd-16g` epic family), evidence hardening, and truthful documentation.
+August was a light consolidation month; the pace surged on 2026-09-01..03.
+
+### Economy, archipelago, and lineage science
+
+- [`f0bd2d0`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/f0bd2d0b06246b9e10ae120be21329e686e5b5bd) -- ci(economy): add conservation economy gate job to ci.yml and calibrate spawn interval (bd-16g.11.2).
+- [`1af6321`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/1af63216205fb1c1c0990246c1e78b5ed1632c49) -- feat(app): economy-audit CLI subcommand, residual timeseries streaming, and deterministic verdict emission (bd-9sg6).
+- [`db83593`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/db83593eada327a0b3ed67fbfd22b41b5c24f3ab) -- feat(economy): Sankey view, trophic table, per-epoch export agreement; close bd-16g.11 (bd-16g.11.3).
+- [`f5107b2`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/f5107b28b9fa0108f0cdf913438db0be29fdedf7) -- feat(storage): record real archipelago end to end with per-island narrative validation (bd-16g.5.5.6).
+- [`81e1703`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/81e1703f71a138423d37eb6dba5dfc7dbc6007c2) -- feat(storage,runtime,tests): archipelago DB reconstruction proof, migration multigraph, and lab chaos trace capture.
+- [`533bbe2`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/533bbe2a9a1e349c3652c5e3a7b44711500bcc3e) + [`bd6b896`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/bd6b8960a51bee9d0e597a6be5c76e601a126492) -- archipelago offline reconstruction report, conservation audit, and E2E CLI test suite (bd-16g.5.5.5).
+- [`5fd5da0`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/5fd5da06d4a83b6cbd45f133689e39035920a21f) + [`50c02db`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/50c02db006352268df502f17bc8e11a520fe7891) -- DB-backed lineage locus tracing with CSV/PNG export, explicit gap semantics, and standalone E2E test (bd-wdyu).
+
+### Genomes, brains, and experiments
+
+- [`74ad7e4`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/74ad7e49ab8c1b51406b3b1bae96f4b60852050c) -- feat(analytics,core,render): lineage fitness report (bootstrap CIs, founder turnover, diversity) and genome browser UI (bd-2z0.11.10, bd-16g.13.3).
+- [`d8cd29c`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/d8cd29ca7625eae5e43e79ed1b03c774fe96129d) -- feat(brain-ml): real candle-core Tensor forward and cohort batch execution (bd-rcae).
+- [`fa28a80`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/fa28a80d9c3e175e228fc797d227e03b2796087f) -- test(app): exercise all brain families in matched-seed experiment runner execution and bundle reopen (bd-2z0.5.11).
+
+### Evidence hardening and browser proof
+
+- [`92768db`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/92768dbcfe25552131f5380009cc2523b0438f0e) + [`a99594e`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/a99594e8143cde7edbce0ca829d78fd9d88cb7b8) -- atomic manifest sidecars, early pre-bootstrap emission, reproducibility masking, genuine digest stepping, and E2E evidence hashes (bd-38us).
+- [`16a4983`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/16a4983c693dda50fd3c94a40c35832debf88a89) -- test(web): execute WASM browser stats refresh in a real browser DOM with negative controls (bd-2z0.12.6).
+- [`745f1e3`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/745f1e3b6db50e918727e5f08e426b9bb12a284e) -- ci(governance): harden asupersync universe guard with consumer ranges, committed fixtures, and ftui policy (bd-2d25).
+- [`10abaf8`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/10abaf8de0075a150a7b45980ad617598df948b9) -- test(storage): journal worker retry limit raised to 30000 under test load.
+
+### Documentation and terminal polish
+
+- [`d33e7f7`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/d33e7f788c29faeabeb6995b5132a48f60c99927) -- docs(arch): truthful current-state architecture guide and extension recipes (bd-bsuh).
+- [`c3b5d3c`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/c3b5d3c4bfeedf07738c6b70df2c4e6ae1f23dce) -- test(tui): retain theme x palette matrix and resize storm goldens (bd-l51j).
+- [`bfa04e1`](https://github.com/Dicklesworthstone/rust_scriptbots/commit/bfa04e12dc0920eb7de44ea009ce1be77c377518) -- test(terminal): regenerate capability matrix golden with diet style modifiers (bd-q2w9).
+- August consolidation: `--brain`/`SCRIPTBOTS_BRAIN` docs aligned with BrainPreset v1, Disc/Rect toroidal region validation, DSR performance-comparison automation recipe (bd-2cd1), and fsqlite namespace gate/use evidence.
 
 ## 1. Foundation & Core Simulation (2025-10-21)
 
