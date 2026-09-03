@@ -177,8 +177,11 @@ and review log). Status at last reconcile:
   (real code-first FtBrain source exists; pinned DSR compile, determinism, and
   benchmark proof plus the F32 `vector_to_parameters` disposition remain
   pending).
-- **OPEN, ready**: bd-2z0.4.14 (`Cx::scoped_cpu` spike) and bd-2z0.12.4
-  (BrowserRuntime evaluation).
+- **OPEN, ready**: bd-2z0.12.4 (BrowserRuntime evaluation).
+  [Correction 2026-09-03 — `bd-docs-status-truth-sweep-v2iw`: bd-2z0.4.14 was
+  removed from this list; it is CLOSED as REJECTED per
+  `docs/scoped_cpu_cancellation_spike_decision.md` (2026-07-22), and its retained
+  completion-proof debt is `bd-2z0.4.15` (open).]
 - **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.13
   (MVCC decision), bd-2z0.4.13 + bd-2z0.8.9.15 (structured-shutdown chain),
   bd-2z0.11.6/.7/.8/.9 (analytics implementations), and

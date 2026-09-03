@@ -4320,6 +4320,166 @@ impl SimulationView {
             .child(insights_row)
             .child(brain_panel)
     }
+
+    /// Render the GPUI Sankey diagram flow view (bd-16g.11.3).
+    ///
+    /// # Strict Ecosystem Accounting Boundary
+    /// Under the strict ecosystem accounting contract, the render module MUST NOT
+    /// perform any flow arithmetic, category re-derivation, or aggregation over raw flows.
+    /// It consumes only canonical [`scriptbots_core::economy::SankeyGraph`] structs.
+    #[must_use]
+    pub fn render_sankey_view(
+        &self,
+        sankey: Option<&scriptbots_core::economy::SankeyGraph>,
+    ) -> Div {
+        let theme = hud_theme(self.accessibility_snapshot().palette);
+        let Some(graph) = sankey else {
+            tracing::warn!(target: "scriptbots::economy::view", "Sankey view requested missing epoch");
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .rounded_lg()
+                .bg(rgb(theme.card_bg))
+                .border_1()
+                .border_color(rgb(theme.card_border))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0x94a3b8))
+                        .child("Ecosystem Sankey Flow: no data for requested epoch"),
+                );
+        };
+
+        let total_flow: f64 = graph.links.iter().map(|l| l.value).sum();
+        let residual_flow: f64 = graph
+            .links
+            .iter()
+            .filter(|l| l.to == 6)
+            .map(|l| l.value)
+            .sum();
+        if total_flow > 0.0 && (residual_flow / total_flow) > 0.01 {
+            tracing::warn!(
+                target: "scriptbots::economy::view",
+                residual_ratio = residual_flow / total_flow,
+                "Sankey residual link exceeds 1% of epoch gross flow; diagram visibly unbalanced"
+            );
+        }
+
+        tracing::info!(
+            target: "scriptbots::economy::view",
+            view = "sankey",
+            nodes = graph.nodes.len(),
+            links = graph.links.len(),
+            total_flow = total_flow,
+            "rendering Sankey flow diagram"
+        );
+
+        let mut node_elements = Vec::new();
+        for node in &graph.nodes {
+            let in_val: f64 = graph
+                .links
+                .iter()
+                .filter(|l| l.to == node.id)
+                .map(|l| l.value)
+                .sum();
+            let out_val: f64 = graph
+                .links
+                .iter()
+                .filter(|l| l.from == node.id)
+                .map(|l| l.value)
+                .sum();
+            let color = match node.class {
+                scriptbots_core::economy::NodeClass::ExternalSource => 0x38bdf8,
+                scriptbots_core::economy::NodeClass::FoodGrid => 0x4ade80,
+                scriptbots_core::economy::NodeClass::Herbivores => 0xa3e635,
+                scriptbots_core::economy::NodeClass::Omnivores => 0xfbbf24,
+                scriptbots_core::economy::NodeClass::Carnivores => 0xf87171,
+                scriptbots_core::economy::NodeClass::Sink => 0x94a3b8,
+                scriptbots_core::economy::NodeClass::Unaccounted => 0xe879f9,
+            };
+
+            node_elements.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(theme.card_bg))
+                    .border_1()
+                    .border_color(rgb(theme.card_border))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(color))
+                            .child(node.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child(format!("in: {:.2} · out: {:.2}", in_val, out_val)),
+                    ),
+            );
+        }
+
+        let mut link_elements = Vec::new();
+        for link in &graph.links {
+            let cat_label = link.category.map_or("unaccounted_residual", |c| c.as_str());
+            let from_name = graph.nodes.get(link.from).map_or("?", |n| n.label.as_str());
+            let to_name = graph.nodes.get(link.to).map_or("?", |n| n.label.as_str());
+            link_elements.push(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(rgb(0xe2e8f0))
+                            .child(format!("{from_name} → {to_name} ({cat_label})")),
+                    )
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x38bdf8))
+                            .child(format!("{:.4}", link.value)),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(theme.card_bg))
+            .border_1()
+            .border_color(rgb(theme.card_border))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(0x38bdf8))
+                    .child("Ecosystem Energy & Resource Flows (Sankey)"),
+            )
+            .child(div().flex().flex_wrap().gap_2().children(node_elements))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(0x0f172a))
+                    .children(link_elements),
+            )
+    }
+
     fn render_history(&self, snapshot: &HudSnapshot) -> Div {
         let theme = hud_theme(self.accessibility_snapshot().palette);
         let header = div()

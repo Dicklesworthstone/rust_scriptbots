@@ -79,10 +79,12 @@ Source of truth: `crates/scriptbots-core/src/lib.rs` (`WorldState`, the `stage_*
   HTTP/MCP servers (`crates/scriptbots-app/src/servers.rs`), and the TUI loop (`crates/scriptbots-app/src/terminal/mod.rs`)
   lock this mutex directly. Closed bead `bd-2z0.4.9` completed a vital transitional milestone by
   migrating control commands to use typed, validated envelopes (`CommandEnvelope`, `CommandId`) and
-  eliminating discarded receipts across Bevy, CLI, REST, and MCP. However, the structural migration
-  to retire `SharedWorld` from `ControlHandle` and switch all server and frontend surfaces to an
-  isolated, dedicated-thread `HostCore` driven exclusively via `HostClient` remains open under P0 bead
-  `bd-k7nq`.
+  eliminating discarded receipts across Bevy, CLI, REST, and MCP. [Correction 2026-09-03 —
+  `bd-docs-status-truth-sweep-v2iw`: the structural migration this paragraph called open is
+  further along than stated: `bd-k7nq` is CLOSED — `ControlHandle` now reaches `HostClient`
+  (server-only mode, `ControlService` seam, stream resume/gap, real E2E). Remaining
+  transitional surfaces: server world-ownership transfer (`bd-pcfj`, in progress) and the
+  frontend migration chain (`bd-88yj`, in progress).]
 
 The runtime control surface (`crates/scriptbots-runtime/src/lib.rs`):
 
@@ -101,14 +103,18 @@ The runtime control surface (`crates/scriptbots-runtime/src/lib.rs`):
 
 - **[Target Invariant] Ownership is exclusive.** Do not introduce new paths holding `&mut WorldState`
   outside `HostCore`. Transitional paths must lock `SharedWorld` strictly within bounded helpers and
-  prepare for migration to `HostClient` under `bd-k7nq`.
+  prepare for migration to `HostClient` (ControlHandle slice completed in `bd-k7nq`; the
+  remaining transitional paths are tracked under `bd-pcfj`/`bd-88yj` — corrected 2026-09-03,
+  `bd-docs-status-truth-sweep-v2iw`).
 - **Commands are validated, not trusted.** New control operations must add a `HostCommand` variant and
   implement validation; they must never bypass the `CommandEnvelope` or discard receipts (`bd-2z0.4.9`).
 
 Source of truth: `crates/scriptbots-runtime/src/lib.rs` (`HostCore`, `HostCommand`, `HostEventKind`,
 `CommandEnvelope`, `CommandId`); `crates/scriptbots-app/src/lib.rs` (`SharedWorld`);
 `crates/scriptbots-app/src/control.rs` (`ControlHandle`); transitional receipt fixes under `bd-2z0.4.9`;
-target HostClient migration under `bd-k7nq`.
+`crates/scriptbots-app/src/control.rs` (`ControlHandle`); transitional receipt fixes under `bd-2z0.4.9`;
+HostClient migration: ControlHandle slice closed in `bd-k7nq`; remaining transfer under `bd-pcfj`/`bd-88yj`
+(corrected 2026-09-03, `bd-docs-status-truth-sweep-v2iw`).
 
 ---
 
@@ -302,7 +308,9 @@ reconstruction envelope for the core science state whose equality those digests 
   RNG schema with native and WASM DSR evidence. `bd-2i1` closed the selected locomotion model's
   V1.6 digest/trace contract, V1.3 checkpoint, V3.5 bootstrap manifest, reviewed semantic goldens,
   and exact-class full performance baseline; its final same-class comparison passed in DSR
-  `0.1.0-bd2i1-perf-compare-quiet1.20260716T160817Z`. `bd-hiv1` remains open as the separate
+  `0.1.0-bd2i1-perf-compare-quiet1.20260716T160817Z`. `bd-hiv1` is CLOSED ("Restore legacy
+  wheel-output semantics for movement noise and spike speed"; status corrected 2026-09-03 —
+  `bd-docs-status-truth-sweep-v2iw`). Hosted workflow
   correction for movement-noise and spike-speed consumers of wheel effort. Hosted workflow
   results are not accepted for these contracts.
 
@@ -358,9 +366,11 @@ Frontends are simulation consumers, never authors of core science state. They re
   (`scriptbots-bevy`), and WASM (`scriptbots-web`) consume projected `RenderSnapshot`s and communicate
   via commands. In `scriptbots-app`, however, the TUI runner (`TerminalRenderer`) and HTTP/MCP servers
   still hold a `SharedWorld` mutex bridge to drive ticks and query state directly.
-- **[Target State (`bd-k7nq`)]**: All frontends, including the TUI and headless server runners,
+- **[Target State (`bd-k7nq` + `bd-pcfj`/`bd-88yj`)]**: All frontends, including the TUI and headless server runners,
   interact strictly via `HostClient` over asynchronous channels. No frontend crate will have link or
-  runtime access to `WorldState` or `SharedWorld`.
+  runtime access to `WorldState` or `SharedWorld`. [Correction 2026-09-03 —
+  `bd-docs-status-truth-sweep-v2iw`: the `ControlHandle` leg of this target is complete
+  (`bd-k7nq` closed); the TUI/server-runner legs remain open under `bd-pcfj`/`bd-88yj`.]
 
 Crate responsibilities:
 
@@ -638,9 +648,9 @@ guard or test, or an explicit open tracking bead.
 | :--- | :--- | :--- | :--- | :--- |
 | **Core Science Purity** (no clock, network, or filesystem in ticks) | `scriptbots-core` | `WorldState::step_outcome` (`crates/scriptbots-core/src/lib.rs`) | `tests/world_determinism.rs` | Enforced; closed in `bd-16g.11` |
 | **Deterministic Stage Order** (21 ordered simulation stages) | `scriptbots-core` | `WorldState::step_outcome` (`crates/scriptbots-core/src/lib.rs`) | `tests/world_digest_v1.rs` golden digest | Enforced; closed in `bd-3n7p` |
-| **Exclusive Simulation Ownership** (HostCore sole owner) | `scriptbots-runtime` | `HostCore` (`crates/scriptbots-runtime/src/lib.rs`) | Transitional `SharedWorld` in `crates/scriptbots-app/src/lib.rs` | Open: **`bd-k7nq`** (retire `SharedWorld`) |
+| **Exclusive Simulation Ownership** (HostCore sole owner) | `scriptbots-runtime` | `HostCore` (`crates/scriptbots-runtime/src/lib.rs`) | Transitional `SharedWorld` in `crates/scriptbots-app/src/lib.rs` | ControlHandle slice closed in `bd-k7nq`; TUI/server ownership transfer open: `bd-pcfj`/`bd-88yj` (corrected 2026-09-03) |
 | **Command Receipt Accounting** (no discarded receipts) | `scriptbots-app` | `CommandEnvelope`, `CommandId` (`crates/scriptbots-runtime/src/lib.rs`) | `no_control_command_discards_its_receipt` (`crates/scriptbots-app/src/servers.rs`) | Closed in `bd-2z0.4.9`; workspace guard in `bd-d6gv` |
-| **WASM Dependency Purity** (no native franken in WASM graph) | `scriptbots-web` | `crates/scriptbots-web/Cargo.toml` | `ci/check_wasm_graph.sh` | Enforced in CI; closed in `bd-2z0.12.3` |
+| **WASM Dependency Purity** (no native franken in WASM graph) | `scriptbots-web` | `crates/scriptbots-web/Cargo.toml` | `ci/check_wasm_graph.sh` | Enforced in CI; purity slice closed in `bd-2z0.12.3`, which has since REOPENED for the broader browser-frontend deliverable (guard itself stays enforced; corrected 2026-09-03) |
 | **Brain Heredity Gate** (copy AND vary proven before founding) | `scriptbots-app` | `install_brains` (`crates/scriptbots-app/src/lib.rs`) | `tests/heredity_gate.rs` | Enforced; closed in `bd-2z0.13.2` |
 | **Read-Only Offline Analytics** (StorageReader cannot mutate) | `scriptbots-storage` | `StorageReader` (`crates/scriptbots-storage/src/lib.rs`) | Type system: no `&mut self` or write methods | Enforced; closed in `bd-2z0.8.9` |
 | **Storage Lease & Inode Protection** (swapped DB detection) | `scriptbots-storage` | `filesystem_has_stable_file_identity` (`crates/scriptbots-storage/src/lib.rs`) | `tests/lease_persistence.rs` | Enforced; closed in `bd-2z0.5.6` |

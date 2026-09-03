@@ -85,6 +85,11 @@ pub mod sense_fixed;
 pub mod species;
 pub mod visual;
 
+pub use economy::{
+    DietCensus, EpochFlows, FoodWebSummaryReport, KirchhoffViolation, NodeClass, SankeyGraph,
+    SankeyLink, SankeyNode, SankeyOpts, TrophicRow, TrophicTable, render_trophic_table,
+    sankey_layout, trophic_table,
+};
 pub use genome_browser::{
     BrowserConnectionView, BrowserLineagePlotView, BrowserNodeView, BrowserPagingMeta,
     GenomeBrowserError, GenomeBrowserViewModel, MutationDiffStatus,
@@ -5680,7 +5685,9 @@ impl ResourceAmounts {
         }
     }
 
-    const fn scale(self) -> f64 {
+    /// Maximum absolute component value in this resource vector.
+    #[must_use]
+    pub const fn scale(self) -> f64 {
         self.food
             .abs()
             .max(self.energy.abs())
@@ -5761,6 +5768,30 @@ impl ResourceFlowKind {
         }
     }
 
+    /// Stable snake_case label for this flow category.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScenarioIntervention => "scenario_intervention",
+            Self::FoodDynamics => "food_dynamics",
+            Self::Aging => "aging",
+            Self::BasalMetabolism => "basal_metabolism",
+            Self::Movement => "movement",
+            Self::MetabolismRamp => "metabolism_ramp",
+            Self::Boost => "boost",
+            Self::Topography => "topography",
+            Self::TemperatureStress => "temperature_stress",
+            Self::GroundFoodConversion => "ground_food_conversion",
+            Self::EnergySharing => "energy_sharing",
+            Self::Combat => "combat",
+            Self::CarcassReward => "carcass_reward",
+            Self::DeathRemoval => "death_removal",
+            Self::ReproductionAllocation => "reproduction_allocation",
+            Self::PopulationInjection => "population_injection",
+            Self::CapacityRejection => "capacity_rejection",
+        }
+    }
+
     /// The accounting class of this flow (bd-16g.11.1). The labels are
     /// LOAD-BEARING: an external input (sunlight regrowth, manufactured carcass
     /// rewards, spawn endowment, interventions) explains stock growth with no
@@ -5806,7 +5837,8 @@ pub enum FlowClass {
     Sink,
 }
 
-const RESOURCE_FLOW_KINDS: [ResourceFlowKind; 17] = [
+/// Canonical array of all 17 resource flow kinds.
+pub const RESOURCE_FLOW_KINDS: [ResourceFlowKind; 17] = [
     ResourceFlowKind::ScenarioIntervention,
     ResourceFlowKind::FoodDynamics,
     ResourceFlowKind::Aging,

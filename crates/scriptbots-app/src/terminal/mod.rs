@@ -14550,3 +14550,15 @@ impl BrainLayerView {
 fn convert_layers(act: &BrainActivations) -> Vec<BrainLayerView> {
     BrainLayerView::vec_from_activations(act)
 }
+
+/// Compact trophic summary table widget renderer for TUI display (bd-16g.11.3).
+///
+/// # Strict Ecosystem Accounting Boundary
+/// Under the strict ecosystem accounting contract, the terminal module MUST NOT
+/// perform any flow arithmetic, category re-derivation, or aggregation over raw flows.
+/// It delegates directly to [`scriptbots_core::economy::render_trophic_table`] using
+/// the canonical [`scriptbots_core::economy::TrophicTable`].
+#[must_use]
+pub fn render_trophic_table(table: Option<&scriptbots_core::economy::TrophicTable>) -> String {
+    scriptbots_core::economy::render_trophic_table(table)
+}

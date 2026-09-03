@@ -359,7 +359,7 @@ pub fn export_locus_trace_png(samples: &[LocusSample], locus: Locus) -> Vec<u8> 
     const HEIGHT: usize = 300;
     const PADDING: usize = 40;
 
-    let mut pixels = vec![30u8, 30u8, 46u8, 255u8].repeat(WIDTH * HEIGHT);
+    let mut pixels = [30u8, 30u8, 46u8, 255u8].repeat(WIDTH * HEIGHT);
 
     let put_pixel = |pixels: &mut [u8], x: i32, y: i32, color: [u8; 4]| {
         if x >= 0 && (x as usize) < WIDTH && y >= 0 && (y as usize) < HEIGHT {

@@ -811,6 +811,16 @@ impl DietClass {
             Self::Omnivore
         }
     }
+
+    /// Human-readable label for the diet class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Herbivore => "Herbivore",
+            Self::Omnivore => "Omnivore",
+            Self::Carnivore => "Carnivore",
+        }
+    }
 }
 
 /// Standing census of living agents grouped by diet class.
@@ -897,6 +907,69 @@ pub struct SankeyGraph {
     pub links: Vec<SankeyLink>,
 }
 
+/// Violation of Kirchhoff conservation at an intermediate flow node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KirchhoffViolation {
+    /// Node identifier.
+    pub node_id: usize,
+    /// Human-readable label for the node.
+    pub node_label: String,
+    /// Sum of all incoming flow link values.
+    pub incoming: f64,
+    /// Sum of all outgoing flow link values.
+    pub outgoing: f64,
+    /// Net absolute imbalance |incoming - outgoing|.
+    pub imbalance: f64,
+}
+
+impl SankeyGraph {
+    /// Verify that Kirchhoff energy conservation holds at all intermediate nodes.
+    ///
+    /// Every non-source, non-sink node must have `|sum(incoming) - sum(outgoing)| <= tolerance`
+    /// after the `Unaccounted` links are included.
+    pub fn verify_kirchhoff(&self, tolerance: f64) -> Result<(), Vec<KirchhoffViolation>> {
+        let mut violations = Vec::new();
+
+        for node in &self.nodes {
+            if matches!(
+                node.class,
+                NodeClass::ExternalSource | NodeClass::Sink | NodeClass::Unaccounted
+            ) {
+                continue;
+            }
+
+            let mut incoming = 0.0f64;
+            let mut outgoing = 0.0f64;
+
+            for link in &self.links {
+                if link.to == node.id {
+                    incoming += link.value;
+                }
+                if link.from == node.id {
+                    outgoing += link.value;
+                }
+            }
+
+            let imbalance = (incoming - outgoing).abs();
+            if imbalance > tolerance {
+                violations.push(KirchhoffViolation {
+                    node_id: node.id,
+                    node_label: node.label.clone(),
+                    incoming,
+                    outgoing,
+                    imbalance,
+                });
+            }
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+}
+
 /// Options for Sankey layout generation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SankeyOpts {
@@ -979,11 +1052,12 @@ pub fn sankey_layout(flows: &EpochFlows, opts: &SankeyOpts) -> SankeyGraph {
         });
     }
 
-    for res in &flows.residual {
+    for (stock_idx, res) in flows.residual.iter().enumerate() {
         let val = res.residual_sum.abs();
         if val > 0.0 || opts.include_zero_links {
+            let from = if stock_idx == 0 { 1 } else { 2 };
             links.push(SankeyLink {
-                from: 1,
+                from,
                 to: 6,
                 value: val,
                 category: None,
@@ -1109,6 +1183,155 @@ pub fn trophic_table(flows: &EpochFlows, pop: &DietCensus) -> TrophicTable {
         first_tick: flows.first_tick,
         last_tick: flows.last_tick,
         rows,
+    }
+}
+
+/// Render the compact TUI trophic summary table (bd-16g.11.3).
+///
+/// Shows per-diet-class agent count, standing health/energy, intake rate,
+/// drain rate, conversion efficiency, and net rate, followed by a one-line
+/// energy conservation status.
+///
+/// If `table` is `None` (missing epoch data in ledger), renders "no data"
+/// without printing false zeros.
+#[must_use]
+pub fn render_trophic_table(table: Option<&TrophicTable>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let Some(t) = table else {
+        tracing::warn!(target: "scriptbots::economy::view", "Ecosystem trophic table requested missing epoch");
+        out.push_str("Ecosystem Trophic Table: no data for requested epoch\n");
+        return out;
+    };
+
+    let total_agents: usize = t.rows.iter().map(|r| r.agent_count).sum();
+    tracing::info!(
+        target: "scriptbots::economy::view",
+        view = "trophic",
+        epoch = t.epoch,
+        first_tick = t.first_tick,
+        last_tick = t.last_tick,
+        total_agents = total_agents,
+        "rendering trophic summary table"
+    );
+
+    for r in &t.rows {
+        if r.agent_count == 0 {
+            tracing::warn!(
+                target: "scriptbots::economy::view",
+                diet_class = r.class.as_str(),
+                epoch = t.epoch,
+                "diet class is completely empty/extinct during epoch"
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "Ecosystem Trophic Table (Epoch {} · Ticks {}..{})",
+        t.epoch, t.first_tick, t.last_tick
+    );
+    out.push_str("+-----------+-------+-----------------+-----------------+-------------+------------+------------+----------+\n");
+    out.push_str("| Diet Class| Count | Standing Health | Standing Energy | Intake Rate | Drain Rate | Efficiency | Net Rate |\n");
+    out.push_str("+-----------+-------+-----------------+-----------------+-------------+------------+------------+----------+\n");
+
+    for r in &t.rows {
+        let eff_str = r
+            .conversion_efficiency
+            .map_or_else(|| "n/a".to_owned(), |eff| format!("{:.1}%", eff * 100.0));
+        let _ = writeln!(
+            out,
+            "| {:<10}| {:>5} | {:>15.1} | {:>15.1} | {:>11.4} | {:>10.4} | {:>10} | {:>+8.4} |",
+            r.class.as_str(),
+            r.agent_count,
+            r.standing_health,
+            r.standing_energy,
+            r.intake_rate,
+            r.drain_rate,
+            eff_str,
+            r.net
+        );
+    }
+    out.push_str("+-----------+-------+-----------------+-----------------+-------------+------------+------------+----------+\n");
+    let _ = writeln!(
+        out,
+        "Energy Conservation: Epoch {} (ticks {}..{}) · {} diet classes tracked",
+        t.epoch,
+        t.first_tick,
+        t.last_tick,
+        t.rows.len()
+    );
+
+    out
+}
+
+/// Canonical per-epoch food-web summary report combining the Sankey graph and trophic table (bd-16g.11.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoodWebSummaryReport {
+    /// Schema format version (v1).
+    pub schema_version: u32,
+    /// Run identifier string.
+    pub run_id: String,
+    /// Epoch ordinal.
+    pub epoch: u64,
+    /// First tick in epoch.
+    pub first_tick: u64,
+    /// Last tick in epoch.
+    pub last_tick: u64,
+    /// Number of ticks in epoch.
+    pub tick_count: u64,
+    /// Complete canonical Sankey flow graph.
+    pub sankey: SankeyGraph,
+    /// Complete canonical trophic table.
+    pub trophic_table: TrophicTable,
+    /// Configuration digest if available.
+    pub config_digest: Option<String>,
+}
+
+impl FoodWebSummaryReport {
+    /// Build a new report from canonical epoch flows and diet census.
+    #[must_use]
+    pub fn build(
+        run_id: impl Into<String>,
+        flows: &EpochFlows,
+        pop: &DietCensus,
+        config_digest: Option<String>,
+    ) -> Self {
+        let sankey = sankey_layout(flows, &SankeyOpts::default());
+        let trophic_table = trophic_table(flows, pop);
+        let run_id_str = run_id.into();
+
+        tracing::info!(
+            target: "scriptbots::economy::view",
+            view = "export",
+            run_id = %run_id_str,
+            epoch = flows.epoch,
+            first_tick = flows.first_tick,
+            last_tick = flows.last_tick,
+            "built canonical food-web summary report"
+        );
+
+        Self {
+            schema_version: 1,
+            run_id: run_id_str,
+            epoch: flows.epoch,
+            first_tick: flows.first_tick,
+            last_tick: flows.last_tick,
+            tick_count: flows.tick_count,
+            sankey,
+            trophic_table,
+            config_digest,
+        }
+    }
+
+    /// Serialize report to formatted JSON string.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize report from JSON string.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
     }
 }
 
@@ -1852,5 +2075,241 @@ mod tests {
             "a truncated breach is still a breach"
         );
         assert!(verdict.summary_line(None).contains("breaches=4900"));
+    }
+
+    /// Test helper for building an EpochStockResidual.
+    fn test_residual(
+        stock: EconomyStock,
+        residual_sum: f64,
+        gross_flow: f64,
+    ) -> EpochStockResidual {
+        EpochStockResidual {
+            stock,
+            residual_sum,
+            residual_max_abs: residual_sum.abs(),
+            argmax_tick: if residual_sum.abs() > 0.0 {
+                Some(1)
+            } else {
+                None
+            },
+            gross_flow,
+            cumulative_tolerance: 1.0,
+            within_tolerance: true,
+            worst_category: None,
+        }
+    }
+
+    /// `sankey_layout` on balanced fixture satisfies Kirchhoff conservation, and dropping Unaccounted link fails (bd-16g.11.3).
+    #[test]
+    fn bd_16g_11_3_sankey_kirchhoff_balance_positive_and_negative() {
+        let flows = flow_set(&[
+            (
+                ResourceFlowKind::FoodDynamics,
+                zero_amounts(),
+                amounts(100.0, 0.0, 0.0),
+            ),
+            (
+                ResourceFlowKind::GroundFoodConversion,
+                zero_amounts(),
+                amounts(90.0, 90.0, 0.0),
+            ),
+            (
+                ResourceFlowKind::BasalMetabolism,
+                zero_amounts(),
+                amounts(0.0, 85.0, 0.0),
+            ),
+        ]);
+
+        let mut epoch_categories = Vec::new();
+        for f in flows {
+            epoch_categories.push(EpochCategoryFlow {
+                kind: f.kind,
+                delta: f.delta,
+                activity: f.activity,
+            });
+        }
+
+        let residuals = [
+            test_residual(EconomyStock::GridFood, 10.0, 100.0),
+            test_residual(EconomyStock::AgentEnergy, 5.0, 90.0),
+            test_residual(EconomyStock::AgentHealth, 0.0, 0.0),
+        ];
+
+        let epoch = EpochFlows {
+            epoch: 1,
+            first_tick: 1,
+            last_tick: 10,
+            tick_count: 10,
+            complete: true,
+            per_category: epoch_categories,
+            residual: residuals,
+        };
+
+        let sankey = sankey_layout(&epoch, &SankeyOpts::default());
+
+        // Positive Kirchhoff assertion: all intermediate nodes balance exactly
+        let balance_res = sankey.verify_kirchhoff(1e-6);
+        assert!(
+            balance_res.is_ok(),
+            "Kirchhoff balance must hold when Unaccounted link is present: {:?}",
+            balance_res.err()
+        );
+
+        // Negative Kirchhoff assertion: dropping the Unaccounted link MUST fail Kirchhoff test
+        let mut dropped_sankey = sankey.clone();
+        dropped_sankey.links.retain(|l| l.to != 6);
+        let dropped_res = dropped_sankey.verify_kirchhoff(1e-6);
+        assert!(
+            dropped_res.is_err(),
+            "Dropping Unaccounted link must cause Kirchhoff balance violation"
+        );
+        let violations = dropped_res.unwrap_err();
+        assert_eq!(
+            violations.len(),
+            2,
+            "Food Grid (node 1) and Herbivores (node 2) must both show imbalance"
+        );
+        assert!(violations.iter().any(|v| v.node_id == 1));
+        assert!(violations.iter().any(|v| v.node_id == 2));
+    }
+
+    /// Trophic table with all 3 classes, 1 empty class, and zero intake prints n/a not NaN (bd-16g.11.3).
+    #[test]
+    fn bd_16g_11_3_trophic_table_empty_class_and_zero_intake() {
+        let epoch = EpochFlows {
+            epoch: 0,
+            first_tick: 0,
+            last_tick: 10,
+            tick_count: 10,
+            complete: true,
+            per_category: Vec::new(),
+            residual: [
+                test_residual(EconomyStock::GridFood, 0.0, 0.0),
+                test_residual(EconomyStock::AgentEnergy, 0.0, 0.0),
+                test_residual(EconomyStock::AgentHealth, 0.0, 0.0),
+            ],
+        };
+
+        let mut pop = DietCensus::default();
+        // Herbivore: present with health and energy
+        pop.counts[0] = 5;
+        pop.standing_health[0] = 50.0;
+        pop.standing_energy[0] = 50.0;
+        // Omnivore: empty (count 0)
+        pop.counts[1] = 0;
+        pop.standing_health[1] = 0.0;
+        pop.standing_energy[1] = 0.0;
+        // Carnivore: present
+        pop.counts[2] = 2;
+        pop.standing_health[2] = 20.0;
+        pop.standing_energy[2] = 20.0;
+
+        let table = trophic_table(&epoch, &pop);
+        assert_eq!(
+            table.rows.len(),
+            3,
+            "all 3 diet classes must be represented in table rows"
+        );
+        assert_eq!(table.rows[1].agent_count, 0, "Omnivore class must be empty");
+        assert!(
+            table.rows[1].conversion_efficiency.is_none(),
+            "empty class must have None efficiency"
+        );
+
+        let rendered = render_trophic_table(Some(&table));
+        assert!(rendered.contains("Herbivore"));
+        assert!(rendered.contains("Omnivore"));
+        assert!(rendered.contains("Carnivore"));
+        assert!(
+            rendered.contains("n/a"),
+            "zero intake/drain must render as n/a"
+        );
+        assert!(!rendered.contains("NaN"), "must never render NaN");
+    }
+
+    /// Requesting an epoch outside the ledger's range renders "no data" and no zeros (bd-16g.11.3).
+    #[test]
+    fn bd_16g_11_3_render_trophic_table_missing_epoch_renders_no_data() {
+        let rendered = render_trophic_table(None);
+        assert!(rendered.contains("Ecosystem Trophic Table: no data for requested epoch"));
+        assert!(
+            !rendered.contains("+-----------+"),
+            "table body must not be drawn for missing epoch"
+        );
+        assert!(
+            !rendered.contains("0.0000"),
+            "false zeros must not be rendered"
+        );
+    }
+
+    /// Trophic table layout snapshot against pinned golden (bd-16g.11.3).
+    #[test]
+    fn bd_16g_11_3_render_trophic_table_snapshot_pinned_golden() {
+        let epoch = EpochFlows {
+            epoch: 42,
+            first_tick: 4200,
+            last_tick: 4300,
+            tick_count: 100,
+            complete: true,
+            per_category: Vec::new(),
+            residual: [
+                test_residual(EconomyStock::GridFood, 0.0, 0.0),
+                test_residual(EconomyStock::AgentEnergy, 0.0, 0.0),
+                test_residual(EconomyStock::AgentHealth, 0.0, 0.0),
+            ],
+        };
+        let mut pop = DietCensus::default();
+        pop.counts[0] = 10;
+        pop.standing_health[0] = 100.0;
+        pop.standing_energy[0] = 100.0;
+
+        let table = trophic_table(&epoch, &pop);
+        let rendered = render_trophic_table(Some(&table));
+        assert!(rendered.starts_with("Ecosystem Trophic Table (Epoch 42 · Ticks 4200..4300)\n"));
+        assert!(rendered.contains("| Diet Class| Count | Standing Health | Standing Energy | Intake Rate | Drain Rate | Efficiency | Net Rate |\n"));
+        assert!(rendered.contains(
+            "Energy Conservation: Epoch 42 (ticks 4200..4300) · 3 diet classes tracked\n"
+        ));
+    }
+
+    /// FoodWebSummaryReport build, JSON serialization, and roundtrip (bd-16g.11.3).
+    #[test]
+    fn bd_16g_11_3_food_web_summary_report_roundtrip() {
+        let epoch = EpochFlows {
+            epoch: 5,
+            first_tick: 500,
+            last_tick: 600,
+            tick_count: 100,
+            complete: true,
+            per_category: Vec::new(),
+            residual: [
+                test_residual(EconomyStock::GridFood, 1.25, 50.0),
+                test_residual(EconomyStock::AgentEnergy, 0.0, 0.0),
+                test_residual(EconomyStock::AgentHealth, 0.0, 0.0),
+            ],
+        };
+        let pop = DietCensus::default();
+
+        let report = FoodWebSummaryReport::build(
+            "test_run_123",
+            &epoch,
+            &pop,
+            Some("cfg_hash_abc".to_owned()),
+        );
+        assert_eq!(report.run_id, "test_run_123");
+        assert_eq!(report.epoch, 5);
+        assert_eq!(report.config_digest.as_deref(), Some("cfg_hash_abc"));
+
+        let json = report.to_json().expect("serialize report to json");
+        assert!(json.contains("\"test_run_123\""));
+        assert!(json.contains("\"sankey\""));
+        assert!(json.contains("\"trophic_table\""));
+
+        let deserialized =
+            FoodWebSummaryReport::from_json(&json).expect("deserialize report from json");
+        assert_eq!(
+            report, deserialized,
+            "roundtrip must preserve byte-exact values"
+        );
     }
 }

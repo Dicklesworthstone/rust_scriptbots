@@ -946,7 +946,8 @@ honest zero-row boundaries. It retains exact births, exact deaths, and nonzero a
 counters in deterministic local order. Finished-run evidence and bounded pages validate sequence
 coverage, ordinals, typed canonical payloads, archive bindings, and exact cursors;
 `RequireNonEmpty` returns typed `NoEvidence` for a vacuous expected-event scenario. Pairwise
-attacker/victim edges remain `bd-2z0.5.9`; the other event families listed above are not claimed by
+attacker/victim edges landed under `bd-2z0.5.9` (closed 2026-07-26; status corrected 2026-09-03 —
+`bd-docs-status-truth-sweep-v2iw`); the other event families listed above are not claimed by
 this slice.
 
 ### 7.4 replay success criteria
@@ -2052,7 +2053,7 @@ batch evaluators; each family owns its reset/inherit/blend policy; and the fixtu
 identical future-affecting evaluator continuation. Core 165/165, integration 13/13, strict core
 Clippy, workspace all-target check, formatting, and UBS passed on the integrated protocol surface.
 
-#### 1.7 brain-family adapters and inheritance [Currently In Progress — family adapters implemented in `bd-2z0.3.3`, `bd-2z0.3.4`, and `bd-2z0.3.5`; world binding remains `bd-2z0.3.6`]
+#### 1.7 brain-family adapters and inheritance [Completed — family adapters `bd-2z0.3.3`/`bd-2z0.3.4`/`bd-2z0.3.5`; world binding `bd-2z0.3.6` closed 2026-07-26 (GoldenPanther); open remainder: FrankenTorch family chain `bd-2z0.3.12.x` — status corrected 2026-09-03, `bd-docs-status-truth-sweep-v2iw`]
 
 - MLP adapter and recurrent-state policy;
 - DWRAON adapter/parity and recurrent-state policy;
@@ -2072,7 +2073,7 @@ persistence was removed from the concrete brain structs so callers cannot bypass
 The integrated all-feature brain suite passes 37/37 tests under strict Clippy. The remaining work in
 this phase is to bind those envelopes into live world agents, reproduction, scenario registration,
 checkpoint/digest consumers, and the multi-generation fixture; the adapter completion does not
-claim that world integration early.
+claim that world integration early. [Status correction 2026-09-03 — `bd-docs-status-truth-sweep-v2iw`: that binding landed; `bd-2z0.3.6` ("Bind every offspring to inherited and mutated brain state") is closed with evidence, so §1.7's exit is met. The open remainder of the brains epic is only the FrankenTorch family chain `bd-2z0.3.12.x`.]
 
 **Exit:** a multi-generation fixture proves real brain genomes evolve and every child is bound.
 
@@ -2160,7 +2161,9 @@ claim that world integration early.
   selected locomotion model is bound through the tick-zero V1.6 digest. The V3.5 schema movement
   is complete under the same pinned DSR evidence. `bd-yw1j` advances the bootstrap form to V3.6
   for the V1.7 digest that excludes the dead neighbor normalizer; the base V3.3 form remains
-  unchanged. [Currently In Progress — `bd-hiv1`] Correct the
+  unchanged. [Completed — `bd-hiv1` closed ("Restore legacy wheel-output semantics for
+  movement noise and spike speed"); status corrected 2026-09-03 —
+  `bd-docs-status-truth-sweep-v2iw`] Correct the
   separate movement-noise and spike-speed consumers to use named legacy wheel effort rather than
   physical displacement.
 
@@ -2653,9 +2656,12 @@ These become separate implementation beads for terrain, camera/input, HUD, and c
 
 #### 4.1 command/event journal and product checkpoint integration
 
-**Status:** [Currently In Progress — runtime lifecycle source committed at `211bfa2`; V8/V9
-storage projections committed at `ae8cea3`; centralized DSR union pending — `bd-2z0.5.2`,
-TopazCastle, 2026-07-17]
+**Status:** [Completed — `bd-2z0.5.2` ("Persist sequenced command status and domain event
+journals") is closed; the formerly pending centralized DSR union for the runtime lifecycle
+source (`211bfa2`) and V8/V9 storage projections (`ae8cea3`) is superseded by that close.
+Status corrected 2026-09-03 — `bd-docs-status-truth-sweep-v2iw`. Remaining open work in
+this phase: checkpoint product integration (`bd-2z0.5.13`), storage reaping proofs
+(`bd-2z0.5.14`), and the narrative-consumer chain (`bd-2z0.5.16`/`bd-2z0.5.17`).]
 
 - persist the already-defined canonical manifest/digest schemas;
 - sequenced commands and separate application/storage status transitions
