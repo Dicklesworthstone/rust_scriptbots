@@ -7872,7 +7872,7 @@ impl PersistenceEvent {
 }
 
 /// Reason recorded for an agent death.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeathCause {
     /// Killed by a carnivore spike.
     CombatCarnivore,

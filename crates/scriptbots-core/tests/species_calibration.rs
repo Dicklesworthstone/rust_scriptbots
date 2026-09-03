@@ -72,7 +72,11 @@ fn test_calibrate_speciation_persistence_sweep() {
             .enumerate()
             .map(|(idx, agent)| {
                 let cohort = idx % 3;
-                let jitter = if idx % 7 == 0 && tick_num % 10 < 3 { 0.4 } else { 0.0 };
+                let jitter = if idx % 7 == 0 && tick_num % 10 < 3 {
+                    0.4
+                } else {
+                    0.0
+                };
                 let features = match cohort {
                     0 => [0.15 + jitter, 0.85, 0.90, 0.05, 0.35, 0.10],
                     1 => [0.85, 0.15 + jitter, 0.30, 0.80, 0.05, 0.25],
@@ -92,13 +96,18 @@ fn test_calibrate_speciation_persistence_sweep() {
             None,
         );
 
-        if let scriptbots_core::species::SpeciesCadenceStepResult::Segmented { snapshot, .. } = step_res {
+        if let scriptbots_core::species::SpeciesCadenceStepResult::Segmented { snapshot, .. } =
+            step_res
+        {
             current_table = snapshot.table.clone();
             history_tables.push(snapshot.table);
         }
     }
 
-    assert!(history_tables.len() >= 8, "insufficient sample history collected");
+    assert!(
+        history_tables.len() >= 8,
+        "insufficient sample history collected"
+    );
 
     // Sweep K from 1 to 5
     // For each K, we evaluate a SpeciationWatch and count confirmed vs transient splits
@@ -122,7 +131,10 @@ fn test_calibrate_speciation_persistence_sweep() {
             }
         }
 
-        println!("{k} | {confirmed_count:19} | {transient_count:17} | {:14}", confirmed_count + transient_count);
+        println!(
+            "{k} | {confirmed_count:19} | {transient_count:17} | {:14}",
+            confirmed_count + transient_count
+        );
         confirmed_per_k.push((k, confirmed_count, transient_count));
     }
 
@@ -181,14 +193,22 @@ fn test_calibrate_reproductive_separation_cross_mating_rate() {
             births.push(birth(1000 + b_idx, (Some(p1), Some(p2))));
         }
         let m = measure_cross_cluster_mating(&births, &table);
-        let rate = m.cross_rate().expect("panmictic births must have attributed matings");
+        let rate = m
+            .cross_rate()
+            .expect("panmictic births must have attributed matings");
         panmictic_rates.push(rate);
     }
 
     #[allow(clippy::cast_precision_loss)]
     let panmictic_mean = panmictic_rates.iter().sum::<f64>() / panmictic_rates.len() as f64;
-    let panmictic_min = panmictic_rates.iter().copied().fold(f64::INFINITY, f64::min);
-    let panmictic_max = panmictic_rates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let panmictic_min = panmictic_rates
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let panmictic_max = panmictic_rates
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
 
     println!("\n=== PANMICTIC NULL CROSS-MATING DISTRIBUTION (bd-3l5d) ===");
     println!("Panmictic mean cross-rate: {panmictic_mean:.4}");
@@ -216,8 +236,13 @@ fn test_calibrate_reproductive_separation_cross_mating_rate() {
     }
 
     let allopatric_m = measure_cross_cluster_mating(&allopatric_births, &table);
-    let allopatric_rate = allopatric_m.cross_rate().expect("allopatric attributed rate");
-    assert!(allopatric_rate.abs() < f64::EPSILON, "clean allopatric clades have 0.0 cross rate");
+    let allopatric_rate = allopatric_m
+        .cross_rate()
+        .expect("allopatric attributed rate");
+    assert!(
+        allopatric_rate.abs() < f64::EPSILON,
+        "clean allopatric clades have 0.0 cross rate"
+    );
 
     // Now test classification under REPRODUCTIVE_SEPARATION_MAX_RATE = 0.05
     assert!((REPRODUCTIVE_SEPARATION_MAX_RATE - 0.05).abs() < f64::EPSILON);
@@ -234,7 +259,11 @@ fn test_calibrate_reproductive_separation_cross_mating_rate() {
         .collect();
     let panmictic_m = measure_cross_cluster_mating(&panmictic_births, &table);
 
-    let panmictic_status = classify_speciation(&persisted_verdict, &panmictic_m, REPRODUCTIVE_SEPARATION_MAX_RATE);
+    let panmictic_status = classify_speciation(
+        &persisted_verdict,
+        &panmictic_m,
+        REPRODUCTIVE_SEPARATION_MAX_RATE,
+    );
     assert_eq!(
         panmictic_status,
         SpeciationStatus::Polymorphic { cross_rate: 1.0 },
@@ -242,7 +271,11 @@ fn test_calibrate_reproductive_separation_cross_mating_rate() {
     );
 
     // Allopatric mating must be classified as Speciation
-    let allopatric_status = classify_speciation(&persisted_verdict, &allopatric_m, REPRODUCTIVE_SEPARATION_MAX_RATE);
+    let allopatric_status = classify_speciation(
+        &persisted_verdict,
+        &allopatric_m,
+        REPRODUCTIVE_SEPARATION_MAX_RATE,
+    );
     assert_eq!(
         allopatric_status,
         SpeciationStatus::Speciation { cross_rate: 0.0 },

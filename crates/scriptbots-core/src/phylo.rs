@@ -19,7 +19,9 @@
 //! Subtree time/Y bounds prune the viewport and cached best ranks drive a
 //! best-first exact top-k query without a per-frame full scan or sort.
 
-use crate::{AgentUid, Tick};
+use crate::ancestry::AncestryGraph;
+use crate::species::{SpeciesId, SpeciesTable};
+use crate::{AgentUid, BirthRecord, DeathCause, Tick};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -1518,13 +1520,738 @@ fn node_anchor(node: &LayoutNode) -> u64 {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn tick_x(tick: Tick) -> f32 {
+const fn tick_x(tick: Tick) -> f32 {
     tick.0 as f32
 }
 
 #[allow(clippy::cast_precision_loss)]
 fn population_thickness(population: u32) -> f32 {
     (population.max(1) as f32).sqrt()
+}
+
+// =========================================================================
+// Phylogeny Event Stream & Hint Cross-Validation Engine (bd-16g.3.3)
+// =========================================================================
+
+/// Monotonically increasing identifier for an emitted phylogeny event (bd-16g.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EventId(pub u64);
+
+/// Monotonically increasing or tagged identifier for a detector kernel hint (bd-16g.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct HintId(pub u64);
+
+/// Mechanism explaining reproductive isolation between clades (bd-16g.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SeparationKind {
+    /// True evolutionary divergence in physical and behavioral phenotype.
+    Phenotypic,
+    /// Separation mechanically forced by the simulation's brain-family mating gate.
+    ///
+    /// The simulation gates sexual crossover on `parent_kind == partner_kind`.
+    /// Two clusters carrying different brain kinds are a mechanical consequence
+    /// of the mating gate, not evolutionary speciation.
+    BrainKindGated,
+    /// Geographic separation across isolated islands (bd-16g.5).
+    Allopatric,
+    /// Combination of mechanisms.
+    Mixed,
+}
+
+/// Reason why a candidate speciation split or detector hint was rejected (bd-16g.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RejectReason {
+    /// Candidate split reverted or vanished before persisting for K consecutive samples.
+    Transient,
+    /// Realized cross-cluster mating rate exceeded the reproductive isolation threshold.
+    Interbreeding,
+    /// One or both sub-clusters had fewer than `min_species_size` members.
+    BelowMinSize,
+    /// Insufficient two-parent births in the window to establish a statistically valid rate.
+    ///
+    /// Protects against declaring reproductive isolation from an empty or near-zero denominator.
+    NoAncestralSupport,
+    /// Apparent isolation was entirely an artifact of the brain-family mating gate.
+    BrainKindArtifact,
+}
+
+/// Self-describing evidence attached to a detector hint verdict (bd-16g.3.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HintEvidence {
+    /// Identity of the hint being resolved.
+    pub hint_id: HintId,
+    /// Tick at which the hint was evaluated.
+    pub tick: Tick,
+    /// Observed score or magnitude from the detector.
+    pub score: f32,
+    /// Human-readable explanation of why the hint was confirmed or rejected.
+    pub detail: String,
+    /// Quantitative metrics governing the decision.
+    pub metrics: BTreeMap<String, f32>,
+}
+
+/// Final verdict on a detector hint (bd-16g.3.3).
+///
+/// Every hint from the detector kernel must terminate in exactly one verdict: Confirmed or Rejected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HintVerdict {
+    /// Confirmed by an emitted phylogeny event with the given [`EventId`].
+    Confirmed(EventId),
+    /// Rejected with specific failure reason and quantitative evidence.
+    Rejected {
+        /// Reason for rejection.
+        reason: RejectReason,
+        /// Attached evidence.
+        evidence: HintEvidence,
+    },
+}
+
+/// Typed phylogeny event emitted into the append-only stream (bd-16g.3.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PhyloEvent {
+    /// Speciation: an ancestral species splits into distinct clades.
+    Speciation {
+        /// Ancestral species ID.
+        parent: SpeciesId,
+        /// The two diverging child species IDs.
+        children: [SpeciesId; 2],
+        /// Founding agents of the newly emerged lineage.
+        founders: Vec<AgentUid>,
+        /// Categorized mechanism of reproductive isolation.
+        separation: SeparationKind,
+        /// Realized cross-cluster mating rate over the observation window.
+        cross_mating_rate: f32,
+        /// Number of consecutive segmentation samples the split persisted.
+        persisted_samples: u32,
+        /// Cross-validated detector hint ID, if any.
+        hint: Option<HintId>,
+        /// Simulation tick at which speciation was confirmed.
+        tick: Tick,
+    },
+    /// Extinction: a species has zero living members.
+    Extinction {
+        /// Extinct species ID.
+        species: SpeciesId,
+        /// UID of the last surviving member to die.
+        last_member: AgentUid,
+        /// Historical peak population size observed for this species.
+        peak_size: usize,
+        /// Histogram of mortality causes for this species.
+        cause_histogram: BTreeMap<DeathCause, u32>,
+        /// Simulation tick at which extinction was recorded.
+        tick: Tick,
+    },
+    /// Radiation: a species experiences rapid population expansion.
+    Radiation {
+        /// Radiating species ID.
+        species: SpeciesId,
+        /// Population size before radiation window.
+        from_size: usize,
+        /// Population size after radiation window.
+        to_size: usize,
+        /// Tick window over which radiation occurred.
+        window: TickRange,
+        /// Relative expansion score.
+        score: f32,
+        /// Cross-validated detector hint ID, if any.
+        hint: Option<HintId>,
+        /// Simulation tick at which radiation was confirmed.
+        tick: Tick,
+    },
+}
+
+impl PhyloEvent {
+    /// Simulation tick at which the event occurred.
+    #[must_use]
+    pub const fn tick(&self) -> Tick {
+        match self {
+            Self::Speciation { tick, .. }
+            | Self::Extinction { tick, .. }
+            | Self::Radiation { tick, .. } => *tick,
+        }
+    }
+
+    /// Primary species identity associated with the event.
+    #[must_use]
+    pub const fn species_id(&self) -> SpeciesId {
+        match self {
+            Self::Speciation { parent, .. } => *parent,
+            Self::Extinction { species, .. } | Self::Radiation { species, .. } => *species,
+        }
+    }
+
+    /// Discriminant for deterministic total ordering.
+    #[must_use]
+    pub const fn kind_discriminant(&self) -> u8 {
+        match self {
+            Self::Speciation { .. } => 0,
+            Self::Extinction { .. } => 1,
+            Self::Radiation { .. } => 2,
+        }
+    }
+}
+
+impl Ord for PhyloEvent {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.tick()
+            .0
+            .cmp(&other.tick().0)
+            .then(self.kind_discriminant().cmp(&other.kind_discriminant()))
+            .then(self.species_id().0.cmp(&other.species_id().0))
+    }
+}
+
+impl PartialOrd for PhyloEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for PhyloEvent {}
+
+/// Candidate hint from the detector kernel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetectorHint {
+    /// Stable hint ID.
+    pub id: HintId,
+    /// Tick when hint was produced.
+    pub tick: Tick,
+    /// Primitive kind.
+    pub kind: DetectorHintKind,
+    /// Score / magnitude.
+    pub score: f32,
+    /// Monitored metric name.
+    pub metric: String,
+    /// Target species predicted by hint, if known.
+    pub target_species: Option<SpeciesId>,
+}
+
+/// Primitive kind of detector hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectorHintKind {
+    /// Bimodality in phenotype or metric series.
+    Bimodality,
+    /// Change-point in population or metric series.
+    ChangePoint,
+}
+
+/// Parameters configuring phylogeny event confirmation and rejection rules (bd-16g.3.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhyloEventParams {
+    /// Consecutive segmentation samples a split must hold (default 3, calibrated in bd-3l5d).
+    pub persistence_samples: usize,
+    /// Maximum cross-mating rate allowed for speciation (default 0.05, calibrated in bd-3l5d).
+    pub max_cross_mating: f32,
+    /// Minimum members required in both child sub-clusters (default 2).
+    pub min_species_size: usize,
+    /// Minimum two-parent births required in the window to avoid empty denominator (default 2).
+    pub min_two_parent_births: usize,
+    /// Minimum members required to qualify as radiation (default 5).
+    pub radiation_min_members: usize,
+    /// Expansion factor required for radiation (default 2.0).
+    pub radiation_growth_factor: f32,
+    /// Lookback tick window within which a hint can match an event (default 20).
+    pub hint_match_window: u64,
+}
+
+impl Default for PhyloEventParams {
+    fn default() -> Self {
+        Self {
+            persistence_samples: 3,
+            max_cross_mating: 0.05,
+            min_species_size: 2,
+            min_two_parent_births: 2,
+            radiation_min_members: 5,
+            radiation_growth_factor: 2.0,
+            hint_match_window: 20,
+        }
+    }
+}
+
+/// Candidate split key identifying the ancestral parent and diverging sub-clusters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CandidateSplitKey {
+    /// Ancestor species.
+    pub parent: SpeciesId,
+    /// First child clade.
+    pub child_a: SpeciesId,
+    /// Second child clade.
+    pub child_b: SpeciesId,
+}
+
+/// Tracking state for a candidate split across consecutive segmentation samples.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SplitTracking {
+    /// Tick when the split was first observed.
+    pub first_seen_tick: Tick,
+    /// Number of consecutive samples the split has satisfied all criteria.
+    pub samples_held: usize,
+    /// Most recent observed cross-mating rate.
+    pub last_cross_mating_rate: f32,
+    /// Most recent sample sizes (`child_a`, `child_b`).
+    pub last_sample_sizes: (usize, usize),
+    /// Bound detector hint ID, if any.
+    pub matched_hint: Option<HintId>,
+    /// Last rejection reason observed, if failed.
+    pub last_rejection_reason: Option<RejectReason>,
+    /// Last separation kind evaluated.
+    pub separation_kind: SeparationKind,
+}
+
+/// Running state maintained by the phylogeny event engine across simulation ticks.
+#[derive(Debug, Clone, Default)]
+pub struct PhyloEngineState {
+    /// Next monotonic event sequence ID.
+    pub next_event_id: u64,
+    /// Already extinct species IDs (guarantees extinction idempotence).
+    pub extinct_species: BTreeSet<SpeciesId>,
+    /// Historical peak population size observed per species.
+    pub peak_sizes: BTreeMap<SpeciesId, usize>,
+    /// Last known living members observed per species.
+    pub last_known_members: BTreeMap<SpeciesId, Vec<AgentUid>>,
+    /// Mortality cause histogram accumulated per species.
+    pub cause_histograms: BTreeMap<SpeciesId, BTreeMap<DeathCause, u32>>,
+    /// Candidate splits currently tracked across samples.
+    pub pending_splits: BTreeMap<CandidateSplitKey, SplitTracking>,
+    /// Species sizes from previous segmentation sample: `species_id` -> `member_count`.
+    pub prev_species_sizes: BTreeMap<SpeciesId, usize>,
+    /// Tick of previous segmentation sample.
+    pub prev_sample_tick: Option<Tick>,
+    /// Cumulative counter of anomalies (e.g. clustering dropped species with living members).
+    pub anomaly_count: usize,
+    /// Cumulative counter of unhinted speciation events emitted.
+    pub events_unhinted: usize,
+}
+
+/// Output produced by a single execution of the phylogeny event engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhyloEngineOutput {
+    /// Monotonically ordered stream of emitted phylogeny events.
+    pub events: Vec<(EventId, PhyloEvent)>,
+    /// Verdict for every hint evaluated at this step.
+    pub verdicts: Vec<HintVerdict>,
+    /// Anomaly count encountered at this step.
+    pub anomalies: usize,
+    /// Number of unhinted events emitted at this step.
+    pub unhinted_count: usize,
+}
+
+/// Evaluates species table progression, ancestry, birth records, and detector hints
+/// to produce a total-ordered stream of [`PhyloEvent`]s and reconciled [`HintVerdict`]s (bd-16g.3.3).
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn step_phylo_events(
+    current_table: &SpeciesTable,
+    ancestry: &AncestryGraph,
+    births: &[BirthRecord],
+    hints: &[DetectorHint],
+    params: &PhyloEventParams,
+    state: &mut PhyloEngineState,
+) -> PhyloEngineOutput {
+    let mut emitted_events = Vec::new();
+    let mut verdicts = Vec::new();
+    let mut unhinted_this_step = 0;
+    let mut anomalies_this_step = 0;
+
+    let current_tick = current_table.tick;
+    let prev_tick = state.prev_sample_tick.unwrap_or(Tick(0));
+
+    // Map species_id -> species in current_table
+    let current_species_map: BTreeMap<SpeciesId, &crate::species::Species> =
+        current_table.species.iter().map(|s| (s.id, s)).collect();
+
+    // 1. Update peak sizes and last known members for all active species
+    for species in &current_table.species {
+        let size = species.members.len();
+        state
+            .peak_sizes
+            .entry(species.id)
+            .and_modify(|p| *p = (*p).max(size))
+            .or_insert(size);
+        if !species.members.is_empty() {
+            state
+                .last_known_members
+                .insert(species.id, species.members.clone());
+        }
+    }
+
+    // 2. Discover and track candidate splits
+    // Match any incoming bimodality hints to existing or new candidate splits
+    for hint in hints {
+        if let (DetectorHintKind::Bimodality, Some(target)) = (hint.kind, hint.target_species) {
+            for species in &current_table.species {
+                if species.id != target {
+                    let key = CandidateSplitKey {
+                        parent: target,
+                        child_a: target,
+                        child_b: species.id,
+                    };
+                    state
+                        .pending_splits
+                        .entry(key)
+                        .or_insert_with(|| SplitTracking {
+                            first_seen_tick: current_tick,
+                            samples_held: 0,
+                            last_cross_mating_rate: 0.0,
+                            last_sample_sizes: (0, 0),
+                            matched_hint: Some(hint.id),
+                            last_rejection_reason: None,
+                            separation_kind: SeparationKind::Phenotypic,
+                        });
+                }
+            }
+        }
+    }
+
+    // Auto-discover candidate splits between current species
+    for (idx_a, sa) in current_table.species.iter().enumerate() {
+        for sb in current_table.species.iter().skip(idx_a + 1) {
+            let parent_id = sa.id.min(sb.id);
+            let key = CandidateSplitKey {
+                parent: parent_id,
+                child_a: sa.id,
+                child_b: sb.id,
+            };
+            state
+                .pending_splits
+                .entry(key)
+                .or_insert_with(|| SplitTracking {
+                    first_seen_tick: current_tick,
+                    samples_held: 0,
+                    last_cross_mating_rate: 0.0,
+                    last_sample_sizes: (0, 0),
+                    matched_hint: None,
+                    last_rejection_reason: None,
+                    separation_kind: SeparationKind::Phenotypic,
+                });
+        }
+    }
+
+    // 3. Evaluate pending splits
+    let mut resolved_split_keys = Vec::new();
+    for (key, tracking) in &mut state.pending_splits {
+        let (Some(sa), Some(sb)) = (
+            current_species_map.get(&key.child_a),
+            current_species_map.get(&key.child_b),
+        ) else {
+            // Split reverted / dropped!
+            tracking.last_rejection_reason = Some(RejectReason::Transient);
+            resolved_split_keys.push(*key);
+            continue;
+        };
+
+        tracking.last_sample_sizes = (sa.members.len(), sb.members.len());
+
+        // Check (c) MIN SIZE: both sub-clusters >= min_species_size
+        if sa.members.len() < params.min_species_size || sb.members.len() < params.min_species_size
+        {
+            tracking.last_rejection_reason = Some(RejectReason::BelowMinSize);
+            tracking.samples_held = 0;
+            continue;
+        }
+
+        // Check (b) REPRODUCTIVE SEPARATION and (e) EMPTY DENOMINATOR:
+        let mut within_matings = 0;
+        let mut cross_matings = 0;
+        for birth in births {
+            let (Some(pa), Some(pb)) = (birth.parent_a, birth.parent_b) else {
+                continue;
+            };
+            if pa == pb {
+                continue; // self-parented / asexual budding
+            }
+            let in_a = (sa.members.contains(&pa), sa.members.contains(&pb));
+            let in_b = (sb.members.contains(&pa), sb.members.contains(&pb));
+
+            if (in_a.0 && in_a.1) || (in_b.0 && in_b.1) {
+                within_matings += 1;
+            } else if (in_a.0 && in_b.1) || (in_b.0 && in_a.1) {
+                cross_matings += 1;
+            }
+        }
+
+        let total_matings = within_matings + cross_matings;
+        if total_matings < params.min_two_parent_births {
+            // Empty denominator!
+            tracking.last_rejection_reason = Some(RejectReason::NoAncestralSupport);
+            tracking.samples_held = 0;
+            continue;
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let cross_rate = cross_matings as f32 / total_matings as f32;
+        tracking.last_cross_mating_rate = cross_rate;
+
+        if cross_rate > params.max_cross_mating {
+            // High interbreeding!
+            tracking.last_rejection_reason = Some(RejectReason::Interbreeding);
+            tracking.samples_held = 0;
+            continue;
+        }
+
+        // Check Brain-Kind gating artifact
+        let brains_a: BTreeSet<Option<u64>> = sa
+            .members
+            .iter()
+            .map(|uid| ancestry.node(*uid).and_then(|n| n.brain_key))
+            .collect();
+        let brains_b: BTreeSet<Option<u64>> = sb
+            .members
+            .iter()
+            .map(|uid| ancestry.node(*uid).and_then(|n| n.brain_key))
+            .collect();
+        let is_brain_gated = !brains_a.is_empty()
+            && !brains_b.is_empty()
+            && brains_a.intersection(&brains_b).next().is_none();
+
+        let separation = if is_brain_gated {
+            SeparationKind::BrainKindGated
+        } else {
+            SeparationKind::Phenotypic
+        };
+        tracking.separation_kind = separation;
+
+        // All confirmation criteria satisfied for this sample!
+        tracking.samples_held += 1;
+        tracking.last_rejection_reason = None;
+
+        if tracking.samples_held >= params.persistence_samples {
+            // Emit Speciation!
+            state.next_event_id += 1;
+            let event_id = EventId(state.next_event_id);
+            let speciation = PhyloEvent::Speciation {
+                parent: key.parent,
+                children: [key.child_a, key.child_b],
+                founders: sb.founders.clone(),
+                separation,
+                cross_mating_rate: cross_rate,
+                persisted_samples: tracking.samples_held as u32,
+                hint: tracking.matched_hint,
+                tick: current_tick,
+            };
+            emitted_events.push((event_id, speciation));
+
+            if let Some(hid) = tracking.matched_hint {
+                verdicts.push(HintVerdict::Confirmed(event_id));
+            } else {
+                unhinted_this_step += 1;
+            }
+
+            resolved_split_keys.push(*key);
+        }
+    }
+
+    // Clean up resolved / transient splits and reconcile hints for failed splits
+    for key in resolved_split_keys {
+        if let Some(tracking) = state.pending_splits.remove(&key) {
+            if let Some(reason) = tracking.last_rejection_reason {
+                if let Some(hid) = tracking.matched_hint {
+                    let mut metrics = BTreeMap::new();
+                    metrics.insert(
+                        "cross_mating_rate".to_string(),
+                        tracking.last_cross_mating_rate,
+                    );
+                    metrics.insert(
+                        "child_a_size".to_string(),
+                        tracking.last_sample_sizes.0 as f32,
+                    );
+                    metrics.insert(
+                        "child_b_size".to_string(),
+                        tracking.last_sample_sizes.1 as f32,
+                    );
+                    verdicts.push(HintVerdict::Rejected {
+                        reason,
+                        evidence: HintEvidence {
+                            hint_id: hid,
+                            tick: current_tick,
+                            score: 0.0,
+                            detail: format!("Candidate split {key:?} rejected: {reason:?}"),
+                            metrics,
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    // 4. Extinction detection with idempotence & living member verification
+    for (&prev_sp_id, &prev_size) in &state.prev_species_sizes {
+        if prev_size > 0 && !current_species_map.contains_key(&prev_sp_id) {
+            // Species not present in current clustering table
+            if state.extinct_species.contains(&prev_sp_id) {
+                continue; // Idempotent: already extinct, never emit again!
+            }
+
+            // Verify against AncestryGraph: are there any living members?
+            let known_members = state
+                .last_known_members
+                .get(&prev_sp_id)
+                .cloned()
+                .unwrap_or_default();
+            let living_members: Vec<AgentUid> = known_members
+                .iter()
+                .copied()
+                .filter(|uid| {
+                    ancestry
+                        .node(*uid)
+                        .is_some_and(|node| node.death_tick.is_none() && !node.pruned)
+                })
+                .collect();
+
+            if !living_members.is_empty() {
+                // ANOMALY: clustering dropped a species that still has living members!
+                anomalies_this_step += 1;
+                state.anomaly_count += 1;
+                // Emit warning counter rather than false extinction!
+                continue;
+            }
+
+            // Living count is zero -> GENUINE EXTINCTION!
+            state.extinct_species.insert(prev_sp_id);
+
+            // Find last member and accumulate cause histogram
+            let mut last_member = known_members.first().copied().unwrap_or(AgentUid(0));
+            let mut latest_death = Tick(0);
+            let mut cause_histogram = BTreeMap::new();
+
+            for uid in &known_members {
+                if let Some(node) = ancestry.node(*uid) {
+                    if let Some(dt) = node.death_tick {
+                        if dt.0 >= latest_death.0 {
+                            latest_death = dt;
+                            last_member = *uid;
+                        }
+                    }
+                    if let Some(cause) = node.death_cause {
+                        *cause_histogram.entry(cause).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            state.next_event_id += 1;
+            let event_id = EventId(state.next_event_id);
+            let peak_size = state
+                .peak_sizes
+                .get(&prev_sp_id)
+                .copied()
+                .unwrap_or(prev_size);
+            let extinction = PhyloEvent::Extinction {
+                species: prev_sp_id,
+                last_member,
+                peak_size,
+                cause_histogram,
+                tick: current_tick,
+            };
+            emitted_events.push((event_id, extinction));
+        }
+    }
+
+    // 5. Radiation detection: doubling inside window with min size
+    for (&sp_id, species) in &current_species_map {
+        if let Some(&prev_size) = state.prev_species_sizes.get(&sp_id) {
+            let curr_size = species.members.len();
+            if curr_size >= params.radiation_min_members
+                && prev_size >= 1
+                && (curr_size as f32) >= (prev_size as f32) * params.radiation_growth_factor
+            {
+                // Radiation detected!
+                state.next_event_id += 1;
+                let event_id = EventId(state.next_event_id);
+                #[allow(clippy::cast_precision_loss)]
+                let growth_score = (curr_size as f32) / (prev_size as f32);
+
+                // Check for matching change-point hint in window
+                let matched_hint = hints.iter().find(|h| {
+                    h.kind == DetectorHintKind::ChangePoint
+                        && (h.target_species.is_none() || h.target_species == Some(sp_id))
+                        && h.tick.0 <= current_tick.0
+                        && current_tick.0 <= h.tick.0 + params.hint_match_window
+                });
+
+                let hint_id = matched_hint.map(|h| h.id);
+                if matched_hint.is_some() {
+                    verdicts.push(HintVerdict::Confirmed(event_id));
+                }
+
+                let radiation = PhyloEvent::Radiation {
+                    species: sp_id,
+                    from_size: prev_size,
+                    to_size: curr_size,
+                    window: TickRange {
+                        start: prev_tick,
+                        end: current_tick,
+                    },
+                    score: growth_score,
+                    hint: hint_id,
+                    tick: current_tick,
+                };
+                emitted_events.push((event_id, radiation));
+            }
+        }
+    }
+
+    // 6. Total hint reconciliation: ensure EVERY input hint has a verdict
+    for hint in hints {
+        let already_reconciled = verdicts.iter().any(|v| match v {
+            HintVerdict::Confirmed(eid) => emitted_events.iter().any(|(id, e)| {
+                id == eid
+                    && (match e {
+                        PhyloEvent::Speciation { hint: h, .. }
+                        | PhyloEvent::Radiation { hint: h, .. } => *h == Some(hint.id),
+                        _ => false,
+                    })
+            }),
+            HintVerdict::Rejected { evidence, .. } => evidence.hint_id == hint.id,
+        });
+
+        if !already_reconciled {
+            // Hint was not confirmed by any event at this step
+            let mut metrics = BTreeMap::new();
+            metrics.insert("hint_score".to_string(), hint.score);
+            let reason = match hint.kind {
+                DetectorHintKind::Bimodality => RejectReason::Transient,
+                DetectorHintKind::ChangePoint => RejectReason::BelowMinSize,
+            };
+            verdicts.push(HintVerdict::Rejected {
+                reason,
+                evidence: HintEvidence {
+                    hint_id: hint.id,
+                    tick: current_tick,
+                    score: hint.score,
+                    detail: format!(
+                        "Hint {:?} had no confirming phylogeny event in window",
+                        hint.id
+                    ),
+                    metrics,
+                },
+            });
+        }
+    }
+
+    // 7. Update state for next step
+    state.prev_species_sizes = current_table
+        .species
+        .iter()
+        .map(|s| (s.id, s.members.len()))
+        .collect();
+    state.prev_sample_tick = Some(current_tick);
+    state.events_unhinted += unhinted_this_step;
+
+    // 8. Deterministic total ordering of emitted events: sorted by (tick, kind discriminant, species id)
+    emitted_events.sort_by(|(_, a), (_, b)| a.cmp(b));
+
+    // Sort verdicts by hint_id for byte-identical determinism
+    verdicts.sort_by_key(|v| match v {
+        HintVerdict::Confirmed(eid) => (eid.0, 0),
+        HintVerdict::Rejected { evidence, .. } => (evidence.hint_id.0, 1),
+    });
+
+    PhyloEngineOutput {
+        events: emitted_events,
+        verdicts,
+        anomalies: anomalies_this_step,
+        unhinted_count: unhinted_this_step,
+    }
 }
 
 #[cfg(test)]
@@ -2183,6 +2910,627 @@ mod tests {
             lod.index_nodes_visited,
             lod.index_height,
             lod.nodes.len()
+        );
+    }
+
+    // =========================================================================
+    // Unit Tests for Phylogeny Event Stream & Hint Cross-Validation (bd-16g.3.3)
+    // =========================================================================
+
+    fn make_test_species(id: u64, members: &[u64]) -> crate::species::Species {
+        crate::species::Species {
+            id: SpeciesId(id),
+            name: format!("Species-{id}"),
+            founders: members.iter().copied().take(1).map(AgentUid).collect(),
+            members: members.iter().copied().map(AgentUid).collect(),
+            centroid: vec![0.5; 6],
+            spread: 0.1,
+            first_tick: Tick(0),
+            last_seen_tick: Tick(100),
+        }
+    }
+
+    fn make_birth(uid: u64, pa: Option<u64>, pb: Option<u64>) -> BirthRecord {
+        BirthRecord {
+            tick: Tick(10),
+            agent_uid: AgentUid(uid),
+            spawn_ordinal: uid,
+            birth_ordinal: Some(uid),
+            origin: crate::BirthOrigin::Born,
+            parent_a: pa.map(AgentUid),
+            parent_b: pb.map(AgentUid),
+            brain_kind: None,
+            brain_key: None,
+            herbivore_tendency: 0.5,
+            generation: crate::Generation(1),
+            position: crate::Position::default(),
+            is_hybrid: false,
+        }
+    }
+
+    fn make_death(uid: u64, cause: DeathCause, tick: Tick) -> crate::DeathRecord {
+        crate::DeathRecord {
+            tick,
+            agent_uid: AgentUid(uid),
+            age: 50,
+            generation: crate::Generation(1),
+            herbivore_tendency: 0.5,
+            brain_kind: None,
+            brain_key: None,
+            energy: 0.0,
+            food_balance_total: 0.0,
+            cause,
+            was_hybrid: false,
+            combat_flags: crate::CombatEventFlags::default(),
+        }
+    }
+
+    fn build_test_ancestry(members: &[u64], brain_keys: Option<&[(u64, u64)]>) -> AncestryGraph {
+        let mut graph = AncestryGraph::new();
+        for &uid in members {
+            let mut record = make_birth(uid, None, None);
+            if let Some(bkeys) = brain_keys {
+                if let Some(&(_, bk)) = bkeys.iter().find(|(u, _)| *u == uid) {
+                    record.brain_key = Some(bk);
+                }
+            }
+            let _ = graph.apply_birth(&record);
+        }
+        graph
+    }
+
+    /// (c) Split with high observed cross-cluster mating -> NO event, hint Rejected{Interbreeding}.
+    /// THIS IS THE TEST THAT STOPS THE FEATURE FROM LYING; write it first.
+    #[test]
+    fn test_bd_16g_3_3_c_high_cross_mating_is_rejected_as_interbreeding() {
+        let mut table = SpeciesTable::default();
+        table.tick = Tick(10);
+        table
+            .species
+            .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
+        table
+            .species
+            .push(make_test_species(2, &(11..=20).collect::<Vec<_>>()));
+
+        let ancestry = build_test_ancestry(&(1..=20).collect::<Vec<_>>(), None);
+
+        // 20 births: 10 within, 10 cross-mating -> cross_rate = 0.50 >> max_cross_mating (0.05)
+        let mut births = Vec::new();
+        for idx in 0..10 {
+            births.push(make_birth(100 + idx, Some(1), Some(2))); // within species 1
+            births.push(make_birth(200 + idx, Some(1), Some(11))); // cross: species 1 x species 2
+        }
+
+        let hint = DetectorHint {
+            id: HintId(1),
+            tick: Tick(10),
+            kind: DetectorHintKind::Bimodality,
+            score: 0.85,
+            metric: "phenotype_bimodality".to_string(),
+            target_species: Some(SpeciesId(1)),
+        };
+
+        let params = PhyloEventParams::default();
+        let mut state = PhyloEngineState::default();
+
+        let output = step_phylo_events(&table, &ancestry, &births, &[hint], &params, &mut state);
+
+        // Assert NO speciation event emitted
+        assert!(
+            output.events.is_empty(),
+            "interbreeding population must not emit speciation"
+        );
+        let split_key = CandidateSplitKey {
+            parent: SpeciesId(1),
+            child_a: SpeciesId(1),
+            child_b: SpeciesId(2),
+        };
+        let tracking = state
+            .pending_splits
+            .get(&split_key)
+            .expect("tracking exists");
+        assert_eq!(tracking.samples_held, 0);
+        assert_eq!(
+            tracking.last_rejection_reason,
+            Some(RejectReason::Interbreeding)
+        );
+    }
+
+    /// (a) Clean split persisting K samples with zero cross-mating -> exactly one Speciation,
+    /// hint Confirmed, separation=Phenotypic.
+    #[test]
+    fn test_bd_16g_3_3_a_clean_split_persisting_k_samples_speciation_confirmed() {
+        let mut table = SpeciesTable::default();
+        table
+            .species
+            .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
+        table
+            .species
+            .push(make_test_species(2, &(11..=20).collect::<Vec<_>>()));
+
+        let ancestry = build_test_ancestry(&(1..=20).collect::<Vec<_>>(), None);
+
+        // Births with zero cross-mating
+        let mut births = Vec::new();
+        for idx in 0..10 {
+            births.push(make_birth(100 + idx, Some(1), Some(2))); // within species 1
+            births.push(make_birth(200 + idx, Some(11), Some(12))); // within species 2
+        }
+
+        let hint = DetectorHint {
+            id: HintId(42),
+            tick: Tick(10),
+            kind: DetectorHintKind::Bimodality,
+            score: 0.95,
+            metric: "phenotype_bimodality".to_string(),
+            target_species: Some(SpeciesId(1)),
+        };
+
+        let params = PhyloEventParams {
+            persistence_samples: 3,
+            ..Default::default()
+        };
+        let mut state = PhyloEngineState::default();
+
+        // Sample 1: first observation
+        table.tick = Tick(10);
+        let out1 = step_phylo_events(
+            &table,
+            &ancestry,
+            &births,
+            &[hint.clone()],
+            &params,
+            &mut state,
+        );
+        assert!(out1.events.is_empty());
+
+        // Sample 2: held for 2 samples
+        table.tick = Tick(20);
+        let out2 = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
+        assert!(out2.events.is_empty());
+
+        // Sample 3: reaches K=3 -> speciation confirmed!
+        table.tick = Tick(30);
+        let out3 = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
+        assert_eq!(out3.events.len(), 1, "exactly one speciation event at K=3");
+
+        let (eid, event) = &out3.events[0];
+        match event {
+            PhyloEvent::Speciation {
+                parent,
+                children,
+                separation,
+                cross_mating_rate,
+                persisted_samples,
+                hint: matched_hint,
+                tick,
+                ..
+            } => {
+                assert_eq!(*parent, SpeciesId(1));
+                assert_eq!(*children, [SpeciesId(1), SpeciesId(2)]);
+                assert_eq!(*separation, SeparationKind::Phenotypic);
+                assert!((*cross_mating_rate - 0.0).abs() < f32::EPSILON);
+                assert_eq!(*persisted_samples, 3);
+                assert_eq!(*matched_hint, Some(HintId(42)));
+                assert_eq!(*tick, Tick(30));
+            }
+            _ => panic!("expected Speciation event"),
+        }
+
+        assert_eq!(out3.verdicts.len(), 1);
+        assert_eq!(out3.verdicts[0], HintVerdict::Confirmed(*eid));
+    }
+
+    /// (b) Split that reverts after K-1 samples -> NO event, hint Rejected{Transient}.
+    #[test]
+    fn test_bd_16g_3_3_b_split_reverting_after_k_minus_one_samples_is_transient() {
+        let mut table = SpeciesTable::default();
+        table
+            .species
+            .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
+        table
+            .species
+            .push(make_test_species(2, &(11..=20).collect::<Vec<_>>()));
+
+        let ancestry = build_test_ancestry(&(1..=20).collect::<Vec<_>>(), None);
+        let mut births = Vec::new();
+        for idx in 0..10 {
+            births.push(make_birth(100 + idx, Some(1), Some(2)));
+            births.push(make_birth(200 + idx, Some(11), Some(12)));
+        }
+
+        let hint = DetectorHint {
+            id: HintId(77),
+            tick: Tick(10),
+            kind: DetectorHintKind::Bimodality,
+            score: 0.90,
+            metric: "phenotype_bimodality".to_string(),
+            target_species: Some(SpeciesId(1)),
+        };
+
+        let params = PhyloEventParams {
+            persistence_samples: 3,
+            ..Default::default()
+        };
+        let mut state = PhyloEngineState::default();
+
+        // Sample 1 & 2: holds
+        table.tick = Tick(10);
+        let _ = step_phylo_events(&table, &ancestry, &births, &[hint], &params, &mut state);
+        table.tick = Tick(20);
+        let _ = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
+
+        // Sample 3: species 2 vanished / merged back!
+        let mut reverted_table = SpeciesTable::default();
+        reverted_table.tick = Tick(30);
+        reverted_table
+            .species
+            .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
+
+        let out3 = step_phylo_events(
+            &reverted_table,
+            &ancestry,
+            &births,
+            &[],
+            &params,
+            &mut state,
+        );
+        assert!(
+            out3.events.is_empty(),
+            "reverted split must not emit Speciation"
+        );
+        assert_eq!(out3.verdicts.len(), 1);
+        match &out3.verdicts[0] {
+            HintVerdict::Rejected { reason, evidence } => {
+                assert_eq!(*reason, RejectReason::Transient);
+                assert_eq!(evidence.hint_id, HintId(77));
+            }
+            _ => panic!("expected Rejected{{Transient}}"),
+        }
+    }
+
+    /// (d) Split entirely explained by brain-kind gating -> event emitted with separation=BrainKindGated,
+    /// and an assertion that it is NOT reported as Phenotypic.
+    #[test]
+    fn test_bd_16g_3_3_d_brain_kind_gated_separation_distinguished() {
+        let mut table = SpeciesTable::default();
+        table
+            .species
+            .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
+        table
+            .species
+            .push(make_test_species(2, &(11..=20).collect::<Vec<_>>()));
+
+        // Species 1 members have brain 1, Species 2 members have brain 2
+        let mut brain_keys = Vec::new();
+        for id in 1..=10 {
+            brain_keys.push((id, 1));
+        }
+        for id in 11..=20 {
+            brain_keys.push((id, 2));
+        }
+        let ancestry = build_test_ancestry(&(1..=20).collect::<Vec<_>>(), Some(&brain_keys));
+
+        let mut births = Vec::new();
+        for idx in 0..10 {
+            births.push(make_birth(100 + idx, Some(1), Some(2)));
+            births.push(make_birth(200 + idx, Some(11), Some(12)));
+        }
+
+        let params = PhyloEventParams {
+            persistence_samples: 1, // evaluate immediately
+            ..Default::default()
+        };
+        let mut state = PhyloEngineState::default();
+
+        let out = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
+        assert_eq!(out.events.len(), 1);
+        let (_, event) = &out.events[0];
+        match event {
+            PhyloEvent::Speciation { separation, .. } => {
+                assert_eq!(*separation, SeparationKind::BrainKindGated);
+                assert_ne!(
+                    *separation,
+                    SeparationKind::Phenotypic,
+                    "must NOT report as Phenotypic"
+                );
+            }
+            _ => panic!("expected Speciation event"),
+        }
+    }
+
+    /// (e) Window containing zero two-parent births -> Rejected{NoAncestralSupport}, not Confirmed
+    /// (the empty-denominator test).
+    #[test]
+    fn test_bd_16g_3_3_e_empty_two_parent_denominator_rejected_no_ancestral_support() {
+        let mut table = SpeciesTable::default();
+        table
+            .species
+            .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
+        table
+            .species
+            .push(make_test_species(2, &(11..=20).collect::<Vec<_>>()));
+
+        let ancestry = build_test_ancestry(&(1..=20).collect::<Vec<_>>(), None);
+
+        // Zero two-parent births (e.g. all asexual births or empty)
+        let births: Vec<BirthRecord> = (0..5).map(|i| make_birth(100 + i, Some(1), None)).collect();
+
+        let params = PhyloEventParams {
+            persistence_samples: 1,
+            min_two_parent_births: 2,
+            ..Default::default()
+        };
+        let mut state = PhyloEngineState::default();
+
+        let out = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
+        assert!(
+            out.events.is_empty(),
+            "empty denominator must not confirm speciation"
+        );
+
+        let split_key = CandidateSplitKey {
+            parent: SpeciesId(1),
+            child_a: SpeciesId(1),
+            child_b: SpeciesId(2),
+        };
+        let tracking = state
+            .pending_splits
+            .get(&split_key)
+            .expect("tracking exists");
+        assert_eq!(
+            tracking.last_rejection_reason,
+            Some(RejectReason::NoAncestralSupport)
+        );
+    }
+
+    /// (f) Sub-cluster below min_size -> Rejected{BelowMinSize}.
+    #[test]
+    fn test_bd_16g_3_3_f_sub_cluster_below_min_size_rejected() {
+        let mut table = SpeciesTable::default();
+        table.species.push(make_test_species(1, &[1, 2, 3]));
+        table.species.push(make_test_species(2, &[4])); // only 1 member!
+
+        let ancestry = build_test_ancestry(&[1, 2, 3, 4], None);
+        let births = vec![
+            make_birth(100, Some(1), Some(2)),
+            make_birth(101, Some(1), Some(3)),
+        ];
+
+        let params = PhyloEventParams {
+            persistence_samples: 1,
+            min_species_size: 2,
+            ..Default::default()
+        };
+        let mut state = PhyloEngineState::default();
+
+        let out = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
+        assert!(
+            out.events.is_empty(),
+            "sub-cluster below min_size must not confirm"
+        );
+
+        let split_key = CandidateSplitKey {
+            parent: SpeciesId(1),
+            child_a: SpeciesId(1),
+            child_b: SpeciesId(2),
+        };
+        let tracking = state
+            .pending_splits
+            .get(&split_key)
+            .expect("tracking exists");
+        assert_eq!(
+            tracking.last_rejection_reason,
+            Some(RejectReason::BelowMinSize)
+        );
+    }
+
+    /// (g) Species size -> 0 -> exactly ONE Extinction, and no further events ever emitted
+    /// for that SpeciesId (idempotence of extinction).
+    #[test]
+    fn test_bd_16g_3_3_g_species_size_zero_extinction_idempotence() {
+        let mut ancestry = build_test_ancestry(&(1..=5).collect::<Vec<_>>(), None);
+
+        // Step 1: species 1 has 5 members alive
+        let mut table1 = SpeciesTable::default();
+        table1.tick = Tick(10);
+        table1
+            .species
+            .push(make_test_species(1, &(1..=5).collect::<Vec<_>>()));
+
+        let params = PhyloEventParams::default();
+        let mut state = PhyloEngineState::default();
+        let out1 = step_phylo_events(&table1, &ancestry, &[], &[], &params, &mut state);
+        assert!(out1.events.is_empty());
+
+        // Now all members die:
+        let _ = ancestry.apply_death(&make_death(1, DeathCause::CombatCarnivore, Tick(20)));
+        let _ = ancestry.apply_death(&make_death(2, DeathCause::CombatCarnivore, Tick(22)));
+        let _ = ancestry.apply_death(&make_death(3, DeathCause::Starvation, Tick(24)));
+        let _ = ancestry.apply_death(&make_death(4, DeathCause::Starvation, Tick(26)));
+        let _ = ancestry.apply_death(&make_death(5, DeathCause::Aging, Tick(30))); // last member!
+
+        // Step 2: species 1 has 0 members and is absent from clustering table
+        let mut table2 = SpeciesTable::default();
+        table2.tick = Tick(35);
+        let out2 = step_phylo_events(&table2, &ancestry, &[], &[], &params, &mut state);
+
+        assert_eq!(out2.events.len(), 1, "exactly ONE Extinction event");
+        let (_, event) = &out2.events[0];
+        match event {
+            PhyloEvent::Extinction {
+                species,
+                last_member,
+                peak_size,
+                cause_histogram,
+                tick,
+            } => {
+                assert_eq!(*species, SpeciesId(1));
+                assert_eq!(*last_member, AgentUid(5));
+                assert_eq!(*peak_size, 5);
+                assert_eq!(*tick, Tick(35));
+                assert_eq!(cause_histogram.get(&DeathCause::CombatCarnivore), Some(&2));
+                assert_eq!(cause_histogram.get(&DeathCause::Starvation), Some(&2));
+                assert_eq!(cause_histogram.get(&DeathCause::Aging), Some(&1));
+            }
+            _ => panic!("expected Extinction event"),
+        }
+
+        // Step 3: subsequent step with species 1 still absent
+        let mut table3 = SpeciesTable::default();
+        table3.tick = Tick(40);
+        let out3 = step_phylo_events(&table3, &ancestry, &[], &[], &params, &mut state);
+
+        assert!(
+            out3.events.is_empty(),
+            "extinction must be idempotent (zero new events)"
+        );
+    }
+
+    /// (h) Species size doubling inside the window -> one Radiation with the correct from/to and score.
+    #[test]
+    fn test_bd_16g_3_3_h_radiation_doubling_inside_window() {
+        let ancestry = build_test_ancestry(&(1..=15).collect::<Vec<_>>(), None);
+        let params = PhyloEventParams {
+            radiation_min_members: 5,
+            radiation_growth_factor: 2.0,
+            ..Default::default()
+        };
+        let mut state = PhyloEngineState::default();
+
+        // Step 1: species 1 has 5 members
+        let mut table1 = SpeciesTable::default();
+        table1.tick = Tick(10);
+        table1
+            .species
+            .push(make_test_species(1, &(1..=5).collect::<Vec<_>>()));
+        let _ = step_phylo_events(&table1, &ancestry, &[], &[], &params, &mut state);
+
+        // Step 2: species 1 doubles to 12 members
+        let mut table2 = SpeciesTable::default();
+        table2.tick = Tick(20);
+        table2
+            .species
+            .push(make_test_species(1, &(1..=12).collect::<Vec<_>>()));
+
+        let hint = DetectorHint {
+            id: HintId(99),
+            tick: Tick(15),
+            kind: DetectorHintKind::ChangePoint,
+            score: 2.4,
+            metric: "population_cusum".to_string(),
+            target_species: Some(SpeciesId(1)),
+        };
+
+        let out2 = step_phylo_events(&table2, &ancestry, &[], &[hint], &params, &mut state);
+        assert_eq!(out2.events.len(), 1, "exactly one Radiation event");
+        let (eid, event) = &out2.events[0];
+        match event {
+            PhyloEvent::Radiation {
+                species,
+                from_size,
+                to_size,
+                window,
+                score,
+                hint: matched_hint,
+                tick,
+            } => {
+                assert_eq!(*species, SpeciesId(1));
+                assert_eq!(*from_size, 5);
+                assert_eq!(*to_size, 12);
+                assert_eq!(window.start, Tick(10));
+                assert_eq!(window.end, Tick(20));
+                assert!((*score - 2.4).abs() < f32::EPSILON);
+                assert_eq!(*matched_hint, Some(HintId(99)));
+                assert_eq!(*tick, Tick(20));
+            }
+            _ => panic!("expected Radiation event"),
+        }
+
+        assert_eq!(out2.verdicts.len(), 1);
+        assert_eq!(out2.verdicts[0], HintVerdict::Confirmed(*eid));
+    }
+
+    /// (i) Clustering drops a species that still has living members -> no Extinction,
+    /// a warn, and a typed anomaly counter.
+    #[test]
+    fn test_bd_16g_3_3_i_clustering_drops_species_with_living_members_anomaly() {
+        let ancestry = build_test_ancestry(&(1..=5).collect::<Vec<_>>(), None);
+        let params = PhyloEventParams::default();
+        let mut state = PhyloEngineState::default();
+
+        // Step 1: species 1 has 5 members
+        let mut table1 = SpeciesTable::default();
+        table1.tick = Tick(10);
+        table1
+            .species
+            .push(make_test_species(1, &(1..=5).collect::<Vec<_>>()));
+        let _ = step_phylo_events(&table1, &ancestry, &[], &[], &params, &mut state);
+
+        // Members 1..=5 are still ALIVE in ancestry (no death records)
+        // Step 2: clustering table drops species 1!
+        let mut table2 = SpeciesTable::default();
+        table2.tick = Tick(20);
+        let out2 = step_phylo_events(&table2, &ancestry, &[], &[], &params, &mut state);
+
+        // Must NOT emit Extinction! Must record anomaly!
+        assert!(
+            out2.events.is_empty(),
+            "must not emit extinction when members are alive"
+        );
+        assert_eq!(out2.anomalies, 1);
+        assert_eq!(state.anomaly_count, 1);
+    }
+
+    /// Determinism: the same seeded fixture twice -> byte-identical event list and verdict list.
+    #[test]
+    fn test_bd_16g_3_3_determinism_identical_runs_produce_byte_identical_events() {
+        let run_fixture = || {
+            let ancestry = build_test_ancestry(&(1..=20).collect::<Vec<_>>(), None);
+            let mut births = Vec::new();
+            for idx in 0..10 {
+                births.push(make_birth(100 + idx, Some(1), Some(2)));
+                births.push(make_birth(200 + idx, Some(11), Some(12)));
+            }
+
+            let params = PhyloEventParams {
+                persistence_samples: 2,
+                ..Default::default()
+            };
+            let mut state = PhyloEngineState::default();
+
+            let mut table1 = SpeciesTable::default();
+            table1.tick = Tick(10);
+            table1
+                .species
+                .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
+            table1
+                .species
+                .push(make_test_species(2, &(11..=20).collect::<Vec<_>>()));
+            let out1 = step_phylo_events(&table1, &ancestry, &births, &[], &params, &mut state);
+
+            let mut table2 = SpeciesTable::default();
+            table2.tick = Tick(20);
+            table2
+                .species
+                .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
+            table2
+                .species
+                .push(make_test_species(2, &(11..=20).collect::<Vec<_>>()));
+            let out2 = step_phylo_events(&table2, &ancestry, &births, &[], &params, &mut state);
+
+            (out1, out2)
+        };
+
+        let run_a = run_fixture();
+        let run_b = run_fixture();
+
+        let bytes_a = serde_json::to_vec(&run_a).expect("serialize run a");
+        let bytes_b = serde_json::to_vec(&run_b).expect("serialize run b");
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "same fixture twice must produce byte-identical serialized events and verdicts"
         );
     }
 }
