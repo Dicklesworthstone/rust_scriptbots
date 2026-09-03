@@ -599,7 +599,7 @@ impl<'a> TerminalApp<'a> {
                 .expect("world mutex poisoned while capturing terrain");
             let render = &world.config().render;
             (
-                TerrainView::from(world.terrain()),
+                TerrainView::from_layers(world.terrain(), world.hydrology()),
                 render.resolved_day_night(),
                 render.reduced_motion,
                 render.quality,
@@ -4177,11 +4177,36 @@ struct TerrainView {
     moisture: Vec<f32>,
     /// Per-tile food-fertility bias, parallel to `kinds`.
     fertility: Vec<f32>,
+    /// Per-tile normalized water depth (0.0 = shallowest margin, 1.0 = deepest basin),
+    /// parallel to `kinds`.
+    water_depth: Vec<f32>,
 }
 
 impl TerrainView {
+    #[allow(dead_code)]
     fn from(terrain: &TerrainLayer) -> Self {
+        Self::from_layers(terrain, None)
+    }
+
+    fn from_layers(
+        terrain: &TerrainLayer,
+        hydrology: Option<&scriptbots_core::HydrologyState>,
+    ) -> Self {
         let tiles = terrain.tiles();
+        let water_depth = match hydrology {
+            Some(hydro)
+                if hydro.width() == terrain.width() && hydro.height() == terrain.height() =>
+            {
+                let raw = hydro.water_depth();
+                let max_d = raw.iter().copied().fold(0.0f32, f32::max);
+                if max_d > 0.0 {
+                    raw.iter().map(|&d| (d / max_d).clamp(0.0, 1.0)).collect()
+                } else {
+                    raw.iter().map(|&d| d.clamp(0.0, 1.0)).collect()
+                }
+            }
+            _ => Vec::new(),
+        };
         Self {
             width: terrain.width(),
             height: terrain.height(),
@@ -4189,6 +4214,7 @@ impl TerrainView {
             elevations: tiles.iter().map(|tile| tile.elevation).collect(),
             moisture: tiles.iter().map(|tile| tile.moisture).collect(),
             fertility: tiles.iter().map(|tile| tile.fertility_bias).collect(),
+            water_depth,
         }
     }
 
@@ -4208,6 +4234,27 @@ impl TerrainView {
         match (self.moisture.get(idx), self.fertility.get(idx)) {
             (Some(&moisture), Some(&fertility)) => visual::terrain_lushness(moisture, fertility),
             _ => 0.5,
+        }
+    }
+
+    /// Normalized water depth for a normalized world point: how deep the water is
+    /// at this tile in `0.0..=1.0` (0.0 = shallowest margin, 1.0 = deepest basin).
+    ///
+    /// Falls back to default depth by terrain kind when the parallel array is short or
+    /// missing, so a truncated view degrades uniformly instead of striping.
+    fn water_depth(&self, u: f32, v: f32) -> f32 {
+        if self.water_depth.len() == self.kinds.len()
+            && let Some((x, y)) = self.tile_coords(u, v)
+        {
+            let idx = (y as usize).saturating_mul(self.width as usize) + x as usize;
+            if let Some(&depth) = self.water_depth.get(idx) {
+                return depth.clamp(0.0, 1.0);
+            }
+        }
+        match self.sample(u, v) {
+            TerrainKind::DeepWater => 1.0,
+            TerrainKind::ShallowWater => 0.0,
+            _ => 0.0,
         }
     }
 
@@ -6480,6 +6527,24 @@ impl Palette {
         ]
     }
 
+    /// Water base color for the canvas, ramped from the shallow to the deep end
+    /// of the biome band by normalized depth (bd-sk55).
+    ///
+    /// Depth 1.0 (deepest basin) retains the biome's full background color;
+    /// depth 0.0 (shallowest margin) lifts toward the biome's foreground ink,
+    /// so two tiles of the same water kind at different depths read distinctly.
+    fn terrain_canvas_rgb_water(&self, kind: TerrainKind, depth: f32) -> [f32; 3] {
+        let base = self.terrain_canvas_rgb(kind);
+        let idx = Self::terrain_index(kind);
+        let ink = color_channels(self.theme().terrain_fg[idx]);
+        let t = (1.0 - depth.clamp(0.0, 1.0)) * CANVAS_WATER_DEPTH_WEIGHT;
+        [
+            (ink[0] - base[0]).mul_add(t, base[0]),
+            (ink[1] - base[1]).mul_add(t, base[1]),
+            (ink[2] - base[2]).mul_add(t, base[2]),
+        ]
+    }
+
     /// Food ink, brightened toward the terrain's glyph color as the cell fills.
     fn food_canvas_rgb(&self, kind: TerrainKind, level: f32) -> [f32; 3] {
         let idx = Self::terrain_index(kind);
@@ -6839,6 +6904,13 @@ const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
 /// Well short of 1.0: that ink is glyph-bright, and tiling a whole map with it
 /// would drown the agent dots the terrain is supposed to sit behind.
 const CANVAS_LUSHNESS_WEIGHT: f32 = 0.35;
+
+/// How far a water tile lifts toward its biome's vivid ink at zero depth (bd-sk55).
+///
+/// Deep basin water stays at the deep background color; shallow margins lift
+/// toward the foreground ink so shallow water and deep water read distinctly
+/// across the biome ramp.
+const CANVAS_WATER_DEPTH_WEIGHT: f32 = 0.35;
 
 /// Minimap edge as a fraction of the canvas.
 const CANVAS_MINIMAP_FRACTION: u16 = 4;
@@ -7237,9 +7309,13 @@ impl MapWidget<'_> {
                 // what is drawn rather than only what a toast claims.
                 let (u, v) = ctx.viewport.world_at(fx, fy);
                 let kind = ctx.terrain.sample(u, v);
-                let base = ctx
-                    .palette
-                    .terrain_canvas_rgb_lush(kind, ctx.terrain.lushness(u, v));
+                let base = if matches!(kind, TerrainKind::DeepWater | TerrainKind::ShallowWater) {
+                    ctx.palette
+                        .terrain_canvas_rgb_water(kind, ctx.terrain.water_depth(u, v))
+                } else {
+                    ctx.palette
+                        .terrain_canvas_rgb_lush(kind, ctx.terrain.lushness(u, v))
+                };
 
                 // Hillshade: the shared normal-light term keyed on terrain kind, so
                 // rock reads craggy and water flat from the same elevation slope.
@@ -7564,6 +7640,7 @@ mod tests {
             elevations: vec![0.5],
             moisture: vec![0.5],
             fertility: vec![0.0],
+            water_depth: Vec::new(),
         }
     }
 
@@ -7981,6 +8058,7 @@ mod tests {
             elevations: vec![0.5, 0.5, 0.5],
             moisture: vec![0.5; 3],
             fertility: vec![0.0; 3],
+            water_depth: Vec::new(),
         };
         let sloped = TerrainView {
             width: 3,
@@ -7989,6 +8067,7 @@ mod tests {
             elevations: vec![0.0, 0.5, 1.0],
             moisture: vec![0.5; 3],
             fertility: vec![0.0; 3],
+            water_depth: Vec::new(),
         };
         let snapshot = Snapshot::default();
         let sample = |terrain: &TerrainView| {
@@ -8016,6 +8095,7 @@ mod tests {
             elevations: vec![0.5],
             moisture: vec![0.5],
             fertility: vec![0.0],
+            water_depth: Vec::new(),
         };
         let frame_at = |tick: u64| {
             let mut snapshot = Snapshot::default();
@@ -8061,6 +8141,7 @@ mod tests {
             elevations: vec![0.5],
             moisture: vec![0.5],
             fertility: vec![0.0],
+            water_depth: Vec::new(),
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
             let mut snapshot = Snapshot::default();
@@ -8101,6 +8182,7 @@ mod tests {
             elevations: vec![0.5],
             moisture: vec![0.5],
             fertility: vec![1.0],
+            water_depth: Vec::new(),
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
             let mut snapshot = Snapshot::default();
@@ -8149,6 +8231,7 @@ mod tests {
             elevations: vec![0.5],
             moisture: vec![0.5],
             fertility: vec![0.0],
+            water_depth: Vec::new(),
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
             let mut snapshot = Snapshot::default();
@@ -12633,6 +12716,7 @@ mod tests {
             elevations: vec![0.5],
             moisture: vec![moisture],
             fertility: vec![fertility],
+            water_depth: Vec::new(),
         };
         let snapshot = Snapshot::default();
         let background = |terrain: &TerrainView| {
@@ -12663,10 +12747,87 @@ mod tests {
             elevations: vec![0.5, 0.5],
             moisture: vec![1.0], // short on purpose
             fertility: vec![0.0, 0.0],
+            water_depth: Vec::new(),
         };
         assert!(
             (ragged.lushness(0.25, 0.5) - ragged.lushness(0.75, 0.5)).abs() < f32::EPSILON,
             "a mismatched view must not stripe"
+        );
+    }
+
+    /// Water depth must ramp the water color within its biome band (bd-sk55).
+    ///
+    /// Two tiles of the SAME water kind with different depths must render
+    /// differently, or the depth is being computed and discarded. Furthermore,
+    /// shallow margins must read brighter than deep basins.
+    #[test]
+    fn water_depth_ramps_water_color_within_its_biome() {
+        let make_shallow = |depth: f32| TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::ShallowWater],
+            elevations: vec![0.5],
+            moisture: vec![1.0],
+            fertility: vec![0.0],
+            water_depth: vec![depth],
+        };
+        let make_deep = |depth: f32| TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::DeepWater],
+            elevations: vec![0.5],
+            moisture: vec![1.0],
+            fertility: vec![0.0],
+            water_depth: vec![depth],
+        };
+        let snapshot = Snapshot::default();
+        let background = |terrain: &TerrainView| {
+            let buf = render_canvas_frame(&snapshot, terrain, (4, 2), canvas_test_day_night());
+            cell_bg(&buf, 1, 1)
+        };
+
+        // ShallowWater: depth 0.0 (margin) vs depth 1.0 (deeper end of shallow band)
+        let shallow_margin = background(&make_shallow(0.0));
+        let shallow_deep = background(&make_shallow(1.0));
+        assert_ne!(
+            shallow_margin, shallow_deep,
+            "two shallow water tiles at different depths must not render identically"
+        );
+        assert!(
+            luminance(shallow_margin) > luminance(shallow_deep),
+            "shallow water margin must read brighter than deeper shallow water: {shallow_margin:?} vs {shallow_deep:?}"
+        );
+
+        // DeepWater: depth 0.0 (shallower deep) vs depth 1.0 (deep basin floor)
+        let deep_shallow = background(&make_deep(0.0));
+        let deep_basin = background(&make_deep(1.0));
+        assert_ne!(
+            deep_shallow, deep_basin,
+            "two deep water tiles at different depths must not render identically"
+        );
+        assert!(
+            luminance(deep_shallow) > luminance(deep_basin),
+            "shallower deep water must read brighter than deep basin: {deep_shallow:?} vs {deep_basin:?}"
+        );
+    }
+
+    /// A short or mismatched water depth array must fall back to the kind default
+    /// uniformly rather than striping or crashing.
+    #[test]
+    fn a_truncated_water_depth_view_falls_back_cleanly() {
+        let ragged = TerrainView {
+            width: 2,
+            height: 1,
+            kinds: vec![TerrainKind::ShallowWater, TerrainKind::ShallowWater],
+            elevations: vec![0.5, 0.5],
+            moisture: vec![1.0, 1.0],
+            fertility: vec![0.0, 0.0],
+            water_depth: vec![0.8], // short on purpose
+        };
+        assert_eq!(
+            ragged.water_depth(0.25, 0.5),
+            ragged.water_depth(0.75, 0.5),
+            "a mismatched water_depth view must degrade uniformly to kind default"
         );
     }
 
@@ -12916,6 +13077,7 @@ mod tests {
             elevations: vec![0.5; 64],
             moisture: vec![0.5; 64],
             fertility: vec![0.0; 64],
+            water_depth: Vec::new(),
         };
         let snapshot = Snapshot::default();
         let frame_at = |zoom: f32| {

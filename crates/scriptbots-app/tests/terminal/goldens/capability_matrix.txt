@@ -16,10 +16,10 @@
 # a_colourless_terminal_falls_back_to_the_flat_map for what IS pinned and
 # why the rest needs an env-driven integration test.
 
-capability canvas braille/truecolor frame=157172786bc93fb0 regions=10
+capability canvas braille/truecolor frame=301b4c3bbe6cce3c regions=10
   header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=1564fc5180306a64
   rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
-  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=5ae9fd15fa805c5b
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=91f3224eeb8bfcbf
   vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=100   hash=4be76e543727b76e
   trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
   leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=81    hash=8e5c4e9279be67a2
@@ -28,10 +28,10 @@ capability canvas braille/truecolor frame=157172786bc93fb0 regions=10
   brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=2b07d455e96c687d
   events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=11ee8eab9d52ee91
 
-capability canvas braille/256 frame=d978a47d52e36eeb regions=10
+capability canvas braille/256 frame=b70b54a7e4655f19 regions=10
   header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=1564fc5180306a64
   rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
-  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=83d8bde290295fe8
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=24ea9ace09193f8e
   vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=100   hash=4be76e543727b76e
   trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
   leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=81    hash=8e5c4e9279be67a2
@@ -52,10 +52,10 @@ capability canvas braille/16 frame=99dbd55761873e49 regions=10
   brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=2b07d455e96c687d
   events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=11ee8eab9d52ee91
 
-capability canvas quadrant/truecolor frame=9833c4e505fe4af5 regions=10
+capability canvas quadrant/truecolor frame=b0add60cddecd0ef regions=10
   header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=1564fc5180306a64
   rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
-  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=158   hash=f10583c7711cb4de
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=158   hash=af949eaaad9a7c3c
   vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=100   hash=4be76e543727b76e
   trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
   leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=81    hash=8e5c4e9279be67a2
@@ -64,10 +64,10 @@ capability canvas quadrant/truecolor frame=9833c4e505fe4af5 regions=10
   brains       x=50  y=29  w=30  h=4   room=yes marker=yes nonblank=86    hash=2b07d455e96c687d
   events       x=50  y=33  w=30  h=3   room=yes marker=yes nonblank=61    hash=11ee8eab9d52ee91
 
-capability canvas half-block/truecolor frame=348fb649a78815cd regions=10
+capability canvas half-block/truecolor frame=e0a8cafb8ced0aaf regions=10
   header       x=0   y=0   w=80  h=3   room=yes marker=yes nonblank=198   hash=1564fc5180306a64
   rail         x=0   y=3   w=80  h=5   room=yes marker=yes nonblank=217   hash=991a20c634f9fe53
-  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=9280ee5c38470482
+  world_map    x=0   y=8   w=50  h=28  room=yes marker=yes nonblank=1398  hash=8ff7cd8f1cd27738
   vital_stats  x=50  y=8   w=30  h=4   room=yes marker=yes nonblank=100   hash=4be76e543727b76e
   trends       x=50  y=12  w=30  h=4   room=yes marker=yes nonblank=62    hash=806d059c24d61653
   leaderboard  x=50  y=16  w=30  h=5   room=yes marker=yes nonblank=81    hash=8e5c4e9279be67a2
