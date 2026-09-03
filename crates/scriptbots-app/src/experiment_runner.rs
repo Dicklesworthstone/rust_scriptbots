@@ -2127,19 +2127,29 @@ mod tests {
                 brain_family: "dwraon".into(),
                 config_overrides: BTreeMap::new(),
             },
+            ScenarioVariant {
+                variant_id: "variant_c".into(),
+                brain_family: "assembly".into(),
+                config_overrides: BTreeMap::new(),
+            },
         ];
 
         let runner =
             MatchedSeedExperimentRunner::new("exp-matched", cohort, variants, 2, 2, &output_dir);
 
         let status = runner.execute_batch(&state_file).unwrap();
-        assert_eq!(status.completed_runs, 2);
+        assert_eq!(status.completed_runs, 3);
         assert_eq!(status.failed_runs, 0);
         assert!(status.is_finished());
         assert_eq!(status.runs[0].brain_family, "mlp.baseline");
         assert_eq!(status.runs[1].brain_family, "dwraon.baseline");
+        assert_eq!(status.runs[2].brain_family, "assembly.experimental");
         assert_ne!(
             status.runs[0].final_digest, status.runs[1].final_digest,
+            "real distinct family registries must produce distinct full world digests"
+        );
+        assert_ne!(
+            status.runs[0].final_digest, status.runs[2].final_digest,
             "real distinct family registries must produce distinct full world digests"
         );
 
@@ -2155,10 +2165,10 @@ mod tests {
             assert_eq!(manifest.root_seed, 1001);
         }
 
-        // A completed resume reopens and semantically verifies both bundles rather
+        // A completed resume reopens and semantically verifies all bundles rather
         // than trusting the status JSON or executing duplicate runs.
         let resumed_status = runner.execute_batch(&state_file).unwrap();
-        assert_eq!(resumed_status.completed_runs, 2);
+        assert_eq!(resumed_status.completed_runs, 3);
         assert_eq!(resumed_status.failed_runs, 0);
         assert_eq!(resumed_status, status);
 
