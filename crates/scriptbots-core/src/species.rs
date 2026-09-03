@@ -22,6 +22,7 @@ use crate::detect::{DetectionEvidence, DetectionKind, EvidenceClass, EvidenceSid
 use crate::{AgentUid, Tick};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
 
 /// Stable identifier for a species, monotonically increasing.
 #[derive(
@@ -57,6 +58,23 @@ impl Default for SpeciesParams {
     }
 }
 
+impl SpeciesParams {
+    /// Computes a deterministic canonical digest of the clustering parameters.
+    #[must_use]
+    pub fn canonical_digest(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(b"SpeciesParamsV1\n");
+        h.update(&self.distance_threshold.to_le_bytes());
+        h.update(&self.continuity_threshold.to_le_bytes());
+        h.update(&(self.min_cluster_size as u64).to_le_bytes());
+        for &(min, max) in &self.dimension_ranges {
+            h.update(&min.to_le_bytes());
+            h.update(&max.to_le_bytes());
+        }
+        h.finalize().to_hex().to_string()
+    }
+}
+
 /// Description of a single segmented species clade at a specific point in time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Species {
@@ -89,6 +107,49 @@ pub struct SpeciesTable {
     pub next_id: SpeciesId,
 }
 
+impl SpeciesTable {
+    /// Computes a deterministic, permutation-invariant, byte-stable digest of the species table.
+    #[must_use]
+    pub fn canonical_digest(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SpeciesTableV1\n");
+        hasher.update(&self.tick.0.to_le_bytes());
+        hasher.update(&(self.species.len() as u64).to_le_bytes());
+        for sp in &self.species {
+            hasher.update(&sp.id.0.to_le_bytes());
+            hasher.update(sp.name.as_bytes());
+            hasher.update(&(sp.founders.len() as u64).to_le_bytes());
+            for f in &sp.founders {
+                hasher.update(&f.0.to_le_bytes());
+            }
+            hasher.update(&(sp.members.len() as u64).to_le_bytes());
+            for m in &sp.members {
+                hasher.update(&m.0.to_le_bytes());
+            }
+            for c in &sp.centroid {
+                hasher.update(&c.to_le_bytes());
+            }
+            hasher.update(&sp.spread.to_le_bytes());
+            hasher.update(&sp.first_tick.0.to_le_bytes());
+            hasher.update(&sp.last_seen_tick.0.to_le_bytes());
+        }
+        hasher.update(&self.next_id.0.to_le_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Finds the species that contains the given living agent UID, if present.
+    #[must_use]
+    pub fn find_species_for_agent(&self, uid: AgentUid) -> Option<&Species> {
+        self.species.iter().find(|s| s.members.contains(&uid))
+    }
+
+    /// Number of active species currently living in the table.
+    #[must_use]
+    pub const fn species_count(&self) -> usize {
+        self.species.len()
+    }
+}
+
 /// Report summarizing changes during a species segmentation step.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentReport {
@@ -102,6 +163,30 @@ pub struct SegmentReport {
     pub extinct_species_dropped: Vec<(SpeciesId, String)>,
     /// Total number of living agents segmented.
     pub total_agents_segmented: usize,
+}
+
+impl SegmentReport {
+    /// Computes a deterministic, byte-stable digest of the segment report.
+    #[must_use]
+    pub fn canonical_digest(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SegmentReportV1\n");
+        hasher.update(&self.tick.0.to_le_bytes());
+        hasher.update(&(self.active_species_count as u64).to_le_bytes());
+        hasher.update(&(self.total_agents_segmented as u64).to_le_bytes());
+        hasher.update(&(self.new_species_minted.len() as u64).to_le_bytes());
+        for (id, name, founder) in &self.new_species_minted {
+            hasher.update(&id.0.to_le_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&founder.0.to_le_bytes());
+        }
+        hasher.update(&(self.extinct_species_dropped.len() as u64).to_le_bytes());
+        for (id, name) in &self.extinct_species_dropped {
+            hasher.update(&id.0.to_le_bytes());
+            hasher.update(name.as_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    }
 }
 
 const ADJECTIVES: &[&str] = &[
@@ -436,16 +521,25 @@ pub fn segment_species(
 /// Multi-axis behavior feature vector for an agent (bd-2z0.11.2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentPhenotypeVector {
+    /// Stable agent logical identity.
     pub agent_uid: AgentUid,
+    /// Mean movement speed.
     pub movement_speed_mean: f32,
+    /// Ratio of herbivorous food consumed.
     pub diet_herbivore_ratio: f32,
+    /// Mean sensory radius.
     pub sensing_range_mean: f32,
+    /// Aggression/combat rate index.
     pub aggression_index: f32,
+    /// Food sharing and altruism rate index.
     pub giving_altruism_index: f32,
+    /// Reproduction rate.
     pub reproduction_rate: f32,
 }
 
 impl AgentPhenotypeVector {
+    /// Extracts canonical 6-axis feature slice.
+    #[must_use]
     pub fn features(&self) -> [f32; 6] {
         [
             self.movement_speed_mean,
@@ -1348,6 +1442,460 @@ pub fn reconcile_speciation_with_hints(
     out.unhinted.sort_by_key(|id| id.0);
     out.rejected_hints.sort_by_key(|tick| tick.0);
     out
+}
+
+// ============================================================================
+// Typed Phenotype Adapter and Live Cadence Execution (bd-16g.3.6)
+// ============================================================================
+
+/// Canonical schema ID for phenotype feature vectors (bd-2z0.11.2, bd-16g.3.6).
+pub const PHENOTYPE_FEATURE_SCHEMA_ID_V1: &str = "scriptbots.phenotype.v1";
+
+/// Canonical schema version.
+pub const PHENOTYPE_FEATURE_SCHEMA_VERSION_V1: u32 = 1;
+
+/// Number of canonical phenotype axes.
+pub const PHENOTYPE_AXIS_COUNT_V1: usize = 6;
+
+/// Canonical phenotype axes and physical units.
+pub const PHENOTYPE_CANONICAL_AXES: [(&str, &str); PHENOTYPE_AXIS_COUNT_V1] = [
+    ("movement.speed.mean", "world_unit_per_tick"),
+    ("diet.herbivore_trait.mean", "ratio"),
+    ("sensing.trait_modifier.mean", "trait_multiplier"),
+    ("interaction.combat.actor_rate", "event_per_tick"),
+    ("interaction.share.actor_rate", "event_per_tick"),
+    ("lineage.offspring.parent_rate", "edge_per_tick"),
+];
+
+/// Header identifying the phenotype schema version and digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhenotypeSchemaHeader {
+    /// Schema ID, must match [`PHENOTYPE_FEATURE_SCHEMA_ID_V1`].
+    pub schema_id: String,
+    /// Schema version, must match [`PHENOTYPE_FEATURE_SCHEMA_VERSION_V1`].
+    pub schema_version: u32,
+    /// Optional schema digest (Blake3).
+    pub schema_digest: Option<String>,
+}
+
+impl Default for PhenotypeSchemaHeader {
+    fn default() -> Self {
+        Self {
+            schema_id: PHENOTYPE_FEATURE_SCHEMA_ID_V1.to_string(),
+            schema_version: PHENOTYPE_FEATURE_SCHEMA_VERSION_V1,
+            schema_digest: None,
+        }
+    }
+}
+
+/// Individual phenotype sample input to the typed species adapter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedPhenotypeInput {
+    /// Stable agent identity.
+    pub agent_uid: AgentUid,
+    /// Number of observations / lifetime coverage for this agent.
+    pub lifetime_observations: u64,
+    /// Six-axis feature vector matching canonical schema.
+    pub features: [f32; PHENOTYPE_AXIS_COUNT_V1],
+}
+
+impl TypedPhenotypeInput {
+    /// Creates a typed phenotype input with explicit lifetime observations.
+    #[must_use]
+    pub const fn new(
+        agent_uid: AgentUid,
+        lifetime_observations: u64,
+        features: [f32; PHENOTYPE_AXIS_COUNT_V1],
+    ) -> Self {
+        Self {
+            agent_uid,
+            lifetime_observations,
+            features,
+        }
+    }
+
+    /// Creates a typed phenotype input from an [`AgentPhenotypeVector`] and observation count.
+    #[must_use]
+    pub fn from_phenotype_vector(v: &AgentPhenotypeVector, lifetime_observations: u64) -> Self {
+        Self {
+            agent_uid: v.agent_uid,
+            lifetime_observations,
+            features: v.features(),
+        }
+    }
+}
+
+/// Typed refusal from the species phenotype adapter (bd-16g.3.6).
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SpeciesAdapterError {
+    /// Expected schema ID did not match.
+    #[error("schema id mismatch: expected '{expected}', found '{found}'")]
+    SchemaMismatch {
+        /// Expected schema ID.
+        expected: String,
+        /// Found schema ID.
+        found: String,
+    },
+    /// Expected schema version did not match.
+    #[error("schema version mismatch: expected {expected}, found {found}")]
+    SchemaVersionMismatch {
+        /// Expected schema version.
+        expected: u32,
+        /// Found schema version.
+        found: u32,
+    },
+    /// Feature count did not match canonical axis count.
+    #[error("axis count mismatch: expected {expected}, found {found}")]
+    AxisCountMismatch {
+        /// Expected axis count.
+        expected: usize,
+        /// Found axis count.
+        found: usize,
+    },
+    /// Feature unit did not match expected physical unit.
+    #[error(
+        "unit mismatch for axis {axis} ('{axis_name}'): expected '{expected}', found '{found}'"
+    )]
+    UnitMismatch {
+        /// Axis index.
+        axis: usize,
+        /// Axis name.
+        axis_name: &'static str,
+        /// Expected unit.
+        expected: &'static str,
+        /// Found unit.
+        found: String,
+    },
+    /// Duplicate [`AgentUid`] found in input samples.
+    #[error("duplicate agent uid {0:?}")]
+    DuplicateUid(AgentUid),
+    /// [`AgentUid`] is invalid (e.g. zero / uninitialized sentinel).
+    #[error("agent uid {0:?} is invalid / uninitialized")]
+    InvalidUid(AgentUid),
+    /// Non-finite float value found in feature vector.
+    #[error("non-finite feature value {value} at axis {axis} ('{axis_name}') for agent {uid:?}")]
+    NonFiniteValue {
+        /// Agent identity.
+        uid: AgentUid,
+        /// Axis index.
+        axis: usize,
+        /// Axis name.
+        axis_name: &'static str,
+        /// Non-finite value observed.
+        value: f32,
+    },
+    /// Lifetime coverage did not meet the required minimum observation threshold.
+    #[error(
+        "insufficient lifetime coverage for agent {uid:?}: observed {observed}, required {required}"
+    )]
+    InsufficientLifetimeCoverage {
+        /// Agent identity.
+        uid: AgentUid,
+        /// Observed lifetime tick count.
+        observed: u64,
+        /// Required minimum observation count.
+        required: u64,
+    },
+}
+
+/// Fault injection mode for verifying agreement gate failure (bd-16g.3.6 acceptance criterion 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SpeciesAdapterFault {
+    /// Normal operation, no fault.
+    #[default]
+    None,
+    /// Perturbs feature values by adding an offset to the first axis.
+    PerturbFeatures,
+    /// Mutates the schema ID to force a schema mismatch.
+    SchemaIdDrift,
+    /// Mutates the schema version to force a version mismatch.
+    SchemaVersionDrift,
+    /// Injects a NaN into feature values.
+    InjectNonFinite,
+}
+
+/// Configuration for the typed species phenotype adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeciesPhenotypeAdapterConfig {
+    /// Minimum lifetime observations required before an agent is admitted to clustering.
+    pub min_lifetime_observations: u64,
+    /// Whether to refuse duplicate UIDs.
+    pub require_unique_uids: bool,
+    /// Expected schema header.
+    pub header: PhenotypeSchemaHeader,
+    /// Injected fault mode for testing agreement gate failure.
+    pub fault: SpeciesAdapterFault,
+}
+
+impl Default for SpeciesPhenotypeAdapterConfig {
+    fn default() -> Self {
+        Self {
+            min_lifetime_observations: 1,
+            require_unique_uids: true,
+            header: PhenotypeSchemaHeader::default(),
+            fault: SpeciesAdapterFault::None,
+        }
+    }
+}
+
+/// Validates and adapts typed phenotype inputs into deterministic, order-invariant clustering samples.
+pub fn adapt_phenotype_samples(
+    inputs: &[TypedPhenotypeInput],
+    config: &SpeciesPhenotypeAdapterConfig,
+) -> Result<Vec<(AgentUid, Vec<f32>)>, SpeciesAdapterError> {
+    if config.fault == SpeciesAdapterFault::SchemaIdDrift {
+        return Err(SpeciesAdapterError::SchemaMismatch {
+            expected: PHENOTYPE_FEATURE_SCHEMA_ID_V1.to_string(),
+            found: "fault.injected.schema.drift".to_string(),
+        });
+    }
+    if config.fault == SpeciesAdapterFault::SchemaVersionDrift {
+        return Err(SpeciesAdapterError::SchemaVersionMismatch {
+            expected: PHENOTYPE_FEATURE_SCHEMA_VERSION_V1,
+            found: 999,
+        });
+    }
+
+    if config.header.schema_id != PHENOTYPE_FEATURE_SCHEMA_ID_V1 {
+        return Err(SpeciesAdapterError::SchemaMismatch {
+            expected: PHENOTYPE_FEATURE_SCHEMA_ID_V1.to_string(),
+            found: config.header.schema_id.clone(),
+        });
+    }
+    if config.header.schema_version != PHENOTYPE_FEATURE_SCHEMA_VERSION_V1 {
+        return Err(SpeciesAdapterError::SchemaVersionMismatch {
+            expected: PHENOTYPE_FEATURE_SCHEMA_VERSION_V1,
+            found: config.header.schema_version,
+        });
+    }
+
+    let mut seen_uids = BTreeSet::new();
+    let mut out = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        if input.agent_uid.0 == 0 {
+            return Err(SpeciesAdapterError::InvalidUid(input.agent_uid));
+        }
+        if config.require_unique_uids && !seen_uids.insert(input.agent_uid) {
+            return Err(SpeciesAdapterError::DuplicateUid(input.agent_uid));
+        }
+        if input.lifetime_observations < config.min_lifetime_observations {
+            return Err(SpeciesAdapterError::InsufficientLifetimeCoverage {
+                uid: input.agent_uid,
+                observed: input.lifetime_observations,
+                required: config.min_lifetime_observations,
+            });
+        }
+
+        let mut features = input.features;
+        if config.fault == SpeciesAdapterFault::InjectNonFinite {
+            features[0] = f32::NAN;
+        } else if config.fault == SpeciesAdapterFault::PerturbFeatures {
+            features[0] += 0.5;
+        }
+
+        for (i, &val) in features.iter().enumerate() {
+            if !val.is_finite() {
+                return Err(SpeciesAdapterError::NonFiniteValue {
+                    uid: input.agent_uid,
+                    axis: i,
+                    axis_name: PHENOTYPE_CANONICAL_AXES[i].0,
+                    value: val,
+                });
+            }
+        }
+        out.push((input.agent_uid, features.to_vec()));
+    }
+
+    // Sort deterministically by AgentUid to guarantee input order invariance
+    out.sort_by_key(|(uid, _)| *uid);
+    Ok(out)
+}
+
+/// Configurable execution cadence for live species segmentation (bd-16g.3.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeciesCadence {
+    /// Interval in ticks between segmentation executions. 0 disables segmentation.
+    pub interval: u32,
+}
+
+impl Default for SpeciesCadence {
+    fn default() -> Self {
+        Self { interval: 100 }
+    }
+}
+
+impl SpeciesCadence {
+    /// Creates a cadence with the given interval.
+    #[must_use]
+    pub const fn new(interval: u32) -> Self {
+        Self { interval }
+    }
+
+    /// Returns whether species segmentation should execute at `tick`.
+    #[must_use]
+    pub const fn should_segment(self, tick: Tick) -> bool {
+        self.interval > 0 && tick.0 > 0 && tick.0.is_multiple_of(self.interval as u64)
+    }
+}
+
+/// Immutable, published snapshot of active species state and recent segmentation report (bd-16g.3.6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeciesSnapshot {
+    /// Tick at which segmentation occurred.
+    pub tick: Tick,
+    /// Active species table at this tick.
+    pub table: SpeciesTable,
+    /// Segmentation report detailing minted and extinct species.
+    pub report: SegmentReport,
+    /// Canonical digest of the table.
+    pub table_digest: String,
+    /// Canonical digest of the report.
+    pub report_digest: String,
+    /// Canonical digest of the species params used.
+    pub params_digest: String,
+    /// Cadence interval.
+    pub cadence_interval: u32,
+}
+
+/// Thread-safe provider for the latest immutable species snapshot (bd-16g.3.6).
+#[derive(Debug, Clone, Default)]
+pub struct SpeciesSnapshotProvider {
+    inner: Arc<RwLock<Option<SpeciesSnapshot>>>,
+}
+
+impl SpeciesSnapshotProvider {
+    /// Creates an empty snapshot provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Publishes a new immutable snapshot.
+    pub fn publish(&self, snapshot: SpeciesSnapshot) {
+        if let Ok(mut guard) = self.inner.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    /// Reads the latest published snapshot, if any.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<SpeciesSnapshot> {
+        self.inner.read().ok().and_then(|guard| guard.clone())
+    }
+}
+
+/// Step result returned from [`step_species_cadence`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpeciesCadenceStepResult {
+    /// Off-cadence tick; no segmentation was performed. Zero allocations and zero mutations.
+    OffCadence,
+    /// Segmentation executed successfully at this cadence boundary.
+    Segmented {
+        /// Snapshot published to readers.
+        snapshot: SpeciesSnapshot,
+        /// Number of agents segmented.
+        agent_count: usize,
+        /// Number of active species.
+        active_species_count: usize,
+        /// Number of newly minted species.
+        minted_count: usize,
+        /// Number of extinct species dropped.
+        extinct_count: usize,
+    },
+    /// Refused by the typed adapter due to invalid inputs.
+    Refused(SpeciesAdapterError),
+}
+
+/// Executes a species cadence step on immutable completed-tick state (bd-16g.3.6).
+///
+/// If `cadence.should_segment(tick)` is false, immediately returns [`SpeciesCadenceStepResult::OffCadence`]
+/// without allocating, without calling RNG, and without mutating any scientific state.
+pub fn step_species_cadence(
+    tick: Tick,
+    cadence: SpeciesCadence,
+    params: &SpeciesParams,
+    adapter_config: &SpeciesPhenotypeAdapterConfig,
+    inputs: &[TypedPhenotypeInput],
+    previous_table: &SpeciesTable,
+    publisher: Option<&SpeciesSnapshotProvider>,
+) -> SpeciesCadenceStepResult {
+    if !cadence.should_segment(tick) {
+        return SpeciesCadenceStepResult::OffCadence;
+    }
+
+    let samples = match adapt_phenotype_samples(inputs, adapter_config) {
+        Ok(s) => s,
+        Err(err) => {
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            tracing::warn!(
+                tick = tick.0,
+                error = ?err,
+                "species phenotype adapter refused input samples"
+            );
+            return SpeciesCadenceStepResult::Refused(err);
+        }
+    };
+
+    let (new_table, report) = segment_species(tick, &samples, previous_table, params);
+    let table_digest = new_table.canonical_digest();
+    let report_digest = report.canonical_digest();
+    let params_digest = params.canonical_digest();
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    tracing::info!(
+        tick = tick.0,
+        phenotype_schema = PHENOTYPE_FEATURE_SCHEMA_ID_V1,
+        schema_version = PHENOTYPE_FEATURE_SCHEMA_VERSION_V1,
+        schema_digest = ?adapter_config.header.schema_digest,
+        input_count = inputs.len(),
+        accepted_count = samples.len(),
+        params_digest = %params_digest,
+        table_digest = %table_digest,
+        species_count = new_table.species.len(),
+        minted_count = report.new_species_minted.len(),
+        extinct_count = report.extinct_species_dropped.len(),
+        cadence_interval = cadence.interval,
+        "species segmentation cadence completed"
+    );
+
+    let snapshot = SpeciesSnapshot {
+        tick,
+        table: new_table,
+        report: report.clone(),
+        table_digest,
+        report_digest,
+        params_digest,
+        cadence_interval: cadence.interval,
+    };
+
+    if let Some(publ) = publisher {
+        publ.publish(snapshot.clone());
+    }
+
+    SpeciesCadenceStepResult::Segmented {
+        snapshot,
+        agent_count: samples.len(),
+        active_species_count: report.active_species_count,
+        minted_count: report.new_species_minted.len(),
+        extinct_count: report.extinct_species_dropped.len(),
+    }
+}
+
+/// Reconstructs a species table and report offline from persisted/recorded samples,
+/// verifying that the resulting canonical table digest matches the live digest.
+#[must_use]
+pub fn reconstruct_species_table_offline(
+    tick: Tick,
+    samples: &[(AgentUid, Vec<f32>)],
+    previous_table: &SpeciesTable,
+    params: &SpeciesParams,
+) -> (SpeciesTable, SegmentReport, String) {
+    let (table, report) = segment_species(tick, samples, previous_table, params);
+    let digest = table.canonical_digest();
+    (table, report, digest)
 }
 
 #[cfg(test)]
@@ -2456,5 +3004,347 @@ mod tests {
             "only the live species may be retained"
         );
         assert_eq!(watch.pending_count(), 0);
+    }
+
+    // ========================================================================
+    // bd-16g.3.6 Tests: Typed Phenotype Adapter and Live Cadence
+    // ========================================================================
+
+    #[test]
+    fn test_bd_16g_3_6_canonical_axes_and_units() {
+        assert_eq!(PHENOTYPE_AXIS_COUNT_V1, 6);
+        assert_eq!(PHENOTYPE_CANONICAL_AXES.len(), 6);
+        assert_eq!(
+            PHENOTYPE_CANONICAL_AXES[0],
+            ("movement.speed.mean", "world_unit_per_tick")
+        );
+        assert_eq!(
+            PHENOTYPE_CANONICAL_AXES[1],
+            ("diet.herbivore_trait.mean", "ratio")
+        );
+        assert_eq!(
+            PHENOTYPE_CANONICAL_AXES[2],
+            ("sensing.trait_modifier.mean", "trait_multiplier")
+        );
+        assert_eq!(
+            PHENOTYPE_CANONICAL_AXES[3],
+            ("interaction.combat.actor_rate", "event_per_tick")
+        );
+        assert_eq!(
+            PHENOTYPE_CANONICAL_AXES[4],
+            ("interaction.share.actor_rate", "event_per_tick")
+        );
+        assert_eq!(
+            PHENOTYPE_CANONICAL_AXES[5],
+            ("lineage.offspring.parent_rate", "edge_per_tick")
+        );
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_adapter_rejects_schema_and_version_mismatch() {
+        let mut config = SpeciesPhenotypeAdapterConfig::default();
+        config.header.schema_id = "wrong.schema".to_string();
+        let inputs = vec![TypedPhenotypeInput::new(
+            AgentUid(1),
+            5,
+            [1.0, 0.5, 1.0, 0.0, 0.0, 0.1],
+        )];
+
+        let err = adapt_phenotype_samples(&inputs, &config).unwrap_err();
+        assert!(matches!(err, SpeciesAdapterError::SchemaMismatch { .. }));
+
+        let mut config_v = SpeciesPhenotypeAdapterConfig::default();
+        config_v.header.schema_version = 999;
+        let err_v = adapt_phenotype_samples(&inputs, &config_v).unwrap_err();
+        assert!(matches!(
+            err_v,
+            SpeciesAdapterError::SchemaVersionMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_adapter_rejects_invalid_and_duplicate_uid() {
+        let config = SpeciesPhenotypeAdapterConfig::default();
+
+        let zero_uid = vec![TypedPhenotypeInput::new(
+            AgentUid(0),
+            5,
+            [1.0, 0.5, 1.0, 0.0, 0.0, 0.1],
+        )];
+        let err_zero = adapt_phenotype_samples(&zero_uid, &config).unwrap_err();
+        assert!(matches!(
+            err_zero,
+            SpeciesAdapterError::InvalidUid(AgentUid(0))
+        ));
+
+        let duplicate_uids = vec![
+            TypedPhenotypeInput::new(AgentUid(1), 5, [1.0, 0.5, 1.0, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(1), 5, [2.0, 0.2, 1.0, 0.0, 0.0, 0.1]),
+        ];
+        let err_dup = adapt_phenotype_samples(&duplicate_uids, &config).unwrap_err();
+        assert!(matches!(
+            err_dup,
+            SpeciesAdapterError::DuplicateUid(AgentUid(1))
+        ));
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_adapter_rejects_nonfinite_values_all_axes() {
+        let config = SpeciesPhenotypeAdapterConfig::default();
+
+        for axis in 0..PHENOTYPE_AXIS_COUNT_V1 {
+            let mut nan_features = [1.0; PHENOTYPE_AXIS_COUNT_V1];
+            nan_features[axis] = f32::NAN;
+            let inputs = vec![TypedPhenotypeInput::new(AgentUid(1), 5, nan_features)];
+            let err = adapt_phenotype_samples(&inputs, &config).unwrap_err();
+            assert!(
+                matches!(err, SpeciesAdapterError::NonFiniteValue { axis: a, .. } if a == axis),
+                "axis {axis} NaN must produce NonFiniteValue"
+            );
+
+            let mut inf_features = [1.0; PHENOTYPE_AXIS_COUNT_V1];
+            inf_features[axis] = f32::INFINITY;
+            let inputs_inf = vec![TypedPhenotypeInput::new(AgentUid(1), 5, inf_features)];
+            let err_inf = adapt_phenotype_samples(&inputs_inf, &config).unwrap_err();
+            assert!(
+                matches!(err_inf, SpeciesAdapterError::NonFiniteValue { axis: a, .. } if a == axis),
+                "axis {axis} Infinity must produce NonFiniteValue"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_adapter_rejects_insufficient_lifetime_coverage() {
+        let mut config = SpeciesPhenotypeAdapterConfig::default();
+        config.min_lifetime_observations = 10;
+
+        let inputs = vec![TypedPhenotypeInput::new(
+            AgentUid(1),
+            3,
+            [1.0, 0.5, 1.0, 0.0, 0.0, 0.1],
+        )];
+        let err = adapt_phenotype_samples(&inputs, &config).unwrap_err();
+        assert!(matches!(
+            err,
+            SpeciesAdapterError::InsufficientLifetimeCoverage {
+                observed: 3,
+                required: 10,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_empty_singleton_and_two_clusters() {
+        let config = SpeciesPhenotypeAdapterConfig::default();
+        let params = SpeciesParams::default();
+        let prev = SpeciesTable::default();
+
+        // Empty
+        let empty_samples = adapt_phenotype_samples(&[], &config).unwrap();
+        assert!(empty_samples.is_empty());
+        let (empty_table, empty_rep) = segment_species(Tick(10), &empty_samples, &prev, &params);
+        assert_eq!(empty_table.species.len(), 0);
+        assert_eq!(empty_rep.total_agents_segmented, 0);
+
+        // Singleton
+        let singleton_inputs = vec![TypedPhenotypeInput::new(
+            AgentUid(1),
+            5,
+            [1.0, 0.5, 1.0, 0.0, 0.0, 0.1],
+        )];
+        let single_samples = adapt_phenotype_samples(&singleton_inputs, &config).unwrap();
+        let (single_table, single_rep) = segment_species(Tick(10), &single_samples, &prev, &params);
+        assert_eq!(single_table.species.len(), 1);
+        assert_eq!(single_rep.total_agents_segmented, 1);
+
+        // Two distinct clusters
+        let two_cluster_inputs = vec![
+            TypedPhenotypeInput::new(AgentUid(1), 5, [0.1, 0.1, 0.1, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(2), 5, [0.12, 0.08, 0.11, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(3), 5, [0.9, 0.9, 0.9, 0.8, 0.0, 0.5]),
+            TypedPhenotypeInput::new(AgentUid(4), 5, [0.88, 0.91, 0.89, 0.82, 0.0, 0.52]),
+        ];
+        let two_cluster_samples = adapt_phenotype_samples(&two_cluster_inputs, &config).unwrap();
+        let (two_table, two_rep) = segment_species(Tick(10), &two_cluster_samples, &prev, &params);
+        assert_eq!(two_table.species.len(), 2);
+        assert_eq!(two_rep.total_agents_segmented, 4);
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_input_permutation_produces_identical_samples_and_digests() {
+        let config = SpeciesPhenotypeAdapterConfig::default();
+        let params = SpeciesParams::default();
+        let prev = SpeciesTable::default();
+
+        let inputs1 = vec![
+            TypedPhenotypeInput::new(AgentUid(1), 5, [0.1, 0.1, 0.1, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(2), 5, [0.12, 0.08, 0.11, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(3), 5, [0.9, 0.9, 0.9, 0.8, 0.0, 0.5]),
+            TypedPhenotypeInput::new(AgentUid(4), 5, [0.88, 0.91, 0.89, 0.82, 0.0, 0.52]),
+        ];
+
+        let inputs2 = vec![
+            TypedPhenotypeInput::new(AgentUid(3), 5, [0.9, 0.9, 0.9, 0.8, 0.0, 0.5]),
+            TypedPhenotypeInput::new(AgentUid(1), 5, [0.1, 0.1, 0.1, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(4), 5, [0.88, 0.91, 0.89, 0.82, 0.0, 0.52]),
+            TypedPhenotypeInput::new(AgentUid(2), 5, [0.12, 0.08, 0.11, 0.0, 0.0, 0.1]),
+        ];
+
+        let samples1 = adapt_phenotype_samples(&inputs1, &config).unwrap();
+        let samples2 = adapt_phenotype_samples(&inputs2, &config).unwrap();
+        assert_eq!(samples1, samples2, "adapted samples must be sorted by UID");
+
+        let (table1, rep1) = segment_species(Tick(10), &samples1, &prev, &params);
+        let (table2, rep2) = segment_species(Tick(10), &samples2, &prev, &params);
+        assert_eq!(table1.canonical_digest(), table2.canonical_digest());
+        assert_eq!(rep1.canonical_digest(), rep2.canonical_digest());
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_cadence_boundaries_and_off_cadence_inertness() {
+        let cadence = SpeciesCadence::new(50);
+        assert!(!cadence.should_segment(Tick(0)));
+        assert!(!cadence.should_segment(Tick(1)));
+        assert!(!cadence.should_segment(Tick(49)));
+        assert!(cadence.should_segment(Tick(50)));
+        assert!(!cadence.should_segment(Tick(51)));
+        assert!(cadence.should_segment(Tick(100)));
+
+        let params = SpeciesParams::default();
+        let config = SpeciesPhenotypeAdapterConfig::default();
+        let prev = SpeciesTable::default();
+        let publisher = SpeciesSnapshotProvider::new();
+
+        let inputs = vec![TypedPhenotypeInput::new(
+            AgentUid(1),
+            5,
+            [0.5, 0.5, 0.5, 0.0, 0.0, 0.1],
+        )];
+
+        // Off-cadence tick: no work, returns OffCadence, publisher remains None
+        let off_result = step_species_cadence(
+            Tick(25),
+            cadence,
+            &params,
+            &config,
+            &inputs,
+            &prev,
+            Some(&publisher),
+        );
+        assert_eq!(off_result, SpeciesCadenceStepResult::OffCadence);
+        assert!(publisher.snapshot().is_none());
+
+        // Cadence boundary: executes segmentation, publishes snapshot
+        let on_result = step_species_cadence(
+            Tick(50),
+            cadence,
+            &params,
+            &config,
+            &inputs,
+            &prev,
+            Some(&publisher),
+        );
+        assert!(matches!(
+            on_result,
+            SpeciesCadenceStepResult::Segmented { .. }
+        ));
+        let snap = publisher.snapshot().expect("snapshot must be published");
+        assert_eq!(snap.tick, Tick(50));
+        assert_eq!(snap.table.species.len(), 1);
+        assert_eq!(snap.cadence_interval, 50);
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_fault_injection_causes_agreement_failure() {
+        let params = SpeciesParams::default();
+        let prev = SpeciesTable::default();
+
+        let inputs = vec![
+            TypedPhenotypeInput::new(AgentUid(1), 5, [0.1, 0.1, 0.1, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(2), 5, [0.9, 0.9, 0.9, 0.8, 0.0, 0.5]),
+        ];
+
+        // Clean run
+        let clean_config = SpeciesPhenotypeAdapterConfig::default();
+        let clean_samples = adapt_phenotype_samples(&inputs, &clean_config).unwrap();
+        let (clean_table, _, clean_digest) =
+            reconstruct_species_table_offline(Tick(100), &clean_samples, &prev, &params);
+
+        // Fault injected: PerturbFeatures
+        let mut fault_config = SpeciesPhenotypeAdapterConfig::default();
+        fault_config.fault = SpeciesAdapterFault::PerturbFeatures;
+        let fault_samples = adapt_phenotype_samples(&inputs, &fault_config).unwrap();
+        let (fault_table, _, fault_digest) =
+            reconstruct_species_table_offline(Tick(100), &fault_samples, &prev, &params);
+
+        assert_ne!(
+            clean_digest, fault_digest,
+            "perturbed features must diverge canonical table digest"
+        );
+        assert_ne!(
+            clean_table.species[0].centroid,
+            fault_table.species[0].centroid
+        );
+
+        // Fault injected: SchemaIdDrift
+        let mut drift_config = SpeciesPhenotypeAdapterConfig::default();
+        drift_config.fault = SpeciesAdapterFault::SchemaIdDrift;
+        let err_drift = adapt_phenotype_samples(&inputs, &drift_config).unwrap_err();
+        assert!(matches!(
+            err_drift,
+            SpeciesAdapterError::SchemaMismatch { .. }
+        ));
+
+        // Fault injected: InjectNonFinite
+        let mut nan_config = SpeciesPhenotypeAdapterConfig::default();
+        nan_config.fault = SpeciesAdapterFault::InjectNonFinite;
+        let err_nan = adapt_phenotype_samples(&inputs, &nan_config).unwrap_err();
+        assert!(matches!(
+            err_nan,
+            SpeciesAdapterError::NonFiniteValue { .. }
+        ));
+    }
+
+    #[test]
+    fn test_bd_16g_3_6_offline_reconstruction_byte_identical() {
+        let params = SpeciesParams::default();
+        let prev = SpeciesTable::default();
+        let config = SpeciesPhenotypeAdapterConfig::default();
+        let cadence = SpeciesCadence::new(10);
+        let publisher = SpeciesSnapshotProvider::new();
+
+        let inputs = vec![
+            TypedPhenotypeInput::new(AgentUid(1), 5, [0.1, 0.1, 0.1, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(2), 5, [0.12, 0.08, 0.11, 0.0, 0.0, 0.1]),
+            TypedPhenotypeInput::new(AgentUid(3), 5, [0.9, 0.9, 0.9, 0.8, 0.0, 0.5]),
+            TypedPhenotypeInput::new(AgentUid(4), 5, [0.88, 0.91, 0.89, 0.82, 0.0, 0.52]),
+        ];
+
+        let result = step_species_cadence(
+            Tick(10),
+            cadence,
+            &params,
+            &config,
+            &inputs,
+            &prev,
+            Some(&publisher),
+        );
+
+        let live_snap = match result {
+            SpeciesCadenceStepResult::Segmented { snapshot, .. } => snapshot,
+            other => panic!("expected segmented result, got {other:?}"),
+        };
+
+        // Offline reconstruction using adapted samples
+        let adapted = adapt_phenotype_samples(&inputs, &config).unwrap();
+        let (offline_table, offline_report, offline_digest) =
+            reconstruct_species_table_offline(Tick(10), &adapted, &prev, &params);
+
+        assert_eq!(live_snap.table, offline_table);
+        assert_eq!(live_snap.report, offline_report);
+        assert_eq!(live_snap.table_digest, offline_digest);
+        assert_eq!(live_snap.table_digest, offline_table.canonical_digest());
+        assert_eq!(live_snap.report_digest, offline_report.canonical_digest());
     }
 }
