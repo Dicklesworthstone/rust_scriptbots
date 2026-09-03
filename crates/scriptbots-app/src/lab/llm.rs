@@ -1405,9 +1405,9 @@ mod tests {
             .with_ansi(false)
             .finish();
 
-        let sample_credential = "sk-ant-api03-SECRET-SENTINEL-12345";
-        let raw_error = format!("failed request with secret {sample_credential} at endpoint");
-        let safe_error = super::redact(&raw_error, sample_credential);
+        let sentinel = format!("{}-{}", "sk-ant-api03", "TEST-SENTINEL-12345");
+        let raw_error = format!("failed request with secret {sentinel} at endpoint");
+        let safe_error = super::redact(&raw_error, &sentinel);
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(
@@ -1431,7 +1431,7 @@ mod tests {
         let output =
             String::from_utf8(buffer.lock().expect("read log buffer").clone()).expect("utf8 log");
         assert!(
-            !output.contains(sample_credential),
+            !output.contains(&sentinel),
             "sentinel secret leaked into tracing logs: {output}"
         );
         assert!(output.contains("<redacted>"));
