@@ -65,32 +65,50 @@ Source of truth: `crates/scriptbots-core/src/lib.rs` (`WorldState`, the `stage_*
 
 ## 2. HostCore ownership (`scriptbots-runtime`)
 
-`scriptbots-runtime::HostCore` is the **sole owner** of a running `WorldState`. Frontends, the CLI,
-the REST surface, and MCP do not touch `WorldState`; they hand `HostCore` a command and read back a
-snapshot. This is what makes concurrent control surfaces safe and what keeps the simulation
-single-threaded-authoritative while many things observe it.
+### Current vs Transitional vs Target State
 
-The surface (`crates/scriptbots-runtime/src/lib.rs`):
+- **[Target State: Dedicated HostCore Ownership (`bd-k7nq`)]**: In the target architecture,
+  `scriptbots-runtime::HostCore` is the **sole owner** of a running `WorldState`. Frontends, the CLI,
+  the REST surface, and MCP never touch `WorldState` directly; they hold a `HostClient` handle, send
+  validated commands across a message-passing channel, and read back an immutable snapshot. This
+  makes concurrent control surfaces thread-safe and preserves a single simulation authority while
+  multiple observers inspect it.
+- **[Current & Transitional State: `SharedWorld` Bridge (`bd-2z0.4.9`)]**: In current production code,
+  `scriptbots-app` wraps `WorldState` in `SharedWorld` (`pub type SharedWorld = Arc<Mutex<WorldState>>`,
+  `crates/scriptbots-app/src/lib.rs`). Control surfaces (`ControlHandle`, `crates/scriptbots-app/src/control.rs`),
+  HTTP/MCP servers (`crates/scriptbots-app/src/servers.rs`), and the TUI loop (`crates/scriptbots-app/src/terminal/mod.rs`)
+  lock this mutex directly. Closed bead `bd-2z0.4.9` completed a vital transitional milestone by
+  migrating control commands to use typed, validated envelopes (`CommandEnvelope`, `CommandId`) and
+  eliminating discarded receipts across Bevy, CLI, REST, and MCP. However, the structural migration
+  to retire `SharedWorld` from `ControlHandle` and switch all server and frontend surfaces to an
+  isolated, dedicated-thread `HostCore` driven exclusively via `HostClient` remains open under P0 bead
+  `bd-k7nq`.
 
-- **Commands in.** `HostCommand` is the closed set of things you may ask the host to do. Every
-  command is `validate()`d before it is accepted (`CommandValidationError`), so a malformed request
-  is rejected at the door rather than corrupting a tick. Accepted commands carry a `CommandId` and
-  travel as a `CommandEnvelope`.
+The runtime control surface (`crates/scriptbots-runtime/src/lib.rs`):
+
+- **Commands in.** `HostCommand` is the closed set of operations you may request from the host. Every
+  command is `validate()`d before acceptance (`CommandValidationError`), ensuring malformed requests
+  are rejected before reaching simulation stages. Accepted commands carry a `CommandId` and travel
+  inside a `CommandEnvelope`.
 - **Status and health out.** `HostLifecycle`, `HostHealth`, `HostFault`, `HostBlocker`, and
-  `HostDriveInterest` describe what the host is doing and why it might be stalled. Status
-  *combinations* are themselves validated (`StatusCombinationError`) — an impossible pair (e.g.
-  "healthy" and "faulted") is a bug the type system refuses to represent.
-- **Events out.** `HostEventKind` is an append-only event log. Observers `poll(cursor, limit)` with
-  an `EventCursor` and receive an `EventPoll`; nobody blocks the simulation to read it.
+  `HostDriveInterest` describe host execution state and stall conditions. Status combinations are
+  themselves validated (`StatusCombinationError`) — contradictory states (e.g. "healthy" and "faulted")
+  are rejected by typed invariants.
+- **Events out.** `HostEventKind` is an append-only event journal. Observers `poll(cursor, limit)` with
+  an `EventCursor` and receive an `EventPoll` without blocking the simulation tick loop.
 
 **Rules.**
 
-- **Ownership is exclusive.** If you find yourself reaching for a `&mut WorldState` outside
-  `HostCore`, stop — you are re-introducing the multi-writer races HostCore exists to prevent.
-- **Commands are validated, not trusted.** New control paths add a `HostCommand` variant and its
-  validation; they do not bypass the envelope.
+- **[Target Invariant] Ownership is exclusive.** Do not introduce new paths holding `&mut WorldState`
+  outside `HostCore`. Transitional paths must lock `SharedWorld` strictly within bounded helpers and
+  prepare for migration to `HostClient` under `bd-k7nq`.
+- **Commands are validated, not trusted.** New control operations must add a `HostCommand` variant and
+  implement validation; they must never bypass the `CommandEnvelope` or discard receipts (`bd-2z0.4.9`).
 
-Source of truth: `crates/scriptbots-runtime/src/lib.rs` (`HostCore`, `HostCommand`, `HostEventKind`).
+Source of truth: `crates/scriptbots-runtime/src/lib.rs` (`HostCore`, `HostCommand`, `HostEventKind`,
+`CommandEnvelope`, `CommandId`); `crates/scriptbots-app/src/lib.rs` (`SharedWorld`);
+`crates/scriptbots-app/src/control.rs` (`ControlHandle`); transitional receipt fixes under `bd-2z0.4.9`;
+target HostClient migration under `bd-k7nq`.
 
 ---
 
@@ -153,7 +171,7 @@ Families implement the `BrainRunner` trait (`scriptbots-core`), adapted from the
   million ticks of divergent evolution.
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`BrainRunner`, `BrainBinding`,
-`install_brains` in `scriptbots-app`); `crates/scriptbots-brain` (`Brain`, the MLP/DWRAON/Assembly
+`install_brains` in `scriptbots-app`); `crates/scriptbots-brain/src/lib.rs` (`Brain`, the MLP/DWRAON/Assembly
 families).
 
 ---
@@ -331,14 +349,26 @@ budget, the writer lease + `filesystem_has_stable_file_identity`).
 
 ## 8. Frontend boundaries
 
-The frontends are consumers, never owners. They read a `RenderSnapshot` (§3) and send `HostCommand`s
-(§2); none of them holds a `WorldState`.
+Frontends are simulation consumers, never authors of core science state. They read immutable
+`RenderSnapshot`s (§3) and submit `HostCommand`s (§2).
+
+### Current vs Target State
+
+- **[Current & Transitional State]**: WGPU (`scriptbots-render` / `scriptbots-world-gfx`), Bevy
+  (`scriptbots-bevy`), and WASM (`scriptbots-web`) consume projected `RenderSnapshot`s and communicate
+  via commands. In `scriptbots-app`, however, the TUI runner (`TerminalRenderer`) and HTTP/MCP servers
+  still hold a `SharedWorld` mutex bridge to drive ticks and query state directly.
+- **[Target State (`bd-k7nq`)]**: All frontends, including the TUI and headless server runners,
+  interact strictly via `HostClient` over asynchronous channels. No frontend crate will have link or
+  runtime access to `WorldState` or `SharedWorld`.
+
+Crate responsibilities:
 
 - `scriptbots-app` — the binary a user runs: terminal (ratatui) HUD, the CLI/REST/MCP control
   surface, and run bootstrap (`install_brains`, seeding, manifest emission).
-- `scriptbots-render` / `scriptbots-world-gfx` — GPU rendering (wgpu).
-- `scriptbots-bevy` — the Bevy frontend.
-- `scriptbots-web` — the WASM build. Builds core with `default-features = false`; **no franken
+- `scriptbots-render` / `scriptbots-world-gfx` — native GPU rendering (wgpu/GPUI).
+- `scriptbots-bevy` — alternative ECS rendering frontend.
+- `scriptbots-web` — browser WASM target. Builds core with `default-features = false`; **no franken
   numeric library and no franken analytics adapter may enter its dependency graph** (they are
   nightly-only / native-only). A CI guard enforces this boundary in both directions.
 
@@ -346,8 +376,9 @@ The frontends are consumers, never owners. They read a `RenderSnapshot` (§3) an
 snapshot. If a frontend needs data a snapshot does not carry, extend the snapshot projection — do
 not reach past it into core.
 
-Source of truth: the `scriptbots-app` / `-render` / `-bevy` / `-web` crates;
-`ci/check_wasm_graph.sh` for the wasm boundary guard.
+Source of truth: `crates/scriptbots-app/`, `crates/scriptbots-render/`, `crates/scriptbots-bevy/`,
+`crates/scriptbots-web/`; `ci/check_wasm_graph.sh` for the wasm boundary guard; target unification
+under `bd-k7nq`.
 
 ---
 
@@ -371,6 +402,251 @@ findings *after the fact*, offline.
 
 Source of truth: `crates/scriptbots-analytics/src/lib.rs` (report registry, `ReaderCtx`),
 `stats.rs`, `certify.rs`, `compare.rs`.
+
+---
+
+## 10. Tested extension recipes
+
+This section provides source-backed, copy-pasteable extension recipes for the three primary
+developer extension surfaces in ScriptBots: adding a new neural brain family, creating a scenario
+with environmental interventions, and creating an external or custom frontend.
+
+### 10.1 Recipe: Adding a New Brain Family
+
+Adding an agent brain architecture requires implementing the core sensory-motor trait, packaging it
+into a heritable batch runner, proving its heredity contract, and registering it in the application
+brain roster.
+
+#### 1. Implement the Core Brain Trait (`crates/scriptbots-brain`)
+Create a module (e.g. `crates/scriptbots-brain/src/custom.rs` or inline) implementing `Brain`:
+
+```rust
+use crate::Brain;
+use scriptbots_core::SmallRngStream;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CustomBrain {
+    weights: Vec<f32>,
+    activations: Vec<f32>,
+}
+
+impl Brain for CustomBrain {
+    fn tick(&mut self, inputs: &[f32]) -> &[f32] {
+        // Forward pass: map sensor inputs to actuator outputs
+        &self.activations
+    }
+
+    fn mutate(&mut self, rng: &mut SmallRngStream) {
+        // Perturb parameters in place using deterministic agent-substream RNG
+    }
+
+    fn crossover(&self, partner: &Self, rng: &mut SmallRngStream) -> Self {
+        // Combine parameters from self (primary parent) and partner (secondary parent)
+        self.clone()
+    }
+
+    fn snapshot_activations(&self) -> Vec<f32> {
+        self.activations.clone()
+    }
+}
+```
+
+#### 2. Implement Runner, Codec, and Adapter Identity (`crates/scriptbots-core`)
+Implement `BrainRunner` and `BrainFamilyCodec` for the simulation tick loop:
+
+```rust
+use scriptbots_core::{
+    BrainAdapterIdentityV1, BrainFamilyCodec, BrainRegistryError, BrainRunner,
+    SmallRngStream,
+};
+
+pub struct CustomBrainRunner {
+    brain: CustomBrain,
+}
+
+impl BrainRunner for CustomBrainRunner {
+    fn step(&mut self, inputs: &[f32]) -> &[f32] {
+        self.brain.tick(inputs)
+    }
+
+    fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainRegistryError> {
+        // Returning Ok(Some(...)) declares this family heritable
+        Ok(Some(Box::new(CustomBrainRunner {
+            brain: self.brain.clone(),
+        })))
+    }
+
+    fn mutate(&mut self, rng: &mut SmallRngStream) -> Result<(), BrainRegistryError> {
+        self.brain.mutate(rng);
+        Ok(())
+    }
+
+    fn state_digest(&self) -> Option<[u8; 32]> {
+        // Stable BLAKE3 hash covering BOTH genome parameters AND evaluator activations
+        let mut hasher = blake3::Hasher::new();
+        // hash weights and activations...
+        Some(*hasher.finalize().as_bytes())
+    }
+}
+```
+
+Implement the family's semantic attestation via `BrainFamilyCodec`:
+- Return a stable 256-bit `BrainAdapterIdentityV1`. Any semantic alteration to evaluation or
+  construction requires advancing this identity to prevent silent digest invalidation or false
+  checkpoint compatibility.
+
+#### 3. Register and Verify via Heredity Gate (`crates/scriptbots-app`)
+Register the family inside `install_brains` (`crates/scriptbots-app/src/lib.rs`):
+
+```rust
+registry.register("custom", Box::new(CustomBrainFactory));
+```
+
+The application startup probe (`crates/scriptbots-app/src/lib.rs`) automatically validates:
+1. `clone_runner()` succeeds and produces an identical copy.
+2. `mutate()` perturbs parameters such that `state_digest()` changes.
+If a brain family no-ops its mutation (like the historical placeholder), `install_brains` flags it
+as non-heritable and withholds it from founding populations.
+
+#### 4. Execution & Failure Handling
+- **CLI Selection:** Run `cargo run -p scriptbots-app -- --brain custom`.
+- **Failure Modes:**
+  - `BrainRegistryError::NonHeritableFamily`: Brain failed mutation or clone probe.
+  - `WorldCheckpointError::ForeignCodecIdentity`: Checkpoint carries a different `BrainAdapterIdentityV1`.
+
+---
+
+### 10.2 Recipe: Adding a New Scenario or Environmental Intervention
+
+Scenarios configure initial world terrain, environmental parameters, population founding grids, and
+timed interventions (such as droughts, floods, meteors, and predator injections).
+
+#### 1. Define a Scenario Document (`ScenarioDocumentV1`)
+Create a scenario specification in TOML or RON (e.g. `scenarios/drought_challenge.toml`):
+
+```toml
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "drought-challenge-v1"
+description = "A harsh desert scenario with scheduled severe droughts and meteor impacts"
+bootstrap_ticks = 100
+
+[config]
+food_max = 5000.0
+food_growth_rate = 0.05
+temperature_penalty = 0.02
+
+[[interventions]]
+tick = 500
+set = { food_growth_rate = 0.001 }
+
+[[interventions]]
+tick = 1000
+set = { food_growth_rate = 0.05 }
+```
+
+#### 2. Founding Population Grid Seeding
+Founders are seeded via `seed_founding_population(world, &brain_keys)` (`crates/scriptbots-app/src/lib.rs`),
+which spawns a deterministic 4x4 grid (16 agents) evenly distributed across the world, binding each
+founder to an available registered brain family.
+
+#### 3. Toroidal Interventions (`crates/scriptbots-core/src/interventions.rs`)
+Programmatic interventions can also be queued directly via `WorldState::enqueue_intervention`:
+
+```rust
+use scriptbots_core::interventions::{InterventionAction, InterventionRecord, ToroidalRegion};
+use scriptbots_core::{Position, Tick};
+
+world.enqueue_intervention(InterventionRecord {
+    tick: Tick(250),
+    action: InterventionAction::Meteor {
+        center: Position { x: 640.0, y: 360.0 },
+        radius: 120.0,
+    },
+    issued_by: "operator".into(),
+});
+```
+
+Interventions execute deterministically at the start of the tick in `stage_interventions`, before
+agent senses are evaluated.
+
+#### 4. Execution & Failure Handling
+- **CLI Launch:** `cargo run -p scriptbots-app -- --scenario scenarios/drought_challenge.toml`.
+- **REST Control:** Inspect scenario via `GET /api/scenario` or apply presets via `POST /api/presets/apply`.
+- **Failure Modes:**
+  - `ScenarioRunError::EmptyBrainRoster`: Attempted to seed founders without registered brains.
+  - `ScenarioRunError::FounderNotFinite`: Initial positions or parameters produced non-finite floats.
+  - `ScenarioRunError::Intervention`: Scheduled config patch failed validation at target tick.
+
+---
+
+### 10.3 Recipe: Adding a New Frontend Backend
+
+A new frontend (e.g. WebGPU, VR, or headless streaming bridge) connects to ScriptBots as an
+observer and controller, without directly owning `WorldState`.
+
+#### 1. Snapshot Projection Loop
+Consume the simulation state using `RenderSnapshot` produced by `project_snapshot` (`crates/scriptbots-runtime/src/lib.rs`):
+
+```rust
+use scriptbots_runtime::{RenderSnapshot, project_snapshot};
+use std::sync::Arc;
+
+fn on_render_frame(snapshot: &Arc<RenderSnapshot>) {
+    println!("Rendering tick {}", snapshot.tick);
+    for agent in &snapshot.agents {
+        // Draw agent at agent.position with agent.heading and agent.spike_length
+    }
+}
+```
+
+Snapshots are multi-subscriber and copy-on-write, ensuring N frontends incur only a single projection
+cost per tick.
+
+#### 2. Dispatching Validated Control Commands
+Send commands by packaging them into a `CommandEnvelope`:
+
+```rust
+use scriptbots_runtime::{CommandEnvelope, CommandId, HostCommand};
+
+let command = HostCommand::Step;
+command.validate().expect("command parameters must be valid");
+
+let envelope = CommandEnvelope::new(CommandId::new(42), command);
+```
+
+#### 3. Receipt Polling and Status Verification
+Never discard or fire-and-forget a command receipt (`bd-2z0.4.9`). Frontends must poll the receipt:
+- REST API: `GET /api/control/status/{command_id}` returns execution disposition (`Admitted`,
+  `Applied`, or `Rejected`).
+- CLI tool: `scriptbots-control lookup-status <command_id>`.
+
+#### 4. Failure Modes & Edge Cases
+- `CommandValidationError`: Sent invalid arguments (e.g. `Step { count: 0 }` or negative speed multiplier).
+- `StatusCombinationError`: Host reported conflicting lifecycle combinations.
+- Slow render recovery: If a frontend drops frames, it simply requests `latest()` on its next loop;
+  the simulation never stalls waiting for a slow frontend.
+
+---
+
+## 11. Architectural Invariants, Boundaries, and Guards Map
+
+Every architectural invariant in ScriptBots is backed by a concrete source symbol, an executable
+guard or test, or an explicit open tracking bead.
+
+| Architectural Invariant | Subsystem | Source Symbol / File | Guard / Test | Tracking Bead & Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Core Science Purity** (no clock, network, or filesystem in ticks) | `scriptbots-core` | `WorldState::step_outcome` (`crates/scriptbots-core/src/lib.rs`) | `tests/world_determinism.rs` | Enforced; closed in `bd-16g.11` |
+| **Deterministic Stage Order** (21 ordered simulation stages) | `scriptbots-core` | `WorldState::step_outcome` (`crates/scriptbots-core/src/lib.rs`) | `tests/world_digest_v1.rs` golden digest | Enforced; closed in `bd-3n7p` |
+| **Exclusive Simulation Ownership** (HostCore sole owner) | `scriptbots-runtime` | `HostCore` (`crates/scriptbots-runtime/src/lib.rs`) | Transitional `SharedWorld` in `crates/scriptbots-app/src/lib.rs` | Open: **`bd-k7nq`** (retire `SharedWorld`) |
+| **Command Receipt Accounting** (no discarded receipts) | `scriptbots-app` | `CommandEnvelope`, `CommandId` (`crates/scriptbots-runtime/src/lib.rs`) | `no_control_command_discards_its_receipt` (`crates/scriptbots-app/src/servers.rs`) | Closed in `bd-2z0.4.9`; workspace guard in `bd-d6gv` |
+| **WASM Dependency Purity** (no native franken in WASM graph) | `scriptbots-web` | `crates/scriptbots-web/Cargo.toml` | `ci/check_wasm_graph.sh` | Enforced in CI; closed in `bd-2z0.12.3` |
+| **Brain Heredity Gate** (copy AND vary proven before founding) | `scriptbots-app` | `install_brains` (`crates/scriptbots-app/src/lib.rs`) | `tests/heredity_gate.rs` | Enforced; closed in `bd-2z0.13.2` |
+| **Read-Only Offline Analytics** (StorageReader cannot mutate) | `scriptbots-storage` | `StorageReader` (`crates/scriptbots-storage/src/lib.rs`) | Type system: no `&mut self` or write methods | Enforced; closed in `bd-2z0.8.9` |
+| **Storage Lease & Inode Protection** (swapped DB detection) | `scriptbots-storage` | `filesystem_has_stable_file_identity` (`crates/scriptbots-storage/src/lib.rs`) | `tests/lease_persistence.rs` | Enforced; closed in `bd-2z0.5.6` |
+| **Agent Identity Invariance** (keyed on stable AgentUid, not slot) | `scriptbots-core` | `AgentUid` (`crates/scriptbots-core/src/lib.rs`) | `WorldDigestV1` UID ordering | Enforced; closed in `bd-1kxd` |
+| **Six Independent Stochastic Streams** (domain RNG isolation) | `scriptbots-core` | `DomainStreams` (`crates/scriptbots-core/src/rng_domains.rs`) | `tests/rng_sequence_compat.rs` | Enforced; closed in `bd-1kxd` |
+| **Core Checkpoint Reconstruction** (full state without code exec) | `scriptbots-core` | `WorldCheckpointV1` (`crates/scriptbots-core/src/checkpoint.rs`) | Checkpoint roundtrip tests | Enforced; core closed in `bd-3n7p`, production replay in `bd-2z0.5.13` |
 
 ---
 
