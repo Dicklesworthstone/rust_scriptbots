@@ -20,6 +20,11 @@ pub use export_pipeline::{
     LineageExportRow, MetricExportRow, RunExportRow, export_storage_table, verify_export_receipt,
 };
 
+pub use scriptbots_core::genome_diff::{
+    Locus, LocusSample, LocusValue, export_locus_trace_csv, export_locus_trace_png,
+    export_locus_trace_svg,
+};
+
 pub use journal::{
     CommandJournalCursor, CommandJournalEvidence, CommandJournalPage, CommandJournalRecord,
     CommandStorageTransition, CommandStorageTransitionKind, DomainEventCursor, DomainEventEvidence,
@@ -45,8 +50,8 @@ use journal::{
     encode_host_command_postcard_hex, encode_journal_u64, prepare_host_journal_archive,
 };
 use scriptbots_core::{
-    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainGenomeEnvelope,
-    DeathCause, DeathRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
+    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainFamilyCodec,
+    BrainGenomeEnvelope, DeathCause, DeathRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
     INTERACTION_EVENTS_PERSISTED_KIND, INTERACTION_EVENTS_SAMPLED_OUT_KIND,
     INTERACTION_EVENTS_TRUNCATED_KIND, PersistedGenome, PersistenceAdmissionError,
     PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase,
@@ -5495,6 +5500,16 @@ pub fn rebuild_ancestry(
     Ok(graph)
 }
 
+/// Trace a locus across an ordered lineage from a run database (bd-wdyu).
+pub fn trace_locus<C: BrainFamilyCodec>(
+    reader: &StorageReader,
+    codec: &C,
+    lineage: &[AgentUid],
+    locus: Locus,
+) -> Result<Vec<LocusSample>, StorageError> {
+    reader.trace_locus(codec, lineage, locus)
+}
+
 /// Replay event reconstructed from persisted storage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedReplayEvent {
@@ -10506,6 +10521,99 @@ impl StorageReader {
             "read genomes page"
         );
         Ok(results)
+    }
+
+    /// Trace a locus across an ordered sequence of lineage ancestor UIDs reading from persisted storage (bd-wdyu).
+    ///
+    /// Reads persisted genomes for each agent in `lineage`, determines each agent's generation and tick from
+    /// persisted birth records, extracts the locus value via the provided `codec`, and returns a strongly-typed
+    /// series of `LocusSample`s. If an agent has no genome or if the locus is absent in that schema, an explicit
+    /// gap (`None`, never phantom 0.0) is recorded.
+    pub fn trace_locus<C: BrainFamilyCodec>(
+        &self,
+        codec: &C,
+        lineage: &[AgentUid],
+        locus: Locus,
+    ) -> Result<Vec<LocusSample>, StorageError> {
+        if lineage.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 1. Fetch generation and tick for agents from births
+        let conn = self.connection()?;
+        let mut meta_map: BTreeMap<AgentUid, (u32, Tick)> = BTreeMap::new();
+        let rows = conn.query_with_params(
+            "SELECT agent_uid, generation, tick FROM births WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        for row in rows {
+            let uid = checked_u64(
+                "births.agent_uid",
+                decode::<i64>(&row, 0, "births.agent_uid")?,
+            )?;
+            let generation_raw = decode::<i64>(&row, 1, "births.generation")?;
+            let tick = checked_u64("births.tick", decode::<i64>(&row, 2, "births.tick")?)?;
+            meta_map.insert(
+                AgentUid(uid),
+                (
+                    u32::try_from(generation_raw.max(0)).unwrap_or(0),
+                    Tick(tick),
+                ),
+            );
+        }
+
+        // 2. Fetch recorded genomes
+        let genomes = self.read_lineage_genomes(lineage)?;
+        let mut genome_map: BTreeMap<AgentUid, BrainGenomeEnvelope> = BTreeMap::new();
+        for (uid, _tick, env) in genomes {
+            genome_map.entry(uid).or_insert(env);
+        }
+
+        // 3. Assemble lineage samples with explicit gaps (never phantom 0.0)
+        let mut samples = Vec::with_capacity(lineage.len());
+        for &uid in lineage {
+            let (generation, tick) = meta_map.get(&uid).copied().unwrap_or((0, Tick(0)));
+            let value = if let Some(env) = genome_map.get(&uid) {
+                match codec.genome_loci(env) {
+                    Ok(loci) => loci
+                        .into_iter()
+                        .find(|(loc, _)| *loc == locus)
+                        .map(|(_, val)| val),
+                    Err(_) => None, // explicit gap on decode error
+                }
+            } else {
+                None // explicit gap on missing genome
+            };
+
+            samples.push(LocusSample {
+                generation,
+                agent_uid: uid,
+                tick,
+                value,
+            });
+        }
+
+        Ok(samples)
+    }
+
+    /// Reconstruct the ancestry DAG from the run database and trace a locus from a target agent
+    /// back to its root founder (bd-wdyu).
+    pub fn trace_agent_lineage_locus<C: BrainFamilyCodec>(
+        &self,
+        codec: &C,
+        target: AgentUid,
+        locus: Locus,
+        max_depth: usize,
+    ) -> Result<Vec<LocusSample>, StorageError> {
+        let births = self.load_ancestry_births()?;
+        let deaths = self.load_ancestry_deaths()?;
+        let graph = rebuild_ancestry(&births, &deaths).map_err(|e| StorageError::InvalidData {
+            context: "rebuild_ancestry",
+            reason: e.to_string(),
+        })?;
+        let mut path = graph.lineage_path(target, max_depth);
+        path.reverse();
+        self.trace_locus(codec, &path, locus)
     }
 
     /// Return replay-event counts grouped by stable event type.

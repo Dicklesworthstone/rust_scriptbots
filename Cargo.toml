@@ -50,6 +50,7 @@ csv = "1.2.2"
 wfc = "0.10.7"
 direction = "0.18.0"
 rand08 = { package = "rand", version = "0.8.5" }
+miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
 
 fastmcp-rust = { version = "=0.3.2", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1038dd4e64cc7df8ea8122dbfb8806b0b04a7130" }
 fsqlite = { version = "=0.1.16", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "e536d7f8ca102b3eb5236bef48514582379f9346", default-features = false, features = ["native"] }

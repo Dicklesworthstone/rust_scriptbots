@@ -28,6 +28,7 @@ postcard = { workspace = true }
 blake3 = { workspace = true }
 toml = "0.8"
 wide = { version = "1.5.0", default-features = false, optional = true }
+miniz_oxide = { workspace = true }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 tracing = { workspace = true }

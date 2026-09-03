@@ -12,14 +12,15 @@
 use fsqlite::compat::{OpenFlags, RowExt, open_with_flags};
 use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::{
-    AgentData, AgentId, AgentUid, BirthOrigin, BirthRecord, BrainFamilyId, BrainGenomeDerivation,
-    BrainGenomeEnvelope, BrainGenomeHash, BrainProvenance, Generation, MetricSample,
-    PersistedGenome, PersistenceBatch, PersistenceEvent, PersistenceEventKind, Position,
-    ScriptBotsConfig, Tick, TickSummary, WorldState,
+    AgentData, AgentId, AgentUid, BirthOrigin, BirthRecord, BrainFamilyCodec, BrainFamilyId,
+    BrainGenomeDerivation, BrainGenomeEnvelope, BrainGenomeHash, BrainProvenance, Generation,
+    MetricSample, PersistedGenome, PersistenceBatch, PersistenceEvent, PersistenceEventKind,
+    Position, ScriptBotsConfig, Tick, TickSummary, WorldState,
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    GenomeStorageError, RunManifestRecord, StorageError, StoragePipeline, StorageReader,
+    GenomeStorageError, Locus, RunManifestRecord, StorageError, StoragePipeline, StorageReader,
+    export_locus_trace_csv, export_locus_trace_png,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -618,5 +619,130 @@ fn test_live_simulation_multigen_e2e_reopened_db() -> Result<(), Box<dyn std::er
     let births = reader.load_ancestry_births()?;
     assert!(!births.is_empty(), "Births table must hold arrival records");
 
+    Ok(())
+}
+
+#[test]
+fn test_db_backed_lineage_locus_tracing_with_csv_and_png_export_and_live_crosscheck()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temp_db_path("locus_trace_e2e");
+    let mut pipeline = StoragePipeline::create_unattributed_file(&path)?;
+
+    let config = ScriptBotsConfig {
+        world_width: 100,
+        world_height: 100,
+        food_cell_size: 20,
+        persistence_interval: 1,
+        rng_seed: Some(0xC0DE_B075),
+        ..ScriptBotsConfig::default()
+    };
+
+    let (mut world, mut persistence) =
+        WorldState::with_persistence(config, Box::new(pipeline.sink()))
+            .expect("world with storage pipeline");
+
+    let family_key = world
+        .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+        .expect("register mlp brain family");
+
+    let mut founder_uids = Vec::new();
+    for _ in 0..4 {
+        let agent_id = world
+            .try_spawn_agent(AgentData::default())
+            .expect("seed agent");
+        assert!(
+            world
+                .bind_agent_brain(agent_id, family_key)
+                .expect("bind brain"),
+            "agent accepts brain binding"
+        );
+        founder_uids.push(world.agent_uid(agent_id).expect("uid"));
+    }
+
+    // Run simulation for 20 ticks to ensure founder genomes and births are persisted
+    for _ in 0..20 {
+        let _ = world.step();
+        persistence.step(&mut world)?;
+    }
+
+    // Capture live agent genomes before shutdown
+    let handles: Vec<AgentId> = world.agents().iter_handles().collect();
+    let mut live_genomes: Vec<(AgentUid, BrainGenomeEnvelope)> = Vec::new();
+    for id in &handles {
+        let uid = world.agent_uid(*id).expect("agent exists");
+        if let Some(envelope) = world.agent_brain_genome(*id) {
+            live_genomes.push((uid, envelope.clone()));
+        }
+    }
+
+    pipeline.shutdown()?;
+
+    let reader = StorageReader::open(&path)?;
+    let codec = MlpBrainFamily::new();
+
+    // 1. Trace a real locus across founders
+    let locus = Locus::NodeBias(0);
+    let samples = reader.trace_locus(&codec, &founder_uids, locus)?;
+    assert_eq!(samples.len(), founder_uids.len());
+
+    // 2. Cross-check DB-traced values against live agent genomes
+    for sample in &samples {
+        if let Some((_, live_env)) = live_genomes.iter().find(|(u, _)| *u == sample.agent_uid) {
+            let live_loci = codec.genome_loci(live_env)?;
+            let expected_val = live_loci
+                .iter()
+                .find(|(l, _)| *l == locus)
+                .map(|(_, v)| v.clone());
+            assert_eq!(
+                sample.value, expected_val,
+                "Locus trace must match live world genome"
+            );
+        }
+    }
+
+    // 3. Test explicit gap: query a locus that does NOT exist in the schema
+    let absent_locus = Locus::NodeBias(99999);
+    let gap_samples = reader.trace_locus(&codec, &founder_uids, absent_locus)?;
+    for s in &gap_samples {
+        assert_eq!(
+            s.value, None,
+            "Absent locus must yield explicit None gap, never phantom 0.0"
+        );
+    }
+
+    // 4. Export CSV and assert format
+    let csv = export_locus_trace_csv(&samples, locus);
+    assert!(csv.contains("# Locus Trace: node 0 bias"));
+    assert!(csv.contains("generation,agent_uid,tick,value_type,value"));
+    for uid in &founder_uids {
+        assert!(csv.contains(&format!("{}", uid.0)));
+    }
+
+    let gap_csv = export_locus_trace_csv(&gap_samples, absent_locus);
+    assert!(gap_csv.contains("gap,GAP"));
+
+    // 5. Export headless PNG and assert format
+    let png = export_locus_trace_png(&samples, locus);
+    assert_eq!(
+        &png[0..8],
+        &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+    assert!(png.len() > 100);
+
+    let gap_png = export_locus_trace_png(&gap_samples, absent_locus);
+    assert_eq!(
+        &gap_png[0..8],
+        &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+    assert!(gap_png.len() > 100);
+
+    // 6. Test trace_agent_lineage_locus on an agent
+    let target = founder_uids[0];
+    let lineage_samples = reader.trace_agent_lineage_locus(&codec, target, locus, 10)?;
+    assert!(!lineage_samples.is_empty());
+    assert_eq!(lineage_samples.last().unwrap().agent_uid, target);
+
+    reader.close()?;
+    let _ = std::fs::remove_file(path);
     Ok(())
 }

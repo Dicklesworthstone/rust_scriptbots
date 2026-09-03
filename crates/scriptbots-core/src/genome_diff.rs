@@ -292,6 +292,226 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
     svg
 }
 
+fn crc32_chunk(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xffff_ffff;
+    for &byte in chunk_type.iter().chain(data.iter()) {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    let len = u32::try_from(data.len()).expect("PNG chunk length fits u32");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(data);
+    let crc = crc32_chunk(chunk_type, data);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    // 1. Signature
+    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+
+    // 2. IHDR Chunk
+    let mut ihdr_data = Vec::with_capacity(13);
+    ihdr_data.extend_from_slice(&width.to_be_bytes());
+    ihdr_data.extend_from_slice(&height.to_be_bytes());
+    ihdr_data.push(8); // 8-bit depth
+    ihdr_data.push(6); // RGBA color type
+    ihdr_data.push(0); // compression method 0
+    ihdr_data.push(0); // filter method 0
+    ihdr_data.push(0); // interlace method 0
+    write_png_chunk(&mut out, b"IHDR", &ihdr_data);
+
+    // 3. IDAT Chunk
+    let scanline_len = 1 + (width as usize) * 4;
+    let mut raw_scanlines = Vec::with_capacity((height as usize) * scanline_len);
+    for row in 0..(height as usize) {
+        raw_scanlines.push(0); // Filter type 0: None
+        let start = row * (width as usize) * 4;
+        let end = start + (width as usize) * 4;
+        raw_scanlines.extend_from_slice(&rgba[start..end]);
+    }
+
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw_scanlines, 6);
+    write_png_chunk(&mut out, b"IDAT", &compressed);
+
+    // 4. IEND Chunk
+    write_png_chunk(&mut out, b"IEND", &[]);
+
+    out
+}
+
+/// Export a locus trace as a headless PNG image buffer.
+#[must_use]
+pub fn export_locus_trace_png(samples: &[LocusSample], locus: Locus) -> Vec<u8> {
+    let _ = locus;
+    const WIDTH: usize = 600;
+    const HEIGHT: usize = 300;
+    const PADDING: usize = 40;
+
+    let mut pixels = vec![30u8, 30u8, 46u8, 255u8].repeat(WIDTH * HEIGHT);
+
+    let put_pixel = |pixels: &mut [u8], x: i32, y: i32, color: [u8; 4]| {
+        if x >= 0 && (x as usize) < WIDTH && y >= 0 && (y as usize) < HEIGHT {
+            let idx = ((y as usize) * WIDTH + (x as usize)) * 4;
+            pixels[idx..idx + 4].copy_from_slice(&color);
+        }
+    };
+
+    let draw_line =
+        |pixels: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: [u8; 4]| {
+            let dx = (x1 - x0).abs();
+            let dy = -(y1 - y0).abs();
+            let sx = if x0 < x1 { 1 } else { -1 };
+            let sy = if y0 < y1 { 1 } else { -1 };
+            let mut err = dx + dy;
+            loop {
+                put_pixel(pixels, x0, y0, color);
+                put_pixel(pixels, x0 + 1, y0, color);
+                put_pixel(pixels, x0, y0 + 1, color);
+                if x0 == x1 && y0 == y1 {
+                    break;
+                }
+                let e2 = 2 * err;
+                if e2 >= dy {
+                    err += dy;
+                    x0 += sx;
+                }
+                if e2 <= dx {
+                    err += dx;
+                    y0 += sy;
+                }
+            }
+        };
+
+    let draw_dot = |pixels: &mut [u8], cx: i32, cy: i32, radius: i32, color: [u8; 4]| {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy <= radius * radius {
+                    put_pixel(pixels, cx + dx, cy + dy, color);
+                }
+            }
+        }
+    };
+
+    let draw_cross = |pixels: &mut [u8], cx: i32, cy: i32, size: i32, color: [u8; 4]| {
+        for d in -size..=size {
+            put_pixel(pixels, cx + d, cy + d, color);
+            put_pixel(pixels, cx + d, cy - d, color);
+        }
+    };
+
+    // Draw frame/axes
+    let axis_color = [69, 71, 90, 255]; // Catppuccin surface0
+    draw_line(
+        &mut pixels,
+        PADDING as i32,
+        (HEIGHT - PADDING) as i32,
+        (WIDTH - PADDING) as i32,
+        (HEIGHT - PADDING) as i32,
+        axis_color,
+    );
+    draw_line(
+        &mut pixels,
+        PADDING as i32,
+        PADDING as i32,
+        PADDING as i32,
+        (HEIGHT - PADDING) as i32,
+        axis_color,
+    );
+    draw_line(
+        &mut pixels,
+        (WIDTH - PADDING) as i32,
+        PADDING as i32,
+        (WIDTH - PADDING) as i32,
+        (HEIGHT - PADDING) as i32,
+        axis_color,
+    );
+    draw_line(
+        &mut pixels,
+        PADDING as i32,
+        PADDING as i32,
+        (WIDTH - PADDING) as i32,
+        PADDING as i32,
+        axis_color,
+    );
+
+    let valid_scalars: Vec<(f32, f32)> = samples
+        .iter()
+        .filter_map(|s| match s.value {
+            Some(LocusValue::Scalar(v)) => Some((s.generation as f32, v)),
+            _ => None,
+        })
+        .collect();
+
+    if !valid_scalars.is_empty() {
+        let min_gen = valid_scalars
+            .iter()
+            .map(|(g, _)| *g)
+            .fold(f32::INFINITY, f32::min);
+        let max_gen = valid_scalars
+            .iter()
+            .map(|(g, _)| *g)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_val = valid_scalars
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f32::INFINITY, f32::min);
+        let max_val = valid_scalars
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        let gen_span = (max_gen - min_gen).max(1.0);
+        let val_span = (max_val - min_val).max(0.001);
+
+        let mut prev_pt: Option<(i32, i32)> = None;
+        let line_color = [137, 180, 250, 255]; // Catppuccin blue
+        let dot_color = [205, 214, 244, 255]; // Catppuccin text
+
+        for (g, v) in &valid_scalars {
+            let x = (PADDING as f32 + (g - min_gen) / gen_span * (WIDTH - 2 * PADDING) as f32)
+                .round() as i32;
+            let y = ((HEIGHT - PADDING) as f32
+                - (v - min_val) / val_span * (HEIGHT - 2 * PADDING) as f32)
+                .round() as i32;
+            if let Some((px, py)) = prev_pt {
+                draw_line(&mut pixels, px, py, x, y, line_color);
+            }
+            draw_dot(&mut pixels, x, y, 3, dot_color);
+            prev_pt = Some((x, y));
+        }
+
+        // Draw gaps as crosses on bottom axis
+        let gap_color = [243, 139, 168, 255]; // Catppuccin red
+        for s in samples {
+            if s.value.is_none() {
+                let g = s.generation as f32;
+                let x = (PADDING as f32 + (g - min_gen) / gen_span * (WIDTH - 2 * PADDING) as f32)
+                    .round() as i32;
+                let y = (HEIGHT - PADDING) as i32;
+                draw_cross(&mut pixels, x, y, 4, gap_color);
+            }
+        }
+    }
+
+    encode_rgba_png(
+        u32::try_from(WIDTH).expect("fits u32"),
+        u32::try_from(HEIGHT).expect("fits u32"),
+        &pixels,
+    )
+}
+
 /// Degenerate inputs are typed, never a panic and never a silent empty diff.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenomeDiffError {
@@ -540,5 +760,12 @@ mod tests {
         assert!(svg.contains("<svg"));
         assert!(svg.contains("Locus Trace: node 0 bias"));
         assert!(svg.contains("<polyline"));
+
+        let png = export_locus_trace_png(&samples, locus);
+        assert_eq!(
+            &png[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        assert!(png.len() > 100);
     }
 }
