@@ -274,6 +274,7 @@ fn test_bit_exact_float_and_subnormal_payload_preservation()
     assert_eq!(readback.material_hash(), env.material_hash());
 
     // Verify each f32 bit pattern matches byte-for-byte and bit-for-bit
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (chunk_idx, chunk) in readback.payload().chunks_exact(4).enumerate() {
         let expected_bits = floats[chunk_idx].to_bits();
         let actual_bits = u32::from_le_bytes(chunk.try_into().unwrap());

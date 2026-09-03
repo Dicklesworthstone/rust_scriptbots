@@ -24757,6 +24757,7 @@ mod tests {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn narrative_maintenance_snapshot(
         connection: &Connection,
     ) -> Result<Vec<(String, String, String, String, f64)>, StorageError> {
@@ -25278,7 +25279,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let storage = Storage::unattributed_memory_with_thresholds(1, 1, 1, 1)?;
         storage.register_host_journal_session(HostSessionId::new(11))?;
-        let command_id = CommandId::from_client_sequence(0x434c_4149_4d, 7);
+        let command_id = CommandId::from_client_sequence(0x0043_4c41_494d, 7);
         let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
         let encoded = encode_command_envelope_postcard_hex(
             "host_command_claims.envelope_postcard_hex",

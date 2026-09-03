@@ -1336,6 +1336,7 @@ fn repeated_recovery_is_a_fixed_point_and_never_duplicates_rows() {
 
     // Recovering the same database repeatedly must be a fixed point: identical rows,
     // identical ordering, identical converged watermarks after every pass.
+    #[allow(clippy::type_complexity)]
     let mut previous: Option<(Vec<(u64, u64)>, PersistenceWatermarks, Option<u64>)> = None;
     for pass in 1..=3_u32 {
         let mut recovered = StoragePipeline::recover_existing(&path_string)
@@ -1368,7 +1369,7 @@ fn repeated_recovery_is_a_fixed_point_and_never_duplicates_rows() {
             .filter(|row| row.name == "energy")
             .map(|row| (row.tick, row.value.to_bits()))
             .collect();
-        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows.sort_by_key(|left| left.0);
         let max_tick = reader.max_tick().expect("max tick query runs");
         let watermarks = reader
             .persistence_watermarks()

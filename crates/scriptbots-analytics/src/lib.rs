@@ -24,12 +24,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use scriptbots_core::AgentUid;
+use scriptbots_core::{AgentUid, Tick};
 use scriptbots_storage::{
     PersistedAgentObservation, PersistedInteraction, PersistedInteractionCapture, PersistedMetric,
     PersistenceBatchId, StorageError, StorageReader,
 };
 use serde::Serialize;
+
+pub use stats::StatsError;
 
 /// Native, dependency-free statistics for offline detector certification (bd-2z0.11.6).
 ///
@@ -214,7 +216,7 @@ pub struct PhenotypeTickWindowV1 {
 }
 
 impl PhenotypeTickWindowV1 {
-    fn validate(self) -> Result<(), PhenotypeExtractionError> {
+    const fn validate(self) -> Result<(), PhenotypeExtractionError> {
         if self.start_tick >= self.end_tick {
             return Err(PhenotypeExtractionError::InvalidWindow {
                 start_tick: self.start_tick,
@@ -224,16 +226,17 @@ impl PhenotypeTickWindowV1 {
         Ok(())
     }
 
-    fn duration(self) -> u64 {
+    const fn duration(self) -> u64 {
         self.end_tick - self.start_tick
     }
 
-    fn contains(self, tick: u64) -> bool {
-        (self.start_tick..self.end_tick).contains(&tick)
+    const fn contains(self, tick: u64) -> bool {
+        self.start_tick <= tick && tick < self.end_tick
     }
 }
 
 /// Typed refusal from the canonical phenotype/interaction extractor.
+#[allow(missing_docs)]
 #[derive(Debug, thiserror::Error)]
 pub enum PhenotypeExtractionError {
     #[error("invalid empty or reversed tick window [{start_tick}, {end_tick})")]
@@ -305,64 +308,99 @@ pub enum PhenotypeExtractionError {
 /// One run-tagged persisted state observation.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RunScopedAgentObservationV1 {
+    /// Source run identifier.
     pub run_id: String,
+    /// Simulation tick.
     pub tick: u64,
+    /// Stable agent identity.
     pub agent_uid: AgentUid,
+    /// X velocity component.
     pub velocity_x: f64,
+    /// Y velocity component.
     pub velocity_y: f64,
     /// Trait proxy, not realized diet.
     pub herbivore_tendency: f64,
-    /// Trait proxies, not realized sensor readings.
+    /// Trait proxy: smell.
     pub trait_smell: f64,
+    /// Trait proxy: sound.
     pub trait_sound: f64,
+    /// Trait proxy: hearing.
     pub trait_hearing: f64,
+    /// Trait proxy: eye.
     pub trait_eye: f64,
+    /// Trait proxy: blood.
     pub trait_blood: f64,
 }
 
 /// One run-tagged canonical directed interaction.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RunScopedInteractionV1 {
+    /// Source run identifier.
     pub run_id: String,
+    /// Simulation tick.
     pub tick: u64,
+    /// Monotonic sequence within the tick.
     pub seq: u64,
+    /// String interaction category.
     pub kind: String,
+    /// Acting agent identity.
     pub actor: AgentUid,
+    /// Target agent identity.
     pub target: AgentUid,
+    /// Interaction magnitude if defined.
     pub magnitude: Option<f64>,
 }
 
 /// One run-tagged stable-identity arrival/parent record.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RunScopedArrivalV1 {
+    /// Source run identifier.
     pub run_id: String,
+    /// Arrival simulation tick.
     pub tick: u64,
+    /// Stable agent identity.
     pub agent_uid: AgentUid,
+    /// First parent identity if born.
     pub parent_a: Option<AgentUid>,
+    /// Second parent identity if sexually reproduced.
     pub parent_b: Option<AgentUid>,
 }
 
 /// Run-tagged interaction-capture accounting.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RunScopedInteractionCaptureV1 {
+    /// Source run identifier.
     pub run_id: String,
+    /// Total interaction events observed.
     pub observed: u64,
+    /// Total interaction events persisted.
     pub persisted: u64,
+    /// Total interaction events dropped by sampling.
     pub sampled_out: u64,
+    /// Total interaction events truncated by capacity.
     pub truncated: u64,
 }
 
 /// Immutable source ledger consumed by the pure extractor.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PhenotypeLedgerV1 {
+    /// Canonical schema identifier.
     pub schema_id: String,
+    /// Blake3 digest of the feature schema.
     pub schema_digest: String,
+    /// Blake3 digest of the simulation configuration.
     pub config_digest: String,
+    /// Source run identifier.
     pub run_id: String,
+    /// Bounded analysis tick window.
     pub window: PhenotypeTickWindowV1,
+    /// Ordered run-scoped observations.
     pub observations: Vec<RunScopedAgentObservationV1>,
+    /// Ordered run-scoped interactions.
     pub interactions: Vec<RunScopedInteractionV1>,
+    /// Ordered ancestry arrivals.
     pub arrivals: Vec<RunScopedArrivalV1>,
+    /// Certified interaction completeness counters.
     pub interaction_capture: RunScopedInteractionCaptureV1,
 }
 
@@ -370,54 +408,112 @@ pub struct PhenotypeLedgerV1 {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum InteractionEdgeKindV1 {
+    /// Directed combat event.
     Combat,
+    /// Directed food sharing event.
     FoodShare,
 }
 
 /// Canonical aggregate of directed source events.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DirectedInteractionEdgeV1 {
+    /// Acting agent identity.
     pub actor: AgentUid,
+    /// Target agent identity.
     pub target: AgentUid,
+    /// Interaction classification.
     pub kind: InteractionEdgeKindV1,
+    /// Total events along this directed edge.
     pub event_count: u64,
+    /// Sum of positive event magnitudes.
     pub magnitude_sum: f64,
+    /// Earliest tick observed.
     pub first_tick: u64,
+    /// Latest tick observed.
     pub last_tick: u64,
 }
 
 /// Permutation-invariant directed graph for one run and window.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DirectedInteractionGraphV1 {
+    /// Schema identifier.
     pub schema_id: &'static str,
+    /// Source run identifier.
     pub run_id: String,
+    /// Tick window.
     pub window: PhenotypeTickWindowV1,
+    /// Certified interaction capture counters.
     pub capture: RunScopedInteractionCaptureV1,
+    /// Sorted unique agent identities.
     pub nodes: Vec<AgentUid>,
+    /// Canonical directed interaction edges.
     pub edges: Vec<DirectedInteractionEdgeV1>,
+    /// Blake3 digest of the graph payload.
     pub canonical_digest: String,
 }
 
 /// One canonical ordered phenotype vector.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PhenotypeFeatureRowV1 {
+    /// Source run identifier.
     pub run_id: String,
+    /// Stable agent identity.
     pub agent_uid: AgentUid,
+    /// Number of ticks this agent was observed.
     pub observed_tick_count: u64,
     /// Values follow [`PHENOTYPE_FEATURE_SCHEMA_V1`] exactly.
     pub values: [f64; PHENOTYPE_AXIS_COUNT_V1],
 }
 
+impl From<&PhenotypeFeatureRowV1> for scriptbots_core::species::AgentPhenotypeVector {
+    fn from(row: &PhenotypeFeatureRowV1) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        Self {
+            agent_uid: row.agent_uid,
+            movement_speed_mean: row.values[0] as f32,
+            diet_herbivore_ratio: row.values[1] as f32,
+            sensing_range_mean: row.values[2] as f32,
+            aggression_index: row.values[3] as f32,
+            giving_altruism_index: row.values[4] as f32,
+            reproduction_rate: row.values[5] as f32,
+        }
+    }
+}
+
+impl PhenotypeFeatureRowV1 {
+    /// Converts this row to a core [`scriptbots_core::species::AgentPhenotypeVector`].
+    ///
+    /// This establishes exact schema parity with the species segmentation pipeline (bd-2z0.11.2, bd-16g.3.6).
+    #[must_use]
+    pub fn to_agent_phenotype_vector(&self) -> scriptbots_core::species::AgentPhenotypeVector {
+        self.into()
+    }
+
+    /// Extracts the canonical behavioral descriptor for MAP-Elites archive binning (bd-2z0.11.2, bd-16g.6.1).
+    #[must_use]
+    pub const fn behavior_descriptor(&self) -> [f64; PHENOTYPE_AXIS_COUNT_V1] {
+        self.values
+    }
+}
+
 /// Production analysis read model derived from persisted run facts.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PhenotypeInteractionAnalysisV1 {
+    /// Canonical schema definition.
     pub schema: PhenotypeFeatureSchemaV1,
+    /// Digest of the schema definition.
     pub schema_digest: String,
+    /// Digest of the simulation configuration.
     pub config_digest: String,
+    /// Source run identifier.
     pub run_id: String,
+    /// Analyzed tick window.
     pub window: PhenotypeTickWindowV1,
+    /// Extracted phenotype feature rows.
     pub features: Vec<PhenotypeFeatureRowV1>,
+    /// Directed interaction network.
     pub interaction_graph: DirectedInteractionGraphV1,
+    /// Blake3 digest of the full analysis model.
     pub canonical_digest: String,
 }
 
@@ -503,12 +599,12 @@ pub fn load_persisted_phenotype_ledger(
     let observations = reader
         .load_agent_observations(window.start_tick, window.end_tick)?
         .into_iter()
-        .map(|observation| run_scoped_observation(&run_id, observation))
+        .map(|observation| run_scoped_observation(&run_id, &observation))
         .collect();
     let interactions = reader
         .load_interactions_window(window.start_tick, window.end_tick)?
         .into_iter()
-        .map(|interaction| run_scoped_interaction(&run_id, interaction))
+        .map(|interaction| run_scoped_interaction(&run_id, &interaction))
         .collect();
     let arrivals = reader
         .load_ancestry_births()?
@@ -550,7 +646,7 @@ pub fn load_persisted_phenotype_ledger(
 
 fn run_scoped_observation(
     run_id: &str,
-    observation: PersistedAgentObservation,
+    observation: &PersistedAgentObservation,
 ) -> RunScopedAgentObservationV1 {
     RunScopedAgentObservationV1 {
         run_id: run_id.to_owned(),
@@ -569,13 +665,13 @@ fn run_scoped_observation(
 
 fn run_scoped_interaction(
     run_id: &str,
-    interaction: PersistedInteraction,
+    interaction: &PersistedInteraction,
 ) -> RunScopedInteractionV1 {
     RunScopedInteractionV1 {
         run_id: run_id.to_owned(),
         tick: interaction.tick,
         seq: interaction.seq,
-        kind: interaction.kind,
+        kind: interaction.kind.clone(),
         actor: interaction.actor,
         target: interaction.target,
         magnitude: interaction.value,
@@ -619,7 +715,7 @@ fn validate_row_run(
     }
 }
 
-fn require_finite(
+const fn require_finite(
     value: f64,
     field: &'static str,
     observation: &RunScopedAgentObservationV1,
@@ -668,7 +764,7 @@ fn canonical_json_digest<T: Serialize>(value: &T) -> Result<String, PhenotypeExt
 ///
 /// This function is pure: callers may use hand-audited fixtures, while
 /// [`load_persisted_phenotype_ledger`] is the production storage adapter.
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn extract_phenotype_interactions(
     ledger: &PhenotypeLedgerV1,
 ) -> Result<PhenotypeInteractionAnalysisV1, PhenotypeExtractionError> {
@@ -996,6 +1092,295 @@ pub fn analyze_persisted_phenotypes(
 ) -> Result<PhenotypeInteractionAnalysisV1, AnalyticsError> {
     let ledger = load_persisted_phenotype_ledger(reader)?;
     Ok(extract_phenotype_interactions(&ledger)?)
+}
+
+/// Single-feature comparison between two cohorts with effect size and bootstrap uncertainty.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FeatureCohortComparison {
+    /// Stable axis name.
+    pub feature_name: &'static str,
+    /// Physical unit.
+    pub unit: &'static str,
+    /// Mean value for cohort A.
+    pub mean_a: f64,
+    /// Mean value for cohort B.
+    pub mean_b: f64,
+    /// Standard deviation for cohort A.
+    pub std_dev_a: f64,
+    /// Standard deviation for cohort B.
+    pub std_dev_b: f64,
+    /// Cohen's d standardized mean difference (B minus A).
+    pub cohens_d: f64,
+    /// Hedges' g small-sample-corrected effect size.
+    pub hedges_g: f64,
+    /// Cliff's delta non-parametric effect size.
+    pub cliffs_delta: f64,
+    /// 95% bootstrap confidence interval of the mean difference (B minus A).
+    pub mean_diff_ci_95: Option<[f64; 2]>,
+    /// Two-sided permutation test p-value for the mean difference.
+    pub permutation_p_value: Option<f64>,
+}
+
+/// Comprehensive statistical comparison between two cohorts of phenotypes (bd-2z0.11.2).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PhenotypeCohortComparisonReport {
+    /// Label for cohort A.
+    pub cohort_a_name: String,
+    /// Label for cohort B.
+    pub cohort_b_name: String,
+    /// Number of agents in cohort A.
+    pub sample_size_a: usize,
+    /// Number of agents in cohort B.
+    pub sample_size_b: usize,
+    /// Per-axis statistical comparisons with effect sizes and uncertainty.
+    pub feature_comparisons: Vec<FeatureCohortComparison>,
+    /// Multivariate Mahalanobis distance and covariance status.
+    pub multivariate_cluster_comparison: scriptbots_core::species::PhenotypeClusterComparison,
+}
+
+/// Parent-to-offspring phenotype shift along canonical axes (bd-2z0.11.2).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LineagePhenotypeShift {
+    /// Parent agent identity.
+    pub parent_uid: AgentUid,
+    /// Offspring agent identity.
+    pub child_uid: AgentUid,
+    /// Offspring feature value minus parent feature value along each canonical axis.
+    pub deltas: [f64; PHENOTYPE_AXIS_COUNT_V1],
+}
+
+/// Lineage phenotype shift summary across a population.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LineagePhenotypeShiftSummary {
+    /// Number of parent-offspring pairs observed.
+    pub pair_count: usize,
+    /// Mean feature shifts (child minus parent).
+    pub mean_deltas: [f64; PHENOTYPE_AXIS_COUNT_V1],
+    /// Standard deviation of feature shifts.
+    pub std_dev_deltas: [f64; PHENOTYPE_AXIS_COUNT_V1],
+}
+
+/// Compares two phenotype cohorts across canonical axes with effect sizes and bootstrap uncertainty (bd-2z0.11.2).
+#[allow(clippy::cast_precision_loss)]
+pub fn compare_phenotype_cohorts(
+    cohort_a_name: &str,
+    cohort_a: &[PhenotypeFeatureRowV1],
+    cohort_b_name: &str,
+    cohort_b: &[PhenotypeFeatureRowV1],
+    seed: u64,
+) -> Result<PhenotypeCohortComparisonReport, stats::StatsError> {
+    let mut feature_comparisons = Vec::with_capacity(PHENOTYPE_AXIS_COUNT_V1);
+
+    let vectors_a: Vec<scriptbots_core::species::AgentPhenotypeVector> = cohort_a
+        .iter()
+        .map(PhenotypeFeatureRowV1::to_agent_phenotype_vector)
+        .collect();
+    let vectors_b: Vec<scriptbots_core::species::AgentPhenotypeVector> = cohort_b
+        .iter()
+        .map(PhenotypeFeatureRowV1::to_agent_phenotype_vector)
+        .collect();
+
+    let multivariate_cluster_comparison = scriptbots_core::species::compare_phenotype_clusters(
+        cohort_a_name,
+        &vectors_a,
+        cohort_b_name,
+        &vectors_b,
+    );
+
+    for axis_idx in 0..PHENOTYPE_AXIS_COUNT_V1 {
+        let axis = &PHENOTYPE_FEATURE_SCHEMA_V1.axes[axis_idx];
+        let values_a: Vec<f64> = cohort_a.iter().map(|r| r.values[axis_idx]).collect();
+        let values_b: Vec<f64> = cohort_b.iter().map(|r| r.values[axis_idx]).collect();
+
+        if values_a.is_empty() || values_b.is_empty() {
+            feature_comparisons.push(FeatureCohortComparison {
+                feature_name: axis.id,
+                unit: axis.unit,
+                mean_a: if values_a.is_empty() {
+                    0.0
+                } else {
+                    stats::mean(&values_a)?
+                },
+                mean_b: if values_b.is_empty() {
+                    0.0
+                } else {
+                    stats::mean(&values_b)?
+                },
+                std_dev_a: if values_a.is_empty() {
+                    0.0
+                } else {
+                    stats::std_dev(&values_a)?
+                },
+                std_dev_b: if values_b.is_empty() {
+                    0.0
+                } else {
+                    stats::std_dev(&values_b)?
+                },
+                cohens_d: 0.0,
+                hedges_g: 0.0,
+                cliffs_delta: 0.0,
+                mean_diff_ci_95: None,
+                permutation_p_value: None,
+            });
+            continue;
+        }
+
+        let mean_a = stats::mean(&values_a)?;
+        let mean_b = stats::mean(&values_b)?;
+        let std_dev_a = stats::std_dev(&values_a)?;
+        let std_dev_b = stats::std_dev(&values_b)?;
+        let cohens_d = stats::cohens_d(&values_a, &values_b)?;
+        let hedges_g = stats::hedges_g(&values_a, &values_b)?;
+        let cliffs_delta = stats::cliffs_delta(&values_a, &values_b)?;
+
+        // Resampling with deterministic seed offset by axis index
+        let axis_seed = seed.wrapping_add((axis_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let ci =
+            stats::bootstrap_mean_difference_ci(&values_a, &values_b, 1_000, 0.95, axis_seed).ok();
+        let mean_diff_ci_95 = ci.map(|c| [c.lower, c.upper]);
+
+        let perm = stats::permutation_test_mean_difference(
+            &values_a,
+            &values_b,
+            1_000,
+            axis_seed.wrapping_add(1),
+        )
+        .ok();
+        let permutation_p_value = perm.map(|p| p.p_value);
+
+        feature_comparisons.push(FeatureCohortComparison {
+            feature_name: axis.id,
+            unit: axis.unit,
+            mean_a,
+            mean_b,
+            std_dev_a,
+            std_dev_b,
+            cohens_d,
+            hedges_g,
+            cliffs_delta,
+            mean_diff_ci_95,
+            permutation_p_value,
+        });
+    }
+
+    Ok(PhenotypeCohortComparisonReport {
+        cohort_a_name: cohort_a_name.to_owned(),
+        cohort_b_name: cohort_b_name.to_owned(),
+        sample_size_a: cohort_a.len(),
+        sample_size_b: cohort_b.len(),
+        feature_comparisons,
+        multivariate_cluster_comparison,
+    })
+}
+
+/// Clusters a cohort of phenotype feature rows into species using the canonical segmentation engine (bd-2z0.11.2, bd-16g.3.6).
+#[must_use]
+pub fn cluster_cohort_species(
+    cohort: &[PhenotypeFeatureRowV1],
+    params: &scriptbots_core::species::SpeciesParams,
+    previous: &scriptbots_core::species::SpeciesTable,
+    tick: Tick,
+) -> (
+    scriptbots_core::species::SpeciesTable,
+    scriptbots_core::species::SegmentReport,
+) {
+    let samples: Vec<(AgentUid, Vec<f32>)> = cohort
+        .iter()
+        .map(|r| {
+            (
+                r.agent_uid,
+                r.to_agent_phenotype_vector().features().to_vec(),
+            )
+        })
+        .collect();
+    scriptbots_core::species::segment_species(tick, &samples, previous, params)
+}
+
+/// Derives the core [`scriptbots_core::species::PhenotypeAnalysisReport`] across cohorts (bd-2z0.11.2).
+#[must_use]
+pub fn compute_core_phenotype_analysis(
+    run_id: &str,
+    tick: Tick,
+    cohorts: &[(&str, &[PhenotypeFeatureRowV1])],
+) -> scriptbots_core::species::PhenotypeAnalysisReport {
+    let mut all_vectors = Vec::new();
+    let converted_cohorts: Vec<(&str, Vec<scriptbots_core::species::AgentPhenotypeVector>)> =
+        cohorts
+            .iter()
+            .map(|(name, rows)| {
+                let vecs: Vec<scriptbots_core::species::AgentPhenotypeVector> = rows
+                    .iter()
+                    .map(PhenotypeFeatureRowV1::to_agent_phenotype_vector)
+                    .collect();
+                all_vectors.extend(vecs.clone());
+                (*name, vecs)
+            })
+            .collect();
+
+    let cohort_refs: Vec<(&str, &[scriptbots_core::species::AgentPhenotypeVector])> =
+        converted_cohorts
+            .iter()
+            .map(|(name, vecs)| (*name, vecs.as_slice()))
+            .collect();
+
+    scriptbots_core::species::compute_phenotype_analysis(run_id, tick, &all_vectors, &cohort_refs)
+}
+
+/// Measures parent-to-offspring phenotype shifts without causal overclaim (bd-2z0.11.2).
+#[allow(clippy::cast_precision_loss)]
+#[must_use]
+pub fn compute_lineage_phenotype_shifts(
+    features: &[PhenotypeFeatureRowV1],
+    arrivals: &[RunScopedArrivalV1],
+) -> (Vec<LineagePhenotypeShift>, LineagePhenotypeShiftSummary) {
+    let feature_map: BTreeMap<AgentUid, &[f64; PHENOTYPE_AXIS_COUNT_V1]> =
+        features.iter().map(|f| (f.agent_uid, &f.values)).collect();
+
+    let mut shifts = Vec::new();
+
+    for arrival in arrivals {
+        let Some(&child_vals) = feature_map.get(&arrival.agent_uid) else {
+            continue;
+        };
+
+        for parent_uid in [arrival.parent_a, arrival.parent_b].into_iter().flatten() {
+            if let Some(&parent_vals) = feature_map.get(&parent_uid) {
+                let mut deltas = [0.0; PHENOTYPE_AXIS_COUNT_V1];
+                for i in 0..PHENOTYPE_AXIS_COUNT_V1 {
+                    deltas[i] = child_vals[i] - parent_vals[i];
+                }
+                shifts.push(LineagePhenotypeShift {
+                    parent_uid,
+                    child_uid: arrival.agent_uid,
+                    deltas,
+                });
+            }
+        }
+    }
+
+    let pair_count = shifts.len();
+    let mut mean_deltas = [0.0; PHENOTYPE_AXIS_COUNT_V1];
+    let mut std_dev_deltas = [0.0; PHENOTYPE_AXIS_COUNT_V1];
+
+    if pair_count > 0 {
+        for i in 0..PHENOTYPE_AXIS_COUNT_V1 {
+            let sum: f64 = shifts.iter().map(|s| s.deltas[i]).sum();
+            mean_deltas[i] = sum / pair_count as f64;
+            let sq_diff: f64 = shifts
+                .iter()
+                .map(|s| (s.deltas[i] - mean_deltas[i]).powi(2))
+                .sum();
+            std_dev_deltas[i] = (sq_diff / pair_count as f64).sqrt();
+        }
+    }
+
+    let summary = LineagePhenotypeShiftSummary {
+        pair_count,
+        mean_deltas,
+        std_dev_deltas,
+    };
+
+    (shifts, summary)
 }
 
 /// String-keyed report parameters with typed accessors.
@@ -2622,5 +3007,167 @@ mod phenotype_tests {
                 end_tick: 4,
             })
         ));
+    }
+
+    #[test]
+    fn test_phenotype_row_conversion_and_map_elites_descriptor() {
+        let row = PhenotypeFeatureRowV1 {
+            run_id: RUN_A.to_owned(),
+            agent_uid: AgentUid(42),
+            observed_tick_count: 10,
+            values: [1.5, 0.8, 0.4, 0.2, 0.1, 0.05],
+        };
+
+        let vec = row.to_agent_phenotype_vector();
+        assert_eq!(vec.agent_uid, AgentUid(42));
+        assert!((vec.movement_speed_mean - 1.5).abs() < 1e-6);
+        assert!((vec.diet_herbivore_ratio - 0.8).abs() < 1e-6);
+        assert!((vec.sensing_range_mean - 0.4).abs() < 1e-6);
+        assert!((vec.aggression_index - 0.2).abs() < 1e-6);
+        assert!((vec.giving_altruism_index - 0.1).abs() < 1e-6);
+        assert!((vec.reproduction_rate - 0.05).abs() < 1e-6);
+
+        let desc = row.behavior_descriptor();
+        assert_eq!(desc, [1.5, 0.8, 0.4, 0.2, 0.1, 0.05]);
+    }
+
+    #[test]
+    fn test_compare_phenotype_cohorts_statistical_metrics() {
+        let cohort_a: Vec<PhenotypeFeatureRowV1> = (0..20)
+            .map(|i| PhenotypeFeatureRowV1 {
+                run_id: RUN_A.to_owned(),
+                agent_uid: AgentUid(i),
+                observed_tick_count: 5,
+                values: [1.0 + (i as f64) * 0.01, 0.2, 0.3, 0.1, 0.0, 0.01],
+            })
+            .collect();
+
+        let cohort_b: Vec<PhenotypeFeatureRowV1> = (20..40)
+            .map(|i| PhenotypeFeatureRowV1 {
+                run_id: RUN_B.to_owned(),
+                agent_uid: AgentUid(i),
+                observed_tick_count: 5,
+                values: [5.0 + (i as f64) * 0.01, 0.8, 0.7, 0.4, 0.2, 0.05],
+            })
+            .collect();
+
+        let report = compare_phenotype_cohorts("cohort_a", &cohort_a, "cohort_b", &cohort_b, 42)
+            .expect("cohort comparison succeeds");
+
+        assert_eq!(report.sample_size_a, 20);
+        assert_eq!(report.sample_size_b, 20);
+        assert_eq!(report.feature_comparisons.len(), PHENOTYPE_AXIS_COUNT_V1);
+
+        // Speed comparison (axis 0): cohort_b is significantly faster (~5.3 vs ~1.1)
+        let speed_comp = &report.feature_comparisons[0];
+        assert_eq!(speed_comp.feature_name, "movement.speed.mean");
+        assert!(speed_comp.mean_b > speed_comp.mean_a);
+        assert!(speed_comp.cohens_d > 10.0, "large effect size on speed");
+        assert_eq!(
+            speed_comp.cliffs_delta, 1.0,
+            "cohort B completely dominates cohort A on speed"
+        );
+        assert!(speed_comp.mean_diff_ci_95.is_some());
+        let ci = speed_comp.mean_diff_ci_95.unwrap();
+        assert!(
+            ci[0] > 3.0 && ci[1] < 5.0,
+            "95% CI covers true difference ~4.0"
+        );
+        assert!(
+            speed_comp.permutation_p_value.unwrap() < 0.01,
+            "significant difference"
+        );
+    }
+
+    #[test]
+    fn test_cluster_cohort_species() {
+        let cohort: Vec<PhenotypeFeatureRowV1> = (0..10)
+            .map(|i| PhenotypeFeatureRowV1 {
+                run_id: RUN_A.to_owned(),
+                agent_uid: AgentUid(i),
+                observed_tick_count: 5,
+                values: [1.0, 0.5, 0.5, 0.1, 0.1, 0.01],
+            })
+            .collect();
+
+        let params = scriptbots_core::species::SpeciesParams::default();
+        let prev = scriptbots_core::species::SpeciesTable {
+            tick: Tick(0),
+            species: Vec::new(),
+            next_id: scriptbots_core::species::SpeciesId(1),
+        };
+
+        let (table, report) = cluster_cohort_species(&cohort, &params, &prev, Tick(10));
+        assert_eq!(report.total_agents_segmented, 10);
+        assert!(!table.species.is_empty(), "minted at least one species");
+    }
+
+    #[test]
+    fn test_compute_lineage_phenotype_shifts() {
+        let parent = PhenotypeFeatureRowV1 {
+            run_id: RUN_A.to_owned(),
+            agent_uid: AgentUid(1),
+            observed_tick_count: 10,
+            values: [2.0, 0.5, 0.5, 0.1, 0.1, 0.02],
+        };
+        let child = PhenotypeFeatureRowV1 {
+            run_id: RUN_A.to_owned(),
+            agent_uid: AgentUid(2),
+            observed_tick_count: 5,
+            values: [2.5, 0.6, 0.4, 0.1, 0.1, 0.03],
+        };
+
+        let arrivals = vec![RunScopedArrivalV1 {
+            run_id: RUN_A.to_owned(),
+            tick: 5,
+            agent_uid: AgentUid(2),
+            parent_a: Some(AgentUid(1)),
+            parent_b: None,
+        }];
+
+        let (shifts, summary) = compute_lineage_phenotype_shifts(&[parent, child], &arrivals);
+        assert_eq!(shifts.len(), 1);
+        assert_eq!(shifts[0].parent_uid, AgentUid(1));
+        assert_eq!(shifts[0].child_uid, AgentUid(2));
+        assert!((shifts[0].deltas[0] - 0.5).abs() < 1e-6); // speed child - parent = 0.5
+        assert!((shifts[0].deltas[1] - 0.1).abs() < 1e-6); // diet child - parent = 0.1
+        assert!((shifts[0].deltas[2] - (-0.1)).abs() < 1e-6); // sensing child - parent = -0.1
+
+        assert_eq!(summary.pair_count, 1);
+        assert!((summary.mean_deltas[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_compute_core_phenotype_analysis() {
+        let cohort_a: Vec<PhenotypeFeatureRowV1> = (0..5)
+            .map(|i| PhenotypeFeatureRowV1 {
+                run_id: RUN_A.to_owned(),
+                agent_uid: AgentUid(i),
+                observed_tick_count: 5,
+                values: [1.0, 0.2, 0.3, 0.1, 0.0, 0.01],
+            })
+            .collect();
+
+        let cohort_b: Vec<PhenotypeFeatureRowV1> = (5..10)
+            .map(|i| PhenotypeFeatureRowV1 {
+                run_id: RUN_A.to_owned(),
+                agent_uid: AgentUid(i),
+                observed_tick_count: 5,
+                values: [3.0, 0.8, 0.6, 0.4, 0.2, 0.05],
+            })
+            .collect();
+
+        let report = compute_core_phenotype_analysis(
+            RUN_A,
+            Tick(50),
+            &[("cohort_a", &cohort_a), ("cohort_b", &cohort_b)],
+        );
+
+        assert_eq!(report.run_id, RUN_A);
+        assert_eq!(report.tick, Tick(50));
+        assert_eq!(report.total_agents_analyzed, 10);
+        assert_eq!(report.comparisons.len(), 1);
+        assert_eq!(report.comparisons[0].cluster_a_name, "cohort_a");
+        assert_eq!(report.comparisons[0].cluster_b_name, "cohort_b");
     }
 }

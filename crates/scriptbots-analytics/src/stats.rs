@@ -451,7 +451,7 @@ pub fn hedges_g(before: &[f64], after: &[f64]) -> Result<f64, StatsError> {
     let d = cohens_d(before, after)?;
     // `cohens_d` already refused n<2 per group, so df >= 2 and the denominator cannot vanish.
     let df = (before.len() + after.len()) as f64 - 2.0;
-    let correction = 1.0 - 3.0 / (4.0 * df - 1.0);
+    let correction = 1.0 - 3.0 / 4.0f64.mul_add(df, -1.0);
     Ok(d * correction)
 }
 

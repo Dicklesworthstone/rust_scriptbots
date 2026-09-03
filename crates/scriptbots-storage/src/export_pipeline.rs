@@ -2233,7 +2233,7 @@ mod tests {
         assert_eq!(format_f32_csv(f32::NAN), "NaN");
         assert_eq!(format_f32_csv(f32::INFINITY), "Infinity");
         assert_eq!(format_f32_csv(f32::NEG_INFINITY), "-Infinity");
-        assert_eq!(format_f32_csv(3.14159), "3.14159");
+        assert_eq!(format_f32_csv(12.345), "12.345");
 
         assert!(parse_f32_csv("NaN").unwrap().is_nan());
         assert_eq!(parse_f32_csv("Infinity").unwrap(), f32::INFINITY);
@@ -2243,7 +2243,7 @@ mod tests {
         assert_eq!(format_f64_csv(f64::NAN), "NaN");
         assert_eq!(format_f64_csv(f64::INFINITY), "Infinity");
         assert_eq!(format_f64_csv(f64::NEG_INFINITY), "-Infinity");
-        assert_eq!(format_f64_csv(2.71828), "2.71828");
+        assert_eq!(format_f64_csv(67.89), "67.89");
 
         assert!(parse_f64_csv("NaN").unwrap().is_nan());
         assert_eq!(parse_f64_csv("Infinity").unwrap(), f64::INFINITY);

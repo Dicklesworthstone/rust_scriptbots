@@ -352,6 +352,7 @@ fn registry_lists_builtin_reports_with_descriptions() {
             "metric-changepoints",
             "compare-runs",
             "metric-distribution",
+            "phenotype-interactions",
         ]
     );
     assert!(listed.iter().all(|(_, d)| !d.is_empty()));
@@ -416,4 +417,212 @@ fn sb_analyze_list_and_run_use_the_real_fixture_database() {
         "params run stderr: {}",
         String::from_utf8_lossy(&params_run.stderr)
     );
+}
+
+fn synth_db_with_phenotypes(dir: &tempfile::TempDir) -> String {
+    use scriptbots_core::{
+        AgentData, AgentId, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin,
+        BirthRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
+        INTERACTION_EVENTS_PERSISTED_KIND, MetricSample, PersistenceBatch, PersistenceEvent,
+        PersistenceEventKind, Position, ReplayEvent, ReplayEventKind, ReplayInteractionKind, Tick,
+        TickSummary, TraitModifiers, Velocity,
+    };
+
+    let path = dir.path().join("phenotypes.sqlite").display().to_string();
+    let mut storage = Storage::create_unattributed_file(&path).expect("create synth phenotype db");
+
+    let agent1 = AgentState {
+        id: AgentId::default(),
+        identity: AgentIdentity {
+            uid: AgentUid(1),
+            spawn_ordinal: 0,
+            birth_ordinal: None,
+        },
+        data: AgentData {
+            position: Position::new(10.0, 20.0),
+            velocity: Velocity::new(3.0, 4.0),
+            health: 10.0,
+            ..AgentData::default()
+        },
+        runtime: AgentRuntime {
+            energy: 10.0,
+            herbivore_tendency: 0.8,
+            trait_modifiers: TraitModifiers {
+                smell: 1.0,
+                sound: 1.0,
+                hearing: 1.0,
+                eye: 1.0,
+                blood: 1.0,
+            },
+            ..AgentRuntime::default()
+        },
+    };
+
+    let agent2 = AgentState {
+        id: AgentId::default(),
+        identity: AgentIdentity {
+            uid: AgentUid(2),
+            spawn_ordinal: 1,
+            birth_ordinal: None,
+        },
+        data: AgentData {
+            position: Position::new(30.0, 40.0),
+            velocity: Velocity::new(1.0, 0.0),
+            health: 10.0,
+            ..AgentData::default()
+        },
+        runtime: AgentRuntime {
+            energy: 10.0,
+            herbivore_tendency: 0.2,
+            trait_modifiers: TraitModifiers {
+                smell: 2.0,
+                sound: 2.0,
+                hearing: 2.0,
+                eye: 2.0,
+                blood: 2.0,
+            },
+            ..AgentRuntime::default()
+        },
+    };
+
+    let birth1 = BirthRecord {
+        tick: Tick(0),
+        agent_uid: AgentUid(1),
+        spawn_ordinal: 0,
+        birth_ordinal: None,
+        origin: BirthOrigin::Seeded,
+        parent_a: None,
+        parent_b: None,
+        brain_kind: Some("mlp".to_owned()),
+        brain_key: None,
+        herbivore_tendency: 0.8,
+        generation: Generation(0),
+        is_hybrid: false,
+        position: Position::new(10.0, 20.0),
+    };
+
+    let birth2 = BirthRecord {
+        tick: Tick(0),
+        agent_uid: AgentUid(2),
+        spawn_ordinal: 1,
+        birth_ordinal: None,
+        origin: BirthOrigin::Seeded,
+        parent_a: None,
+        parent_b: None,
+        brain_kind: Some("mlp".to_owned()),
+        brain_key: None,
+        herbivore_tendency: 0.2,
+        generation: Generation(0),
+        is_hybrid: false,
+        position: Position::new(30.0, 40.0),
+    };
+
+    let replay_interaction = ReplayEvent {
+        agent_uid: Some(AgentUid(1)),
+        position: Some(Position::new(10.0, 20.0)),
+        counterpart: Some(AgentUid(2)),
+        counterpart_position: Some(Position::new(30.0, 40.0)),
+        kind: ReplayEventKind::Interaction {
+            tick: Tick(0),
+            ordinal: 0,
+            kind: ReplayInteractionKind::Combat,
+            magnitude: 2.5,
+        },
+    };
+
+    let batch = PersistenceBatch {
+        summary: TickSummary {
+            tick: Tick(0),
+            agent_count: 2,
+            births: 0,
+            deaths: 0,
+            total_energy: 20.0,
+            average_energy: 10.0,
+            average_health: 10.0,
+            max_age: 1,
+            spike_hits: 0,
+        },
+        epoch: 1,
+        closed: false,
+        metrics: vec![MetricSample::new("total_energy", 20.0)],
+        events: vec![
+            PersistenceEvent::new(
+                PersistenceEventKind::Custom(INTERACTION_EVENTS_OBSERVED_KIND.into()),
+                1,
+            ),
+            PersistenceEvent::new(
+                PersistenceEventKind::Custom(INTERACTION_EVENTS_PERSISTED_KIND.into()),
+                1,
+            ),
+        ],
+        agents: vec![agent1, agent2],
+        births: vec![birth1, birth2],
+        deaths: Vec::new(),
+        replay_events: vec![replay_interaction],
+        narrative_events: Vec::new(),
+        genomes: Vec::new(),
+    };
+
+    storage.persist(&batch).expect("persist batch");
+    storage.flush().expect("flush");
+    storage.close().expect("close");
+    path
+}
+
+#[test]
+fn phenotype_interactions_report_runs_and_serializes_with_provenance() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = synth_db_with_phenotypes(&dir);
+    let executable = env!("CARGO_BIN_EXE_sb-analyze");
+
+    let json_path = dir.path().join("phenotype.json");
+    let md_path = dir.path().join("phenotype.md");
+    let run = Command::new(executable)
+        .arg(&path)
+        .arg("run")
+        .arg("phenotype-interactions")
+        .arg("--json")
+        .arg(&json_path)
+        .arg("--md")
+        .arg(&md_path)
+        .output()
+        .expect("run sb-analyze phenotype-interactions");
+    assert!(
+        run.status.success(),
+        "run stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let machine: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json_path).expect("read machine report"))
+            .expect("parse machine report");
+    assert_eq!(machine["schema_version"], REPORT_SCHEMA_VERSION);
+    assert_eq!(machine["report"], "phenotype-interactions");
+    assert_eq!(machine["row_count"], 2);
+    assert_eq!(
+        machine["machine"]["features"]
+            .as_array()
+            .expect("features array")
+            .len(),
+        2
+    );
+    assert_eq!(
+        machine["machine"]["interaction_graph"]["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .len(),
+        2
+    );
+    assert_eq!(
+        machine["machine"]["interaction_graph"]["edges"]
+            .as_array()
+            .expect("edges array")
+            .len(),
+        1
+    );
+    assert!(machine["machine"]["canonical_digest"].is_string());
+
+    let markdown = std::fs::read_to_string(md_path).expect("read markdown report");
+    assert!(markdown.contains("# Phenotype and interaction analysis"));
+    assert!(markdown.contains("| uid | observations | speed |"));
 }

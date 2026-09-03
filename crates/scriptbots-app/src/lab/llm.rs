@@ -137,6 +137,38 @@ pub enum LlmError {
     /// The model declined the request.
     #[error("model refused the request")]
     Refused,
+    /// Provider error (HTTP 4xx / 5xx) with structured metadata.
+    #[error("provider error {status}: {message}")]
+    ProviderError {
+        /// HTTP status code returned.
+        status: u16,
+        /// Provider error message, if parsed.
+        message: String,
+        /// Provider request ID, if supplied.
+        request_id: Option<String>,
+        /// Partial token usage, if supplied.
+        partial_usage: Option<TokenUsage>,
+    },
+}
+
+impl LlmError {
+    /// Provider request identifier, if supplied with this failure.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::ProviderError { request_id, .. } => request_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Partial token usage reported with this failure, if supplied.
+    #[must_use]
+    pub fn partial_usage(&self) -> Option<TokenUsage> {
+        match self {
+            Self::ProviderError { partial_usage, .. } => *partial_usage,
+            _ => None,
+        }
+    }
 }
 
 /// Build the proposal tool from the single canonical experiment contract.
@@ -171,6 +203,9 @@ pub struct LlmResponse {
     pub usage: TokenUsage,
     /// Why it stopped.
     pub stop_reason: StopReason,
+    /// Provider request identifier, if returned in headers or body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// The provider seam.
@@ -241,6 +276,11 @@ pub fn parse_response(request: &LlmRequest, body: &[u8]) -> Result<LlmResponse, 
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|err| LlmError::InvalidResponse(format!("body is not JSON: {err}")))?;
 
+    let request_id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+
     // Usage first: a response we cannot bill is a response we cannot budget.
     let usage = value
         .get("usage")
@@ -294,7 +334,63 @@ pub fn parse_response(request: &LlmRequest, body: &[u8]) -> Result<LlmResponse, 
         tool_calls,
         usage,
         stop_reason,
+        request_id,
     })
+}
+
+/// Parse an Anthropic error response body into structured error details.
+#[must_use]
+pub fn parse_error_body(status: u16, body: &[u8], request_id: Option<String>) -> LlmError {
+    if body.is_empty() {
+        return LlmError::ProviderError {
+            status,
+            message: format!("provider returned HTTP {status} with empty body"),
+            request_id,
+            partial_usage: None,
+        };
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        let message = value
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("provider returned HTTP {status}"));
+
+        let body_req_id = value
+            .get("request_id")
+            .or_else(|| value.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+
+        let partial_usage = value.get("usage").and_then(|u| {
+            let input = u.get("input_tokens").and_then(serde_json::Value::as_u64)?;
+            let output = u.get("output_tokens").and_then(serde_json::Value::as_u64)?;
+            Some(TokenUsage {
+                input: u32::try_from(input).ok()?,
+                output: u32::try_from(output).ok()?,
+            })
+        });
+
+        LlmError::ProviderError {
+            status,
+            message,
+            request_id: request_id.or(body_req_id),
+            partial_usage,
+        }
+    } else {
+        let truncated_len = body.len().min(256);
+        let preview = body.get(..truncated_len).map_or_else(
+            || String::from_utf8_lossy(body).into_owned(),
+            |slice| String::from_utf8_lossy(slice).into_owned(),
+        );
+        LlmError::ProviderError {
+            status,
+            message: format!("HTTP {status}: {preview}"),
+            request_id,
+            partial_usage: None,
+        }
+    }
 }
 
 fn read_token_count(usage: &serde_json::Value, field: &str) -> Result<u32, LlmError> {
@@ -427,10 +523,11 @@ impl RetryPolicy {
     /// Whether an error is worth another attempt.
     #[must_use]
     pub fn is_retryable(error: &LlmError) -> bool {
-        matches!(
-            error,
-            LlmError::Transport(_) | LlmError::RateLimited { .. } | LlmError::Overloaded
-        )
+        match error {
+            LlmError::Transport(_) | LlmError::RateLimited { .. } | LlmError::Overloaded => true,
+            LlmError::ProviderError { status, .. } => *status >= 500 && *status != 529,
+            _ => false,
+        }
     }
 }
 
@@ -520,7 +617,7 @@ pub use anthropic::AnthropicClient;
 mod anthropic {
     use super::{
         LlmClient, LlmError, LlmRequest, LlmResponse, MAX_RESPONSE_BYTES, RetryPolicy,
-        parse_response, parse_retry_after, read_bounded_bytes, redact,
+        parse_error_body, parse_response, parse_retry_after, read_bounded_bytes, redact,
     };
     use rand::rngs::SmallRng;
     use std::sync::Mutex;
@@ -600,6 +697,7 @@ mod anthropic {
         }
 
         fn attempt(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            let start = std::time::Instant::now();
             let response = self
                 .http
                 .post(ANTHROPIC_URL)
@@ -613,31 +711,123 @@ mod anthropic {
                 .map_err(|err| LlmError::Transport(redact(&err.to_string(), &self.api_key)))?;
 
             let status = response.status();
+            let declared_bytes = response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|val| val.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok());
+
+            let request_id = response
+                .headers()
+                .get("request-id")
+                .or_else(|| response.headers().get("x-request-id"))
+                .and_then(|val| val.to_str().ok())
+                .map(ToOwned::to_owned);
+
             if status.as_u16() == 429 {
                 let retry_after_ms = response
                     .headers()
                     .get("retry-after")
                     .and_then(|value| value.to_str().ok())
                     .and_then(parse_retry_after);
+                tracing::warn!(
+                    provider = "anthropic",
+                    status = 429,
+                    retry_after_ms = ?retry_after_ms,
+                    retry_classification = "retryable",
+                    latency_ms = start.elapsed().as_millis() as u64,
+                    request_id = ?request_id,
+                    "rate limited by provider"
+                );
                 return Err(LlmError::RateLimited { retry_after_ms });
             }
             if status.as_u16() == 529 {
+                tracing::warn!(
+                    provider = "anthropic",
+                    status = 529,
+                    retry_classification = "retryable",
+                    latency_ms = start.elapsed().as_millis() as u64,
+                    request_id = ?request_id,
+                    "provider overloaded"
+                );
                 return Err(LlmError::Overloaded);
             }
 
             // Read incrementally into a bounded buffer: past the cap we stop, rather than
             // letting a pathological body grow until the process dies (bd-wqnk).
-            let bytes =
-                read_bounded_bytes(response, MAX_RESPONSE_BYTES).map_err(|err| match err {
-                    LlmError::Transport(msg) => LlmError::Transport(redact(&msg, &self.api_key)),
-                    other => other,
-                })?;
+            let read_res = read_bounded_bytes(response, MAX_RESPONSE_BYTES);
+            let bytes = match read_res {
+                Ok(b) => b,
+                Err(err) => {
+                    let observed_bytes = match err {
+                        LlmError::ResponseTooLarge { bytes, .. } => bytes,
+                        _ => 0,
+                    };
+                    tracing::warn!(
+                        provider = "anthropic",
+                        status = status.as_u16(),
+                        declared_bytes = ?declared_bytes,
+                        observed_bytes,
+                        cap_decision = "rejected",
+                        latency_ms = start.elapsed().as_millis() as u64,
+                        retry_classification = "terminal",
+                        request_id = ?request_id,
+                        "response body rejected by byte cap or transport error"
+                    );
+                    return Err(match err {
+                        LlmError::Transport(msg) => {
+                            LlmError::Transport(redact(&msg, &self.api_key))
+                        }
+                        other => other,
+                    });
+                }
+            };
+
+            let observed_bytes = bytes.len();
             if !status.is_success() {
-                return Err(LlmError::Transport(format!(
-                    "provider returned HTTP {status}"
-                )));
+                let err = parse_error_body(status.as_u16(), &bytes, request_id);
+                let retry_class = if RetryPolicy::is_retryable(&err) {
+                    "retryable"
+                } else {
+                    "terminal"
+                };
+                tracing::warn!(
+                    provider = "anthropic",
+                    status = status.as_u16(),
+                    declared_bytes = ?declared_bytes,
+                    observed_bytes,
+                    cap_decision = "accepted",
+                    latency_ms = start.elapsed().as_millis() as u64,
+                    retry_classification = retry_class,
+                    request_id = ?err.request_id(),
+                    partial_input_tokens = err.partial_usage().map(|u| u.input),
+                    partial_output_tokens = err.partial_usage().map(|u| u.output),
+                    "provider error response received"
+                );
+                return Err(err);
             }
-            parse_response(request, &bytes)
+
+            let mut parsed = parse_response(request, &bytes)?;
+            if parsed.request_id.is_none() {
+                parsed.request_id = request_id;
+            }
+
+            tracing::info!(
+                provider = "anthropic",
+                model_id = %self.model_id,
+                status = status.as_u16(),
+                declared_bytes = ?declared_bytes,
+                observed_bytes,
+                cap_decision = "accepted",
+                latency_ms = start.elapsed().as_millis() as u64,
+                input_tokens = parsed.usage.input,
+                output_tokens = parsed.usage.output,
+                stop_reason = ?parsed.stop_reason,
+                request_id = ?parsed.request_id,
+                "llm call attempt succeeded"
+            );
+
+            Ok(parsed)
         }
     }
 
@@ -653,6 +843,7 @@ mod anthropic {
                             input_tokens = response.usage.input,
                             output_tokens = response.usage.output,
                             stop_reason = ?response.stop_reason,
+                            request_id = ?response.request_id,
                             attempt,
                             "llm call succeeded"
                         );
@@ -674,6 +865,9 @@ mod anthropic {
                             error_kind = ?error,
                             retry_after_ms = ?hint,
                             backoff_ms = backoff,
+                            retry_classification = "retryable",
+                            request_id = ?error.request_id(),
+                            partial_usage = ?error.partial_usage(),
                             "llm call failed; retrying"
                         );
                         last = error;
@@ -681,7 +875,17 @@ mod anthropic {
                             std::thread::sleep(std::time::Duration::from_millis(backoff));
                         }
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        tracing::warn!(
+                            attempt,
+                            error_kind = ?error,
+                            retry_classification = "terminal",
+                            request_id = ?error.request_id(),
+                            partial_usage = ?error.partial_usage(),
+                            "llm call failed terminally"
+                        );
+                        return Err(error);
+                    }
                 }
             }
             Err(last)
@@ -1024,5 +1228,239 @@ mod tests {
 
         let empty_redacted = super::redact("some error", "");
         assert_eq!(empty_redacted, "some error");
+    }
+
+    struct ChunkedReader<'a> {
+        data: &'a [u8],
+        chunk_size: usize,
+        pos: usize,
+    }
+
+    impl std::io::Read for ChunkedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let remaining = self.data.len() - self.pos;
+            let to_read = remaining.min(self.chunk_size).min(buf.len());
+            buf[..to_read].copy_from_slice(&self.data[self.pos..self.pos + to_read]);
+            self.pos += to_read;
+            Ok(to_read)
+        }
+    }
+
+    #[test]
+    fn read_bounded_bytes_handles_adversarial_chunk_sizes() {
+        let payload = vec![b'x'; 500];
+        // 1-byte chunking under cap
+        let mut reader = ChunkedReader {
+            data: &payload,
+            chunk_size: 1,
+            pos: 0,
+        };
+        let res = read_bounded_bytes(&mut reader, 500).expect("exact cap succeeds");
+        assert_eq!(res.len(), 500);
+
+        // 1-byte chunking over cap
+        let mut reader = ChunkedReader {
+            data: &payload,
+            chunk_size: 1,
+            pos: 0,
+        };
+        let res = read_bounded_bytes(&mut reader, 499);
+        assert_eq!(
+            res,
+            Err(LlmError::ResponseTooLarge {
+                bytes: 500,
+                cap: 499,
+            })
+        );
+
+        // 7-byte chunking over cap
+        let mut reader = ChunkedReader {
+            data: &payload,
+            chunk_size: 7,
+            pos: 0,
+        };
+        let res = read_bounded_bytes(&mut reader, 100);
+        assert_eq!(
+            res,
+            Err(LlmError::ResponseTooLarge {
+                bytes: 101,
+                cap: 100,
+            })
+        );
+    }
+
+    struct FailingReader {
+        yielded: usize,
+        fail_at: usize,
+    }
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.yielded >= self.fail_at {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                ));
+            }
+            let to_write = (self.fail_at - self.yielded).min(buf.len());
+            buf[..to_write].fill(b'q');
+            self.yielded += to_write;
+            Ok(to_write)
+        }
+    }
+
+    #[test]
+    fn read_bounded_bytes_returns_transport_on_connection_abort() {
+        let mut reader = FailingReader {
+            yielded: 0,
+            fail_at: 50,
+        };
+        let res = read_bounded_bytes(&mut reader, 100);
+        assert!(
+            matches!(res, Err(LlmError::Transport(msg)) if msg.contains("connection reset by peer"))
+        );
+    }
+
+    #[test]
+    fn parse_error_body_extracts_details_and_partial_usage() {
+        let err_json = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Prompt exceeded token window"
+            },
+            "request_id": "req_019abc",
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 0
+            }
+        });
+        let err = parse_error_body(400, err_json.to_string().as_bytes(), None);
+        assert_eq!(err.request_id(), Some("req_019abc"));
+        assert_eq!(
+            err.partial_usage(),
+            Some(TokenUsage {
+                input: 120,
+                output: 0,
+            })
+        );
+        assert_eq!(
+            err,
+            LlmError::ProviderError {
+                status: 400,
+                message: "Prompt exceeded token window".to_owned(),
+                request_id: Some("req_019abc".to_owned()),
+                partial_usage: Some(TokenUsage {
+                    input: 120,
+                    output: 0,
+                }),
+            }
+        );
+        assert!(!RetryPolicy::is_retryable(&err));
+
+        // 500 server error is retryable
+        let server_err =
+            parse_error_body(500, b"Internal Server Error", Some("req_500".to_owned()));
+        assert_eq!(server_err.request_id(), Some("req_500"));
+        assert!(RetryPolicy::is_retryable(&server_err));
+    }
+
+    #[test]
+    fn tracing_capture_proves_sentinel_api_key_is_never_logged() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct SharedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedLog {
+            type Writer = SharedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = SharedLog(buffer.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .finish();
+
+        let sentinel_key = "sk-ant-api03-SECRET-SENTINEL-12345";
+        let raw_error = format!("failed request with key {sentinel_key} at endpoint");
+        let safe_error = super::redact(&raw_error, sentinel_key);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                provider = "anthropic",
+                model_id = "claude-3-5-sonnet",
+                status = 200,
+                declared_bytes = 100,
+                observed_bytes = 100,
+                cap_decision = "accepted",
+                latency_ms = 45,
+                retry_classification = "none",
+                "simulated success"
+            );
+            tracing::warn!(
+                provider = "anthropic",
+                error = %safe_error,
+                "simulated error warning"
+            );
+        });
+
+        let output =
+            String::from_utf8(buffer.lock().expect("read log buffer").clone()).expect("utf8 log");
+        assert!(
+            !output.contains(sentinel_key),
+            "sentinel key leaked into tracing logs: {output}"
+        );
+        assert!(output.contains("<redacted>"));
+        assert!(output.contains("cap_decision=\"accepted\""));
+    }
+
+    #[test]
+    #[ignore = "requires ANTHROPIC_API_KEY; live network roundtrip"]
+    fn live_anthropic_provider_roundtrip_records_redacted_diagnostics() {
+        let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        if key.is_empty() {
+            eprintln!("skipping live provider test: ANTHROPIC_API_KEY is not set");
+            return;
+        }
+        #[cfg(feature = "llm-anthropic")]
+        {
+            let rng = SmallRng::seed_from_u64(0x1234_5678);
+            let client = AnthropicClient::from_env("claude-3-5-haiku-20241022", rng)
+                .expect("client builds from environment");
+            let req = LlmRequest {
+                system: "respond in one short sentence".to_owned(),
+                messages: vec![LlmMessage {
+                    role: "user".to_owned(),
+                    content: "say hello".to_owned(),
+                }],
+                tools: Vec::new(),
+                max_tokens: 32,
+            };
+            let resp = client.complete(&req).expect("live request succeeds");
+            assert!(resp.text.is_some());
+            assert!(resp.usage.input > 0);
+            assert!(resp.usage.output > 0);
+            eprintln!(
+                "live Anthropic roundtrip succeeded: request_id={:?}",
+                resp.request_id
+            );
+        }
     }
 }
