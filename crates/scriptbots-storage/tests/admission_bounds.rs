@@ -148,7 +148,7 @@ fn a_narration_burst_cannot_starve_simulation_admission_through_the_real_path() 
     });
 
     let mut loud = batch(1, 8);
-    loud.narrative_events = (0..512).map(narrative_event).collect();
+    loud.narrative_events = (0..512).map(|_| narrative_event(1)).collect();
     let (narrative_bytes, narrative_events) = estimate_narrative_size(&loud);
     assert!(
         narrative_events > 128 && narrative_bytes > (64 << 10),
