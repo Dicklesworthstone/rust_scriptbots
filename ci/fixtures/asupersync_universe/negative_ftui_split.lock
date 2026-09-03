@@ -1,0 +1,14 @@
+# Committed negative fixture: ftui-* family split across 0.5.0 and 0.5.1
+version = 4
+
+[[package]]
+name = "ftui"
+version = "0.5.0"
+
+[[package]]
+name = "ftui-core"
+version = "0.5.0"
+
+[[package]]
+name = "ftui-widgets"
+version = "0.5.1"

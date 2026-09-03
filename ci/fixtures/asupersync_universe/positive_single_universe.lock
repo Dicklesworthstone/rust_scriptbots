@@ -1,0 +1,15 @@
+# Committed positive fixture: single asupersync 0.3.9 from crates.io
+version = 4
+
+[[package]]
+name = "asupersync"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cbadf37dce3015a059ffe058804d958026e8b276d665116015e3126d2673cfe"
+
+[[package]]
+name = "scriptbots-app"
+version = "0.1.0"
+dependencies = [
+ "asupersync",
+]

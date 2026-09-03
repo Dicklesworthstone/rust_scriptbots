@@ -310,10 +310,10 @@ jobs:
           bash ci/check_franken_licenses.sh
           bash ci/check_franken_licenses.sh --third-party
 
-      - name: Asupersync single-version-universe guard (bd-2z0.8.17)
+      - name: Asupersync & ftui single-version-universe guard (bd-2z0.8.17 / bd-2d25)
         run: |
           bash ci/check_asupersync_universe.sh --self-test
-          bash ci/check_asupersync_universe.sh asupersync
+          bash ci/check_asupersync_universe.sh asupersync ftui
 
       - name: FrankenSQLite pin-consistency guard (bd-2z0.8.9.14)
         run: |

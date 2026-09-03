@@ -1,0 +1,12 @@
+# Committed negative fixture: identical version 0.3.9 from split sources (crates.io vs git)
+version = 4
+
+[[package]]
+name = "asupersync"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "asupersync"
+version = "0.3.9"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=abcdef#abcdef"
