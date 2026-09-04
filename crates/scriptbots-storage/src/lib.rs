@@ -24,6 +24,9 @@ pub use scriptbots_core::genome_diff::{
     Locus, LocusSample, LocusValue, export_locus_trace_csv, export_locus_trace_png,
     export_locus_trace_svg,
 };
+pub use scriptbots_core::map_elites::{
+    ArchiveCellRow, ArchiveSpaceRow, BehaviorSpaceV0, MapElitesArchive, QdError,
+};
 
 pub use journal::{
     CommandJournalCursor, CommandJournalEvidence, CommandJournalPage, CommandJournalRecord,
@@ -57,6 +60,7 @@ use scriptbots_core::{
     PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase,
     ReplayEvent, ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
+    map_elites::{ArchiveCellRow, ArchiveSpaceRow, BehaviorSpaceV0, MapElitesArchive},
     narrative::{
         EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord,
         NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION, NARRATIVE_INPUT_V1_SCHEMA_VERSION,
@@ -229,9 +233,15 @@ const SCRIPTBOTS_SCHEMA_V12_VERSION: i64 = 12;
 const SCRIPTBOTS_SCHEMA_V13_VERSION: i64 = 13;
 const SCRIPTBOTS_SCHEMA_V14_VERSION: i64 = 14;
 const SCRIPTBOTS_SCHEMA_V15_VERSION: i64 = 15;
+const SCRIPTBOTS_SCHEMA_V16_VERSION: i64 = 16;
+/// Schema version introducing MAP-Elites behavioral archive tables (bd-16g.6.1).
+pub const SCRIPTBOTS_SCHEMA_V17_VERSION: i64 = 17;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 16;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 17;
+
+/// Historical schema migration alias for MAP-Elites behavioral archive (bd-16g.6.1).
+pub const SCRIPTBOTS_SCHEMA_V3: &str = SCRIPTBOTS_SCHEMA_V17;
 
 /// Accumulates one tick's per-island batches and releases them only as a COMPLETE barrier.
 ///
@@ -1724,7 +1734,41 @@ const SCRIPTBOTS_SCHEMA_V16: &str = r#"
     PRAGMA user_version = 16;
 "#;
 
-const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 11] = [
+/// Schema migration V17: adds MAP-Elites behavioral archive tables (bd-16g.6.1).
+///
+/// Introduces `archive_space(run_id, space_version, axes_json)` and
+/// `archive_cells(run_id, cell_id, uid, tick_inserted, quality, descriptor, genome, genome_version)`.
+/// This migration is purely additive and leaves all existing tables (`ticks`, `metrics`,
+/// `events`, `replay_events`, `genomes`, `islands`, `migrations`) intact.
+pub const SCRIPTBOTS_SCHEMA_V17: &str = r#"
+    CREATE TABLE archive_space (
+        run_id TEXT NOT NULL,
+        space_version INTEGER NOT NULL CHECK (space_version >= 0),
+        axes_json TEXT NOT NULL CHECK (axes_json <> ''),
+        PRIMARY KEY (run_id, space_version),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+
+    CREATE TABLE archive_cells (
+        run_id TEXT NOT NULL,
+        cell_id INTEGER NOT NULL CHECK (cell_id >= 0),
+        uid INTEGER NOT NULL CHECK (uid >= 0),
+        tick_inserted INTEGER NOT NULL CHECK (tick_inserted >= 0),
+        quality REAL NOT NULL,
+        descriptor BLOB NOT NULL,
+        genome BLOB NOT NULL,
+        genome_version INTEGER NOT NULL CHECK (genome_version >= 0),
+        parent_uid INTEGER CHECK (parent_uid IS NULL OR parent_uid >= 0),
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        PRIMARY KEY (run_id, cell_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX archive_cells_run_uid_index ON archive_cells (run_id, uid);
+
+    PRAGMA user_version = 17;
+"#;
+
+const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 12] = [
     (
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         "create_multi_run_schema",
@@ -1776,9 +1820,14 @@ const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 11] = [
         SCRIPTBOTS_SCHEMA_V15,
     ),
     (
-        SCRIPTBOTS_SCHEMA_VERSION,
+        SCRIPTBOTS_SCHEMA_V16_VERSION,
         "migrations_carry_both_organism_identities",
         SCRIPTBOTS_SCHEMA_V16,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_VERSION,
+        "add_map_elites_behavioral_archive",
+        SCRIPTBOTS_SCHEMA_V17,
     ),
 ];
 
@@ -1918,7 +1967,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
     // Every suffix of the chain is a legal lineage: a database joins at whatever version it
     // was left at and runs forward from there. Enumerated rather than computed so that adding
     // a migration without extending this list fails loudly instead of accepting a gap.
-    const LINEAGE: [i64; 11] = [
+    const LINEAGE: [i64; 12] = [
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         SCRIPTBOTS_SCHEMA_V7_VERSION,
         SCRIPTBOTS_SCHEMA_V8_VERSION,
@@ -1929,6 +1978,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
         SCRIPTBOTS_SCHEMA_V13_VERSION,
         SCRIPTBOTS_SCHEMA_V14_VERSION,
         SCRIPTBOTS_SCHEMA_V15_VERSION,
+        SCRIPTBOTS_SCHEMA_V16_VERSION,
         SCRIPTBOTS_SCHEMA_VERSION,
     ];
     let applied_is_valid = result.applied.is_empty()
@@ -3808,6 +3858,9 @@ pub enum StorageError {
     /// Genome persistence and readback errors.
     #[error(transparent)]
     Genome(#[from] GenomeStorageError),
+    /// Quality-Diversity behavioral archive errors.
+    #[error(transparent)]
+    Qd(#[from] QdError),
 }
 
 /// Versioned genome persistence and readback errors.
@@ -5970,6 +6023,10 @@ struct StorageBuffer {
     genomes: Vec<GenomeRow>,
     #[serde(default)]
     migrations: Vec<MigrationRow>,
+    #[serde(default)]
+    archive_spaces: Vec<ArchiveSpaceRow>,
+    #[serde(default)]
+    archive_cells: Vec<ArchiveCellRow>,
 }
 
 /// Per-batch row counts inside [`StorageBuffer`], enabling one-batch
@@ -5991,6 +6048,8 @@ struct BufferedBatchSpan {
     run_events: usize,
     genomes: usize,
     migrations: usize,
+    archive_spaces: usize,
+    archive_cells: usize,
 }
 
 impl BufferedBatchSpan {
@@ -6007,6 +6066,8 @@ impl BufferedBatchSpan {
             run_events: buffer.run_events.len(),
             genomes: buffer.genomes.len(),
             migrations: buffer.migrations.len(),
+            archive_spaces: buffer.archive_spaces.len(),
+            archive_cells: buffer.archive_cells.len(),
         }
     }
 }
@@ -6647,6 +6708,8 @@ impl StorageBuffer {
             && self.run_events.is_empty()
             && self.genomes.is_empty()
             && self.migrations.is_empty()
+            && self.archive_spaces.is_empty()
+            && self.archive_cells.is_empty()
     }
 
     /// Total buffered rows across every table, for degraded-close reporting.
@@ -6666,6 +6729,8 @@ impl StorageBuffer {
             + self.run_events.len()
             + self.genomes.len()
             + self.migrations.len()
+            + self.archive_spaces.len()
+            + self.archive_cells.len()
     }
 
     fn clear(&mut self) {
@@ -6679,6 +6744,8 @@ impl StorageBuffer {
         self.run_events.clear();
         self.genomes.clear();
         self.migrations.clear();
+        self.archive_spaces.clear();
+        self.archive_cells.clear();
     }
 
     fn append(&mut self, mut other: Self) {
@@ -6692,6 +6759,8 @@ impl StorageBuffer {
         self.run_events.append(&mut other.run_events);
         self.genomes.append(&mut other.genomes);
         self.migrations.append(&mut other.migrations);
+        self.archive_spaces.append(&mut other.archive_spaces);
+        self.archive_cells.append(&mut other.archive_cells);
     }
 
     fn validate_contents(&self, enclosing_tick: u64) -> Result<(), StorageError> {
@@ -8030,6 +8099,87 @@ fn load_run_manifest(
         });
     }
     Ok(manifest)
+}
+
+fn load_archive_space(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<ArchiveSpaceRow>, StorageError> {
+    let rows = connection.query_with_params(
+        "SELECT space_version, axes_json
+         FROM archive_space
+         WHERE run_id = ?1
+         ORDER BY space_version DESC
+         LIMIT 1",
+        &[sqlite_run_id(run_id)],
+    )?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let row = &rows[0];
+    let space_version: i64 = decode(row, 0, "archive_space.space_version")?;
+    let axes_json: String = decode(row, 1, "archive_space.axes_json")?;
+    let space_version = u32::try_from(space_version).map_err(|error| StorageError::InvalidData {
+        context: "archive_space.space_version",
+        reason: error.to_string(),
+    })?;
+    Ok(Some(ArchiveSpaceRow {
+        space_version,
+        axes_json,
+    }))
+}
+
+fn load_archive_cells(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Vec<ArchiveCellRow>, StorageError> {
+    let rows = connection.query_with_params(
+        "SELECT cell_id, uid, tick_inserted, quality, descriptor, genome, genome_version
+         FROM archive_cells
+         WHERE run_id = ?1
+         ORDER BY cell_id ASC",
+        &[sqlite_run_id(run_id)],
+    )?;
+    let mut cells = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let cell_id_i64: i64 = decode(row, 0, "archive_cells.cell_id")?;
+        let uid_i64: i64 = decode(row, 1, "archive_cells.uid")?;
+        let tick_inserted_i64: i64 = decode(row, 2, "archive_cells.tick_inserted")?;
+        let quality: f64 = decode(row, 3, "archive_cells.quality")?;
+        let descriptor: Vec<u8> = decode(row, 4, "archive_cells.descriptor")?;
+        let genome: Vec<u8> = decode(row, 5, "archive_cells.genome")?;
+        let genome_version_i64: i64 = decode(row, 6, "archive_cells.genome_version")?;
+
+        let cell_id = usize::try_from(cell_id_i64).map_err(|error| StorageError::InvalidData {
+            context: "archive_cells.cell_id",
+            reason: error.to_string(),
+        })?;
+        let uid = u64::try_from(uid_i64).map_err(|error| StorageError::InvalidData {
+            context: "archive_cells.uid",
+            reason: error.to_string(),
+        })?;
+        let tick_inserted =
+            u64::try_from(tick_inserted_i64).map_err(|error| StorageError::InvalidData {
+                context: "archive_cells.tick_inserted",
+                reason: error.to_string(),
+            })?;
+        let genome_version =
+            u32::try_from(genome_version_i64).map_err(|error| StorageError::InvalidData {
+                context: "archive_cells.genome_version",
+                reason: error.to_string(),
+            })?;
+
+        cells.push(ArchiveCellRow {
+            cell_id,
+            uid,
+            tick_inserted,
+            quality,
+            descriptor,
+            genome,
+            genome_version,
+        });
+    }
+    Ok(cells)
 }
 
 struct FinishedRunReaderLease {
@@ -10562,6 +10712,30 @@ impl StorageReader {
         Ok(results)
     }
 
+    /// Load the most recent behavior space definition for this run.
+    pub fn archive_space(&self) -> Result<Option<ArchiveSpaceRow>, StorageError> {
+        load_archive_space(self.connection()?, self.run_id)
+    }
+
+    /// Load all archive cells stored for this run.
+    pub fn archive_cells(&self) -> Result<Vec<ArchiveCellRow>, StorageError> {
+        load_archive_cells(self.connection()?, self.run_id)
+    }
+
+    /// Reload the MAP-Elites behavioral archive for this run, if persisted.
+    pub fn reload_archive(
+        &self,
+        byte_cap: usize,
+    ) -> Result<Option<MapElitesArchive>, StorageError> {
+        let space_row = match self.archive_space()? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let cell_rows = self.archive_cells()?;
+        let archive = MapElitesArchive::from_rows(&space_row, &cell_rows, byte_cap)?;
+        Ok(Some(archive))
+    }
+
     /// Trace a locus across an ordered sequence of lineage ancestor UIDs reading from persisted storage (bd-wdyu).
     ///
     /// Reads persisted genomes for each agent in `lineage`, determines each agent's generation and tick from
@@ -12376,6 +12550,102 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist MAP-Elites behavioral archive space and cells to the database.
+    pub fn persist_map_elites_archive(
+        &mut self,
+        archive: &MapElitesArchive,
+    ) -> Result<(), StorageError> {
+        let space_row = archive
+            .to_space_row(self.run_id.as_str())
+            .map_err(|e| StorageError::InvalidData {
+                context: "archive_space",
+                reason: e.to_string(),
+            })?;
+        let cell_rows = archive
+            .to_cell_rows(self.run_id.as_str())
+            .map_err(|e| StorageError::InvalidData {
+                context: "archive_cells",
+                reason: e.to_string(),
+            })?;
+        let conn = self.connection()?;
+        let tx = conn.transaction().map_err(StorageError::from)?;
+        Self::insert_archive_space(&tx, self.run_id, &[space_row]).map_err(StorageError::from)?;
+        Self::insert_archive_cells(&tx, self.run_id, &cell_rows).map_err(StorageError::from)?;
+        tx.commit().map_err(StorageError::from)?;
+        Ok(())
+    }
+
+    /// Load the MAP-Elites behavioral archive for this run, if present.
+    pub fn load_map_elites_archive(
+        &self,
+        byte_cap: usize,
+    ) -> Result<Option<MapElitesArchive>, StorageError> {
+        let conn = self.connection()?;
+        let space_query = "SELECT space_version, axes_json FROM archive_space WHERE run_id = ?1 ORDER BY space_version DESC LIMIT 1";
+        let space_rows = conn.query_with_params(space_query, &[sqlite_run_id(self.run_id)])?;
+        let Some(space_row_first) = space_rows.first() else {
+            return Ok(None);
+        };
+        let space_version: i64 = decode(space_row_first, 0, "archive_space.space_version")?;
+        let axes_json: String = decode(space_row_first, 1, "archive_space.axes_json")?;
+        let space_row = ArchiveSpaceRow {
+            run_id: self.run_id.to_string(),
+            space_version: u16::try_from(space_version).map_err(|e| StorageError::InvalidData {
+                context: "archive_space.space_version",
+                reason: e.to_string(),
+            })?,
+            axes_json,
+        };
+
+        let space = BehaviorSpaceV0::from_space_row(&space_row).map_err(|e| StorageError::InvalidData {
+            context: "archive_space",
+            reason: e.to_string(),
+        })?;
+
+        let cells_query = "SELECT cell_id, uid, tick_inserted, quality, descriptor, genome, genome_version, parent_uid, generation
+                           FROM archive_cells WHERE run_id = ?1 ORDER BY cell_id ASC";
+        let cell_db_rows = conn.query_with_params(cells_query, &[sqlite_run_id(self.run_id)])?;
+        let mut cell_rows = Vec::with_capacity(cell_db_rows.len());
+        for row in &cell_db_rows {
+            let cell_id: i64 = decode(row, 0, "archive_cells.cell_id")?;
+            let uid: i64 = decode(row, 1, "archive_cells.uid")?;
+            let tick_inserted: i64 = decode(row, 2, "archive_cells.tick_inserted")?;
+            let quality: f64 = decode(row, 3, "archive_cells.quality")?;
+            let descriptor: Vec<u8> = decode(row, 4, "archive_cells.descriptor")?;
+            let genome: Vec<u8> = decode(row, 5, "archive_cells.genome")?;
+            let genome_version: i64 = decode(row, 6, "archive_cells.genome_version")?;
+            let parent_uid_opt: Option<i64> = decode(row, 7, "archive_cells.parent_uid")?;
+            let generation: i64 = decode(row, 8, "archive_cells.generation")?;
+
+            cell_rows.push(ArchiveCellRow {
+                run_id: self.run_id.to_string(),
+                cell_id: cell_id as u64,
+                uid: uid as u64,
+                tick_inserted: tick_inserted as u64,
+                quality,
+                descriptor,
+                genome,
+                genome_version: u32::try_from(genome_version).map_err(|e| StorageError::InvalidData {
+                    context: "archive_cells.genome_version",
+                    reason: e.to_string(),
+                })?,
+                parent_uid: parent_uid_opt.map(|p| p as u64),
+                generation: u32::try_from(generation).map_err(|e| StorageError::InvalidData {
+                    context: "archive_cells.generation",
+                    reason: e.to_string(),
+                })?,
+            });
+        }
+
+        let archive = MapElitesArchive::from_rows(space, &cell_rows, byte_cap).map_err(|e| {
+            StorageError::InvalidData {
+                context: "MapElitesArchive::from_rows",
+                reason: e.to_string(),
+            }
+        })?;
+        Ok(Some(archive))
     }
 
     /// Atomically reserve and create an unattributed file-backed database.
@@ -17595,6 +17865,58 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist a snapshot of the MAP-Elites behavioral archive (space and cells) for this run.
+    pub fn persist_archive_snapshot(
+        &mut self,
+        space: &ArchiveSpaceRow,
+        cells: &[ArchiveCellRow],
+    ) -> Result<(), StorageError> {
+        let mut tx = self.connection()?.transaction()?;
+        let res = (|| -> Result<(), StorageError> {
+            Self::insert_archive_space(&tx, self.run_id, std::slice::from_ref(space))?;
+            Self::insert_archive_cells(&tx, self.run_id, cells)?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                tx.commit()?;
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "scriptbots::qd::archive",
+                    error = %e,
+                    "failed to persist MAP-Elites archive snapshot"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Load the most recent behavior space definition for this run.
+    pub fn archive_space(&self) -> Result<Option<ArchiveSpaceRow>, StorageError> {
+        load_archive_space(self.connection()?, self.run_id)
+    }
+
+    /// Load all archive cells stored for this run.
+    pub fn archive_cells(&self) -> Result<Vec<ArchiveCellRow>, StorageError> {
+        load_archive_cells(self.connection()?, self.run_id)
+    }
+
+    /// Reload the MAP-Elites behavioral archive for this run, if persisted.
+    pub fn reload_archive(
+        &self,
+        byte_cap: usize,
+    ) -> Result<Option<MapElitesArchive>, StorageError> {
+        let space_row = match self.archive_space()? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let cell_rows = self.archive_cells()?;
+        let archive = MapElitesArchive::from_rows(&space_row, &cell_rows, byte_cap)?;
+        Ok(Some(archive))
+    }
+
     /// Whether the buffered row counts have crossed any flush threshold.
     fn flush_due(&self) -> bool {
         self.buffer.ticks.len() >= self.tick_flush_threshold
@@ -18098,6 +18420,72 @@ impl Storage {
         Ok(())
     }
 
+    fn insert_archive_space(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[ArchiveSpaceRow],
+    ) -> Result<(), FrankenError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sql = "insert into archive_space (
+                run_id, space_version, axes_json
+            ) values (?1, ?2, ?3)
+            on conflict (run_id, space_version) do update set
+                axes_json = excluded.axes_json";
+        for row in rows {
+            tx.execute_with_params(
+                sql,
+                &[
+                    sqlite_run_id(run_id),
+                    (i64::from(row.space_version)).into(),
+                    row.axes_json.as_str().into(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_archive_cells(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[ArchiveCellRow],
+    ) -> Result<(), FrankenError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sql = "insert into archive_cells (
+                run_id, cell_id, uid, tick_inserted, quality, descriptor, genome, genome_version, parent_uid, generation
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            on conflict (run_id, cell_id) do update set
+                uid = excluded.uid,
+                tick_inserted = excluded.tick_inserted,
+                quality = excluded.quality,
+                descriptor = excluded.descriptor,
+                genome = excluded.genome,
+                genome_version = excluded.genome_version,
+                parent_uid = excluded.parent_uid,
+                generation = excluded.generation";
+        for row in rows {
+            tx.execute_with_params(
+                sql,
+                &[
+                    sqlite_run_id(run_id),
+                    (row.cell_id as i64).into(),
+                    (row.uid as i64).into(),
+                    (row.tick_inserted as i64).into(),
+                    row.quality.into(),
+                    row.descriptor.as_slice().into(),
+                    row.genome.as_slice().into(),
+                    (i64::from(row.genome_version)).into(),
+                    sqlite_optional_i64(row.parent_uid.map(|p| p as i64)),
+                    (i64::from(row.generation)).into(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn flush_attempt(
         connection: &Connection,
         path: &str,
@@ -18163,6 +18551,8 @@ impl Storage {
             Self::insert_run_events(&tx, run_id, &buffer.run_events)?;
             Self::insert_genomes(&tx, run_id, &buffer.genomes)?;
             Self::insert_migrations(&tx, run_id, &buffer.migrations)?;
+            Self::insert_archive_space(&tx, run_id, &buffer.archive_spaces)?;
+            Self::insert_archive_cells(&tx, run_id, &buffer.archive_cells)?;
             #[cfg(test)]
             fail_at_host_journal_transaction_fault(
                 path,
@@ -18326,6 +18716,8 @@ impl Storage {
                 run_events: self.buffer.run_events.len(),
                 genomes: self.buffer.genomes.len(),
                 migrations: self.buffer.migrations.len(),
+                archive_spaces: self.buffer.archive_spaces.len(),
+                archive_cells: self.buffer.archive_cells.len(),
             },
         };
         if self.buffer.is_empty() {
@@ -18346,6 +18738,8 @@ impl Storage {
             run_events: self.buffer.run_events[..span.run_events].to_vec(),
             genomes: self.buffer.genomes[..span.genomes].to_vec(),
             migrations: self.buffer.migrations[..span.migrations].to_vec(),
+            archive_spaces: self.buffer.archive_spaces[..span.archive_spaces].to_vec(),
+            archive_cells: self.buffer.archive_cells[..span.archive_cells].to_vec(),
         };
         let connection = self.connection()?;
         let mut attempt = 1_u8;
@@ -18404,6 +18798,8 @@ impl Storage {
                     self.buffer.run_events.drain(..span.run_events);
                     self.buffer.genomes.drain(..span.genomes);
                     self.buffer.migrations.drain(..span.migrations);
+                    self.buffer.archive_spaces.drain(..span.archive_spaces);
+                    self.buffer.archive_cells.drain(..span.archive_cells);
                     self.buffered_outbox_ids.remove(0);
                     self.buffered_batch_spans.remove(0);
                     return Ok(true);
@@ -25700,8 +26096,12 @@ mod tests {
                 "partition_per_tick_tables_by_island",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V16_VERSION,
                 "migrations_carry_both_organism_identities",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_map_elites_behavioral_archive",
             ),
         ];
         assert_eq!(migrations.len(), expected.len());
@@ -26775,8 +27175,12 @@ mod tests {
                 "partition_per_tick_tables_by_island",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V16_VERSION,
                 "migrations_carry_both_organism_identities",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "add_map_elites_behavioral_archive",
             ),
         ]
         .into_iter()
@@ -28152,7 +28556,8 @@ mod tests {
                 (13, 'add_durable_command_claims', 'forged'),
                 (14, 'add_narrative_input_replay_contract', 'forged'),
                 (15, 'partition_per_tick_tables_by_island', 'forged'),
-                (16, 'migrations_carry_both_organism_identities', 'forged');
+                (16, 'migrations_carry_both_organism_identities', 'forged'),
+                (17, 'add_map_elites_behavioral_archive', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -28162,7 +28567,7 @@ mod tests {
                 PRIMARY KEY (run_id, singleton)
              );
              INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 16;",
+             PRAGMA user_version = 17;",
         )?;
         connection.close()?;
 
