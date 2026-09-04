@@ -1013,7 +1013,7 @@ Helpful docs:
 
 ## Licensing
 
-ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT with an additional rider (see `LICENSE`): **no rights are granted to OpenAI, Anthropic, their affiliates, or parties acting for them**, and any distribution of the software or derivative works must include the rider unmodified. This is the same license the embedded FrankenSQLite/asupersync components carry, so the whole product ships under one uniform license (owner relicensing decision, 2026-07-13; previously the first-party code was declared `MIT OR Apache-2.0`). Release archives bundle `THIRD-PARTY-LICENSES.md` for embedded-component notices; full audit: `docs/licenses.md`.
+ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT with an additional rider (see [`LICENSE`](LICENSE)): **no rights are granted to OpenAI, Anthropic, their affiliates, or parties acting for them**, and any distribution of the software or derivative works must include the rider unmodified. This is the same license the embedded FrankenSQLite/asupersync components carry, so the whole product ships under one uniform license (owner relicensing decision, 2026-07-13; previously the first-party code was declared `MIT OR Apache-2.0`). Release archives bundle [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md) for embedded-component notices; full audit: [`docs/licenses.md`](docs/licenses.md).
 
 ## Credits
 - Original ScriptBots by Andrej Karpathy (reference snapshot included under `original_scriptbots_code_for_reference/`).

@@ -96,11 +96,16 @@ combined work containing rider-licensed object code. Two obligations follow:
 
 1. Release artifacts **must bundle a third-party license notice including the
    rider text unmodified** ("any distribution … must include this rider
-   provision unmodified"). Tracked as its own work item: **bd-2z0.13.6**.
+   provision unmodified"). **Satisfied (bd-2z0.13.6, bd-2z0.13.7)**: Release
+   artifacts bundle `THIRD-PARTY-LICENSES.md` via `[workspace.metadata.dist] include`,
+   verified by `ci/check_franken_licenses.sh --third-party` and release extraction
+   assertions (checking canonical rider sha `32a82e0a5754e72e51fae44b65a936c831c07376f21c90f5fb9e76897fcc3509`
+   and all lockfile packages). Complete community license texts and inventory are included.
 2. Third-party *redistributors* of our binaries are bound by the rider for the
    embedded components — including the prohibition on making them available to
-   Restricted Parties. Our README license section must disclose this so
-   redistribution is informed (also bd-2z0.13.6).
+   Restricted Parties. **Satisfied (bd-2z0.13.6, bd-2z0.13.7)**: Our `README.md`
+   Licensing section explicitly discloses this, linking `docs/licenses.md` and
+   `THIRD-PARTY-LICENSES.md`, guarded by `ci/check_franken_licenses.sh --readme-guard`.
 
 **(d) Residual ambiguity, recorded honestly.** Whether public hosting of a
 *combined* binary by a non-owner redistributor "makes available" the embedded
