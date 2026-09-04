@@ -105,7 +105,7 @@ pub use checkpoint::{
 pub use channels::{
     BOOST_THRESHOLD, IoLayoutError, OutputChannel, OutputsExt, SENSOR_LAYOUT, SENSOR_LAYOUT_DIGEST,
     SensorChannel, SensorField, SensorKind, SensorSource, SensorsExt, WorldIoLayout,
-    compute_sensor_layout_digest, sensor_layout,
+    compute_sensor_layout_digest, sensor_field, sensor_layout,
 };
 use rng_domains::{
     AgentRngCounterError, AgentRngCountersV1, AgentRngOperationV1, AgentSubstreamProtocolV1,

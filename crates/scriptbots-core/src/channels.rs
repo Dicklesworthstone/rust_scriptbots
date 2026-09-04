@@ -252,6 +252,18 @@ pub const fn sensor_layout() -> &'static [SensorChannel; INPUT_SIZE] {
     &SENSOR_LAYOUT
 }
 
+/// Returns the sensor channel metadata for a given index, or `None` if out of bounds (`bd-16g.4.1`).
+///
+/// Total and non-panicking.
+#[must_use]
+pub const fn sensor_field(index: usize) -> Option<&'static SensorChannel> {
+    if index < INPUT_SIZE {
+        Some(&SENSOR_LAYOUT[index])
+    } else {
+        None
+    }
+}
+
 /// The canonical sensor layout, in wire order.
 ///
 /// This mirrors `World::setInputs` in the legacy C++ exactly:
@@ -668,7 +680,10 @@ mod tests {
             assert_eq!(c.source(), c.source);
             assert_eq!(c.eye_index(), c.eye);
             assert_eq!(c.clock_index(), c.clock);
+            assert_eq!(sensor_field(i), Some(c));
         }
+        assert_eq!(sensor_field(INPUT_SIZE), None);
+        assert_eq!(sensor_field(INPUT_SIZE + 42), None);
     }
 
     #[test]
