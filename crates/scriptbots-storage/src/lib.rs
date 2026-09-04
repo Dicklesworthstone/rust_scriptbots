@@ -5972,6 +5972,45 @@ struct StorageBuffer {
     migrations: Vec<MigrationRow>,
 }
 
+/// Per-batch row counts inside [`StorageBuffer`], enabling one-batch
+/// application (bd-w1oi): the oldest buffered batch commits in its own
+/// transaction, so a Persist command's admission acknowledgement waits behind
+/// at most one batch apply instead of an unbounded multi-batch transaction.
+/// Counts are relative — the first span always starts at index zero because
+/// applied prefixes are drained from the shared buffer on success.
+#[derive(Debug, Clone, Copy)]
+struct BufferedBatchSpan {
+    batch_id: PersistenceBatchId,
+    ticks: usize,
+    metrics: usize,
+    events: usize,
+    agents: usize,
+    births: usize,
+    deaths: usize,
+    replay_events: usize,
+    run_events: usize,
+    genomes: usize,
+    migrations: usize,
+}
+
+impl BufferedBatchSpan {
+    fn record(batch_id: PersistenceBatchId, buffer: &StorageBuffer) -> Self {
+        Self {
+            batch_id,
+            ticks: buffer.ticks.len(),
+            metrics: buffer.metrics.len(),
+            events: buffer.events.len(),
+            agents: buffer.agents.len(),
+            births: buffer.births.len(),
+            deaths: buffer.deaths.len(),
+            replay_events: buffer.replay_events.len(),
+            run_events: buffer.run_events.len(),
+            genomes: buffer.genomes.len(),
+            migrations: buffer.migrations.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum HostJournalState {
     Admitted,
@@ -12289,6 +12328,7 @@ pub struct Storage {
     terminally_failed: bool,
     buffer: StorageBuffer,
     buffered_outbox_ids: Vec<PersistenceBatchId>,
+    buffered_batch_spans: Vec<BufferedBatchSpan>,
     next_batch_id: u64,
     tick_flush_threshold: usize,
     agent_flush_threshold: usize,
@@ -12664,6 +12704,7 @@ impl Storage {
             terminally_failed: false,
             buffer: StorageBuffer::default(),
             buffered_outbox_ids: Vec::new(),
+            buffered_batch_spans: Vec::new(),
             next_batch_id: 1,
             tick_flush_threshold: tick,
             agent_flush_threshold: agent,
@@ -17219,8 +17260,7 @@ impl Storage {
                 batch.batch_id,
                 batch.tick,
             )?;
-            self.buffer.append(batch.storage);
-            self.buffered_outbox_ids.push(batch.batch_id);
+            self.append_staged(batch.batch_id, batch.storage)?;
             next_unapplied += 1;
         }
 
@@ -17379,16 +17419,32 @@ impl Storage {
         Ok(prepared)
     }
 
+    /// Buffer one admitted batch for application without triggering a flush
+    /// (bd-w1oi). The async worker appends with this and interleaves one-batch
+    /// applies between command services so admission acknowledgements stay
+    /// bounded; same-thread [`Self::persist`] keeps the threshold-triggered
+    /// [`Self::enqueue_staged`] behavior.
+    fn append_staged(
+        &mut self,
+        batch_id: PersistenceBatchId,
+        prepared: StorageBuffer,
+    ) -> Result<(), StorageError> {
+        if self.terminally_failed {
+            return Err(StorageError::TerminallyFailed);
+        }
+        self.buffered_batch_spans
+            .push(BufferedBatchSpan::record(batch_id, &prepared));
+        self.buffer.append(prepared);
+        self.buffered_outbox_ids.push(batch_id);
+        Ok(())
+    }
+
     fn enqueue_staged(
         &mut self,
         batch_id: PersistenceBatchId,
         prepared: StorageBuffer,
     ) -> Result<bool, StorageError> {
-        if self.terminally_failed {
-            return Err(StorageError::TerminallyFailed);
-        }
-        self.buffer.append(prepared);
-        self.buffered_outbox_ids.push(batch_id);
+        self.append_staged(batch_id, prepared)?;
         self.maybe_flush()
     }
 
@@ -17539,15 +17595,19 @@ impl Storage {
         Ok(())
     }
 
-    fn maybe_flush(&mut self) -> Result<bool, StorageError> {
-        if self.buffer.ticks.len() >= self.tick_flush_threshold
+    /// Whether the buffered row counts have crossed any flush threshold.
+    fn flush_due(&self) -> bool {
+        self.buffer.ticks.len() >= self.tick_flush_threshold
             || self.buffer.metrics.len() >= self.metric_flush_threshold
             || self.buffer.events.len() >= self.event_flush_threshold
             || self.buffer.agents.len() >= self.agent_flush_threshold
             || self.buffer.births.len() >= self.birth_flush_threshold
             || self.buffer.deaths.len() >= self.death_flush_threshold
             || self.buffer.replay_events.len() >= self.replay_flush_threshold
-        {
+    }
+
+    fn maybe_flush(&mut self) -> Result<bool, StorageError> {
+        if self.flush_due() {
             self.flush()?;
             return Ok(true);
         }
@@ -18222,14 +18282,71 @@ impl Storage {
     }
 
     /// Force flush buffered records, retrying only fully rolled-back transient transactions.
+    ///
+    /// Since bd-w1oi each buffered batch commits in its own transaction via
+    /// [`Self::flush_one`], so a crash mid-drain leaves only the tail still
+    /// admitted-but-unapplied (exactly what recovery replays).
     pub fn flush(&mut self) -> Result<(), StorageError> {
         if self.terminally_failed {
             return Err(StorageError::TerminallyFailed);
         }
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
+        while self.flush_one()? {}
+        Ok(())
+    }
 
+    /// Apply the OLDEST buffered batch in its own transaction (bd-w1oi).
+    ///
+    /// Returns `Ok(true)` when a batch was applied and `Ok(false)` when
+    /// nothing was buffered. The async worker interleaves these one-batch
+    /// applies between command services, so a Persist command's admission
+    /// acknowledgement waits behind at most one batch apply instead of an
+    /// unbounded multi-batch transaction.
+    fn flush_one(&mut self) -> Result<bool, StorageError> {
+        if self.terminally_failed {
+            return Err(StorageError::TerminallyFailed);
+        }
+        // Defensive fallback: batches appended without a span (none remain
+        // today — recovery records spans too) keep the historical whole-buffer
+        // transaction semantics instead of being silently skipped.
+        let span = match self.buffered_batch_spans.first().copied() {
+            Some(span) => span,
+            None if self.buffer.is_empty() => return Ok(false),
+            None => BufferedBatchSpan {
+                batch_id: match self.buffered_outbox_ids.last().copied() {
+                    Some(batch_id) => batch_id,
+                    None => return Ok(false),
+                },
+                ticks: self.buffer.ticks.len(),
+                metrics: self.buffer.metrics.len(),
+                events: self.buffer.events.len(),
+                agents: self.buffer.agents.len(),
+                births: self.buffer.births.len(),
+                deaths: self.buffer.deaths.len(),
+                replay_events: self.buffer.replay_events.len(),
+                run_events: self.buffer.run_events.len(),
+                genomes: self.buffer.genomes.len(),
+                migrations: self.buffer.migrations.len(),
+            },
+        };
+        if self.buffer.is_empty() {
+            self.buffered_batch_spans.clear();
+            self.buffered_outbox_ids.clear();
+            return Ok(false);
+        }
+        // The first span always starts at index zero: applied prefixes are
+        // drained below, so relative counts address the live buffer directly.
+        let batch = StorageBuffer {
+            ticks: self.buffer.ticks[..span.ticks].to_vec(),
+            metrics: self.buffer.metrics[..span.metrics].to_vec(),
+            events: self.buffer.events[..span.events].to_vec(),
+            agents: self.buffer.agents[..span.agents].to_vec(),
+            births: self.buffer.births[..span.births].to_vec(),
+            deaths: self.buffer.deaths[..span.deaths].to_vec(),
+            replay_events: self.buffer.replay_events[..span.replay_events].to_vec(),
+            run_events: self.buffer.run_events[..span.run_events].to_vec(),
+            genomes: self.buffer.genomes[..span.genomes].to_vec(),
+            migrations: self.buffer.migrations[..span.migrations].to_vec(),
+        };
         let connection = self.connection()?;
         let mut attempt = 1_u8;
         loop {
@@ -18237,11 +18354,11 @@ impl Storage {
                 connection,
                 &self.path,
                 self.run_id,
-                &self.buffer,
-                &self.buffered_outbox_ids,
+                &batch,
+                &[span.batch_id],
             ) {
                 Ok(()) => {
-                    for event in &self.buffer.run_events {
+                    for event in &batch.run_events {
                         let identity = format!(
                             "v1/{}/{}/{}:{}",
                             event.tick,
@@ -18272,13 +18389,24 @@ impl Storage {
                     info!(
                         path = %self.path,
                         attempt,
-                        rows = self.buffer.ticks.len(),
-                        batches = self.buffered_outbox_ids.len(),
+                        rows = batch.row_count(),
+                        batches = 1,
+                        batch_id = span.batch_id.get(),
                         "FrankenSQLite storage transaction committed"
                     );
-                    self.buffer.clear();
-                    self.buffered_outbox_ids.clear();
-                    return Ok(());
+                    self.buffer.ticks.drain(..span.ticks);
+                    self.buffer.metrics.drain(..span.metrics);
+                    self.buffer.events.drain(..span.events);
+                    self.buffer.agents.drain(..span.agents);
+                    self.buffer.births.drain(..span.births);
+                    self.buffer.deaths.drain(..span.deaths);
+                    self.buffer.replay_events.drain(..span.replay_events);
+                    self.buffer.run_events.drain(..span.run_events);
+                    self.buffer.genomes.drain(..span.genomes);
+                    self.buffer.migrations.drain(..span.migrations);
+                    self.buffered_outbox_ids.remove(0);
+                    self.buffered_batch_spans.remove(0);
+                    return Ok(true);
                 }
                 Err(error) if should_retry_transaction(&error, attempt) => {
                     warn!(
@@ -20786,12 +20914,23 @@ fn storage_worker(
                             continue;
                         }
                         state.pending_analytics.push((receipt.batch_id, pending));
-                        match storage.enqueue_staged(receipt.batch_id, prepared) {
-                            Ok(flushed) => {
+                        // bd-w1oi: append without flushing, then apply at most
+                        // ONE buffered batch before returning to rx.recv(). A
+                        // queued Persist is therefore staged and acknowledged
+                        // after at most one batch apply, so its admission
+                        // acknowledgement can no longer queue behind an
+                        // unbounded flush and hit the deadline that latched the
+                        // science boundary. Sustained overload still fails
+                        // closed through the byte-budget permits.
+                        match storage.append_staged(receipt.batch_id, prepared) {
+                            Ok(()) => {
                                 state.pending_permits.push((receipt.batch_id, permit));
-                                if flushed
-                                    && let Err(error) =
-                                        flush_worker_storage(&mut storage, &mut state, &analytics)
+                                if storage.flush_due()
+                                    && let Err(error) = flush_one_worker_storage(
+                                        &mut storage,
+                                        &mut state,
+                                        &analytics,
+                                    )
                                 {
                                     analytics.publish_worker_error(&error, true);
                                     storage.abandon_after_error();
@@ -21213,20 +21352,14 @@ fn release_finalized_permits(state: &mut WorkerState) {
     drop(state.pending_permits.drain(..eligible));
 }
 
-fn flush_worker_storage(
+/// Refresh watermarks, publish committed analytics, finalize the applied
+/// prefix durable, and release the permits it covers. Shared by the drain-all
+/// flush and the one-batch interleave (bd-w1oi).
+fn finalize_and_publish_worker(
     storage: &mut Storage,
     state: &mut WorkerState,
     analytics: &AnalyticsSnapshotProvider,
-) -> Result<FlushReceipt, StorageWorkerError> {
-    storage.flush().map_err(|error| {
-        worker_error_from_storage(
-            StorageOperation::Flush,
-            &storage.path,
-            state.admitted_tick,
-            FailureCommitState::Indeterminate,
-            error,
-        )
-    })?;
+) -> Result<(), StorageWorkerError> {
     state.watermarks = storage.persistence_watermarks().map_err(|error| {
         worker_error_from_storage(
             StorageOperation::Flush,
@@ -21256,6 +21389,46 @@ fn flush_worker_storage(
     };
     publish_committed_state(state, analytics);
     release_finalized_permits(state);
+    Ok(())
+}
+
+/// Apply ONE buffered batch and run the durability dance for it (bd-w1oi).
+///
+/// The worker's Persist arm calls this instead of draining the whole buffer so
+/// the command loop returns to `rx.recv()` between applies and queued
+/// admission acknowledgements never queue behind an unbounded flush.
+fn flush_one_worker_storage(
+    storage: &mut Storage,
+    state: &mut WorkerState,
+    analytics: &AnalyticsSnapshotProvider,
+) -> Result<(), StorageWorkerError> {
+    storage.flush_one().map_err(|error| {
+        worker_error_from_storage(
+            StorageOperation::Flush,
+            &storage.path,
+            state.admitted_tick,
+            FailureCommitState::Indeterminate,
+            error,
+        )
+    })?;
+    finalize_and_publish_worker(storage, state, analytics)
+}
+
+fn flush_worker_storage(
+    storage: &mut Storage,
+    state: &mut WorkerState,
+    analytics: &AnalyticsSnapshotProvider,
+) -> Result<FlushReceipt, StorageWorkerError> {
+    storage.flush().map_err(|error| {
+        worker_error_from_storage(
+            StorageOperation::Flush,
+            &storage.path,
+            state.admitted_tick,
+            FailureCommitState::Indeterminate,
+            error,
+        )
+    })?;
+    finalize_and_publish_worker(storage, state, analytics)?;
     Ok(FlushReceipt {
         committed_tick: state.committed_tick,
         guarantee: state.guarantee,
