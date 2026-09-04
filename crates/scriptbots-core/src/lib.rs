@@ -85,6 +85,13 @@ pub mod sense_fixed;
 pub mod species;
 pub mod visual;
 
+pub use map_elites as qd;
+pub use map_elites::{
+    AgentAccumulatedStats, ArchiveCellRow, ArchiveEntry, ArchiveProvenance, ArchiveSpaceRow, Axis,
+    BehaviorDescriptor, BehaviorSpaceV0, CellId, InsertionResult, MAX_ARCHIVE_CELLS,
+    MapElitesArchive, PhenotypeFeature, QdError, QualityMetric, compute_novelty_score,
+};
+
 pub use economy::{
     DietCensus, EpochFlows, FoodWebSummaryReport, KirchhoffViolation, NodeClass, SankeyGraph,
     SankeyLink, SankeyNode, SankeyOpts, TrophicRow, TrophicTable, render_trophic_table,
@@ -247,6 +254,12 @@ impl AgentUid {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+}
+
+impl fmt::Display for AgentUid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
     }
 }
 
@@ -8199,6 +8212,55 @@ const fn interaction_event_tick_stride_is_digest_sentinel(value: &u32) -> bool {
     *value == DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE
 }
 
+const DIGEST_NEUTRAL_ARCHIVE_INTERVAL: u64 = u64::MAX;
+const DIGEST_NEUTRAL_ARCHIVE_MIN_LIFETIME_TICKS: u32 = u32::MAX;
+const DIGEST_NEUTRAL_ARCHIVE_MAX_CELLS: u64 = u64::MAX;
+const DIGEST_NEUTRAL_ARCHIVE_MAX_BYTES: usize = usize::MAX;
+
+const fn default_archive_enabled() -> bool {
+    false
+}
+const fn default_archive_interval() -> u64 {
+    500
+}
+const fn default_archive_min_lifetime_ticks() -> u32 {
+    200
+}
+const fn default_archive_max_cells() -> u64 {
+    100_000
+}
+const fn default_archive_max_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_archive_quality_metric() -> QualityMetric {
+    QualityMetric::LifetimeIntake
+}
+fn default_archive_space() -> BehaviorSpaceV0 {
+    BehaviorSpaceV0::default()
+}
+
+const fn archive_enabled_is_digest_sentinel(value: &bool) -> bool {
+    !*value
+}
+const fn archive_interval_is_digest_sentinel(value: &u64) -> bool {
+    *value == DIGEST_NEUTRAL_ARCHIVE_INTERVAL
+}
+const fn archive_min_lifetime_is_digest_sentinel(value: &u32) -> bool {
+    *value == DIGEST_NEUTRAL_ARCHIVE_MIN_LIFETIME_TICKS
+}
+const fn archive_max_cells_is_digest_sentinel(value: &u64) -> bool {
+    *value == DIGEST_NEUTRAL_ARCHIVE_MAX_CELLS
+}
+const fn archive_max_bytes_is_digest_sentinel(value: &usize) -> bool {
+    *value == DIGEST_NEUTRAL_ARCHIVE_MAX_BYTES
+}
+fn archive_metric_is_digest_sentinel(value: &QualityMetric) -> bool {
+    *value == QualityMetric::LifetimeIntake
+}
+fn archive_space_is_digest_sentinel(value: &BehaviorSpaceV0) -> bool {
+    value.axes.is_empty()
+}
+
 /// Persistence event kind recording pairwise interactions observed by the simulation.
 pub const INTERACTION_EVENTS_OBSERVED_KIND: &str = "interaction_events_observed";
 /// Persistence event kind recording pairwise interactions emitted to durable projection.
@@ -12785,6 +12847,48 @@ pub struct ScriptBotsConfig {
         skip_serializing_if = "interaction_event_tick_stride_is_digest_sentinel"
     )]
     pub interaction_event_tick_stride: u32,
+    /// Whether MAP-Elites behavioral archive evaluation is enabled (bd-16g.6.1).
+    #[serde(
+        default = "default_archive_enabled",
+        skip_serializing_if = "archive_enabled_is_digest_sentinel"
+    )]
+    pub archive_enabled: bool,
+    /// Cadence in ticks for evaluating live agents into the MAP-Elites archive (default 500).
+    #[serde(
+        default = "default_archive_interval",
+        skip_serializing_if = "archive_interval_is_digest_sentinel"
+    )]
+    pub archive_interval: u64,
+    /// Minimum lifetime in ticks an agent must have survived to be evaluated (default 200).
+    #[serde(
+        default = "default_archive_min_lifetime_ticks",
+        skip_serializing_if = "archive_min_lifetime_is_digest_sentinel"
+    )]
+    pub archive_min_lifetime_ticks: u32,
+    /// Maximum allowed grid cells in the MAP-Elites archive (default 100_000, max 1_000_000).
+    #[serde(
+        default = "default_archive_max_cells",
+        skip_serializing_if = "archive_max_cells_is_digest_sentinel"
+    )]
+    pub archive_max_cells: u64,
+    /// Maximum memory consumption in bytes for the archive (default 64MB).
+    #[serde(
+        default = "default_archive_max_bytes",
+        skip_serializing_if = "archive_max_bytes_is_digest_sentinel"
+    )]
+    pub archive_max_bytes: usize,
+    /// Quality metric for elite replacement in MAP-Elites (default LifetimeIntake).
+    #[serde(
+        default = "default_archive_quality_metric",
+        skip_serializing_if = "archive_metric_is_digest_sentinel"
+    )]
+    pub archive_quality_metric: QualityMetric,
+    /// Behavioral space definition for MAP-Elites grid discretization.
+    #[serde(
+        default = "default_archive_space",
+        skip_serializing_if = "archive_space_is_digest_sentinel"
+    )]
+    pub archive_space: BehaviorSpaceV0,
 }
 
 // `f32::cos` is supplied by each target's math runtime and may round the last bit
@@ -12899,6 +13003,13 @@ impl Default for ScriptBotsConfig {
             },
             control: ControlSettings::default(),
             render: RenderSettings::default(),
+            archive_enabled: false,
+            archive_interval: 500,
+            archive_min_lifetime_ticks: 200,
+            archive_max_cells: 100_000,
+            archive_max_bytes: 64 * 1024 * 1024,
+            archive_quality_metric: QualityMetric::LifetimeIntake,
+            archive_space: BehaviorSpaceV0::default(),
         }
     }
 }
@@ -13619,6 +13730,50 @@ impl ScriptBotsConfig {
             "history_capacity must be at least 1"
         );
         self.render.validate()?;
+        if self.archive_max_cells != u64::MAX {
+            reject_unless!(
+                self.archive_max_cells <= MAX_ARCHIVE_CELLS,
+                "archive_max_cells must not exceed 1000000"
+            );
+        }
+        if self.archive_enabled {
+            reject_unless!(
+                self.archive_interval > 0,
+                "archive_interval must be non-zero"
+            );
+            if let Err(QdError::CellCapacityExceeded { .. }) =
+                self.archive_space.validate_with_cap(self.archive_max_cells)
+            {
+                return Err(WorldStateError::InvalidConfig(
+                    "archive_space exceeds max cell capacity (1000000)",
+                ));
+            } else if self
+                .archive_space
+                .validate_with_cap(self.archive_max_cells)
+                .is_err()
+            {
+                return Err(WorldStateError::InvalidConfig(
+                    "archive_space violates capacity or validity",
+                ));
+            }
+        } else if !self.archive_space.axes.is_empty() {
+            if let Err(QdError::CellCapacityExceeded { .. }) = self
+                .archive_space
+                .validate_with_cap(self.archive_max_cells.min(MAX_ARCHIVE_CELLS))
+            {
+                return Err(WorldStateError::InvalidConfig(
+                    "archive_space exceeds max cell capacity (1000000)",
+                ));
+            } else if self
+                .archive_space
+                .validate_with_cap(self.archive_max_cells.min(MAX_ARCHIVE_CELLS))
+                .is_err()
+            {
+                return Err(WorldStateError::InvalidConfig(
+                    "archive_space violates capacity or validity",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -18160,6 +18315,9 @@ pub struct WorldState {
     config_audit: Vec<ConfigAuditEntry>,
     config_revision: u64,
     resource_ledger: ResourceLedgerState,
+    archive: Option<MapElitesArchive>,
+    agent_stats: BTreeMap<AgentUid, AgentAccumulatedStats>,
+    archive_evaluations: u64,
 }
 
 // bd-tqpj: intentional curated summary — a full-field Debug would dump entire world
@@ -18912,6 +19070,21 @@ impl WorldState {
         );
         let history_capacity = config.history_capacity;
         let cadence = TickCadence::from_config(&config);
+        let archive = if config.archive_enabled {
+            Some(
+                MapElitesArchive::new(
+                    config.archive_space.clone(),
+                    config.archive_quality_metric,
+                    config.archive_min_lifetime_ticks,
+                    config.archive_max_bytes,
+                )
+                .map_err(|_| {
+                    WorldStateError::InvalidConfig("invalid map_elites archive configuration")
+                })?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             food,
             terrain,
@@ -19001,6 +19174,9 @@ impl WorldState {
             config_audit: Vec::with_capacity(32),
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
+            archive,
+            agent_stats: BTreeMap::new(),
+            archive_evaluations: 0,
         })
     }
 
@@ -21247,6 +21423,182 @@ impl WorldState {
         self.pending_spike_hit_events = self
             .pending_spike_hit_events
             .saturating_add(self.combat_spike_hits);
+    }
+
+    fn stage_accumulate_agent_stats(&mut self) {
+        let mut handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        handles.sort_unstable_by_key(|id| {
+            self.identities
+                .get(*id)
+                .map_or(id.data().as_ffi(), |ident| ident.uid.0)
+        });
+        for handle in handles {
+            let Some(identity) = self.identities.get(handle) else {
+                continue;
+            };
+            let Some(data) = self.agents.snapshot(handle) else {
+                continue;
+            };
+            let Some(runtime) = self.runtime.get(handle) else {
+                continue;
+            };
+            let speed = data.velocity.vx.hypot(data.velocity.vy);
+            let stats = self.agent_stats.entry(identity.uid).or_default();
+            stats.record_tick(
+                speed,
+                data.heading,
+                runtime.spiked,
+                runtime.give_intent,
+                runtime.sound_output,
+                runtime.food_delta,
+            );
+        }
+    }
+
+    fn stage_archive_maintenance(&mut self, next_tick: Tick) {
+        let Some(mut archive) = self.archive.take() else {
+            return;
+        };
+        self.archive_evaluations = self.archive_evaluations.saturating_add(1);
+
+        let mut live_agents: Vec<(AgentUid, AgentId)> = Vec::with_capacity(self.agents.len());
+        for handle in self.agents.iter_handles() {
+            if let Some(identity) = self.identities.get(handle) {
+                live_agents.push((identity.uid, handle));
+            }
+        }
+        live_agents.sort_unstable_by_key(|(uid, _)| uid.0);
+
+        let total_pop = live_agents.len();
+        let min_lifetime = archive.min_lifetime_ticks;
+
+        let mut rejected_count = 0usize;
+        let mut evaluated_candidates = Vec::new();
+        let num_axes = archive.space.axes.len();
+        let mut axis_bins: Vec<Vec<u8>> = vec![Vec::new(); num_axes];
+
+        for (uid, handle) in live_agents {
+            let Some(data) = self.agents.snapshot(handle) else {
+                continue;
+            };
+            let Some(stats) = self.agent_stats.get(&uid) else {
+                continue;
+            };
+            if stats.ticks_observed < min_lifetime {
+                rejected_count = rejected_count.saturating_add(1);
+                continue;
+            }
+            let Some(runtime) = self.runtime.get(handle) else {
+                continue;
+            };
+            let Some(genome) = self.agent_brain_genome(handle) else {
+                continue;
+            };
+
+            let descriptor = match stats.compute_descriptor(&archive.space, runtime) {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "scriptbots::qd::archive",
+                        tick = %next_tick.0,
+                        uid = %uid.0,
+                        error = %err,
+                        "failed to compute behavior descriptor for agent"
+                    );
+                    continue;
+                }
+            };
+
+            for (axis_idx, (axis, &val)) in archive
+                .space
+                .axes
+                .iter()
+                .zip(descriptor.as_slice())
+                .enumerate()
+            {
+                if let Ok(bin) = axis.discretize(val, axis_idx) {
+                    axis_bins[axis_idx].push(bin);
+                }
+            }
+
+            let quality = archive.quality_metric.compute(runtime, &data, stats);
+            let provenance = ArchiveProvenance {
+                run_id: String::new(),
+                parent_uid: runtime.lineage[0],
+                generation: data.generation,
+            };
+
+            let entry = ArchiveEntry {
+                uid,
+                tick_inserted: next_tick,
+                descriptor,
+                quality,
+                genome: genome.clone(),
+                provenance,
+            };
+
+            evaluated_candidates.push(entry);
+        }
+
+        if total_pop > 0 && rejected_count.saturating_mul(10) > total_pop.saturating_mul(9) {
+            if !archive.logged_eligibility_warning {
+                archive.logged_eligibility_warning = true;
+                #[allow(clippy::cast_precision_loss)]
+                let rejection_ratio = rejected_count as f32 / total_pop as f32;
+                tracing::warn!(
+                    target: "scriptbots::qd::archive",
+                    tick = %next_tick.0,
+                    rejected_count,
+                    total_pop,
+                    rejection_ratio,
+                    "MAP-Elites eligibility filter rejected >90% of the population"
+                );
+            }
+        }
+
+        if evaluated_candidates.len() >= 5 {
+            for (axis_idx, bins) in axis_bins.iter().enumerate() {
+                if let Some(&first) = bins.first() {
+                    if bins.iter().all(|&b| b == first) {
+                        let axis_name = &archive.space.axes[axis_idx].name;
+                        tracing::warn!(
+                            target: "scriptbots::qd::archive",
+                            tick = %next_tick.0,
+                            axis = %axis_name,
+                            bin = %first,
+                            candidate_count = %bins.len(),
+                            "observed values for axis fall entirely inside one bin; domain may be mis-scaled"
+                        );
+                    }
+                }
+            }
+        }
+
+        for entry in evaluated_candidates {
+            if let Err(err) = archive.insert(entry) {
+                tracing::error!(
+                    target: "scriptbots::qd::archive",
+                    tick = %next_tick.0,
+                    error = %err,
+                    "failed to insert elite into MAP-Elites archive"
+                );
+            }
+        }
+
+        if self.archive_evaluations % 100 == 0 {
+            tracing::info!(
+                target: "scriptbots::qd::archive",
+                tick = %next_tick.0,
+                filled_cells = %archive.coverage_count(),
+                total_cells = %archive.total_cells(),
+                coverage_pct = %(archive.coverage_ratio() * 100.0),
+                mean_quality = %archive.mean_quality(),
+                max_quality = %archive.max_quality().unwrap_or(0.0),
+                "MAP-Elites archive maintenance summary"
+            );
+        }
+
+        self.archive = Some(archive);
     }
 
     fn stage_reset_events(&mut self, preserve_persistence_tail: bool) {
@@ -23626,7 +23978,9 @@ impl WorldState {
         let dead_ids: HashSet<AgentId> = dead.iter().map(|(_, id)| *id).collect();
         for id in &dead_ids {
             self.runtime.remove(*id);
-            self.identities.remove(*id);
+            if let Some(identity) = self.identities.remove(*id) {
+                self.agent_stats.remove(&identity.uid);
+            }
             self.agent_rng_counters.remove(*id);
         }
         let removed = self.agents.remove_many(&dead_ids);
@@ -24058,6 +24412,16 @@ impl WorldState {
 
         self.last_births = orders.len();
         for order in orders {
+            if let Some(stats) = self.agent_stats.get_mut(&order.parent_uid) {
+                stats.record_offspring();
+            }
+            if let Some(partner_id) = order.partner_id {
+                if let Some(identity) = self.identities.get(partner_id) {
+                    if let Some(stats) = self.agent_stats.get_mut(&identity.uid) {
+                        stats.record_offspring();
+                    }
+                }
+            }
             let SpawnOrder {
                 parent_uid: _,
                 parent_id: _,
@@ -25404,6 +25768,14 @@ impl WorldState {
         let summary = observed_stage!(WorldStepStage::Bookkeeping, {
             self.stage_accumulate_food_balance();
             self.stage_accumulate_tick_events();
+            if self.config.archive_enabled {
+                self.stage_accumulate_agent_stats();
+                if self.config.archive_interval != 0
+                    && next_tick.0.is_multiple_of(self.config.archive_interval)
+                {
+                    self.stage_archive_maintenance(next_tick);
+                }
+            }
             let summary = self.stage_record_history(next_tick);
             self.stage_narrative(next_tick);
             summary
@@ -26050,6 +26422,13 @@ impl WorldState {
         scientific_config.neuroflow = NeuroflowSettings::default();
         scientific_config.control = ControlSettings::default();
         scientific_config.render = RenderSettings::default();
+        scientific_config.archive_enabled = false;
+        scientific_config.archive_interval = DIGEST_NEUTRAL_ARCHIVE_INTERVAL;
+        scientific_config.archive_min_lifetime_ticks = DIGEST_NEUTRAL_ARCHIVE_MIN_LIFETIME_TICKS;
+        scientific_config.archive_max_cells = DIGEST_NEUTRAL_ARCHIVE_MAX_CELLS;
+        scientific_config.archive_max_bytes = DIGEST_NEUTRAL_ARCHIVE_MAX_BYTES;
+        scientific_config.archive_quality_metric = QualityMetric::LifetimeIntake;
+        scientific_config.archive_space = BehaviorSpaceV0::new(0, Vec::new());
         let mut config_encoder =
             CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "config");
         config_encoder.postcard("scientific ScriptBotsConfig", &scientific_config)?;
@@ -26532,6 +26911,34 @@ impl WorldState {
             self.record_config_audit(value);
         }
 
+        if new_config.archive_enabled {
+            let space_changed = match &self.archive {
+                Some(existing) => {
+                    existing.space != new_config.archive_space
+                        || existing.quality_metric != new_config.archive_quality_metric
+                        || existing.min_lifetime_ticks != new_config.archive_min_lifetime_ticks
+                        || existing.max_archive_cells != new_config.archive_max_cells
+                        || existing.max_archive_bytes != new_config.archive_max_bytes
+                }
+                None => true,
+            };
+            if space_changed {
+                self.archive = Some(
+                    MapElitesArchive::new(
+                        new_config.archive_space.clone(),
+                        new_config.archive_quality_metric,
+                        new_config.archive_min_lifetime_ticks,
+                        new_config.archive_max_bytes,
+                    )
+                    .map_err(|_| {
+                        WorldStateError::InvalidConfig("invalid map_elites archive configuration")
+                    })?,
+                );
+            }
+        } else {
+            self.archive = None;
+        }
+
         self.config = new_config;
         self.food_profiles = food_profiles;
         self.cadence = TickCadence::from_config(&self.config);
@@ -26964,6 +27371,24 @@ impl WorldState {
     #[must_use]
     pub fn agent_uid(&self, id: AgentId) -> Option<AgentUid> {
         self.agent_identity(id).map(|identity| identity.uid)
+    }
+
+    /// Reference to the MAP-Elites behavioral archive, if enabled.
+    #[must_use]
+    pub const fn archive(&self) -> Option<&MapElitesArchive> {
+        self.archive.as_ref()
+    }
+
+    /// Mutable reference to the MAP-Elites behavioral archive, if enabled.
+    #[must_use]
+    pub fn archive_mut(&mut self) -> Option<&mut MapElitesArchive> {
+        self.archive.as_mut()
+    }
+
+    /// Access the accumulated lifetime statistics per agent.
+    #[must_use]
+    pub const fn agent_stats(&self) -> &BTreeMap<AgentUid, AgentAccumulatedStats> {
+        &self.agent_stats
     }
 
     /// Resolve a live handle's stable `AgentUid`, or name the exact path that lacked one.
