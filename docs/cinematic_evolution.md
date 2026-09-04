@@ -6,6 +6,15 @@ The Cinematic Evolution Lab transforms ScriptBots from a simple simulation viewe
 
 ## Quality Tiers & Performance Matrix
 
+> **Status: design target — not yet a delivered or gated promise.**
+> (Reality check 2026-09-04, bead bd-m02n.) No row of this matrix is yet
+> measured, owned, or enforced by a CI/DSR gate. Frame-rate budgets become
+> gated only when the visual perf harness (bd-2z0.14.3.5.3) lands; tick-rate
+> and snapshot budgets live in the bd-2z0.8.18 harness, which does not
+> measure FPS. Until a row carries its own status/owner/gate annotation
+> here, treat the numbers below as the aspiration the bd-2z0.14 cinematic
+> program is building toward, not a claim about shipped behavior.
+
 | Tier | Frame Budget (1k agents) | Frame Budget (10k agents) | Features Enabled |
 |------|-------------------------|--------------------------|------------------|
 | Potato | 60 FPS (16.6ms) | 60 FPS (16.6ms) | Flat shading, disabled AA, no shadows |
