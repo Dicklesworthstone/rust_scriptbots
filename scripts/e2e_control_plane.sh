@@ -148,6 +148,11 @@ check "MCP initialize succeeds (not -32601)" \
 check "MCP initialize negotiates a protocol version" \
     "$(printf '%s' "$INIT_RESPONSE" | jq -r '.result.protocolVersion // empty' 2>/dev/null | cut -c1-4)" "2024"
 
+BAD_VER_RESPONSE="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}')"
+check "MCP unsupported protocol version returns -32602" \
+    "$(printf '%s' "$BAD_VER_RESPONSE" | jq -r '.error.code // "no-error"' 2>/dev/null)" "-32602"
+
 TOOLS="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
     | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
 EXPECTED_TOOLS="apply_patch apply_updates apply_preset get_command_status get_config get_status list_knobs list_presets pause resume set_speed shutdown step "
