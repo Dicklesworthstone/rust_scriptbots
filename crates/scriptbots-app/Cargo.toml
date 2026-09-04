@@ -87,3 +87,4 @@ fsqlite = { workspace = true }
 rand = { workspace = true }
 tempfile = "3.13"
 serial_test = "3.0"
+scriptbots-render = { path = "../scriptbots-render" }
