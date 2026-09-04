@@ -1549,3 +1549,160 @@ fn test_bd_2z0_5_6_e2e_real_db_export_roundtrip() {
         start_time.elapsed()
     );
 }
+
+#[test]
+fn test_map_elites_archive_persistence_roundtrip() {
+    use scriptbots_core::{
+        BrainFamilyId, BrainGenomeEnvelope, BrainProvenance,
+        map_elites::{
+            ArchiveEntry, ArchiveProvenance, Axis, BehaviorDescriptor, BehaviorSpaceV0,
+            MapElitesArchive, PhenotypeFeature, QualityMetric,
+        },
+    };
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_micros();
+    let path = std::env::temp_dir().join(format!(
+        "scriptbots_map_elites_roundtrip_{}_{}.sqlite",
+        std::process::id(),
+        timestamp
+    ));
+    let path_str = path.to_str().expect("utf8 path");
+
+    let mut storage = Storage::create_unattributed_file(path_str).expect("create storage");
+
+    // Submit a tick batch to verify standard tables coexist with archive tables
+    let tick_summary = TickSummary {
+        tick: Tick(100),
+        agent_count: 5,
+        births: 2,
+        deaths: 1,
+        total_energy: 50.0,
+        average_energy: 10.0,
+        average_health: 0.9,
+        max_age: 150,
+        spike_hits: 3,
+    };
+    storage
+        .write_batch(&PersistenceBatch {
+            summary: tick_summary,
+            epoch: 1,
+            closed: false,
+            metrics: Vec::new(),
+            events: Vec::new(),
+            agents: Vec::new(),
+            births: Vec::new(),
+            deaths: Vec::new(),
+            replay_events: Vec::new(),
+            narrative_events: Vec::new(),
+            genomes: Vec::new(),
+        })
+        .expect("write tick batch");
+
+    // Build a behavioral archive
+    let space = BehaviorSpaceV0::new(vec![
+        Axis::new("diet", PhenotypeFeature::DietTendency, 0.0, 1.0, 4).unwrap(),
+        Axis::new("speed", PhenotypeFeature::MeanSpeed, 0.0, 10.0, 4).unwrap(),
+    ])
+    .unwrap();
+    let mut archive =
+        MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 0, 1024 * 1024).unwrap();
+
+    let family_id = BrainFamilyId::new("mlp").expect("family_id");
+    let genome_1 =
+        BrainGenomeEnvelope::new(family_id, 1, 1, vec![1, 2, 3, 4], BrainProvenance::default());
+    let entry_1 = ArchiveEntry {
+        uid: AgentUid::new(10),
+        tick_inserted: 50,
+        quality: 12.5,
+        descriptor: BehaviorDescriptor::new(vec![0.2, 2.5]),
+        genome: genome_1,
+        provenance: ArchiveProvenance {
+            generation: 1,
+            lineage_depth: 0,
+            origin: "seed".to_string(),
+        },
+    };
+
+    let genome_2 =
+        BrainGenomeEnvelope::new(family_id, 1, 1, vec![5, 6, 7, 8], BrainProvenance::default());
+    let entry_2 = ArchiveEntry {
+        uid: AgentUid::new(20),
+        tick_inserted: 80,
+        quality: 24.0,
+        descriptor: BehaviorDescriptor::new(vec![0.8, 8.0]),
+        genome: genome_2,
+        provenance: ArchiveProvenance {
+            generation: 2,
+            lineage_depth: 1,
+            origin: "born".to_string(),
+        },
+    };
+
+    assert!(archive.insert(entry_1).unwrap());
+    assert!(archive.insert(entry_2).unwrap());
+    assert_eq!(archive.occupied_cells(), 2);
+
+    let space_row = archive.to_space_row().expect("space row");
+    let cell_rows = archive.to_cell_rows().expect("cell rows");
+
+    // Persist archive snapshot via Storage
+    storage
+        .persist_archive_snapshot(&space_row, &cell_rows)
+        .expect("persist archive snapshot");
+
+    // Query on open storage
+    let retrieved_space = storage.archive_space().expect("query space").expect("space exists");
+    assert_eq!(retrieved_space.space_version, space_row.space_version);
+    assert_eq!(retrieved_space.axes_json, space_row.axes_json);
+
+    let retrieved_cells = storage.archive_cells().expect("query cells");
+    assert_eq!(retrieved_cells.len(), 2);
+    assert_eq!(retrieved_cells[0].uid, 10);
+    assert_eq!(retrieved_cells[1].uid, 20);
+
+    let reloaded_archive = storage
+        .reload_archive(1024 * 1024)
+        .expect("reload archive")
+        .expect("archive exists");
+    assert_eq!(reloaded_archive.occupied_cells(), 2);
+    assert_eq!(reloaded_archive.space(), archive.space());
+
+    // Close storage and verify via StorageReader
+    storage.close().expect("close storage");
+
+    let reader = StorageReader::open(path_str).expect("open reader");
+    let reader_space = reader.archive_space().expect("query reader space").expect("space exists");
+    assert_eq!(reader_space.space_version, space_row.space_version);
+    assert_eq!(reader_space.axes_json, space_row.axes_json);
+
+    let reader_cells = reader.archive_cells().expect("query reader cells");
+    assert_eq!(reader_cells.len(), 2);
+
+    let reader_reloaded = reader
+        .reload_archive(1024 * 1024)
+        .expect("reader reload archive")
+        .expect("reader archive exists");
+    assert_eq!(reader_reloaded.occupied_cells(), 2);
+    assert_eq!(reader_reloaded.space(), archive.space());
+
+    for (cell_id, entry) in archive.cells() {
+        let reloaded_entry = reader_reloaded
+            .get(cell_id)
+            .expect("reloaded entry must exist");
+        assert_eq!(reloaded_entry.uid, entry.uid);
+        assert_eq!(reloaded_entry.tick_inserted, entry.tick_inserted);
+        assert_eq!(reloaded_entry.quality, entry.quality);
+        assert_eq!(reloaded_entry.descriptor, entry.descriptor);
+        assert_eq!(
+            reloaded_entry.genome.material_hash(),
+            entry.genome.material_hash()
+        );
+    }
+
+    // Verify existing tables (e.g. tick_summaries) are intact
+    let max_tick = reader.max_tick().expect("query max tick");
+    assert_eq!(max_tick, Some(100));
+}
