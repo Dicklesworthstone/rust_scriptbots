@@ -41,7 +41,7 @@ fn measure_mode(conn: &fsqlite::Connection, mode: &str) {
         .expect("insert");
         times.push(start.elapsed().as_micros());
     }
-    if mode == "bigtx" {
+    if mode.starts_with("bigtx") {
         conn.execute("COMMIT").expect("commit");
     }
     println!("mode={mode}");
@@ -59,7 +59,24 @@ fn insert_latency_scaling_repro() {
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b TEXT NOT NULL)")
         .expect("create");
     conn.execute("CREATE INDEX t_a ON t(a)").expect("index");
-    for mode in ["autocommit", "bigtx"] {
+    // A/B the concurrent-write coordinator (bd-w1oi): if per-insert growth
+    // flattens with concurrent_mode=OFF, the linear term lives in the BEGIN
+    // CONCURRENT machinery and a single-writer connection can opt out.
+    for mode in [
+        "autocommit",
+        "bigtx-default",
+        "bigtx-concurrent-on",
+        "bigtx-concurrent-off",
+    ] {
+        match mode {
+            "bigtx-concurrent-on" => {
+                conn.execute("PRAGMA fsqlite.concurrent_mode=ON").expect("pragma on");
+            }
+            "bigtx-concurrent-off" => {
+                conn.execute("PRAGMA fsqlite.concurrent_mode=OFF").expect("pragma off");
+            }
+            _ => {}
+        }
         measure_mode(&conn, mode);
     }
 }
