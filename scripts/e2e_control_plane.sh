@@ -142,11 +142,11 @@ check_ge "SSE tick stream yields >=3 summaries in 10s" "${SSE_COUNT:-0}" 3
 
 # ------------------------------------------------------------------- MCP ---
 INIT_RESPONSE="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}')"
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}')"
 check "MCP initialize succeeds (not -32601)" \
     "$(printf '%s' "$INIT_RESPONSE" | jq -r '.error.code // "ok"' 2>/dev/null)" "ok"
 check "MCP initialize negotiates a protocol version" \
-    "$(printf '%s' "$INIT_RESPONSE" | jq -r '.result.protocolVersion // empty' 2>/dev/null | cut -c1-4)" "2025"
+    "$(printf '%s' "$INIT_RESPONSE" | jq -r '.result.protocolVersion // empty' 2>/dev/null | cut -c1-4)" "2024"
 
 TOOLS="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
     | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
