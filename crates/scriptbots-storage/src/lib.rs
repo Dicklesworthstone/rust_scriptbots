@@ -27142,7 +27142,7 @@ mod tests {
 
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 11);
+        assert_eq!(migrations.len(), 12);
         for (index, (expected_version, expected_name)) in [
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
@@ -34328,6 +34328,103 @@ mod tests {
             return Err("shutdown must surface a structured worker error".into());
         };
         assert_eq!(join_error.status(), reply_status);
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_storage_map_elites_archive_persistence_and_reload()
+        -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_core::map_elites::{
+            ArchiveEntry, BehaviorAxis, BehaviorDescriptor, BehaviorSpaceV0,
+            ContinuousDomain, MapElitesArchive, QualityMetric,
+        };
+        use scriptbots_core::provenance::OrganismProvenance;
+        use scriptbots_core::{AgentUid, Generation, Tick};
+
+        let path = temp_db_path("storage-map-elites-archive");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::create_unattributed_file(&path_string)?;
+
+        let space = BehaviorSpaceV0::new(
+            0,
+            vec![
+                BehaviorAxis {
+                    name: "carnivory".into(),
+                    domain: ContinuousDomain::new(0.0, 1.0)?,
+                    num_bins: 5,
+                },
+                BehaviorAxis {
+                    name: "speed".into(),
+                    domain: ContinuousDomain::new(0.0, 10.0)?,
+                    num_bins: 4,
+                },
+            ],
+        )?;
+
+        let mut archive = MapElitesArchive::new(space, QualityMetric::default(), 0, 1024 * 1024)?;
+
+        let agent_uid_1 = AgentUid::new(101);
+        let genome_1 = scriptbots_core::BrainGenomeEnvelope::new_v0_mlp(
+            vec![10, 8, 4],
+            vec![0.1; 120],
+            OrganismProvenance::synthetic(agent_uid_1, Generation(1)),
+        );
+        let entry_1 = ArchiveEntry {
+            descriptor: BehaviorDescriptor(vec![0.2, 3.0]),
+            quality: 42.5,
+            genome: genome_1,
+            uid: agent_uid_1,
+            tick_inserted: Tick(100),
+            provenance: OrganismProvenance::synthetic(agent_uid_1, Generation(1)),
+        };
+
+        let agent_uid_2 = AgentUid::new(202);
+        let genome_2 = scriptbots_core::BrainGenomeEnvelope::new_v0_mlp(
+            vec![10, 8, 4],
+            vec![0.2; 120],
+            OrganismProvenance::synthetic(agent_uid_2, Generation(2)),
+        );
+        let entry_2 = ArchiveEntry {
+            descriptor: BehaviorDescriptor(vec![0.8, 8.0]),
+            quality: 99.9,
+            genome: genome_2,
+            uid: agent_uid_2,
+            tick_inserted: Tick(200),
+            provenance: OrganismProvenance::synthetic(agent_uid_2, Generation(2)),
+        };
+
+        archive.insert(entry_1, 100);
+        archive.insert(entry_2, 200);
+        assert_eq!(archive.len(), 2);
+
+        // Persist to storage
+        storage.persist_map_elites_archive(&archive)?;
+
+        // Reload from storage
+        let loaded_opt = storage.load_map_elites_archive(archive.byte_cap)?;
+        let loaded = loaded_opt.expect("archive should be loaded from storage");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.space.space_version, 0);
+        assert_eq!(loaded.space.axes.len(), 2);
+        assert_eq!(loaded.space.axes[0].name, "carnivory");
+        assert_eq!(loaded.space.axes[1].name, "speed");
+
+        let cell_1 = loaded.space.bin(&BehaviorDescriptor(vec![0.2, 3.0]))?;
+        let entry_1_loaded = loaded.get(cell_1).expect("cell 1 present");
+        assert_eq!(entry_1_loaded.uid, agent_uid_1);
+        assert!((entry_1_loaded.quality - 42.5).abs() < 1e-5);
+        assert_eq!(entry_1_loaded.tick_inserted, Tick(100));
+        assert_eq!(entry_1_loaded.provenance.generation, Generation(1));
+
+        let cell_2 = loaded.space.bin(&BehaviorDescriptor(vec![0.8, 8.0]))?;
+        let entry_2_loaded = loaded.get(cell_2).expect("cell 2 present");
+        assert_eq!(entry_2_loaded.uid, agent_uid_2);
+        assert!((entry_2_loaded.quality - 99.9).abs() < 1e-5);
+        assert_eq!(entry_2_loaded.tick_inserted, Tick(200));
+        assert_eq!(entry_2_loaded.provenance.generation, Generation(2));
 
         let _ = fs::remove_file(path);
         Ok(())
