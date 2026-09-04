@@ -56,10 +56,8 @@ fn measure_mode(conn: &fsqlite::Connection, mode: &str) {
 #[ignore = "timing diagnostic for bd-w1oi; run explicitly with --ignored --nocapture"]
 fn insert_latency_scaling_repro() {
     let conn = fsqlite::Connection::open(":memory:").expect("open");
-    conn.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b TEXT NOT NULL)",
-    )
-    .expect("create");
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b TEXT NOT NULL)")
+        .expect("create");
     conn.execute("CREATE INDEX t_a ON t(a)").expect("index");
     for mode in ["autocommit", "bigtx"] {
         measure_mode(&conn, mode);
