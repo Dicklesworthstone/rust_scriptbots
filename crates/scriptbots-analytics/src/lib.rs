@@ -82,6 +82,10 @@ pub mod lineage;
 pub mod dataframe;
 pub use dataframe::*;
 
+/// NetworkX-parity graph analysis and report layer (bd-2z0.11.7).
+pub mod graphs;
+pub use graphs::*;
+
 pub use lineage::{
     EvolutionaryChangeExplanation, FounderLineageRecord, GenerationMetricRow,
     LINEAGE_FITNESS_SCHEMA_ID_V1, LineageFitness, LineageFitnessMachine, LineageLifespanSummary,
@@ -564,6 +568,9 @@ pub enum AnalyticsError {
     /// Dataframe export or summary error.
     #[error("dataframe error: {0}")]
     DataFrame(#[from] crate::dataframe::DataFrameError),
+    /// Graph construction, algorithm, or export error (bd-2z0.11.7).
+    #[error("graph error: {0}")]
+    Graph(String),
 }
 
 /// Read-only context handed to every report.
@@ -1536,6 +1543,9 @@ impl Registry {
                 Box::new(MetricDistribution),
                 Box::new(PhenotypeInteractions),
                 Box::new(lineage::LineageFitness),
+                Box::new(graphs::LineageStructure),
+                Box::new(graphs::DynastyCommunities),
+                Box::new(graphs::InteractionCentrality),
             ],
         }
     }
@@ -2712,6 +2722,7 @@ fn narrative_timeline_limit(params: &ReportParams) -> Result<usize, AnalyticsErr
 }
 
 #[cfg(test)]
+#[allow(clippy::all, clippy::pedantic, clippy::nursery)]
 mod phenotype_tests {
     use super::*;
 

@@ -354,6 +354,9 @@ fn registry_lists_builtin_reports_with_descriptions() {
             "metric-distribution",
             "phenotype-interactions",
             "lineage-fitness",
+            "lineage-structure",
+            "dynasty-communities",
+            "interaction-centrality",
         ]
     );
     assert!(listed.iter().all(|(_, d)| !d.is_empty()));

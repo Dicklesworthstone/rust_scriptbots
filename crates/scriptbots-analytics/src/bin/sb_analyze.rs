@@ -88,6 +88,38 @@ enum Command {
         #[arg(long)]
         md: Option<PathBuf>,
     },
+    /// Export graph representations to GraphML or Edge-List (bd-2z0.11.7).
+    ExportGraph {
+        /// Which graph to export: lineage, dynasty, or interaction.
+        #[arg(long, value_enum, default_value_t = ExportGraphKind::Lineage)]
+        graph: ExportGraphKind,
+        /// Export format: graphml or edgelist.
+        #[arg(long, value_enum, default_value_t = ExportGraphFormat::Graphml)]
+        format: ExportGraphFormat,
+        /// Optional destination file path (stdout if omitted).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+/// Target graph representation for export.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum ExportGraphKind {
+    /// Directed ancestry/phylogeny graph (parent -> child).
+    Lineage,
+    /// Undirected mating/ancestry graph for dynasty community clustering.
+    Dynasty,
+    /// Directed pairwise interaction graph (actor -> target).
+    Interaction,
+}
+
+/// Serialization format for exported graphs.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum ExportGraphFormat {
+    /// Standard XML-based GraphML format.
+    Graphml,
+    /// Space-delimited edge list format.
+    Edgelist,
 }
 
 fn init_tracing(verbose: u8) {
@@ -235,6 +267,63 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             }
 
             println!("{}", summary.markdown_table);
+            Ok(())
+        }
+        Command::ExportGraph { graph, format, out } => {
+            let cx = ReaderCtx::open(&db)?;
+            let text = match (graph, format) {
+                (ExportGraphKind::Lineage, ExportGraphFormat::Graphml) => {
+                    let births = cx.reader.load_ancestry_births()?;
+                    let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
+                    scriptbots_analytics::export_digraph_graphml(&digraph)?
+                }
+                (ExportGraphKind::Lineage, ExportGraphFormat::Edgelist) => {
+                    let births = cx.reader.load_ancestry_births()?;
+                    let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
+                    scriptbots_analytics::export_digraph_edgelist(&digraph)?
+                }
+                (ExportGraphKind::Dynasty, ExportGraphFormat::Graphml) => {
+                    let births = cx.reader.load_ancestry_births()?;
+                    let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
+                    let undirected = digraph.to_undirected();
+                    scriptbots_analytics::export_graph_graphml(&undirected)?
+                }
+                (ExportGraphKind::Dynasty, ExportGraphFormat::Edgelist) => {
+                    let births = cx.reader.load_ancestry_births()?;
+                    let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
+                    let undirected = digraph.to_undirected();
+                    scriptbots_analytics::export_graph_edgelist(&undirected)?
+                }
+                (ExportGraphKind::Interaction, ExportGraphFormat::Graphml) => {
+                    let rec = cx.reader.recent_interactions(4096)?;
+                    let interactions = if rec.is_empty() {
+                        scriptbots_analytics::extract_interactions_from_replay(&cx, 4096)?
+                    } else {
+                        rec
+                    };
+                    let (digraph, _, _) =
+                        scriptbots_analytics::build_interaction_digraph(&interactions);
+                    scriptbots_analytics::export_digraph_graphml(&digraph)?
+                }
+                (ExportGraphKind::Interaction, ExportGraphFormat::Edgelist) => {
+                    let rec = cx.reader.recent_interactions(4096)?;
+                    let interactions = if rec.is_empty() {
+                        scriptbots_analytics::extract_interactions_from_replay(&cx, 4096)?
+                    } else {
+                        rec
+                    };
+                    let (digraph, _, _) =
+                        scriptbots_analytics::build_interaction_digraph(&interactions);
+                    scriptbots_analytics::export_digraph_edgelist(&digraph)?
+                }
+            };
+
+            if let Some(path) = out {
+                std::fs::write(path, &text)?;
+                tracing::info!(path = %path.display(), "graph exported");
+            } else {
+                print!("{text}");
+            }
             Ok(())
         }
     }
