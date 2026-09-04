@@ -52,6 +52,7 @@ poll_json() {
     local url="$1" jq_expr="$2" deadline=$((SECONDS + ${3:-60})) out
     while [ "$SECONDS" -lt "$deadline" ]; do
         out="$(http "$url" | jq -r "$jq_expr" 2>/dev/null)"
+        [ -n "$out" ] && [ "$out" != "null" ] && { printf '%s' "$out"; return 0; }
         sleep 0.5
     done
     return 1

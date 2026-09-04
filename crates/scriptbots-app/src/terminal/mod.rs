@@ -833,59 +833,40 @@ impl<'a> TerminalApp<'a> {
 
         let mut force_step = single_step;
         let mut latched_fault = None;
-        let pending_commands = if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.latched_step_error() {
-                latched_fault = Some(Arc::<str>::from(error.to_string()));
-                None
-            } else {
-                let mut playback = Vec::new();
-                // The bus now hands over `BusCommand { id, command }`. This loop is
-                // the APPLIER — the point at which a receipt could truthfully
-                // advance past admitted — and `id` is the identity to report
-                // against. Publishing that outcome belongs to the ledger/receipt
-                // lane rather than here, so this only carries the id into the
-                // diagnostics for now: a rejection is at least traceable back to
-                // the submission that caused it (bd-0s7x).
-                for bus in (self.command_drain.as_ref())() {
-                    let receipt = bus.id;
-                    // The report comes from HERE, the only place that knows
-                    // whether the world took the command. This is what turns a
-                    // carried identity into an observed outcome, and what makes
-                    // a receipt advance past `admitted` in production rather
-                    // than only in the app path (bd-tgfz).
-                    match apply_control_command(&mut world, bus.command) {
-                        Ok(ControlDisposition::WorldApplied) => {
-                            (self.command_reporter)(&receipt, CommandOutcome::Applied);
-                        }
-                        Ok(ControlDisposition::Playback(command)) => {
-                            // Playback is an application too: the command was
-                            // accepted and routed, it simply lands on the
-                            // driver rather than on world state.
-                            (self.command_reporter)(&receipt, CommandOutcome::Applied);
-                            playback.push(command);
-                        }
-                        Err(error) => {
-                            (self.command_reporter)(&receipt, CommandOutcome::Rejected);
-                            warn!(%error, %receipt, "terminal rejected a drained control command");
-                        }
+        let mut playback = Vec::new();
+        if let Ok(mut world) = self.world.lock() {
+            // Drain commands unconditionally so receipts always advance past admitted,
+            // even if a simulation fault or latched step error is present (bd-brvp).
+            for bus in (self.command_drain.as_ref())() {
+                let receipt = bus.id;
+                match apply_control_command(&mut world, bus.command) {
+                    Ok(ControlDisposition::WorldApplied) => {
+                        (self.command_reporter)(&receipt, CommandOutcome::Applied);
+                    }
+                    Ok(ControlDisposition::Playback(command)) => {
+                        (self.command_reporter)(&receipt, CommandOutcome::Applied);
+                        playback.push(command);
+                    }
+                    Err(error) => {
+                        (self.command_reporter)(&receipt, CommandOutcome::Rejected);
+                        warn!(%error, %receipt, "terminal rejected a drained control command");
                     }
                 }
-                Some(playback)
             }
-        } else {
-            None
-        };
-        if let Some(error) = latched_fault {
-            self.paused = true;
-            self.sim_accumulator = 0.0;
-            self.simulation_fault = Some(error);
-            self.refresh_snapshot();
-            return;
+            if let Some(error) = world.latched_step_error() {
+                latched_fault = Some(Arc::<str>::from(error.to_string()));
+            }
         }
-        if let Some(pending) = pending_commands
-            && self.apply_simulation_commands(pending)
-        {
+        if self.apply_simulation_commands(playback) {
             force_step = true;
+        }
+        if let Some(error) = latched_fault {
+            self.simulation_fault = Some(error);
+            if !force_step && self.paused {
+                self.sim_accumulator = 0.0;
+                self.refresh_snapshot();
+                return;
+            }
         }
 
         if single_step {
@@ -942,6 +923,8 @@ impl<'a> TerminalApp<'a> {
             self.paused = true;
             self.sim_accumulator = 0.0;
             self.simulation_fault = Some(error);
+        } else if steps > 0 {
+            self.simulation_fault = None;
         }
     }
 

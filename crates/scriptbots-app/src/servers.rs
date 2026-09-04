@@ -17,9 +17,8 @@ use axum::{
     routing::{get, post},
 };
 use fastmcp_rust::{
-    Content, Cx, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, McpError,
-    McpErrorCode, McpResult, NotificationSender, PendingRequests, RequestSender, Server, Session,
-    ToolHandler,
+    Content, Cx, JsonRpcRequest, McpError, McpErrorCode, McpResult, NotificationSender,
+    PendingRequests, RequestSender, Server, Session, ToolHandler,
 };
 use futures_util::stream::{Stream, StreamExt};
 use scriptbots_core::PresetKind;

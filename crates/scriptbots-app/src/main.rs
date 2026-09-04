@@ -395,6 +395,11 @@ fn main() -> Result<()> {
             "a less specific configuration layer was declined"
         );
     }
+    tracing::debug!(
+        sensor_layout_digest = scriptbots_core::SENSOR_LAYOUT_DIGEST,
+        sensor_count = scriptbots_core::INPUT_SIZE,
+        "canonical sensor layout loaded"
+    );
     // One audited environment publication for the whole interactive startup, rather
     // than four scattered `unsafe` blocks (bd-o0cq).
     PreThreadEnvironment {
@@ -3227,6 +3232,8 @@ impl Renderer for ServerRenderer {
         info!("ScriptBots server mode starting (headless background simulation with REST/MCP API)");
         let target_interval = std::time::Duration::from_millis(16);
         let reporter = ctx.control_runtime.command_reporter();
+        let mut server_paused = false;
+        let mut force_step = false;
         while !matches!(
             ctx.control_runtime.status(),
             scriptbots_app::servers::ControlRuntimeStatus::Failed(_)
@@ -3246,7 +3253,19 @@ impl Renderer for ServerRenderer {
                             &mut world,
                             bus.command,
                         ) {
-                            Ok(_) => scriptbots_app::CommandOutcome::Applied,
+                            Ok(scriptbots_core::ControlDisposition::WorldApplied) => {
+                                scriptbots_app::CommandOutcome::Applied
+                            }
+                            Ok(scriptbots_core::ControlDisposition::Playback(cmd)) => {
+                                if let Some(paused) = cmd.paused {
+                                    server_paused = paused;
+                                }
+                                if cmd.step_once {
+                                    force_step = true;
+                                    server_paused = true;
+                                }
+                                scriptbots_app::CommandOutcome::Applied
+                            }
                             Err(error) => {
                                 warn!(%error, receipt = %bus.id, "server rejected a drained control command");
                                 scriptbots_app::CommandOutcome::Rejected
@@ -3260,9 +3279,13 @@ impl Renderer for ServerRenderer {
                     break;
                 }
             }
-            if let Err(error) = (ctx.simulation_step)() {
-                warn!(%error, "Simulation step failed in server mode; stopping loop");
-                break;
+            let should_step = !server_paused || force_step;
+            force_step = false;
+            if should_step {
+                if let Err(error) = (ctx.simulation_step)() {
+                    warn!(%error, "Simulation step failed in server mode; stopping loop");
+                    break;
+                }
             }
             let elapsed = start.elapsed();
             if elapsed < target_interval {
