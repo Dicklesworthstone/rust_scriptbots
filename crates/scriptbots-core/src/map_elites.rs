@@ -766,6 +766,24 @@ impl MapElitesArchive {
         self.cells.len()
     }
 
+    /// Number of occupied cells in the archive.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// True if no cells are occupied in the archive.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Retrieve an entry by cell ID if present.
+    #[must_use]
+    pub fn get(&self, cell_id: CellId) -> Option<&ArchiveEntry> {
+        self.cells.get(&cell_id)
+    }
+
     /// Total potential cells defined by the behavior space.
     #[must_use]
     pub fn total_cells(&self) -> u64 {
@@ -1018,6 +1036,10 @@ pub struct ArchiveCellRow {
     pub genome: Vec<u8>,
     /// Genome schema version.
     pub genome_version: u32,
+    /// Primary parent UID, if any.
+    pub parent_uid: Option<u64>,
+    /// Heritable generation of the agent.
+    pub generation: u32,
 }
 
 impl ArchiveEntry {
@@ -1036,6 +1058,8 @@ impl ArchiveEntry {
             descriptor: descriptor_bytes,
             genome: genome_bytes,
             genome_version: self.genome.schema_version(),
+            parent_uid: self.provenance.parent_uid.map(|u| u.get()),
+            generation: self.provenance.generation.0,
         })
     }
 }
@@ -1049,8 +1073,8 @@ impl ArchiveCellRow {
             .map_err(|e| QdError::Serialization(e.to_string()))?;
         let provenance = ArchiveProvenance {
             run_id: self.run_id.clone(),
-            parent_uid: genome.provenance().parent_uid(),
-            generation: genome.provenance().generation(),
+            parent_uid: self.parent_uid.map(AgentUid),
+            generation: Generation(self.generation),
         };
         let entry = ArchiveEntry {
             uid: AgentUid(self.uid),
@@ -1086,7 +1110,9 @@ impl BehaviorSpaceV0 {
         }
         let axes: Vec<Axis> = serde_json::from_str(&row.axes_json)
             .map_err(|e| QdError::Serialization(e.to_string()))?;
-        Self::new(axes)
+        let space = Self::new(row.space_version, axes);
+        space.validate()?;
+        Ok(space)
     }
 }
 
@@ -1112,11 +1138,11 @@ impl MapElitesArchive {
         byte_cap: usize,
     ) -> Result<Self, QdError> {
         let space = BehaviorSpaceV0::from_space_row(space_row)?;
-        let mut archive = Self::new(space, byte_cap)?;
+        let mut archive = Self::new(space, QualityMetric::default(), 0, byte_cap)?;
         for row in cell_rows {
             let (cell_id, entry) = row.to_entry()?;
-            archive.total_bytes = archive
-                .total_bytes
+            archive.current_bytes = archive
+                .current_bytes
                 .saturating_add(entry.approximate_bytes());
             archive.cells.insert(cell_id, entry);
         }
@@ -1478,7 +1504,13 @@ mod tests {
     #[test]
     fn test_archive_persistence_row_roundtrip() {
         let space = BehaviorSpaceV0::default();
-        let mut archive = MapElitesArchive::new(space, DEFAULT_MAX_ARCHIVE_BYTES).expect("archive");
+        let mut archive = MapElitesArchive::new(
+            space,
+            QualityMetric::default(),
+            100,
+            DEFAULT_MAX_ARCHIVE_BYTES,
+        )
+        .expect("archive");
         let entry = ArchiveEntry {
             uid: AgentUid(42),
             tick_inserted: Tick(100),
