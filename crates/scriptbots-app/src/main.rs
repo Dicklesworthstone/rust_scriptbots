@@ -874,9 +874,25 @@ fn apply_process_niceness(low_power: bool) -> Result<()> {
 }
 
 fn init_tracing() {
+    let raw_env = std::env::var("RUST_LOG").unwrap_or_default();
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if !raw_env.contains("fsqlite") {
+        for target in [
+            "fsqlite=warn",
+            "fsqlite_mvcc=warn",
+            "fsqlite_vdbe=warn",
+            "fsqlite_core=warn",
+            "fsqlite_planner=warn",
+        ] {
+            if let Ok(directive) = target.parse() {
+                filter = filter.add_directive(directive);
+            }
+        }
+    }
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .try_init();
 }
 
