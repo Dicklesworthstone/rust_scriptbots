@@ -1,3 +1,160 @@
+# Reality Check — rust_scriptbots — refreshed 2026-09-04
+
+## Current verdict and evidence boundary
+
+**ScriptBots contains a substantial simulation and research substrate, but it does not yet deliver the complete Evolution Lab journey.** The limiting work is connecting the production host, frontends, checkpoint continuation, scientific reports, and release evidence. Completing components or closing their issues does not prove those connections.
+
+This refresh supersedes the September 3 assessment preserved below. Source audited: `fa1fb08b1bc1a341f2ea4f0638ae2ecaa7eb7dbf` on `main`. The initial checkout already had a modified `.beads/last-touched` and an untracked compiler ICE report; neither was treated as audit-authored code. No application code is changed by this assessment.
+
+Method: read all 1,031 lines of AGENTS.md and 1,053 lines of README.md; read the recovery plan, four historical root plans, architecture guide, rendering plans/specification, browser ADRs/plans, analytics contracts, and integration decisions. The recovery plan is the active measuring stick; historical proposals do not override it. Inspect implementation, production callers, feature declarations and tests by capability. Search the full tracker snapshot, including closed issues, before adding completion debt. Keyword scan found 73 matching Rust lines; AST scan found five `unimplemented!()` calls, all in tests/test-only modules. These counts are scan results, not defect counts. Behavioral inspection found more consequential gaps without those macros.
+
+Initial tracker: **636 issues: 456 closed, 173 open, 6 in progress, 1 blocked; 180 not closed.** `br ready` returned 63 entries, including aggregates. The authoritative BV wrapper reported 87 graph-actionable entries and explicitly warned that only BR authorizes claims. Active dependency cycle count was zero. No percentage of product completion is inferred from these counts.
+
+Fresh execution evidence is limited:
+
+| Observation on this host | Result | What it proves |
+|---|---|---|
+| `dsr --json status` | configuration invalid; no configured hosts | The required acceptance lane is not provisioned here. |
+| `dsr build --tool rust_scriptbots --target darwin/arm64 --no-sync --version reality-20260904-fa1fb08` | refused: repository profile absent, before compilation | Neither a red suite nor a green suite; no current-source runtime acceptance. |
+| `bash ci/check_fsqlite_pin.sh` | exit 0 | Current manifest/lock/AGENTS pin consistency only. |
+| `bash ci/check_franken_licenses.sh` | exit 0 | Family inventory has documentation entries; not a legal or packaged-archive audit. |
+| `br dep cycles --json` and authoritative BV triage | zero active cycles; snapshot accepted | Tracker structure/freshness, not product correctness. |
+| GitHub Releases API | v0.1.1, published 2026-07-22, zero attached assets | A release record exists; it does not provide downloaded native/WASM binaries to verify. |
+
+Raw local observations are retained in `/tmp/scriptbots-reality-20260904-G9j3WJ` (tracker snapshot, triage, scans, DSR refusal, guard logs, release JSON). These are diagnostic files, not a portable acceptance bundle. A discovered `/data/tmp/.../pkg/scriptbots-app` was an 18-byte shell fixture that only prints `ok`; it was excluded as runtime evidence. No current-source application test suite, GUI/PTY/browser journey, or benchmark was executed successfully in this audit. Historical green tests remain historical evidence at their recorded commits.
+
+## Vision checklist: component evidence versus product delivery
+
+`PARTIAL` means substantial code exists but the stated journey has missing implementation or integration. `UNPROVEN` means the claim exceeds available execution evidence. `STUB` is reserved for an observed placeholder. No row is marked `WORKING`: the skill requires tests and E2E verified, and this host could not provide fresh acceptance. This does not assert that every component is broken.
+
+| ID | Testable promise / source | Current reality and representative source | Gap owners already present |
+|---|---|---|---|
+| V01 | Living, understandable default meadow; recovery plan §18.1 | PARTIAL. Scenario catalog, founder installation and terminal paths exist. `tests/meadow_acceptance.rs` manually copies selected config fields; its GUI lane calls `world.step()` and a CPU PNG renderer. That is not default production GUI startup. | `bd-2z0.10.4`, `.10.5`; `bd-bacf` |
+| V02 | One simulation owner; rendering cannot advance science; plan §4.1 | PARTIAL. `runtime/host_core.rs`, native lifecycle and `app/host_thread.rs` are real. `app/main.rs:434` still creates `SharedWorld`; `control.rs:390` retains it; Bevy takes `Arc<Mutex<WorldState>>` and spawns a worker. | `bd-pcfj`, `bd-88yj`, `bd-2z0.7.2`, `.6.1`, `bd-37m` |
+| V03 | UI/REST/MCP acknowledged controls, ordering and stream recovery; README control contract | PARTIAL. Runtime lifecycle/journal contracts exist, but `ControlHandle::with_world` still locks the world. Its legacy status cannot be upgraded to durable merely because runtime/storage implement journal types. | `bd-5dkk`, `bd-6mus`, `bd-g6wf`, `bd-ydu8`, `bd-2z0.12.2` |
+| V04 | Real heritable default brains; plan §18.2 | UNPROVEN at this HEAD, with substantial implementation. `app/brains.rs::install_brains` structurally admits MLP/DWRAON/Assembly protocol families. NeuroFlow is withheld from mixed founders but explicitly selectable. Placeholder ML is not installed. | Protocol family work largely closed; `bd-2z0.3.12.3`–`.6` retain FtBrain completion/proof. |
+| V05 | Honest ML/native family capability claims; README brains | PARTIAL. Candle tensor and batch functions are real in `brain-ml/src/candle.rs`; no Candle `BrainPreset` or protocol family is installed. Default brain-ml still copies sensors; Tract/tch remain selection/probe paths. Tensor errors fall back to scalar in `forward`. | `bd-1bdd` owns feature truth; closed `bd-rcae` delivered tensors, not product family admission. |
+| V06 | Determinism, stable identity, meaningful evolution; plan §18.2–3 | UNPROVEN at this HEAD, with real six-domain RNG, UID substreams, genome/evaluator codecs, staged step, resource ledger, digest v1.7 and trace contracts. Existing tests include mixed-family batch/scalar parity and rollback. Remaining knob witnesses and default sensing discrepancy matter scientifically. | `bd-dorx`, `bd-3mul`, `bd-6i23`, `bd-m30b`, `bd-16g.2.9` |
+| V07 | Production checkpoint continuation and first divergence; plan §4.1/18.3 | PARTIAL. Core checkpoint v1.3 is implemented but explicitly excludes persistence/session ownership. `main.rs::run_replay_cli` logs the latest checkpoint, then starts ordinary headless replay. `experiment_runner.rs` refuses interrupted running-status resume. | `bd-2z0.5.13`, `.11.4` |
+| V08 | Exact durable admission, recovery, bounded waits; storage contract | PARTIAL at product level. Real sole-thread fsqlite worker, outbox identities, three watermarks, leases, recovery and read snapshots exist. Deadlines cannot cancel in-flight SQL or guarantee a bounded reaper. Live memory-mode admission timeout remains reported. | `bd-w1oi`, `bd-2z0.5.14`, `.5.17`; storage protocol children largely closed. |
+| V09 | Portable bundles and repeatable multi-seed experiments; plan §4.2–3 | PARTIAL. CLI bundle create/verify and `MatchedSeedExperimentRunner` execute real persisted runs and verify finished bundles. Mid-run resume and independent-checkout reproduction remain separate acceptance obligations. | `bd-2z0.5.13`, `.11.4`, `.11.9`, `bd-16g.1.7`, `bd-1bdd` |
+| V10 | Immutable, bounded snapshots with proven latency; plan runtime budgets | PARTIAL. Runtime projections and hub exist; retained allocation/latency proof and some event scaling remain open. No application-wide lock-free world claim is justified. | `bd-2z0.4.8.1`, `.4.16`, `bd-g6wf` |
+| V11 | FrankenTUI canvas, inspector, science screens and palette; plan §8 | PARTIAL. Ratatui is the actual dependency. `terminal/frankentui_shell.rs` is a model/harness; no workspace crate consumes the prepared ftui pin. Live pointer, screens and receipt integration remain. | `bd-2z0.6.1`, `.6.5`, `.6.6`, `.6.8`, `.14.2.3`–`.5`, `bd-dkd9` |
+| V12 | Primary batched Bevy GUI, preserved scientific visual semantics; plan §9 | PARTIAL. Real Bevy renderer, camera/HUD and offscreen render-graph capture exist. Per-agent multipart entities/materials and separate simulation ownership remain; semantic golden failure is an existing report, not rerun here. | `bd-2z0.7.2`–`.4`, `.7.14`, `.14.1.1`, `.14.3.9`–`.11`, `bd-d26y` |
+| V13 | Cinematic terrain/water/creatures/light/VFX/camera/audio; cinematic program | PARTIAL. Many helpers and settings exist, but connected effects, instancing and measured frame budgets remain a large program. A config declaration or CPU image is insufficient proof of an actual frame. | `bd-2z0.14.1.1`–`.9`, `.1.11`, `.1.18`, `.14.3.5`, `bd-ogcs`, `bd-rl1h` |
+| V14 | Brain/sense/lineage inspection explains behavior; plan science UX | PARTIAL. Bounded inspection and attribution algorithms/panels exist. Production edge projections can yield `NoConnections`; live phylogeny layout/views and per-eye selection are incomplete. | `bd-16g.4.4`, `.4.5`, `.3.4`, `.3.5`, `bd-r7cz`, `bd-2z0.7.15` |
+| V15 | Distinct cohort-proven scenarios and interventions; plan §2.3 | UNPROVEN at this HEAD, with six checked-in scenarios, normalization/seeding, schedules and catalog tests. Final onboarding and full production meadow proof remain. | `bd-2z0.10.4`, `.10.5`, `bd-2z0.13.3` |
+| V16 | Scientific graph/stats/dataframe exports; plan §4.4 | PARTIAL. Analytics registry, native stats, fnx graph calls, persistent interaction readers and exporters are real. Full pipeline proof remains. Graph doc promises weighted/count edges; `build_interaction_digraph` only inserts node pairs. Query fallback and window semantics differ. | `bd-2z0.11.6`, `.11.9`, `bd-metric-summary-test-memory-8wxv`; specific graph completion debt below. |
+| V17 | Narrated persisted timeline and calibrated detector; evolved science vision | PARTIAL. `detect.rs`, narrative persistence and text exist; complete persisted-input parity, bounded cleanup and scrub/focus UI remain. | `bd-16g.2.9`–`.11`, `bd-ji3a`, `bd-farh`, `bd-2z0.5.17` |
+| V18 | Information theory / quality diversity / communication affect useful analyses | PARTIAL. MI/TE and MAP-Elites algorithms exist; MI/TE production consumers, archive persistence, novelty selection and communication scenarios remain. | `bd-xqd5`, `bd-r4ja`, `bd-16g.6.1`–`.3`, `.7.1`, `.7.3` |
+| V19 | Multi-island evolutionary experiments with one durable history | PARTIAL. Archipelago barriers/migration are substantial; canonical overrides, real outer parallelism and production `persist_barrier` connection remain. | `bd-5tyo`, `bd-16g.5.4`, `.5.5.2`, `.5.5.4`, `bd-t3ge`, `bd-brw4` |
+| V20 | LLM proposes, validates, runs and reports bounded experiments | PARTIAL. `lab_assistant.rs` has a state machine and a real `MatchedSeedExecutor`; this is more than a stub. Full budget/refusal/notebook/adversarial acceptance remains. | `bd-16g.1.3`, `.1.7`, `.16`, `bd-6mus` |
+| V21 | Browser rendering, controls, parity and durable storage | PARTIAL. `web/main.js` directly runs WASM and Canvas on RAF; no WebGPU import, renderer selector or binary-format control. Browser WASM APIs support more than this page exposes. Storage Worker/recovery and runtime isolation remain. | `bd-2z0.12.3`, `.12.4`, `.12.7`, `bd-ywtv`, `bd-azi3`, `bd-ac4l` |
+| V22 | Shareable runs, forks, gallery, reels, tournament and sonification | PARTIAL. Core gallery/permalink/reel/audio and app montage/tournament code exist. End-to-end fork/gallery/reel/ratings/live transport remain tracked. Browser audio ADR remains a deferred decision, not an accepted shipped capability. | `bd-16g.8.2`–`.3`, `.9.2`–`.3`, `.12.2`–`.3`, `.14.2`–`.3` |
+| V23 | Faster GPU science with exact CPU parity | STUB for current WGSL accumulation. `world-gfx/src/sense_wgsl.rs` only zeroes `saturations`; its validator checks two substrings. CPU fixed-point primitives do not prove GPU sensing. | `bd-16g.15.2`, `.15.3` |
+| V24 | CPU/frame/memory budgets on named hardware | UNPROVEN here. CPU gate covers 1k/5k default MLP/Neuro lanes; 10k publication is separate. GPUI zero-copy/FPS and scoped-CPU decision numbers lack inspected retained artifacts. No fresh performance result claimed. | `bd-h33`, `bd-kuho`, `bd-2z0.7.7`, `.4.15`, `.14.3.5.3` |
+| V25 | Maintainable, reproducible builds, correct extension recipes and releases | PARTIAL. Strong pin/license/graph guards and reviewed commits exist. Required DSR profile is absent here; recipe tests do not execute documented extensions; release has no attached binaries. | `bd-build-farm-reliability-lb19`, `bd-1bdd`, `bd-2z0.9.2`–`.3`; focused debt below. |
+
+## What the old report got wrong
+
+1. **ControlHandle is not migrated.** The old follow-up inferred implementation from closed `bd-k7nq`. The field and lock in `control.rs` falsify it. `bd-88yj` already explicitly records preparation, not completed migration.
+2. **The libudev blocker is historical.** `bd-rch-full-workspace-lane-5mff` closed after worker provisioning; this audit's blocker is missing local DSR configuration, not a repeated Bevy compiler failure.
+3. **Candle tensor execution exists.** It is neither just the original scalar probe nor a fully admitted product family. Both halves must be stated.
+4. **Checkpoint capability is overstated in code too.** `CharacterizationLimitationsV0::default` currently sets `checkpoint_replay_guarantee: true`, although evaluator coverage is false and replay does not restore the discovered checkpoint. `bd-2z0.5.13` already owns this exact defect.
+5. **Graph exports and fnx code are implemented.** Their remaining semantics/proof must be inspected, not described as wholly absent. Whole-window extraction and recent-page/fallback modes are different scientific populations.
+6. **There is no defensible delivery date here.** The old claim that `2 - 1/6` means within 8% is arithmetically false (it is about 1.833). Its confidence-weighted ETA is not a calibrated estimator. Fleet capacity was inferred from incomplete failed-run observations. All old dates/capacity/near-optimality claims below are withdrawn.
+
+## Bridge plan and coverage verdict
+
+**Completing the existing open beads would close most named implementation gaps, but would not by itself prove the whole vision.** Existing release and science epics are broad; they need explicit source-bound acceptance at the joins. Closed recipe/graph work also leaves concrete requirements without an open leaf owner. Preserve all existing features and delivery; add narrow completion tasks rather than reopen large delivered epics.
+
+| Gap | Concrete work and acceptance | Existing coverage / planned addition |
+|---|---|---|
+| G1: extension recipes prove different operations | Compile the actual documented custom-family source; normalize and execute the documented scenario; attach a frontend to the real host and correlate application/journal receipts. Correct current-state claims from callers. Guard by mutating the actual recipe, not a disconnected phantom string. | New recipe repair plus companion production E2E under `bd-2z0.13`; preserve closed `bd-bsuh` contribution. |
+| G2: graph population and edge semantics drift | Define bounded window/recent/fallback selection, zero-limit behavior, explicit capture completeness, duplicate aggregation and weighted versus unweighted algorithms. Preserve doc-promised count/magnitude attributes in exports; independently verify hand-built directed multievent fixtures. | New graph semantics repair plus real-storage/CLI tests under `bd-2z0.11`; integrate with `.11.9`. |
+| G3: acceptance lane cannot be reproduced by a fresh agent | Provide a reviewable portable DSR profile and host prerequisites, bound to clean main/expected SHA, exact target and external unique evidence directory. Retain typed refusal/build/test/runtime/performance outcomes; never synthesize machine fingerprints or reuse dirty evidence. | New profile portability plus fresh-host proof under build-farm epic; existing fleet repair remains separate. |
+| G4: no single verified Evolution Lab journey | Bind the supported product/platform matrix to a real scenario → control receipt → persisted run → inspection → checkpoint continuation → comparison → report → second-checkout bundle journey. Each stage must consume preceding artifacts and prove the observation it claims. | New composed acceptance task and negative-control companion under `bd-2z0.13`; reuse `.10.4`, `.10.5`, `.5.13`, `.11.9`, `bd-1bdd`. |
+| G5: remaining documented promises | Host first, then checkpoint/persistence/control joins, then frontend and scientific consumers, while renderer implementation proceeds against the same snapshots. Extend existing acceptance instead of making duplicate feature tickets. | Owners mapped in V01–V25; no performance or browser promotion based on a static scan. |
+
+Execution order is dependency-based: prepare reproducible acceptance; finish `bd-pcfj` and `bd-88yj`; migrate TUI/Bevy/GPUI consumers and command transports; integrate checkpoint continuation and scientific artifacts; complete frontend/science feature gates; compose the real release journey. Independent docs/graph repairs can proceed without waiting for host cutover. A local infrastructure failure blocks an acceptance result, not independent implementation. Use `br ready` for claims and BV for analysis, never a synthetic timetable.
+
+## Current-session phase record
+
+- Phase 1: documentation-first vision extraction, source/caller/feature/test audit, keyword + AST + behavioral checks, tracker coverage and release inspection completed; fresh DSR execution attempted and explicitly refused by missing configuration.
+- Phase 2: V01–V25 and G1–G5 above define the bridge and preserve all existing feature programs.
+- Phase 3a: created four bounded completion tasks and four companion proof tasks using only `br`. Each has standalone background, source findings, implementation boundaries, positive/negative tests, retained logging and explicit acceptance. IDs are bound in the round record below; no application fixes or acceptance passes are implied by planning completion.
+
+### Ambition round 1: preserve the complete user journey
+
+The first bridge could still become four isolated improvements. Strengthen it around the actual joins: scenario/config → tick-zero world → stable-agent inspection → command application → persistence → checkpoint continuation → report/export. The same run, source and cohort identities must flow between those stages. Production GUI/PTY/browser evidence must name the surface actually executed, and every declared required matrix cell must be represented. A component test or a successful recipe parser cannot substitute for any join.
+
+The eight new tasks are `bd-2z0.13.8` (recipes), `bd-2z0.13.10` (recipe proof), `bd-2z0.11.11` (graphs), `bd-2z0.11.12` (graph proof), `bd-build-farm-reliability-lb19.1` (DSR profile), `.2` (fresh-host proof), `bd-2z0.13.9` (journey manifest), and `bd-2z0.13.11` (journey proof). Existing feature owners remain authoritative.
+
+### Ambition round 2: failure and resource boundaries are part of the product
+
+Require rejection evidence at each boundary: stale source, foreign run, partial seed cohort, lost receipt, indeterminate admission, unknown capture completeness, truncated report input, unavailable adapter and corrupted checkpoint. These states remain distinct from valid empty results. Boundedness means row/byte/work admission limits plus honest disclosure of in-flight calls that cannot be cancelled; a timeout alone is not proof of reclaimed resources.
+
+For interaction graphs, selecting a complete tick window and selecting a newest page are different operations. The implementation must validate the mode before loading data and refuse an unbounded complete request rather than quietly sample it. For releases, profile portability can be implemented before host access is available, but qualification and final journey execution stay blocked until actual evidence exists. This keeps independent work available without turning missing infrastructure into success.
+
+### Ambition round 3: use scientific invariants, not decorative scheduling math
+
+Make proof strength concrete. For an event multiset E and directed pair (a,b), require `count(a,b) = number of selected events with that pair` and `weight(a,b) = sum of their declared magnitudes`; total edge counts must equal selected events, including duplicate encounters. Check graph export against these raw-event identities. Keep unweighted centralities explicitly unweighted unless a separate weighted contract is implemented. A lineage DAG can merge founder components through two-parent reproduction: the old analytics E2E promise that component count always equals founder-cohort count is valid only for a fixture that prohibits such cross-cohort births.
+
+For experiments, compare matched seeds as pairs, retain every declared seed, and distinguish the distribution of independent runs from repeated snapshots within one run. A planted effect and null control test different failure modes. Do not replace a false-discovery rule with a single favorable p-value or infer absence of behavior from sampled-out events. Keep these requirements in the existing science owners rather than add a speculative algorithm program.
+
+Completion is a conjunction over required evidence cells and identity joins, not an average percentage: one required missing/refused cell prevents final pass. This is directly computable and falsifiable. There is no ETA without measured remaining durations, resource availability and uncertainty calibration.
+
+### Bead regeneration and refinement
+
+After all three ambition rounds, Phase 3a was reapplied to the same bridge: strengthened the four implementation acceptance fields; added scientific and boundary notes; updated existing `bd-2z0.10.5`, `bd-2z0.11.9` and `bd-1bdd` without taking their ownership or closing them.
+
+1. **Refinement 1 — ownership and dependency review:** all eight new tasks retain open parent owners and companion implementation/proof separation. Added the final journey proof's explicit dependencies on recipe/graph/fresh-host proof and existing host, checkpoint, onboarding, meadow, analytics and release-matrix work. Harness authoring remains unblocked. Active cycle check still returns zero. This corrects a plan-space gap: a final acceptance task could otherwise be claimed before its required surfaces exist.
+
+2. **Refinement 2 — test discrimination:** reviewed all new proof tasks against the observation they claim. Added actual live-family binding/output, scheduled config effects, receipt-to-projection correlation, different old/new graph fixtures, zero-limit fallback, graph error propagation, and preflight-before-execution checks. Valid zero observations remain distinct from missing evidence. Each negative changes an input used by the actual positive path.
+
+3. **Refinement 3 — coverage and infrastructure:** prevented a supported-subset release result from claiming full V01–V25 completion; added explicit final-proof prerequisites for real FrankenTUI, snapshot-only Bevy and browser rendering. Linked full analytics E2E to graph semantics proof. Recorded the existing hz4 memory failure as a host-specific resource disposition, without inventing a failure on the unprovisioned DSR host or silently skipping that test.
+
+4. **Refinement 4 — feasibility and contract consistency:** corrected an over-broad sensitivity requirement in the journey proof: an intervention must change the quantity it is designed to affect, not every unrelated metric. Valid null results remain legitimate. Required explicit edge-list attribute representation or typed refusal so GraphML/count/weight promises cannot disappear in a less expressive export format. No feature or negative control was removed.
+
+5. **Refinement 5 — convergence review:** rechecked the eight standalone descriptions/acceptance fields, existing coverage notes, dependency directions and final journey prerequisites. All eight remain open; the four implementation/harness tasks are BR-ready and each companion proof depends on its implementation. No additional change was found in this bounded review. This is convergence of this bridge, not a claim that all repository defects were found. Tracker now has **644 issues: 456 closed, 181 open, 6 in progress, 1 blocked; 67 BR-ready**. No existing issue was closed or reassigned by this audit. Active dependency cycles remain zero.
+
+Final document verification: `git diff --check` passes. UBS was invoked on this Markdown report and returned exit 3, explicitly **nothing scanned**; that is not a code-scan pass. No Rust changes were made, so no compiler result is asserted. DSR provisioning and all unexecuted runtime/performance acceptance remain visible work in the new profile/proof tasks and existing capability owners.
+
+## Frozen operators
+
+Phase 3a is applied verbatim to the bridge and again after the ambition rounds:
+
+```text
+OK so please take ALL of that and elaborate on it and use it to create a comprehensive and granular
+set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed
+comments so that the whole thing is totally self-contained and self-documenting (including relevant
+background, reasoning/justification, considerations, etc.-- anything we'd want our "future self" to
+know about the goals and intentions and thought process and how it serves the over-arching goals of
+the project.) The beads should be so detailed that we never need to consult back to the original
+markdown plan document. Remember to ONLY use the `br` tool to create and modify the beads and add
+the dependencies.
+```
+
+Every refinement pass uses this unchanged operator:
+
+```text
+Check over each bead super carefully-- are you sure it makes sense? Is it optimal? Could we change
+anything to make the system work better for users? If so, revise the beads. It's a lot easier and
+faster to operate in "plan space" before we start implementing these things! DO NOT OVERSIMPLIFY
+THINGS! DO NOT LOSE ANY FEATURES OR FUNCTIONALITY! Also make sure that as part of the beads we
+include comprehensive unit tests and e2e test scripts with great, detailed logging so we can be
+sure that everything is working perfectly after implementation. Make sure to ONLY use the `br` cli
+tool for all changes, and you can and should also use the `bv` tool to help diagnose potential
+problems with the beads.
+```
+
+## Historical assessment (superseded; not current acceptance evidence)
+
+The original text is retained for auditability. Its working labels, closed-bead inferences, claimed host migration, scheduling/capacity math, and forecasts are explicitly superseded by the refresh above. Historical executions were not repeated here.
+
+<details>
+<summary>September 3 assessment and follow-up record</summary>
+
 # Reality Check — rust_scriptbots — 2026-09-03
 
 **Method:** Full read of AGENTS.md (1,022 lines), README.md (1,053), PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md (3,612), docs/ARCHITECTURE.md (665), plus all 44 markdown plan/spec/decision docs digested with per-promise citations. Ground truth from a per-crate static audit of all 14 crates (273,608 src LOC, 29,391 test LOC, ~1,895 `#[test]`), a stub/mock scan of `crates/*/src`, a full tracker audit (625 beads; every not-closed bead read verbatim), bv robot diagnostics, and live test runs through RCH.
@@ -177,3 +334,5 @@ Operator-weeks, not days: the velocity history is bimodal on operator presence (
 - **Implementation record — 2026-09-03 (SapphireTrout):** G4 landed: dated corrections in the plan (§1.7 bd-2z0.3.6 completed; §7.3 bd-2z0.5.9 landed; §1.8 bd-hiv1 closed; §4.1 bd-2z0.5.2 closed) and docs/ARCHITECTURE.md (bd-k7nq closed — ControlHandle now on HostClient; bd-hiv1 closed; bd-2z0.12.3 reopened clarification) and docs/franken_integration.md (bd-2z0.4.14 REJECTED/closed; bd-2z0.5.2 closed; gated list pruned of bd-2z0.8.9.13/.15, bd-2z0.4.13, bd-16g.2.6 — all verified closed via `br show`). G2 landed: CHANGELOG Phase 11 with commit-linked entries. G1 route (b) landed: AGENTS.md documents the workspace-minus-bevy lane with its ~10% coverage honesty and the exit-103 retry rule; route (a) stays operator-owned. G3 landed: new epic bd-build-farm-reliability-lb19; 47 beads re-parented to honest open owners (bd-2z0.4.8.1 and bd-9pqz.1 replaced closed parents; bd-bacf moved out of bd-ikts); bd-ikts closed as superseded-by bd-2z0.14 with its sole child enumerated; bd-2z0.8.9 closed with all sixteen children enumerated (a follow-up comment corrects an error in the close reason itself). Verification: `br dep cycles` = 0; authoritative wrapper green post-mutation.
 - **Sweep discovery (material):** bd-k7nq ("Migrate ControlHandle off SharedWorld to HostClient") is CLOSED — the docs and this report's §1 V2/V3 rows were written against the older ARCHITECTURE claims. The host-retirement spine is further along than the July docs said: ControlHandle is migrated; the remaining transitional legs are exactly bd-pcfj (server world-ownership, in progress) and bd-88yj (frontend chain, in progress). Lane 1's job is unchanged, but its starting line moved forward.
 - **Sweep discovery (record hygiene):** bd-rcae (CandleBrain real Tensor forward, in-progress at audit time) and bd-16g.11 (ecosystem accounting) closed during this session — the swarm is actively converging on lanes 2–4 of the Execution Program while this document was being written, which is the system working as designed.
+
+</details>
