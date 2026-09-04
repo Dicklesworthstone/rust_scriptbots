@@ -10,8 +10,8 @@
 #
 # Born from the 2026-09-03 reality check, which found MCP /mcp returning
 # -32601 "unknown method" for every JSON-RPC method and REST playback
-# commands stuck admitted-forever. This probe exists so neither defect can
-# silently return.
+# commands stuck admitted-forever (the bd-w1oi storage latch). This probe
+# exists so neither defect can silently return.
 #
 # Environment overrides:
 #   APP_BIN    binary to launch   (default: target/debug/scriptbots-app)
@@ -45,13 +45,13 @@ check_ge(){ if [ "$2" -ge "$3" ] 2>/dev/null; then ok "$1"; else bad "$1 (expect
 http() { curl -s --max-time 20 "$@"; }
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@"; }
 
-# poll_json URL JQ [timeout_s]: poll until jq output is non-empty/non-null.
+tick_now() { http "$REST/api/status" | jq -r '.tick' 2>/dev/null; }
+
+# poll_json URL JQ_EXPR [timeout_s]: poll until jq output is non-empty/non-null.
 poll_json() {
-    local url="$1" jq_expr="$2" deadline=$((SECONDS + ${3:-60}))
+    local url="$1" jq_expr="$2" deadline=$((SECONDS + ${3:-60})) out
     while [ "$SECONDS" -lt "$deadline" ]; do
-        local out
         out="$(http "$url" | jq -r "$jq_expr" 2>/dev/null)"
-        [ -n "$out" ] && [ "$out" != "null" ] && { printf '%s' "$out"; return 0; }
         sleep 0.5
     done
     return 1
@@ -72,14 +72,13 @@ wait_command_terminal() {
     printf '%s' "${state:-<no-response>}"
     return 1
 }
-
 # ---------------------------------------------------------------- launch ---
 [ -x "$APP_BIN" ] || { echo "FATAL: $APP_BIN is not executable (set APP_BIN)"; exit 2; }
 SCRIPTBOTS_CONTROL_REST_ENABLED=1 \
 SCRIPTBOTS_CONTROL_REST_ADDR="$REST_ADDR" \
 SCRIPTBOTS_CONTROL_MCP=http \
 SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR="$MCP_ADDR" \
-RUST_LOG="${RUST_LOG:-info,fsqlite.statement_reuse=off,fsqlite_mvcc=off,fsqlite_planner=off}" \
+RUST_LOG="${RUST_LOG:-info,fsqlite=off,fsqlite_mvcc=off,fsqlite_vdbe=off,fsqlite_core=off,fsqlite_planner=off}" \
     "$APP_BIN" --mode server --storage memory --threads 2 >"$APP_LOG" 2>&1 &
 APP_PID=$!
 
@@ -100,31 +99,32 @@ AGENTS="$(poll_json "$REST/api/status" '.agent_count' 30)"
 check_ge "world reports a live founding population" "${AGENTS:-0}" 1
 
 # ------------------------------------------- two-axis playback semantics ---
-# Baseline tick, then pause and confirm the freeze before stepping.
-T0="$(http "$REST/api/status" | jq -r '.tick')"
+# Pause: the tick loop observes the pause at the NEXT boundary, so judge the
+# freeze by comparing two post-pause samples, not the pre-pause tick.
 PAUSE_ID="$(http -X POST "$REST/api/control/pause" | jq -r '.command_id')"
 PAUSE_STATE="$(wait_command_terminal "$PAUSE_ID")"
 check "control/pause reaches a terminal application state" "$PAUSE_STATE" "applied"
-
 sleep 2
-T_FROZEN="$(http "$REST/api/status" | jq -r '.tick')"
-check "pause freezes the world" "$T_FROZEN" "$T0"
+F1="$(tick_now)"
+sleep 2
+F2="$(tick_now)"
+check "pause freezes the world" "$F2" "$F1"
 
 # Single step: exactly one tick, still paused afterwards.
 STEP_ID="$(http -X POST "$REST/api/control/step" -H 'content-type: application/json' -d '{"count":1}' | jq -r '.command_id')"
 STEP_STATE="$(wait_command_terminal "$STEP_ID")"
 check "control/step reaches a terminal application state" "$STEP_STATE" "applied"
 sleep 2
-T_STEP="$(http "$REST/api/status" | jq -r '.tick')"
-check "control/step advances exactly one tick" "$T_STEP" "$((T_FROZEN + 1))"
+T_STEP="$(tick_now)"
+check "control/step advances exactly one tick" "$T_STEP" "$((F2 + 1))"
 sleep 2
-check "stepped world stays paused" "$(http "$REST/api/status" | jq -r '.tick')" "$T_STEP"
+check "stepped world stays paused" "$(tick_now)" "$T_STEP"
 
 # Resume must unfreeze: tick advances beyond the frozen boundary.
 RESUME_ID="$(http -X POST "$REST/api/control/resume" | jq -r '.command_id')"
 RESUME_STATE="$(wait_command_terminal "$RESUME_ID")"
 check "control/resume reaches a terminal application state" "$RESUME_STATE" "applied"
-poll_json "$REST/api/status" --argjson base "$T_STEP" 'select(.tick > $base) | .tick' "$TICK_BUDGET_S" >/dev/null \
+poll_json "$REST/api/status" "select(.tick > $T_STEP) | .tick" "$TICK_BUDGET_S" >/dev/null \
     && ok "resume unfreezes the world (tick advanced past $T_STEP)" \
     || bad "resume unfreezes the world (tick stuck at/under $T_STEP within ${TICK_BUDGET_S}s)"
 

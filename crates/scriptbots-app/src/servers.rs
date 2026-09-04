@@ -1,7 +1,7 @@
 use std::{
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -17,8 +17,9 @@ use axum::{
     routing::{get, post},
 };
 use fastmcp_rust::{
-    Content, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, McpError, McpErrorCode,
-    McpResult, Server, ToolHandler,
+    Content, Cx, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, McpError,
+    McpErrorCode, McpResult, NotificationSender, PendingRequests, RequestSender, Server, Session,
+    ToolHandler,
 };
 use futures_util::stream::{Stream, StreamExt};
 use scriptbots_core::PresetKind;
@@ -27,7 +28,7 @@ use serde_json::{Value, json};
 use std::convert::Infallible;
 use tokio::sync::watch;
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -2098,13 +2099,37 @@ async fn prepare_mcp_server(
     );
 
     let server = Arc::new(builder.build());
+    let session = Arc::new(Mutex::new(Session::new(
+        server.info().clone(),
+        server.capabilities().clone(),
+    )));
+    // HTTP has no persistent outbound channel, so server-initiated
+    // notifications are only observable in the trace log. Tool callers never
+    // depend on them; the request/response path below is the product surface.
+    let notification_sender: NotificationSender = Arc::new(|request: JsonRpcRequest| {
+        debug!(
+            method = %request.method,
+            "MCP notification not deliverable over stateless HTTP transport"
+        );
+    });
+    let request_sender = RequestSender::new(
+        Arc::new(PendingRequests::new()),
+        Arc::new(|_message: &_| {
+            Err("MCP HTTP transport does not support server-to-client requests".into())
+        }),
+    );
 
     let router = Router::new()
         .route("/mcp", post(handle_mcp_http_request))
         .route("/mcp/notify", post(handle_mcp_http_notification))
         .route("/mcp/events", get(handle_mcp_http_events))
         .route("/health", get(handle_mcp_http_health))
-        .with_state(server);
+        .with_state(McpHttpState {
+            server,
+            session,
+            notification_sender,
+            request_sender,
+        });
     let listener = tokio::net::TcpListener::from_std(reserved.listener)
         .context("failed to adopt reserved MCP HTTP listener")?;
 
@@ -2315,48 +2340,37 @@ fn register_tool(
     })
 }
 
-async fn handle_mcp_http_request(
-    State(_server): State<Arc<Server>>,
-    Json(request): Json<JsonRpcRequest>,
-) -> Json<JsonRpcMessage> {
-    Json(JsonRpcMessage::Response(JsonRpcResponse::error(
-        request.id,
-        JsonRpcError {
-            code: -32601,
-            message: format!("unknown method: {}", request.method),
-            data: None,
-        },
-    )))
+/// Shared per-process MCP HTTP state: one negotiated session guarded by
+/// `dispatch_request_concurrent`, which releases the session mutex for
+/// read-only tool calls so parallel `tools/call` probes stay concurrent.
+#[derive(Clone)]
+struct McpHttpState {
+    server: Arc<Server>,
+    session: Arc<Mutex<Session>>,
+    notification_sender: NotificationSender,
+    request_sender: RequestSender,
 }
 
-#[allow(dead_code)]
-fn normalize_mcp_http_response(response: JsonRpcResponse) -> JsonRpcMessage {
-    let protocol_error = response.result.as_ref().and_then(|result| {
-        let result = result.as_object()?;
-        if result.len() != 1 {
-            return None;
-        }
-        let error = result.get("error")?.as_object()?;
-        let code = error
-            .get("code")?
-            .as_i64()
-            .and_then(|code| i32::try_from(code).ok())?;
-        let message = error.get("message")?.as_str()?.to_string();
-        let data = error.get("data").cloned();
-        Some((code, message, data))
-    });
-
-    if let Some((code, message, data)) = protocol_error {
-        JsonRpcMessage::Response(JsonRpcResponse::error(
-            response.id,
-            JsonRpcError {
-                code,
-                message,
-                data,
-            },
-        ))
-    } else {
-        JsonRpcMessage::Response(response)
+/// Dispatch one JSON-RPC request through the real fastmcp router.
+///
+/// Requests carrying an `id` receive a JSON-RPC response; notifications (no
+/// `id`) are accepted with HTTP 202 and never produce a response body. The
+/// registered 13-tool control roster is reachable exactly as MCP clients
+/// expect: `initialize`, `tools/list`, then `tools/call`.
+async fn handle_mcp_http_request(
+    State(state): State<McpHttpState>,
+    Json(request): Json<JsonRpcRequest>,
+) -> Response {
+    let cx = Cx::for_request();
+    match state.server.dispatch_request_concurrent(
+        &cx,
+        &state.session,
+        request,
+        &state.notification_sender,
+        &state.request_sender,
+    ) {
+        Some(message) => Json(message).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
     }
 }
 
