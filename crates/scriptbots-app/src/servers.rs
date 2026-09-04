@@ -1850,12 +1850,22 @@ async fn post_control_resume(
     post,
     path = "/api/control/step",
     tag = "control",
+    request_body(content = Option<StepRequestBody>, description = "Optional step configuration"),
     responses((status = 200, body = CommandStatusDto))
 )]
 async fn post_control_step(
     State(state): State<ApiState>,
+    bytes: axum::body::Bytes,
 ) -> Result<Json<CommandStatusDto>, AppError> {
-    let status = run_control(move || state.handle.step()).await?;
+    let count = if bytes.iter().all(u8::is_ascii_whitespace) {
+        1
+    } else {
+        let body: StepRequestBody = serde_json::from_slice(&bytes).map_err(|error| {
+            AppError::bad_request(format!("invalid step request payload: {error}"))
+        })?;
+        body.count
+    };
+    let status = run_control(move || state.handle.step_count(count)).await?;
     Ok(Json(status))
 }
 
@@ -1894,13 +1904,19 @@ async fn post_control_shutdown(
     path = "/api/control/status/{command_id}",
     tag = "control",
     params(("command_id" = String, Path, description = "Command ID")),
-    responses((status = 200, body = Option<CommandStatusDto>))
+    responses(
+        (status = 200, body = CommandStatusDto),
+        (status = 404, description = "Command ID not found")
+    )
 )]
 async fn get_control_status(
     State(state): State<ApiState>,
     axum::extract::Path(command_id): axum::extract::Path<String>,
-) -> Result<Json<Option<CommandStatusDto>>, AppError> {
-    let status = run_control(move || state.handle.command_status(&command_id)).await?;
+) -> Result<Json<CommandStatusDto>, AppError> {
+    let id_for_handle = command_id.clone();
+    let status = run_control(move || state.handle.command_status(&id_for_handle))
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("unknown command id: {command_id}")))?;
     Ok(Json(status))
 }
 
@@ -1961,14 +1977,21 @@ async fn post_resume(
     post,
     path = "/api/step",
     tag = "control",
-    request_body = StepRequestBody,
+    request_body(content = Option<StepRequestBody>, description = "Optional step configuration"),
     responses((status = 200, body = CommandStatusDto))
 )]
 async fn post_step(
     State(state): State<ApiState>,
-    body: Option<Json<StepRequestBody>>,
+    bytes: axum::body::Bytes,
 ) -> Result<Json<CommandStatusDto>, AppError> {
-    let count = body.map(|b| b.count).unwrap_or(1);
+    let count = if bytes.iter().all(u8::is_ascii_whitespace) {
+        1
+    } else {
+        let body: StepRequestBody = serde_json::from_slice(&bytes).map_err(|error| {
+            AppError::bad_request(format!("invalid step request payload: {error}"))
+        })?;
+        body.count
+    };
     // `step_count` submits `count` commands and returns the LAST receipt. The
     // reported id therefore identifies the final step, not the batch; a caller
     // polling it learns about that one command. Saying so beats implying the
@@ -3573,7 +3596,7 @@ mod tests {
         )
         .await
         {
-            Ok(Json(status)) => status.expect("the issued command is cached"),
+            Ok(Json(status)) => status,
             Err(error) => panic!("status lookup must succeed: {}", error.message),
         };
         assert_eq!(
@@ -3581,17 +3604,14 @@ mod tests {
             body
         );
 
-        // An unknown ID is absent, not a fabricated terminal status.
-        let missing = match get_control_status(
+        // An unknown ID is a typed 404 Not Found, not a fabricated terminal status or 200 null.
+        let missing = get_control_status(
             State(state),
             axum::extract::Path("cmd-does-not-exist".to_owned()),
         )
         .await
-        {
-            Ok(Json(status)) => status,
-            Err(error) => panic!("status lookup must succeed: {}", error.message),
-        };
-        assert!(missing.is_none());
+        .expect_err("unknown command id must return 404 not found");
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
     }
 
     /// The MCP roster README documents and that `ControlToolKind` dispatches.

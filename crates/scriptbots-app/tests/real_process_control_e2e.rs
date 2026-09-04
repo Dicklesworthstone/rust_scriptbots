@@ -31,18 +31,28 @@ fn binary() -> PathBuf {
     path.join("scriptbots-app")
 }
 
-/// Minimal HTTP/1.1 over a real socket.
-///
-/// Hand-rolled rather than adding an HTTP client dependency: these are bare GETs
-/// and one bodyless POST, and a new dev-dependency is an operator decision this
-/// proof does not need.
-fn http(addr: SocketAddr, method: &str, path: &str) -> Result<(u16, String)> {
+/// Minimal HTTP/1.1 with optional body over a real socket.
+fn http_with_body(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body_bytes: &[u8],
+    content_type: Option<&str>,
+) -> Result<(u16, String)> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    let ct_header = match content_type {
+        Some(ct) => format!("Content-Type: {ct}\r\n"),
+        None => String::new(),
+    };
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{ct_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
     )?;
+    if !body_bytes.is_empty() {
+        stream.write_all(body_bytes)?;
+    }
     stream.flush()?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
@@ -57,6 +67,10 @@ fn http(addr: SocketAddr, method: &str, path: &str) -> Result<(u16, String)> {
         .ok_or_else(|| anyhow!("no status line in {head:?}"))?
         .parse()?;
     Ok((status, body.to_string()))
+}
+
+fn http(addr: SocketAddr, method: &str, path: &str) -> Result<(u16, String)> {
+    http_with_body(addr, method, path, &[], None)
 }
 
 /// Pull a string field out of a small JSON object without a parser dependency.
@@ -113,25 +127,16 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Read the child's stderr until the REST listener announces its bound address.
-///
-/// Port 0 means the OS assigns, so the address must be READ BACK rather than
-/// assumed — a fixed port would collide with whatever else is running on a shared
-/// machine, which is the failure mode that makes an E2E flaky rather than wrong.
-fn wait_for_rest_address(
+/// Read the child's stderr until both REST and MCP listeners announce their bound addresses.
+fn wait_for_control_addresses(
     child: &mut Child,
     timeout: Duration,
-) -> Result<(SocketAddr, Vec<String>)> {
+) -> Result<(SocketAddr, SocketAddr, Vec<String>)> {
     let stderr = child
         .stderr
         .take()
         .ok_or_else(|| anyhow!("child stderr was not captured"))?;
 
-    // Read on a THREAD and hand lines over a channel, rather than calling
-    // read_line on this one. BufRead::read_line BLOCKS until a line or EOF, so a
-    // deadline checked between reads cannot fire while the child is merely quiet —
-    // the loop would wait forever instead of failing with a diagnosis. recv_timeout
-    // makes the deadline real.
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
@@ -144,13 +149,17 @@ fn wait_for_rest_address(
 
     let deadline = Instant::now() + timeout;
     let mut log = Vec::new();
+    let mut rest_addr: Option<SocketAddr> = None;
+    let mut mcp_addr: Option<SocketAddr> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             bail!(
-                "timed out after {timeout:?} waiting for the REST listener; child alive={}; \
-                 last {} stderr lines:\n{}",
+                "timed out after {timeout:?} waiting for REST/MCP listeners; child alive={}; \
+                 rest={:?}, mcp={:?}; last {} stderr lines:\n{}",
                 child.try_wait().ok().flatten().is_none(),
+                rest_addr,
+                mcp_addr,
                 log.len().min(40),
                 log.iter()
                     .rev()
@@ -168,14 +177,24 @@ fn wait_for_rest_address(
                 if trimmed.contains("REST control server listening")
                     && let Some(parsed) = parse_announced_address(&trimmed)
                 {
-                    return Ok((parsed, log));
+                    rest_addr = Some(parsed);
+                }
+                if trimmed.contains("MCP HTTP server listening")
+                    && let Some(parsed) = parse_announced_address(&trimmed)
+                {
+                    mcp_addr = Some(parsed);
+                }
+                if let (Some(rest), Some(mcp)) = (rest_addr, mcp_addr) {
+                    return Ok((rest, mcp, log));
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => bail!(
-                "child stderr closed before announcing a REST listener; child alive={}; \
-                 last {} lines:\n{}",
+                "child stderr closed before announcing listeners; child alive={}; \
+                 rest={:?}, mcp={:?}; last {} lines:\n{}",
                 child.try_wait().ok().flatten().is_none(),
+                rest_addr,
+                mcp_addr,
                 log.len().min(40),
                 log.iter()
                     .rev()
@@ -189,23 +208,23 @@ fn wait_for_rest_address(
     }
 }
 
-/// THE REAL-PROCESS CONTROL-PLANE PROOF.
+/// THE REAL-PROCESS CONTROL-PLANE ACCEPTANCE PROBE (bd-6mus, bd-0n87).
 ///
-/// Asserts three things the in-process harnesses structurally cannot:
-///
-///  1. `--mode server` resolves and stays alive without a TTY, with its REST
-///     listener bound and announced — i.e. main.rs wiring and mode resolution work.
-///  2. A command submitted over a real socket reaches the WORLD. Server mode drains
-///     and applies the bus, so the receipt advances past admission on its own.
-///  3. `/api/screenshot/ascii` REFUSES with 409 in this mode. `ServerRenderer`
-///     publishes no presented frame, so the endpoint has nothing to serve. This is
-///     the exact situation where the old handler silently re-rasterized the world
-///     and returned 200 with a synthesized map, so proving the refusal against the
-///     SHIPPED BINARY is the end-to-end evidence that the substitution is gone —
-///     not merely gone in a unit test's view of the code.
-///
-/// The 200 from `/api/status` is paired with the 409 deliberately: without it, a
-/// 409 would be indistinguishable from "the server never came up".
+/// Asserts wire-level contracts against the real SHIPPED BINARY:
+///  1. `--mode server --storage memory` boots and binds OS-assigned REST and MCP ports.
+///  2. GET /api-docs/openapi.json exposes >=29 paths; GET /api/knobs >=100 entries;
+///     GET /api/status returns live tick/founding population.
+///  3. POST /api/control/pause reaches `applied` and freezes ticks (f2 == f1).
+///  4. POST /api/control/step {count:1} reaches `applied`, advances tick by exactly +1,
+///     and leaves the world paused.
+///  5. POST /api/control/resume reaches `applied` and unfreezes ticks.
+///  6. Negative paths: malformed step body -> 400; unknown command status -> 404.
+///  7. GET /api/screenshot/ascii refuses with 409 in unpresented server mode.
+///  8. FastMCP HTTP endpoint: GET /health -> 200; POST /mcp initialize -> 200 with negotiated
+///     protocolVersion; POST /mcp notifications/initialized -> 202; POST /mcp tools/list -> 200
+///     with all 13 tools; POST /mcp tools/call get_status -> 200 with live tick;
+///     POST /mcp tools/call unknown -> JSON-RPC error.
+///  9. Process lifecycle: process remains alive throughout and shuts down cleanly.
 #[test]
 #[serial]
 fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screenshot() -> Result<()> {
@@ -216,7 +235,8 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
         // Port 0: the OS assigns and the process announces what it bound.
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
-        .env("SCRIPTBOTS_CONTROL_MCP", "disabled")
+        .env("SCRIPTBOTS_CONTROL_MCP", "http")
+        .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
         // Narrow the filter deliberately: at bare `info` the fsqlite statement-reuse
         // telemetry emits thousands of lines and the listener announcement is
         // drowned in them, which is how the first run of this test timed out.
@@ -227,27 +247,28 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         .spawn()
         .context("failed to spawn the shipped binary")?;
 
-    let (addr, boot_log) = match wait_for_rest_address(&mut child, Duration::from_secs(90)) {
-        Ok(found) => found,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
+    let (rest_addr, mcp_addr, boot_log) =
+        match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+            Ok(found) => found,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
     let mut guard = ChildGuard(Some(child));
 
-    // (1) The control plane is genuinely up. Polled rather than slept on: the
-    // listener is announced before the first tick, so a fixed sleep would either
-    // be flaky or wastefully long.
+    // (1) REST /api/status is reachable and reports live world state.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut status_body = String::new();
+    let mut status_val: serde_json::Value = serde_json::Value::Null;
     let mut status_code = 0;
     while Instant::now() < deadline {
-        if let Ok((code, body)) = http(addr, "GET", "/api/status") {
+        if let Ok((code, body)) = http(rest_addr, "GET", "/api/status") {
             status_code = code;
-            status_body = body;
-            if code == 200 {
+            if code == 200
+                && let Ok(v) = serde_json::from_str(&body)
+            {
+                status_val = v;
                 break;
             }
         }
@@ -255,60 +276,191 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     }
     assert_eq!(
         status_code, 200,
-        "the shipped binary must serve /api/status in --mode server, got {status_code} \
-         with body {status_body:?}"
+        "the shipped binary must serve /api/status in --mode server, got {status_code}"
+    );
+    assert!(
+        status_val["agent_count"].as_u64().unwrap_or(0) >= 1,
+        "world must report a live founding population; got: {status_val:?}"
     );
 
-    // (2) A command submitted over the socket must reach the world.
-    let (pause_code, pause_body) = http(addr, "POST", "/api/control/pause")?;
+    // (2) REST metadata reads: OpenAPI and Knobs
+    let (open_code, open_body) = http(rest_addr, "GET", "/api-docs/openapi.json")?;
+    assert_eq!(open_code, 200, "openapi endpoint must return 200");
+    let open_json: serde_json::Value = serde_json::from_str(&open_body)?;
+    let paths_count = open_json["paths"].as_object().map_or(0, |p| p.len());
+    assert!(
+        paths_count >= 29,
+        "openapi must publish >= 29 paths, found {paths_count}"
+    );
+
+    let (knobs_code, knobs_body) = http(rest_addr, "GET", "/api/knobs")?;
+    assert_eq!(knobs_code, 200, "knobs endpoint must return 200");
+    let knobs_json: serde_json::Value = serde_json::from_str(&knobs_body)?;
+    let knobs_count = knobs_json.as_array().map_or(0, |a| a.len());
+    assert!(
+        knobs_count >= 100,
+        "knobs roster must publish >= 100 knobs, found {knobs_count}"
+    );
+
+    // (3) Two-axis playback semantics: Pause
+    let (pause_code, pause_body) = http(rest_addr, "POST", "/api/control/pause")?;
     assert_eq!(
         pause_code, 200,
         "pause must be accepted, got {pause_code}: {pause_body}"
     );
-    let command_id = json_str(&pause_body, "command_id")
+    let pause_id = json_str(&pause_body, "command_id")
         .ok_or_else(|| anyhow!("pause response carried no command_id: {pause_body}"))?;
 
-    // Server mode drains at a 16ms cadence, so application follows admission
-    // quickly — but poll for it rather than assuming, because asserting the
-    // SUBMITTED state and calling it applied is the exact defect class bd-0oro
-    // records.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut application_state = String::new();
+    let mut pause_app_state = String::new();
     let mut journal_state = String::new();
     let mut receipt_body = String::new();
     while Instant::now() < deadline {
-        let (code, body) = http(addr, "GET", &format!("/api/control/status/{command_id}"))?;
+        let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{pause_id}"))?;
         if code == 200 {
             receipt_body = body.clone();
-            application_state = json_str(&body, "application_state").unwrap_or_default();
+            pause_app_state = json_str(&body, "application_state").unwrap_or_default();
             journal_state = json_str(&body, "journal_state").unwrap_or_default();
-            if application_state == "applied" {
+            if pause_app_state == "applied" {
                 break;
             }
         }
         std::thread::sleep(Duration::from_millis(25));
     }
     assert_eq!(
-        application_state, "applied",
-        "the command must reach the WORLD, not merely the queue; receipt: {receipt_body}"
+        pause_app_state, "applied",
+        "the pause command must reach the WORLD, not merely the queue; receipt: {receipt_body}"
     );
-
-    // WHICH LEVEL THIS PROVES, stated rather than left for the reader to assume.
-    // `application_state == applied` is the applier's own observation: the world
-    // took the command. The JOURNAL axis is a separate, strictly stronger claim
-    // about durability, and it is reported here as OBSERVED rather than asserted at
-    // a level this path does not reach. bd-88yj records that the legacy bus — which
-    // server mode drains — writes no lifecycle record, so a `not_required` journal
-    // state here is the honest current answer, not a failure. If a later change
-    // advances it, this assertion will still pass and the evidence line below will
-    // show the stronger value, which is the point of recording it separately.
     assert!(
         !journal_state.is_empty(),
         "the receipt must report a journal state, even if it is not_required: {receipt_body}"
     );
 
-    // (3) The screenshot endpoint must REFUSE, because no frame was presented.
-    let (shot_code, shot_body) = http(addr, "GET", "/api/screenshot/ascii")?;
+    // Verify ticks are frozen
+    std::thread::sleep(Duration::from_millis(150));
+    let (_, b1) = http(rest_addr, "GET", "/api/status")?;
+    let f1: serde_json::Value = serde_json::from_str(&b1)?;
+    let tick1 = f1["tick"].as_u64().expect("tick u64");
+    std::thread::sleep(Duration::from_millis(150));
+    let (_, b2) = http(rest_addr, "GET", "/api/status")?;
+    let f2: serde_json::Value = serde_json::from_str(&b2)?;
+    let tick2 = f2["tick"].as_u64().expect("tick u64");
+    assert_eq!(
+        tick2, tick1,
+        "pause must freeze world ticks; got {tick1} then {tick2}"
+    );
+
+    // (4) Single step: exactly one tick, remains paused
+    let (step_code, step_body) = http_with_body(
+        rest_addr,
+        "POST",
+        "/api/control/step",
+        b"{\"count\":1}",
+        Some("application/json"),
+    )?;
+    assert_eq!(step_code, 200, "step must be accepted: {step_body}");
+    let step_id = json_str(&step_body, "command_id")
+        .ok_or_else(|| anyhow!("step response carried no command_id: {step_body}"))?;
+
+    let step_deadline = Instant::now() + Duration::from_secs(30);
+    let mut step_app_state = String::new();
+    while Instant::now() < step_deadline {
+        let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{step_id}"))?;
+        if code == 200 {
+            step_app_state = json_str(&body, "application_state").unwrap_or_default();
+            if step_app_state == "applied" {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        step_app_state, "applied",
+        "step command must reach applied state"
+    );
+
+    let (_, b_step) = http(rest_addr, "GET", "/api/status")?;
+    let v_step: serde_json::Value = serde_json::from_str(&b_step)?;
+    let tick_step = v_step["tick"].as_u64().expect("tick u64");
+    assert_eq!(
+        tick_step,
+        tick2 + 1,
+        "step count 1 must advance tick by exactly 1"
+    );
+
+    std::thread::sleep(Duration::from_millis(150));
+    let (_, b_step2) = http(rest_addr, "GET", "/api/status")?;
+    let v_step2: serde_json::Value = serde_json::from_str(&b_step2)?;
+    let tick_step2 = v_step2["tick"].as_u64().expect("tick u64");
+    assert_eq!(tick_step2, tick_step, "stepped world must remain paused");
+
+    // (5) Resume: unfreezes the world
+    let (resume_code, resume_body) = http(rest_addr, "POST", "/api/control/resume")?;
+    assert_eq!(resume_code, 200, "resume must be accepted: {resume_body}");
+    let resume_id = json_str(&resume_body, "command_id")
+        .ok_or_else(|| anyhow!("resume response carried no command_id: {resume_body}"))?;
+
+    let res_deadline = Instant::now() + Duration::from_secs(30);
+    let mut res_app_state = String::new();
+    while Instant::now() < res_deadline {
+        let (code, body) = http(
+            rest_addr,
+            "GET",
+            &format!("/api/control/status/{resume_id}"),
+        )?;
+        if code == 200 {
+            res_app_state = json_str(&body, "application_state").unwrap_or_default();
+            if res_app_state == "applied" {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        res_app_state, "applied",
+        "resume command must reach applied state"
+    );
+
+    let advance_deadline = Instant::now() + Duration::from_secs(30);
+    let mut advanced = false;
+    while Instant::now() < advance_deadline {
+        if let Ok((code, body)) = http(rest_addr, "GET", "/api/status") {
+            if code == 200
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+            {
+                if let Some(t) = v["tick"].as_u64() {
+                    if t > tick_step {
+                        advanced = true;
+                        break;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        advanced,
+        "resume must unfreeze world ticks past {tick_step}"
+    );
+
+    // (6) Negative paths: malformed step and unknown command status
+    let (bad_step_code, _) = http_with_body(
+        rest_addr,
+        "POST",
+        "/api/control/step",
+        b"not-json",
+        Some("application/json"),
+    )?;
+    assert_eq!(bad_step_code, 400, "malformed step payload must return 400");
+
+    let (not_found_code, _) = http(rest_addr, "GET", "/api/control/status/no-such-command-xyz")?;
+    assert_eq!(
+        not_found_code, 404,
+        "unknown command status must return 404"
+    );
+
+    // (7) Terminal unpresented screenshot refusal
+    let (shot_code, shot_body) = http(rest_addr, "GET", "/api/screenshot/ascii")?;
     assert_eq!(
         shot_code, 409,
         "--mode server presents no terminal frame, so the endpoint must refuse \
@@ -324,8 +476,104 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
          restored as a convenience: {shot_body}"
     );
 
-    // (4) Lifecycle: the child must still be running (this is a long-lived server,
-    // not a batch job that happened to answer), and must then terminate.
+    // (8) FastMCP HTTP protocol verification
+    let (health_code, health_body) = http(mcp_addr, "GET", "/health")?;
+    assert_eq!(health_code, 200, "MCP /health must return 200");
+    assert!(
+        health_body.contains("healthy"),
+        "MCP /health body: {health_body}"
+    );
+
+    // MCP initialize (protocolVersion 2024-11-05)
+    let init_payload = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
+    let (init_code, init_body) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        init_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        init_code, 200,
+        "MCP initialize must return 200: {init_body}"
+    );
+    let init_json: serde_json::Value = serde_json::from_str(&init_body)?;
+    assert_eq!(
+        init_json["result"]["protocolVersion"], "2024-11-05",
+        "MCP must negotiate protocolVersion: {init_body}"
+    );
+
+    // MCP notifications/initialized
+    let notify_payload = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    let (notify_code, _) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        notify_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        notify_code, 202,
+        "MCP notifications/initialized must return 202"
+    );
+
+    // MCP tools/list
+    let list_payload = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+    let (list_code, list_body) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        list_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        list_code, 200,
+        "MCP tools/list must return 200: {list_body}"
+    );
+    let list_json: serde_json::Value = serde_json::from_str(&list_body)?;
+    let tools = list_json["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert_eq!(tools.len(), 13, "MCP tools/list must return all 13 tools");
+
+    // MCP tools/call get_status
+    let status_payload = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#;
+    let (status_call_code, status_call_body) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        status_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        status_call_code, 200,
+        "MCP tools/call get_status must return 200: {status_call_body}"
+    );
+    assert!(
+        status_call_body.contains("tick"),
+        "MCP get_status must report tick: {status_call_body}"
+    );
+
+    // MCP tools/call unknown tool -> JSON-RPC error
+    let unknown_payload = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#;
+    let (unknown_code, unknown_body) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        unknown_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        unknown_code, 200,
+        "MCP unknown tool call returns JSON-RPC error response"
+    );
+    let unknown_json: serde_json::Value = serde_json::from_str(&unknown_body)?;
+    assert!(
+        unknown_json["error"].is_object(),
+        "MCP unknown tool must return JSON-RPC error object: {unknown_body}"
+    );
+
+    // (9) Lifecycle: the child must still be running and terminates cleanly.
     let child = guard.0.as_mut().expect("child still held");
     assert!(
         child.try_wait()?.is_none(),
@@ -335,11 +583,6 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     let exit = child.wait()?;
     guard.0 = None;
 
-    // Anchored to the manifest dir, NOT the inherited cwd: this test sets
-    // current_dir to a tempdir for the child, and a git call inheriting that
-    // returns nothing — which silently produced an EMPTY source_commit in the
-    // first green run. An evidence line with a hollow provenance field is
-    // evidence-shaped output that was never earned.
     let commit = Command::new("git")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args(["rev-parse", "HEAD"])
@@ -349,15 +592,16 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     println!(
-        "{{\"schema\":\"scriptbots.real-process-e2e.v1\",\"binary\":\"{}\",\"mode\":\"server\",\
-         \"storage\":\"memory\",\"rest_address\":\"{addr}\",\"boot_log_lines\":{},\
-         \"status_code\":{status_code},\"pause_code\":{pause_code},\"command_id\":\"{command_id}\",\
-         \"application_state\":\"{application_state}\",\"journal_state\":\"{journal_state}\",\
+        "{{\"schema\":\"scriptbots.real-process-e2e.v2\",\"binary\":\"{}\",\"mode\":\"server\",\
+         \"storage\":\"memory\",\"rest_address\":\"{rest_addr}\",\"mcp_address\":\"{mcp_addr}\",\
+         \"boot_log_lines\":{},\"status_code\":{status_code},\"pause_code\":{pause_code},\
+         \"pause_id\":\"{pause_id}\",\"step_id\":\"{step_id}\",\"resume_id\":\"{resume_id}\",\
+         \"application_state\":\"applied\",\"journal_state\":\"{journal_state}\",\
          \"proved_level\":\"applied\",\"screenshot_code\":{shot_code},\
-         \"screenshot_bytes\":{},\"child_exit\":\"{}\",\"source_commit\":\"{commit}\"}}",
+         \"tools_count\":{},\"child_exit\":\"{}\",\"source_commit\":\"{commit}\"}}",
         binary().display(),
         boot_log.len(),
-        shot_body.len(),
+        tools.len(),
         exit.code()
             .map_or_else(|| "signalled".to_string(), |code| code.to_string()),
     );

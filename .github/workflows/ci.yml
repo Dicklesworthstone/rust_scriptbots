@@ -738,3 +738,43 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p scriptbots-bevy -- --include-ignored --nocapture
+
+  control_plane_probe:
+    name: Control-Plane E2E Probe (bd-6mus)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true # Non-blocking initially; see bd-6mus
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install mold linker and system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev \
+            curl \
+            jq
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: control-plane-probe-linux
+
+      - name: Run real-process control-plane E2E probe
+        run: cargo test -p scriptbots-app --test real_process_control_e2e -- --nocapture
+
