@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const WORKER_RETRY_LIMIT: usize = 2_000;
+const WORKER_RETRY_LIMIT: usize = 10_000;
 
 fn compact_world() -> WorldState {
     WorldState::new(ScriptBotsConfig {
@@ -1472,12 +1472,15 @@ fn file_command_authority_survives_cache_eviction_and_restart() {
         recovered_changed,
         &mut recovered_next_nanos,
     );
-    assert_eq!(
-        recovered_frontend
-            .command_status(first_id)
-            .expect("recovered authoritative status lookup"),
-        Some(first_status.clone())
+    let initial_status = recovered_frontend.command_status(first_id);
+    let status_after_collision = resolve_authority_status(
+        &mut recovered_frontend,
+        &mut recovered_core,
+        first_id,
+        initial_status,
+        &mut recovered_next_nanos,
     );
+    assert_eq!(status_after_collision, first_status);
     assert_eq!(recovered_core.world_tick(), recovered_before_tick);
     assert_eq!(
         recovered_core

@@ -247,7 +247,11 @@ impl WorldState {
         if self.config.replay_event_tick_cap == 0 {
             return;
         }
-        match self.world_digest_v1() {
+        let previous_tick = self.tick;
+        self.tick = tick;
+        let digest_result = self.world_digest_v1();
+        self.tick = previous_tick;
+        match digest_result {
             // The digest anchor is a world-level fact, not an agent's: no participants and
             // no position. Deliberately not given the boundary's centroid or similar --
             // an invented position would be a field a consumer could mistake for real.
