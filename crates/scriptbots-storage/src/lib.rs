@@ -27203,6 +27203,80 @@ mod tests {
     }
 
     #[test]
+    fn v16_to_v17_archive_migration_preserves_existing_tables_and_adds_archive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_V16_VERSION).run(&connection)?;
+
+        let v16_user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        assert_eq!(v16_user_version, SCRIPTBOTS_SCHEMA_V16_VERSION);
+
+        // Populate V16 tables
+        connection.execute(
+            "INSERT INTO runs (
+                run_id, manifest_schema_version, experiment_id, variant_id,
+                scenario_id, scenario_version, normalized_config_json, config_digest,
+                root_seed_hex, rng_algorithm, rng_version, brain_roster_json,
+                source_revision, source_tree_digest, source_tree_dirty,
+                source_bundle_digest, rust_toolchain, cargo_lock_digest, target_triple,
+                started_at_unix_ms_hex, requested_tick_budget_hex, live_run_policy,
+                reproducible, manifest_json, manifest_digest
+            ) VALUES (
+                'test_run_mig', 1, 'exp', 'var', 'scen', 1, '{}', 'cdig',
+                '0000', 'wyrand', 1, '[]', 'rev', 'stdig', 0, 'sbd', 'nightly',
+                'cld', 'target', '0', '0', 'default', 1, '{}', 'mdig'
+            )",
+        )?;
+        connection.execute(
+            "INSERT INTO tick_summaries (
+                run_id, tick, agent_count, births, deaths,
+                total_energy, average_energy, average_health
+            ) VALUES (
+                'test_run_mig', 10, 4, 1, 0, 40.0, 10.0, 1.0
+            )",
+        )?;
+
+        // Run migration to V17 (HEAD)
+        install_scriptbots_schema(&connection)?;
+
+        let v17_user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        assert_eq!(v17_user_version, SCRIPTBOTS_SCHEMA_VERSION);
+
+        // Verify pre-existing data is intact
+        let run_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runs WHERE run_id = 'test_run_mig'")?
+            .get_typed(0)?;
+        assert_eq!(run_count, 1);
+
+        let tick_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tick_summaries WHERE run_id = 'test_run_mig'")?
+            .get_typed(0)?;
+        assert_eq!(tick_count, 1);
+
+        // Verify new archive tables exist and have expected columns
+        let space_cols = table_columns(&connection, "archive_space")?;
+        assert_eq!(space_cols, ["run_id", "space_version", "axes_json"]);
+
+        let cells_cols = table_columns(&connection, "archive_cells")?;
+        assert_eq!(
+            cells_cols,
+            [
+                "run_id",
+                "cell_id",
+                "uid",
+                "tick_inserted",
+                "quality",
+                "descriptor",
+                "genome",
+                "genome_version",
+            ]
+        );
+
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn nonempty_v8_host_journal_refuses_v9_before_any_migration_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
