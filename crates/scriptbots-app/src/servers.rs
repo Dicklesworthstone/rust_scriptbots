@@ -2383,6 +2383,7 @@ async fn handle_mcp_http_request(
     State(state): State<McpHttpState>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
+    let method = request.method.clone();
     let id = request.id.clone();
     let cx = Cx::for_request();
     match state.server.dispatch_request_concurrent(
@@ -2395,12 +2396,20 @@ async fn handle_mcp_http_request(
         Some(message) => Json(message).into_response(),
         None => {
             if let Some(request_id) = id {
+                let (code, message) = if method == "initialize" {
+                    (
+                        -32602,
+                        "Unsupported protocol version; supported versions: [\"2024-11-05\"]",
+                    )
+                } else {
+                    (-32600, "Invalid Request: unhandled or rejected by MCP server")
+                };
                 let err_response = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "error": {
-                        "code": -32600,
-                        "message": "Invalid Request: unhandled or rejected by MCP server"
+                        "code": code,
+                        "message": message
                     }
                 });
                 Json(err_response).into_response()

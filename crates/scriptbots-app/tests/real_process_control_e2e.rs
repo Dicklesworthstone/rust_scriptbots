@@ -503,6 +503,32 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         "MCP must negotiate protocolVersion: {init_body}"
     );
 
+    // MCP initialize with unsupported protocol version -> JSON-RPC error -32602
+    let bad_version_payload = br#"{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
+    let (bad_ver_code, bad_ver_body) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        bad_version_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        bad_ver_code, 200,
+        "MCP unsupported protocol version returns JSON-RPC error response"
+    );
+    let bad_ver_json: serde_json::Value = serde_json::from_str(&bad_ver_body)?;
+    assert_eq!(
+        bad_ver_json["error"]["code"], -32602,
+        "MCP unsupported protocol version must return -32602: {bad_ver_body}"
+    );
+    assert!(
+        bad_ver_json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unsupported protocol version"),
+        "MCP error message must name unsupported protocol version: {bad_ver_body}"
+    );
+
     // MCP notifications/initialized
     let notify_payload = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
     let (notify_code, _) = http_with_body(
