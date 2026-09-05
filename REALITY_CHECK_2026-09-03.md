@@ -2,9 +2,9 @@
 
 ## Execution TODO — started 2026-09-05
 
-Continuation block — **bd-16g.5.5.2, in progress, TurquoiseLake**:
+Continuation block — **bd-16g.5.5.2, closed after pinned DSR21, TurquoiseLake**:
 
-- [ ] Resolve the seven failures from completed DSR16 (`4a1c8e5`) before full-suite acceptance.
+- [x] Resolve the seven failures from completed DSR16 (`4a1c8e5`) before full-suite acceptance.
   - [x] Retain the completed failed run: storage unit tests 208/208; multi-run 17/19;
     journal 3/8; other default integration targets passed, including reaper 4/4.
     Three existing timing tests remained ignored. No full-suite pass is claimed.
@@ -25,18 +25,99 @@ Continuation block — **bd-16g.5.5.2, in progress, TurquoiseLake**:
     the real concurrent file channel. Two commands remained pending within unchanged polling
     limits; the other failure was a copied corruption fixture missing its writer-lock companion.
     Both runs failed overall; copied logs and verdicts have matching remote/local SHA-256 hashes.
-  - [ ] Complete **bd-0wek**, witnessed live narrative configuration boundaries. Authenticate
+  - [x] Complete **bd-0wek**, witnessed live narrative configuration boundaries. Authenticate
     monotonic revisions against applied commands at the preceding tick, require exact policy,
-    and reject unwitnessed jumps/regressions. Candidate extends real GUI replay with changed
+    and reject unwitnessed jumps/regressions. Candidate extends GUI-origin command replay with changed
     policy, a planted policy mismatch, and explicit fixed-config offline-reader refusal.
-  - [ ] Qualify the copied-fixture repair and trace journal admission, state transitions,
+  - [x] Qualify the copied-fixture repair and trace journal admission, state transitions,
     command projection and science persistence with actual worker span timings in DSR19.
     Instrumentation is diagnostic evidence, not a timeout fix or a performance-gate result.
-  - [ ] Execute the full suite on corrected source, followed by both original 600-second
-    server scenarios. Keep the archipelago bead open until regression acceptance passes.
+    DSR19 (`e85faf5`) failed overall: runtime 2/2, codec 2/2, allocation 1/1, missing-claim 1/1,
+    narrative admission 1/1 and multi-run 19/19 passed; journal remained 5/8. The channel's
+    applied transition took 24.5 seconds, while its command projection took only 48.3 ms.
+    The original domain lifecycle/combat positives passed before another copied fixture's
+    absent lock companion failed. The command ordinal-corruption repair passed.
+  - [x] Complete **bd-ek7o**, preserving a crossover's occurrence tick one when its lifecycle
+    payload is published at tick two. DSR19 got past narrative revision admission and exposed
+    the old equality guard. Candidate preserves both timestamps and exact archive matching,
+    rejects future occurrences, and requires the distinct pair in GUI-origin journal readback.
+  - [x] Correct the new policy mutation test to exercise `Storage::recover_existing_run`:
+    ordinary finished-reader opening does not validate the narrative policy. `4ef8a2e` requires
+    successful recovery before the mutation and typed policy refusal afterward. No runtime
+    credit from DSR19, which failed earlier; DSR20 executed and passed both controls.
+  - [x] DSR20 at `a16f27b`: lifecycle unit 1/1, narrative admission 1/1 and journal 8/8 passed
+    (73.13 seconds for the integration target). This includes full two-run GUI command/digest/
+    receipt equality, crossover occurrence/publication ticks (1,2), valid-copy recovery followed
+    by policy mutation refusal, offline mixed-config refusal, and domain corruption controls.
+    Workspace all-target check passed in 5m13s. Strict Clippy failed with 421 core diagnostics;
+    the overall diagnostic run exited 6. Both targeted fix beads closed with this precise limit;
+    the full storage suite is not covered by DSR20.
+  - [ ] Track the intermittent journal latency separately as **bd-j8o2**. DSR20's channel passed
+    without a causal latency fix; the observed DSR19 24.5-second applied transition remains
+    unresolved. Do not conflate it with the original 120-second memory-admission server failure.
+  - [x] Execute the full suite on corrected source. DSR21 at `a16f27b` passed all 11 steps:
+    five guards, workspace all-target check, both CLI tests, capture retry, multi-run 19/19,
+    full storage tests and analytics build. Storage units 211/211 and integration tests 83/83
+    passed, with three existing timing tests ignored. The harness summary says 300 because
+    six child-process test executions are counted again; distinct parent tests total 294.
+    Journal 8/8 passed in 71.44 seconds. Retained verdict SHA-256:
+    `34d485a5ca4bec2276c3bc4846e9be976fdc9d070d5fbb9540b6dec860649968`.
+  - [ ] Execute both original 600-second server scenarios. DSR24 at `a16f27b` stopped at
+    an incorrect MCP negotiation test before reaching either long run. **bd-s5ou** corrects
+    the test against the pinned SDK and normative 2024-11-05 protocol: unsupported initialize
+    versions receive a supported alternative; malformed parameter types still require -32602.
+    Pinned DSR27 `server-d4cab5d-20260905-27` now reruns the lane on hz4.
+- [ ] Complete **bd-vlp7**, strict core lint qualification without changing scientific results.
+  - [x] Retain DSR20's exact diagnostics; confirm its core source is unchanged from `9b8490b`.
+  - [x] Assign disjoint file groups under AGENTS.md's parallel-small-change instruction;
+    root owns `lib.rs`, with three agents covering the other 15 affected files.
+  - [x] Implement root documentation, const, equivalent control flow and existing validated
+    dimension conversions; remove the unused UID helper after proving no consumers.
+  - [x] Separate archive eligibility diagnostics from candidate insertion without changing order.
+  - [x] Review every delegated hunk, especially numeric expectations and extracted calculations.
+  - [x] Implement **bd-mjkd** audio budget/sample-count wrapping, **bd-fb32** phylogeny count
+    truncation, and **bd-sknl** MI sizing before bin validation, with discriminating boundary tests.
+    DSR22 executed audio 7/7, phylogeny 1/1 and MI bounds 1/1 successfully. Closure review remains.
+  - [x] Verify formatting and inspect UBS findings for all changed files. Raw scanner findings
+    are retained; existing assertion/const guards and simulation-state crypto misclassification
+    are not a clean compiler result.
+  - [x] Commit reviewed source as `3a08217`; compare the frozen diff byte-for-byte with the
+    complete source diff reviewed before committing.
+  - [ ] Run pinned strict core/workspace Clippy and compiler checks. DSR22 at `3a08217` finished
+    failed: both compiler checks and formatting passed; strict Clippy stopped on one remaining
+    core-library length diagnostic. DSR25 got past that fix and rejected an obsolete lint
+    expectation; its removal is being checked in DSR26. Every physical worker keeps one DSR job.
+  - [ ] Run scientific regressions, existing unchanged goldens and the economy-fault feature lane.
+    DSR22 default units: 687 passed / 6 failed / 5 existing ignored; economy-fault units:
+    690 / 6 / 5. Every core integration target passed. The same six failures affect checkpoint
+    decoding (four tests), complete config decoding (one), and archive knob classification (one).
+  - [ ] Complete **bd-6xr2**, full configuration serialization independent of the scientific
+    digest projection. Both structs now derive from one field declaration; all recording fields
+    serialize positionally without holes. Preserve science goldens; explicitly advance checkpoint
+    codec 7→8 because payload layout changes. Keep the old wire golden until actual byte
+    capture and review; add default/non-default and float-bit tests. That review is recorded below.
+    Candidate `02ec805` failed DSR23 compilation because root missed one validator reference
+    to the removed stride sentinel constant. Corrected locally to the explicit `u32::MAX`
+    bound. Remove the old archive capacity sentinel exemption and test both enabled/disabled
+    configurations. No execution credit for the failed candidate; qualification continues.
+    DSR25 at `6c89bef` passed 697 default / 700 economy-fault unit cases; the sole failure
+    was the intentionally old checkpoint wire golden. Both builds produced the same canonical
+    8,698-byte wire. Its 149-byte growth equals the seven archive fields byte-for-byte. Reviewed
+    codec-8 golden and obsolete-lint-expectation removal landed in `d4cab5d`; DSR26 now runs
+    complete core suites, storage config codec/journal tests, compiler checks and strict Clippy.
+  - [ ] Complete **bd-3cf0**, classify all eight archive paths from actual consumers and run
+    witnesses for differing operational telemetry with equal full science digests, plus typed
+    invalid-cap refusal. Both witnesses and unchanged completeness gates passed DSR25; final
+    broader source qualification continues in DSR26.
+  - [ ] Complete **bd-lhrv**, preserve real collected elites across unchanged, cadence-only,
+    chart-only and valid-cap changes. Remove the comparison between actual grid size and a
+    configured ceiling. Keep rebuilds for changed quality meaning; real MLP witness passed
+    DSR25 1/1. Final broader source qualification continues in DSR26.
+  - [ ] Record actual outcomes and close only after required acceptance passes; keep wider
+    build-farm, native frontend and exact-class performance qualification separate.
 - [x] Trace checkpoint replay and archipelago production entry points against current code.
-  Checkpoint restore still needs the host/session boundary. The app's archipelago only
-  runs inside the determinism self-check; that check must not gain database side effects.
+  Checkpoint restore still needs the host/session boundary. At initial inspection, the app's
+  archipelago only ran inside the determinism self-check; that check stays free of database writes.
 - [x] Add a separate bounded isolated-island CLI run using canonical config, production
   brain installation and founders, sole-owner hosts, and one complete barrier per tick.
 - [x] Bound journal capture and preserve volatile versus durable receipt semantics.

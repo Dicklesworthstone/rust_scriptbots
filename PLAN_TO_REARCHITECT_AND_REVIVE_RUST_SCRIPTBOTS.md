@@ -2711,9 +2711,11 @@ resume, replay, and first-divergence verification remain separate open work in t
 
 #### 4.5 intervention studies
 
-- [Currently In Progress — bd-16g.5.5.2, TurquoiseLake, 2026-09-05] Expose a separate
+- [Completed — bd-16g.5.5.2, TurquoiseLake, 2026-09-05, pinned DSR21 at a16f27b] Expose a separate
   bounded isolated-island run and atomically persist complete barriers through the existing
   archipelago/storage seam. Keep the determinism self-check free of persistence side effects.
+  Actual CLI/database readback covers three distinct islands at all four ticks in all four
+  per-tick tables, founder genomes, durable watermarks and conservation; full storage tests pass.
   Migration persistence and complete host-session replay remain broader completion work.
 
 - drought/resource shock;
