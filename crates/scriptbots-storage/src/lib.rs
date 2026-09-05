@@ -6890,7 +6890,11 @@ where
 {
     let mut attempt = 1_u8;
     loop {
-        let mut transaction = match connection.transaction() {
+        let transaction_result = {
+            let _span = debug_span!("storage_transaction_begin", attempt).entered();
+            connection.transaction()
+        };
+        let mut transaction = match transaction_result {
             Ok(transaction) => transaction,
             Err(source) => {
                 let failure = FlushAttemptError {
@@ -6910,7 +6914,14 @@ where
                 });
             }
         };
-        let result = operation(&transaction).and_then(|()| transaction.commit());
+        let result = {
+            let _span = debug_span!("storage_transaction_statements", attempt).entered();
+            operation(&transaction)
+        }
+        .and_then(|()| {
+            let _span = debug_span!("storage_transaction_commit", attempt).entered();
+            transaction.commit()
+        });
         match result {
             Ok(()) => return Ok(attempt),
             Err(source) => {
@@ -9784,29 +9795,7 @@ impl StorageReader {
                     reason: "normalized actor differs from its typed payload".to_owned(),
                 });
             }
-            match &payload {
-                DomainEventPayload::Birth(record) if record.tick.0 != tick => {
-                    return Err(StorageError::InvalidData {
-                        context: "host_domain_events.tick",
-                        reason: "birth payload tick differs from its normalized row".to_owned(),
-                    });
-                }
-                DomainEventPayload::Death(record) if record.tick.0 != tick => {
-                    return Err(StorageError::InvalidData {
-                        context: "host_domain_events.tick",
-                        reason: "death payload tick differs from its normalized row".to_owned(),
-                    });
-                }
-                DomainEventPayload::Combat(combat)
-                    if combat.spike_attempts == 0 && combat.spike_hits == 0 =>
-                {
-                    return Err(StorageError::InvalidData {
-                        context: "host_domain_events.payload_json",
-                        reason: "zero aggregate combat payload must not be projected".to_owned(),
-                    });
-                }
-                _ => {}
-            }
+            payload.validate_boundary(Tick(tick))?;
             let journal_sequence =
                 decode_journal_u64("host_domain_events.journal_sequence", &journal)?;
             events.push(DomainEventRecord {
@@ -16837,29 +16826,7 @@ impl Storage {
                     ),
                 });
             }
-            match &payload {
-                DomainEventPayload::Birth(record) if record.tick.0 != row_tick => {
-                    return Err(StorageError::InvalidData {
-                        context: "host_domain_events.tick",
-                        reason: "birth payload tick differs from its normalized row".to_owned(),
-                    });
-                }
-                DomainEventPayload::Death(record) if record.tick.0 != row_tick => {
-                    return Err(StorageError::InvalidData {
-                        context: "host_domain_events.tick",
-                        reason: "death payload tick differs from its normalized row".to_owned(),
-                    });
-                }
-                DomainEventPayload::Combat(combat)
-                    if combat.spike_attempts == 0 && combat.spike_hits == 0 =>
-                {
-                    return Err(StorageError::InvalidData {
-                        context: "host_domain_events.payload_json",
-                        reason: "zero aggregate combat payload must not be projected".to_owned(),
-                    });
-                }
-                _ => {}
-            }
+            payload.validate_boundary(Tick(row_tick))?;
         }
         Ok(())
     }

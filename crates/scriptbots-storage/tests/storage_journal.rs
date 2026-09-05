@@ -2099,6 +2099,22 @@ fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
 
     let first_reader = StorageReader::open_finished_for_run(&first_path, first_run_id)
         .expect("open immutable first command journal");
+    let domain = first_reader
+        .domain_event_page(FIRST_SESSION, None, 16, options.max_event_page_bytes)
+        .expect("read actual crossover occurrence and publication ticks");
+    let crossovers = domain
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            DomainEventPayload::Birth(birth)
+                if birth.parent_a == Some(parents[0].0) && birth.parent_b == Some(parents[1].0) =>
+            {
+                Some((birth.tick, event.tick))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(crossovers, vec![(Tick(1), Tick(2))]);
     assert!(
         matches!(
             first_reader.narrative_input_page_v1(None, 2, 0),
@@ -3143,6 +3159,15 @@ fn file_domain_journal_preserves_lifecycle_and_combat_across_deferred_persistenc
         let corrupted_path = unique_database_path(label);
         fs::copy(&path, &corrupted_path)
             .expect("copy finished domain database for corruption proof");
+        fs::copy(
+            format!("{path}.scriptbots-writer.lock"),
+            format!("{corrupted_path}.scriptbots-writer.lock"),
+        )
+        .expect("copy the stable domain writer-lease companion");
+        StorageReader::open_finished_for_run(&corrupted_path, run_id)
+            .expect("domain fixture must validate before deliberate corruption")
+            .close()
+            .expect("close the valid domain fixture");
         let connection = Connection::open(&corrupted_path)
             .expect("open copied domain database for deliberate corruption");
         connection

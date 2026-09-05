@@ -376,6 +376,31 @@ impl DomainEventPayload {
         }
     }
 
+    pub(super) fn validate_boundary(&self, boundary_tick: Tick) -> Result<(), StorageError> {
+        // External lifecycle commands can occur between science steps. Their
+        // original occurrence tick survives publication by the following step.
+        let occurrence = match self {
+            Self::Birth(record) => Some(record.tick),
+            Self::Death(record) => Some(record.tick),
+            Self::Combat(combat) => {
+                if combat.spike_attempts == 0 && combat.spike_hits == 0 {
+                    return Err(StorageError::InvalidData {
+                        context: "host_domain_events.payload_json",
+                        reason: "zero aggregate combat payload must not be projected".to_owned(),
+                    });
+                }
+                None
+            }
+        };
+        if occurrence.is_some_and(|tick| tick > boundary_tick) {
+            return Err(StorageError::InvalidData {
+                context: "host_domain_events.tick",
+                reason: "lifecycle occurrence follows its publication boundary".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn encode_json(&self) -> Result<String, StorageError> {
         let encoded = match self {
             Self::Birth(record) => serde_json::to_string(record),
@@ -433,7 +458,8 @@ pub struct DomainEventRecord {
     pub event_ordinal: u64,
     /// Total journal identity whose canonical archive supplied this row.
     pub journal_batch_id: JournalBatchId,
-    /// Scientific tick recorded by the canonical boundary.
+    /// Scientific tick recorded by the canonical publication boundary.
+    /// Lifecycle payloads retain their own occurrence tick, which can be earlier.
     pub tick: Tick,
     /// Full typed domain payload.
     pub payload: DomainEventPayload,
@@ -523,6 +549,7 @@ impl PreparedDomainEventProjection {
         let mut events = Vec::with_capacity(event_capacity);
         for birth in scientific.births() {
             let payload = DomainEventPayload::Birth(birth.clone());
+            payload.validate_boundary(tick)?;
             let payload_json = payload.encode_json()?;
             events.push(PreparedDomainEvent {
                 ordinal: u64::try_from(events.len()).map_err(|error| {
@@ -537,6 +564,7 @@ impl PreparedDomainEventProjection {
         }
         for death in scientific.deaths() {
             let payload = DomainEventPayload::Death(death.clone());
+            payload.validate_boundary(tick)?;
             let payload_json = payload.encode_json()?;
             events.push(PreparedDomainEvent {
                 ordinal: u64::try_from(events.len()).map_err(|error| {
@@ -3398,6 +3426,69 @@ mod tests {
             tick: Tick(1),
             revisions: HostRevisions::default(),
         }
+    }
+
+    #[test]
+    fn domain_payload_retains_occurrence_tick_and_refuses_future_occurrences() {
+        let birth = DomainEventPayload::Birth(BirthRecord {
+            tick: Tick(1),
+            agent_uid: AgentUid(1),
+            spawn_ordinal: 1,
+            birth_ordinal: Some(1),
+            origin: scriptbots_core::BirthOrigin::Born,
+            parent_a: None,
+            parent_b: None,
+            brain_kind: None,
+            brain_key: None,
+            herbivore_tendency: 0.5,
+            generation: scriptbots_core::Generation::default(),
+            position: scriptbots_core::Position::default(),
+            is_hybrid: false,
+        });
+        let death = DomainEventPayload::Death(DeathRecord {
+            tick: Tick(1),
+            agent_uid: AgentUid(1),
+            age: 1,
+            generation: scriptbots_core::Generation::default(),
+            herbivore_tendency: 0.5,
+            brain_kind: None,
+            brain_key: None,
+            energy: 0.0,
+            food_balance_total: 0.0,
+            cause: scriptbots_core::DeathCause::Starvation,
+            was_hybrid: false,
+            combat_flags: scriptbots_core::CombatEventFlags::default(),
+        });
+        for payload in [birth, death] {
+            let before = payload.encode_json().expect("canonical lifecycle payload");
+            payload
+                .validate_boundary(Tick(1))
+                .expect("same-tick publication");
+            payload
+                .validate_boundary(Tick(2))
+                .expect("deferred publication");
+            assert!(matches!(
+                payload.validate_boundary(Tick(0)),
+                Err(StorageError::InvalidData {
+                    context: "host_domain_events.tick",
+                    ..
+                })
+            ));
+            assert_eq!(payload.encode_json().expect("unchanged occurrence"), before);
+        }
+        assert!(matches!(
+            DomainEventPayload::Combat(TickCombatSummary::default()).validate_boundary(Tick(1)),
+            Err(StorageError::InvalidData {
+                context: "host_domain_events.payload_json",
+                ..
+            })
+        ));
+        DomainEventPayload::Combat(TickCombatSummary {
+            spike_attempts: 1,
+            spike_hits: 0,
+        })
+        .validate_boundary(Tick(1))
+        .expect("a missed attempt is observed combat");
     }
 
     fn scientific() -> ScientificBoundary {
