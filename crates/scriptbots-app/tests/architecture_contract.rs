@@ -1,13 +1,16 @@
-//! Architectural documentation contract and extension recipe verification (bd-bsuh).
+//! Architecture references and literal scenario-input checks.
+//!
+//! The guide is included in crate documentation and its Rust programs execute in
+//! `cargo test -p scriptbots-app --doc`. These integration tests supplement those
+//! executions; source-reference checks alone do not prove a runtime capability.
 //!
 //! Verifies:
 //! 1. `docs/ARCHITECTURE.md` explicitly distinguishes Current/Transitional (`SharedWorld`, `bd-2z0.4.9`)
 //!    from Target (`HostCore`-only, `bd-k7nq`).
 //! 2. Every relative path cited in `docs/ARCHITECTURE.md` exists on disk.
-//! 3. Every primary Rust symbol cited in the guide exists and compiles in the workspace.
-//! 4. Every REST route cited in the guide matches live server definitions.
-//! 5. Negative controls prove that non-existent paths, renamed symbols, invalid routes,
-//!    and missing state annotations are caught and rejected.
+//! 3. The explicitly enumerated Rust symbols compile and route strings exist in source.
+//! 4. The literal scenario is normalized and stepped, including both interventions.
+//! 5. Mutated literal scenario input rejects unknown fields and detects missing effects.
 
 use std::path::{Path, PathBuf};
 
@@ -51,7 +54,7 @@ fn architecture_guide_distinguishes_current_transitional_and_target_state() {
     );
     assert!(
         guide.contains("bd-k7nq"),
-        "guide must cite open tracking bead bd-k7nq for HostCore/HostClient migration"
+        "guide must retain the historical bd-k7nq context without inferring caller migration"
     );
 
     // Must document current SharedWorld bridge and bd-2z0.4.9
@@ -242,121 +245,130 @@ fn architecture_guide_negative_controls() {
     );
 }
 
+fn recipe_block<'a>(guide: &'a str, name: &str, language: &str) -> Result<&'a str, String> {
+    let marker = format!("<!-- recipe:{name} -->");
+    let section = guide
+        .split_once(&marker)
+        .ok_or_else(|| format!("missing {marker}"))?
+        .1;
+    let fence = format!("```{language}\n");
+    let source = section
+        .trim_start()
+        .strip_prefix(&fence)
+        .ok_or_else(|| format!("{name} must be a runnable {language} block"))?;
+    source
+        .split_once("\n```")
+        .map(|(body, _)| body)
+        .ok_or_else(|| format!("unclosed {name} block"))
+}
+
 #[test]
-fn recipe_e2e_exercise_brain_family_registration() {
-    use scriptbots_app::{BrainPreset, install_brains};
+fn literal_rust_recipes_remain_enrolled_in_documentation_tests() {
+    let guide = load_architecture_guide();
+    for name in ["brain", "scenario", "meteor", "frontend"] {
+        let body = recipe_block(&guide, name, "rust").expect("runnable recipe");
+        assert!(
+            body.contains("fn main()"),
+            "{name} must be a complete program"
+        );
+        let marker = format!("<!-- recipe:{name} -->\n```rust");
+        let disabled = guide.replacen(&marker, &format!("{marker},ignore"), 1);
+        assert_ne!(
+            disabled, guide,
+            "the negative must mutate the literal fence"
+        );
+        assert!(recipe_block(&disabled, name, "rust").is_err());
+    }
+    let library = std::fs::read_to_string(repo_root().join("crates/scriptbots-app/src/lib.rs"))
+        .expect("library source");
+    assert!(library.contains("#![doc = include_str!(\"../../../docs/ARCHITECTURE.md\")]"));
+    // This is enrollment evidence only. The companion cargo --doc run must
+    // report actual executed examples; this test cannot substitute for it.
+}
+
+fn execute_literal_scenario(text: &str) -> anyhow::Result<Vec<(u64, usize, f32)>> {
+    use scriptbots_app::{
+        BrainPreset, ScenarioDocumentV1, apply_scenario_interventions, install_brains,
+        precedence::{ConfigLayerKind, ConfigLayerStatement, resolve_config_layers},
+        seed_founding_population,
+    };
     use scriptbots_core::{ScriptBotsConfig, WorldState};
-
-    let mut world = WorldState::new(ScriptBotsConfig::default())
-        .expect("WorldState with default config must succeed");
-    let installed = install_brains(&mut world, BrainPreset::Mixed)
-        .expect("installing mixed brain preset must succeed");
-
-    assert!(
-        installed.registered() >= 3,
-        "must register at least 3 families"
-    );
-    assert!(
-        !installed.population().is_empty(),
-        "founding population must have admitted families"
-    );
-
-    let evidence = serde_json::json!({
-        "schema": "scriptbots.architecture-recipe.evidence.v1",
-        "recipe_id": "brain_family_extension",
-        "command": "install_brains",
-        "path": "crates/scriptbots-brain/src/lib.rs",
-        "symbol": "BrainRunner",
-        "route": "N/A",
-        "expected_result": "core_families_registered_and_heredity_verified",
-        "observed_result": format!("registered_count={},population_count={}", installed.registered(), installed.population().len()),
-        "artifact_hash": blake3::hash(format!("{:?}", installed.population()).as_bytes()).to_hex().to_string(),
-        "failure_disposition": "none"
-    });
-    println!("{}", evidence);
+    let document = ScenarioDocumentV1::parse_toml(text.as_bytes())?;
+    let defaults = serde_json::to_value(ScriptBotsConfig::default())?;
+    let mut current = resolve_config_layers(
+        &defaults,
+        &[
+            ConfigLayerStatement {
+                kind: ConfigLayerKind::File,
+                label: document.id.clone(),
+                fields: document.config.clone(),
+            },
+            ConfigLayerStatement {
+                kind: ConfigLayerKind::Cli,
+                label: "recipe-seed".into(),
+                fields: serde_json::json!({"rng_seed": 42}),
+            },
+        ],
+    )
+    .merged;
+    let config = serde_json::from_value(current.clone())?;
+    let mut world = WorldState::new(config)?;
+    let roster = install_brains(&mut world, BrainPreset::Mlp)?;
+    seed_founding_population(&mut world, roster.population())?;
+    let mut effects = Vec::new();
+    for tick in 0..=1000 {
+        anyhow::ensure!(world.tick().0 == tick, "recipe tick drift");
+        let count =
+            apply_scenario_interventions(&mut world, &mut current, &document.interventions, tick)?;
+        if count != 0 {
+            effects.push((tick, count, world.config().food_growth_rate));
+        }
+        world.step()?;
+    }
+    Ok(effects)
 }
 
 #[test]
-fn recipe_e2e_exercise_scenario_and_interventions() {
-    use scriptbots_app::ScenarioDocumentV1;
-
-    let scenario_toml = r#"
-schema = "scriptbots.scenario.v1"
-schema_version = 1
-id = "drought-challenge-v1"
-description = "A harsh desert scenario with scheduled severe droughts and meteor impacts"
-bootstrap_ticks = 100
-
-[config]
-food_max = 5000.0
-food_growth_rate = 0.05
-temperature_penalty = 0.02
-
-[[interventions]]
-tick = 500
-set = { food_growth_rate = 0.001 }
-
-[[interventions]]
-tick = 1000
-set = { food_growth_rate = 0.05 }
-"#;
-
-    let document = ScenarioDocumentV1::parse_toml(scenario_toml.as_bytes())
-        .expect("scenario document must parse valid TOML");
-
-    assert_eq!(document.id, "drought-challenge-v1");
-    assert_eq!(document.schema_version, 1);
-    assert_eq!(document.bootstrap_ticks, Some(100));
-    assert_eq!(document.interventions.len(), 2);
-    assert_eq!(document.interventions[0].tick, 500);
-    assert_eq!(document.interventions[1].tick, 1000);
-
-    let evidence = serde_json::json!({
-        "schema": "scriptbots.architecture-recipe.evidence.v1",
-        "recipe_id": "scenario_extension",
-        "command": "ScenarioDocumentV1::parse_toml",
-        "path": "crates/scriptbots-core/src/interventions.rs",
-        "symbol": "ScenarioDocumentV1",
-        "route": "/api/scenario",
-        "expected_result": "scenario_parsed_with_two_interventions",
-        "observed_result": format!("id={},interventions={}", document.id, document.interventions.len()),
-        "artifact_hash": blake3::hash(scenario_toml.as_bytes()).to_hex().to_string(),
-        "failure_disposition": "none"
-    });
-    println!("{}", evidence);
+fn literal_scenario_applies_both_effects_and_rejects_mutated_inputs() {
+    let guide = load_architecture_guide();
+    let text = recipe_block(&guide, "scenario-document", "toml").expect("literal scenario");
+    let expected = vec![(500, 1, 0.001_f32), (1000, 1, 0.05_f32)];
+    let observed = execute_literal_scenario(text).expect("execute documented scenario");
+    assert_eq!(observed, expected);
+    let unknown = text.replacen("food_max", "food_max_typo", 1);
+    assert_ne!(unknown, text);
+    assert!(execute_literal_scenario(&unknown).is_err());
+    let no_recovery = text.replacen(
+        "set = { food_growth_rate = 0.05 }",
+        "set = { food_growth_rate = 0.001 }",
+        1,
+    );
+    assert_ne!(no_recovery, text);
+    assert_ne!(
+        execute_literal_scenario(&no_recovery).expect("valid but ineffective recovery"),
+        expected
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "literal_input_blake3": blake3::hash(text.as_bytes()).to_hex().to_string(),
+            "observed_effects": observed, "final_tick": 1001,
+            "scope": "production scenario configuration and simulation steps; no frontend claim",
+        })
+    );
 }
 
 #[test]
-fn recipe_e2e_exercise_frontend_projection_and_command() {
-    use scriptbots_runtime::{CommandEnvelope, CommandId, HostCommand};
-
-    let command = HostCommand::Step;
-    command.validate().expect("Step command must be valid");
-
-    let pause = HostCommand::Pause;
-    pause.validate().expect("Pause command must be valid");
-
-    let resume = HostCommand::Resume;
-    resume.validate().expect("Resume command must be valid");
-
-    let speed = HostCommand::SetSpeed(1.5);
-    speed.validate().expect("SetSpeed command must be valid");
-
-    let envelope = CommandEnvelope::new(CommandId::new(42), command.clone());
-    assert_eq!(envelope.command, command);
-    assert_eq!(envelope.command_id.get(), 42);
-
-    let evidence = serde_json::json!({
-        "schema": "scriptbots.architecture-recipe.evidence.v1",
-        "recipe_id": "frontend_extension",
-        "command": "HostCommand::validate + CommandEnvelope::new",
-        "path": "crates/scriptbots-runtime/src/lib.rs",
-        "symbol": "CommandEnvelope",
-        "route": "/api/control/status/{command_id}",
-        "expected_result": "command_envelope_validated_and_receipt_correlated",
-        "observed_result": format!("cmd_id={:?},command={:?}", envelope.command_id, envelope.command),
-        "artifact_hash": blake3::hash(format!("{:?}:{:?}", envelope.command_id, envelope.command).as_bytes()).to_hex().to_string(),
-        "failure_disposition": "none"
-    });
-    println!("{}", evidence);
+fn custom_family_is_a_library_extension_not_an_invented_cli_preset() {
+    use clap::ValueEnum;
+    use scriptbots_app::BrainPreset;
+    assert_eq!(
+        BrainPreset::from_str("mlp", false).unwrap(),
+        BrainPreset::Mlp
+    );
+    assert!(BrainPreset::from_str("custom", false).is_err());
+    let guide = load_architecture_guide();
+    let brain = recipe_block(&guide, "brain", "rust").unwrap();
+    assert!(brain.contains("world.register_brain_family("));
+    assert!(guide.contains("`--brain custom` does not exist"));
 }
