@@ -1298,11 +1298,10 @@ impl SharedHostState {
         let (cache, prior_digest, status) = if let Some(authority) = self.commands.get(&command_id)
         {
             ("live", authority.envelope_digest, &authority.status)
-        } else if let Some(archived) = self.archived_idempotency.get(&command_id) {
+        } else {
+            let archived = self.archived_idempotency.get(&command_id)?;
             // Durable archive retries replay terminal status only for the exact payload.
             ("archive", archived.envelope_digest, &archived.status)
-        } else {
-            return None;
         };
         let exact = prior_digest == envelope_digest;
         trace_command_authority_decision(

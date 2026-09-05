@@ -3,8 +3,8 @@
 use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentUid, BrainRunner, CharacterizationError, ControlCommand, INPUT_SIZE,
-    OUTPUT_SIZE, Position, ReplayEventKind, ScriptBotsConfig, SelectionMode, SelectionState,
-    SelectionUpdate, Tick, WorldContinuationBlocker, WorldDigestV1, WorldState,
+    NullPersistence, OUTPUT_SIZE, Position, ReplayEventKind, ScriptBotsConfig, SelectionMode,
+    SelectionState, SelectionUpdate, Tick, WorldContinuationBlocker, WorldDigestV1, WorldState,
     channels::OutputChannel,
 };
 use scriptbots_runtime::{
@@ -3443,8 +3443,13 @@ fn verify_channel_capacity_recovery(
         "a blocked world must not claim a continuable scientific digest"
     );
     let mut oracle = compact_world();
+    let mut oracle_persistence = oracle
+        .bind_persistence(Box::new(NullPersistence))
+        .expect("bind the independent science-only oracle");
     for _ in 0..2 {
-        oracle.step().expect("independent science-only oracle step");
+        oracle_persistence
+            .step(&mut oracle)
+            .expect("independent science-only oracle step");
     }
     let (mut driver, _port) = ChannelHostDriver::new(
         FixedDeadlineHost::new(core),
@@ -3495,7 +3500,9 @@ fn verify_channel_capacity_recovery(
         Tick(3),
         "fresh Step advances exactly once"
     );
-    oracle.step().expect("independent third science transition");
+    oracle_persistence
+        .step(&mut oracle)
+        .expect("independent third science transition");
     assert_eq!(
         driver
             .host()

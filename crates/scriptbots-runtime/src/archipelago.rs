@@ -4111,7 +4111,7 @@ mod tests {
             fn check() {}
         }
         impl<T: ?Sized> AmbiguousIfClone<()> for T {}
-        impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
         let _ = <MigratingAgent as AmbiguousIfClone<_>>::check;
 
         // The real evidence is structural and is asserted by the type system at
